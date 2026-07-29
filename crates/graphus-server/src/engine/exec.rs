@@ -597,6 +597,7 @@ pub(super) fn handle_run<
         row_tx,
         row_rx: Some(row_rx),
         pending_row: None,
+        pending_error: None,
         seam_error: None,
         started_nanos: started,
         query: query.to_owned(),
@@ -620,6 +621,12 @@ pub(super) fn handle_run<
             RunOutcome::Suspended(Box::new(inflight))
         }
         BatchStep::Done { produced_ok } => {
+            // The seam's captured deferral error is this statement's terminal item, and handing it
+            // over must never block the engine thread on a full egress channel (`rmp` #907): if the
+            // channel refuses it, park the statement and let the resume path deliver it.
+            let Some(produced_ok) = settle_seam_error(&mut inflight, produced_ok) else {
+                return RunOutcome::Suspended(Box::new(inflight));
+            };
             finalize_inflight(
                 &mut inflight,
                 coordinator,
@@ -1140,6 +1147,25 @@ pub(super) struct InFlightInline {
     /// One materialized row produced but not yet sent (the channel was full at try_send time). Held
     /// here so no row is lost or re-pulled; sent first on the next resume.
     pending_row: Option<Vec<graphus_cypher::MaterializedValue>>,
+    /// The statement's **terminal error**, produced but not yet accepted by a full bounded egress
+    /// channel (`rmp` #907).
+    ///
+    /// Every terminal item used to be handed over with the *blocking* [`RowSender::send`], on the
+    /// documented assumption that "the engine only ever reaches a resumed batch while the consumer is
+    /// actively draining". That assumption does not hold: the engine reaches a resumed batch whenever
+    /// the channel has room, and a consumer that stopped draining after its last page leaves the
+    /// channel exactly full at the moment the cursor's next call errors. The blocking `send` then
+    /// parks the **engine thread** — the single thread serving the whole database — until somebody
+    /// drains that one channel, which is precisely what a paused consumer will not do. A Bolt client
+    /// with several results open in one transaction can reach it inside a single connection: it
+    /// blocks in its next `RUN` while the earlier result is parked, so it cannot drain and cannot be
+    /// unblocked.
+    ///
+    /// While this is `Some` the statement's cursor is finished — no further row is ever pulled. The
+    /// statement simply stays parked and the engine re-offers the error, without blocking, on each
+    /// resume until the consumer makes room. The error is never dropped (that would be a silent
+    /// truncation of a failed result) and never re-ordered (it is still the last item on the stream).
+    pending_error: Option<GraphusError>,
     /// The first seam-captured deferral error seen across visits (the load-bearing `RecordStoreGraph`
     /// invariant), surfaced as the terminal item at finalization — rows precede it, byte-identically
     /// to the single-visit ordering.
@@ -1200,6 +1226,64 @@ impl InFlightInline {
     pub(super) fn deliver_terminal_error(&self, e: GraphusError) {
         let _ = self.row_tx.send(Err(e));
     }
+
+    /// Offers `error` to the consumer as this stream's **terminal item without blocking the engine
+    /// thread** (`rmp` #907). Returns `true` once it has been handed over (or the consumer is gone,
+    /// in which case there is nobody left to tell); `false` when the bounded egress channel is full,
+    /// in which case the error is retained in [`pending_error`](Self::pending_error) and the caller
+    /// must keep the statement parked so [`retry_pending_error`](Self::retry_pending_error) can
+    /// re-offer it on a later tick.
+    fn offer_terminal_error(&mut self, error: GraphusError) -> bool {
+        use super::stream::TrySend;
+        match self.row_tx.try_send(Err(error)) {
+            TrySend::Sent | TrySend::Disconnected(_) => true,
+            TrySend::Full(item) => {
+                // `try_send` hands back exactly the item it refused, so this is the same error.
+                self.pending_error = item.err();
+                debug_assert!(
+                    self.pending_error.is_some(),
+                    "INVARIANT: a refused terminal item is the error we passed in"
+                );
+                false
+            }
+        }
+    }
+
+    /// Re-offers the terminal error held back by a full egress channel (`rmp` #907). Returns `true`
+    /// once it lands (the statement can then be finalised), `false` while the channel is still full
+    /// (the statement stays parked). A no-op returning `true` when nothing is held.
+    fn retry_pending_error(&mut self) -> bool {
+        match self.pending_error.take() {
+            None => true,
+            Some(error) => self.offer_terminal_error(error),
+        }
+    }
+}
+
+/// Hands the seam's captured deferral error to the consumer as the statement's terminal item, without
+/// blocking the engine thread (`rmp` #907).
+///
+/// Returns the `produced_ok` verdict to finalise with — `Some(false)` once an error has been
+/// delivered, `Some(produced_ok)` when there is none — or `None` when the bounded egress channel
+/// refused it, in which case the caller must keep the statement **parked**: the error is held in
+/// [`InFlightInline::pending_error`] and the resume path delivers it and finalises later.
+///
+/// A statement that already failed (`produced_ok == false`) has delivered its terminal item elsewhere,
+/// so the seam error is not sent a second time — the pre-existing behaviour, preserved exactly.
+fn settle_seam_error(inflight: &mut InFlightInline, produced_ok: bool) -> Option<bool> {
+    if !produced_ok {
+        return Some(false);
+    }
+    match inflight.seam_error.take() {
+        None => Some(true),
+        Some(error) => {
+            if inflight.offer_terminal_error(error) {
+                Some(false)
+            } else {
+                None
+            }
+        }
+    }
 }
 
 /// How a single resume visit ended (`rmp` task #372): either the statement is fully done (the caller
@@ -1210,6 +1294,11 @@ enum BatchStep {
     /// runs the auto-commit accordingly.
     Done { produced_ok: bool },
     /// The egress channel filled again; the statement stays suspended (state already stored back).
+    ///
+    /// It is also how a **terminal error that the full channel refused** is reported (`rmp` #907):
+    /// the error is held in [`InFlightInline::pending_error`], the cursor is finished and will never
+    /// be resumed (the resume path delivers the error first and finalises), so the statement is
+    /// simply parked like any other suspension.
     Suspended,
 }
 
@@ -1234,10 +1323,39 @@ pub(super) fn resume_inflight<
     degraded: &super::EngineDegraded,
     clock: &Arc<dyn Clock + Send + Sync>,
 ) -> bool {
+    // A terminal error a full egress channel refused on an earlier visit (`rmp` #907). The cursor is
+    // already finished, so nothing may be pulled from it: all that remains is to hand the error over.
+    // Re-offer it WITHOUT blocking — while the consumer still has not made room the statement simply
+    // stays parked, which costs the engine thread nothing and keeps every other database client
+    // moving. Blocking here (the old behaviour) stalled the engine thread for the whole database.
+    if inflight.pending_error.is_some() {
+        if !inflight.retry_pending_error() {
+            return true; // still full; try again on a later tick
+        }
+        finalize_inflight(
+            inflight,
+            coordinator,
+            open,
+            /* produced_ok */ false,
+            metrics,
+            db,
+            degraded,
+            clock,
+            None,
+        );
+        return false;
+    }
+
     let step = run_batch(inflight, coordinator, extensions);
     match step {
         BatchStep::Suspended => true,
         BatchStep::Done { produced_ok } => {
+            // The seam's captured deferral error is the terminal item and must not block the engine
+            // thread either (`rmp` #907): when the channel refuses it the statement stays parked and
+            // the branch above finalises it once it lands.
+            let Some(produced_ok) = settle_seam_error(inflight, produced_ok) else {
+                return true;
+            };
             // The parked-statement resume path runs OUTSIDE a group-commit batch drain, so a durable
             // auto-commit write finalised here commits INLINE (`None`, its own `fdatasync`), unchanged by
             // #566 — the (rare) slow-consumer statement pays one sync, never coalesced. The common
@@ -1272,8 +1390,13 @@ fn run_batch<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 
     let mut graph = match coordinator.statement(inflight.txn) {
         Ok(g) => g,
         Err(e) => {
-            let _ = inflight.row_tx.send(Err(e));
-            return BatchStep::Done { produced_ok: false };
+            // Terminal, and handed over WITHOUT blocking the engine thread (`rmp` #907): a full
+            // channel parks the statement holding the error instead of stalling the whole database.
+            return if inflight.offer_terminal_error(e) {
+                BatchStep::Done { produced_ok: false }
+            } else {
+                BatchStep::Suspended
+            };
         }
     };
 
@@ -1381,11 +1504,16 @@ fn drive_batch(
             }
             Err(e) => {
                 // A runtime error mid-stream is the terminal item, in the SAME position it would have
-                // in a single visit (after the rows already sent).
-                let _ = inflight
-                    .row_tx
-                    .send(Err(GraphusError::Runtime(e.to_string())));
-                return BatchStep::Done { produced_ok: false };
+                // in a single visit (after the rows already sent). Handed over WITHOUT blocking the
+                // engine thread (`rmp` #907): the row that filled the channel may have been the last
+                // one this batch could send, and a consumer that has paused between pages would then
+                // park the single engine thread here for the whole database. On a refusal the error
+                // is held and the statement is parked; the resume path re-offers it.
+                return if inflight.offer_terminal_error(GraphusError::Runtime(e.to_string())) {
+                    BatchStep::Done { produced_ok: false }
+                } else {
+                    BatchStep::Suspended
+                };
             }
         }
     }
@@ -1426,14 +1554,15 @@ fn finalize_inflight<D: BlockDevice, S: LogSink>(
 ) {
     // A seam-captured deferral error (the load-bearing `RecordStoreGraph` invariant) is the terminal
     // item, sent after every row — and it flips the statement to a failure so the auto-commit rolls
-    // back rather than commits silently-wrong rows.
-    let mut produced_ok = produced_ok;
-    if produced_ok {
-        if let Some(err) = inflight.seam_error.take() {
-            let _ = inflight.row_tx.send(Err(err));
-            produced_ok = false;
-        }
-    }
+    // back rather than commits silently-wrong rows. It is delivered by [`settle_seam_error`] in the
+    // caller, immediately before this call and in exactly the same position on the stream, because
+    // delivery may have to be *deferred* when the bounded egress channel is full: blocking here would
+    // stall the engine thread for the whole database (`rmp` #907). By the time we get here the error
+    // is gone and `produced_ok` already reflects it.
+    debug_assert!(
+        inflight.seam_error.is_none() && inflight.pending_error.is_none(),
+        "INVARIANT: the terminal error is settled before finalization (rmp #907)"
+    );
 
     // Auto-commit: commit on success, roll back on a runtime/deferral error — while `row_tx` is still
     // open so a commit failure (e.g. an SSI serialization abort) reaches the consumer as a terminal

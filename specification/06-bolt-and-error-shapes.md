@@ -379,6 +379,71 @@ two messages relative to the letter of the Bolt spec:
   panic path. Pinned by `goodbye_mid_tx_rolls_back_open_transaction` (and its no-op counterpart
   `goodbye_with_no_open_tx_does_not_roll_back`).
 
+### 3.5 Several result streams open at once inside a transaction (`rmp` #907)
+
+Inside an **explicit transaction** a client may start a new statement while an earlier result is
+still being streamed, so the connection can hold **several open result streams at once**, each
+addressed by its own `qid`.
+
+**Specification.** The Bolt server-state page
+(neo4j.com/docs/bolt/current/bolt/server-state/) is explicit about this:
+
+- `TX_STREAMING`'s transitions include **`RUN to TX_STREAMING or FAILED`** (Table 6, whose response
+  column is `SUCCESS {"qid": id::Integer}`), so a second statement inside the transaction is a valid
+  message and leaves the connection streaming.
+- The `PULL` and `DISCARD` tables (7 and 8) give the post-stream state as
+  **"`TX_READY` or `TX_STREAMING` if there are other streams open"**, so consuming or discarding one
+  of several results does **not** return the connection to `TX_READY`.
+- `qid` defaults to `-1`, "the last executed statement". Graphus resolves that to the **most recently
+  opened** statement of the current transaction, matching the reference server (`TransactionImpl`
+  records a `latestStatementId` at `run` and `StreamingStateTransition` resolves `-1` to it). A `qid`
+  — including a resolved `-1` — that names no *live* statement is a protocol error
+  (`Neo.ClientError.Request.Invalid` → `FAILED`), again matching the reference server, which throws
+  when the resolved id has no open statement.
+
+**Why it matters.** The official drivers depend on it. The Neo4j Python driver buffers the previous
+result before the next `tx.run()` **only** when `connection.supports_multiple_results is False` — a
+branch its own comment labels "Bolt 3 Support" — and `_bolt5.py` sets `supports_multiple_results =
+True`. On Bolt 5.x the driver therefore leaves the earlier result open. A transaction whose first
+result exceeds the driver's fetch size (1000 by default) answers its first `PULL` with
+`has_more: true` and is still `TX_STREAMING` when the second `tx.run()` arrives; a single-stream
+server rejects it and the transaction dies. Results smaller than the fetch size drain to `TX_READY`
+first, which is why the defect was invisible to a suite that only used small results.
+
+**Auto-commit `STREAMING` stays single-stream**, deliberately: `STREAMING`'s transition table lists
+only `PULL` and `DISCARD`, and an auto-commit `RUN` is assigned no `qid`, so a second auto-commit
+result could not be addressed even if one were opened.
+
+**`COMMIT` / `ROLLBACK` with streams open are refused.** Neither appears among `TX_STREAMING`'s
+transitions — both are listed for `TX_READY` only — and the specification states that the results
+"must be fully consumed or discarded by a client before the server can transition to the `TX_READY`
+state". Graphus therefore answers them with `FAILURE` → `FAILED` exactly as it does any other
+out-of-order message; `RESET` recovers the connection and rolls the transaction back. This is what
+the drivers already do: the Python driver's `_commit` and `_rollback` both call `_consume_results()`
+first ("DISCARD pending records then do a commit"), so a conformant client never sends either here.
+Note this is *stricter* than the Neo4j reference server, which merges `TX_READY` and `TX_STREAMING`
+into one `IN_TRANSACTION` state and so accepts `COMMIT` with statements still open; Graphus follows
+the published state machine, and no driver is affected.
+
+**`RESET` and a failure both discard every stream.** `RESET` must return the connection to the state
+it would have "as if `HELLO`/`LOGON` had just successfully completed", which has no open results at
+all, so it drops **all** streams, resets the `qid` counter and rolls the transaction back (the
+`rmp` #613 contract, generalised). Likewise, a `FAILURE` on any one stream drops **all** of them
+before entering `FAILED`, so no stream is orphaned; `GOODBYE` and EOF roll the transaction back
+exactly once however many streams were open.
+
+**Bound.** The number of concurrently-open streams **per transaction** is capped
+(`SessionConfig::max_open_streams_per_tx`, default `DEFAULT_MAX_OPEN_STREAMS_PER_TX = 64`). The
+specification sets no limit and the reference server keeps an unbounded map, but on an authenticated
+connection an unbounded collection is an attacker-controlled allocation: each open stream pins a
+cursor, a result channel and an engine **admission permit** for its whole lifetime. The engine's
+per-database admission budget is `admission.max_concurrent_queries` (256 by default), so a
+per-transaction cap of a quarter of it means no single transaction can monopolise a database's
+admission capacity with results nobody reads, while remaining an order of magnitude above any real
+driver's usage. Exceeding it answers the offending `RUN` with `Neo.ClientError.Request.Invalid` →
+`FAILED` — a *client* error, because retrying would hit the same limit and it must not look
+retryable to a driver — and the refused statement is never started.
+
 ---
 
 ## 4. REST transactional API — read/write access mode

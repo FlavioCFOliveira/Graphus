@@ -9,7 +9,7 @@
 #   5. the criterion regression gate (vs the committed baseline)
 #   6. the LDBC-SNB macro harness (tiny scale)
 #   7. the examples suite, in BOTH modes (self-boot + attached to a running instance)
-#   8. the official Neo4j driver interop suite (real driver over Bolt; needs node/npm + network)
+#   8. the official Neo4j driver interop suite (real drivers over Bolt; needs node/npm, python3, go + network)
 #
 # The SLOW gates are deliberately NOT run here (they are documented in VERIFICATION.md and run on a
 # nightly/manual job): the loom model-check, the miri UB gate, the full Criterion suites, and any
@@ -85,17 +85,29 @@ scripts/examples-gate.sh
 # run stayed green — the regression was invisible to all of them. The suite is therefore a GATE here,
 # not an optional extra.
 #
-# It is a HARD failure when `node`/`npm` are missing, never a skip. A gate that quietly skips is
-# indistinguishable from a gate that passes, which is the failure mode being closed; the prerequisite is
-# documented in VERIFICATION.md and in the suite's own module docs.
-step "8/8  official Neo4j driver interop — real driver over Bolt (needs node/npm + network)"
-if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
-    echo "FAIL: the interop gate needs \`node\` and \`npm\` on PATH (see VERIFICATION.md)." >&2
+# The suite now spans THREE official driver ecosystems (`rmp` #907): the JavaScript driver via
+# `node`/`npm`, the Python driver via a `python3` venv created in the test's own temporary directory,
+# and the Go driver via a `go` module built there. Each is provisioned hermetically per test and
+# removed with the temporary directory, so nothing is installed on the machine — but the three
+# toolchains themselves must be present.
+#
+# It is a HARD failure when any of them is missing, never a skip. A gate that quietly skips is
+# indistinguishable from a gate that passes, which is the failure mode being closed; the prerequisites
+# are documented in VERIFICATION.md and in the suite's own module docs. Checking them HERE also means a
+# missing toolchain is reported at the gate, with a clear message, instead of deep inside a test helper.
+step "8/8  official Neo4j driver interop — real drivers over Bolt (needs node/npm, python3, go + network)"
+missing_interop_tools=""
+for tool in node npm python3 go; do
+    command -v "$tool" >/dev/null 2>&1 || missing_interop_tools="$missing_interop_tools $tool"
+done
+if [ -n "$missing_interop_tools" ]; then
+    echo "FAIL: the interop gate needs these on PATH (see VERIFICATION.md):$missing_interop_tools" >&2
     echo "      They are a prerequisite of scripts/verify.sh, not an optional extra: this suite is" >&2
     echo "      the only proof that the official driver ecosystem can talk to Graphus." >&2
     exit 1
 fi
-# Serial: the tests each boot a server and share one npm prefix, so they must not race on it.
+# Serial: the tests each boot a server and share one npm prefix, one pip cache and one Go module
+# cache, so they must not race on them.
 cargo test -p graphus-server --features neo4j-interop --test neo4j_driver_interop -- --test-threads=1
 
 if [ "$WITH_LOOM" = "1" ]; then

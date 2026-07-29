@@ -3234,3 +3234,745 @@ fn bolt_50_hello_auth_token_excludes_exactly_the_reserved_protocol_fields() {
         ]
     );
 }
+
+// ---- Multiple open result streams in one transaction (rmp #907) ---------------------------------
+//
+// The Bolt server-state specification permits several results to be open at once inside an explicit
+// transaction: `TX_STREAMING` lists `RUN to TX_STREAMING or FAILED` (Table 6) and the `PULL`/`DISCARD`
+// tables give the post-stream state as "TX_READY **or TX_STREAMING if there are other streams open**"
+// (Tables 7 and 8) — neo4j.com/docs/bolt/current/bolt/server-state/. The official drivers rely on it:
+// the Neo4j Python driver buffers the previous result before the next `tx.run()` only when
+// `supports_multiple_results is False` ("Bolt 3 Support"), and `_bolt5.py` sets it to `True`.
+//
+// Every test below is careful to keep the first stream **genuinely open**: it uses a bounded `PULL`
+// that leaves rows behind (asserted through `has_more: true`). A result that fits in one `PULL`
+// drains immediately and would silently degenerate into the single-stream case these tests exist to
+// replace — which is exactly why the defect survived for so long.
+
+/// Rows `values` as a single-column canned result.
+fn int_rows(field: &str, values: &[i64]) -> CannedResult {
+    CannedResult::rows(
+        &[field],
+        values.iter().map(|v| vec![Value::Integer(*v)]).collect(),
+    )
+}
+
+/// Asserts `resp` is a `SUCCESS` carrying `has_more: true` — i.e. the stream it answers is still
+/// **open**. This is the load-bearing assertion of the multi-stream tests.
+fn assert_has_more(resp: &Response, what: &str) {
+    match resp {
+        Response::Success { metadata } => assert_eq!(
+            metadata
+                .iter()
+                .find(|(k, _)| k == "has_more")
+                .map(|(_, v)| v),
+            Some(&Value::Boolean(true)),
+            "{what}: the stream must still be open (has_more: true), got {metadata:?}"
+        ),
+        other => panic!("{what}: expected SUCCESS has_more, got {other:?}"),
+    }
+}
+
+/// Asserts `resp` is a trailing `SUCCESS` **without** `has_more` — the stream drained.
+fn assert_drained(resp: &Response, what: &str) {
+    match resp {
+        Response::Success { metadata } => assert!(
+            !metadata.iter().any(|(k, _)| k == "has_more"),
+            "{what}: a drained stream's SUCCESS must not carry has_more, got {metadata:?}"
+        ),
+        other => panic!("{what}: expected trailing SUCCESS, got {other:?}"),
+    }
+}
+
+/// The integer cell of a `RECORD` response.
+fn record_int(resp: &Response, what: &str) -> i64 {
+    match resp {
+        Response::Record { values } => match values.as_slice() {
+            [crate::packstream::BoltValue::Value(Value::Integer(n))] => *n,
+            other => panic!("{what}: expected a single integer cell, got {other:?}"),
+        },
+        other => panic!("{what}: expected RECORD, got {other:?}"),
+    }
+}
+
+/// The `qid` of a `RUN` `SUCCESS`.
+fn success_qid(resp: &Response, what: &str) -> Option<i64> {
+    match resp {
+        Response::Success { metadata } => {
+            metadata.iter().find_map(|(k, v)| match (k.as_str(), v) {
+                ("qid", Value::Integer(n)) => Some(*n),
+                _ => None,
+            })
+        }
+        other => panic!("{what}: expected SUCCESS, got {other:?}"),
+    }
+}
+
+/// Drives a whole session over a `MemoryTransport` and returns the decoded responses.
+fn drive(exec: MockExecutor, requests: &[Request]) -> Vec<Response> {
+    let auth = auth_fixture();
+    let mut transport = MemoryTransport::with_input(&session_input(requests));
+    {
+        let mut session = BoltSession::new(&mut transport, exec, &auth);
+        session.run().expect("session runs");
+    }
+    let (_, stream) = split_handshake(transport.written());
+    decode_responses(stream)
+}
+
+/// As [`drive`], but also returns the mock executor's call log so a test can assert the executor-side
+/// lifecycle (rollbacks, how many statements actually ran).
+fn drive_with_log(exec: MockExecutor, requests: &[Request]) -> (Vec<Response>, Vec<String>) {
+    let auth = auth_fixture();
+    let mut transport = MemoryTransport::with_input(&session_input(requests));
+    let log;
+    {
+        let mut session = BoltSession::new(&mut transport, exec, &auth);
+        session.run().expect("session runs");
+        log = session.executor().log.clone();
+    }
+    let (_, stream) = split_handshake(transport.written());
+    (decode_responses(stream), log)
+}
+
+fn run_req(query: &str) -> Request {
+    Request::Run {
+        query: query.to_owned(),
+        parameters: vec![],
+        extra: vec![],
+    }
+}
+
+#[test]
+fn run_is_accepted_in_tx_streaming_and_opens_a_second_stream_rmp_907() {
+    // THE REPRODUCTION (rmp #907). An explicit transaction whose first result is larger than the
+    // client's fetch size: the first bounded PULL answers `has_more: true`, so the connection is
+    // still TX_STREAMING when the second statement arrives. Before the fix `dispatch_streaming`
+    // matched only PULL/DISCARD/RESET, so that second RUN was answered with a FAILURE and the
+    // transaction died. Spec: server-state Table 6, `TX_STREAMING --RUN--> TX_STREAMING`.
+    let exec = MockExecutor::new()
+        .on_query("MATCH (n) RETURN n", int_rows("n", &[1, 2, 3, 4, 5]))
+        .on_query("RETURN 1", int_rows("one", &[1]));
+
+    let r = drive(
+        exec,
+        &[
+            hello(),
+            logon_alice(),
+            Request::Begin { extra: vec![] },
+            run_req("MATCH (n) RETURN n"),
+            // A bounded PULL that leaves three rows behind: the stream stays OPEN.
+            Request::Pull { n: 2, qid: None },
+            // The statement that used to fail.
+            run_req("RETURN 1"),
+            Request::Pull { n: ALL, qid: None },
+            // Back to the first stream, addressed by its own qid.
+            Request::Pull {
+                n: ALL,
+                qid: Some(0),
+            },
+            Request::Commit,
+            Request::Goodbye,
+        ],
+    );
+
+    // [0]HELLO [1]LOGON [2]BEGIN [3]RUN{qid:0} [4]REC 1 [5]REC 2 [6]SUCCESS{has_more}
+    // [7]RUN{qid:1} [8]REC 1 [9]SUCCESS(stream 1 drained) [10..12]REC 3,4,5 [13]SUCCESS [14]COMMIT
+    assert_eq!(success_qid(&r[3], "first in-tx RUN"), Some(0));
+    assert_eq!(record_int(&r[4], "stream 0 row 1"), 1);
+    assert_eq!(record_int(&r[5], "stream 0 row 2"), 2);
+    assert_has_more(&r[6], "the first stream is deliberately left un-drained");
+    // The crux: RUN in TX_STREAMING is accepted and gets its own qid.
+    assert!(
+        !matches!(r[7], Response::Failure(_)),
+        "RUN in TX_STREAMING must be accepted (server-state Table 6), got {:?}",
+        r[7]
+    );
+    assert_eq!(success_qid(&r[7], "second in-tx RUN"), Some(1));
+    assert_eq!(record_int(&r[8], "stream 1 row"), 1);
+    assert_drained(&r[9], "stream 1");
+    // Draining stream 1 must NOT return the connection to TX_READY: stream 0 is still open
+    // (Tables 7/8, "TX_READY or TX_STREAMING if there are other streams open"). Proven by the fact
+    // that the next PULL against qid 0 is served rather than rejected as out-of-order.
+    assert_eq!(record_int(&r[10], "stream 0 row 3"), 3);
+    assert_eq!(record_int(&r[11], "stream 0 row 4"), 4);
+    assert_eq!(record_int(&r[12], "stream 0 row 5"), 5);
+    assert_drained(&r[13], "stream 0");
+    assert!(
+        matches!(r[14], Response::Success { .. }),
+        "COMMIT must succeed once every stream is consumed, got {:?}",
+        r[14]
+    );
+    assert_eq!(r.len(), 15);
+}
+
+#[test]
+fn interleaved_pulls_across_two_open_qids_return_each_stream_s_own_records_rmp_907() {
+    // Two results open at once, PULLed alternately by qid. Each PULL must return the records of the
+    // stream it names — the records, not merely the right count.
+    let exec = MockExecutor::new()
+        .on_query("A", int_rows("a", &[10, 20, 30]))
+        .on_query("B", int_rows("b", &[100, 200, 300]));
+
+    let r = drive(
+        exec,
+        &[
+            hello(),
+            logon_alice(),
+            Request::Begin { extra: vec![] },
+            run_req("A"), // qid 0
+            run_req("B"), // qid 1 — opened while stream 0 is still open (never PULLed)
+            Request::Pull { n: 1, qid: Some(0) },
+            Request::Pull { n: 1, qid: Some(1) },
+            Request::Pull { n: 1, qid: Some(0) },
+            Request::Pull {
+                n: ALL,
+                qid: Some(1),
+            },
+            Request::Pull {
+                n: ALL,
+                qid: Some(0),
+            },
+            Request::Commit,
+            Request::Goodbye,
+        ],
+    );
+
+    assert_eq!(success_qid(&r[3], "RUN A"), Some(0));
+    assert_eq!(success_qid(&r[4], "RUN B"), Some(1));
+    // PULL qid 0, n=1
+    assert_eq!(record_int(&r[5], "A row 1"), 10);
+    assert_has_more(&r[6], "stream A");
+    // PULL qid 1, n=1
+    assert_eq!(record_int(&r[7], "B row 1"), 100);
+    assert_has_more(&r[8], "stream B");
+    // PULL qid 0, n=1 — resumes stream A exactly where it left off.
+    assert_eq!(record_int(&r[9], "A row 2"), 20);
+    assert_has_more(&r[10], "stream A");
+    // PULL qid 1, all — the remainder of B only.
+    assert_eq!(record_int(&r[11], "B row 2"), 200);
+    assert_eq!(record_int(&r[12], "B row 3"), 300);
+    assert_drained(&r[13], "stream B");
+    // PULL qid 0, all — the remainder of A only.
+    assert_eq!(record_int(&r[14], "A row 3"), 30);
+    assert_drained(&r[15], "stream A");
+    assert!(matches!(r[16], Response::Success { .. }), "COMMIT");
+    assert_eq!(r.len(), 17);
+}
+
+#[test]
+fn qid_minus_one_addresses_the_most_recently_opened_stream_rmp_907() {
+    // The Bolt message spec gives `qid` a default of -1, "the last executed statement". With several
+    // streams open that must be the most recently OPENED one — the reference server resolves -1 to
+    // `TransactionImpl.latestStatementId`. The official Python driver depends on exactly this: its
+    // `Result._qid` sends -1 only when the result's own qid equals `connection.most_recent_qid`.
+    let exec = MockExecutor::new()
+        .on_query("A", int_rows("a", &[10, 20]))
+        .on_query("B", int_rows("b", &[100, 200]));
+
+    let r = drive(
+        exec,
+        &[
+            hello(),
+            logon_alice(),
+            Request::Begin { extra: vec![] },
+            run_req("A"), // qid 0
+            run_req("B"), // qid 1 — now the "last" statement
+            Request::Pull { n: ALL, qid: None },
+            Request::Goodbye,
+        ],
+    );
+
+    // The un-qualified PULL must stream B (100, 200), never A.
+    assert_eq!(
+        record_int(&r[5], "qid -1 row 1"),
+        100,
+        "qid -1 must address the most recently opened stream (B), not the first one"
+    );
+    assert_eq!(record_int(&r[6], "qid -1 row 2"), 200);
+    assert_drained(&r[7], "stream B");
+}
+
+#[test]
+fn pull_against_an_already_drained_qid_is_rejected_rmp_907() {
+    // A qid names a *live* statement. Once its result is consumed the stream is closed and the qid
+    // addresses nothing — the reference server's `StreamingStateTransition` throws when the resolved
+    // statement id has no live statement, so this is a protocol FAILURE, not a silent re-aim at some
+    // other open stream.
+    let exec = MockExecutor::new()
+        .on_query("A", int_rows("a", &[10, 20]))
+        .on_query("B", int_rows("b", &[100]));
+
+    let r = drive(
+        exec,
+        &[
+            hello(),
+            logon_alice(),
+            Request::Begin { extra: vec![] },
+            run_req("A"), // qid 0
+            run_req("B"), // qid 1
+            Request::Pull {
+                n: ALL,
+                qid: Some(1),
+            }, // drains B
+            Request::Pull {
+                n: ALL,
+                qid: Some(1),
+            }, // B is gone
+            Request::Goodbye,
+        ],
+    );
+
+    assert_eq!(record_int(&r[5], "B row"), 100);
+    assert_drained(&r[6], "stream B");
+    match &r[7] {
+        Response::Failure(f) => assert_eq!(f.code, "Neo.ClientError.Request.Invalid"),
+        other => panic!("a drained qid must be rejected, got {other:?}"),
+    }
+}
+
+#[test]
+fn commit_while_streams_are_open_is_rejected_rmp_907() {
+    // `COMMIT` is NOT among `TX_STREAMING`'s transitions — the server-state spec lists it for
+    // `TX_READY` only, and says the open results "must be fully consumed or discarded by a client
+    // before the server can transition to the TX_READY state". The official drivers honour this: the
+    // Neo4j Python driver's `_commit` calls `_consume_results()` first ("DISCARD pending records then
+    // do a commit"), so a conformant client never sends COMMIT here. It is therefore an out-of-order
+    // message: FAILURE → FAILED, recoverable with RESET.
+    let exec = MockExecutor::new().on_query("A", int_rows("a", &[1, 2, 3]));
+
+    let (r, log) = drive_with_log(
+        exec,
+        &[
+            hello(),
+            logon_alice(),
+            Request::Begin { extra: vec![] },
+            run_req("A"),
+            Request::Pull { n: 1, qid: None }, // leaves the stream open
+            Request::Commit,
+            Request::Reset,
+            Request::Goodbye,
+        ],
+    );
+
+    assert_has_more(&r[5], "the stream is still open when COMMIT arrives");
+    match &r[6] {
+        Response::Failure(f) => {
+            assert_eq!(f.code, "Neo.ClientError.Request.Invalid");
+            assert!(
+                f.message.contains("COMMIT"),
+                "the failure must name the offending message, got {:?}",
+                f.message
+            );
+        }
+        other => panic!("COMMIT in TX_STREAMING must FAILURE, got {other:?}"),
+    }
+    assert!(matches!(r[7], Response::Success { .. }), "RESET recovers");
+    assert!(
+        !log.contains(&"commit".to_owned()),
+        "the executor must never be asked to commit a transaction with open results: {log:?}"
+    );
+    assert!(
+        log.contains(&"rollback_open_tx".to_owned()),
+        "RESET must roll the transaction back: {log:?}"
+    );
+}
+
+#[test]
+fn rollback_while_streams_are_open_is_rejected_rmp_907() {
+    // The mirror of `commit_while_streams_are_open_is_rejected_rmp_907`: `ROLLBACK` is likewise not a
+    // `TX_STREAMING` transition, and the driver's `_rollback` also calls `_consume_results()` first.
+    let exec = MockExecutor::new().on_query("A", int_rows("a", &[1, 2, 3]));
+
+    let (r, log) = drive_with_log(
+        exec,
+        &[
+            hello(),
+            logon_alice(),
+            Request::Begin { extra: vec![] },
+            run_req("A"),
+            Request::Pull { n: 1, qid: None },
+            Request::Rollback,
+            Request::Reset,
+            Request::Goodbye,
+        ],
+    );
+
+    assert_has_more(&r[5], "the stream is still open when ROLLBACK arrives");
+    match &r[6] {
+        Response::Failure(f) => assert_eq!(f.code, "Neo.ClientError.Request.Invalid"),
+        other => panic!("ROLLBACK in TX_STREAMING must FAILURE, got {other:?}"),
+    }
+    assert!(matches!(r[7], Response::Success { .. }), "RESET recovers");
+    // The transaction is still cleaned up — by RESET, which rolls it back unconditionally (rmp #613).
+    assert!(
+        log.contains(&"rollback_open_tx".to_owned()),
+        "RESET must roll the transaction back: {log:?}"
+    );
+}
+
+#[test]
+fn reset_with_several_streams_open_rolls_back_and_leaves_none_open_rmp_907() {
+    // The rmp #613 regression ("RESET after an error in an explicit transaction must not leak
+    // `transaction already open`") extended to the MULTI-STREAM case: RESET must discard EVERY open
+    // stream and roll the transaction back, so the connection comes back "as if HELLO/LOGON had just
+    // successfully completed" — a state in which no result is open and qid assignment restarts at 0.
+    let exec = MockExecutor::new()
+        .on_query("A", int_rows("a", &[1, 2, 3]))
+        .on_query("B", int_rows("b", &[4, 5, 6]))
+        .on_query("C", int_rows("c", &[7]));
+
+    let (r, log) = drive_with_log(
+        exec,
+        &[
+            hello(),
+            logon_alice(),
+            Request::Begin { extra: vec![] },
+            run_req("A"),                      // qid 0
+            Request::Pull { n: 1, qid: None }, // stream 0 stays open
+            run_req("B"),                      // qid 1, also open
+            Request::Pull { n: 1, qid: None }, // stream 1 stays open too
+            Request::Reset,
+            // A brand-new transaction on the same connection must work.
+            Request::Begin { extra: vec![] },
+            run_req("C"),
+            Request::Pull { n: ALL, qid: None },
+            Request::Commit,
+            Request::Goodbye,
+        ],
+    );
+
+    assert_has_more(&r[5], "stream 0 open");
+    assert_eq!(success_qid(&r[6], "RUN B"), Some(1));
+    assert_has_more(&r[8], "stream 1 open");
+    assert!(
+        matches!(r[9], Response::Success { .. }),
+        "RESET → SUCCESS, got {:?}",
+        r[9]
+    );
+    // The crux of rmp #613, now with two streams open: the next BEGIN must succeed.
+    assert!(
+        matches!(r[10], Response::Success { .. }),
+        "BEGIN after RESET must succeed — a leaked transaction poisons the connection, got {:?}",
+        r[10]
+    );
+    // No stream survived RESET: qid assignment restarts at 0 in the new transaction, and the fresh
+    // statement streams normally.
+    assert_eq!(
+        success_qid(&r[11], "first RUN of the new transaction"),
+        Some(0),
+        "RESET must reset qid assignment"
+    );
+    assert_eq!(record_int(&r[12], "C row"), 7);
+    assert_drained(&r[13], "stream C");
+    assert!(matches!(r[14], Response::Success { .. }), "COMMIT");
+    assert_eq!(
+        log.iter().filter(|e| *e == "rollback_open_tx").count(),
+        1,
+        "RESET rolls the transaction back exactly once: {log:?}"
+    );
+}
+
+#[test]
+fn a_failure_on_one_stream_fails_the_connection_and_orphans_no_stream_rmp_907() {
+    // The fail-then-ignore-until-RESET rule still holds with several streams open, and the streams
+    // that were NOT at fault must not be left dangling: every one is dropped when the connection
+    // enters FAILED, so nothing survives to be addressed afterwards.
+    let exec = MockExecutor::new()
+        .on_query("A", int_rows("a", &[1, 2, 3]))
+        .on_query("B", int_rows("b", &[4, 5, 6]))
+        .on_query_error("BAD", GraphusError::Compile("syntax".to_owned()));
+
+    let (r, log) = drive_with_log(
+        exec,
+        &[
+            hello(),
+            logon_alice(),
+            Request::Begin { extra: vec![] },
+            run_req("A"),                      // qid 0
+            Request::Pull { n: 1, qid: None }, // open
+            run_req("B"),                      // qid 1
+            Request::Pull { n: 1, qid: None }, // open
+            run_req("BAD"),                    // fails
+            // Both survivors must now be unreachable: the connection is FAILED, so everything is
+            // IGNORED until RESET.
+            Request::Pull {
+                n: ALL,
+                qid: Some(0),
+            },
+            Request::Pull {
+                n: ALL,
+                qid: Some(1),
+            },
+            Request::Reset,
+            Request::Begin { extra: vec![] },
+            Request::Goodbye,
+        ],
+    );
+
+    assert_has_more(&r[5], "stream 0 open");
+    assert_has_more(&r[8], "stream 1 open");
+    match &r[9] {
+        Response::Failure(_) => {}
+        other => panic!("the failing RUN must FAILURE, got {other:?}"),
+    }
+    assert!(matches!(r[10], Response::Ignored), "IGNORED after FAILURE");
+    assert!(matches!(r[11], Response::Ignored), "IGNORED after FAILURE");
+    assert!(matches!(r[12], Response::Success { .. }), "RESET recovers");
+    assert!(
+        matches!(r[13], Response::Success { .. }),
+        "BEGIN after RESET must succeed — no stream or transaction leaked, got {:?}",
+        r[13]
+    );
+    assert_eq!(
+        log.iter().filter(|e| *e == "rollback_open_tx").count(),
+        2,
+        "one rollback for the failed transaction (at RESET) and one for the second, deliberately \
+         un-committed transaction (at GOODBYE) — never more, so no stream or transaction is \
+         double-released: {log:?}"
+    );
+}
+
+#[test]
+fn eof_with_several_streams_open_rolls_back_exactly_once_rmp_907() {
+    // An abrupt disconnect (EOF, no GOODBYE) with several results open must still roll the
+    // transaction back exactly once (rmp #388/#444) — never twice, and never not at all.
+    let exec = MockExecutor::new()
+        .on_query("A", int_rows("a", &[1, 2, 3]))
+        .on_query("B", int_rows("b", &[4, 5, 6]));
+
+    let (_, log) = drive_with_log(
+        exec,
+        &[
+            hello(),
+            logon_alice(),
+            Request::Begin { extra: vec![] },
+            run_req("A"),
+            Request::Pull { n: 1, qid: None },
+            run_req("B"),
+            Request::Pull { n: 1, qid: None },
+            // No GOODBYE: the transport reaches EOF with two streams open.
+        ],
+    );
+
+    assert_eq!(
+        log.iter().filter(|e| *e == "rollback_open_tx").count(),
+        1,
+        "EOF with several streams open must roll back exactly once: {log:?}"
+    );
+}
+
+#[test]
+fn goodbye_with_several_streams_open_rolls_back_exactly_once_rmp_907() {
+    // The clean counterpart of the EOF case: GOODBYE "interrupts the server current work if there is
+    // any" (Bolt message spec), so an open transaction with several open results is rolled back once.
+    let exec = MockExecutor::new()
+        .on_query("A", int_rows("a", &[1, 2, 3]))
+        .on_query("B", int_rows("b", &[4, 5, 6]));
+
+    let (_, log) = drive_with_log(
+        exec,
+        &[
+            hello(),
+            logon_alice(),
+            Request::Begin { extra: vec![] },
+            run_req("A"),
+            Request::Pull { n: 1, qid: None },
+            run_req("B"),
+            Request::Pull { n: 1, qid: None },
+            Request::Goodbye,
+        ],
+    );
+
+    assert_eq!(
+        log.iter().filter(|e| *e == "rollback_open_tx").count(),
+        1,
+        "GOODBYE with several streams open must roll back exactly once: {log:?}"
+    );
+}
+
+#[test]
+fn too_many_open_streams_in_one_transaction_is_rejected_rmp_907() {
+    // The per-transaction open-stream cap (`SessionConfig::max_open_streams_per_tx`). An unbounded
+    // collection would be an attacker-controlled allocation on an authenticated connection: a client
+    // could RUN without ever consuming a result and pin a cursor, a channel and an admission permit
+    // per stream. The refusal is a client error (retrying would hit the same limit), the statement is
+    // NEVER started, and RESET recovers the connection.
+    let exec = MockExecutor::new()
+        .on_query("A", int_rows("a", &[1, 2]))
+        .on_query("B", int_rows("b", &[3, 4]))
+        .on_query("C", int_rows("c", &[5, 6]));
+
+    let auth = auth_fixture();
+    let capped = SessionConfig {
+        max_open_streams_per_tx: 2,
+        ..SessionConfig::default()
+    };
+    let input = session_input(&[
+        hello(),
+        logon_alice(),
+        Request::Begin { extra: vec![] },
+        run_req("A"),
+        run_req("B"),
+        run_req("C"), // one too many
+        Request::Reset,
+        Request::Begin { extra: vec![] },
+        Request::Goodbye,
+    ]);
+    let mut transport = MemoryTransport::with_input(&input);
+    let log;
+    {
+        let mut session = BoltSession::with_config(&mut transport, exec, &auth, capped);
+        session.run().expect("session runs");
+        log = session.executor().log.clone();
+    }
+    let (_, stream) = split_handshake(transport.written());
+    let r = decode_responses(stream);
+
+    assert_eq!(success_qid(&r[3], "RUN A"), Some(0));
+    assert_eq!(success_qid(&r[4], "RUN B"), Some(1));
+    match &r[5] {
+        Response::Failure(f) => {
+            assert_eq!(f.code, "Neo.ClientError.Request.Invalid");
+            assert!(
+                f.message.contains("too many result streams open"),
+                "unexpected message {:?}",
+                f.message
+            );
+        }
+        other => panic!("the over-cap RUN must FAILURE, got {other:?}"),
+    }
+    assert!(matches!(r[6], Response::Success { .. }), "RESET recovers");
+    assert!(
+        matches!(r[7], Response::Success { .. }),
+        "BEGIN after RESET"
+    );
+    assert_eq!(
+        log.iter().filter(|e| e.starts_with("run(")).count(),
+        2,
+        "the refused statement must never reach the executor: {log:?}"
+    );
+    // The default is generous enough that no real driver meets it.
+    assert_eq!(
+        SessionConfig::default().max_open_streams_per_tx,
+        DEFAULT_MAX_OPEN_STREAMS_PER_TX
+    );
+}
+
+#[test]
+fn run_in_auto_commit_streaming_is_still_rejected_rmp_907() {
+    // Auto-commit STREAMING stays SINGLE-stream, deliberately. The Bolt server-state spec lists only
+    // PULL and DISCARD as STREAMING transitions ("this result must be fully consumed or discarded by
+    // a client before the server can re-enter the READY state and allow any further queries to be
+    // executed"), and an auto-commit RUN is assigned no qid, so a second result could not be
+    // addressed even if one were opened. Widening TX_STREAMING must not widen STREAMING.
+    let exec = MockExecutor::new()
+        .on_query("A", int_rows("a", &[1, 2, 3]))
+        .on_query("B", int_rows("b", &[4]));
+
+    let (r, log) = drive_with_log(
+        exec,
+        &[
+            hello(),
+            logon_alice(),
+            run_req("A"),                      // auto-commit
+            Request::Pull { n: 1, qid: None }, // leaves the stream open (STREAMING)
+            run_req("B"),                      // NOT valid in STREAMING
+            Request::Goodbye,
+        ],
+    );
+
+    assert_eq!(success_qid(&r[2], "auto-commit RUN"), None, "no qid");
+    assert_has_more(&r[4], "the auto-commit stream is still open");
+    match &r[5] {
+        Response::Failure(f) => {
+            assert_eq!(f.code, "Neo.ClientError.Request.Invalid");
+            assert!(
+                f.message.contains("RUN") && f.message.contains("Streaming"),
+                "unexpected message {:?}",
+                f.message
+            );
+        }
+        other => panic!("RUN in auto-commit STREAMING must FAILURE, got {other:?}"),
+    }
+    assert_eq!(
+        log.iter().filter(|e| e.starts_with("run(")).count(),
+        1,
+        "the rejected RUN must never reach the executor: {log:?}"
+    );
+}
+
+#[test]
+fn an_auto_commit_result_after_a_transaction_is_still_addressed_by_minus_one_rmp_907() {
+    // Guards the interaction between the per-transaction "last opened qid" bookkeeping and the
+    // auto-commit path: a transaction leaves a last-opened qid behind, and an auto-commit result
+    // carries NO qid. If the tracker were not cleared when an auto-commit result opens, `PULL -1`
+    // would resolve to a qid that no open stream carries and the perfectly ordinary
+    // "BEGIN … COMMIT, then a plain query" flow would fail.
+    let exec = MockExecutor::new()
+        .on_query("A", int_rows("a", &[1]))
+        .on_query("B", int_rows("b", &[2]));
+
+    let r = drive(
+        exec,
+        &[
+            hello(),
+            logon_alice(),
+            Request::Begin { extra: vec![] },
+            run_req("A"), // qid 0
+            Request::Pull { n: ALL, qid: None },
+            Request::Commit,
+            run_req("B"), // auto-commit: no qid
+            Request::Pull { n: ALL, qid: None },
+            Request::Goodbye,
+        ],
+    );
+
+    assert!(
+        !r.iter().any(|resp| matches!(resp, Response::Failure(_))),
+        "no failure expected: {r:?}"
+    );
+    assert_eq!(record_int(&r[8], "auto-commit row"), 2);
+    assert_drained(&r[9], "the auto-commit stream");
+}
+
+#[test]
+fn discard_of_one_of_several_streams_keeps_the_connection_streaming_rmp_907() {
+    // DISCARD is governed by the same rule as PULL (server-state Table 7): discarding one of several
+    // open results leaves the connection in TX_STREAMING, and the remaining stream is still
+    // addressable and still yields its own records.
+    let exec = MockExecutor::new()
+        .on_query("A", int_rows("a", &[1, 2, 3]))
+        .on_query("B", int_rows("b", &[7, 8, 9]));
+
+    let r = drive(
+        exec,
+        &[
+            hello(),
+            logon_alice(),
+            Request::Begin { extra: vec![] },
+            run_req("A"), // qid 0
+            run_req("B"), // qid 1
+            Request::Discard {
+                n: ALL,
+                qid: Some(1),
+            },
+            Request::Pull {
+                n: ALL,
+                qid: Some(0),
+            },
+            Request::Commit,
+            Request::Goodbye,
+        ],
+    );
+
+    // DISCARD emits only the trailing SUCCESS (no RECORDs).
+    assert_drained(&r[5], "discarded stream B");
+    // Stream A is untouched and still returns ITS records.
+    assert_eq!(record_int(&r[6], "A row 1"), 1);
+    assert_eq!(record_int(&r[7], "A row 2"), 2);
+    assert_eq!(record_int(&r[8], "A row 3"), 3);
+    assert_drained(&r[9], "stream A");
+    assert!(matches!(r[10], Response::Success { .. }), "COMMIT");
+    assert_eq!(r.len(), 11);
+}

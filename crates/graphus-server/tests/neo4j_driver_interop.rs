@@ -18,8 +18,14 @@
 //! cargo test -p graphus-server --features neo4j-interop --test neo4j_driver_interop -- --nocapture
 //! ```
 //!
-//! Requirements when run: `node` (v18+) and `npm` on PATH, and network/cache access for
-//! `npm install neo4j-driver`.
+//! Requirements when run: `node` (v18+) and `npm` on PATH for the JavaScript ecosystem, `python3`
+//! (with the `venv` module) for the Python ecosystem, `go` (1.23+) for the Go ecosystem, and
+//! network/cache access so each ecosystem can provision its official driver. Every provisioning
+//! step is a HARD failure when its toolchain is missing — never a skip.
+//!
+//! Each ecosystem is provisioned **hermetically inside the test's own temp directory**: a Node
+//! project with its `node_modules`, a Python virtual environment with the `neo4j` package, and a Go
+//! module built against the pinned `neo4j-go-driver`. Nothing is installed system-wide.
 #![cfg(feature = "neo4j-interop")]
 
 use std::net::SocketAddr;
@@ -700,6 +706,633 @@ function assertProtocol50(protocolVersion, where) {
 })();
 "#;
 
+/// A Node.js script that reproduces rmp #907 with the OFFICIAL `neo4j-driver`: ONE explicit
+/// transaction whose FIRST result is larger than the session's `fetchSize`, followed by a SECOND
+/// statement issued while that first stream is still open.
+///
+/// Before the fix, a `RUN` received in Bolt state `TX_STREAMING` was rejected, so the second
+/// statement got a `FAILURE` and the whole transaction died. That contradicts the **Bolt 4.0+**
+/// server-state specification (this is a 4.0 addition — at Bolt 3 there is no `qid` and a single
+/// stream must indeed be drained first; Graphus advertises only 5.0–5.4, so the premise holds
+/// structurally here):
+///
+/// - Table 6 lists `RUN` among the requests valid in `TX_STREAMING`, answering
+///   `SUCCESS {"qid": id::Integer}` — so rejecting a `RUN` *because of the state* is non-conformant;
+/// - Tables 7 and 8 give the new state as "`TX_READY` **or `TX_STREAMING` if there are other streams
+///   open**", which presupposes several concurrently open streams — including the case exercised
+///   here, where statement 2 finishes (`has_more: false`) while stream 1 is still suspended;
+/// - Table 8 keeps the connection in `TX_STREAMING` when a `PULL` is answered with
+///   `SUCCESS {"has_more": true}`;
+/// - the message specification's Explicit-Transaction example defines the semantics of addressing
+///   those streams individually by `qid` ("two streams are open", `PULL {"qid": 123}`, …).
+///
+/// ## How the second stream is *genuinely* left open (and proven to be)
+///
+/// The JavaScript `Result` is lazy and `Promise`-like: `await tx.run(...)` would drain the entire
+/// stream and silently degenerate the test into the single-stream case. Instead the script takes the
+/// `Result`'s **async iterator** and pulls exactly ONE record, which drives `RUN` + a single
+/// `PULL {n: fetchSize}`. The server answers a batch of at most `n` records (`n` is a maximum, not a
+/// promise) plus `SUCCESS {has_more: true}`, and stays in `TX_STREAMING`; the driver's own flow
+/// control then stops on its own (its high watermark is `0.7 * fetchSize`, so with a full batch
+/// buffered and nothing consumed it will not auto-pull again until the buffer drains below
+/// `0.3 * fetchSize`). The iterator is never `return`ed — there is no `break` out of a `for await`,
+/// which would make the driver send `DISCARD` and close the stream — so stream 1 is still open when
+/// statement 2 is issued.
+///
+/// Because Bolt requests are processed strictly in order, the server dequeues the second `RUN` only
+/// after it has finished answering the first `PULL`; this script therefore proves the second `RUN`
+/// was *sent* while the client still held an unfinished stream. (The Go program is stricter still:
+/// its driver blocks until `SUCCESS {has_more: true}` has actually been received before sending the
+/// second `RUN` — see [`GO_MULTI_STREAM_SCRIPT`].)
+///
+/// That reasoning is not merely asserted in a comment: the script installs a `logging` hook that
+/// captures the driver's own outgoing Bolt messages and, at the end, **fails** unless the wire shows
+/// the interleaving — at most 2 `PULL`s before the second `RUN` (draining 2500 rows at `n = 1000`
+/// needs at least 3); every one of those carrying the fetch size, so a drain-everything
+/// `PULL {n: -1}` cannot masquerade as a partial read; at least 2 `PULL`s after it, one for
+/// statement 2 and the rest resuming stream 1; at least one of those resume `PULL`s addressed to an
+/// explicit `qid`, which is only ever emitted for a stream that is *not* the current one and is thus
+/// direct evidence that two streams were open at once; and no `DISCARD` at all. A deliberately
+/// mutated variant that drains stream 1 before statement 2 passes every value assertion and is still
+/// rejected by that gate.
+///
+/// Prints `GRAPHUS_MULTISTREAM_OK` and exits 0 only on full success; any mismatch exits 1.
+const MULTI_STREAM_SCRIPT: &str = r#"
+'use strict';
+const neo4j = require('neo4j-driver');
+
+const [, , port, user, password] = process.argv;
+const uri = `bolt+ssc://127.0.0.1:${port}`;
+
+const TOTAL = 2500;   // rows in the FIRST result: strictly more than one fetch batch
+const FETCH = 1000;   // the driver default; named explicitly so the arithmetic below is checkable
+
+function fail(msg) {
+  console.error('MULTISTREAM FAILURE: ' + msg);
+  process.exit(1);
+}
+const toNum = (v) => (neo4j.isInt(v) ? v.toNumber() : v);
+
+// Capture the driver's OWN outgoing Bolt messages. This is what makes the test non-vacuous: it
+// proves from the wire that the second RUN was issued while the first stream was still open,
+// instead of silently degenerating into the single-stream case if the driver ever decided to
+// buffer the first result.
+const clientMessages = [];
+const logging = {
+  level: 'debug',
+  logger: (_level, message) => {
+    const m = /(?:^|\s)C: (RUN|PULL|DISCARD)\b(.*)$/.exec(message);
+    if (m !== null) clientMessages.push(m[1] + m[2]);
+  },
+};
+
+(async () => {
+  const driver = neo4j.driver(uri, neo4j.auth.basic(user, password), { logging });
+  try {
+    await driver.verifyConnectivity();
+
+    // 1. Seed the rows in a SEPARATE managed write transaction, so the transaction under test does
+    //    nothing but run the two statements. Integers must be wrapped with neo4j.int(): a plain JS
+    //    number crosses the wire as a PackStream Float, which range() rejects.
+    {
+      const session = driver.session();
+      try {
+        await session.executeWrite((tx) =>
+          tx.run('UNWIND range(1, $n) AS i CREATE (:Big {i: i})', { n: neo4j.int(TOTAL) })
+        );
+      } finally {
+        await session.close();
+      }
+    }
+
+    // 2. ONE explicit transaction, TWO statements, the first larger than fetchSize.
+    const session = driver.session({ fetchSize: FETCH });
+    try {
+      const tx = session.beginTransaction();
+      const mark = clientMessages.length; // ignore everything the seeding transaction wrote
+
+      // Statement 1 — lazily started, then advanced by exactly one record (see the doc comment).
+      const r1 = tx.run('MATCH (n:Big) RETURN n.i AS i ORDER BY i');
+      const it = r1[Symbol.asyncIterator]();
+      const firstStep = await it.next();
+      if (firstStep.done === true) fail('the first statement returned no records at all');
+      const firstValue = toNum(firstStep.value.get('i'));
+      if (firstValue !== 1) fail(`first record of stream 1 was i=${firstValue}, expected 1`);
+
+      // Statement 2 — the RUN that used to be rejected because the connection was in TX_STREAMING.
+      const r2 = await tx.run('RETURN 1 AS one');
+      if (r2.records.length !== 1)
+        fail(`second statement returned ${r2.records.length} records, expected 1`);
+      const one = toNum(r2.records[0].get('one'));
+      if (one !== 1) fail(`second statement returned one=${one}, expected 1`);
+
+      // Finish stream 1 and assert the RECORDS (not just the count) arrive complete and in order.
+      const got = [firstValue];
+      for (;;) {
+        const step = await it.next();
+        if (step.done === true) break;
+        got.push(toNum(step.value.get('i')));
+      }
+      if (got.length !== TOTAL) fail(`stream 1 yielded ${got.length} records, expected ${TOTAL}`);
+      for (let i = 0; i < TOTAL; i++) {
+        if (got[i] !== i + 1) fail(`stream 1 record ${i} was i=${got[i]}, expected ${i + 1}`);
+      }
+
+      await tx.commit();
+
+      // 3. Non-vacuity gate on the captured wire traffic.
+      const msgs = clientMessages.slice(mark);
+      const run1 = msgs.findIndex((m) => m.startsWith('RUN') && m.includes('MATCH (n:Big)'));
+      const run2 = msgs.findIndex((m) => m.startsWith('RUN') && m.includes('RETURN 1 AS one'));
+      if (run1 === -1) fail(`no RUN for the first statement was logged: ${JSON.stringify(msgs)}`);
+      if (run2 === -1) fail(`no RUN for the second statement was logged: ${JSON.stringify(msgs)}`);
+      if (run2 < run1) fail('the second statement was sent before the first');
+      const pullsBefore = msgs.slice(0, run2).filter((m) => m.startsWith('PULL'));
+      const pullsAfter = msgs.slice(run2 + 1).filter((m) => m.startsWith('PULL'));
+      const discards = msgs.filter((m) => m.startsWith('DISCARD')).length;
+      // Draining 2500 rows at n=1000 needs at least 3 PULLs, so <= 2 PULLs before the second RUN
+      // proves stream 1 was demonstrably UNFINISHED when statement 2 was issued.
+      if (pullsBefore.length > 2) {
+        fail(`stream 1 had already been drained before the second RUN (${pullsBefore.length} ` +
+          `PULLs); the test would be vacuous: ${JSON.stringify(msgs)}`);
+      }
+      // ...but only because each of those PULLs was BOUNDED by the fetch size. A drain-everything
+      // PULL {n: -1} would finish stream 1 in a single message and make the count meaningless.
+      const unbounded = pullsBefore.find((m) => !m.includes(String(FETCH)));
+      if (unbounded !== undefined) {
+        fail(`a PULL before the second RUN was not bounded by the fetch size ${FETCH}, so the ` +
+          `PULL count proves nothing: ${JSON.stringify(unbounded)}`);
+      }
+      // One PULL serves statement 2's own result; the rest resume the still-open stream 1.
+      if (pullsAfter.length < 2) {
+        fail(`only ${pullsAfter.length} PULLs followed the second RUN; stream 1 was not resumed ` +
+          `after it: ${JSON.stringify(msgs)}`);
+      }
+      // A PULL carrying an explicit qid addresses a stream that is NOT the connection's current one
+      // — direct evidence that two streams of this transaction were open at the same time.
+      if (!pullsAfter.some((m) => m.includes('qid'))) {
+        fail(`no PULL after the second RUN addressed an explicit qid, so stream 1 was never ` +
+          `resumed as a second, independently addressable stream: ${JSON.stringify(msgs)}`);
+      }
+      if (discards !== 0) {
+        fail(`the driver discarded a stream instead of keeping it open: ${JSON.stringify(msgs)}`);
+      }
+      console.log(`GRAPHUS_MULTISTREAM_WIRE pulls_before=${pullsBefore.length} ` +
+        `pulls_after=${pullsAfter.length}`);
+    } finally {
+      await session.close();
+    }
+
+    console.log('GRAPHUS_MULTISTREAM_OK');
+    process.exit(0);
+  } catch (err) {
+    fail((err && err.stack) ? err.stack : String(err));
+  } finally {
+    await driver.close();
+  }
+})();
+"#;
+
+/// The Python counterpart of [`MULTI_STREAM_SCRIPT`] (rmp #907), driving the OFFICIAL `neo4j` PyPI
+/// package. It is the verbatim reproduction from the bug report: `next(iter(r1))` forces exactly the
+/// first `PULL` (so the server answers `has_more: true` and stays in `TX_STREAMING`), then a second
+/// `tx.run(...)` is issued on the same transaction.
+///
+/// The Python driver does not buffer the previous result on Bolt 4+/5: it only does so when the
+/// connection reports `supports_multiple_results is False` (the Bolt 3 fallback, which has no
+/// `qid`) — the driver's own source says as much. On Bolt 5 it therefore sends the second `RUN` with
+/// stream 1 still open, which is exactly what the wire gate at the end of the script re-verifies
+/// from the driver's own `neo4j.io` debug log, with the same arithmetic and the same bounded-`PULL`
+/// and explicit-`qid` checks as the JavaScript script.
+///
+/// The driver is also the one that would send a `DISCARD` if a result were left unconsumed at commit
+/// time; both results here are exhausted first, so the gate's `DISCARD == 0` assertion is a genuine
+/// statement about stream lifetime rather than an accident of when the transaction ends.
+///
+/// Prints `GRAPHUS_PY_MULTISTREAM_OK` and exits 0 only on full success; any mismatch exits non-zero.
+const PYTHON_MULTI_STREAM_SCRIPT: &str = r#"
+"""Drives Graphus with the OFFICIAL `neo4j` Python driver and reproduces rmp #907: one explicit
+transaction whose FIRST result is larger than the session fetch size, followed by a SECOND statement
+issued while that first stream is still open (Bolt state TX_STREAMING).
+"""
+
+import logging
+import sys
+
+import neo4j
+
+PORT, USER, PASSWORD = sys.argv[1], sys.argv[2], sys.argv[3]
+URI = f"bolt+ssc://127.0.0.1:{PORT}"
+
+TOTAL = 2500  # rows in the FIRST result: strictly more than one fetch batch
+FETCH = 1000  # the driver default; named explicitly so the arithmetic below is checkable
+
+
+def fail(msg):
+    print(f"PY MULTISTREAM FAILURE: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+# Capture the driver's OWN outgoing Bolt messages. This is what makes the test non-vacuous: it
+# proves from the wire that the second RUN was issued while the first stream was still open, instead
+# of silently degenerating into the single-stream case if the driver ever decided to buffer the
+# first result.
+CLIENT_MESSAGES = []
+
+
+class _CaptureClientMessages(logging.Handler):
+    def emit(self, record):
+        text = record.getMessage()
+        marker = text.find("C: ")
+        if marker == -1:
+            return
+        body = text[marker + 3 :]
+        if body.startswith(("RUN", "PULL", "DISCARD")):
+            CLIENT_MESSAGES.append(body)
+
+
+_io_log = logging.getLogger("neo4j.io")
+_io_log.setLevel(logging.DEBUG)
+_io_log.addHandler(_CaptureClientMessages())
+_io_log.propagate = False
+
+
+def main():
+    with neo4j.GraphDatabase.driver(URI, auth=(USER, PASSWORD)) as driver:
+        driver.verify_connectivity()
+
+        # 1. Seed the rows in a SEPARATE managed write transaction, so the transaction under test
+        #    does nothing but run the two statements.
+        with driver.session() as session:
+            session.execute_write(
+                lambda tx: tx.run(
+                    "UNWIND range(1, $n) AS i CREATE (:Big {i: i})", n=TOTAL
+                ).consume()
+            )
+
+        # 2. ONE explicit transaction, TWO statements, the first larger than fetch_size.
+        with driver.session(fetch_size=FETCH) as session:
+            mark = len(CLIENT_MESSAGES)  # ignore everything the seeding transaction wrote
+            with session.begin_transaction() as tx:
+                # `Result` is lazy. Taking exactly ONE record drives RUN + a single PULL(fetch_size):
+                # the server answers a full batch + SUCCESS {has_more: true} and stays in
+                # TX_STREAMING. The driver does not pull again until the buffer is consumed, so
+                # stream 1 stays open across statement 2. Iterating the same `Result` again later
+                # resumes it (every `iter()` walks the same underlying stream state).
+                r1 = tx.run("MATCH (n:Big) RETURN n.i AS i ORDER BY i")
+                first = next(iter(r1))
+                if first["i"] != 1:
+                    fail(f"first record of stream 1 was i={first['i']}, expected 1")
+
+                # Statement 2 — the RUN that used to be rejected in TX_STREAMING.
+                r2 = tx.run("RETURN 1 AS one")
+                single = r2.single()
+                if single is None:
+                    fail("the second statement returned no record")
+                if single["one"] != 1:
+                    fail(f"second statement returned one={single['one']}, expected 1")
+
+                # Finish stream 1 and assert the RECORDS (not just the count) arrive in order.
+                got = [first["i"]] + [record["i"] for record in r1]
+                expected = list(range(1, TOTAL + 1))
+                if len(got) != TOTAL:
+                    fail(f"stream 1 yielded {len(got)} records, expected {TOTAL}")
+                if got != expected:
+                    bad = next(i for i, (a, b) in enumerate(zip(got, expected)) if a != b)
+                    fail(
+                        f"stream 1 record {bad} was i={got[bad]}, expected {expected[bad]}"
+                    )
+
+                tx.commit()
+
+            # 3. Non-vacuity gate on the captured wire traffic.
+            msgs = CLIENT_MESSAGES[mark:]
+            run1 = next(
+                (i for i, m in enumerate(msgs) if m.startswith("RUN") and "MATCH (n:Big)" in m),
+                -1,
+            )
+            run2 = next(
+                (i for i, m in enumerate(msgs) if m.startswith("RUN") and "RETURN 1 AS one" in m),
+                -1,
+            )
+            if run1 == -1:
+                fail(f"no RUN for the first statement was logged: {msgs}")
+            if run2 == -1:
+                fail(f"no RUN for the second statement was logged: {msgs}")
+            if run2 < run1:
+                fail("the second statement was sent before the first")
+            pulls_before = [m for m in msgs[:run2] if m.startswith("PULL")]
+            pulls_after = [m for m in msgs[run2 + 1 :] if m.startswith("PULL")]
+            discards = sum(1 for m in msgs if m.startswith("DISCARD"))
+            # Draining 2500 rows at n=1000 needs at least 3 PULLs, so <= 2 PULLs before the second
+            # RUN proves stream 1 was demonstrably UNFINISHED when statement 2 was issued.
+            if len(pulls_before) > 2:
+                fail(
+                    f"stream 1 had already been drained before the second RUN "
+                    f"({len(pulls_before)} PULLs); the test would be vacuous: {msgs}"
+                )
+            # ...but only because each of those PULLs was BOUNDED by the fetch size. A
+            # drain-everything PULL {n: -1} would finish stream 1 in a single message and make the
+            # count meaningless.
+            unbounded = [m for m in pulls_before if str(FETCH) not in m]
+            if unbounded:
+                fail(
+                    f"a PULL before the second RUN was not bounded by the fetch size {FETCH}, "
+                    f"so the PULL count proves nothing: {unbounded}"
+                )
+            # One PULL serves statement 2's own result; the rest resume the still-open stream 1.
+            if len(pulls_after) < 2:
+                fail(
+                    f"only {len(pulls_after)} PULLs followed the second RUN; stream 1 was not "
+                    f"resumed after it: {msgs}"
+                )
+            # A PULL carrying an explicit qid addresses a stream that is NOT the connection's
+            # current one — direct evidence that two streams were open at the same time.
+            if not any("qid" in m for m in pulls_after):
+                fail(
+                    f"no PULL after the second RUN addressed an explicit qid, so stream 1 was "
+                    f"never resumed as a second, independently addressable stream: {msgs}"
+                )
+            if discards != 0:
+                fail(f"the driver discarded a stream instead of keeping it open: {msgs}")
+            print(
+                f"GRAPHUS_PY_MULTISTREAM_WIRE pulls_before={len(pulls_before)} "
+                f"pulls_after={len(pulls_after)}"
+            )
+
+    print("GRAPHUS_PY_MULTISTREAM_OK")
+
+
+if __name__ == "__main__":
+    main()
+"#;
+
+/// The Go counterpart of [`MULTI_STREAM_SCRIPT`] (rmp #907), driving the OFFICIAL
+/// `neo4j-go-driver/v5`.
+///
+/// The Go driver keeps several streams open per transaction rather than buffering: when a `RUN`
+/// arrives while the connection is in its `bolt5StreamingTx` state, `bolt5.run` calls `pauseStream`
+/// (drain the batch already in flight, then stop) — **not** `bufferStream`, which is what it does
+/// for an *auto-commit* stream that has no transaction to key a `qid` against. The paused stream is
+/// still counted as open, so the connection stays in `bolt5StreamingTx`, and resuming it later emits
+/// `PULL {n, qid}` addressed to the non-current stream. The wire gate at the end of the program
+/// re-verifies exactly that from the driver's own `BoltLogger`.
+///
+/// This makes the Go program the strictest of the three witnesses: `pauseStream` receives every
+/// outstanding response before the second `RUN` is queued, so unlike the JavaScript and Python
+/// scripts the Go driver has demonstrably *observed* `SUCCESS {has_more: true}` — i.e. knows the
+/// server is in `TX_STREAMING` — at the moment it sends the second `RUN`. A server that cannot hold
+/// several streams per transaction therefore fails this program twice over: once on the second
+/// `RUN`, and once on the `qid`-addressed `PULL` that resumes the first result.
+///
+/// Prints `GRAPHUS_GO_MULTISTREAM_OK` and exits 0 only on full success; any mismatch exits non-zero.
+// NOTE: unlike the JavaScript/Python scripts above, this literal deliberately starts on the SAME
+// line as the opening quote. A leading blank line would make the generated `main.go` fail `gofmt`,
+// and the Go ecosystem treats an unformatted source file as a defect.
+const GO_MULTI_STREAM_SCRIPT: &str = r#"// Drives Graphus with the OFFICIAL neo4j-go-driver and reproduces rmp #907: one explicit
+// transaction whose FIRST result is larger than the session fetch size, followed by a SECOND
+// statement issued while that first stream is still open (Bolt state TX_STREAMING).
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"strings"
+	"sync"
+
+	"github.com/neo4j/neo4j-go-driver/v5/neo4j"
+)
+
+const (
+	total = 2500 // rows in the FIRST result: strictly more than one fetch batch
+	fetch = 1000 // the driver default; named explicitly so the arithmetic below is checkable
+)
+
+func fail(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "GO MULTISTREAM FAILURE: "+format+"\n", args...)
+	os.Exit(1)
+}
+
+// captureLogger records the driver's OWN outgoing Bolt messages. This is what makes the test
+// non-vacuous: it proves from the wire that the second RUN was issued while the first stream was
+// still open, instead of silently degenerating into the single-stream case if the driver ever
+// decided to buffer the first result.
+type captureLogger struct {
+	mu       sync.Mutex
+	messages []string
+}
+
+func (c *captureLogger) LogClientMessage(_ string, msg string, args ...any) {
+	line := fmt.Sprintf(msg, args...)
+	if !strings.HasPrefix(line, "RUN") && !strings.HasPrefix(line, "PULL") &&
+		!strings.HasPrefix(line, "DISCARD") {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.messages = append(c.messages, line)
+}
+
+func (c *captureLogger) LogServerMessage(_ string, _ string, _ ...any) {}
+
+func (c *captureLogger) snapshot() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.messages...)
+}
+
+func indexOfRun(messages []string, needle string) int {
+	for i, m := range messages {
+		if strings.HasPrefix(m, "RUN") && strings.Contains(m, needle) {
+			return i
+		}
+	}
+	return -1
+}
+
+func withPrefix(messages []string, prefix string) []string {
+	var out []string
+	for _, m := range messages {
+		if strings.HasPrefix(m, prefix) {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+func main() {
+	if len(os.Args) < 4 {
+		fail("usage: interop <port> <user> <password>")
+	}
+	port, user, password := os.Args[1], os.Args[2], os.Args[3]
+	uri := fmt.Sprintf("bolt+ssc://127.0.0.1:%s", port)
+	ctx := context.Background()
+
+	driver, err := neo4j.NewDriverWithContext(uri, neo4j.BasicAuth(user, password, ""))
+	if err != nil {
+		fail("could not create the driver: %v", err)
+	}
+	defer func() { _ = driver.Close(ctx) }()
+
+	if err := driver.VerifyConnectivity(ctx); err != nil {
+		fail("could not connect: %v", err)
+	}
+
+	// 1. Seed the rows in a SEPARATE managed write transaction, so the transaction under test does
+	//    nothing but run the two statements.
+	seed := driver.NewSession(ctx, neo4j.SessionConfig{})
+	_, err = seed.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+		result, err := tx.Run(ctx,
+			"UNWIND range(1, $n) AS i CREATE (:Big {i: i})", map[string]any{"n": total})
+		if err != nil {
+			return nil, err
+		}
+		return result.Consume(ctx)
+	})
+	if closeErr := seed.Close(ctx); closeErr != nil {
+		fail("could not close the seeding session: %v", closeErr)
+	}
+	if err != nil {
+		fail("could not seed %d nodes: %v", total, err)
+	}
+
+	// 2. ONE explicit transaction, TWO statements, the first larger than FetchSize. The BoltLogger
+	//    is attached to THIS session only, so the capture holds exactly this transaction's traffic.
+	capture := &captureLogger{}
+	session := driver.NewSession(ctx, neo4j.SessionConfig{FetchSize: fetch, BoltLogger: capture})
+	defer func() { _ = session.Close(ctx) }()
+
+	tx, err := session.BeginTransaction(ctx)
+	if err != nil {
+		fail("could not begin the transaction: %v", err)
+	}
+
+	// Statement 1. Taking exactly ONE record drives RUN + a single PULL(FetchSize): the server
+	// answers a full batch + SUCCESS {has_more: true} and stays in TX_STREAMING. The driver then
+	// PAUSES this stream (it does not buffer it) and addresses it again later with PULL {n, qid}.
+	r1, err := tx.Run(ctx, "MATCH (n:Big) RETURN n.i AS i ORDER BY i", nil)
+	if err != nil {
+		fail("the first statement failed: %v", err)
+	}
+	if !r1.Next(ctx) {
+		fail("the first statement returned no records at all (err: %v)", r1.Err())
+	}
+	firstValue, ok := r1.Record().Get("i")
+	if !ok {
+		fail("the first record of stream 1 has no column i")
+	}
+	first, ok := firstValue.(int64)
+	if !ok {
+		fail("column i came back as %T, expected an integer", firstValue)
+	}
+	if first != 1 {
+		fail("first record of stream 1 was i=%d, expected 1", first)
+	}
+
+	// Statement 2 — the RUN that used to be rejected because the connection was in TX_STREAMING.
+	r2, err := tx.Run(ctx, "RETURN 1 AS one", nil)
+	if err != nil {
+		fail("the second statement failed while the first stream was open: %v", err)
+	}
+	record, err := r2.Single(ctx)
+	if err != nil {
+		fail("the second statement did not return exactly one record: %v", err)
+	}
+	oneValue, ok := record.Get("one")
+	if !ok {
+		fail("the second statement's record has no column one")
+	}
+	if one, ok := oneValue.(int64); !ok || one != 1 {
+		fail("second statement returned one=%v, expected 1", oneValue)
+	}
+
+	// Finish stream 1 and assert the RECORDS (not just the count) arrive complete and in order.
+	got := []int64{first}
+	for r1.Next(ctx) {
+		value, ok := r1.Record().Get("i")
+		if !ok {
+			fail("a record of stream 1 has no column i")
+		}
+		n, ok := value.(int64)
+		if !ok {
+			fail("column i came back as %T, expected an integer", value)
+		}
+		got = append(got, n)
+	}
+	if err := r1.Err(); err != nil {
+		fail("stream 1 failed while being drained: %v", err)
+	}
+	if len(got) != total {
+		fail("stream 1 yielded %d records, expected %d", len(got), total)
+	}
+	for i, n := range got {
+		if n != int64(i+1) {
+			fail("stream 1 record %d was i=%d, expected %d", i, n, i+1)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		fail("could not commit: %v", err)
+	}
+
+	// 3. Non-vacuity gate on the captured wire traffic.
+	messages := capture.snapshot()
+	run1 := indexOfRun(messages, "MATCH (n:Big)")
+	run2 := indexOfRun(messages, "RETURN 1 AS one")
+	if run1 == -1 {
+		fail("no RUN for the first statement was logged: %v", messages)
+	}
+	if run2 == -1 {
+		fail("no RUN for the second statement was logged: %v", messages)
+	}
+	if run2 < run1 {
+		fail("the second statement was sent before the first: %v", messages)
+	}
+	pullsBefore := withPrefix(messages[:run2], "PULL")
+	pullsAfter := withPrefix(messages[run2+1:], "PULL")
+	discards := len(withPrefix(messages, "DISCARD"))
+	// Draining 2500 rows at n=1000 needs at least 3 PULLs, so <= 2 PULLs before the second RUN
+	// proves stream 1 was demonstrably UNFINISHED when statement 2 was issued.
+	if len(pullsBefore) > 2 {
+		fail("stream 1 had already been drained before the second RUN (%d PULLs); "+
+			"the test would be vacuous: %v", len(pullsBefore), messages)
+	}
+	// ...but only because each of those PULLs was BOUNDED by the fetch size. A drain-everything
+	// PULL {n: -1} would finish stream 1 in a single message and make the count meaningless.
+	for _, m := range pullsBefore {
+		if !strings.Contains(m, fmt.Sprint(fetch)) {
+			fail("a PULL before the second RUN was not bounded by the fetch size %d, so the "+
+				"PULL count proves nothing: %q", fetch, m)
+		}
+	}
+	// One PULL serves statement 2's own result; the rest resume the still-open stream 1.
+	if len(pullsAfter) < 2 {
+		fail("only %d PULLs followed the second RUN; stream 1 was not resumed after it: %v",
+			len(pullsAfter), messages)
+	}
+	// A PULL carrying an explicit qid addresses a stream that is NOT the connection's current one
+	// — direct evidence that two streams of this transaction were open at the same time.
+	qidAddressed := false
+	for _, m := range pullsAfter {
+		if strings.Contains(m, "qid") {
+			qidAddressed = true
+		}
+	}
+	if !qidAddressed {
+		fail("no PULL after the second RUN addressed an explicit qid, so stream 1 was never "+
+			"resumed as a second, independently addressable stream: %v", messages)
+	}
+	if discards != 0 {
+		fail("the driver discarded a stream instead of keeping it open: %v", messages)
+	}
+	fmt.Printf("GRAPHUS_GO_MULTISTREAM_WIRE pulls_before=%d pulls_after=%d\n",
+		len(pullsBefore), len(pullsAfter))
+
+	fmt.Println("GRAPHUS_GO_MULTISTREAM_OK")
+}
+"#;
+
 /// `package.json` pinning the official driver (v6.x — current major) for a reproducible install.
 const PACKAGE_JSON: &str = r#"{
   "name": "graphus-neo4j-interop",
@@ -710,6 +1343,21 @@ const PACKAGE_JSON: &str = r#"{
     "neo4j-driver": "^6.1.0"
   }
 }
+"#;
+
+/// The official Neo4j Python driver, pinned to the current major for a reproducible `pip install`
+/// (same policy as [`PACKAGE_JSON`] pins the JavaScript driver).
+const PYTHON_DRIVER_REQUIREMENT: &str = "neo4j>=6.1,<7";
+
+/// `go.mod` for the throw-away interop module. The driver version is pinned to the exact one the
+/// repository's own Go client examples depend on (`examples/clients-go/go.mod`), so the interop test
+/// and the shipped examples are proven against the same driver build, and the shared module cache is
+/// reused rather than fetching a second copy.
+const GO_MOD: &str = r#"module graphusinterop
+
+go 1.23
+
+require github.com/neo4j/neo4j-go-driver/v5 v5.28.4
 "#;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -829,6 +1477,217 @@ async fn install_and_run_driver(
         vec![port.to_string(), USER.to_owned(), PASSWORD.to_owned()],
     )
     .await
+}
+
+/// Serialises the Python provisioning phase (virtual-environment creation + `pip install`) across
+/// the concurrent interop tests, for exactly the reason [`npm_install_lock`] exists: `pip` shares a
+/// global HTTP/wheel cache (`~/.cache/pip`) that concurrent installs can trip over. The lock is held
+/// ONLY around the provisioning, never around the server boot or the driver exchange, so the actual
+/// Bolt traffic still runs in parallel and the download cache stays warm.
+fn pip_install_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Materialises a Python project (the given script as `interop.py`) in `project`, provisions a
+/// **virtual environment inside that directory** with the official `neo4j` package, runs the script
+/// with the given positional `argv`, and returns `(stdout, stderr, success)`.
+///
+/// The venv keeps the whole thing hermetic: nothing is installed into the system interpreter, and
+/// the environment dies with the test's `TempDir`. A missing `python3` (or a `python3` without the
+/// `venv` module) is a HARD failure, never a skip — the same policy `scripts/verify.sh` applies to
+/// `node`/`npm`. This mirrors [`install_and_run_driver_argv`] for the Python ecosystem.
+async fn install_and_run_python_driver(
+    project: PathBuf,
+    script: &str,
+    argv: Vec<String>,
+) -> (String, String, bool) {
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("interop.py"), script).unwrap();
+    let venv = project.join("venv");
+
+    {
+        // Serialise ONLY the provisioning so concurrent tests do not race the shared pip cache.
+        let _serialise = pip_install_lock().lock().await;
+
+        let create = {
+            let venv = venv.clone();
+            let project = project.clone();
+            tokio::task::spawn_blocking(move || {
+                Command::new("python3")
+                    .arg("-m")
+                    .arg("venv")
+                    .arg(&venv)
+                    .current_dir(&project)
+                    .output()
+            })
+            .await
+            .expect("python venv task")
+            .expect("spawn python3 (is `python3` on PATH?)")
+        };
+        assert!(
+            create.status.success(),
+            "python3 -m venv failed (is the `venv` module available?):\n\
+             --- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&create.stdout),
+            String::from_utf8_lossy(&create.stderr),
+        );
+
+        let install = {
+            let pip = venv.join("bin").join("pip");
+            let project = project.clone();
+            tokio::task::spawn_blocking(move || {
+                Command::new(&pip)
+                    .arg("install")
+                    .arg("--disable-pip-version-check")
+                    .arg(PYTHON_DRIVER_REQUIREMENT)
+                    .current_dir(&project)
+                    .output()
+            })
+            .await
+            .expect("pip install task")
+            .expect("spawn the venv pip (venv creation should have provided it)")
+        };
+        assert!(
+            install.status.success(),
+            "pip install {PYTHON_DRIVER_REQUIREMENT} failed:\n\
+             --- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&install.stdout),
+            String::from_utf8_lossy(&install.stderr),
+        );
+    }
+
+    let run = {
+        let python = venv.join("bin").join("python");
+        tokio::task::spawn_blocking(move || {
+            Command::new(&python)
+                .arg("interop.py")
+                .args(&argv)
+                .current_dir(&project)
+                .output()
+        })
+        .await
+        .expect("python task")
+        .expect("spawn the venv python")
+    };
+
+    (
+        String::from_utf8_lossy(&run.stdout).into_owned(),
+        String::from_utf8_lossy(&run.stderr).into_owned(),
+        run.status.success(),
+    )
+}
+
+/// Serialises the Go provisioning phase (`go mod tidy` + `go build`) across the concurrent interop
+/// tests, for exactly the reason [`npm_install_lock`] exists: the module cache (`GOMODCACHE`) and
+/// the build cache (`GOCACHE`) are shared, process-global resources. As with npm and pip, the lock
+/// covers only the provisioning, never the server boot or the driver exchange.
+fn go_build_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Materialises a Go module ([`GO_MOD`] plus the given program as `main.go`) in `project`, resolves
+/// and builds it against the pinned official driver, runs the resulting binary with the given
+/// positional `argv`, and returns `(stdout, stderr, success)`.
+///
+/// A missing `go` toolchain is a HARD failure, never a skip. This mirrors
+/// [`install_and_run_driver_argv`] for the Go ecosystem.
+async fn install_and_run_go_driver(
+    project: PathBuf,
+    script: &str,
+    argv: Vec<String>,
+) -> (String, String, bool) {
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("go.mod"), GO_MOD).unwrap();
+    std::fs::write(project.join("main.go"), script).unwrap();
+    let binary = project.join("interop");
+
+    {
+        // Serialise ONLY the provisioning so concurrent tests do not race the shared Go caches.
+        let _serialise = go_build_lock().lock().await;
+
+        let tidy = {
+            let project = project.clone();
+            tokio::task::spawn_blocking(move || {
+                Command::new("go")
+                    .arg("mod")
+                    .arg("tidy")
+                    .current_dir(&project)
+                    .output()
+            })
+            .await
+            .expect("go mod tidy task")
+            .expect("spawn go (is `go` on PATH?)")
+        };
+        assert!(
+            tidy.status.success(),
+            "go mod tidy failed:\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&tidy.stdout),
+            String::from_utf8_lossy(&tidy.stderr),
+        );
+
+        let build = {
+            let project = project.clone();
+            let binary = binary.clone();
+            tokio::task::spawn_blocking(move || {
+                Command::new("go")
+                    .arg("build")
+                    .arg("-o")
+                    .arg(&binary)
+                    .arg(".")
+                    .current_dir(&project)
+                    .output()
+            })
+            .await
+            .expect("go build task")
+            .expect("spawn go build")
+        };
+        assert!(
+            build.status.success(),
+            "go build failed:\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr),
+        );
+    }
+
+    let run = tokio::task::spawn_blocking(move || {
+        Command::new(&binary)
+            .args(&argv)
+            .current_dir(&project)
+            .output()
+    })
+    .await
+    .expect("go program task")
+    .expect("spawn the built Go interop binary");
+
+    (
+        String::from_utf8_lossy(&run.stdout).into_owned(),
+        String::from_utf8_lossy(&run.stderr).into_owned(),
+        run.status.success(),
+    )
+}
+
+/// Boots a real Graphus server (Bolt-TCP+TLS) for one of the rmp #907 multi-statement-transaction
+/// tests and hands back the handle plus its ephemeral Bolt port. Every ecosystem drives the exact
+/// same server configuration, so a difference between them is a driver difference, never a
+/// configuration difference. The `TempDir` is returned because it owns the store and the TLS
+/// material for the lifetime of the test.
+async fn boot_multi_stream_server() -> (TempDir, ServerHandle, u16) {
+    let dir = TempDir::new();
+
+    // Self-signed cert/key for the TLS listener (`bolt+ssc://` trusts it).
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    let cert_path = dir.path.join("cert.pem");
+    let key_path = dir.path.join("key.pem");
+    std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+    std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
+
+    let config = config_for(&dir, cert_path, key_path, None, None);
+    let server = boot(config).await;
+    let bolt: SocketAddr = server.bolt_tcp_addr.expect("Bolt-TCP listener enabled");
+    let port = bolt.port();
+    (dir, server, port)
 }
 
 /// Full CRUD lifecycle over the OFFICIAL Neo4j driver at a realistic volume (≥100 nodes, ≥200 edges).
@@ -1057,4 +1916,120 @@ async fn official_driver_reads_default_graphus_server_agent() {
         "node-agent-default",
     )
     .await;
+}
+
+/// Several open result streams in ONE explicit transaction, proven with the OFFICIAL JavaScript
+/// driver (rmp #907).
+///
+/// Graphus rejected a `RUN` received in Bolt state `TX_STREAMING`, so an explicit transaction whose
+/// FIRST result was larger than the driver's `fetchSize` (1000 by default) could not run a SECOND
+/// statement: the driver got a `FAILURE` and the transaction died. That is a direct violation of the
+/// Bolt server-state tables, which list `RUN` among the valid requests in `TX_STREAMING` and require
+/// the server to keep every stream of the transaction addressable by its `qid`.
+///
+/// This boots a real Graphus server (Bolt-TCP+TLS), seeds 2500 nodes in a separate write, then in
+/// ONE explicit transaction leaves a 2500-row result open after a single batch and runs a second
+/// statement on top of it. It asserts the second statement's value, then that the first stream still
+/// delivers all 2500 records **in order** (the records, not merely the count), and finally that the
+/// captured wire traffic really carried the interleaving — see [`MULTI_STREAM_SCRIPT`] for how the
+/// stream is kept open and how the non-vacuity gate is computed.
+///
+/// Like every other test here it is a real-ecosystem wire test, which is why it lives behind the
+/// `neo4j-interop` feature and not in the DST simulator: DST is in-process and cannot drive the
+/// external official driver over a TLS socket, and driving that exact wire path is the entire point.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn official_neo4j_driver_multi_statement_transaction_with_large_first_result() {
+    let (dir, server, port) = boot_multi_stream_server().await;
+
+    let (stdout, stderr, ok) =
+        install_and_run_driver(dir.path.join("node-multistream"), MULTI_STREAM_SCRIPT, port).await;
+
+    assert!(
+        ok,
+        "the official Neo4j JavaScript driver could NOT run a second statement in a transaction \
+         whose first result was still streaming (rmp #907).\n\
+         --- node stdout ---\n{stdout}\n--- node stderr ---\n{stderr}",
+    );
+    assert!(
+        stdout.contains("GRAPHUS_MULTISTREAM_OK"),
+        "driver exited 0 but the multi-stream success marker was missing.\n\
+         --- node stdout ---\n{stdout}\n--- node stderr ---\n{stderr}",
+    );
+
+    server.shutdown().await.expect("clean shutdown");
+}
+
+/// The same rmp #907 reproduction driven by the OFFICIAL **Python** driver.
+///
+/// A second, independent driver ecosystem is not redundancy: each official driver decides for
+/// itself whether to keep several streams open or to buffer the previous result, so only by driving
+/// more than one can Graphus claim the fix matches what the ecosystem actually speaks. The Python
+/// driver buffers the previous result **only** on Bolt 3 (no `qid` exists there); on Bolt 5 it sends
+/// the second `RUN` with the first stream still open, which is exactly the reproduction from the bug
+/// report.
+///
+/// The `neo4j` package is provisioned into a virtual environment inside the test's own temp
+/// directory, so the run is hermetic and leaves nothing behind. A missing `python3` is a hard
+/// failure, never a skip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn official_python_driver_multi_statement_transaction_with_large_first_result() {
+    let (dir, server, port) = boot_multi_stream_server().await;
+
+    let (stdout, stderr, ok) = install_and_run_python_driver(
+        dir.path.join("python-multistream"),
+        PYTHON_MULTI_STREAM_SCRIPT,
+        vec![port.to_string(), USER.to_owned(), PASSWORD.to_owned()],
+    )
+    .await;
+
+    assert!(
+        ok,
+        "the official Neo4j Python driver could NOT run a second statement in a transaction whose \
+         first result was still streaming (rmp #907).\n\
+         --- python stdout ---\n{stdout}\n--- python stderr ---\n{stderr}",
+    );
+    assert!(
+        stdout.contains("GRAPHUS_PY_MULTISTREAM_OK"),
+        "the Python driver exited 0 but the multi-stream success marker was missing.\n\
+         --- python stdout ---\n{stdout}\n--- python stderr ---\n{stderr}",
+    );
+
+    server.shutdown().await.expect("clean shutdown");
+}
+
+/// The same rmp #907 reproduction driven by the OFFICIAL **Go** driver.
+///
+/// The Go driver is the strictest witness of the three: on receiving a `RUN` while a transaction
+/// stream is open it *pauses* that stream rather than buffering it, and later resumes it with an
+/// explicit `PULL {n, qid}` addressed to a non-current stream. A server that cannot hold several
+/// streams per transaction therefore fails this test twice over — once on the second `RUN`, and
+/// once on the `qid`-addressed `PULL` that resumes the first result.
+///
+/// The module is created and built inside the test's own temp directory against the very driver
+/// version the repository's Go client examples pin (`examples/clients-go/go.mod`). A missing `go`
+/// toolchain is a hard failure, never a skip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn official_go_driver_multi_statement_transaction_with_large_first_result() {
+    let (dir, server, port) = boot_multi_stream_server().await;
+
+    let (stdout, stderr, ok) = install_and_run_go_driver(
+        dir.path.join("go-multistream"),
+        GO_MULTI_STREAM_SCRIPT,
+        vec![port.to_string(), USER.to_owned(), PASSWORD.to_owned()],
+    )
+    .await;
+
+    assert!(
+        ok,
+        "the official Neo4j Go driver could NOT run a second statement in a transaction whose \
+         first result was still streaming (rmp #907).\n\
+         --- go stdout ---\n{stdout}\n--- go stderr ---\n{stderr}",
+    );
+    assert!(
+        stdout.contains("GRAPHUS_GO_MULTISTREAM_OK"),
+        "the Go driver exited 0 but the multi-stream success marker was missing.\n\
+         --- go stdout ---\n{stdout}\n--- go stderr ---\n{stderr}",
+    );
+
+    server.shutdown().await.expect("clean shutdown");
 }

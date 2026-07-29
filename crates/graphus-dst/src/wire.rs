@@ -921,6 +921,127 @@ mod tests {
         );
     }
 
+    /// A **multi-statement explicit transaction with several result streams open at once**, driven
+    /// through the real `BoltSession` over the simulated network against the real engine (`rmp` #907).
+    ///
+    /// This is the deterministic, in-simulator counterpart of the official-driver interop tests. It
+    /// reproduces exactly the shape that used to break: inside one transaction the first result is
+    /// larger than the client's fetch size, so the first `PULL` answers `has_more: true` and the
+    /// connection is still `TX_STREAMING` when the second statement arrives. The Bolt server-state
+    /// specification permits that (`TX_STREAMING --RUN--> TX_STREAMING`, Table 6), and the drivers
+    /// depend on it; before the fix the second `RUN` was answered with a `FAILURE` and the
+    /// transaction died.
+    ///
+    /// The assertions pin the **records** of each stream, not their counts, and the lifecycle around
+    /// them: the second stream drains while the first is still open (so the connection must stay
+    /// `TX_STREAMING`), the first is then resumed by its own `qid` and yields exactly its remaining
+    /// rows, and only then does `COMMIT` succeed.
+    #[test]
+    fn bolt_multi_statement_transaction_keeps_several_streams_open() {
+        let eng = engine();
+        let mut reqs = login_prologue();
+        reqs.extend([
+            // Seed five nodes in an auto-commit statement.
+            Request::Run {
+                query: "UNWIND range(1, 5) AS i CREATE (:Big {i: i})".to_owned(),
+                parameters: vec![],
+                extra: vec![],
+            },
+            Request::Pull { n: -1, qid: None },
+            Request::Begin { extra: vec![] },
+            // Stream 0: five rows.
+            Request::Run {
+                query: "MATCH (n:Big) RETURN n.i AS i ORDER BY i".to_owned(),
+                parameters: vec![],
+                extra: vec![],
+            },
+            // A bounded PULL that leaves three rows behind: stream 0 stays OPEN.
+            Request::Pull { n: 2, qid: None },
+            // Stream 1, opened while stream 0 is still streaming — the statement that used to fail.
+            Request::Run {
+                query: "RETURN 7 AS seven".to_owned(),
+                parameters: vec![],
+                extra: vec![],
+            },
+            // `qid: -1` addresses the most recently opened statement, i.e. stream 1.
+            Request::Pull { n: -1, qid: None },
+            // Back to stream 0 by its own qid.
+            Request::Pull {
+                n: -1,
+                qid: Some(0),
+            },
+            Request::Commit,
+            Request::Goodbye,
+        ]);
+
+        let auth = sim_auth();
+        let responses = run_scripted_bolt_session(eng, 7, &auth, &reqs).expect("session runs");
+
+        assert!(
+            !responses
+                .iter()
+                .any(|r| matches!(r, Response::Failure { .. })),
+            "a multi-stream transaction is a clean session: {responses:?}"
+        );
+
+        // Every RECORD of the session, as the integers they carry, in wire order.
+        let ints: Vec<i64> = responses
+            .iter()
+            .filter_map(|r| match r {
+                Response::Record { values } => match values.as_slice() {
+                    [
+                        graphus_bolt::packstream::BoltValue::Value(graphus_core::Value::Integer(n)),
+                    ] => Some(*n),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ints,
+            vec![1, 2, 7, 3, 4, 5],
+            "stream 0 yields rows 1 and 2, then stream 1 yields 7 while stream 0 is still open, \
+             then stream 0 resumes with exactly its remaining rows 3, 4 and 5: {responses:?}"
+        );
+
+        // The second in-transaction RUN must have been answered with its OWN qid (1) — the proof it
+        // opened an additional stream rather than replacing the first.
+        let qids: Vec<i64> = responses
+            .iter()
+            .filter_map(|r| match r {
+                Response::Success { metadata } => {
+                    metadata.iter().find_map(|(k, v)| match (k.as_str(), v) {
+                        ("qid", graphus_core::Value::Integer(n)) => Some(*n),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            qids,
+            vec![0, 1],
+            "both in-transaction statements are assigned their own qid: {responses:?}"
+        );
+
+        // Exactly one SUCCESS carries `has_more: true` — the bounded PULL of stream 0. If it were
+        // absent the first result would have drained in one PULL and this scenario would silently
+        // degenerate into the single-stream case it exists to replace.
+        let has_more_count = responses
+            .iter()
+            .filter(|r| match r {
+                Response::Success { metadata } => metadata
+                    .iter()
+                    .any(|(k, v)| k == "has_more" && *v == graphus_core::Value::Boolean(true)),
+                _ => false,
+            })
+            .count();
+        assert_eq!(
+            has_more_count, 1,
+            "the first stream must genuinely be left open by the bounded PULL: {responses:?}"
+        );
+    }
+
     /// The SAME real session over the simulated network at **every** Bolt minor Graphus advertises
     /// (5.0–5.4), including the 5.0 flow where the credentials ride in the `HELLO` and there is no
     /// `LOGON` (rmp #906).

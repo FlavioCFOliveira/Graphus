@@ -24,12 +24,37 @@
 //! Bolt 5.0  : CONNECTED --(HELLO ok, credentials IN the HELLO)-------> READY
 //!
 //!    READY  --(RUN)--> STREAMING --(stream drained)--> READY
-//!    READY  --(BEGIN)--> TX_READY --(RUN)--> TX_STREAMING --(drained)--> TX_READY
+//!    READY  --(BEGIN)--> TX_READY --(RUN)--> TX_STREAMING --(RUN)--> TX_STREAMING
+//! TX_STREAMING --(last open stream drained)--> TX_READY
 //!  TX_READY --(COMMIT/ROLLBACK)--> READY
 //!  post-auth --(error)--> FAILED --(RESET)--> READY
 //!  pre-auth  --(HELLO/LOGON fail or out-of-order msg)--> DEFUNCT
 //!    <any>  --(GOODBYE / fatal)--> DEFUNCT
 //! ```
+//!
+//! ## Several result streams may be open at once inside a transaction (rmp #907)
+//!
+//! Inside an explicit transaction a client may start a new statement **while an earlier result is
+//! still being streamed**. The Bolt server-state specification says so directly: `TX_STREAMING`
+//! lists `RUN to TX_STREAMING or FAILED` (Table 6), and the `PULL`/`DISCARD` tables (7 and 8) give
+//! the post-stream state as "`TX_READY` **or `TX_STREAMING` if there are other streams open**"
+//! (neo4j.com/docs/bolt/current/bolt/server-state/). Each in-transaction `RUN` is answered with its
+//! own `qid`, and `PULL`/`DISCARD` address a specific result by that `qid`. The session therefore
+//! keeps an **ordered collection** of open streams, not a single slot, and only returns to
+//! `TX_READY` once the last one is consumed or discarded.
+//!
+//! This is not a theoretical corner of the specification: the official drivers depend on it. The
+//! Neo4j Python driver buffers the previous result before the next `tx.run()` **only** when
+//! `connection.supports_multiple_results is False` — a branch its own comment labels "Bolt 3
+//! Support" — and `_bolt5.py` sets `supports_multiple_results = True`. So on Bolt 5.x the driver
+//! deliberately leaves the earlier result open. A server that rejects `RUN` in `TX_STREAMING`
+//! breaks any transaction whose first result exceeds the driver's fetch size (1000 by default),
+//! because that first result's `PULL` answers `has_more = true` and the connection is still
+//! `TX_STREAMING` when the second `tx.run()` arrives.
+//!
+//! **Auto-commit `STREAMING` stays single-stream**, deliberately: the specification assigns no
+//! `qid` to an auto-commit `RUN`, and `STREAMING`'s transition table lists only `PULL` and
+//! `DISCARD` — `RUN` is not a valid message there.
 //!
 //! ## Bolt 5.0 authenticates from `HELLO` (rmp #906)
 //!
@@ -110,7 +135,10 @@ pub enum State {
     Streaming,
     /// Inside an explicit transaction; awaiting `RUN`/`COMMIT`/`ROLLBACK`.
     TxReady,
-    /// A `RUN` result is open inside an explicit transaction; awaiting `PULL`/`DISCARD`.
+    /// At least one `RUN` result is open inside an explicit transaction; awaiting
+    /// `PULL`/`DISCARD`/`RUN` (rmp #907 — a further `RUN` re-enters this state and opens an
+    /// additional stream; the connection falls back to [`TxReady`](Self::TxReady) only once the
+    /// **last** open stream is consumed or discarded).
     TxStreaming,
     /// A `FAILURE` occurred; ignore requests until `RESET` (`04 §8.1`).
     Failed,
@@ -188,6 +216,32 @@ const LOGON_AUTH_MIN_MINOR: u8 = 1;
 /// Note what is **absent**: `bolt_agent` is a Bolt **5.3+** field and is *not* in the 5.0 decoder's
 /// list, so a 5.0 client that sent it would have it treated as part of the token — the reference
 /// behaviour, reproduced here deliberately rather than "improved".
+/// The default cap on **concurrently-open result streams within one explicit transaction**
+/// (rmp #907).
+///
+/// The Bolt specification permits a client to keep several results open at once inside a
+/// transaction (server-state Tables 6/7/8) and places no limit on how many. The Neo4j reference
+/// server keeps them in an unbounded `HashMap` (`TransactionImpl.statementMap`). Graphus does not:
+/// on an authenticated connection an unbounded collection is an attacker-controlled allocation —
+/// a client could issue `RUN` after `RUN` without ever consuming a result and pin server memory,
+/// an engine cursor and an admission permit per stream. The engine bounds the same resource for the
+/// same reason (its `max_parked_inline` queue).
+///
+/// **Where the number comes from.** Every open stream pins one engine *admission permit* for its
+/// whole lifetime, and the engine's per-database budget for those is `admission
+/// .max_concurrent_queries` (256 by default). A per-transaction cap of a **quarter** of that budget
+/// means no single transaction — and therefore no single connection — can monopolise a database's
+/// admission capacity with results nobody is reading, while still being an order of magnitude above
+/// what any real driver does: a driver opens one stream per `tx.run()` whose result the application
+/// has not finished consuming, which in practice is a handful.
+///
+/// **What a client sees when it is hit.** The offending `RUN` is answered with a `FAILURE`
+/// (`Neo.ClientError.Request.Invalid`) and the connection enters `FAILED`, so the transaction is
+/// abandoned rather than silently degraded; `RESET` recovers the connection and rolls the
+/// transaction back. The classification is deliberately a *client* error: retrying the same
+/// statement would hit the same limit, so it must not look retryable to a driver.
+pub const DEFAULT_MAX_OPEN_STREAMS_PER_TX: usize = 64;
+
 const HELLO_NON_AUTH_FIELDS: [&str; 5] = [
     "patch_bolt",
     "routing",
@@ -232,6 +286,11 @@ pub struct SessionConfig {
     /// ([`clamp_max_minor`](crate::handshake::clamp_max_minor)), so this can only ever *narrow* what
     /// Graphus offers.
     pub max_protocol_minor: u8,
+    /// The maximum number of **concurrently-open result streams inside one explicit transaction**
+    /// (rmp #907). Defaults to [`DEFAULT_MAX_OPEN_STREAMS_PER_TX`], whose documentation explains
+    /// where the number comes from and what a client sees when the cap is reached. A value of `0` is
+    /// treated as `1` (a transaction must always be able to open one result).
+    pub max_open_streams_per_tx: usize,
 }
 
 impl Default for SessionConfig {
@@ -242,6 +301,7 @@ impl Default for SessionConfig {
             advertised_bolt_address: None,
             routing_ttl_secs: DEFAULT_ROUTING_TTL_SECS,
             max_protocol_minor: crate::handshake::MAX_MINOR,
+            max_open_streams_per_tx: DEFAULT_MAX_OPEN_STREAMS_PER_TX,
         }
     }
 }
@@ -299,18 +359,32 @@ pub struct BoltSession<'a, T: Transport, E: BoltExecutor> {
     version: Option<Version>,
     /// The authenticated principal (set after `LOGON`).
     principal: Option<String>,
-    /// The in-flight result, while `STREAMING` / `TX_STREAMING`.
-    open_stream: Option<OpenResult<E::Stream>>,
+    /// The in-flight results, while `STREAMING` / `TX_STREAMING`, **in the order they were opened**
+    /// (rmp #907).
+    ///
+    /// Auto-commit `STREAMING` holds at most one entry, with no `qid` — the specification assigns
+    /// none and `RUN` is not a valid `STREAMING` message, so a second one can never appear. Inside
+    /// an explicit transaction there may be several, each addressed by its own `qid`; an entry is
+    /// removed when its result is consumed or discarded, and the connection leaves `TX_STREAMING`
+    /// only when the collection empties. It is bounded by
+    /// [`SessionConfig::max_open_streams_per_tx`].
+    open_streams: Vec<OpenStream<E::Stream>>,
     /// Inside an explicit transaction, the server assigns each `RUN` a query id (`qid`), returned in
     /// the `RUN` `SUCCESS` and addressable by `PULL`/`DISCARD` (`04 §8.1` / Bolt message spec). It
     /// starts at 0 for the first `RUN` after `BEGIN` and increments per statement; it is reset when a
-    /// new explicit transaction opens. The `qid` of the **currently open** stream (the only stream a
-    /// single-active-stream server can address) is tracked so `PULL`/`DISCARD` can validate the
-    /// client's `qid`. `None` in an auto-commit `RUN` (the spec returns no `qid` there).
+    /// new explicit transaction opens. An auto-commit `RUN` consumes no `qid` (the spec returns none).
     next_qid: i64,
-    /// The `qid` of the currently open in-tx stream (`Some` only while `TX_STREAMING`), for
-    /// `PULL`/`DISCARD` validation.
-    open_qid: Option<i64>,
+    /// The `qid` of the **most recently opened** statement of the current explicit transaction —
+    /// what `qid == -1` ("the last query", also the field's default) addresses.
+    ///
+    /// It records the last `qid` *assigned*, not the last still open: it is deliberately **not**
+    /// cleared when that stream drains. This is the Neo4j reference server's `latestStatementId`
+    /// (`TransactionImpl.run` sets it; `StreamingStateTransition` resolves `statementId == -1` to
+    /// it and fails when the statement it names is no longer open), so a `-1` that names a finished
+    /// result is a protocol error here too rather than a silent re-aim at some other open stream.
+    /// `None` outside an explicit transaction — an auto-commit result carries no `qid`, so `-1`
+    /// simply addresses the single open stream.
+    last_opened_qid: Option<i64>,
     /// Reassembles request messages from the inbound byte stream.
     dechunker: Dechunker,
     /// A scratch read buffer.
@@ -344,6 +418,16 @@ struct OpenResult<S> {
     stream: S,
     /// A record peeked-but-not-yet-emitted (the lookahead), if any.
     peeked: Option<Record>,
+}
+
+/// One open result stream and the `qid` that addresses it (rmp #907).
+struct OpenStream<S> {
+    /// The server-assigned statement id returned in the `RUN` `SUCCESS`, for a statement inside an
+    /// explicit transaction. `None` for an auto-commit result: the Bolt message spec assigns a `qid`
+    /// to an explicit-transaction `RUN` only, and an auto-commit connection can hold just one result.
+    qid: Option<i64>,
+    /// The result itself, with its one-record `has_more` lookahead.
+    result: OpenResult<S>,
 }
 
 impl<S: RecordStream> OpenResult<S> {
@@ -406,9 +490,9 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
             state: State::Connected,
             version: None,
             principal: None,
-            open_stream: None,
+            open_streams: Vec::new(),
             next_qid: 0,
-            open_qid: None,
+            last_opened_qid: None,
             dechunker: Dechunker::new(),
             read_buf: vec![0u8; 8 * 1024],
             packer: Packer::new(),
@@ -908,9 +992,9 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
                 match self.executor.begin(mode, db.as_deref()) {
                     Ok(()) => {
                         // A fresh transaction restarts qid assignment at 0 (`04 §8.1`; qids are
-                        // scoped to the transaction — rmp #391).
+                        // scoped to the transaction — rmp #391), and nothing is open in it yet.
                         self.next_qid = 0;
-                        self.open_qid = None;
+                        self.last_opened_qid = None;
                         self.send(&Response::Success { metadata: vec![] })?;
                         self.state = State::TxReady;
                     }
@@ -998,19 +1082,61 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
         }
     }
 
-    /// `STREAMING` / `TX_STREAMING`: `PULL`, `DISCARD`, `RESET`.
+    /// `STREAMING`: `PULL`, `DISCARD`, `RESET`. `TX_STREAMING`: the same, plus `RUN` (rmp #907).
+    ///
+    /// The asymmetry is the specification's, not a simplification. `STREAMING`'s transition table
+    /// lists only `PULL` and `DISCARD` ("this result must be fully consumed or discarded by a client
+    /// before the server can re-enter the READY state and allow any further queries to be
+    /// executed"), whereas `TX_STREAMING` additionally lists `RUN to TX_STREAMING or FAILED`
+    /// (Table 6) — a second statement inside the same transaction opens an *additional* result
+    /// stream and leaves the connection streaming
+    /// (neo4j.com/docs/bolt/current/bolt/server-state/).
+    ///
+    /// `COMMIT` and `ROLLBACK` are deliberately **not** accepted here: neither appears among
+    /// `TX_STREAMING`'s transitions — they are listed for `TX_READY` only — and the specification
+    /// states that the open results "must be fully consumed or discarded by a client before the
+    /// server can transition to the TX_READY state". The official drivers honour this: the Neo4j
+    /// Python driver's `_commit` and `_rollback` both call `_consume_results()` first, with the
+    /// comment "DISCARD pending records then do a commit". So they fall through to
+    /// [`unexpected`](Self::unexpected) → `FAILURE` → `FAILED`, exactly as any other out-of-order
+    /// message does.
     fn dispatch_streaming(&mut self, request: Request) -> BoltResult<Flow> {
-        match request {
-            Request::Pull { n, qid } => self.handle_pull(n, qid, true),
-            Request::Discard { n, qid } => self.handle_pull(n, qid, false),
-            Request::Reset => self.handle_reset(),
-            other => self.unexpected(&other),
+        match (self.state, request) {
+            (_, Request::Pull { n, qid }) => self.handle_pull(n, qid, true),
+            (_, Request::Discard { n, qid }) => self.handle_pull(n, qid, false),
+            (_, Request::Reset) => self.handle_reset(),
+            (
+                State::TxStreaming,
+                Request::Run {
+                    query,
+                    parameters,
+                    extra,
+                },
+            ) => {
+                // A further statement in the same explicit transaction. The transaction is pinned to
+                // the database named at BEGIN; the executor rejects a different non-empty `db` here,
+                // exactly as it does for the TX_READY RUN.
+                let db = db_from_extra(&extra);
+                self.handle_run(
+                    &query,
+                    parameters,
+                    TxControl::InExplicit { db },
+                    State::TxStreaming,
+                )
+            }
+            (_, other) => self.unexpected(&other),
         }
     }
 
     // ---- RUN / PULL streaming --------------------------------------------------------------------
 
-    /// Runs a query and, on success, replies `SUCCESS{fields}` and enters `streaming_state`.
+    /// Runs a query and, on success, replies `SUCCESS{fields}`, opens a result stream and enters
+    /// `streaming_state`.
+    ///
+    /// Inside an explicit transaction the new stream is **added** to the streams already open
+    /// (rmp #907) rather than replacing one; the per-transaction cap is enforced first, *before* the
+    /// executor is asked to do any work, so a refused `RUN` never starts a statement it then has to
+    /// abandon.
     fn handle_run(
         &mut self,
         query: &str,
@@ -1018,6 +1144,20 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
         tx: TxControl,
         streaming_state: State,
     ) -> BoltResult<Flow> {
+        let in_transaction = streaming_state == State::TxStreaming;
+        // An auto-commit RUN is only ever dispatched from READY, which is unreachable while a result
+        // is open — so the single-stream invariant of `STREAMING` holds by construction.
+        debug_assert!(in_transaction || self.open_streams.is_empty());
+        if in_transaction && self.open_streams.len() >= self.max_open_streams_per_tx() {
+            // The per-transaction open-stream cap (see `DEFAULT_MAX_OPEN_STREAMS_PER_TX`). Refuse
+            // BEFORE running anything: a client error, non-retryable, recoverable with RESET.
+            let limit = self.max_open_streams_per_tx();
+            self.fail_protocol(&format!(
+                "too many result streams open in one transaction (limit {limit}); consume or \
+                 discard a result before running another statement"
+            ))?;
+            return Ok(Flow::Continue);
+        }
         match self.executor.run(query, parameters, tx) {
             Ok(stream) => {
                 let fields: Vec<Value> = stream
@@ -1030,16 +1170,23 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
                 // returns it in the RUN SUCCESS so `PULL`/`DISCARD` can address it (`04 §8.1`; Bolt
                 // message spec: "qid::Integer specifies the server assigned statement ID … Explicit
                 // Transaction only"). An auto-commit RUN omits `qid` entirely (rmp #391).
-                if streaming_state == State::TxStreaming {
+                let qid = if in_transaction {
                     let qid = self.next_qid;
                     self.next_qid += 1;
-                    self.open_qid = Some(qid);
+                    // This statement becomes "the last query" that a `qid` of -1 addresses.
+                    self.last_opened_qid = Some(qid);
                     metadata.push(("qid".to_owned(), Value::Integer(qid)));
+                    Some(qid)
                 } else {
-                    self.open_qid = None;
-                }
+                    // An auto-commit result has no qid; `-1` addresses the one open stream.
+                    self.last_opened_qid = None;
+                    None
+                };
                 self.send(&Response::Success { metadata })?;
-                self.open_stream = Some(OpenResult::new(stream));
+                self.open_streams.push(OpenStream {
+                    qid,
+                    result: OpenResult::new(stream),
+                });
                 self.state = streaming_state;
                 Ok(Flow::Continue)
             }
@@ -1049,6 +1196,34 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
                 Ok(Flow::Continue)
             }
         }
+    }
+
+    /// The effective per-transaction open-stream cap: [`SessionConfig::max_open_streams_per_tx`],
+    /// floored at 1 so a misconfigured `0` cannot make every in-transaction `RUN` impossible.
+    fn max_open_streams_per_tx(&self) -> usize {
+        self.config.max_open_streams_per_tx.max(1)
+    }
+
+    /// Resolves the `qid` of a `PULL`/`DISCARD` to an index into [`open_streams`](Self::open_streams),
+    /// or `None` when it names no open stream (rmp #391/#907).
+    ///
+    /// An absent `qid` and `qid == -1` are the same thing — the Bolt message spec gives the field a
+    /// default of `-1`, "the last executed statement". Inside a transaction that is the most recently
+    /// *opened* statement ([`last_opened_qid`](Self::last_opened_qid)); if that statement has already
+    /// been consumed, `-1` resolves to nothing and the caller reports a protocol failure, exactly as
+    /// the reference server does. Outside a transaction no `qid` is ever assigned, so `-1` addresses
+    /// the single open auto-commit result.
+    fn stream_index_for(&self, qid: Option<i64>) -> Option<usize> {
+        let requested = qid.unwrap_or(ALL);
+        if requested == ALL {
+            return match self.last_opened_qid {
+                Some(last) => self.open_streams.iter().position(|s| s.qid == Some(last)),
+                None => self.open_streams.iter().position(|s| s.qid.is_none()),
+            };
+        }
+        self.open_streams
+            .iter()
+            .position(|s| s.qid == Some(requested))
     }
 
     /// Emits up to `n` records (`n == -1` = all) when `emit` is true (PULL) or silently drops them
@@ -1064,25 +1239,25 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
             self.fail_protocol("PULL/DISCARD n must be -1 (all) or a positive integer")?;
             return Ok(Flow::Continue);
         }
-        // Validate `qid` against the addressed open stream (rmp #391). `qid == -1` (or absent) means
-        // "the last/current statement" and always addresses the open stream; an explicit `qid` must
-        // equal the open stream's id. Any other value names a result this single-active-stream
-        // server does not have open → FAILURE `Neo.ClientError.Request.Invalid` → FAILED, per the
-        // Bolt message spec's `qid` semantics. (DEFERRAL: Graphus keeps at most one stream open at a
-        // time, so multiple concurrently-open result-sets addressed by distinct qids are not
-        // supported; a `qid` that is neither `-1` nor the open stream's id is rejected rather than
-        // buffered. This is spec-conformant for the single-stream case a stock driver drives.)
-        if let Some(requested) = qid {
-            if requested != ALL && self.open_qid != Some(requested) {
+        // Route to the addressed stream (rmp #391/#907). `qid == -1` (or absent) means "the last
+        // executed statement"; an explicit `qid` names one of the streams open in this transaction.
+        // A `qid` that names no open stream is a protocol error → FAILURE
+        // `Neo.ClientError.Request.Invalid` → FAILED, per the Bolt message spec's `qid` semantics
+        // and the reference server (`StreamingStateTransition` throws when the id resolves to no
+        // live statement).
+        let Some(index) = self.stream_index_for(qid) else {
+            if self.open_streams.is_empty() {
+                // Should not happen (only reachable in a streaming state), but be defensive.
+                self.fail_protocol("PULL/DISCARD with no open result")?;
+            } else {
                 self.fail_protocol("PULL/DISCARD qid does not match an open result stream")?;
-                return Ok(Flow::Continue);
             }
-        }
-        let Some(mut result) = self.open_stream.take() else {
-            // Should not happen (only reachable in a streaming state), but be defensive.
-            self.fail_protocol("PULL/DISCARD with no open result")?;
             return Ok(Flow::Continue);
         };
+        // Detached for the duration of the stream loop (the emit path needs `&mut self`), then put
+        // back at the SAME position if rows remain, so the opening order — which is what `-1` and the
+        // "other streams open" rule are defined against — is preserved.
+        let mut entry = self.open_streams.remove(index);
 
         let unlimited = n == ALL;
         let mut produced: i64 = 0;
@@ -1090,7 +1265,7 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
             if !unlimited && produced >= n {
                 break false; // hit the fetch-size limit; whether rows remain is checked below
             }
-            match result.next_record() {
+            match entry.result.next_record() {
                 Ok(Some(record)) => {
                     if emit {
                         self.send(&Response::Record { values: record })?;
@@ -1111,7 +1286,7 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
         let has_more = if drained {
             false
         } else {
-            match result.has_more() {
+            match entry.result.has_more() {
                 Ok(more) => more,
                 Err(e) => {
                     self.fail_with(&e)?;
@@ -1125,18 +1300,24 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
             self.send(&Response::Success {
                 metadata: vec![("has_more".to_owned(), Value::Boolean(true))],
             })?;
-            self.open_stream = Some(result);
+            self.open_streams.insert(index, entry);
             debug_assert!(self.state.is_streaming());
         } else {
             // Exhausted (either the stream drained, or the limit landed exactly on the last record):
-            // trailing SUCCESS with the summary; back to (TX_)READY.
-            let summary = result.stream.summary();
+            // trailing SUCCESS with the summary. This stream is closed — `entry` is dropped here, so
+            // its `qid` no longer addresses anything (rmp #391).
+            let summary = entry.result.stream.summary();
             self.send(&Response::Success {
                 metadata: summary_metadata(&summary, false),
             })?;
-            // The stream is fully consumed; its qid no longer addresses anything (rmp #391).
-            self.open_qid = None;
-            self.state = self.state.ready_after_stream();
+            drop(entry);
+            // Back to (TX_)READY only when NO stream is left open. The Bolt server-state spec's
+            // PULL/DISCARD tables give the post-stream state as "TX_READY **or TX_STREAMING if there
+            // are other streams open**" (Tables 7 and 8), so consuming one of several results inside
+            // a transaction keeps the connection streaming (rmp #907).
+            if self.open_streams.is_empty() {
+                self.state = self.state.ready_after_stream();
+            }
         }
         Ok(Flow::Continue)
     }
@@ -1209,8 +1390,7 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
         // `Some` and takes the normal recovery path below.
         if self.principal.is_none() {
             self.executor.rollback_open_tx();
-            self.open_stream = None;
-            self.open_qid = None;
+            self.close_all_streams();
             self.next_qid = 0;
             self.send_failure(Failure::new(
                 "Neo.ClientError.Request.Invalid",
@@ -1231,28 +1411,40 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
         // is safe on every RESET (clean `TxReady`/`TxStreaming`, post-failure `Failed`, or plain
         // `Ready`).
         self.executor.rollback_open_tx();
-        self.open_stream = None;
-        self.open_qid = None;
+        // RESET discards EVERY open result stream, not just the one being streamed: the connection
+        // must come back "as if HELLO/LOGON had just successfully completed", and a freshly
+        // authenticated connection has no open results at all (rmp #907 generalises the single-slot
+        // clear this used to do).
+        self.close_all_streams();
         self.next_qid = 0;
         self.send(&Response::Success { metadata: vec![] })?;
         self.state = State::Ready;
         Ok(Flow::Continue)
     }
 
-    /// Sends a `FAILURE` for a `GraphusError` and enters [`State::Failed`], dropping any open
-    /// stream (the fail-then-ignore rule then applies until `RESET`).
+    /// Drops **every** open result stream and forgets the `qid` they were addressed by.
+    ///
+    /// Used on `RESET` and on every failure path. Dropping a stream releases whatever the executor
+    /// attached to it (for the engine seam: the admission permit and the result channel), so no
+    /// stream is ever orphaned when a transaction is abandoned — with several open at once that
+    /// matters more than it did with one (rmp #907).
+    fn close_all_streams(&mut self) {
+        self.open_streams.clear();
+        self.last_opened_qid = None;
+    }
+
+    /// Sends a `FAILURE` for a `GraphusError` and enters [`State::Failed`], dropping **all** open
+    /// streams (the fail-then-ignore rule then applies until `RESET`).
     fn fail_with(&mut self, error: &graphus_core::GraphusError) -> BoltResult<()> {
-        self.open_stream = None;
-        self.open_qid = None;
+        self.close_all_streams();
         self.send_failure(failure_from_error(error))?;
         self.state = State::Failed;
         Ok(())
     }
 
-    /// Sends a protocol `FAILURE` and enters [`State::Failed`].
+    /// Sends a protocol `FAILURE` and enters [`State::Failed`], dropping **all** open streams.
     fn fail_protocol(&mut self, message: &str) -> BoltResult<()> {
-        self.open_stream = None;
-        self.open_qid = None;
+        self.close_all_streams();
         self.send_failure(Failure::new("Neo.ClientError.Request.Invalid", message))?;
         self.state = State::Failed;
         Ok(())
@@ -1269,8 +1461,7 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
     /// which the engine seam treats as unrestricted (rmp #820). No transaction can be open before
     /// authentication, so there is nothing to roll back.
     fn fail_terminal(&mut self, failure: Failure) -> BoltResult<Flow> {
-        self.open_stream = None;
-        self.open_qid = None;
+        self.close_all_streams();
         self.send_failure(failure)?;
         self.state = State::Defunct;
         Ok(Flow::Stop)
