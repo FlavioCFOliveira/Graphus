@@ -9,6 +9,7 @@
 #   5. the criterion regression gate (vs the committed baseline)
 #   6. the LDBC-SNB macro harness (tiny scale)
 #   7. the examples suite, in BOTH modes (self-boot + attached to a running instance)
+#   8. the official Neo4j driver interop suite (real driver over Bolt; needs node/npm + network)
 #
 # The SLOW gates are deliberately NOT run here (they are documented in VERIFICATION.md and run on a
 # nightly/manual job): the loom model-check, the miri UB gate, the full Criterion suites, and any
@@ -37,12 +38,12 @@ done
 
 step() { printf '\n\033[1;34m==> %s\033[0m\n' "$1"; }
 
-step "1/7  build + clippy + fmt (workspace)"
+step "1/8  build + clippy + fmt (workspace)"
 cargo build --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 
-step "2/7  anomaly gate — Elle/DSG serializability checker"
+step "2/8  anomaly gate — Elle/DSG serializability checker"
 cargo test -p graphus-cypher --test elle
 
 # A read of the record store returns raw physical state; which answer the caller owes back is one of
@@ -50,18 +51,18 @@ cargo test -p graphus-cypher --test elle
 # defects, each of them behind a docstring that asserted the wrong polarity and was believed. This
 # gate reads source text, costs milliseconds, and fails when a polarity-sensitive read appears or
 # moves without being classified (`rmp` #905; VERIFICATION.md gate 10).
-step "3/7  read-polarity census — superset / decision / conservative storage reads"
+step "3/8  read-polarity census — superset / decision / conservative storage reads"
 cargo test -p graphus-cypher --test read_polarity_census
 cargo test -p graphus-storage --test scan_polarity_barrier
 
-step "4/7  proptest invariants — codec round-trips + order-preserving key codec"
+step "4/8  proptest invariants — codec round-trips + order-preserving key codec"
 cargo test -p graphus-storage --test proptest_codecs
 cargo test -p graphus-cypher --test proptest_keycodec
 
-step "5/7  criterion regression gate — vs committed baseline (release)"
+step "5/8  criterion regression gate — vs committed baseline (release)"
 cargo run -q -p graphus-bench --release --bin bench_gate
 
-step "6/7  LDBC-SNB macro harness — tiny scale (release)"
+step "6/8  LDBC-SNB macro harness — tiny scale (release)"
 cargo run -q -p graphus-bench --release --bin ldbc_snb
 
 # The examples are the project's instrument for exposing regressions and resource inefficiencies in a
@@ -69,8 +70,33 @@ cargo run -q -p graphus-bench --release --bin ldbc_snb
 # evidence defects this gate now guards against (a failing example sitting unnoticed on `main`, reports
 # publishing fabricated zeros, a baseline gate comparing 0.0 to 0.0) survived precisely because nothing
 # executed the suite. It runs BOTH modes: self-boot, and attached to an already-running instance.
-step "7/7  examples suite — E2E, both modes (self-boot + attach to a running instance)"
+step "7/8  examples suite — E2E, both modes (self-boot + attach to a running instance)"
 scripts/examples-gate.sh
+
+# The official-driver interop suite is the ONLY test that proves the four inviolable wire claims (Bolt,
+# PackStream, and the Cypher and transaction semantics a real client depends on) against a real,
+# unmodified Neo4j driver rather than against Graphus's own view of them. It lives behind the opt-in
+# `neo4j-interop` cargo feature so that a plain `cargo test` stays hermetic — it needs `node`/`npm` and
+# the network to install the driver.
+#
+# That opt-in is exactly how `rmp` #960 hid. The suite has existed since 2026-06-15 and no automated
+# gate has ever enabled the feature, so when #865 introduced the defect on 2026-07-26,
+# `official_neo4j_driver_full_crud_nodes_and_edges` began failing on `main` while every gate that does
+# run stayed green — the regression was invisible to all of them. The suite is therefore a GATE here,
+# not an optional extra.
+#
+# It is a HARD failure when `node`/`npm` are missing, never a skip. A gate that quietly skips is
+# indistinguishable from a gate that passes, which is the failure mode being closed; the prerequisite is
+# documented in VERIFICATION.md and in the suite's own module docs.
+step "8/8  official Neo4j driver interop — real driver over Bolt (needs node/npm + network)"
+if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+    echo "FAIL: the interop gate needs \`node\` and \`npm\` on PATH (see VERIFICATION.md)." >&2
+    echo "      They are a prerequisite of scripts/verify.sh, not an optional extra: this suite is" >&2
+    echo "      the only proof that the official driver ecosystem can talk to Graphus." >&2
+    exit 1
+fi
+# Serial: the tests each boot a server and share one npm prefix, so they must not race on it.
+cargo test -p graphus-server --features neo4j-interop --test neo4j_driver_interop -- --test-threads=1
 
 if [ "$WITH_LOOM" = "1" ]; then
     step "loom model-check — buffer-pool latch protocol (slow)"

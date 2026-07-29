@@ -23,6 +23,14 @@ how CI should schedule it.
 | 8 | LDBC-SNB macro harness | `graphus-bench` (`bin/ldbc_snb`, `src/ldbc/`) | nightly / perf job | seconds (tiny) |
 | 9 | Examples suite — E2E, both modes | `examples/run-all.sh` via `scripts/examples-gate.sh` | every push | ~2–4 min |
 | 10 | Read-polarity census (superset / decision / conservative) | `graphus-cypher/tests/read_polarity_census.rs`, `graphus-storage/tests/scan_polarity_barrier.rs` | every push | < 1 s |
+| 11 | Official Neo4j driver interop (real driver over Bolt) | `graphus-server/tests/neo4j_driver_interop.rs` (feature `neo4j-interop`) | every push | ~1–3 min |
+
+> **What "every push" means today.** It is the *intended* cadence, and it is what `scripts/verify.sh`
+> runs — but nothing invokes that script automatically: `.github/workflows/` holds only the on-demand
+> Docker Hub publish job, so every "every push" gate above is in practice **run by a human executing
+> `scripts/verify.sh`**. This is worth stating plainly rather than leaving the column to imply
+> enforcement that does not exist, because a gate nobody runs is exactly how `rmp` #960 survived (see
+> gate 11). Restoring a CI workflow that invokes `scripts/verify.sh` is the open item.
 
 ---
 
@@ -399,11 +407,51 @@ census table with its justification.
 
 ---
 
+## 11. Official Neo4j driver interop — the wire claims, proved by a real client (`rmp` #960)
+
+Three of the project's four inviolable claims are claims about **interoperability**: that any Bolt
+client, "including the official Neo4j driver ecosystem", can talk to Graphus exactly as the
+specification mandates. Every other test in this repository checks Graphus against Graphus's own
+reading of those specifications. This suite is the only one that checks it against an **unmodified,
+official `neo4j-driver`**, driven from Node.js over a real socket: connect, authenticate, run
+parameterised reads and writes, explicit and managed transactions, and read the results back.
+
+```sh
+cargo test -p graphus-server --features neo4j-interop --test neo4j_driver_interop -- --test-threads=1
+```
+
+**Prerequisite: `node` and `npm` on `PATH`, plus network access** (the harness runs
+`npm install neo4j-driver`). This is why the suite sits behind the opt-in `neo4j-interop` cargo
+feature: a plain `cargo test` must stay hermetic. `--test-threads=1` is required — each test boots a
+server and they share one npm prefix.
+
+**Why it is a gate and not an optional extra.** The opt-in feature is exactly how `rmp` #960 stayed
+hidden. The suite has existed since 2026-06-15 (`rmp` #226/#230) and no automated gate has ever enabled
+it. So when #865 introduced the defect on 2026-07-26,
+`official_neo4j_driver_full_crud_nodes_and_edges` began failing on `main` — reporting
+`after CREATE edges, count=0, expected 200` — and every gate that *does* run stayed green, start to
+finish. The defect it was catching was a silent wrong answer: a `MATCH` predicate combining a
+driving-row variable with a query parameter matched nothing, which broke the `UNWIND … MATCH … CREATE`
+idiom every driver uses to write relationships in bulk. A test that nothing runs cannot fail, and a
+claim nothing tests is not a claim.
+
+`scripts/verify.sh` therefore runs it as step 8, and **fails hard** when `node`/`npm` are absent rather
+than skipping. A gate that quietly skips is indistinguishable from a gate that passes — the very
+property that let this regression survive. The consequence is deliberate: `scripts/verify.sh` cannot
+complete on a machine with no network access, because it cannot honestly claim conformance it did not
+measure.
+
+**When gate 11 fails**, treat it as a conformance defect first, not a harness defect. The driver is the
+reference implementation of the protocol; if it disagrees with Graphus, Graphus is the one that has to
+change.
+
+---
+
 ## Quick start
 
 ```sh
 # Fast gates only (build/clippy/fmt, anomaly, read-polarity census, proptest, regression gate,
-# LDBC, examples) — every push:
+# LDBC, examples, official-driver interop) — every push:
 scripts/verify.sh
 
 # Add the slow gates as needed:

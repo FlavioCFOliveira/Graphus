@@ -392,6 +392,32 @@ fn collect_param_expectations(plan: &PhysicalPlan) -> BTreeMap<String, ParamType
 
 /// Walks a physical plan, reporting each parameter reference with its position expectation through
 /// `record`.
+///
+/// # Why every pattern below is exhaustive (no `..`)
+///
+/// [`BoundParameters`] carries **exactly** the names this walk records, and [`crate::eval`] resolves
+/// an unrecorded `$p` to [`Value::Null`]. An expression field that escapes this walk is therefore not
+/// a missing diagnostic — it is a **silent wrong answer**: the comparison goes null, every row is
+/// rejected, and the query returns zero rows with no error at all.
+///
+/// That has now happened four times, always the same way — a planner pass moves an expression *out*
+/// of a `Filter` and *onto* an operator field, and this walk is not updated with it:
+/// `ExpandAll::to_predicate` (`rmp` #870), `OptionalExpand::predicates` (#882), the count-store
+/// `fallback` (#866), and `ValueHashJoin`'s join keys (#960). The last one made **every** `MATCH`
+/// whose predicate combines a driving-row variable with a `$param` match nothing, which is precisely
+/// the `UNWIND … MATCH … CREATE` idiom every official driver writes.
+///
+/// So the patterns bind **every** field of **every** variant, with `_` for the ones that hold no
+/// expression. That verbosity is the point and must stay: adding a field to any [`PhysicalOp`]
+/// variant is then a **compile error here**, which forces whoever adds it to decide whether it
+/// carries an expression — instead of shipping another silently empty result.
+///
+/// [`PhysicalOp::op_expressions`](crate::physical::PhysicalOp) is a second, independently maintained
+/// inventory of "which expressions does this operator evaluate", and comparing the two is a useful
+/// review check — it had `ValueHashJoin`'s keys right while this walk did not. It is **not** a
+/// substitute, though: it deliberately reports nothing for the write operators (`Create`, `Merge`,
+/// `SetClause`, `Delete`, `Remove`, `Foreach`, `ProcedureCall`), whose expressions this walk must and
+/// does still collect. Reconcile the two only in the read-operator direction.
 fn walk_physical(op: &PhysicalOp, record: &mut impl FnMut(&str, ParamType)) {
     match op {
         // ---- count positions: Integer expectation ------------------------------------------
@@ -408,20 +434,50 @@ fn walk_physical(op: &PhysicalOp, record: &mut impl FnMut(&str, ParamType)) {
         }
 
         // ---- value positions: Any expectation ----------------------------------------------
-        PhysicalOp::NodeIndexSeek { value, .. } => {
+        PhysicalOp::NodeIndexSeek {
+            value,
+            variable: _,
+            label: _,
+            property: _,
+            ordered: _,
+            cached_property: _,
+            index: _,
+        } => {
             // Index-seek value: no static type expectation in v1 (indexability is the executor's
             // runtime concern); record as Any. (A seek is a leaf — no input to recurse into.)
             params_in_expr(value, ParamType::Any, record);
         }
-        PhysicalOp::NodeCompositeIndexSeek { values, .. } => {
+        PhysicalOp::NodeCompositeIndexSeek {
+            values,
+            variable: _,
+            label: _,
+            properties: _,
+            cached_property: _,
+            index: _,
+        } => {
             // Composite index-seek values (`rmp` task #657): one per key, each treated like a single
             // seek value — no static type expectation, recorded as Any. A leaf, so no input to recurse.
             for value in values {
                 params_in_expr(value, ParamType::Any, record);
             }
         }
-        PhysicalOp::NodeIndexMultiSeek { values, .. }
-        | PhysicalOp::RelIndexMultiSeek { values, .. } => {
+        PhysicalOp::NodeIndexMultiSeek {
+            values,
+            variable: _,
+            label: _,
+            property: _,
+            index: _,
+        }
+        | PhysicalOp::RelIndexMultiSeek {
+            values,
+            relationship: _,
+            from: _,
+            to: _,
+            rel_type: _,
+            property: _,
+            direction: _,
+            index: _,
+        } => {
             // The multi-value seek's alternatives (`rmp` task #868): one per `IN`-list element / `OR`
             // branch, each treated exactly like a single seek value — no static type expectation,
             // recorded as Any. They MUST be walked here or a `$param` alternative would never bind.
@@ -430,39 +486,94 @@ fn walk_physical(op: &PhysicalOp, record: &mut impl FnMut(&str, ParamType)) {
                 params_in_expr(value, ParamType::Any, record);
             }
         }
-        PhysicalOp::NodeLabelScanEq { value, .. } => {
+        PhysicalOp::NodeLabelScanEq {
+            value,
+            variable: _,
+            label: _,
+            property: _,
+        } => {
             // The precise equality-scan value (`rmp` task #325): same treatment as a seek value — no
             // static type expectation, recorded as Any. A leaf, so no input to recurse into.
             params_in_expr(value, ParamType::Any, record);
         }
-        PhysicalOp::NodeIndexRangeSeek { value, .. } => {
+        PhysicalOp::NodeIndexRangeSeek {
+            value,
+            variable: _,
+            label: _,
+            property: _,
+            bound: _,
+            ordered: _,
+            cached_property: _,
+            index: _,
+        } => {
             params_in_expr(value, ParamType::Any, record);
         }
-        PhysicalOp::RelIndexSeek { value, .. } => {
+        PhysicalOp::RelIndexSeek {
+            value,
+            relationship: _,
+            from: _,
+            to: _,
+            rel_type: _,
+            property: _,
+            direction: _,
+            index: _,
+        } => {
             // The relationship-property seek value (`rmp` task #659): same treatment as a node seek
             // value — no static type expectation, recorded as Any. A leaf — no input to recurse into.
             params_in_expr(value, ParamType::Any, record);
         }
-        PhysicalOp::RelIndexRangeSeek { value, .. } => {
+        PhysicalOp::RelIndexRangeSeek {
+            value,
+            relationship: _,
+            from: _,
+            to: _,
+            rel_type: _,
+            property: _,
+            bound: _,
+            direction: _,
+            index: _,
+        } => {
             // The relationship-property RANGE seek's bound value (`rmp` task #680): commonly a `$param`
             // after literal auto-parameterisation (`WHERE r.amount >= 9000` becomes `>= $AUTOPARAM_n`),
             // so it MUST be walked here or the bound would never bind. Same treatment as the node range
             // seek's bound — no static type expectation, recorded as Any. A leaf — no input to recurse.
             params_in_expr(value, ParamType::Any, record);
         }
-        PhysicalOp::RelCompositeIndexSeek { values, .. } => {
+        PhysicalOp::RelCompositeIndexSeek {
+            values,
+            relationship: _,
+            from: _,
+            to: _,
+            rel_type: _,
+            properties: _,
+            direction: _,
+            index: _,
+        } => {
             // The composite relationship seek values (`rmp` task #666): one per key, each treated like a
             // single seek value — no static type expectation, recorded as Any. A leaf — no input.
             for value in values {
                 params_in_expr(value, ParamType::Any, record);
             }
         }
-        PhysicalOp::NodeIndexStartsWithSeek { prefix, .. } => {
+        PhysicalOp::NodeIndexStartsWithSeek {
+            prefix,
+            variable: _,
+            label: _,
+            property: _,
+            index: _,
+        } => {
             // The STARTS WITH prefix (`rmp` task #658): commonly a `$param` after literal
             // auto-parameterisation. No static type expectation, recorded as Any. A leaf — no input.
             params_in_expr(prefix, ParamType::Any, record);
         }
-        PhysicalOp::NodeTextIndexSeek { needle, .. } => {
+        PhysicalOp::NodeTextIndexSeek {
+            needle,
+            variable: _,
+            label: _,
+            property: _,
+            op: _,
+            index: _,
+        } => {
             // The CONTAINS/ENDS WITH/STARTS WITH needle (`rmp` task #662): commonly a `$param` after
             // literal auto-parameterisation. No static type expectation, recorded as Any. A leaf.
             params_in_expr(needle, ParamType::Any, record);
@@ -471,7 +582,11 @@ fn walk_physical(op: &PhysicalOp, record: &mut impl FnMut(&str, ParamType)) {
             params_in_expr(predicate, ParamType::Any, record);
             walk_physical(input, record);
         }
-        PhysicalOp::Projection { input, items, .. } => {
+        PhysicalOp::Projection {
+            input,
+            items,
+            distinct: _,
+        } => {
             for it in items {
                 params_in_expr(&it.expr, ParamType::Any, record);
             }
@@ -492,8 +607,16 @@ fn walk_physical(op: &PhysicalOp, record: &mut impl FnMut(&str, ParamType)) {
         // so the walk must descend into it. Treating them as expression-free *leaves* would silently
         // stop collecting parameter references from the subtree that actually runs whenever the seam
         // declines, and a `$param` in it would then fail to bind.
-        PhysicalOp::NodeCountFromCountStore { fallback, .. }
-        | PhysicalOp::RelationshipCountFromCountStore { fallback, .. } => {
+        PhysicalOp::NodeCountFromCountStore {
+            fallback,
+            column: _,
+            label: _,
+        }
+        | PhysicalOp::RelationshipCountFromCountStore {
+            fallback,
+            column: _,
+            types: _,
+        } => {
             walk_physical(fallback, record);
         }
         PhysicalOp::Sort { input, keys } => {
@@ -545,7 +668,14 @@ fn walk_physical(op: &PhysicalOp, record: &mut impl FnMut(&str, ParamType)) {
             input,
             rel_props,
             to_predicate,
-            ..
+            from: _,
+            relationship: _,
+            to: _,
+            direction: _,
+            types: _,
+            range: _,
+            prior_rels: _,
+            pruning: _,
         } => {
             for e in rel_props.iter().chain(to_predicate.iter()) {
                 params_in_expr(e, ParamType::Any, record);
@@ -553,23 +683,62 @@ fn walk_physical(op: &PhysicalOp, record: &mut impl FnMut(&str, ParamType)) {
             walk_physical(input, record);
         }
         PhysicalOp::ExpandInto {
-            input, rel_props, ..
+            input,
+            rel_props,
+            from: _,
+            relationship: _,
+            to: _,
+            direction: _,
+            types: _,
+            range: _,
+            prior_rels: _,
         } => {
             if let Some(props) = rel_props {
                 params_in_expr(props, ParamType::Any, record);
             }
             walk_physical(input, record);
         }
-        PhysicalOp::ShortestPath { input, .. } | PhysicalOp::NamedPath { input, .. } => {
+        // Neither carries an expression of its own: a path operator's bounds are `VarLengthRange`
+        // (plain `Option<u64>` counts) and its steps are `Var`s.
+        PhysicalOp::ShortestPath {
+            input,
+            from: _,
+            to: _,
+            relationship: _,
+            path: _,
+            direction: _,
+            types: _,
+            range: _,
+            all: _,
+        }
+        | PhysicalOp::NamedPath {
+            input,
+            variable: _,
+            start: _,
+            steps: _,
+        } => {
             walk_physical(input, record);
         }
 
         // A quantified path pattern carries its per-iteration interior predicate, which may reference
         // parameters (e.g. `((x)-[r]->(y) WHERE x.age > $min){1,3}`).
+        // `extra_hops` holds `QppStep`s, which carry only `Var`s, a direction and relationship types —
+        // every interior condition of every hop is folded into the one `interior_predicate`.
         PhysicalOp::QuantifiedPath {
             input,
             interior_predicate,
-            ..
+            from: _,
+            to: _,
+            group_start: _,
+            group_end: _,
+            relationship: _,
+            direction: _,
+            types: _,
+            extra_hops: _,
+            min: _,
+            max: _,
+            prior_rels: _,
+            into: _,
         } => {
             if let Some(pred) = interior_predicate {
                 params_in_expr(pred, ParamType::Any, record);
@@ -578,13 +747,38 @@ fn walk_physical(op: &PhysicalOp, record: &mut impl FnMut(&str, ParamType)) {
         }
 
         // ---- joins / branches ---------------------------------------------------------------
+        // `join_keys` are shared column NAMES (`Vec<String>`), not expressions, and `all` is a flag.
         PhysicalOp::NestedLoopJoin { left, right }
-        | PhysicalOp::HashJoin { left, right, .. }
-        | PhysicalOp::ValueHashJoin { left, right, .. } => {
+        | PhysicalOp::HashJoin {
+            left,
+            right,
+            join_keys: _,
+        }
+        | PhysicalOp::Union {
+            left,
+            right,
+            all: _,
+        } => {
             walk_physical(left, record);
             walk_physical(right, record);
         }
-        PhysicalOp::Union { left, right, .. } => {
+        // `rmp` #960. Unlike every other join, this one carries its own key EXPRESSIONS, and they are
+        // the only place those expressions exist — the planner builds a `ValueHashJoin` by CONSUMING
+        // the `Filter` that held the equality (`rmp` #865), so after the rewrite there is no `Filter`
+        // arm above to record their `$param`s. Grouping it with the other joins for their shared
+        // `left`/`right` forced a `..` here, and the two keys fell through it: `BoundParameters` then
+        // omitted the name, `eval` resolved it to `Null`, the key never matched, and
+        // `UNWIND range(0, 99) AS i MATCH (b:Person {id: (i + 1) % $n}) …` returned ZERO rows against a
+        // store that held every one of them. The literal spelling of the same query was unaffected,
+        // which is what kept it hidden.
+        PhysicalOp::ValueHashJoin {
+            left,
+            right,
+            left_key,
+            right_key,
+        } => {
+            params_in_expr(left_key, ParamType::Any, record);
+            params_in_expr(right_key, ParamType::Any, record);
             walk_physical(left, record);
             walk_physical(right, record);
         }
@@ -593,19 +787,35 @@ fn walk_physical(op: &PhysicalOp, record: &mut impl FnMut(&str, ParamType)) {
         // `WHERE EXISTS { (u:USER {uidn: $id}) }` declaring `$id`. The `predicate` field is NOT walked:
         // it is the same subquery in its un-rewritten spelling, so recording it too would double-declare
         // every parameter, and it is never evaluated.
-        PhysicalOp::SemiApply { input, inner, .. } => {
+        PhysicalOp::SemiApply {
+            input,
+            inner,
+            anti: _,
+            predicate: _,
+        } => {
             walk_physical(input, record);
             walk_physical(inner, record);
         }
-        PhysicalOp::Optional { input, .. } | PhysicalOp::Eager { input } => {
-            walk_physical(input, record)
+        PhysicalOp::Optional {
+            input,
+            null_variables: _,
         }
+        | PhysicalOp::Eager { input } => walk_physical(input, record),
         // `rmp` #882: the fused one-hop `OPTIONAL MATCH` carries the predicates that used to be
         // `Filter` operators of its own, so its parameters must be recorded here or a
         // `OPTIONAL MATCH (a)-[r]->(b) WHERE b.x = $v` would silently lose the `$v` expectation the
         // `Filter` arm above used to record.
         PhysicalOp::OptionalExpand {
-            input, predicates, ..
+            input,
+            predicates,
+            from: _,
+            relationship: _,
+            to: _,
+            direction: _,
+            types: _,
+            into: _,
+            null_variables: _,
+            arguments: _,
         } => {
             for predicate in predicates {
                 params_in_expr(predicate, ParamType::Any, record);
@@ -614,19 +824,25 @@ fn walk_physical(op: &PhysicalOp, record: &mut impl FnMut(&str, ParamType)) {
         }
 
         // ---- write operators carry expressions in their pattern/ops -------------------------
-        PhysicalOp::Create { input, pattern } | PhysicalOp::Merge { input, pattern, .. } => {
+        PhysicalOp::Create { input, pattern } => {
             for part in pattern {
                 params_in_create_part(part, record);
             }
-            if let PhysicalOp::Merge {
-                on_create,
-                on_match,
-                ..
-            } = op
-            {
-                for set_op in on_create.iter().chain(on_match) {
-                    params_in_set_op(set_op, record);
-                }
+            walk_physical(input, record);
+        }
+        // Kept separate from `Create` (rather than sharing an arm and re-matching for the `SET` ops)
+        // so that both patterns stay field-exhaustive and cannot drift apart.
+        PhysicalOp::Merge {
+            input,
+            pattern,
+            on_create,
+            on_match,
+        } => {
+            for part in pattern {
+                params_in_create_part(part, record);
+            }
+            for set_op in on_create.iter().chain(on_match) {
+                params_in_set_op(set_op, record);
             }
             walk_physical(input, record);
         }
@@ -636,7 +852,11 @@ fn walk_physical(op: &PhysicalOp, record: &mut impl FnMut(&str, ParamType)) {
             }
             walk_physical(input, record);
         }
-        PhysicalOp::Delete { input, exprs, .. } => {
+        PhysicalOp::Delete {
+            input,
+            exprs,
+            detach: _,
+        } => {
             for e in exprs {
                 params_in_expr(e, ParamType::Any, record);
             }
@@ -644,21 +864,39 @@ fn walk_physical(op: &PhysicalOp, record: &mut impl FnMut(&str, ParamType)) {
         }
         PhysicalOp::Remove { input, ops } => {
             for op in ops {
-                if let crate::logical::RemoveOp::Property { target } = op {
-                    params_in_expr(target, ParamType::Any, record);
+                // A `match`, not an `if let`: an `if let` is not exhaustiveness-checked, so a future
+                // `RemoveOp` variant carrying an expression would compile here and silently lose its
+                // `$param`s — the very failure mode this walk exists to prevent.
+                match op {
+                    crate::logical::RemoveOp::Property { target } => {
+                        params_in_expr(target, ParamType::Any, record);
+                    }
+                    // `REMOVE n:Label` names a variable and a label list; no expression.
+                    crate::logical::RemoveOp::Labels {
+                        target: _,
+                        labels: _,
+                    } => {}
                 }
             }
             walk_physical(input, record);
         }
         PhysicalOp::Foreach {
-            input, list, body, ..
+            input,
+            list,
+            body,
+            variable: _,
         } => {
             params_in_expr(list, ParamType::Any, record);
             walk_physical(input, record);
             // The body sub-plan may reference `$param`s in its inner update clauses.
             walk_physical(body, record);
         }
-        PhysicalOp::ProcedureCall { input, args, .. } => {
+        PhysicalOp::ProcedureCall {
+            input,
+            args,
+            name: _,
+            yields: _,
+        } => {
             if let Some(args) = args {
                 for a in args {
                     params_in_expr(a, ParamType::Any, record);
@@ -673,26 +911,79 @@ fn walk_physical(op: &PhysicalOp, record: &mut impl FnMut(&str, ParamType)) {
         // `SpatialIndexSeek` / `RelSpatialIndexSeek`'s centre and radius are plan-time-folded `f64`
         // constants (never `$param`s — a non-constant proximity predicate is declined by the planner),
         // so they carry no parameter references (`rmp` tasks #73, #664).
-        PhysicalOp::AllNodesScan { .. }
-        | PhysicalOp::NodeByLabelScan { .. }
-        | PhysicalOp::TokenLookupScan { .. }
-        | PhysicalOp::NodeIndexScan { .. }
-        | PhysicalOp::SpatialIndexSeek { .. }
-        | PhysicalOp::RelSpatialIndexSeek { .. }
-        | PhysicalOp::AllRelationshipsScan { .. }
-        | PhysicalOp::Argument { .. }
+        PhysicalOp::AllNodesScan { variable: _ }
+        | PhysicalOp::NodeByLabelScan {
+            variable: _,
+            label: _,
+        }
+        | PhysicalOp::TokenLookupScan {
+            variable: _,
+            label: _,
+            index: _,
+        }
+        | PhysicalOp::NodeIndexScan {
+            variable: _,
+            label: _,
+            property: _,
+            ordered: _,
+            cached_property: _,
+            index: _,
+        }
+        | PhysicalOp::SpatialIndexSeek {
+            variable: _,
+            label: _,
+            property: _,
+            center_x: _,
+            center_y: _,
+            radius: _,
+            index: _,
+        }
+        | PhysicalOp::RelSpatialIndexSeek {
+            relationship: _,
+            from: _,
+            to: _,
+            rel_type: _,
+            property: _,
+            center_x: _,
+            center_y: _,
+            radius: _,
+            direction: _,
+            index: _,
+        }
+        | PhysicalOp::AllRelationshipsScan {
+            relationship: _,
+            from: _,
+            to: _,
+            direction: _,
+            types: _,
+        }
+        | PhysicalOp::Argument { arguments: _ }
         | PhysicalOp::Empty => {}
     }
 }
 
 /// Reports parameters appearing in a write-pattern part's inline property expression.
+///
+/// Field-exhaustive for the same reason [`walk_physical`] is: an unrecorded `$param` in a `CREATE`
+/// property map is a silent wrong write, not a diagnostic.
 fn params_in_create_part(
     part: &crate::logical::CreatePart,
     record: &mut impl FnMut(&str, ParamType),
 ) {
     let props = match part {
-        crate::logical::CreatePart::Node { properties, .. }
-        | crate::logical::CreatePart::Relationship { properties, .. } => properties,
+        crate::logical::CreatePart::Node {
+            properties,
+            variable: _,
+            labels: _,
+        }
+        | crate::logical::CreatePart::Relationship {
+            properties,
+            variable: _,
+            from: _,
+            to: _,
+            rel_type: _,
+            direction: _,
+        } => properties,
     };
     if let Some(props) = props {
         params_in_expr(props, ParamType::Any, record);
@@ -700,17 +991,24 @@ fn params_in_create_part(
 }
 
 /// Reports parameters appearing in a `SET` op's value/target expressions.
+///
+/// Field-exhaustive: see [`params_in_create_part`].
 fn params_in_set_op(op: &crate::logical::SetOp, record: &mut impl FnMut(&str, ParamType)) {
     match op {
         crate::logical::SetOp::Property { target, value } => {
             params_in_expr(target, ParamType::Any, record);
             params_in_expr(value, ParamType::Any, record);
         }
-        crate::logical::SetOp::ReplaceProperties { value, .. }
-        | crate::logical::SetOp::MergeProperties { value, .. } => {
+        // `target` is a `Var`, not an expression, in both of these.
+        crate::logical::SetOp::ReplaceProperties { value, target: _ }
+        | crate::logical::SetOp::MergeProperties { value, target: _ } => {
             params_in_expr(value, ParamType::Any, record);
         }
-        crate::logical::SetOp::AddLabels { .. } => {}
+        // `SET n:Label` names a variable and a label list; no expression.
+        crate::logical::SetOp::AddLabels {
+            target: _,
+            labels: _,
+        } => {}
     }
 }
 
@@ -771,35 +1069,78 @@ fn params_in_expr(expr: &Expr, ty: ParamType, record: &mut impl FnMut(&str, Para
             }
         }
         ExprKind::Case(case) => params_in_case(case, record),
-        ExprKind::ListComprehension(lc) => {
-            params_in_expr(&lc.list, ParamType::Any, record);
-            if let Some(p) = &lc.predicate {
+        ExprKind::ListComprehension(crate::ast::ListComprehension {
+            list,
+            predicate,
+            projection,
+            variable: _,
+        }) => {
+            params_in_expr(list, ParamType::Any, record);
+            if let Some(p) = predicate {
                 params_in_expr(p, ParamType::Any, record);
             }
-            if let Some(proj) = &lc.projection {
+            if let Some(proj) = projection {
                 params_in_expr(proj, ParamType::Any, record);
             }
         }
+        // The comprehension's PATTERN is evaluated per driving row exactly like a `MATCH` pattern —
+        // `eval_pattern_comprehension` matches `pc.element` and applies each inline property map — so
+        // its `$param`s must be recorded here. They were not, which is the same defect class as `rmp`
+        // #960 one level down: `RETURN [(a)-[:KNOWS]->(b:Person {city: $c}) | b.name]` left `$c`
+        // unbound, the map comparison went null, and the comprehension yielded an EMPTY LIST for
+        // every row while the `WHERE b.city = $c` spelling of the same query returned the match.
         ExprKind::PatternComprehension(pc) => {
-            if let Some(p) = &pc.predicate {
+            // Destructured exhaustively (rather than reaching for fields) so that a new field on
+            // `PatternComprehension` is a compile error here. `element` was missing for exactly that
+            // reason. The `&**` is because the payload is boxed; box patterns are not stable.
+            let crate::ast::PatternComprehension {
+                element,
+                predicate,
+                projection,
+                var: _,
+            } = &**pc;
+            params_in_pattern_element(element, record);
+            if let Some(p) = predicate {
                 params_in_expr(p, ParamType::Any, record);
             }
-            params_in_expr(&pc.projection, ParamType::Any, record);
+            params_in_expr(projection, ParamType::Any, record);
         }
         ExprKind::Quantifier(q) => {
-            params_in_expr(&q.list, ParamType::Any, record);
-            params_in_expr(&q.predicate, ParamType::Any, record);
+            let crate::ast::QuantifierExpr {
+                list,
+                predicate,
+                kind: _,
+                variable: _,
+            } = &**q;
+            params_in_expr(list, ParamType::Any, record);
+            params_in_expr(predicate, ParamType::Any, record);
         }
         ExprKind::Reduce(r) => {
-            params_in_expr(&r.init, ParamType::Any, record);
-            params_in_expr(&r.list, ParamType::Any, record);
-            params_in_expr(&r.body, ParamType::Any, record);
+            let crate::ast::ReduceExpr {
+                init,
+                list,
+                body,
+                accumulator: _,
+                variable: _,
+            } = &**r;
+            params_in_expr(init, ParamType::Any, record);
+            params_in_expr(list, ParamType::Any, record);
+            params_in_expr(body, ParamType::Any, record);
         }
         ExprKind::MapProjection(mp) => {
-            params_in_expr(&mp.entity, ParamType::Any, record);
-            for sel in &mp.selectors {
-                if let crate::ast::MapProjectionSelector::Entry { value, .. } = sel {
-                    params_in_expr(value, ParamType::Any, record);
+            let crate::ast::MapProjection { entity, selectors } = &**mp;
+            params_in_expr(entity, ParamType::Any, record);
+            for sel in selectors {
+                // A `match`, not an `if let`, for the reason given on [`walk_physical`]: an `if let`
+                // is not exhaustiveness-checked, so a future selector carrying an expression would
+                // compile here and silently lose its `$param`s.
+                match sel {
+                    crate::ast::MapProjectionSelector::Entry { value, key: _ } => {
+                        params_in_expr(value, ParamType::Any, record);
+                    }
+                    // `.name` is a property key; `.*` names nothing. Neither holds an expression.
+                    crate::ast::MapProjectionSelector::Property(_)
+                    | crate::ast::MapProjectionSelector::AllProperties => {}
                 }
             }
         }
@@ -849,6 +1190,19 @@ fn params_in_query(query: &Query, record: &mut impl FnMut(&str, ParamType)) {
                 for a in args {
                     params_in_expr(a, ParamType::Any, record);
                 }
+            }
+            // `CALL … YIELD a, b WHERE <expr>` — the trailing filter is an expression like any other.
+            // Unreachable today (a subquery body is always a `QueryBody::Regular`, and the top-level
+            // standalone form lowers its `WHERE` into a `Filter` that the plan walk records), but this
+            // function's name invites reuse on a top-level query, and omitting it is the identical
+            // defect class this module exists to prevent. `crate::plan_cache`'s twin walker already
+            // walks it.
+            if let Some(crate::ast::StandaloneYield::Items {
+                where_clause: Some(w),
+                items: _,
+            }) = &call.yield_clause
+            {
+                params_in_expr(w, ParamType::Any, record);
             }
         }
     }
@@ -913,8 +1267,15 @@ fn params_in_single_query(sq: &SingleQuery, record: &mut impl FnMut(&str, ParamT
             }
             Clause::Remove(r) => {
                 for item in &r.items {
-                    if let RemoveItem::Property(e) = item {
-                        params_in_expr(e, ParamType::Any, record);
+                    // A `match`, not an `if let`: see [`walk_physical`]. The AST twin of the
+                    // `RemoveOp` walk in the plan walker, and hardened for the same reason.
+                    match item {
+                        RemoveItem::Property(e) => params_in_expr(e, ParamType::Any, record),
+                        // `REMOVE n:Label` names a variable and a label list; no expression.
+                        RemoveItem::Labels {
+                            target: _,
+                            labels: _,
+                        } => {}
                     }
                 }
             }
@@ -976,10 +1337,24 @@ fn params_in_projection_body(body: &ProjectionBody, record: &mut impl FnMut(&str
 
 /// Reports the parameters referenced by a pattern part's inline property maps (`{p: $x}`).
 fn params_in_pattern_part(part: &PatternPart, record: &mut impl FnMut(&str, ParamType)) {
-    if let Some(props) = &part.element.start.properties {
+    params_in_pattern_element(&part.element, record);
+}
+
+/// Reports the parameters referenced by a pattern **element**'s inline property maps (`{p: $x}`).
+///
+/// Split out of [`params_in_pattern_part`] so that the two places a pattern element is evaluated —
+/// a clause's [`PatternPart`] and a
+/// [`PatternComprehension`](crate::ast::PatternComprehension)'s `element` — share ONE implementation.
+/// They did not, and the comprehension's copy simply did not exist, so every `$param` written inside a
+/// comprehension's pattern was silently unbound.
+fn params_in_pattern_element(
+    element: &crate::ast::PatternElement,
+    record: &mut impl FnMut(&str, ParamType),
+) {
+    if let Some(props) = &element.start.properties {
         params_in_expr(props, ParamType::Any, record);
     }
-    for link in &part.element.chain {
+    for link in &element.chain {
         if let Some(props) = &link.relationship.properties {
             params_in_expr(props, ParamType::Any, record);
         }
