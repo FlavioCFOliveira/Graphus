@@ -37,9 +37,12 @@
 //!
 //! Time-zone *rules* (IANA tzdb lookups) are intentionally **not** implemented
 //! here: a `ZonedDateTime` carries an already-resolved offset, and resolving a
-//! named zone to an offset is the responsibility of the layer that owns the
-//! time-zone database. The `parse_zoned_date_time_parts` function exposes the
-//! unresolved pieces so that callers can perform that resolution.
+//! named zone to an offset belongs to the sibling module [`crate::timezone`],
+//! which owns the embedded time-zone database. The `parse_zoned_date_time_parts`
+//! function exposes the unresolved pieces so that callers can perform that
+//! resolution. This module stays pure and data-free; only the two zone-related
+//! [`TemporalError`] variants cross the boundary, so that the whole temporal
+//! surface reports through one error type.
 //!
 //! All functions are pure, allocation is limited to the returned `String`s, and
 //! no function panics on any input (invalid components and out-of-range results
@@ -102,6 +105,17 @@ pub enum TemporalError {
     },
     /// The result is not representable in the fixed-width storage types.
     Overflow,
+    /// A named IANA time zone is absent from the embedded tz database. Carries the id as it was
+    /// supplied, so the message names what the caller actually wrote.
+    UnknownTimeZone(String),
+    /// The zone exists but its rules could not answer the query (unparseable TZif data, or an
+    /// instant outside the range the rules cover).
+    TimeZoneRules {
+        /// The zone id as it was supplied.
+        zone: String,
+        /// The underlying reason, already rendered.
+        reason: String,
+    },
 }
 
 impl fmt::Display for TemporalError {
@@ -114,6 +128,11 @@ impl fmt::Display for TemporalError {
                 write!(f, "cannot parse temporal value {input:?}: {reason}")
             }
             Self::Overflow => write!(f, "temporal value out of representable range"),
+            // These two renderings are a contract, not a detail: the Cypher evaluator surfaces
+            // them verbatim as the `TypeError` context (`temporal_fns::terr`), so the text is the
+            // same as before the resolver moved out of `graphus-cypher` (`rmp` #908).
+            Self::UnknownTimeZone(zone) => write!(f, "unknown time zone id `{zone}`"),
+            Self::TimeZoneRules { zone, reason } => write!(f, "time zone `{zone}`: {reason}"),
         }
     }
 }

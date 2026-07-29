@@ -34,13 +34,13 @@
 
 use graphus_core::Value;
 use graphus_core::temporal_calc::{self as tc, TemporalError};
+use graphus_core::timezone;
 use graphus_core::value::temporal::{
     Date, Duration, LocalDateTime, LocalTime, NANOS_PER_DAY, ZonedDateTime, ZonedTime,
 };
 
 use crate::eval::EvalError;
 use crate::statement_clock::StatementClock;
-use crate::timezone;
 
 /// Adapts a calendar-engine error to the evaluator's runtime error class.
 fn terr(e: TemporalError) -> EvalError {
@@ -225,7 +225,7 @@ fn construct_time(arg: &Value) -> Result<Value, EvalError> {
                         Date::default(),
                         base.as_ref().map(|b| b.time).unwrap_or_default(),
                     );
-                    let (_, offset) = timezone::resolve_local(zone, &anchor, None)?;
+                    let (_, offset) = timezone::resolve_local(zone, &anchor, None).map_err(terr)?;
                     (base.as_ref().map(|b| b.time), offset)
                 }
                 (None, _) => (
@@ -281,8 +281,9 @@ fn construct_date_time(arg: &Value) -> Result<Value, EvalError> {
                 // `'...+02:00[Europe/Stockholm]'` keeps +02:00, `'...[Europe/London]'`
                 // resolves +01:00, and 1818 Stockholm resolves the historical +00:53:28).
                 (offset, Some(zone)) => {
-                    let zone = timezone::canonical_id(&zone)?;
-                    let (local, offset) = timezone::resolve_local(zone, &local, offset)?;
+                    let zone = timezone::canonical_id(&zone).map_err(terr)?;
+                    let (local, offset) =
+                        timezone::resolve_local(zone, &local, offset).map_err(terr)?;
                     Ok(Value::zoned_date_time(
                         ZonedDateTime::from_local(local, offset, zone).map_err(terr)?,
                     ))
@@ -386,7 +387,7 @@ impl TzSpec {
     fn parse(tz: &str) -> Result<Self, EvalError> {
         match tc::parse_offset_seconds(tz) {
             Ok(offset) => Ok(Self::Fixed(offset)),
-            Err(_) => Ok(Self::Named(timezone::canonical_id(tz)?)),
+            Err(_) => Ok(Self::Named(timezone::canonical_id(tz).map_err(terr)?)),
         }
     }
 
@@ -395,7 +396,7 @@ impl TzSpec {
     fn offset_at_instant(self, unix_seconds: i64) -> Result<i32, EvalError> {
         match self {
             Self::Fixed(offset) => Ok(offset),
-            Self::Named(zone) => timezone::offset_at_instant(zone, unix_seconds),
+            Self::Named(zone) => timezone::offset_at_instant(zone, unix_seconds).map_err(terr),
         }
     }
 }
@@ -674,7 +675,7 @@ fn date_time_from_map(map: &ComponentMap<'_>) -> Result<Value, EvalError> {
             None => (0, ""),
             Some(TzSpec::Fixed(offset)) => (offset, ""),
             Some(TzSpec::Named(zone)) => (
-                timezone::offset_at_instant(zone, local.epoch_seconds)?,
+                timezone::offset_at_instant(zone, local.epoch_seconds).map_err(terr)?,
                 zone,
             ),
         };
@@ -728,7 +729,11 @@ fn date_time_from_map(map: &ComponentMap<'_>) -> Result<Value, EvalError> {
             let date = date_from_map(map, default_date)?;
             let local = LocalDateTime::from_date_time(date, b.time);
             let from = match &b.zone {
-                Some(zone) => timezone::resolve_local(zone, &local, Some(from))?.1,
+                Some(zone) => {
+                    timezone::resolve_local(zone, &local, Some(from))
+                        .map_err(terr)?
+                        .1
+                }
                 None => from,
             };
             let instant = local.epoch_seconds - i64::from(from);
@@ -752,14 +757,16 @@ fn date_time_from_map(map: &ComponentMap<'_>) -> Result<Value, EvalError> {
     let (local, offset, zone_id): (LocalDateTime, i32, String) = match tz {
         Some(TzSpec::Fixed(offset)) => (local, offset, String::new()),
         Some(TzSpec::Named(zone)) => {
-            let (local, offset) = timezone::resolve_local(zone, &local, converted_offset)?;
+            let (local, offset) =
+                timezone::resolve_local(zone, &local, converted_offset).map_err(terr)?;
             (local, offset, zone.to_owned())
         }
         None => match base.as_ref() {
             Some(TimeBase {
                 zone: Some(zone), ..
             }) => {
-                let (local, offset) = timezone::resolve_local(zone, &local, base_offset)?;
+                let (local, offset) =
+                    timezone::resolve_local(zone, &local, base_offset).map_err(terr)?;
                 (local, offset, zone.clone())
             }
             Some(TimeBase {
@@ -1102,7 +1109,7 @@ pub(crate) fn duration_between(kind: &str, a: &Value, b: &Value) -> Result<Value
                 other.date = anchor_date;
             }
             let local = LocalDateTime::from_date_time(other.date, other.time);
-            let (adjusted, offset) = timezone::resolve_local(&zone, &local, None)?;
+            let (adjusted, offset) = timezone::resolve_local(&zone, &local, None).map_err(terr)?;
             let (date, time) = adjusted.to_date_time();
             other.date = date;
             other.time = time;
@@ -1380,7 +1387,7 @@ pub(crate) fn truncate(
                 Some(TzSpec::Fixed(offset)) => offset,
                 Some(TzSpec::Named(zone)) => {
                     let local = LocalDateTime::from_date_time(parts.date, time);
-                    timezone::resolve_local(zone, &local, None)?.1
+                    timezone::resolve_local(zone, &local, None).map_err(terr)?.1
                 }
                 None => parts.offset.unwrap_or(0),
             };
@@ -1398,12 +1405,14 @@ pub(crate) fn truncate(
             let (local, offset, zone_id): (LocalDateTime, i32, String) = match override_tz {
                 Some(TzSpec::Fixed(offset)) => (local, offset, String::new()),
                 Some(TzSpec::Named(zone)) => {
-                    let (local, offset) = timezone::resolve_local(zone, &local, None)?;
+                    let (local, offset) =
+                        timezone::resolve_local(zone, &local, None).map_err(terr)?;
                     (local, offset, zone.to_owned())
                 }
                 None => match parts.zone {
                     Some(zone) => {
-                        let (local, offset) = timezone::resolve_local(&zone, &local, parts.offset)?;
+                        let (local, offset) =
+                            timezone::resolve_local(&zone, &local, parts.offset).map_err(terr)?;
                         (local, offset, zone)
                     }
                     None => (local, parts.offset.unwrap_or(0), String::new()),

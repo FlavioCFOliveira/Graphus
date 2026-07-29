@@ -7,3 +7,22 @@ license-file.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Shared vocabulary (IDs, value model, errors, capability traits, constants) for Graphus."
+
+[dependencies]
+# IANA time-zone resolution (src/timezone.rs). It lives in this crate — the one every layer can
+# already reach — because the two ingress paths for a named zone MUST resolve it identically:
+# the Cypher temporal constructors (`datetime({timezone: 'Europe/Stockholm'})`, `rmp` task #60)
+# and the PackStream `DateTimeZoneId` decoder (structure `0x69`, `rmp` task #908), which receives
+# a zone id with no numeric offset and has to localize the UTC instant. `graphus-bolt` cannot
+# depend on `graphus-cypher`, so the resolver cannot live there.
+#
+# `jiff-tzdb` embeds the compiled TZif tables of *vanilla* tzdata as static, dependency-free data
+# (no runtime filesystem access, so it behaves identically on Linux/macOS/Raspberry Pi OS across
+# x86-64/arm64/aarch64), and `tz-rs` parses and queries them. Vanilla data matters for TCK
+# faithfulness: the `tzdb` crate was evaluated and rejected because its data is built WITH the
+# `backzone` file, which gives Europe/Stockholm its own pre-1879 history (+01:12:12) where the
+# TCK pins the vanilla link to Europe/Berlin (+00:53:28, `Temporal2.feature` scenario [6]).
+# Deliberately NOT `chrono-tz`: Graphus has its own temporal type system in this crate and must
+# not pull in `chrono`.
+jiff-tzdb = "0.1.6"
+tz-rs = "0.7.3"

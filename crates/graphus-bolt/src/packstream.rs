@@ -40,10 +40,18 @@
 //! (tag `0x49`) and `DateTimeZoneId` (tag `0x69`) carry **UTC** epoch seconds (not local seconds —
 //! that was the pre-5.0 layout). [`Date`] is *days* since the epoch, [`LocalTime`] / `Time` are
 //! nanoseconds-of-day, and [`Duration`] is `(months, days, seconds, nanos)`.
+//!
+//! Both zoned forms are decoded by reconstructing the local wall clock as `local = utc + offset`,
+//! and encoded by the inverse `utc = local - offset`. The two differ only in where the offset
+//! comes from: `DateTime` carries it as a third field, while `DateTimeZoneId` carries a zone id
+//! and the offset must be **resolved from the IANA rules at that instant**
+//! ([`graphus_core::timezone::localize_instant`], `rmp` #908). An unresolvable zone id fails the
+//! decode; it is never silently treated as UTC.
 
 use std::collections::HashMap;
 
 use graphus_core::Value;
+use graphus_core::timezone;
 use graphus_core::value::spatial::{Crs, Point};
 use graphus_core::value::temporal::{
     Date, Duration, LocalDateTime, LocalTime, ZonedDateTime, ZonedTime,
@@ -1326,11 +1334,31 @@ fn unpack_structured_value(unpacker: &mut Unpacker<'_>) -> BoltResult<Value> {
             let utc_secs = unpacker.read_int()?;
             let nanos = read_u32_field(unpacker, "DateTimeZoneId.nanoseconds")?;
             let zone_id = unpacker.read_string()?;
-            // A zone-id DateTime carries no numeric offset on the wire; the offset is whatever the
-            // zone resolves to. We preserve the UTC instant and the zone id, leaving the resolved
-            // offset at 0 (offset resolution from an IANA id is the engine's job, not the codec's).
+            // PackStream specifies `DateTimeZoneId` deserialization as *two* steps: build the UTC
+            // instant from (seconds, nanoseconds), THEN **localize it to `tz_id`**. The wire form
+            // carries no numeric offset precisely because the zone id determines it, so the codec
+            // must resolve it here — Neo4j's `DateTimeZoneIdReader` does exactly this
+            // (`ZonedDateTime.ofInstant(instant, zoneId)`), as does the official Python driver
+            // (`hydrate_datetime` → `t.as_timezone(zone)`).
+            //
+            // An unresolvable zone id is a hard decode error, never a silent offset of 0. Zero was
+            // the previous behaviour and it is the defect `rmp` #908 fixes: it round-trips
+            // byte-for-byte while yielding the wrong wall clock, so nothing detects it until a
+            // stored value is compared or an accessor is read. Neo4j fails the same way
+            // (`IllegalStructArgumentException.invalidZoneId`).
+            //
+            // The normalised id is taken from the same lookup so a wire-supplied value is
+            // *identical* to the one `datetime({timezone: …})` builds for the same instant and
+            // zone (both go through `graphus_core::timezone`), not merely equivalent — `zone_id`
+            // is a tiebreaker in the Cypher ordering, so anything less makes the two sort apart.
+            // Normalisation is case-only; link ids are preserved, so the bytes round-trip.
+            let (canonical, offset) = timezone::localize_instant(&zone_id, utc_secs)
+                .map_err(|e| BoltError::Decode(format!("DateTimeZoneId.tz_id: {e}")))?;
             Ok(Value::zoned_date_time(zoned_from_utc(
-                utc_secs, nanos, 0, zone_id,
+                utc_secs,
+                nanos,
+                offset,
+                canonical.to_owned(),
             )))
         }
         tag::DURATION => {
@@ -1536,6 +1564,11 @@ fn unpack_path(unpacker: &mut Unpacker<'_>) -> BoltResult<BoltPath> {
 
 /// Reconstructs a [`ZonedDateTime`] (whose `local` field stores the *local* instant) from the
 /// Bolt-5.0+ UTC epoch seconds by re-applying the offset (`local = utc + offset`).
+///
+/// `offset_seconds` must be the offset genuinely in effect for this instant: the wire field for
+/// `DateTime` (`0x49`), or the value [`timezone::localize_instant`] resolves for
+/// `DateTimeZoneId` (`0x69`). It is the exact inverse of the encoder's `utc = local - offset`,
+/// so the pair round-trips byte-for-byte.
 fn zoned_from_utc(
     utc_secs: i64,
     nanos: u32,
@@ -2110,12 +2143,27 @@ mod tests {
                 offset_seconds: 7200,
                 zone_id: String::new(),
             }),
+            // Europe/Lisbon on 2023-11-14 is WET (+00:00): a named zone whose offset happens to
+            // be zero. Kept deliberately — but note it CANNOT distinguish a localizing decoder
+            // from one that hard-codes offset 0, which is why the summer case below exists.
             Value::zoned_date_time(ZonedDateTime {
                 local: LocalDateTime {
                     epoch_seconds: 1_700_000_000,
                     nanos: 500,
                 },
                 offset_seconds: 0,
+                zone_id: "Europe/Lisbon".to_owned(),
+            }),
+            // The same zone six months earlier is WEST (+01:00), so the local wall clock is one
+            // hour ahead of the UTC instant the wire carries. A decoder that hard-codes offset 0
+            // fails this case (`rmp` #908).
+            Value::zoned_date_time(ZonedDateTime {
+                // 2023-07-01T00:00:00Z + 1 h = 01:00 local.
+                local: LocalDateTime {
+                    epoch_seconds: 1_688_169_600 + 3600,
+                    nanos: 500,
+                },
+                offset_seconds: 3600,
                 zone_id: "Europe/Lisbon".to_owned(),
             }),
             Value::Duration(Duration {
@@ -2149,6 +2197,167 @@ mod tests {
         // Round-trip restores the local instant.
         let mut u = Unpacker::new(&bytes);
         assert_eq!(unpack_value(&mut u).unwrap(), Value::zoned_date_time(v));
+    }
+
+    /// The PackStream specification's own worked example for structure `0x69`
+    /// (`DateTimeZoneId`): 4500 seconds, 42 nanoseconds, `"Europe/Paris"`.
+    const SPEC_DATE_TIME_ZONE_ID: &[u8] = &[
+        0xB3, 0x69, // struct, 3 fields, tag DateTimeZoneId
+        0xC9, 0x11, 0x94, // INT_16 4500
+        0x2A, // TINY_INT 42
+        0x8C, b'E', b'u', b'r', b'o', b'p', b'e', b'/', b'P', b'a', b'r', b'i',
+        b's', // TINY_STRING(12)
+    ];
+
+    #[test]
+    fn date_time_zone_id_localizes_the_specification_example_bytes() {
+        // Deserializing `DateTimeZoneId` is a TWO-step procedure the specification spells out:
+        // build the UTC instant from (seconds, nanoseconds), THEN localize it to `tz_id`.
+        // 4500 s = 1970-01-01T01:15:00Z, and France was on CET (+01:00) in January 1970 (DST
+        // was only reintroduced there in 1976), so the wall clock is 02:15+01:00 — exactly what
+        // Neo4j's `DateTimeZoneIdReader` (`ZonedDateTime.ofInstant`) and the official Python
+        // driver (`hydrate_datetime` → `t.as_timezone`) produce. Yielding 01:15 tagged
+        // Europe/Paris — the UTC wall clock with the zone name merely stapled on — was `rmp` #908.
+        let mut u = Unpacker::new(SPEC_DATE_TIME_ZONE_ID);
+        let v = unpack_value(&mut u).expect("the specification's example bytes decode");
+        assert!(u.is_empty(), "the example is consumed exactly");
+        let Value::ZonedDateTime(z) = v else {
+            panic!("expected a ZonedDateTime, got {v:?}");
+        };
+        assert_eq!(z.offset_seconds, 3600, "Europe/Paris is +01:00 at 4500s");
+        assert_eq!(z.zone_id, "Europe/Paris");
+        assert_eq!(z.local.epoch_seconds, 8_100, "02:15 local, not 01:15 UTC");
+        assert_eq!(z.local.nanos, 42);
+        // The UTC instant itself is untouched: re-deriving it returns the wire seconds, which is
+        // why the defect round-tripped byte-for-byte and stayed silent.
+        assert_eq!(z.local.epoch_seconds - i64::from(z.offset_seconds), 4_500);
+        // And re-encoding reproduces the specification's bytes verbatim.
+        let mut p = Packer::new();
+        pack_value(&mut p, &Value::zoned_date_time(*z));
+        assert_eq!(p.into_inner(), SPEC_DATE_TIME_ZONE_ID);
+    }
+
+    #[test]
+    fn date_time_zone_id_offset_follows_the_instant_not_the_zone() {
+        // The resolved offset is a function of (zone, instant), so the SAME zone decodes to
+        // different offsets on either side of a DST transition. Europe/Paris springs forward at
+        // 2017-03-26T01:00:00Z (+01:00 → +02:00). A decoder that resolved a zone to one constant
+        // offset — or to zero — could not produce both of these.
+        let spring_forward = 1_490_490_000_i64;
+        let decode_at = |utc: i64| {
+            let mut p = Packer::new();
+            p.write_struct_header(tag::DATE_TIME_ZONE_ID, 3).unwrap();
+            p.write_int(utc);
+            p.write_int(0);
+            p.write_string("Europe/Paris");
+            let bytes = p.into_inner();
+            let mut u = Unpacker::new(&bytes);
+            match unpack_value(&mut u).expect("decodes") {
+                Value::ZonedDateTime(z) => (z.offset_seconds, z.local.epoch_seconds),
+                other => panic!("expected a ZonedDateTime, got {other:?}"),
+            }
+        };
+        assert_eq!(
+            decode_at(spring_forward - 1),
+            (3600, spring_forward - 1 + 3600)
+        );
+        assert_eq!(decode_at(spring_forward), (7200, spring_forward + 7200));
+    }
+
+    #[test]
+    fn date_time_zone_id_rejects_an_unresolvable_zone_id() {
+        // Failing loudly is the point: silently defaulting the offset to zero is the defect
+        // (`rmp` #908), because it produces a plausible-looking value that is simply wrong.
+        // Neo4j rejects the same input (`IllegalStructArgumentException.invalidZoneId`).
+        let mut p = Packer::new();
+        p.write_struct_header(tag::DATE_TIME_ZONE_ID, 3).unwrap();
+        p.write_int(4_500);
+        p.write_int(42);
+        p.write_string("Mars/Olympus_Mons");
+        let bytes = p.into_inner();
+        let mut u = Unpacker::new(&bytes);
+        let err = unpack_value(&mut u).expect_err("an unknown zone id must not decode");
+        let BoltError::Decode(msg) = err else {
+            panic!("expected a Decode error, got {err:?}");
+        };
+        assert!(
+            msg.contains("DateTimeZoneId.tz_id") && msg.contains("Mars/Olympus_Mons"),
+            "the error must name the field and the offending id, got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn date_time_zone_id_rejects_an_instant_the_zone_rules_cannot_serve() {
+        // A second consequence of resolving the zone for real: an absurd instant now fails the
+        // decode instead of being clamped into a different one. `i64::MAX` seconds is outside the
+        // range any zone's rules cover (and far outside the representable calendar), so the
+        // lookup errors and the whole structure is refused. Neo4j fails here too
+        // (`Instant.ofEpochSecond` throws, caught as `invalidTemporalComponent`).
+        //
+        // Note the asymmetry this leaves behind: the offset-carrying `DateTime` (`0x49`) form has
+        // no zone to consult, so it still saturates instead of failing. That gap belongs to
+        // `rmp` #911 (temporal domain validation), not here.
+        let mut p = Packer::new();
+        p.write_struct_header(tag::DATE_TIME_ZONE_ID, 3).unwrap();
+        p.write_int(i64::MAX);
+        p.write_int(0);
+        p.write_string("Europe/Paris");
+        let bytes = p.into_inner();
+        let mut u = Unpacker::new(&bytes);
+        let err = unpack_value(&mut u).expect_err("an unservable instant must not decode");
+        assert!(
+            matches!(&err, BoltError::Decode(m) if m.contains("DateTimeZoneId.tz_id")),
+            "expected a Decode error naming the field, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn date_time_zone_id_canonicalises_the_decoded_zone_id() {
+        // A wire value must end up IDENTICAL to the one `datetime({timezone: …})` builds, not
+        // merely equivalent: `zone_id` is the final tiebreaker in the Cypher ordering, so two ids
+        // differing only in case would sort apart. Both ingress paths now normalise through the
+        // same `graphus_core::timezone` lookup.
+        //
+        // Normalisation is case-only. Link/alias ids (`US/Eastern`, `Europe/Kiev`, …) are their
+        // own entries in the embedded database and are preserved verbatim, so the wire bytes
+        // round-trip unchanged — which is also what java.time does
+        // (`ZoneId.of("US/Eastern").getId()` is `"US/Eastern"`, not `"America/New_York"`).
+        for (supplied, canonical) in [
+            ("europe/paris", "Europe/Paris"),
+            ("EUROPE/PARIS", "Europe/Paris"),
+            ("US/Eastern", "US/Eastern"),
+        ] {
+            let mut p = Packer::new();
+            p.write_struct_header(tag::DATE_TIME_ZONE_ID, 3).unwrap();
+            p.write_int(4_500);
+            p.write_int(0);
+            p.write_string(supplied);
+            let bytes = p.into_inner();
+            let mut u = Unpacker::new(&bytes);
+            match unpack_value(&mut u).expect("decodes") {
+                Value::ZonedDateTime(z) => assert_eq!(z.zone_id, canonical, "for {supplied}"),
+                other => panic!("expected a ZonedDateTime, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn date_time_zone_id_round_trips_across_a_dst_overlap() {
+        // During a fall-back overlap the same local wall clock occurs twice with two different
+        // offsets. The wire form carries the UTC instant, which disambiguates them, so BOTH
+        // readings survive encode∘decode exactly. Europe/Paris falls back 2017-10-29T01:00:00Z
+        // (+02:00 → +01:00): local 02:30 exists at 00:30Z (+02:00) and again at 01:30Z (+01:00).
+        for (utc, offset) in [(1_509_236_000_i64, 7200), (1_509_239_600_i64, 3600)] {
+            let v = Value::zoned_date_time(ZonedDateTime {
+                local: LocalDateTime {
+                    epoch_seconds: utc + i64::from(offset),
+                    nanos: 7,
+                },
+                offset_seconds: offset,
+                zone_id: "Europe/Paris".to_owned(),
+            });
+            assert_eq!(round_trip(&v), v, "overlap reading at {utc} (+{offset}s)");
+        }
     }
 
     #[test]

@@ -1,6 +1,7 @@
-//! IANA time-zone resolution for the temporal functions (`rmp` task #60).
+//! IANA time-zone resolution shared by every layer that has to turn a named zone into a UTC
+//! offset (`rmp` tasks #60, #908).
 //!
-//! [`graphus_core::temporal_calc`] deliberately performs no zone-rule resolution
+//! [`crate::temporal_calc`] deliberately performs no zone-rule resolution
 //! (`parse_zoned_date_time_parts` hands the bracketed zone id back unresolved); this module owns
 //! the time-zone database. The data is the compiled TZif table of **vanilla** IANA tzdata
 //! embedded statically by `jiff-tzdb` — identical on every supported OS and architecture, with
@@ -10,10 +11,19 @@
 //! 1818 Stockholm to `+00:53:28`, the local mean time of Europe/Berlin, which Europe/Stockholm
 //! links to in vanilla tzdata since release 2022b.
 //!
+//! It lives in `graphus-core` — rather than in the Cypher evaluator that first needed it —
+//! because both ingress paths must resolve zones **identically**: the Cypher constructors
+//! (`datetime({timezone: 'Europe/Paris'})`) and the PackStream `DateTimeZoneId` decoder
+//! (structure `0x69`), which carries a zone id and no numeric offset and must localize the UTC
+//! instant it receives. Resolving in only one of the two made a wire-supplied value and a
+//! Cypher-built value for the same instant disagree on `offset_seconds`, so they neither
+//! compared equal nor sorted together (`rmp` #908).
+//!
 //! The resolution *direction* matters:
 //!
 //! - [`offset_at_instant`] answers "which UTC offset is in effect at this instant" — total:
-//!   every instant has exactly one offset.
+//!   every instant has exactly one offset. This is the direction `DateTimeZoneId` decoding
+//!   needs, and it is what `java.time.ZonedDateTime.ofInstant` performs.
 //! - [`resolve_local`] answers "which UTC offset applies to this **local wall-clock**
 //!   date-time" — partial: around a DST transition a local time can be skipped (*gap*, spring
 //!   forward) or repeated (*overlap*, fall back).
@@ -32,9 +42,8 @@
 use std::collections::HashMap;
 use std::sync::{LazyLock, RwLock};
 
-use graphus_core::value::temporal::LocalDateTime;
-
-use crate::eval::EvalError;
+use crate::temporal_calc::TemporalError;
+use crate::value::temporal::LocalDateTime;
 
 /// Parsed zones, keyed by canonical id. TZif parsing allocates, so each zone is parsed once and
 /// leaked: the set is bounded by the embedded database (~600 zones) and lives for the process.
@@ -45,9 +54,10 @@ static ZONES: LazyLock<RwLock<HashMap<&'static str, &'static tz::TimeZone>>> =
 /// and returns its canonical id with the parsed zone rules.
 ///
 /// # Errors
-/// [`EvalError::TypeError`] for an id absent from the database, or for TZif data the parser
-/// rejects (unreachable for the embedded, generated tables).
-fn lookup(zone: &str) -> Result<(&'static str, &'static tz::TimeZone), EvalError> {
+/// [`TemporalError::UnknownTimeZone`] for an id absent from the database, or
+/// [`TemporalError::TimeZoneRules`] for TZif data the parser rejects (unreachable for the
+/// embedded, generated tables).
+fn lookup(zone: &str) -> Result<(&'static str, &'static tz::TimeZone), TemporalError> {
     let (canonical, data) = jiff_tzdb::get(zone).ok_or_else(|| unknown_zone(zone))?;
     if let Some(tz) = ZONES
         .read()
@@ -63,9 +73,7 @@ fn lookup(zone: &str) -> Result<(&'static str, &'static tz::TimeZone), EvalError
     if let Some(tz) = zones.get(canonical) {
         return Ok((canonical, tz));
     }
-    let parsed = tz::TimeZone::from_tz_data(data).map_err(|e| EvalError::TypeError {
-        context: format!("time zone `{zone}`: {e}"),
-    })?;
+    let parsed = tz::TimeZone::from_tz_data(data).map_err(|e| zone_rules(zone, &e))?;
     let leaked: &'static tz::TimeZone = Box::leak(Box::new(parsed));
     zones.insert(canonical, leaked);
     Ok((canonical, leaked))
@@ -75,32 +83,65 @@ fn lookup(zone: &str) -> Result<(&'static str, &'static tz::TimeZone), EvalError
 /// error.
 ///
 /// # Errors
-/// [`EvalError::TypeError`] for an id absent from the database.
-pub(crate) fn canonical_id(zone: &str) -> Result<&'static str, EvalError> {
+/// [`TemporalError::UnknownTimeZone`] for an id absent from the database.
+pub fn canonical_id(zone: &str) -> Result<&'static str, TemporalError> {
     jiff_tzdb::get(zone)
         .map(|(canonical, _)| canonical)
         .ok_or_else(|| unknown_zone(zone))
 }
 
-/// The typed runtime error for a zone id absent from the embedded IANA database.
-fn unknown_zone(zone: &str) -> EvalError {
-    EvalError::TypeError {
-        context: format!("unknown time zone id `{zone}`"),
+/// The typed error for a zone id absent from the embedded IANA database.
+fn unknown_zone(zone: &str) -> TemporalError {
+    TemporalError::UnknownTimeZone(zone.to_owned())
+}
+
+/// The typed error for zone data or an instant the zone rules cannot serve.
+fn zone_rules(zone: &str, reason: &dyn std::fmt::Display) -> TemporalError {
+    TemporalError::TimeZoneRules {
+        zone: zone.to_owned(),
+        reason: reason.to_string(),
     }
+}
+
+/// Localizes the UTC instant `unix_seconds` to `zone`: returns the zone's canonical id together
+/// with the UTC offset (seconds east of UTC) in effect at that instant.
+///
+/// This is the whole of `java.time.ZonedDateTime.ofInstant(instant, zoneId)` as far as the value
+/// model is concerned, and it is the operation the PackStream `DateTimeZoneId` decoder performs
+/// (`rmp` #908): the wire form carries a zone id and no numeric offset, so the offset must come
+/// from the zone rules at that instant. Returning the canonical id in the same call keeps a
+/// wire-supplied value identical to the one the Cypher constructors build for the same instant
+/// and zone (both normalise here), which is what makes the two compare equal and sort together —
+/// `zone_id` is a tiebreaker in the Cypher ordering.
+///
+/// Canonicalisation is **case-only**. Link ids are separate entries in the embedded database and
+/// are returned unchanged (`"US/Eastern"` stays `"US/Eastern"`, as in `java.time.ZoneId.of`), so
+/// a decoded value re-encodes to the bytes it arrived as.
+///
+/// # Errors
+/// [`TemporalError::UnknownTimeZone`] for an unknown zone id, or
+/// [`TemporalError::TimeZoneRules`] if the instant falls outside the range the zone rules cover
+/// (unreachable for values the calendar engine can represent).
+pub fn localize_instant(
+    zone: &str,
+    unix_seconds: i64,
+) -> Result<(&'static str, i32), TemporalError> {
+    let (canonical, tz) = lookup(zone)?;
+    let offset = tz
+        .find_local_time_type(unix_seconds)
+        .map(tz::LocalTimeType::ut_offset)
+        .map_err(|e| zone_rules(zone, &e))?;
+    Ok((canonical, offset))
 }
 
 /// The UTC offset (seconds east of UTC) `zone` is in at the instant `unix_seconds`.
 ///
 /// # Errors
-/// [`EvalError::TypeError`] for an unknown zone id, or if the instant falls outside the range
-/// the zone rules cover (unreachable for values the calendar engine can represent).
-pub(crate) fn offset_at_instant(zone: &str, unix_seconds: i64) -> Result<i32, EvalError> {
-    let (_, tz) = lookup(zone)?;
-    tz.find_local_time_type(unix_seconds)
-        .map(|ltt| ltt.ut_offset())
-        .map_err(|e| EvalError::TypeError {
-            context: format!("time zone `{zone}`: {e}"),
-        })
+/// [`TemporalError::UnknownTimeZone`] for an unknown zone id, or
+/// [`TemporalError::TimeZoneRules`] if the instant falls outside the range the zone rules cover
+/// (unreachable for values the calendar engine can represent).
+pub fn offset_at_instant(zone: &str, unix_seconds: i64) -> Result<i32, TemporalError> {
+    localize_instant(zone, unix_seconds).map(|(_, offset)| offset)
 }
 
 /// Probe distance for bracketing the DST transition (if any) nearest to a local time. It must
@@ -119,26 +160,25 @@ const PROBE_SECONDS: i64 = 2 * 86_400;
 /// `None` to take java.time's default (the offset before the transition).
 ///
 /// # Errors
-/// [`EvalError::TypeError`] for an unknown zone id or an instant outside the zone rules.
-pub(crate) fn resolve_local(
+/// [`TemporalError::UnknownTimeZone`] for an unknown zone id, or
+/// [`TemporalError::TimeZoneRules`] for an instant outside the zone rules.
+pub fn resolve_local(
     zone: &str,
     local: &LocalDateTime,
     preferred: Option<i32>,
-) -> Result<(LocalDateTime, i32), EvalError> {
+) -> Result<(LocalDateTime, i32), TemporalError> {
     let (_, tz) = lookup(zone)?;
-    let offset_at = |instant: i64| -> Result<i32, EvalError> {
+    let offset_at = |instant: i64| -> Result<i32, TemporalError> {
         tz.find_local_time_type(instant)
-            .map(|ltt| ltt.ut_offset())
-            .map_err(|e| EvalError::TypeError {
-                context: format!("time zone `{zone}`: {e}"),
-            })
+            .map(tz::LocalTimeType::ut_offset)
+            .map_err(|e| zone_rules(zone, &e))
     };
     let wall = local.epoch_seconds;
     // The offsets in effect strictly before and strictly after any transition near `wall`.
     let before = offset_at(wall.saturating_sub(PROBE_SECONDS))?;
     let after = offset_at(wall.saturating_add(PROBE_SECONDS))?;
     // A candidate offset is valid when interpreting the wall clock with it round-trips.
-    let valid = |offset: i32| -> Result<bool, EvalError> {
+    let valid = |offset: i32| -> Result<bool, TemporalError> {
         Ok(offset_at(wall - i64::from(offset))? == offset)
     };
     let before_valid = valid(before)?;
@@ -171,7 +211,7 @@ pub(crate) fn resolve_local(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use graphus_core::temporal_calc::parse_local_date_time;
+    use crate::temporal_calc::parse_local_date_time;
 
     fn local(s: &str) -> LocalDateTime {
         parse_local_date_time(s).expect("test literal parses")
@@ -248,7 +288,13 @@ mod tests {
     fn unknown_zone_is_a_typed_error() {
         let err = resolve_local("Mars/Olympus_Mons", &local("2017-10-29T00:00"), None)
             .expect_err("unknown zone");
-        assert!(matches!(err, EvalError::TypeError { .. }), "{err:?}");
+        assert!(
+            matches!(err, TemporalError::UnknownTimeZone(ref z) if z == "Mars/Olympus_Mons"),
+            "{err:?}"
+        );
+        // The rendered message is the contract the Cypher evaluator surfaces verbatim as a
+        // `TypeError` context, so it is pinned here.
+        assert_eq!(err.to_string(), "unknown time zone id `Mars/Olympus_Mons`");
         assert!(canonical_id("Europe/Stockholm").is_ok());
     }
 
@@ -268,5 +314,43 @@ mod tests {
             "Europe/Stockholm"
         );
         assert!(canonical_id("Mars/Olympus_Mons").is_err());
+    }
+
+    #[test]
+    fn localize_instant_normalises_the_zone_id_by_case_only() {
+        // Both ingress paths (Cypher constructors and the PackStream `DateTimeZoneId` decoder)
+        // normalise through this one lookup, so an id differing only in case lands on the same
+        // string and the two values stay identical (`rmp` #908).
+        let (canonical, offset) =
+            localize_instant("europe/paris", 4_500).expect("known zone, valid instant");
+        assert_eq!(canonical, "Europe/Paris");
+        assert_eq!(offset, 3600);
+        // Link/alias ids are their own entries in the embedded database and are preserved
+        // verbatim — matching `java.time.ZoneId.of("US/Eastern").getId()`. Pinned because it is
+        // what keeps wire bytes round-tripping unchanged.
+        assert_eq!(
+            localize_instant("US/Eastern", 0).expect("known alias").0,
+            "US/Eastern"
+        );
+        assert!(matches!(
+            localize_instant("Mars/Olympus_Mons", 0),
+            Err(TemporalError::UnknownTimeZone(_))
+        ));
+    }
+
+    #[test]
+    fn offset_at_instant_tracks_the_dst_transition() {
+        // Europe/Paris springs forward 2017-03-26 01:00 UTC (+01:00 -> +02:00). `offset_at_instant`
+        // is the *instant* direction used by the PackStream `DateTimeZoneId` decoder (`rmp` #908):
+        // one second before the transition it is still winter time, at the transition it is summer.
+        let spring_forward = 1_490_490_000; // 2017-03-26T01:00:00Z
+        assert_eq!(
+            offset_at_instant("Europe/Paris", spring_forward - 1).expect("resolves"),
+            3600
+        );
+        assert_eq!(
+            offset_at_instant("Europe/Paris", spring_forward).expect("resolves"),
+            7200
+        );
     }
 }

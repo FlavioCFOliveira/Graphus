@@ -40,18 +40,10 @@ graphus-index = { path = "../graphus-index" }
 # crate to the build graph. The edge is acyclic: graphus-bufpool depends on core/io/wal, never on
 # cypher.
 graphus-bufpool = { path = "../graphus-bufpool" }
-# IANA time-zone resolution for the temporal functions (`rmp` task #60, src/timezone.rs):
-# `datetime({timezone: 'Europe/Stockholm'})` and `datetime('...[Europe/London]')` need the
-# historical offset and DST rules of the IANA tz database. `jiff-tzdb` embeds the compiled TZif
-# tables of *vanilla* tzdata as static, dependency-free data (no runtime filesystem access, so it
-# behaves identically on Linux/macOS/Raspberry Pi OS across x86-64/arm64/aarch64), and `tz-rs`
-# parses and queries them. Vanilla data matters for TCK faithfulness: the `tzdb` crate was
-# evaluated and rejected because its data is built WITH the `backzone` file, which gives
-# Europe/Stockholm its own pre-1879 history (+01:12:12) where the TCK pins the vanilla link to
-# Europe/Berlin (+00:53:28, `Temporal2.feature` scenario [6]). Deliberately NOT `chrono-tz`:
-# Graphus has its own temporal type system in graphus-core and must not pull in `chrono`.
-jiff-tzdb = "0.1.6"
-tz-rs = "0.7.3"
+# NOTE: the IANA time-zone resolver the temporal functions use (`datetime({timezone: '...'})`,
+# `datetime('...[Europe/London]')`, `rmp` task #60) moved to `graphus_core::timezone` in `rmp`
+# task #908, taking its `jiff-tzdb`/`tz-rs` dependencies with it, so that the PackStream
+# `DateTimeZoneId` decoder in `graphus-bolt` resolves named zones through the *same* rules.
 # The Graph Data Science engine (`gds.*` procedures, `rmp` task #133): the in-memory CSR projection
 # + named-graph catalog + algorithm library. `graphus-gds` has ZERO runtime dependencies, so this
 # edge is trivially acyclic (gds depends on nothing in the workspace; cypher adapts it to the

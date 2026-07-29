@@ -1155,6 +1155,10 @@ dependencies = [
 [[package]]
 name = "graphus-core"
 version = "0.0.10"
+dependencies = [
+ "jiff-tzdb",
+ "tz-rs",
+]
 
 [[package]]
 name = "graphus-crypto"
@@ -1190,12 +1194,10 @@ dependencies = [
  "graphus-storage",
  "graphus-txn",
  "graphus-wal",
- "jiff-tzdb",
  "proptest",
  "rayon",
  "regex",
  "rustc-hash",
- "tz-rs",
  "unicode-normalization",
 ]
 

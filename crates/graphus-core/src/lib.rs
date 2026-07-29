@@ -26,6 +26,10 @@ pub use version::{MAX_TIMESTAMP, VersionStamp};
 /// value types in [`value::temporal`].
 pub mod temporal_calc;
 
+/// IANA time-zone rules: resolving a named zone to a UTC offset, in both directions
+/// (instant → offset, and local wall clock → offset with the DST gap/overlap rules).
+pub mod timezone;
+
 /// Identifier newtypes used across the storage, transaction, and query layers.
 pub mod ids {
     /// Physical page identifier within a store file.
