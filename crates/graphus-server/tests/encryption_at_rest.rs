@@ -89,6 +89,7 @@ fn config_with_key(temp: &TempStore, key_path: Option<PathBuf>) -> ServerConfig 
         bolt_tcp_addr: None,
         advertised_bolt_address: None,
         bolt_server_agent: None,
+        bolt_max_protocol_minor: None,
         rest_addr: None,
         uds_path: Some(temp.uds_path()),
         tls: TlsConfig::default(),

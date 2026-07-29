@@ -2448,3 +2448,789 @@ fn bolt_logon_sheds_before_the_kdf_when_the_global_verify_bound_is_saturated() {
         "the admitted LOGON ran exactly one KDF"
     );
 }
+
+// ---- Bolt 5.0 HELLO-carried authentication + per-version decodability (rmp #906) ---------------
+//
+// Bolt 5.1 is where authentication moved out of `HELLO` into `LOGON` (server-state spec, "Summary of
+// changes": Version 5.1 — "HELLO message no longer accepts authentication … LOGON message has been
+// added"; Version 5.0 — "No changes compared to version 4.4"). Graphus advertises 5.0 in both
+// handshake forms, so it MUST serve the 5.0 flow: HELLO authenticates and lands in READY, and
+// LOGON/LOGOFF are not even decodable. These tests drive whole sessions at an exact negotiated minor.
+
+/// Client handshake bytes proposing **exactly** `Version::new(5, minor)` (range 0, one slot).
+fn handshake_at(minor: u8) -> Vec<u8> {
+    encode_client_handshake([
+        Proposal::exact(5, minor),
+        Proposal::exact(0, 0),
+        Proposal::exact(0, 0),
+        Proposal::exact(0, 0),
+    ])
+}
+
+/// An input byte stream that negotiates exactly Bolt 5.`minor`, then frames each request.
+fn session_input_at(minor: u8, requests: &[Request]) -> Vec<u8> {
+    let mut input = handshake_at(minor);
+    for r in requests {
+        input.extend_from_slice(&encode_request_framed(r).unwrap());
+    }
+    input
+}
+
+/// A Bolt **5.0** `HELLO`: the required `user_agent` **plus** the authentication token, which at 5.0
+/// rides in the `HELLO` `extra` map itself. Also carries the reserved non-auth field `patch_bolt`, to
+/// prove it is filtered out of the token rather than fed to the authenticator as a credential.
+fn hello_50(principal: &str, credentials: &str) -> Request {
+    Request::Hello {
+        extra: vec![
+            ("user_agent".to_owned(), Value::String("drv/1".to_owned())),
+            (
+                "patch_bolt".to_owned(),
+                Value::List(vec![Value::String("utc".to_owned())]),
+            ),
+            ("scheme".to_owned(), Value::String("basic".to_owned())),
+            ("principal".to_owned(), Value::String(principal.to_owned())),
+            (
+                "credentials".to_owned(),
+                Value::String(credentials.to_owned()),
+            ),
+        ],
+    }
+}
+
+#[test]
+fn bolt_50_authenticates_from_hello_and_runs_a_query() {
+    // ACCEPTANCE 1 (rmp #906): a client negotiating exactly 5.0 authenticates from its HELLO and can
+    // RUN. Before the fix, HELLO always routed to AUTHENTICATION and read only `user_agent`, so the
+    // credentials were dropped on the floor and the first RUN hit `unexpected` → FAILURE + DEFUNCT:
+    // EVERY negotiated-5.0 connection was dead on arrival.
+    let exec = MockExecutor::new().on_query(
+        "RETURN 1 AS x",
+        CannedResult::rows(&["x"], vec![vec![Value::Integer(1)]]),
+    );
+    let input = session_input_at(
+        0,
+        &[
+            hello_50("alice", "alice-pw"),
+            Request::Run {
+                query: "RETURN 1 AS x".to_owned(),
+                parameters: vec![],
+                extra: vec![],
+            },
+            Request::Pull { n: ALL, qid: None },
+            Request::Goodbye,
+        ],
+    );
+
+    let auth = auth_fixture();
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::new(&mut transport, exec, &auth);
+        session.run().expect("session runs");
+        assert_eq!(
+            session.version(),
+            Some(Version::new(5, 0)),
+            "negotiated 5.0"
+        );
+        assert_eq!(
+            session.principal(),
+            Some("alice"),
+            "the HELLO credentials must authenticate the connection at 5.0"
+        );
+        assert_eq!(session.state(), State::Defunct, "ended by GOODBYE");
+    }
+
+    let written = transport.written();
+    let (hs, stream) = split_handshake(written);
+    assert_eq!(hs, [0x00, 0x00, 0x00, 0x05], "server replied 5.0");
+
+    let r = decode_responses(stream);
+    // HELLO→SUCCESS (negotiation AND authentication ack), RUN→SUCCESS{fields}, RECORD, trailing
+    // SUCCESS. There is no LOGON SUCCESS at 5.0 — the HELLO SUCCESS is the only handshake reply.
+    assert_eq!(r.len(), 4, "responses: {r:?}");
+    assert!(
+        !r.iter().any(|resp| matches!(resp, Response::Failure(_))),
+        "a healthy 5.0 session must produce no FAILURE: {r:?}"
+    );
+    // The 5.0 HELLO SUCCESS carries the SAME metadata as the 5.1+ one.
+    match &r[0] {
+        Response::Success { metadata } => {
+            let keys: Vec<&str> = metadata.iter().map(|(k, _)| k.as_str()).collect();
+            assert!(keys.contains(&"server"), "metadata: {metadata:?}");
+            assert!(keys.contains(&"connection_id"), "metadata: {metadata:?}");
+            assert!(keys.contains(&"hints"), "metadata: {metadata:?}");
+        }
+        other => panic!("expected HELLO SUCCESS, got {other:?}"),
+    }
+    match &r[1] {
+        Response::Success { metadata } => {
+            assert!(metadata.iter().any(|(k, _)| k == "fields"));
+        }
+        other => panic!("expected RUN SUCCESS, got {other:?}"),
+    }
+    assert!(matches!(r[2], Response::Record { .. }));
+    assert!(matches!(r[3], Response::Success { .. }));
+}
+
+#[test]
+fn bolt_50_hello_with_wrong_credentials_fails_terminally() {
+    // The 5.0 HELLO is a PRE-authentication message, so a rejected credential is terminal (DEFUNCT),
+    // exactly like a rejected 5.1+ LOGON — never the RESET-recoverable FAILED state (rmp #820).
+    let input = session_input_at(
+        0,
+        &[
+            hello_50("alice", "WRONG-pw"),
+            Request::Run {
+                query: "RETURN 1".to_owned(),
+                parameters: vec![],
+                extra: vec![],
+            },
+        ],
+    );
+    let auth = auth_fixture();
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::new(&mut transport, MockExecutor::new(), &auth);
+        session.run().unwrap();
+        assert_eq!(session.principal(), None);
+        assert_eq!(session.state(), State::Defunct);
+    }
+    let (_, stream) = split_handshake(transport.written());
+    let r = decode_responses(stream);
+    match &r[0] {
+        Response::Failure(f) => assert_eq!(f.code, CODE_UNAUTHORIZED),
+        other => panic!("expected an Unauthorized FAILURE, got {other:?}"),
+    }
+    assert_eq!(
+        r.len(),
+        1,
+        "a failed 5.0 HELLO is terminal; the RUN must never be processed: {r:?}"
+    );
+}
+
+#[test]
+fn bolt_50_hello_without_user_agent_is_still_rejected_before_any_credential() {
+    // The `user_agent` requirement is version-independent, and it is checked BEFORE the credentials,
+    // so a malformed 5.0 HELLO never reaches the authenticator. `CountingAuth` proves the KDF is
+    // untouched.
+    let auth = CountingAuth::new(auth_fixture());
+    let input = session_input_at(
+        0,
+        &[Request::Hello {
+            extra: vec![
+                ("scheme".to_owned(), Value::String("basic".to_owned())),
+                ("principal".to_owned(), Value::String("alice".to_owned())),
+                (
+                    "credentials".to_owned(),
+                    Value::String("alice-pw".to_owned()),
+                ),
+            ],
+        }],
+    );
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::new(&mut transport, MockExecutor::new(), &auth);
+        session.run().unwrap();
+        assert_eq!(session.state(), State::Defunct);
+        assert_eq!(session.principal(), None);
+    }
+    assert_eq!(
+        auth.kdf_calls(),
+        0,
+        "a HELLO missing `user_agent` must be refused BEFORE the credentials are looked at"
+    );
+    let (_, stream) = split_handshake(transport.written());
+    match &decode_responses(stream)[0] {
+        Response::Failure(f) => assert_eq!(f.code, "Neo.ClientError.Request.Invalid"),
+        other => panic!("expected a malformed-HELLO FAILURE, got {other:?}"),
+    }
+}
+
+#[test]
+fn bolt_50_rejects_logon_as_an_undefined_message() {
+    // ACCEPTANCE 2 (rmp #906): LOGON does not exist at 5.0 — the Neo4j reference server unregisters
+    // its decoder entirely (`BoltProtocolV50.createRequestMessageRegistry`). Graphus must therefore
+    // reject it as an UNDECODABLE message for the negotiated version, not act on it.
+    //
+    // (a) POST-authentication (the realistic case: a 5.0 session is READY straight after HELLO). A
+    //     post-auth malformed message is the recoverable FAILED state, and RESET clears it.
+    let exec = MockExecutor::new().on_query(
+        "RETURN 1",
+        CannedResult::rows(&["x"], vec![vec![Value::Integer(1)]]),
+    );
+    let input = session_input_at(
+        0,
+        &[
+            hello_50("alice", "alice-pw"),
+            logon_alice(),
+            Request::Reset,
+            Request::Run {
+                query: "RETURN 1".to_owned(),
+                parameters: vec![],
+                extra: vec![],
+            },
+            Request::Pull { n: ALL, qid: None },
+            Request::Goodbye,
+        ],
+    );
+    let auth = auth_fixture();
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::new(&mut transport, exec, &auth);
+        session.run().unwrap();
+        assert_eq!(session.state(), State::Defunct, "ended by GOODBYE");
+    }
+    let (_, stream) = split_handshake(transport.written());
+    let r = decode_responses(stream);
+    assert!(
+        matches!(r[0], Response::Success { .. }),
+        "HELLO authenticates"
+    );
+    match &r[1] {
+        Response::Failure(f) => {
+            assert_eq!(f.code, "Neo.ClientError.Request.Invalid");
+            assert!(
+                f.message.contains("not defined by Bolt 5.0"),
+                "the FAILURE must say the message does not exist at this version: {f:?}"
+            );
+        }
+        other => panic!("expected an undecodable-message FAILURE, got {other:?}"),
+    }
+    assert!(matches!(r[2], Response::Success { .. }), "RESET recovers");
+    assert!(matches!(r[3], Response::Success { .. }), "RUN after RESET");
+    assert!(matches!(r[4], Response::Record { .. }));
+
+    // (b) PRE-authentication: a LOGON as the very first message is refused the same way, and being
+    //     pre-auth it is TERMINAL (rmp #820) — it can never authenticate the connection.
+    let input = session_input_at(0, &[logon_alice(), hello_50("alice", "alice-pw")]);
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::new(&mut transport, MockExecutor::new(), &auth);
+        session.run().unwrap();
+        assert_eq!(session.state(), State::Defunct);
+        assert_eq!(session.principal(), None);
+    }
+    let (_, stream) = split_handshake(transport.written());
+    let r = decode_responses(stream);
+    match &r[0] {
+        Response::Failure(f) => assert_eq!(f.code, "Neo.ClientError.Request.Invalid"),
+        other => panic!("expected an undecodable-message FAILURE, got {other:?}"),
+    }
+    assert_eq!(r.len(), 1, "a pre-auth failure is terminal: {r:?}");
+}
+
+#[test]
+fn bolt_50_rejects_logoff_as_an_undefined_message() {
+    // LOGOFF shares LOGON's 5.1 introduction and the reference's `unregister`, so at 5.0 it too is
+    // undecodable. It must NOT drop the principal or move the session to AUTHENTICATION — that state
+    // is unreachable at 5.0, where there is no LOGON to get back out of it.
+    let exec = MockExecutor::new().on_query(
+        "RETURN 1",
+        CannedResult::rows(&["x"], vec![vec![Value::Integer(1)]]),
+    );
+    let input = session_input_at(
+        0,
+        &[
+            hello_50("alice", "alice-pw"),
+            Request::Logoff,
+            Request::Reset,
+            Request::Run {
+                query: "RETURN 1".to_owned(),
+                parameters: vec![],
+                extra: vec![],
+            },
+            Request::Pull { n: ALL, qid: None },
+            Request::Goodbye,
+        ],
+    );
+    let auth = auth_fixture();
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::new(&mut transport, exec, &auth);
+        session.run().unwrap();
+        assert_eq!(
+            session.principal(),
+            Some("alice"),
+            "an undecodable LOGOFF must NOT drop the authenticated identity"
+        );
+    }
+    let (_, stream) = split_handshake(transport.written());
+    let r = decode_responses(stream);
+    match &r[1] {
+        Response::Failure(f) => {
+            assert_eq!(f.code, "Neo.ClientError.Request.Invalid");
+            assert!(
+                f.message.contains("not defined by Bolt 5.0"),
+                "the FAILURE must say the message does not exist at this version: {f:?}"
+            );
+        }
+        other => panic!("expected an undecodable-message FAILURE, got {other:?}"),
+    }
+    // Post-authentication the refusal is the RECOVERABLE `FAILED` state, not a state change and not
+    // a closed connection: RESET clears it and the session keeps serving.
+    assert!(matches!(r[2], Response::Success { .. }), "RESET recovers");
+    assert!(matches!(r[3], Response::Success { .. }), "RUN after RESET");
+    assert!(matches!(r[4], Response::Record { .. }));
+}
+
+#[test]
+fn bolt_51_still_requires_logon_and_never_authenticates_from_hello() {
+    // ACCEPTANCE 3 (rmp #906): 5.1+ behaviour is unchanged. A HELLO — even one that (wrongly) carries
+    // credentials — only negotiates: the session goes to AUTHENTICATION with NO principal, and a RUN
+    // before the LOGON is a terminal pre-auth failure.
+    let input = session_input_at(
+        1,
+        &[
+            hello_50("alice", "alice-pw"), // credentials in HELLO: ignored at 5.1+
+            Request::Run {
+                query: "RETURN 1".to_owned(),
+                parameters: vec![],
+                extra: vec![],
+            },
+        ],
+    );
+    let auth = auth_fixture();
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::new(&mut transport, MockExecutor::new(), &auth);
+        session.run().unwrap();
+        assert_eq!(session.version(), Some(Version::new(5, 1)));
+        assert_eq!(
+            session.principal(),
+            None,
+            "a 5.1 HELLO must NEVER authenticate, whatever it carries"
+        );
+        assert_eq!(session.state(), State::Defunct);
+    }
+    let (_, stream) = split_handshake(transport.written());
+    let r = decode_responses(stream);
+    assert!(matches!(r[0], Response::Success { .. }), "HELLO → SUCCESS");
+    match &r[1] {
+        Response::Failure(f) => assert_eq!(f.code, "Neo.ClientError.Request.Invalid"),
+        other => panic!("expected a pre-auth wrong-state FAILURE, got {other:?}"),
+    }
+    assert_eq!(r.len(), 2, "pre-auth failures are terminal: {r:?}");
+
+    // The full 5.1 flow still works end to end: HELLO → LOGON → RUN → PULL.
+    let exec = MockExecutor::new().on_query(
+        "RETURN 1",
+        CannedResult::rows(&["x"], vec![vec![Value::Integer(1)]]),
+    );
+    let input = session_input_at(
+        1,
+        &[
+            hello(),
+            logon_alice(),
+            Request::Run {
+                query: "RETURN 1".to_owned(),
+                parameters: vec![],
+                extra: vec![],
+            },
+            Request::Pull { n: ALL, qid: None },
+            Request::Goodbye,
+        ],
+    );
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::new(&mut transport, exec, &auth);
+        session.run().unwrap();
+        assert_eq!(session.principal(), Some("alice"));
+    }
+    let (_, stream) = split_handshake(transport.written());
+    let r = decode_responses(stream);
+    // HELLO SUCCESS, LOGON SUCCESS, RUN SUCCESS{fields}, RECORD, trailing SUCCESS.
+    assert_eq!(r.len(), 5, "responses: {r:?}");
+    assert!(!r.iter().any(|resp| matches!(resp, Response::Failure(_))));
+
+    // ...and LOGOFF (a 5.1 message) is still honoured at 5.1, returning to AUTHENTICATION.
+    let input = session_input_at(1, &[hello(), logon_alice(), Request::Logoff]);
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::new(&mut transport, MockExecutor::new(), &auth);
+        session.run().unwrap();
+        assert_eq!(
+            session.principal(),
+            None,
+            "LOGOFF drops the identity at 5.1"
+        );
+    }
+    let (_, stream) = split_handshake(transport.written());
+    let r = decode_responses(stream);
+    assert!(
+        matches!(r[2], Response::Success { .. }),
+        "LOGOFF is a valid 5.1 message: {r:?}"
+    );
+}
+
+#[test]
+fn telemetry_is_undecodable_below_5_4_and_accepted_at_5_4() {
+    // The reference server registers `TelemetryMessageDecoder` only from `BoltProtocolV54`; v50–v53
+    // unregister it. So a TELEMETRY in READY is an undecodable message below 5.4 — and the same
+    // message becomes a plain SUCCESS at 5.4. Driven at 5.3 (the highest minor that still lacks it)
+    // and at 5.4, over the same authenticated flow, so ONLY the negotiated version differs.
+    let auth = auth_fixture();
+    for (minor, expect_success) in [(3u8, false), (4u8, true)] {
+        let input = session_input_at(
+            minor,
+            &[hello(), logon_alice(), Request::Telemetry { api: 2 }],
+        );
+        let mut transport = MemoryTransport::with_input(&input);
+        {
+            let mut session = BoltSession::new(&mut transport, MockExecutor::new(), &auth);
+            session.run().unwrap();
+        }
+        let (_, stream) = split_handshake(transport.written());
+        let r = decode_responses(stream);
+        if expect_success {
+            assert!(
+                matches!(r[2], Response::Success { .. }),
+                "TELEMETRY must be accepted at 5.{minor}: {r:?}"
+            );
+        } else {
+            match &r[2] {
+                Response::Failure(f) => {
+                    assert_eq!(f.code, "Neo.ClientError.Request.Invalid");
+                    assert!(
+                        f.message.contains("TELEMETRY")
+                            && f.message.contains(&format!("Bolt 5.{minor}")),
+                        "the FAILURE must name the message and the version: {f:?}"
+                    );
+                }
+                other => panic!("TELEMETRY must be undecodable at 5.{minor}, got {other:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn max_protocol_minor_caps_both_handshake_forms_and_serves_the_capped_version() {
+    // The ratified `bolt_max_protocol_minor` option (rmp #906) reaches the session through
+    // `SessionConfig`. A capped session must (a) reply with the cap even though the client offered
+    // more, on BOTH handshake forms, and (b) then serve that version's flow — here the 5.0
+    // HELLO-carried authentication, driven by a client that had asked for 5.0..=5.4.
+    let capped = SessionConfig {
+        max_protocol_minor: 0,
+        ..SessionConfig::default()
+    };
+    let auth = auth_fixture();
+    let requests = [hello_50("alice", "alice-pw"), Request::Goodbye];
+
+    // (a) Legacy 4-slot handshake: the client offers the full 5.0..=5.4 span.
+    let mut input = encode_client_handshake([
+        Proposal::range(5, 4, 4),
+        Proposal::exact(0, 0),
+        Proposal::exact(0, 0),
+        Proposal::exact(0, 0),
+    ]);
+    for r in &requests {
+        input.extend_from_slice(&encode_request_framed(r).unwrap());
+    }
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session =
+            BoltSession::with_config(&mut transport, MockExecutor::new(), &auth, capped.clone());
+        session.run().unwrap();
+        assert_eq!(session.version(), Some(Version::new(5, 0)), "capped to 5.0");
+        assert_eq!(session.principal(), Some("alice"));
+    }
+    let (hs, stream) = split_handshake(transport.written());
+    assert_eq!(hs, [0x00, 0x00, 0x00, 0x05], "legacy reply is 5.0");
+    assert!(matches!(
+        decode_responses(stream)[0],
+        Response::Success { .. }
+    ));
+
+    // (b) Manifest-v1 handshake: the server's manifest must advertise the SAME capped window, and a
+    //     client choosing above the cap is refused.
+    let mut input = manifest_handshake(Version::new(5, 0));
+    for r in &requests {
+        input.extend_from_slice(&encode_request_framed(r).unwrap());
+    }
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session =
+            BoltSession::with_config(&mut transport, MockExecutor::new(), &auth, capped.clone());
+        session.run().unwrap();
+        assert_eq!(session.version(), Some(Version::new(5, 0)));
+        assert_eq!(session.principal(), Some("alice"));
+    }
+    let written = transport.written().to_vec();
+    // The manifest reply: ack (4 bytes), count 1, the range, capabilities 0 — the range must be the
+    // exact 5.0 single version, matching what the legacy path negotiated.
+    assert_eq!(&written[..4], &crate::handshake::MANIFEST_V1_REQUEST);
+    assert_eq!(
+        &written[5..9],
+        &[0x00, 0x00, 0x00, 0x05],
+        "advertised 5.0 only"
+    );
+
+    // A manifest client that picks 5.4 against a 5.0-capped server is rejected outright.
+    let mut transport = MemoryTransport::with_input(&manifest_handshake(Version::new(5, 4)));
+    let mut session = BoltSession::with_config(&mut transport, MockExecutor::new(), &auth, capped);
+    assert!(
+        session.run().is_err(),
+        "a capped server must refuse a manifest choice above its cap"
+    );
+
+    // The DEFAULT session is unchanged: it still negotiates the compiled maximum.
+    let mut input = encode_client_handshake([
+        Proposal::range(5, 4, 4),
+        Proposal::exact(0, 0),
+        Proposal::exact(0, 0),
+        Proposal::exact(0, 0),
+    ]);
+    input.extend_from_slice(&encode_request_framed(&hello()).unwrap());
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::new(&mut transport, MockExecutor::new(), &auth);
+        session.run().unwrap();
+        assert_eq!(
+            session.version(),
+            Some(Version::new(5, crate::handshake::MAX_MINOR))
+        );
+    }
+}
+
+/// A [`Transport`] that counts [`Transport::on_authenticated`] calls and otherwise delegates to a
+/// [`MemoryTransport`], so a test can prove the rmp #469 pre-authentication read-deadline relaxation
+/// fires on a given authentication path (on a real socket transport that call is what stops a
+/// legitimate long-lived session from being reaped by the slow-loris guard).
+struct AuthSignalTransport {
+    inner: MemoryTransport,
+    on_authenticated_calls: usize,
+}
+
+impl AuthSignalTransport {
+    fn with_input(input: &[u8]) -> Self {
+        Self {
+            inner: MemoryTransport::with_input(input),
+            on_authenticated_calls: 0,
+        }
+    }
+}
+
+impl crate::transport::Transport for AuthSignalTransport {
+    fn read(&mut self, buf: &mut [u8]) -> BoltResult<usize> {
+        self.inner.read(buf)
+    }
+    fn write_all(&mut self, bytes: &[u8]) -> BoltResult<()> {
+        self.inner.write_all(bytes)
+    }
+    fn flush(&mut self) -> BoltResult<()> {
+        self.inner.flush()
+    }
+    fn on_authenticated(&mut self) {
+        self.on_authenticated_calls += 1;
+    }
+}
+
+#[test]
+fn bolt_50_hello_relaxes_the_pre_auth_read_deadline_exactly_once() {
+    // rmp #469 (F-NET-1): the transport's stricter PRE-authentication read deadline must be relaxed
+    // at the single transition out of the unauthenticated phase. At 5.0 that transition is the HELLO,
+    // not a LOGON — skipping the signal there would have the slow-loris guard reap every legitimate
+    // long-lived 5.0 session.
+    let auth = auth_fixture();
+    let mut transport = AuthSignalTransport::with_input(&session_input_at(
+        0,
+        &[hello_50("alice", "alice-pw"), Request::Goodbye],
+    ));
+    {
+        let mut session = BoltSession::new(&mut transport, MockExecutor::new(), &auth);
+        session.run().unwrap();
+    }
+    assert_eq!(
+        transport.on_authenticated_calls, 1,
+        "the 5.0 HELLO must signal authentication to the transport exactly once"
+    );
+
+    // A REJECTED 5.0 HELLO must NOT relax the deadline (the connection never authenticated).
+    let mut transport =
+        AuthSignalTransport::with_input(&session_input_at(0, &[hello_50("alice", "WRONG-pw")]));
+    {
+        let mut session = BoltSession::new(&mut transport, MockExecutor::new(), &auth);
+        session.run().unwrap();
+    }
+    assert_eq!(
+        transport.on_authenticated_calls, 0,
+        "a failed 5.0 HELLO must never relax the pre-authentication deadline"
+    );
+}
+
+/// Drives ONE bad Bolt **5.0** `HELLO` authentication for `principal` on a fresh session sharing
+/// `auth` + `throttle`, returning the decoded responses. A failed pre-auth HELLO is terminal
+/// (rmp #820), so each attempt is a fresh connection — exactly how the throttle accrues across
+/// reconnects in production. The 5.0 counterpart of [`drive_bad_logon`].
+fn drive_bad_hello_auth_50(
+    auth: &CountingAuth,
+    throttle: &LoginThrottle,
+    principal: &str,
+) -> Vec<Response> {
+    let input = session_input_at(0, &[hello_50(principal, "WRONG-pw")]);
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::new(&mut transport, MockExecutor::new(), auth)
+            .with_login_throttle(throttle.clone());
+        session.run().unwrap();
+        assert_eq!(session.principal(), None);
+        assert_eq!(
+            session.state(),
+            State::Defunct,
+            "a failed 5.0 HELLO authentication is terminal (rmp #820)"
+        );
+    }
+    let (_, stream) = split_handshake(transport.written());
+    decode_responses(stream)
+}
+
+#[test]
+fn bolt_50_hello_auth_consults_the_same_throttle_and_verify_bound_as_logon() {
+    // ACCEPTANCE 4 + the SECURITY PRECONDITION of rmp #906: the 5.0 HELLO-carried authentication path
+    // MUST traverse BOTH existing limiters — the per-account `AuthThrottle` (rmp #823) and the global
+    // `VerifyLimiter` (rmp #824). If it bypassed them, an attacker would sidestep both simply by
+    // negotiating 5.0. Proven exactly as the LOGON tests prove it: `CountingAuth` counts the Argon2
+    // KDF, which lives strictly inside `authenticate_password`, so a FLAT count across a
+    // throttled/shed attempt proves the limiter rejected it before the KDF.
+    const MAX: u32 = 3;
+    let auth = CountingAuth::new(auth_fixture());
+    let clock = Arc::new(TestClock::new());
+    let throttle = LoginThrottle::new(
+        Arc::new(AuthThrottle::new(MAX, 1).expect("non-zero limits")),
+        clock.clone(),
+    );
+
+    // Spend `alice`'s failure budget over Bolt 5.0 connections only.
+    for i in 0..MAX {
+        let before = auth.kdf_calls();
+        let r = drive_bad_hello_auth_50(&auth, &throttle, "alice");
+        assert!(
+            matches!(r[0], Response::Failure(_)),
+            "attempt {i}: a wrong password in a 5.0 HELLO must FAIL"
+        );
+        assert_eq!(
+            auth.kdf_calls(),
+            before + 1,
+            "attempt {i}: the KDF runs while the account still has budget"
+        );
+    }
+
+    // The (MAX+1)th 5.0 HELLO is rejected BEFORE the KDF by the SAME per-account throttle.
+    let before = auth.kdf_calls();
+    let r = drive_bad_hello_auth_50(&auth, &throttle, "alice");
+    match &r[0] {
+        Response::Failure(f) => assert_eq!(
+            f.code, CODE_UNAUTHORIZED,
+            "a throttled 5.0 HELLO returns the SAME Unauthorized as a wrong password (no oracle)"
+        ),
+        other => panic!("expected an Unauthorized FAILURE, got {other:?}"),
+    }
+    assert_eq!(
+        auth.kdf_calls(),
+        before,
+        "the throttled 5.0 HELLO MUST be rejected BEFORE the Argon2 KDF (rmp #823 over 5.0)"
+    );
+
+    // The budget is shared with the 5.1+ LOGON path: `alice` is ALSO locked out over LOGON, so an
+    // attacker cannot spend the budget on one version and continue on the other.
+    let before = auth.kdf_calls();
+    let r = drive_bad_logon(&auth, &throttle, "alice");
+    match &r[1] {
+        Response::Failure(f) => assert_eq!(f.code, CODE_UNAUTHORIZED),
+        other => panic!("expected an Unauthorized FAILURE, got {other:?}"),
+    }
+    assert_eq!(
+        auth.kdf_calls(),
+        before,
+        "the budget spent over 5.0 must lock the account out over the 5.1+ LOGON path too"
+    );
+
+    // Still PER-ACCOUNT: a different principal is unaffected and its first attempt runs the KDF.
+    let before = auth.kdf_calls();
+    let _ = drive_bad_hello_auth_50(&auth, &throttle, "bob");
+    assert_eq!(auth.kdf_calls(), before + 1);
+
+    // A CORRECT credential authenticates once the bucket refills (success is never throttled).
+    clock.advance_secs(u64::from(MAX) + 1);
+    let input = session_input_at(0, &[hello_50("alice", "alice-pw")]);
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::new(&mut transport, MockExecutor::new(), &auth)
+            .with_login_throttle(throttle);
+        session.run().unwrap();
+        assert_eq!(session.principal(), Some("alice"));
+    }
+
+    // ...and the GLOBAL concurrent-verification bound (rmp #824) sheds a 5.0 HELLO before the KDF
+    // exactly as it sheds a LOGON.
+    let limiter = Arc::new(VerifyLimiter::new(1));
+    let held = limiter.try_acquire().expect("within cap");
+    let before = auth.kdf_calls();
+    let input = session_input_at(0, &[hello_50("alice", "alice-pw")]);
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::new(&mut transport, MockExecutor::new(), &auth)
+            .with_verify_limiter(Arc::clone(&limiter));
+        session.run().unwrap();
+        assert_eq!(session.principal(), None);
+    }
+    let (_, stream) = split_handshake(transport.written());
+    match &decode_responses(stream)[0] {
+        Response::Failure(f) => assert_eq!(
+            f.code, CODE_SERVER_BUSY,
+            "a saturated-bound shed carries the transient busy code over 5.0 too"
+        ),
+        other => panic!("expected a busy FAILURE, got {other:?}"),
+    }
+    assert_eq!(
+        auth.kdf_calls(),
+        before,
+        "a shed 5.0 HELLO must NOT run the Argon2 KDF (rmp #824 over 5.0)"
+    );
+    drop(held);
+}
+
+#[test]
+fn bolt_50_hello_auth_token_excludes_exactly_the_reserved_protocol_fields() {
+    // The 5.0 auth token is `extra` MINUS the reserved non-auth fields, mirroring the Neo4j
+    // reference (`HelloMessageDecoderV41.FIELDS` → `AuthenticationMetadataUtils.extractAuthToken`).
+    // Pin the list: a future edit that drops one would leak a protocol field into the token, and one
+    // that adds `bolt_agent` (a 5.3+ field NOT in the reference's 5.0 list) would silently diverge.
+    let extra = vec![
+        ("user_agent".to_owned(), Value::String("drv/1".to_owned())),
+        ("patch_bolt".to_owned(), Value::List(vec![])),
+        ("routing".to_owned(), Value::Map(vec![])),
+        (
+            "notifications_minimum_severity".to_owned(),
+            Value::String("WARNING".to_owned()),
+        ),
+        (
+            "notifications_disabled_categories".to_owned(),
+            Value::List(vec![]),
+        ),
+        ("bolt_agent".to_owned(), Value::Map(vec![])),
+        ("scheme".to_owned(), Value::String("basic".to_owned())),
+        ("principal".to_owned(), Value::String("alice".to_owned())),
+        (
+            "credentials".to_owned(),
+            Value::String("alice-pw".to_owned()),
+        ),
+        ("realm".to_owned(), Value::String("native".to_owned())),
+    ];
+    let token = hello_auth_token(extra);
+    let token: Vec<&str> = token.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(
+        token,
+        ["bolt_agent", "scheme", "principal", "credentials", "realm"],
+        "the token is everything except the five reserved protocol fields, in `extra` order"
+    );
+    // The reserved list itself, pinned against the reference decoder's field list.
+    assert_eq!(
+        HELLO_NON_AUTH_FIELDS,
+        [
+            "patch_bolt",
+            "routing",
+            "user_agent",
+            "notifications_minimum_severity",
+            "notifications_disabled_categories",
+        ]
+    );
+}

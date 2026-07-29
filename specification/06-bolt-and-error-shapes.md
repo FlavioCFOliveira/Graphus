@@ -71,6 +71,39 @@ requires a Bolt minor beyond 5.4.
   versions Graphus certifies, reading the verbatim Bolt specification for any minor adopted beyond
   5.4 (`04` §12 item 11; "never guess").
 
+### 1.3 The negotiated minor selects the message set and the authentication flow (rmp #906)
+
+Negotiating "down to any 5.x minor in the 5.0–5.4 window" is only honoured if the server then
+**serves that minor's protocol**, not the 5.4 one. Bolt introduces messages at exact minors, and the
+authentication flow itself changed inside the window, so the state machine and the message registry
+are both keyed on the negotiated version.
+
+- **Authentication.** From **5.1**, `HELLO` only negotiates and a separate `LOGON` authenticates; at
+  **5.0**, `HELLO` carries the authentication token in its `extra` map and a successful `HELLO` goes
+  straight to `READY` (there is no `AUTHENTICATION` state at 5.0). The Bolt server-state
+  specification's "Summary of changes" states it directly — *Version 5.1*: "HELLO message no longer
+  accepts authentication … LOGON message has been added … LOGOFF message has been added"; *Version
+  5.0*: "No changes compared to version 4.4".
+- **The 5.0 authentication token** is the whole `HELLO` `extra` map **minus** the reserved protocol
+  fields `patch_bolt`, `routing`, `user_agent`, `notifications_minimum_severity` and
+  `notifications_disabled_categories` — the Neo4j reference server's rule
+  (`HelloMessageDecoderV41` → `AuthenticationMetadataUtils.extractAuthToken`). Note that `bolt_agent`
+  is a 5.3+ field and is deliberately **not** reserved at 5.0.
+- **Message availability.** `LOGON` (`0x6A`) and `LOGOFF` (`0x6B`) exist from **5.1**; `TELEMETRY`
+  (`0x54`) from **5.4**; every other message spans the whole window. A message the negotiated version
+  does not define is **undecodable**, not merely out of order: it is answered exactly like any other
+  malformed message (`Neo.ClientError.Request.Invalid` — terminal before authentication per the
+  pre-auth rule, the recoverable `FAILED` state after it). The reference server implements this by
+  *unregistering* those decoders at the affected versions.
+- **Security invariant.** Every authentication path — the 5.0 `HELLO` and the 5.1+ `LOGON` — resolves
+  through one chokepoint, so the per-account failed-authentication throttle and the global
+  concurrent-verification bound apply identically. Negotiating an older minor MUST never be a way
+  around a limiter.
+- **Capped window.** The `bolt_max_protocol_minor` startup option narrows the advertised window
+  (`5.0..=cap`). It is honoured by **both** handshake forms — the legacy 4-slot reply and the
+  Manifest-v1 exchange — so the two can never advertise different windows, and it can only ever
+  narrow, never widen, what Graphus offers.
+
 ---
 
 ## 2. TCK error-classification model

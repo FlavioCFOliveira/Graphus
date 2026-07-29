@@ -46,6 +46,18 @@
 //! client requests within that window. [`negotiate`] picks the **highest** mutually-supported minor
 //! across the four proposals (drivers list their preference highest-first; choosing the highest
 //! offered minor that we support is the standard, driver-friendly rule).
+//!
+//! ## Capping the advertised window (`bolt_max_protocol_minor`; rmp #906)
+//!
+//! An operator may cap the highest 5.x minor the listener advertises and accepts, so an unmodified
+//! stock driver can be pinned to an exact minor (conformance testing, or working around a driver bug
+//! at a newer minor). Every negotiation primitive therefore comes in two forms: the plain one, which
+//! uses the compiled [`MAX_MINOR`], and a `…_within(max_minor)` one, which uses the capped window
+//! `MIN_MINOR..=max_minor`. **Both handshake forms take the same cap** — [`negotiate_within`] for the
+//! legacy reply, [`graphus_manifest_within`] + [`version_supported_within`] for the Manifest-v1
+//! exchange — so the claim above ("both handshake forms negotiate the *same* version window") stays
+//! true at any cap. The cap is clamped into `MIN_MINOR..=MAX_MINOR` inside these functions, so a
+//! caller can never make Graphus advertise a minor it does not implement.
 
 use crate::error::{BoltError, BoltResult};
 
@@ -99,8 +111,35 @@ impl Version {
     /// Whether Graphus supports this exact version (major 5, minor `0..=4`).
     #[must_use]
     pub fn is_supported(self) -> bool {
-        self.major == SUPPORTED_MAJOR && (MIN_MINOR..=MAX_MINOR).contains(&self.minor)
+        version_supported_within(self, MAX_MINOR)
     }
+}
+
+/// Clamps an operator-supplied maximum minor into the window Graphus actually implements
+/// (`MIN_MINOR..=MAX_MINOR`).
+///
+/// Every `…_within` primitive runs its argument through this, so a caller can never widen the
+/// advertised window past the compiled maximum (nor collapse it below the 5.0 floor) — the cap can
+/// only ever *narrow* what Graphus offers. `graphus-server` validates the configured value up front;
+/// this is the defence-in-depth backstop for any other caller.
+/// Written against the named bounds rather than as a bare `min(MAX_MINOR)` so that raising
+/// [`MIN_MINOR`] (dropping the 5.0 baseline) automatically tightens the floor here too. While
+/// `MIN_MINOR == 0` the lower bound is a no-op for a `u8`, which is exactly the intent.
+#[must_use]
+pub fn clamp_max_minor(max_minor: u8) -> u8 {
+    max_minor.clamp(MIN_MINOR, MAX_MINOR)
+}
+
+/// Whether `version` falls inside the **capped** window `MIN_MINOR..=max_minor` of major
+/// [`SUPPORTED_MAJOR`] (`max_minor` is clamped by [`clamp_max_minor`]).
+///
+/// This is the manifest-side counterpart of [`negotiate_within`]: after the client returns its chosen
+/// version in the Manifest-v1 second round, the server accepts it only if it is within the same
+/// window the legacy path would have negotiated.
+#[must_use]
+pub fn version_supported_within(version: Version, max_minor: u8) -> bool {
+    version.major == SUPPORTED_MAJOR
+        && (MIN_MINOR..=clamp_max_minor(max_minor)).contains(&version.minor)
 }
 
 /// The all-zero version that the server returns to **reject** every proposal (`04 §8.1`).
@@ -155,19 +194,21 @@ impl Proposal {
         }
     }
 
-    /// The highest minor in this proposal that Graphus supports, if any.
+    /// The highest minor in this proposal that Graphus supports within the window
+    /// `MIN_MINOR..=max_minor` (`max_minor` is clamped by [`clamp_max_minor`]), if any.
     ///
     /// Walks the proposed span from its top (`minor`) downward to `minor - range` (saturating at 0)
-    /// and returns the first minor that is within Graphus's supported window. Returning the highest
-    /// is what makes [`negotiate`] pick the best mutually-supported version.
-    fn best_supported_minor(self) -> Option<u8> {
+    /// and returns the first minor that is within that window. Returning the highest is what makes
+    /// [`negotiate_within`] pick the best mutually-supported version.
+    fn best_supported_minor_within(self, max_minor: u8) -> Option<u8> {
         if self.major != SUPPORTED_MAJOR {
             return None;
         }
+        let cap = clamp_max_minor(max_minor);
         let lowest = self.minor.saturating_sub(self.range);
         // Iterate from the top of the span downward.
         for minor in (lowest..=self.minor).rev() {
-            if (MIN_MINOR..=MAX_MINOR).contains(&minor) {
+            if (MIN_MINOR..=cap).contains(&minor) {
                 return Some(minor);
             }
         }
@@ -211,9 +252,20 @@ pub fn parse_client_handshake(bytes: &[u8]) -> BoltResult<[Proposal; PROPOSAL_SL
 /// and is naturally unsupported, so empty slots are ignored.
 #[must_use]
 pub fn negotiate(proposals: &[Proposal]) -> Option<Version> {
+    negotiate_within(proposals, MAX_MINOR)
+}
+
+/// [`negotiate`] against the **capped** window `MIN_MINOR..=max_minor` (rmp #906).
+///
+/// Identical to [`negotiate`] except that the top of the window is `max_minor` (clamped by
+/// [`clamp_max_minor`]) instead of the compiled [`MAX_MINOR`], so a listener configured with
+/// `bolt_max_protocol_minor` negotiates within exactly the window it advertises. Passing
+/// [`MAX_MINOR`] reproduces [`negotiate`] bit-for-bit.
+#[must_use]
+pub fn negotiate_within(proposals: &[Proposal], max_minor: u8) -> Option<Version> {
     proposals
         .iter()
-        .filter_map(|p| p.best_supported_minor())
+        .filter_map(|p| p.best_supported_minor_within(max_minor))
         .max()
         .map(|minor| Version::new(SUPPORTED_MAJOR, minor))
 }
@@ -307,13 +359,30 @@ pub fn encode_server_manifest(ranges: &[Proposal], capabilities: u64) -> Vec<u8>
 /// encoded as one [`Proposal`] (top minor `MAX_MINOR`, spanning down to `MIN_MINOR`).
 #[must_use]
 pub fn supported_manifest_range() -> Proposal {
-    Proposal::range(SUPPORTED_MAJOR, MAX_MINOR, MAX_MINOR - MIN_MINOR)
+    supported_manifest_range_within(MAX_MINOR)
+}
+
+/// [`supported_manifest_range`] for the **capped** window `MIN_MINOR..=max_minor` (rmp #906):
+/// one [`Proposal`] with top minor `max_minor` (clamped by [`clamp_max_minor`]) spanning down to
+/// [`MIN_MINOR`]. A cap of `MIN_MINOR` yields an exact single-version range (range byte `0`).
+#[must_use]
+pub fn supported_manifest_range_within(max_minor: u8) -> Proposal {
+    let cap = clamp_max_minor(max_minor);
+    Proposal::range(SUPPORTED_MAJOR, cap, cap - MIN_MINOR)
 }
 
 /// The server's full Manifest-v1 reply bytes for Graphus's supported window and no capabilities.
 #[must_use]
 pub fn graphus_manifest() -> Vec<u8> {
-    encode_server_manifest(&[supported_manifest_range()], 0)
+    graphus_manifest_within(MAX_MINOR)
+}
+
+/// [`graphus_manifest`] for the **capped** window `MIN_MINOR..=max_minor` (rmp #906): the server's
+/// Manifest-v1 reply advertising exactly the same window [`negotiate_within`] would negotiate, so
+/// the two handshake forms can never disagree about what Graphus offers.
+#[must_use]
+pub fn graphus_manifest_within(max_minor: u8) -> Vec<u8> {
+    encode_server_manifest(&[supported_manifest_range_within(max_minor)], 0)
 }
 
 /// The client's chosen version + accepted capabilities, sent after the server's manifest.
@@ -560,7 +629,7 @@ mod tests {
         // The advertised range negotiates exactly Graphus's legacy window.
         let range = supported_manifest_range();
         assert_eq!(negotiate(&[range]), Some(Version::new(5, 4)));
-        assert_eq!(range.best_supported_minor(), Some(4));
+        assert_eq!(range.best_supported_minor_within(MAX_MINOR), Some(4));
     }
 
     #[test]
@@ -588,6 +657,101 @@ mod tests {
             parse_manifest_choice(&[0x00, 0x00, 0x04, 0x05]),
             Err(BoltError::Handshake(_))
         ));
+    }
+
+    // ---- Capped version window (`bolt_max_protocol_minor`; rmp #906) --------------------------
+
+    #[test]
+    fn a_capped_window_negotiates_down_to_the_cap() {
+        // A stock driver proposing the full 5.0..=5.4 span gets exactly the cap, at every cap.
+        let full_span = [Proposal::range(5, MAX_MINOR, MAX_MINOR - MIN_MINOR)];
+        for cap in MIN_MINOR..=MAX_MINOR {
+            assert_eq!(
+                negotiate_within(&full_span, cap),
+                Some(Version::new(5, cap)),
+                "cap 5.{cap}"
+            );
+        }
+        // A client that will ONLY speak above the cap gets no version at all (rejection), rather
+        // than a version the capped listener did not offer.
+        assert_eq!(negotiate_within(&[Proposal::exact(5, 4)], 0), None);
+        assert_eq!(negotiate_within(&[Proposal::exact(5, 2)], 1), None);
+        // The cap only ever NARROWS: at MAX_MINOR it is bit-for-bit `negotiate`.
+        for proposals in [
+            vec![Proposal::exact(5, 4)],
+            vec![Proposal::range(5, 9, 6)],
+            vec![Proposal::exact(5, 1), Proposal::exact(5, 3)],
+            vec![Proposal::exact(4, 4)],
+        ] {
+            assert_eq!(
+                negotiate_within(&proposals, MAX_MINOR),
+                negotiate(&proposals),
+                "{proposals:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_out_of_range_cap_is_clamped_and_can_never_widen_the_window() {
+        // Above the compiled maximum: clamped down, so a caller cannot make Graphus advertise a
+        // minor it does not implement.
+        assert_eq!(clamp_max_minor(9), MAX_MINOR);
+        assert_eq!(
+            negotiate_within(&[Proposal::range(5, 9, 9)], 200),
+            Some(Version::new(5, MAX_MINOR))
+        );
+        assert_eq!(graphus_manifest_within(200), graphus_manifest());
+        // Below the floor is impossible for a `u8` while MIN_MINOR == 0, but the clamp is defined
+        // for it regardless.
+        assert_eq!(clamp_max_minor(MIN_MINOR), MIN_MINOR);
+    }
+
+    #[test]
+    fn both_handshake_forms_honour_the_same_cap() {
+        // The module docs claim both handshake forms negotiate the SAME window. Under a cap that
+        // must still hold, or a driver would be offered one window and negotiated into another.
+        for cap in MIN_MINOR..=MAX_MINOR {
+            // Legacy: a full-span proposal lands on the cap.
+            let legacy = negotiate_within(&[Proposal::range(5, MAX_MINOR, MAX_MINOR)], cap);
+            assert_eq!(legacy, Some(Version::new(5, cap)));
+
+            // Manifest: the advertised range's top IS the cap, spanning down to the floor.
+            let manifest = graphus_manifest_within(cap);
+            assert_eq!(&manifest[..4], &MANIFEST_V1_REQUEST, "manifest ack");
+            assert_eq!(manifest[4], 0x01, "one advertised range");
+            assert_eq!(
+                &manifest[5..9],
+                &[0x00, cap - MIN_MINOR, cap, SUPPORTED_MAJOR],
+                "advertised range at cap 5.{cap}"
+            );
+            assert_eq!(manifest[9], 0x00, "no extra capabilities");
+
+            // ...and the acceptance check agrees with the legacy outcome exactly: everything at or
+            // below the cap is accepted, everything above it refused.
+            for minor in MIN_MINOR..=MAX_MINOR {
+                assert_eq!(
+                    version_supported_within(Version::new(5, minor), cap),
+                    minor <= cap,
+                    "cap 5.{cap}, client chose 5.{minor}"
+                );
+            }
+            assert!(version_supported_within(legacy.unwrap(), cap));
+        }
+    }
+
+    #[test]
+    fn a_zero_cap_advertises_exactly_bolt_5_0() {
+        // The `bolt_max_protocol_minor = 0` configuration used to pin a stock driver to Bolt 5.0.
+        let manifest = graphus_manifest_within(0);
+        // Range byte 0 = an exact single version, minor 0, major 5.
+        assert_eq!(&manifest[5..9], &[0x00, 0x00, 0x00, 0x05]);
+        assert_eq!(supported_manifest_range_within(0), Proposal::exact(5, 0));
+        assert_eq!(
+            server_reply(negotiate_within(&[Proposal::range(5, 4, 4)], 0)),
+            [0x00, 0x00, 0x00, 0x05],
+            "the server replies 5.0 to a driver that offered 5.0..=5.4"
+        );
+        assert!(!version_supported_within(Version::new(5, 1), 0));
     }
 
     #[test]

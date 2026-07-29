@@ -28,10 +28,19 @@
 //! - `LOGOFF` / `COMMIT` / `ROLLBACK` / `RESET` / `GOODBYE` carry **no** fields.
 //! - `SUCCESS` / `FAILURE` carry one **metadata** map; `RECORD` one **values** list; `IGNORED` no
 //!   fields.
+//!
+//! ## Not every opcode exists at every version (rmp #906)
+//!
+//! The request set above is the **5.4** set; the earlier minors in the 5.0–5.4 window Graphus
+//! negotiates define fewer messages. [`opcode_available_at`] is the authoritative predicate and
+//! [`Request::decode_at`] is the version-aware decoder the session uses — a tag the negotiated
+//! version does not define is rejected as an undecodable message rather than acted on. See
+//! [`opcode_min_minor`] for the per-opcode table and its sources.
 
 use graphus_core::Value;
 
 use crate::error::{BoltError, BoltResult, Failure};
+use crate::handshake::{SUPPORTED_MAJOR, Version};
 use crate::packstream::{
     BoltValue, MAX_STRUCT_FIELDS, Packer, Unpacker, pack_bolt_value, pack_value, prealloc_cap,
     unpack_bolt_value, unpack_value,
@@ -64,6 +73,76 @@ pub mod opcode {
 /// Sentinel value for "fetch / discard all remaining records" in a `PULL`/`DISCARD` `n` field, and
 /// for "the last query" in a `qid` field (`04 §8.1`, mirrors Bolt's `-1`).
 pub const ALL: i64 = -1;
+
+/// The lowest Bolt **5.x minor** that defines the request opcode `tag` — the per-version message
+/// registry, expressed as a table (rmp #906).
+///
+/// Bolt does not add messages silently: a message is introduced at an exact minor and simply does not
+/// exist below it, so a server advertising a *window* of minors must gate its decoder on the version
+/// it actually negotiated. The two gated families:
+///
+/// - **`LOGON` (`0x6A`) / `LOGOFF` (`0x6B`) — Bolt 5.1.** The Bolt server-state specification's
+///   "Summary of changes" says of *Version 5.1*: "HELLO message no longer accepts authentication …
+///   LOGON message has been added … LOGOFF message has been added", and of *Version 5.0*: "No changes
+///   compared to version 4.4" (neo4j.com/docs/bolt/current/bolt/server-state/). The Neo4j reference
+///   server makes this literal: `BoltProtocolV50.createRequestMessageRegistry()` **unregisters**
+///   `DefaultLogonMessageDecoder` and `DefaultLogoffMessageDecoder`, so at 5.0 those struct tags are
+///   not decodable at all.
+/// - **`TELEMETRY` (`0x54`) — Bolt 5.4.** The reference server registers `TelemetryMessageDecoder`
+///   only from `BoltProtocolV54`; v50/v51/v52/v53 all unregister it.
+///
+/// Every other opcode — including one Graphus does not model, which decodes to
+/// [`Request::Unsupported`] and is answered by the session's state machine — exists across the whole
+/// 5.0–5.4 window, so it returns [`MIN_MINOR`](crate::handshake::MIN_MINOR) (`0`).
+#[must_use]
+pub const fn opcode_min_minor(tag: u8) -> u8 {
+    match tag {
+        opcode::LOGON | opcode::LOGOFF => 1,
+        opcode::TELEMETRY => 4,
+        _ => crate::handshake::MIN_MINOR,
+    }
+}
+
+/// Whether the request opcode `tag` is **decodable at** the negotiated protocol `version`
+/// (rmp #906) — the gate [`Request::decode_at`] applies before it decodes anything.
+///
+/// `true` when `version` defines the message, `false` when the message was introduced at a later
+/// minor (see [`opcode_min_minor`] for the table and its specification/reference sources). A `false`
+/// here is *not* a wrong-state error: the message does not exist for this connection at all, so the
+/// session answers it exactly as it answers any other malformed message.
+///
+/// Graphus only ever negotiates major [`SUPPORTED_MAJOR`]; a version with any other major cannot
+/// reach a live session, and the gate defers (returns `true`) for it rather than inventing a table
+/// for a major this crate does not implement.
+#[must_use]
+pub fn opcode_available_at(tag: u8, version: Version) -> bool {
+    if version.major != SUPPORTED_MAJOR {
+        return true;
+    }
+    version.minor >= opcode_min_minor(tag)
+}
+
+/// A short name for a request opcode, for protocol-error messages; `None` for an opcode this version
+/// of Graphus does not model.
+#[must_use]
+pub const fn opcode_name(tag: u8) -> Option<&'static str> {
+    Some(match tag {
+        opcode::HELLO => "HELLO",
+        opcode::GOODBYE => "GOODBYE",
+        opcode::RESET => "RESET",
+        opcode::RUN => "RUN",
+        opcode::BEGIN => "BEGIN",
+        opcode::COMMIT => "COMMIT",
+        opcode::ROLLBACK => "ROLLBACK",
+        opcode::DISCARD => "DISCARD",
+        opcode::PULL => "PULL",
+        opcode::TELEMETRY => "TELEMETRY",
+        opcode::ROUTE => "ROUTE",
+        opcode::LOGON => "LOGON",
+        opcode::LOGOFF => "LOGOFF",
+        _ => return None,
+    })
+}
 
 /// A client → server request message (`04 §8.1`).
 #[derive(Debug, Clone, PartialEq)]
@@ -165,7 +244,12 @@ pub enum Response {
 }
 
 impl Request {
-    /// Decodes a request from a message payload (the bytes inside the chunk framing).
+    /// Decodes a request from a message payload (the bytes inside the chunk framing), **without**
+    /// applying the per-version opcode gate — every opcode this crate models is accepted.
+    ///
+    /// A live session must use [`decode_at`](Self::decode_at) instead, so a message the negotiated
+    /// version does not define is refused (rmp #906). This version-agnostic form remains the right
+    /// tool for codec-level round-trip tests and for any caller that has no negotiated version.
     ///
     /// # Errors
     /// [`BoltError::Decode`] on a malformed structure, a wrong field count for the opcode, or
@@ -173,6 +257,38 @@ impl Request {
     pub fn decode(payload: &[u8]) -> BoltResult<Self> {
         let mut u = Unpacker::new(payload);
         let (tag, field_count) = u.read_struct_header()?;
+        let fields = read_fields(&mut u, field_count)?;
+        Self::from_structure(tag, fields)
+    }
+
+    /// Decodes a request **for the negotiated protocol `version`** (rmp #906): the opcode is first
+    /// checked against [`opcode_available_at`], and a message the version does not define is refused
+    /// as undecodable before any field is read.
+    ///
+    /// This is the decoder a [`BoltSession`](crate::server::BoltSession) uses. Refusing at the
+    /// signature byte — rather than decoding the message and rejecting it later as "wrong state" —
+    /// mirrors the Neo4j reference server, which simply has **no decoder registered** for the tag at
+    /// that version, and keeps the outcome honest: the message does not exist on this connection.
+    /// The session answers the resulting error exactly as it answers any other malformed message
+    /// (`Neo.ClientError.Request.Invalid`; terminal before authentication per rmp #820, the
+    /// recoverable `FAILED` state after it).
+    ///
+    /// # Errors
+    /// [`BoltError::Decode`] if the opcode is not defined at `version`, or for any fault
+    /// [`decode`](Self::decode) reports.
+    pub fn decode_at(payload: &[u8], version: Version) -> BoltResult<Self> {
+        let mut u = Unpacker::new(payload);
+        let (tag, field_count) = u.read_struct_header()?;
+        if !opcode_available_at(tag, version) {
+            let name = opcode_name(tag).unwrap_or("message");
+            return Err(BoltError::Decode(format!(
+                "message {tag:#04x} ({name}) is not defined by Bolt {}.{} (introduced in {}.{})",
+                version.major,
+                version.minor,
+                SUPPORTED_MAJOR,
+                opcode_min_minor(tag),
+            )));
+        }
         let fields = read_fields(&mut u, field_count)?;
         Self::from_structure(tag, fields)
     }
@@ -848,5 +964,168 @@ mod tests {
         p.write_string("RETURN 1");
         let bytes = p.into_inner();
         assert!(matches!(Request::decode(&bytes), Err(BoltError::Decode(_))));
+    }
+
+    // ---- Per-version opcode decodability (rmp #906) ---------------------------------------------
+
+    /// The opcodes that exist across the WHOLE 5.0–5.4 window Graphus negotiates.
+    const ALWAYS_AVAILABLE: [u8; 10] = [
+        opcode::HELLO,
+        opcode::GOODBYE,
+        opcode::RESET,
+        opcode::RUN,
+        opcode::BEGIN,
+        opcode::COMMIT,
+        opcode::ROLLBACK,
+        opcode::DISCARD,
+        opcode::PULL,
+        opcode::ROUTE,
+    ];
+
+    #[test]
+    fn opcode_min_minor_matches_the_specification_table() {
+        // LOGON/LOGOFF arrived in Bolt 5.1 (server-state spec, "Summary of changes" — Version 5.1:
+        // "LOGON message has been added … LOGOFF message has been added"; Version 5.0: "No changes
+        // compared to version 4.4"). The Neo4j reference server unregisters both decoders at v50.
+        assert_eq!(opcode_min_minor(opcode::LOGON), 1);
+        assert_eq!(opcode_min_minor(opcode::LOGOFF), 1);
+        // TELEMETRY arrived in Bolt 5.4 (the reference registers `TelemetryMessageDecoder` only from
+        // `BoltProtocolV54`; v50–v53 unregister it).
+        assert_eq!(opcode_min_minor(opcode::TELEMETRY), 4);
+        // Everything else — modelled or not — exists across the whole window.
+        for tag in ALWAYS_AVAILABLE {
+            assert_eq!(opcode_min_minor(tag), 0, "opcode {tag:#04x}");
+        }
+        assert_eq!(
+            opcode_min_minor(0xAB),
+            0,
+            "an unmodelled opcode is not gated"
+        );
+    }
+
+    #[test]
+    fn opcode_available_at_gates_exactly_the_versioned_messages() {
+        for minor in 0..=crate::handshake::MAX_MINOR {
+            let v = Version::new(5, minor);
+            // The always-available set is decodable at every minor in the window.
+            for tag in ALWAYS_AVAILABLE {
+                assert!(
+                    opcode_available_at(tag, v),
+                    "opcode {tag:#04x} must be decodable at 5.{minor}"
+                );
+            }
+            // LOGON/LOGOFF: 5.1+ only.
+            let logon_ok = minor >= 1;
+            assert_eq!(opcode_available_at(opcode::LOGON, v), logon_ok, "5.{minor}");
+            assert_eq!(
+                opcode_available_at(opcode::LOGOFF, v),
+                logon_ok,
+                "5.{minor}"
+            );
+            // TELEMETRY: 5.4+ only.
+            assert_eq!(
+                opcode_available_at(opcode::TELEMETRY, v),
+                minor >= 4,
+                "5.{minor}"
+            );
+        }
+        // A non-5 major cannot reach a live session; the gate defers rather than guessing a table.
+        assert!(opcode_available_at(opcode::LOGON, Version::new(4, 4)));
+    }
+
+    #[test]
+    fn decode_at_refuses_logon_and_logoff_below_5_1() {
+        let logon = Request::Logon {
+            auth: vec![("scheme".to_owned(), Value::String("basic".to_owned()))],
+        }
+        .encode()
+        .unwrap();
+        let logoff = Request::Logoff.encode().unwrap();
+
+        // 5.0: neither message exists — the decoder refuses them outright.
+        for bytes in [&logon, &logoff] {
+            match Request::decode_at(bytes, Version::new(5, 0)) {
+                Err(BoltError::Decode(msg)) => {
+                    assert!(
+                        msg.contains("not defined by Bolt 5.0"),
+                        "message should name the version: {msg}"
+                    );
+                }
+                other => panic!("expected a decode refusal at 5.0, got {other:?}"),
+            }
+            // 5.1 onwards they decode normally...
+            assert!(Request::decode_at(bytes, Version::new(5, 1)).is_ok());
+            // ...and the version-agnostic decoder still accepts them at any version (it is the codec
+            // entry point, not the session's).
+            assert!(Request::decode(bytes).is_ok());
+        }
+    }
+
+    #[test]
+    fn decode_at_refuses_telemetry_below_5_4() {
+        let telemetry = Request::Telemetry { api: 0 }.encode().unwrap();
+        for minor in 0..4 {
+            match Request::decode_at(&telemetry, Version::new(5, minor)) {
+                Err(BoltError::Decode(msg)) => assert!(
+                    msg.contains("TELEMETRY") && msg.contains("5.4"),
+                    "message should name the message and the minor that introduced it: {msg}"
+                ),
+                other => panic!("expected a decode refusal at 5.{minor}, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            Request::decode_at(&telemetry, Version::new(5, 4)).unwrap(),
+            Request::Telemetry { api: 0 }
+        );
+    }
+
+    #[test]
+    fn decode_at_is_identical_to_decode_for_ungated_messages() {
+        // The gate must be surgical: every message that is NOT version-gated decodes identically
+        // through both entry points, at every minor in the window.
+        let messages = [
+            Request::Hello {
+                extra: vec![("user_agent".to_owned(), Value::String("drv/1".to_owned()))],
+            },
+            Request::Run {
+                query: "RETURN 1".to_owned(),
+                parameters: vec![],
+                extra: vec![],
+            },
+            Request::Pull {
+                n: ALL,
+                qid: Some(-1),
+            },
+            Request::Discard { n: 3, qid: None },
+            Request::Begin { extra: vec![] },
+            Request::Commit,
+            Request::Rollback,
+            Request::Reset,
+            Request::Goodbye,
+            Request::Route {
+                routing: vec![],
+                bookmarks: vec![],
+                extra: vec![],
+            },
+        ];
+        for m in &messages {
+            let bytes = m.encode().unwrap();
+            for minor in 0..=crate::handshake::MAX_MINOR {
+                assert_eq!(
+                    &Request::decode_at(&bytes, Version::new(5, minor)).unwrap(),
+                    m,
+                    "{m:?} must decode unchanged at 5.{minor}"
+                );
+            }
+            assert_eq!(&Request::decode(&bytes).unwrap(), m);
+        }
+    }
+
+    #[test]
+    fn opcode_name_covers_the_modelled_request_set() {
+        assert_eq!(opcode_name(opcode::LOGON), Some("LOGON"));
+        assert_eq!(opcode_name(opcode::TELEMETRY), Some("TELEMETRY"));
+        assert_eq!(opcode_name(opcode::PULL), Some("PULL"));
+        assert_eq!(opcode_name(0xAB), None);
     }
 }

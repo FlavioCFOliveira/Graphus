@@ -113,7 +113,20 @@ dialing. To use UDS you therefore speak Bolt directly over the socket. Two optio
 - **Handshake.** The client opens with the 4-byte magic preamble `60 60 B0 17` followed by
   four 32-bit version proposals. Graphus negotiates the highest mutually supported minor in
   the 5.0–5.4 window and replies with the chosen 4-byte version (or `00 00 00 00` to
-  reject). The modern Manifest-v1 handshake is also supported.
+  reject). The modern Manifest-v1 handshake is also supported. The top of that window can be
+  capped with the `bolt_max_protocol_minor` startup option (both handshake forms honour the
+  same cap); see
+  [configuration.md](configuration.md#bolt-protocol-version-cap).
+- **Authentication depends on the negotiated version.** From Bolt **5.1** the `HELLO` only
+  negotiates and a separate `LOGON` authenticates. At Bolt **5.0** the `HELLO` does both: the
+  authentication token (`scheme`, `principal`, `credentials`) travels in the `HELLO` `extra`
+  map and a successful `HELLO` lands directly in `READY`. Graphus serves both flows, and the
+  official drivers pick the right one automatically from the negotiated version.
+- **Per-version message set.** Older minors define fewer messages, and Graphus rejects a
+  message the negotiated version does not define (a `Neo.ClientError.Request.Invalid`
+  `FAILURE`, like any other undecodable message) rather than acting on it: `LOGON` and
+  `LOGOFF` exist from **5.1**, `TELEMETRY` from **5.4**; every other message spans the whole
+  5.0–5.4 window.
 - **Server agent.** The `HELLO` reply's `SUCCESS` carries a `server` agent string. Graphus announces
   `Graphus/<version>` by default — 100% Bolt-conformant and accepted by every modern Neo4j driver
   (which treat it as informational). For strict/legacy clients that demand the literal `Neo4j`, set

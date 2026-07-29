@@ -76,12 +76,15 @@ impl Drop for TempDir {
 /// as the admin (so the driver can both authenticate and run write queries — CREATE needs write,
 /// which the admin holds). `bolt_server_agent` selects the `HELLO` `SUCCESS` `server` string the
 /// listener announces (`None` = the honest `Graphus/<ver>` default; `Some("neo4j-compat")` = the
-/// vetted `Neo4j/5.13.0` legacy-driver compat mode — rmp #614).
+/// vetted `Neo4j/5.13.0` legacy-driver compat mode — rmp #614). `bolt_max_protocol_minor` caps the
+/// highest Bolt 5.x minor the listener advertises (`None` = the full 5.0–5.4 window; `Some(0)` pins
+/// an unmodified driver to exactly Bolt 5.0 — rmp #906).
 fn config_for(
     dir: &TempDir,
     cert_path: PathBuf,
     key_path: PathBuf,
     bolt_server_agent: Option<String>,
+    bolt_max_protocol_minor: Option<u8>,
 ) -> ServerConfig {
     ServerConfig {
         store_path: dir.path.join("store"),
@@ -91,6 +94,7 @@ fn config_for(
         bolt_tcp_addr: Some("127.0.0.1:0".to_owned()),
         advertised_bolt_address: None,
         bolt_server_agent,
+        bolt_max_protocol_minor,
         // No REST/UDS: this test only needs the TLS Bolt-TCP path the driver speaks.
         rest_addr: None,
         uds_path: None,
@@ -578,6 +582,124 @@ function driverRetryable(err) {
 })();
 "#;
 
+/// A Node.js script that proves the OFFICIAL driver interoperates over **exactly Bolt 5.0** (rmp
+/// #906). The server is booted with `bolt_max_protocol_minor = 0`, so the *unmodified* driver — which
+/// would otherwise choose the highest minor on offer — negotiates 5.0 and switches to its own Bolt 5.0
+/// protocol implementation, where the authentication token rides in `HELLO` and there is no `LOGON`.
+///
+/// It asserts:
+/// - the negotiated protocol version the driver reports is **5.0** (both on `getServerInfo()` and on a
+///   query's `ResultSummary`), so the test cannot silently pass on 5.4;
+/// - authentication succeeded (`verifyConnectivity()` completed) — at 5.0 that means the credentials
+///   in the `HELLO` were read and accepted;
+/// - a query round-trips end to end, including a write inside a managed transaction and reading it
+///   back, so the whole 5.0 session (RUN/PULL/BEGIN/COMMIT) works, not just the handshake.
+///
+/// Prints `GRAPHUS_BOLT50_OK` and exits 0 only on full success; any mismatch exits 1.
+const BOLT_50_SCRIPT: &str = r#"
+'use strict';
+const neo4j = require('neo4j-driver');
+
+const [, , port, user, password] = process.argv;
+const uri = `bolt+ssc://127.0.0.1:${port}`;
+
+function fail(msg) {
+  console.error('BOLT50 FAILURE: ' + msg);
+  process.exit(1);
+}
+const toNum = (v) => (neo4j.isInt(v) ? v.toNumber() : v);
+
+// Normalises the negotiated Bolt version the driver reports into "<major>.<minor>". Driver 6.x
+// reports an object `{ major, minor }`; the 5.x line reported a float (5.4, or 5 for 5.0). Accept
+// both shapes so the assertion pins the VERSION, not the driver's internal representation, and
+// refuse anything else loudly rather than passing on an unreadable value.
+function protocolVersionString(protocolVersion) {
+  if (protocolVersion && typeof protocolVersion === 'object' &&
+      typeof protocolVersion.major === 'number' && typeof protocolVersion.minor === 'number') {
+    return `${protocolVersion.major}.${protocolVersion.minor}`;
+  }
+  if (typeof protocolVersion === 'number') {
+    // 5.0 arrives as the number 5; every other minor keeps its fractional part.
+    return Number.isInteger(protocolVersion)
+      ? `${protocolVersion}.0`
+      : String(protocolVersion);
+  }
+  return null;
+}
+
+function assertProtocol50(protocolVersion, where) {
+  const seen = protocolVersionString(protocolVersion);
+  if (seen === null) {
+    fail(`${where}: could not read the negotiated protocolVersion ` +
+      `(got ${JSON.stringify(protocolVersion)}); cannot prove Bolt 5.0 was negotiated`);
+  }
+  if (seen !== '5.0') {
+    fail(`${where}: negotiated Bolt ${seen}, expected exactly 5.0 ` +
+      `(the server was booted with bolt_max_protocol_minor = 0)`);
+  }
+}
+
+(async () => {
+  const driver = neo4j.driver(uri, neo4j.auth.basic(user, password));
+  try {
+    // 1. Handshake + authentication. At Bolt 5.0 the credentials travel INSIDE the HELLO (there is
+    //    no LOGON message at that version), so reaching this point at all proves the server read and
+    //    accepted a HELLO-carried auth token.
+    await driver.verifyConnectivity();
+    const info = await driver.getServerInfo({ database: 'graphus' });
+    assertProtocol50(info.protocolVersion, 'getServerInfo()');
+
+    // 2. A query round-trips, and its summary agrees the connection is on 5.0.
+    {
+      const session = driver.session();
+      try {
+        const res = await session.run('RETURN 1 AS n');
+        assertProtocol50(res.summary.server.protocolVersion, 'result.summary.server');
+        const n = toNum(res.records[0].get('n'));
+        if (n !== 1) fail(`RETURN 1 gave ${n}, expected 1`);
+      } finally {
+        await session.close();
+      }
+    }
+
+    // 3. A managed write transaction + read-back: the whole 5.0 session surface (BEGIN/RUN/PULL/
+    //    COMMIT), not just the handshake.
+    const marker = 'bolt50-' + Date.now();
+    {
+      const session = driver.session();
+      try {
+        await session.executeWrite((tx) =>
+          tx.run('CREATE (p:Bolt50 {tag: $tag, n: $n})', { tag: marker, n: neo4j.int(7) })
+        );
+      } finally {
+        await session.close();
+      }
+    }
+    {
+      const session = driver.session();
+      try {
+        const res = await session.run(
+          'MATCH (p:Bolt50 {tag: $tag}) RETURN p.tag AS tag, p.n AS n', { tag: marker });
+        if (res.records.length !== 1) fail(`MATCH found ${res.records.length} nodes, expected 1`);
+        if (res.records[0].get('tag') !== marker) fail(`tag=${res.records[0].get('tag')}`);
+        const n = toNum(res.records[0].get('n'));
+        if (n !== 7) fail(`n=${n}, expected 7`);
+        assertProtocol50(res.summary.server.protocolVersion, 'post-write result.summary.server');
+      } finally {
+        await session.close();
+      }
+    }
+
+    console.log('GRAPHUS_BOLT50_OK');
+    process.exit(0);
+  } catch (err) {
+    fail((err && err.stack) ? err.stack : String(err));
+  } finally {
+    await driver.close();
+  }
+})();
+"#;
+
 /// `package.json` pinning the official driver (v6.x — current major) for a reproducible install.
 const PACKAGE_JSON: &str = r#"{
   "name": "graphus-neo4j-interop",
@@ -602,7 +724,7 @@ async fn official_neo4j_driver_interoperates_over_bolt_tls() {
     std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
 
     // Boot the real server and read back the OS-assigned ephemeral Bolt-TCP port.
-    let config = config_for(&dir, cert_path, key_path, None);
+    let config = config_for(&dir, cert_path, key_path, None, None);
     let server = boot(config).await;
     let bolt: SocketAddr = server.bolt_tcp_addr.expect("Bolt-TCP listener enabled");
 
@@ -733,7 +855,7 @@ async fn official_neo4j_driver_full_crud_nodes_and_edges() {
     std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
 
     // Boot the real server and read back the OS-assigned ephemeral Bolt-TCP port.
-    let config = config_for(&dir, cert_path, key_path, None);
+    let config = config_for(&dir, cert_path, key_path, None, None);
     let server = boot(config).await;
     let bolt: SocketAddr = server.bolt_tcp_addr.expect("Bolt-TCP listener enabled");
 
@@ -779,7 +901,7 @@ async fn official_neo4j_driver_reports_database_not_found_leaf_code() {
     std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
 
     // Boot the real server and read back the OS-assigned ephemeral Bolt-TCP port.
-    let config = config_for(&dir, cert_path, key_path, None);
+    let config = config_for(&dir, cert_path, key_path, None, None);
     let server = boot(config).await;
     let bolt: SocketAddr = server.bolt_tcp_addr.expect("Bolt-TCP listener enabled");
 
@@ -799,6 +921,52 @@ async fn official_neo4j_driver_reports_database_not_found_leaf_code() {
     assert!(
         stdout.contains("GRAPHUS_DBNOTFOUND_OK"),
         "driver exited 0 but the DatabaseNotFound success marker was missing.\n\
+         --- node stdout ---\n{stdout}\n--- node stderr ---\n{stderr}",
+    );
+
+    server.shutdown().await.expect("clean shutdown");
+}
+
+/// Bolt **5.0** end to end against the OFFICIAL Neo4j driver (rmp #906).
+///
+/// Graphus advertises 5.0 in both handshake forms, so a client that negotiates it must be served — but
+/// only the 5.1+ `LOGON` authentication flow existed, which made every negotiated-5.0 connection dead
+/// on arrival (the `HELLO` credentials were never read, and the first `RUN` was answered with a
+/// FAILURE and a closed connection). This test boots the server with `bolt_max_protocol_minor: Some(0)`
+/// so the **unmodified** official driver negotiates exactly 5.0, then asserts the driver reports 5.0,
+/// authenticates from its `HELLO`, and completes queries and a write transaction.
+///
+/// It is the real-ecosystem counterpart of the in-process 5.0 state-machine tests in `graphus-bolt`:
+/// only the reference driver can prove Graphus serves the 5.0 flow as the ecosystem actually speaks it,
+/// which is why — like the other interop tests here — it lives behind the `neo4j-interop` feature and
+/// not in the DST simulator (DST is in-process and cannot drive the external driver over a TLS socket).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn official_neo4j_driver_negotiates_bolt_50_and_runs_a_query() {
+    let dir = TempDir::new();
+
+    // Self-signed cert/key for the TLS listener (`bolt+ssc://` trusts it).
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    let cert_path = dir.path.join("cert.pem");
+    let key_path = dir.path.join("key.pem");
+    std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+    std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
+
+    // Cap the advertised Bolt window at 5.0 so the stock driver negotiates exactly that minor.
+    let config = config_for(&dir, cert_path, key_path, None, Some(0));
+    let server = boot(config).await;
+    let bolt: SocketAddr = server.bolt_tcp_addr.expect("Bolt-TCP listener enabled");
+
+    let (stdout, stderr, ok) =
+        install_and_run_driver(dir.path.join("node-bolt50"), BOLT_50_SCRIPT, bolt.port()).await;
+
+    assert!(
+        ok,
+        "the official Neo4j driver did NOT complete a Bolt 5.0 session against Graphus.\n\
+         --- node stdout ---\n{stdout}\n--- node stderr ---\n{stderr}",
+    );
+    assert!(
+        stdout.contains("GRAPHUS_BOLT50_OK"),
+        "driver exited 0 but the Bolt 5.0 success marker was missing.\n\
          --- node stdout ---\n{stdout}\n--- node stderr ---\n{stderr}",
     );
 
@@ -826,7 +994,7 @@ async fn assert_official_driver_sees_agent(
     std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
 
     // Boot with the requested agent and read back the OS-assigned ephemeral Bolt-TCP port.
-    let config = config_for(&dir, cert_path, key_path, bolt_server_agent);
+    let config = config_for(&dir, cert_path, key_path, bolt_server_agent, None);
     let server = boot(config).await;
     let bolt: SocketAddr = server.bolt_tcp_addr.expect("Bolt-TCP listener enabled");
 

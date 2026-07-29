@@ -49,27 +49,30 @@ fn mint_connection_id() -> String {
     format!("bolt-{n}")
 }
 
-/// Builds the per-connection [`SessionConfig`]: a freshly-minted unique `connection_id`, the server's
-/// advertised routing address (rmp #95), and the `server` agent string announced in `HELLO` `SUCCESS`
-/// (rmp #614 — resolved once at startup from config, the same for every connection). The default
-/// `routing_ttl` applies.
-fn session_config(advertised_bolt_address: Option<String>, server_agent: String) -> SessionConfig {
+/// Builds the per-connection [`SessionConfig`] by cloning the startup-built `template` and minting
+/// this connection's unique `connection_id` (rmp #95).
+///
+/// Everything else in the template — the advertised routing address (rmp #95), the `server` agent
+/// string (rmp #614), the Bolt version cap (rmp #906) and the routing TTL — is resolved **once** at
+/// startup from the server config and is identical for every connection, so the accept loops carry
+/// one value instead of one parameter per setting.
+fn session_config(template: &SessionConfig) -> SessionConfig {
     SessionConfig {
         connection_id: mint_connection_id(),
-        server_agent,
-        advertised_bolt_address,
-        ..SessionConfig::default()
+        ..template.clone()
     }
 }
 
 /// Runs the UDS Bolt accept loop until shutdown. Each accepted connection is admitted by the global
 /// connection cap then by peer-cred, and finally handed to a blocking session task. `context` is the
 /// shared database-targeting + admin surface every per-connection executor routes through (rmp #84).
-/// `advertised_bolt_address` is the address routing drivers are told to reconnect to in a `ROUTE`
-/// reply (rmp #95). `conn_limit` is the process-wide connection-admission semaphore (rmp #118);
-/// `idle_timeout` reaps idle sessions when set (`None` = disabled); `pre_auth_timeout` is the stricter
-/// slow-loris guard that reaps a connected-but-silent *unauthenticated* client before it can pin a slot
-/// (rmp #469, F-NET-1) — UDS is peer-cred gated, but the guard still bounds a misbehaving local client.
+/// `session_template` carries the per-server session settings resolved once at startup (advertised
+/// routing address — rmp #95, `server` agent — rmp #614, Bolt version cap — rmp #906); each connection
+/// clones it and mints its own `connection_id`. `conn_limit` is the process-wide connection-admission
+/// semaphore (rmp #118); `idle_timeout` reaps idle sessions when set (`None` = disabled);
+/// `pre_auth_timeout` is the stricter slow-loris guard that reaps a connected-but-silent
+/// *unauthenticated* client before it can pin a slot (rmp #469, F-NET-1) — UDS is peer-cred gated, but
+/// the guard still bounds a misbehaving local client.
 #[allow(clippy::too_many_arguments)] // The accept loop legitimately needs all the shared services.
 pub async fn run_uds_accept_loop(
     acceptor: UdsAcceptor,
@@ -78,8 +81,7 @@ pub async fn run_uds_accept_loop(
     auth_throttle: Arc<AuthThrottle>,
     clock: Arc<dyn Clock + Send + Sync>,
     verify_limiter: Arc<VerifyLimiter>,
-    advertised_bolt_address: Option<String>,
-    server_agent: String,
+    session_template: SessionConfig,
     metrics: Arc<Metrics>,
     conn_limit: Arc<Semaphore>,
     idle_timeout: Option<Duration>,
@@ -133,7 +135,7 @@ pub async fn run_uds_accept_loop(
                     Arc::clone(&auth_throttle),
                     Arc::clone(&clock),
                     Arc::clone(&verify_limiter),
-                    session_config(advertised_bolt_address.clone(), server_agent.clone()),
+                    session_config(&session_template),
                     idle_timeout,
                     pre_auth_timeout,
                     permit,
@@ -171,13 +173,15 @@ fn try_admit(
 /// Runs the TCP Bolt accept loop until shutdown. Each accepted connection is admitted by the global
 /// connection cap, TLS-wrapped under a handshake deadline, then handed to a blocking session task
 /// (native LOGON auth happens inside the session). `context` is the shared database-targeting + admin
-/// surface (rmp #84). `advertised_bolt_address` is the address routing drivers are told to reconnect
-/// to in a `ROUTE` reply (rmp #95). `conn_limit` is the process-wide connection-admission semaphore;
-/// `per_ip` is the per-source-IP connection cap (rmp #478) taken as an inner bound *after* the global
-/// permit, so one abusive IP cannot hold more than its share of the global budget. `handshake_timeout`
-/// bounds the TLS handshake **and** doubles as the Bolt pre-authentication read
-/// deadline (rmp #469, F-NET-1) reaping a client that completes TLS then withholds the Bolt
-/// handshake / `HELLO` / `LOGON`, and `idle_timeout` reaps idle *authenticated* sessions (rmp #118).
+/// surface (rmp #84). `session_template` carries the per-server session settings resolved once at
+/// startup (advertised routing address — rmp #95, `server` agent — rmp #614, Bolt version cap —
+/// rmp #906); each connection clones it and mints its own `connection_id`. `conn_limit` is the
+/// process-wide connection-admission semaphore; `per_ip` is the per-source-IP connection cap
+/// (rmp #478) taken as an inner bound *after* the global permit, so one abusive IP cannot hold more
+/// than its share of the global budget. `handshake_timeout` bounds the TLS handshake **and** doubles
+/// as the Bolt pre-authentication read deadline (rmp #469, F-NET-1) reaping a client that completes
+/// TLS then withholds the Bolt handshake / `HELLO` / `LOGON`, and `idle_timeout` reaps idle
+/// *authenticated* sessions (rmp #118).
 #[allow(clippy::too_many_arguments)] // The accept loop legitimately needs all the shared services.
 pub async fn run_tcp_accept_loop(
     acceptor: TcpAcceptor,
@@ -187,8 +191,7 @@ pub async fn run_tcp_accept_loop(
     auth_throttle: Arc<AuthThrottle>,
     clock: Arc<dyn Clock + Send + Sync>,
     verify_limiter: Arc<VerifyLimiter>,
-    advertised_bolt_address: Option<String>,
-    server_agent: String,
+    session_template: SessionConfig,
     metrics: Arc<Metrics>,
     conn_limit: Arc<Semaphore>,
     per_ip: Arc<PerIpConnLimiter>,
@@ -250,8 +253,7 @@ pub async fn run_tcp_accept_loop(
                 let verify_limiter = Arc::clone(&verify_limiter);
                 let shutdown = shutdown.clone();
                 let metrics = Arc::clone(&metrics);
-                let advertised = advertised_bolt_address.clone();
-                let agent = server_agent.clone();
+                let session_template = session_template.clone();
                 tokio::spawn(async move {
                     match tokio::time::timeout(handshake_timeout, tls.accept(conn)).await {
                         Ok(Ok(tls_stream)) => {
@@ -266,7 +268,7 @@ pub async fn run_tcp_accept_loop(
                                 auth_throttle,
                                 clock,
                                 verify_limiter,
-                                session_config(advertised, agent),
+                                session_config(&session_template),
                                 idle_timeout,
                                 // Reuse the handshake deadline as the Bolt pre-authentication read
                                 // deadline: after TLS, it bounds the time the (now unauthenticated)

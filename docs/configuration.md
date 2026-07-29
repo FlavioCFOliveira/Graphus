@@ -36,6 +36,7 @@ full surface. For a listener address env var, an **empty value disables** that l
 | `uds_path`                | `GRAPHUS_UDS_PATH`                 | `graphus.sock`     | Bolt-over-UDS socket path; `None`/empty disables. (Docker: `/data/graphus.sock`.) |
 | `advertised_bolt_address` | `GRAPHUS_ADVERTISED_BOLT_ADDRESS`  | = `bolt_tcp_addr`  | Address advertised to routing (`neo4j://`) drivers when reachable via a different name/port (LB/NAT). |
 | `bolt_server_agent`       | `GRAPHUS_BOLT_SERVER_AGENT`        | `Graphus/<version>` | The `server` **agent string** announced in the Bolt `HELLO` reply. Opt-in Neo4j compatibility for strict/legacy drivers — see below. |
+| `bolt_max_protocol_minor` | `GRAPHUS_BOLT_MAX_PROTOCOL_MINOR`  | unset (`4` ⇒ 5.4)  | Caps the highest Bolt 5.x minor the listeners advertise and accept — see below. |
 
 ### Bolt server agent (legacy-driver compatibility)
 
@@ -62,6 +63,34 @@ unlock capabilities: drivers gate features on the *negotiated Bolt version*, nev
 ```toml
 # Interoperate with strict/legacy Neo4j drivers:
 bolt_server_agent = "neo4j-compat"     # → announces Neo4j/5.13.0
+```
+
+### Bolt protocol version cap
+
+Graphus speaks Bolt **5.0–5.4** and, by default, negotiates the highest minor a client offers within
+that window. `bolt_max_protocol_minor` caps the top of the advertised window, so an **unmodified**
+stock driver negotiates the capped minor instead of the highest one:
+
+- unset (the default) → the full `5.0`–`5.4` window; behaviour is identical to a server that does not
+  have this option at all.
+- `0`–`4` → the listeners advertise and accept at most `5.<value>`. A driver that will only speak a
+  higher minor is rejected at the handshake, exactly as it would be by an older server.
+- anything else → **startup is rejected** with a clear message. The cap can only ever *narrow* the
+  window; it can never make Graphus claim a version it does not implement.
+
+The cap governs **both** handshake forms — the legacy 4-slot reply *and* the Manifest-v1 exchange — so
+the two can never advertise different windows.
+
+Two situations call for it: certifying an older protocol version end to end against the official
+driver ecosystem (Graphus's own Bolt 5.0 interoperability test boots with `bolt_max_protocol_minor = 0`
+so the official driver negotiates exactly 5.0), and working around a driver defect that only appears
+at a newer minor. Note that older minors have **fewer** messages — at 5.0 the credentials travel in
+the `HELLO` and there is no `LOGON`/`LOGOFF`, and `TELEMETRY` exists only from 5.4 — which the drivers
+handle automatically, but which does change what a raw client must send.
+
+```toml
+# Pin every Bolt client to exactly Bolt 5.0:
+bolt_max_protocol_minor = 0
 ```
 
 ## TLS

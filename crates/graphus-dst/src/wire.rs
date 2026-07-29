@@ -21,6 +21,7 @@ use graphus_auth::{AuthProvider, Authenticator, Privilege};
 use graphus_bolt::executor::{
     AccessMode as BoltAccessMode, BoltExecutor, QuerySummary, Record, RecordStream, TxControl,
 };
+use graphus_bolt::handshake::MAX_MINOR;
 use graphus_bolt::server::{BoltSession, encode_client_handshake, encode_request_framed};
 use graphus_bolt::{BoltResult, Dechunker, Frame, Proposal, Request, Response, Transport};
 use graphus_core::capability::Clock;
@@ -202,12 +203,31 @@ pub fn run_scripted_bolt_session(
     auth: &dyn AuthProvider,
     requests: &[Request],
 ) -> BoltResult<Vec<Response>> {
+    run_scripted_bolt_session_at(engine, seed, auth, MAX_MINOR, requests)
+}
+
+/// [`run_scripted_bolt_session`] at an **exact negotiated Bolt 5.x minor** (rmp #906).
+///
+/// The prepended handshake proposes exactly `5.<minor>` (range 0), so the server negotiates that
+/// version and the session runs its protocol — which differs across the window: at **5.0** the
+/// credentials ride in the `HELLO` and there is no `LOGON`/`LOGOFF`, and `TELEMETRY` exists only from
+/// **5.4**. Pair it with [`login_prologue_at`], which emits the right prologue for the minor.
+///
+/// # Errors
+/// [`graphus_bolt::BoltError`] as [`run_scripted_bolt_session`].
+pub fn run_scripted_bolt_session_at(
+    engine: SharedEngine,
+    seed: u64,
+    auth: &dyn AuthProvider,
+    minor: u8,
+    requests: &[Request],
+) -> BoltResult<Vec<Response>> {
     let net = SimNet::with_seed(seed);
     let link = net.connect();
 
-    // Build the client byte script: a Bolt 5.4 handshake, then each framed request.
+    // Build the client byte script: a handshake proposing exactly 5.`minor`, then each framed request.
     let mut input = encode_client_handshake([
-        Proposal::range(5, 4, 4),
+        Proposal::exact(5, minor),
         Proposal::exact(0, 0),
         Proposal::exact(0, 0),
         Proposal::exact(0, 0),
@@ -497,26 +517,43 @@ pub fn run_bolt_workload(
     run_scripted_bolt_session(engine, seed, auth, &reqs)
 }
 
-/// The standard `HELLO` + `LOGON` prologue for the `sim` user (Bolt 5.x basic auth).
+/// The standard `HELLO` + `LOGON` prologue for the `sim` user (Bolt 5.1+ basic auth).
 #[must_use]
 pub fn login_prologue() -> Vec<Request> {
+    login_prologue_at(MAX_MINOR)
+}
+
+/// The login prologue for the `sim` user **at an exact negotiated Bolt 5.x minor** (rmp #906).
+///
+/// The authentication flow changed inside Graphus's 5.0–5.4 window: from **5.1** a separate `LOGON`
+/// authenticates, but at **5.0** the token rides in the `HELLO` `extra` map and `LOGON` does not exist
+/// at all. This emits the right prologue for `minor`, so a scripted scenario driven by
+/// [`run_scripted_bolt_session_at`] reaches `READY` at any version in the window.
+#[must_use]
+pub fn login_prologue_at(minor: u8) -> Vec<Request> {
+    let user_agent = (
+        "user_agent".to_owned(),
+        Value::String("graphus-vopr".to_owned()),
+    );
+    let token = vec![
+        ("scheme".to_owned(), Value::String("basic".to_owned())),
+        ("principal".to_owned(), Value::String("sim".to_owned())),
+        (
+            "credentials".to_owned(),
+            Value::String("sim-secret".to_owned()),
+        ),
+    ];
+    if minor < 1 {
+        // Bolt 5.0: HELLO both negotiates and authenticates; there is no LOGON.
+        let mut extra = vec![user_agent];
+        extra.extend(token);
+        return vec![Request::Hello { extra }];
+    }
     vec![
         Request::Hello {
-            extra: vec![(
-                "user_agent".to_owned(),
-                Value::String("graphus-vopr".to_owned()),
-            )],
+            extra: vec![user_agent],
         },
-        Request::Logon {
-            auth: vec![
-                ("scheme".to_owned(), Value::String("basic".to_owned())),
-                ("principal".to_owned(), Value::String("sim".to_owned())),
-                (
-                    "credentials".to_owned(),
-                    Value::String("sim-secret".to_owned()),
-                ),
-            ],
-        },
+        Request::Logon { auth: token },
     ]
 }
 
@@ -882,6 +919,61 @@ mod tests {
                 .any(|r| matches!(r, Response::Failure { .. })),
             "clean session has no FAILURE: {responses:?}"
         );
+    }
+
+    /// The SAME real session over the simulated network at **every** Bolt minor Graphus advertises
+    /// (5.0–5.4), including the 5.0 flow where the credentials ride in the `HELLO` and there is no
+    /// `LOGON` (rmp #906).
+    ///
+    /// Graphus advertises 5.0 in both handshake forms, so a client that negotiates it must be served.
+    /// Before the fix, only the 5.1+ `LOGON` flow existed: a negotiated-5.0 connection never
+    /// authenticated and its first `RUN` was answered with a `FAILURE` and a closed connection. This
+    /// is the deterministic, in-simulator counterpart of the real-driver Bolt 5.0 interop test — it
+    /// drives the real `BoltSession` over the SimNet byte pipe, so a regression is reproducible from
+    /// the seed alone.
+    #[test]
+    fn bolt_session_authenticates_and_round_trips_at_every_advertised_minor() {
+        for minor in 0..=MAX_MINOR {
+            let eng = engine();
+            let mut reqs = login_prologue_at(minor);
+            reqs.extend([
+                Request::Run {
+                    query: "CREATE (:Person {name: 'Ada'})".to_owned(),
+                    parameters: vec![],
+                    extra: vec![],
+                },
+                Request::Pull { n: -1, qid: None },
+                Request::Run {
+                    query: "MATCH (p:Person) RETURN p.name AS name".to_owned(),
+                    parameters: vec![],
+                    extra: vec![],
+                },
+                Request::Pull { n: -1, qid: None },
+                Request::Goodbye,
+            ]);
+
+            let auth = sim_auth();
+            let responses =
+                run_scripted_bolt_session_at(eng, 7, &auth, minor, &reqs).expect("session runs");
+
+            assert!(
+                !responses
+                    .iter()
+                    .any(|r| matches!(r, Response::Failure { .. })),
+                "Bolt 5.{minor}: a clean session must produce no FAILURE — the negotiated version's \
+                 own authentication flow must be served: {responses:?}"
+            );
+            let has_ada = responses.iter().any(|r| match r {
+                Response::Record { values } => {
+                    values.iter().any(|v| format!("{v:?}").contains("Ada"))
+                }
+                _ => false,
+            });
+            assert!(
+                has_ada,
+                "Bolt 5.{minor}: the MATCH must return the created node: {responses:?}"
+            );
+        }
     }
 
     /// The same script over the same seed yields byte-identical decoded responses (determinism).

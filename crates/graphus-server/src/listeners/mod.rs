@@ -190,6 +190,31 @@ pub async fn start_all(
         );
     }
 
+    // The highest Bolt 5.x minor both listeners advertise and accept (rmp #906): the compiled maximum
+    // unless an operator capped it. Resolved once here — it is the same for every connection.
+    let bolt_max_protocol_minor = config.resolved_bolt_max_protocol_minor();
+    if bolt_max_protocol_minor < crate::config::MAX_BOLT_PROTOCOL_MINOR {
+        tracing::info!(
+            bolt_max_protocol_minor,
+            compiled_max = crate::config::MAX_BOLT_PROTOCOL_MINOR,
+            "Bolt version window capped by configuration: the listeners will negotiate at most Bolt \
+             5.{bolt_max_protocol_minor} (rmp #906)"
+        );
+    }
+
+    // The per-server Bolt session settings, built ONCE and cloned per accepted connection (which then
+    // mints its own unique `connection_id` — see `bolt::session_config`). Building a template rather
+    // than threading one accept-loop parameter per setting keeps both already-long accept-loop
+    // signatures from growing with every new session-scoped option.
+    let bolt_session_template = graphus_bolt::server::SessionConfig {
+        server_agent: bolt_server_agent,
+        advertised_bolt_address: advertised_bolt,
+        max_protocol_minor: bolt_max_protocol_minor,
+        // `connection_id` is a placeholder here: every accepted connection overwrites it with a
+        // freshly-minted unique id, so the template's value never reaches the wire.
+        ..graphus_bolt::server::SessionConfig::default()
+    };
+
     // The shared database-targeting + admin-statement context (rmp #84/#92). One per server: both
     // Bolt loops clone it per connection, the REST adapter holds one. It carries the live
     // `SecurityCatalog` (admin authorization + security-command execution + persistence).
@@ -247,8 +272,7 @@ pub async fn start_all(
             Arc::clone(&auth_throttle),
             Arc::clone(&clock),
             Arc::clone(&verify_limiter),
-            advertised_bolt.clone(),
-            bolt_server_agent.clone(),
+            bolt_session_template.clone(),
             Arc::clone(&metrics),
             Arc::clone(&conn_limit),
             idle_timeout,
@@ -283,8 +307,7 @@ pub async fn start_all(
             Arc::clone(&auth_throttle),
             Arc::clone(&clock),
             Arc::clone(&verify_limiter),
-            advertised_bolt.clone(),
-            bolt_server_agent.clone(),
+            bolt_session_template.clone(),
             Arc::clone(&metrics),
             Arc::clone(&conn_limit),
             Arc::clone(&per_ip_limiter),

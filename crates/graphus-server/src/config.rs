@@ -894,6 +894,23 @@ pub struct ServerConfig {
     /// Bolt version*, not this string); see [`NEO4J_COMPAT_SERVER_AGENT`](graphus_bolt::server::NEO4J_COMPAT_SERVER_AGENT)
     /// for why the announced Neo4j version must not exceed the negotiated Bolt window.
     pub bolt_server_agent: Option<String>,
+    /// The **highest Bolt 5.x minor** the Bolt listeners advertise and accept (rmp #906), or `None`
+    /// (the default) to use the compiled maximum [`graphus_bolt::handshake::MAX_MINOR`] — i.e. the
+    /// full `5.0..=5.4` window, which is exactly the behaviour before this option existed.
+    ///
+    /// Set it to pin an unmodified stock driver to an exact older minor: the server simply never
+    /// offers anything above the cap, so a driver that would otherwise choose 5.4 negotiates the
+    /// capped version instead. Two real uses: certifying an older protocol version end to end against
+    /// the official driver ecosystem, and working around a driver defect that only appears at a newer
+    /// minor.
+    ///
+    /// The cap governs **both** handshake forms — the legacy 4-slot reply and the Manifest-v1
+    /// exchange — so the two can never advertise different windows. A value outside
+    /// `MIN_MINOR..=MAX_MINOR` is rejected by [`validate`](Self::validate) with a clear message; it
+    /// can only ever *narrow* the window, never widen it past what Graphus implements.
+    ///
+    /// Overridable via `GRAPHUS_BOLT_MAX_PROTOCOL_MINOR`.
+    pub bolt_max_protocol_minor: Option<u8>,
     /// TCP address for the REST listener, or `None` to disable it. TLS required when set.
     pub rest_addr: Option<String>,
     /// Filesystem path for the Bolt-over-UDS listener, or `None` to disable it.
@@ -960,6 +977,7 @@ impl Default for ServerConfig {
             bolt_tcp_addr: None,
             advertised_bolt_address: None,
             bolt_server_agent: None,
+            bolt_max_protocol_minor: None,
             rest_addr: Some("127.0.0.1:7474".to_owned()),
             uds_path: Some(PathBuf::from("graphus.sock")),
             tls: TlsConfig::default(),
@@ -1051,6 +1069,10 @@ impl ServerConfig {
             opt("bolt_tcp_addr", &self.bolt_tcp_addr),
             opt("advertised_bolt_address", &self.advertised_bolt_address),
             opt("bolt_server_agent", &self.bolt_server_agent),
+            SettingRow {
+                name: "bolt_max_protocol_minor",
+                value: self.bolt_max_protocol_minor.map(|m| m.to_string()),
+            },
             opt("rest_addr", &self.rest_addr),
             path("uds_path", &self.uds_path),
             // TLS + encryption.
@@ -1217,6 +1239,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("bolt_tcp_addr", &self.bolt_tcp_addr)
             .field("advertised_bolt_address", &self.advertised_bolt_address)
             .field("bolt_server_agent", &self.bolt_server_agent)
+            .field("bolt_max_protocol_minor", &self.bolt_max_protocol_minor)
             .field("rest_addr", &self.rest_addr)
             .field("uds_path", &self.uds_path)
             .field("tls", &self.tls)
@@ -1431,6 +1454,21 @@ impl ServerConfig {
         if let Ok(v) = var("GRAPHUS_BOLT_SERVER_AGENT") {
             self.bolt_server_agent = empty_to_none(v);
         }
+        if let Ok(v) = var("GRAPHUS_BOLT_MAX_PROTOCOL_MINOR") {
+            // An EMPTY value means "unset" (use the compiled maximum), mirroring how a blanked
+            // listener address disables its listener. A non-empty value must parse as a `u8`; whether
+            // it names a minor Graphus implements is `validate`'s call, so the range error carries the
+            // same clear, actionable message from the file and the env alike.
+            self.bolt_max_protocol_minor = match empty_to_none(v) {
+                None => None,
+                Some(v) => Some(v.trim().parse().map_err(|_| {
+                    ConfigError::Parse(format!(
+                        "GRAPHUS_BOLT_MAX_PROTOCOL_MINOR is not a Bolt 5.x minor \
+                         ({MIN_BOLT_PROTOCOL_MINOR}..={MAX_BOLT_PROTOCOL_MINOR}): {v:?}"
+                    ))
+                })?),
+            };
+        }
         if let Ok(v) = var("GRAPHUS_REST_ADDR") {
             self.rest_addr = empty_to_none(v);
         }
@@ -1600,6 +1638,20 @@ impl ServerConfig {
         }
         if let Err(e) = crate::dbcatalog::normalize_db_name(&self.default_database) {
             return Err(ConfigError::Invalid(format!("default_database: {e}")));
+        }
+        // The Bolt version cap (rmp #906) may only NARROW the window Graphus implements. Rejecting an
+        // out-of-range value here — rather than silently clamping it — means an operator who asks for
+        // a minor Graphus does not speak learns at startup instead of discovering the wrong version
+        // negotiated at runtime.
+        if let Some(minor) = self.bolt_max_protocol_minor
+            && !(MIN_BOLT_PROTOCOL_MINOR..=MAX_BOLT_PROTOCOL_MINOR).contains(&minor)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "bolt_max_protocol_minor must be between {MIN_BOLT_PROTOCOL_MINOR} and \
+                 {MAX_BOLT_PROTOCOL_MINOR} (the Bolt 5.x minors Graphus implements), got {minor}; \
+                 leave it unset to advertise the full 5.{MIN_BOLT_PROTOCOL_MINOR}–5.\
+                 {MAX_BOLT_PROTOCOL_MINOR} window"
+            )));
         }
         if self.admission.max_concurrent_queries == 0 {
             return Err(ConfigError::Invalid(
@@ -1813,7 +1865,30 @@ impl ServerConfig {
             Some(s) => s.to_owned(),
         }
     }
+
+    /// The highest Bolt 5.x minor the listeners advertise and accept, resolved from
+    /// [`bolt_max_protocol_minor`](Self::bolt_max_protocol_minor) (rmp #906): the configured cap when
+    /// set, else the compiled [`MAX_BOLT_PROTOCOL_MINOR`] — so an unconfigured server negotiates the
+    /// full window exactly as it did before the option existed.
+    ///
+    /// [`validate`](Self::validate) has already refused an out-of-range cap; the handshake layer
+    /// clamps again as defence in depth, so the value returned here can never widen the window.
+    #[must_use]
+    pub fn resolved_bolt_max_protocol_minor(&self) -> u8 {
+        self.bolt_max_protocol_minor
+            .unwrap_or(MAX_BOLT_PROTOCOL_MINOR)
+    }
 }
+
+/// The lowest Bolt 5.x minor Graphus implements — the floor of the
+/// [`bolt_max_protocol_minor`](ServerConfig::bolt_max_protocol_minor) range (re-exported from
+/// `graphus-bolt`, so the config validator and the protocol core can never drift apart).
+pub const MIN_BOLT_PROTOCOL_MINOR: u8 = graphus_bolt::handshake::MIN_MINOR;
+
+/// The highest Bolt 5.x minor Graphus implements — the ceiling of the
+/// [`bolt_max_protocol_minor`](ServerConfig::bolt_max_protocol_minor) range **and** its resolved
+/// default (re-exported from `graphus-bolt`; see [`MIN_BOLT_PROTOCOL_MINOR`]).
+pub const MAX_BOLT_PROTOCOL_MINOR: u8 = graphus_bolt::handshake::MAX_MINOR;
 
 /// Maps an empty string to `None` so `GRAPHUS_REST_ADDR=` explicitly *disables* a listener (rather
 /// than binding to the empty address).
@@ -2607,6 +2682,91 @@ mod tests {
         };
         cfg.normalize();
         assert_eq!(cfg.bolt_server_agent.as_deref(), Some("Neo4j/5.13.0"));
+    }
+
+    #[test]
+    fn bolt_max_protocol_minor_defaults_to_the_compiled_maximum_and_only_narrows() {
+        // rmp #906. Unset → the compiled maximum, so an unconfigured server advertises the full
+        // window exactly as it did before the option existed.
+        let cfg = ServerConfig::default();
+        assert_eq!(cfg.bolt_max_protocol_minor, None, "unset by default");
+        assert_eq!(
+            cfg.resolved_bolt_max_protocol_minor(),
+            MAX_BOLT_PROTOCOL_MINOR
+        );
+        assert_eq!(
+            MAX_BOLT_PROTOCOL_MINOR,
+            graphus_bolt::handshake::MAX_MINOR,
+            "the config ceiling must track the protocol core's, never drift from it"
+        );
+
+        // Every in-range cap resolves verbatim and validates.
+        for minor in MIN_BOLT_PROTOCOL_MINOR..=MAX_BOLT_PROTOCOL_MINOR {
+            let cfg = ServerConfig {
+                bolt_max_protocol_minor: Some(minor),
+                rest_addr: None,
+                bolt_tcp_addr: None,
+                uds_path: Some(PathBuf::from("x.sock")),
+                ..ServerConfig::default()
+            };
+            assert_eq!(cfg.resolved_bolt_max_protocol_minor(), minor);
+            assert!(cfg.validate().is_ok(), "5.{minor} must be a valid cap");
+        }
+
+        // It is a first-class TOML key (the struct is `deny_unknown_fields`, so this also proves the
+        // documented spelling is the one the parser accepts).
+        let cfg: ServerConfig =
+            toml::from_str("bolt_max_protocol_minor = 0\n").expect("parse the cap from TOML");
+        assert_eq!(cfg.bolt_max_protocol_minor, Some(0));
+        assert_eq!(cfg.resolved_bolt_max_protocol_minor(), 0);
+    }
+
+    #[test]
+    fn an_out_of_range_bolt_max_protocol_minor_is_rejected_at_validation() {
+        // A minor Graphus does not implement is a fail-fast startup error, not a silent clamp: an
+        // operator asking for 5.9 must learn at boot, not discover 5.4 negotiated at runtime.
+        for minor in [MAX_BOLT_PROTOCOL_MINOR + 1, 9, 200] {
+            let cfg = ServerConfig {
+                bolt_max_protocol_minor: Some(minor),
+                rest_addr: None,
+                bolt_tcp_addr: None,
+                uds_path: Some(PathBuf::from("x.sock")),
+                ..ServerConfig::default()
+            };
+            match cfg.validate() {
+                Err(ConfigError::Invalid(msg)) => assert!(
+                    msg.contains("bolt_max_protocol_minor"),
+                    "the error must name the setting: {msg}"
+                ),
+                other => panic!("5.{minor} must be rejected, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn bolt_max_protocol_minor_is_reported_and_debug_printed() {
+        // `SHOW SETTINGS` must surface the cap (it changes what every driver negotiates), and it is
+        // not a secret, so `Debug` prints it verbatim.
+        let cfg = ServerConfig {
+            bolt_max_protocol_minor: Some(0),
+            ..ServerConfig::default()
+        };
+        let row = cfg
+            .effective_settings()
+            .into_iter()
+            .find(|r| r.name == "bolt_max_protocol_minor")
+            .expect("the cap must appear in SHOW SETTINGS");
+        assert_eq!(row.value.as_deref(), Some("0"));
+        assert!(format!("{cfg:?}").contains("bolt_max_protocol_minor: Some(0)"));
+
+        // Unset renders as null (not as the resolved default) — the row reports the *setting*.
+        let cfg = ServerConfig::default();
+        let row = cfg
+            .effective_settings()
+            .into_iter()
+            .find(|r| r.name == "bolt_max_protocol_minor")
+            .expect("the cap must appear in SHOW SETTINGS");
+        assert_eq!(row.value, None);
     }
 
     #[test]

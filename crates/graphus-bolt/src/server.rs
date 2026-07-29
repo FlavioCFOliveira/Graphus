@@ -16,8 +16,13 @@
 //!
 //! ## States (`04 §8.1`)
 //!
+//! The **authentication prologue depends on the negotiated version** (rmp #906); everything from
+//! `READY` onwards is version-independent.
+//!
 //! ```text
-//! CONNECTED --(HELLO ok)--> AUTHENTICATION --(LOGON ok)--> READY
+//! Bolt 5.1+ : CONNECTED --(HELLO ok)--> AUTHENTICATION --(LOGON ok)--> READY
+//! Bolt 5.0  : CONNECTED --(HELLO ok, credentials IN the HELLO)-------> READY
+//!
 //!    READY  --(RUN)--> STREAMING --(stream drained)--> READY
 //!    READY  --(BEGIN)--> TX_READY --(RUN)--> TX_STREAMING --(drained)--> TX_READY
 //!  TX_READY --(COMMIT/ROLLBACK)--> READY
@@ -25,6 +30,24 @@
 //!  pre-auth  --(HELLO/LOGON fail or out-of-order msg)--> DEFUNCT
 //!    <any>  --(GOODBYE / fatal)--> DEFUNCT
 //! ```
+//!
+//! ## Bolt 5.0 authenticates from `HELLO` (rmp #906)
+//!
+//! Bolt **5.1** is where authentication moved out of `HELLO` into `LOGON`. The Bolt server-state
+//! specification's "Summary of changes" records it exactly: *Version 5.1* — "HELLO message no longer
+//! accepts authentication … LOGON message has been added"; *Version 5.0* — "No changes compared to
+//! version 4.4" (neo4j.com/docs/bolt/current/bolt/server-state/). So at **5.0** the `HELLO` both
+//! negotiates *and* authenticates, there is no `AUTHENTICATION` state, and `LOGON`/`LOGOFF` are not
+//! even decodable (see [`crate::message::opcode_available_at`]). The Neo4j reference server encodes
+//! the same split: `BoltProtocolV50` drops the `NEGOTIATION` state and starts in `AUTHENTICATION`
+//! with `HelloStateTransition.andThen(AuthenticationStateTransition)`, and unregisters the
+//! `LOGON`/`LOGOFF` decoders.
+//!
+//! [`BoltSession::dispatch_connected`] therefore branches on the negotiated version. Both branches
+//! validate `user_agent` identically, share the same `HELLO` `SUCCESS` metadata, and route every
+//! credential through the one [`BoltSession::authenticate`] chokepoint — so the per-account
+//! [`AuthThrottle`] (rmp #823) and the global [`VerifyLimiter`] (rmp #824) apply to the 5.0 path
+//! exactly as they do to `LOGON`. Negotiating 5.0 can never be a way around them.
 //!
 //! ## The fail-then-ignore-until-RESET rule (`04 §8.1`, `06 §3.2`)
 //!
@@ -64,8 +87,8 @@ use crate::error::{
 use crate::executor::{AccessMode, BoltExecutor, Record, RecordStream, TxControl};
 use crate::framing::{Dechunker, Frame, chunk_message_into};
 use crate::handshake::{
-    MAGIC, Version, detect_manifest_request, graphus_manifest, negotiate, parse_client_handshake,
-    parse_manifest_choice, server_reply,
+    MAGIC, Version, detect_manifest_request, graphus_manifest_within, negotiate_within,
+    parse_client_handshake, parse_manifest_choice, server_reply, version_supported_within,
 };
 use crate::message::{ALL, Request, Response};
 use crate::packstream::Packer;
@@ -76,7 +99,10 @@ use crate::transport::Transport;
 pub enum State {
     /// Handshake done; awaiting `HELLO`.
     Connected,
-    /// `HELLO` accepted; awaiting `LOGON`.
+    /// `HELLO` accepted; awaiting `LOGON`. **Bolt 5.1+ only** — at 5.0 authentication rides in the
+    /// `HELLO` itself, so a 5.0 connection goes straight from [`Connected`](Self::Connected) to
+    /// [`Ready`](Self::Ready) and this state is unreachable (the only other way in, `LOGOFF` from
+    /// `READY`, is a 5.1+ message that a 5.0 connection cannot even decode — rmp #906).
     Authentication,
     /// Authenticated and idle; awaiting `RUN`/`BEGIN`/`LOGOFF`/`GOODBYE`.
     Ready,
@@ -138,6 +164,38 @@ const VALID_TELEMETRY_API_MIN: i64 = 0;
 /// [`VALID_TELEMETRY_API_MIN`].
 const VALID_TELEMETRY_API_MAX: i64 = 3;
 
+/// The first Bolt 5.x minor whose `HELLO` **no longer carries** the authentication token — i.e. the
+/// minor from which a separate `LOGON` authenticates the connection (Bolt **5.1**; rmp #906).
+///
+/// Below it (only 5.0 within Graphus's window) the credentials ride in the `HELLO` `extra` map, per
+/// the Bolt server-state spec's "Summary of changes" (*Version 5.1*: "HELLO message no longer accepts
+/// authentication … LOGON message has been added"; *Version 5.0*: "No changes compared to version
+/// 4.4") and the message spec's `HELLO` note ("On versions earlier than 5.1, the authentication token
+/// described on the LOGON message should be sent as part of the HELLO message instead").
+const LOGON_AUTH_MIN_MINOR: u8 = 1;
+
+/// The `HELLO` `extra` keys that are **not** part of the authentication token when `HELLO` carries
+/// credentials (Bolt 5.0 — rmp #906).
+///
+/// At 5.0 the auth token is *the whole `extra` map minus these reserved fields*, exactly as the Neo4j
+/// reference server builds it: `HelloMessageDecoderV41` (the decoder `BoltProtocolV50` registers for
+/// `HELLO`) declares this field list, and `AbstractLegacyHelloMessageDecoder.readAuthToken` hands it
+/// to `AuthenticationMetadataUtils.extractAuthToken(providedFields, meta)`, which copies every other
+/// entry into the token. Keeping the list identical is what makes an unmodified stock driver
+/// authenticate: it sends `scheme`/`principal`/`credentials` (and any realm/custom-scheme entries)
+/// alongside these, and only these must be filtered out.
+///
+/// Note what is **absent**: `bolt_agent` is a Bolt **5.3+** field and is *not* in the 5.0 decoder's
+/// list, so a 5.0 client that sent it would have it treated as part of the token — the reference
+/// behaviour, reproduced here deliberately rather than "improved".
+const HELLO_NON_AUTH_FIELDS: [&str; 5] = [
+    "patch_bolt",
+    "routing",
+    "user_agent",
+    "notifications_minimum_severity",
+    "notifications_disabled_categories",
+];
+
 /// Per-connection metadata the listener supplies to a [`BoltSession`] (rmp #95).
 ///
 /// The protocol core is transport-agnostic, but two pieces of `HELLO`/`ROUTE` metadata are inherently
@@ -162,6 +220,18 @@ pub struct SessionConfig {
     /// after this; a single instance's table never really changes, so a comfortable default avoids
     /// needless re-routing round-trips.
     pub routing_ttl_secs: i64,
+    /// The **highest Bolt 5.x minor** this session will advertise and accept (rmp #906). Defaults to
+    /// the compiled [`handshake::MAX_MINOR`](crate::handshake::MAX_MINOR), so the out-of-the-box
+    /// behaviour is bit-for-bit what it always was.
+    ///
+    /// Lowering it pins an unmodified stock driver to an exact older minor — the supported way to
+    /// exercise (or work around) a specific protocol version end to end. The cap governs **both**
+    /// handshake forms: the legacy 4-slot reply negotiates within `MIN_MINOR..=max_protocol_minor`
+    /// and the Manifest-v1 exchange advertises (and accepts) exactly the same window, so the two can
+    /// never disagree. Values outside `MIN_MINOR..=MAX_MINOR` are clamped by the handshake layer
+    /// ([`clamp_max_minor`](crate::handshake::clamp_max_minor)), so this can only ever *narrow* what
+    /// Graphus offers.
+    pub max_protocol_minor: u8,
 }
 
 impl Default for SessionConfig {
@@ -171,6 +241,7 @@ impl Default for SessionConfig {
             server_agent: DEFAULT_SERVER_AGENT.to_owned(),
             advertised_bolt_address: None,
             routing_ttl_secs: DEFAULT_ROUTING_TTL_SECS,
+            max_protocol_minor: crate::handshake::MAX_MINOR,
         }
     }
 }
@@ -415,7 +486,7 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
                 self.state = State::Defunct;
                 return Ok(());
             };
-            let request = match Request::decode(&payload) {
+            let request = match self.decode_request(&payload) {
                 Ok(r) => r,
                 Err(e) => {
                     let failure = Failure::new("Neo.ClientError.Request.Invalid", e.to_string());
@@ -451,6 +522,21 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
         }
     }
 
+    /// Decodes one request payload **at the negotiated protocol version** (rmp #906), so a message
+    /// the version does not define (`LOGON`/`LOGOFF` below 5.1, `TELEMETRY` below 5.4) is rejected as
+    /// undecodable instead of being acted on. The caller (`run`) answers the error exactly as it
+    /// answers any other malformed message.
+    ///
+    /// The version is always `Some` here — `do_handshake` runs to completion before the first message
+    /// is read — but the `None` arm decodes version-agnostically rather than panicking, so a future
+    /// caller that drives the message loop without a handshake still behaves as it did before.
+    fn decode_request(&self, payload: &[u8]) -> BoltResult<Request> {
+        match self.version {
+            Some(version) => Request::decode_at(payload, version),
+            None => Request::decode(payload),
+        }
+    }
+
     // ---- Handshake -------------------------------------------------------------------------------
 
     /// Reads the 20-byte client handshake and negotiates a version, over either the **legacy** 4-slot
@@ -474,7 +560,10 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
             return self.do_manifest_handshake();
         }
 
-        let chosen = negotiate(&proposals);
+        // Negotiate within the configured window (rmp #906): `SessionConfig::max_protocol_minor`
+        // defaults to the compiled `MAX_MINOR`, so an unconfigured listener negotiates exactly as
+        // before; a capped listener offers only up to its cap.
+        let chosen = negotiate_within(&proposals, self.config.max_protocol_minor);
         self.transport.write_all(&server_reply(chosen))?;
         match chosen {
             Some(v) => {
@@ -502,10 +591,14 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
     /// # Errors
     /// [`BoltError::Handshake`] if the client's choice is unreadable or names an unsupported version.
     fn do_manifest_handshake(&mut self) -> BoltResult<()> {
-        self.transport.write_all(&graphus_manifest())?;
+        // The manifest advertises — and the acceptance check below honours — the SAME capped window
+        // the legacy path negotiates (rmp #906), so the two handshake forms can never disagree about
+        // which versions Graphus offers.
+        let cap = self.config.max_protocol_minor;
+        self.transport.write_all(&graphus_manifest_within(cap))?;
         let choice_bytes = self.read_manifest_choice()?;
         let choice = parse_manifest_choice(&choice_bytes)?;
-        if choice.version.is_supported() {
+        if version_supported_within(choice.version, cap) {
             self.version = Some(choice.version);
             self.state = State::Connected;
             Ok(())
@@ -587,6 +680,10 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
     }
 
     /// `CONNECTED`: only `HELLO` is valid.
+    ///
+    /// What the `HELLO` *does* depends on the negotiated version (rmp #906): at **5.1+** it only
+    /// negotiates and hands over to `AUTHENTICATION` for a `LOGON`; at **5.0** it also authenticates,
+    /// from the credentials in its own `extra` map, and lands directly in `READY`.
     fn dispatch_connected(&mut self, request: Request) -> BoltResult<Flow> {
         match request {
             Request::Hello { extra } => {
@@ -596,6 +693,8 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
                 // this also closes a trivial DoS where a client drives the handshake with truncated
                 // metadata. Being a pre-authentication failure it is terminal: the connection goes
                 // straight to DEFUNCT and closes (rmp #820), never the recoverable FAILED state.
+                // Validated identically on BOTH version branches, and BEFORE any credential is
+                // looked at, so a malformed HELLO never reaches the authenticator.
                 let user_agent_ok = map_str(&extra, "user_agent").is_some_and(|s| !s.is_empty());
                 if !user_agent_ok {
                     // A malformed HELLO is a PRE-authentication failure and is therefore TERMINAL:
@@ -607,27 +706,114 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
                         "HELLO is missing the required `user_agent` field",
                     ));
                 }
-                // HELLO no longer carries credentials in 5.1+ (LOGON does). Acknowledge with server
-                // metadata and move to AUTHENTICATION. The `server` agent and the per-connection
-                // `connection_id` come from the listener's `SessionConfig` (rmp #95); `hints` is the
-                // optional driver-tuning map (empty here — Graphus advertises no hints yet, but the
-                // key's presence is what some drivers probe).
-                let meta = vec![
-                    (
-                        "server".to_owned(),
-                        Value::String(self.config.server_agent.clone()),
-                    ),
-                    (
-                        "connection_id".to_owned(),
-                        Value::String(self.config.connection_id.clone()),
-                    ),
-                    ("hints".to_owned(), Value::Map(vec![])),
-                ];
-                self.send(&Response::Success { metadata: meta })?;
+                if self.hello_carries_auth() {
+                    // Hand `extra` over BY VALUE: the auth token is derived by filtering it in place,
+                    // so the decoded map is never duplicated while the (slow) KDF runs. See
+                    // `hello_auth_token`.
+                    return self.hello_authenticate(extra);
+                }
+                // Bolt 5.1+: HELLO no longer carries credentials (LOGON does). Acknowledge with the
+                // server metadata and move to AUTHENTICATION.
+                let metadata = self.hello_success_metadata();
+                self.send(&Response::Success { metadata })?;
                 self.state = State::Authentication;
                 Ok(Flow::Continue)
             }
             other => self.unexpected(&other),
+        }
+    }
+
+    /// Whether the negotiated version carries the authentication token **inside `HELLO`** — true
+    /// only for Bolt 5.0 within Graphus's 5.0–5.4 window (rmp #906; see [`LOGON_AUTH_MIN_MINOR`]).
+    ///
+    /// An un-negotiated session (`version == None`, unreachable once `do_handshake` has run) keeps
+    /// the 5.1+ `LOGON` flow, which is the safer default: it never treats a `HELLO` as an
+    /// authentication attempt on a connection whose version is unknown. The `major` is checked for
+    /// the same reason its two sibling predicates check it
+    /// ([`version_supported_within`](crate::handshake::version_supported_within) and
+    /// [`opcode_available_at`](crate::message::opcode_available_at)): the minor number only means
+    /// anything within a known major, so all three agree by construction rather than by coincidence.
+    fn hello_carries_auth(&self) -> bool {
+        self.version.is_some_and(|v| {
+            v.major == crate::handshake::SUPPORTED_MAJOR && v.minor < LOGON_AUTH_MIN_MINOR
+        })
+    }
+
+    /// The `HELLO` `SUCCESS` metadata, identical on both version branches: the `server` agent and the
+    /// per-connection `connection_id` from the listener's [`SessionConfig`] (rmp #95), plus `hints` —
+    /// the optional driver-tuning map (empty here; Graphus advertises no hints yet, but the key's
+    /// presence is what some drivers probe).
+    fn hello_success_metadata(&self) -> Vec<(String, Value)> {
+        vec![
+            (
+                "server".to_owned(),
+                Value::String(self.config.server_agent.clone()),
+            ),
+            (
+                "connection_id".to_owned(),
+                Value::String(self.config.connection_id.clone()),
+            ),
+            ("hints".to_owned(), Value::Map(vec![])),
+        ]
+    }
+
+    /// Bolt **5.0**: authenticate from the `HELLO` `extra` map and, on success, go straight to
+    /// `READY` (rmp #906).
+    ///
+    /// The token is `extra` minus [`HELLO_NON_AUTH_FIELDS`] — the reference server's rule, see that
+    /// constant — and is resolved through the SAME [`authenticate`](Self::authenticate) chokepoint as
+    /// a 5.1+ `LOGON`, so the per-account throttle (rmp #823) and the global verification bound
+    /// (rmp #824) are enforced here too. A client can never sidestep either limiter by negotiating
+    /// 5.0.
+    ///
+    /// Success mirrors the `LOGON` success arm exactly (audit hook, executor principal, the shared
+    /// `HELLO` `SUCCESS` metadata, and the rmp #469 pre-authentication read-deadline relaxation);
+    /// failure is a PRE-authentication failure and is therefore terminal (rmp #820).
+    ///
+    /// `extra` is taken **by value** so the token is produced by filtering it in place. Cloning it
+    /// instead would keep the decoded `HELLO` map and a near-copy of it alive simultaneously across
+    /// the memory-hard KDF — the longest window in the pre-authentication phase — raising this path's
+    /// peak heap ~1.55× over the `LOGON` path for the same attacker byte budget, and with it the
+    /// number of unauthenticated connections needed to exhaust memory (measured on a
+    /// `MAX_DECODE_ELEMENTS`-sized `extra`; the `rmp` #550 decode budget is the bound this must not
+    /// erode).
+    fn hello_authenticate(&mut self, extra: Vec<(String, Value)>) -> BoltResult<Flow> {
+        let auth = hello_auth_token(extra);
+        // Capture the attempted principal BEFORE authenticating so a failure can be audited with the
+        // attempted username (the username is not a secret; the credentials in `auth` ARE — they are
+        // never passed to the audit hook — rmp #70).
+        let attempted = map_str(&auth, "principal").map(str::to_owned);
+        match self.authenticate(&auth) {
+            Ok(user) => {
+                // Announce the identity to the executor so it can authorize identity-gated work
+                // (rmp #84) and record an `auth_success` audit event (rmp #70).
+                self.executor.on_auth_success(&user);
+                self.executor.set_principal(Some(&user));
+                self.principal = Some(user);
+                // At 5.0 the HELLO SUCCESS is BOTH the negotiation ack and the authentication ack, so
+                // it carries the same `server`/`connection_id`/`hints` metadata as the 5.1+ HELLO
+                // (the 5.1+ LOGON's own empty SUCCESS has no counterpart here).
+                let metadata = self.hello_success_metadata();
+                self.send(&Response::Success { metadata })?;
+                self.state = State::Ready;
+                // The connection has authenticated: relax the transport's stricter *pre-authentication*
+                // read deadline (the slow-loris guard that reaps a connected-but-silent unauthenticated
+                // client) to its steady-state idle policy (rmp #469, F-NET-1). Skipping this on the 5.0
+                // path would reap legitimate long-lived 5.0 sessions. A no-op on transports without a
+                // deadline.
+                self.transport.on_authenticated();
+                Ok(Flow::Continue)
+            }
+            Err(failure) => {
+                // Record the failed attempt for audit (rmp #70) before the FAILURE goes out.
+                self.executor
+                    .on_auth_failure(attempted.as_deref(), "authentication failed");
+                // A failed 5.0 HELLO is a PRE-authentication failure and is TERMINAL, exactly like a
+                // failed 5.1+ LOGON: the Bolt server-state spec transitions to DEFUNCT on an
+                // unsuccessful HELLO, and RESET is not valid before authentication — so this must never
+                // enter the RESET-recoverable FAILED state (rmp #820).
+                self.fail_terminal(failure)
+            }
         }
     }
 
@@ -1256,6 +1442,27 @@ fn db_from_extra(extra: &[(String, Value)]) -> Option<String> {
     map_str(extra, "db")
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
+}
+
+/// Builds the Bolt **5.0** authentication token from a `HELLO` `extra` map: every entry that is not
+/// one of the reserved [`HELLO_NON_AUTH_FIELDS`] (rmp #906).
+///
+/// The whole-map-minus-reserved-fields rule is the Neo4j reference server's
+/// (`AuthenticationMetadataUtils.extractAuthToken`, driven by `HelloMessageDecoderV41`'s field list),
+/// and it is what lets an unmodified stock driver authenticate at 5.0: it puts `scheme`, `principal`
+/// and `credentials` — plus any realm/custom-scheme entries — straight into the `HELLO` `extra`
+/// alongside the protocol fields. The result is fed to [`BoltSession::authenticate`], which is the
+/// same function the 5.1+ `LOGON` uses, so the two paths validate the token identically.
+///
+/// SECURITY: the map is consumed and filtered **in place** (`Vec::retain`) rather than cloned. A
+/// clone would keep the decoded `HELLO` map and a near-copy of it alive at the same time across the
+/// memory-hard KDF that follows, inflating the peak heap an *unauthenticated* peer can pin per
+/// connection and eroding the `rmp` #550 pre-authentication decode budget. Measured at the decode
+/// budget's ceiling, the cloning form cost ~1.55× the `LOGON` path's peak for the same attacker byte
+/// budget; filtering in place restores parity.
+fn hello_auth_token(mut extra: Vec<(String, Value)>) -> Vec<(String, Value)> {
+    extra.retain(|(k, _)| !HELLO_NON_AUTH_FIELDS.contains(&k.as_str()));
+    extra
 }
 
 /// Borrows a string value from a map by key.

@@ -156,6 +156,7 @@ fn serve_config(root: &TempRoot) -> ServerConfig {
         bolt_tcp_addr: None,
         advertised_bolt_address: None,
         bolt_server_agent: None,
+        bolt_max_protocol_minor: None,
         rest_addr: None,
         uds_path: Some(root.path.join("graphus.sock")),
         tls: TlsConfig::default(),

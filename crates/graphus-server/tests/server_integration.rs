@@ -81,6 +81,7 @@ fn base_config(temp: &TempStore) -> ServerConfig {
         bolt_tcp_addr: None,
         advertised_bolt_address: None,
         bolt_server_agent: None,
+        bolt_max_protocol_minor: None,
         // REST on an ephemeral port; no TLS so the test's raw HTTP client can connect.
         rest_addr: Some("127.0.0.1:0".to_owned()),
         uds_path: Some(temp.uds_path()),
