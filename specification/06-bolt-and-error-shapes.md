@@ -104,6 +104,78 @@ are both keyed on the negotiated version.
   Manifest-v1 exchange — so the two can never advertise different windows, and it can only ever
   narrow, never widen, what Graphus offers.
 
+### 1.4 Slot order is the client's preference, and it binds (`rmp` #910)
+
+The four handshake slots are **resolved in the order the client sent them**, and the first slot the
+server can satisfy wins. Graphus previously took the highest supported minor found anywhere in the
+four slots. That silently overrode the one mechanism the handshake gives a client to state a
+preference: a driver pinned to 5.1 for a known incompatibility at 5.3 listed 5.1 first and was
+answered 5.3 anyway.
+
+Two rules apply, and they are different by design — both are the reference server's:
+
+| scope | rule | reference |
+|---|---|---|
+| **across slots** | the **first** satisfiable slot wins, however low its minor | `LegacyProtocolHandshakeHandler` iterates "every suggested protocol revision (in order of occurrence)" and stops at the first it can serve |
+| **within one slot** | a range proposal means "any of these", so the **highest** supported minor of the span wins | `DefaultBoltProtocolRegistry.get` takes `max(Comparator.comparing(BoltProtocol::version))` over the versions one proposal matches |
+
+The **Manifest-v1 marker** (`00 00 01 FF`) competes for attention by slot position like any other
+proposal: the reference switches to the modern handshake only on *reaching* a manifest slot, having
+already stopped at any earlier legacy proposal it could serve. Every official driver puts the marker
+first with legacy fallbacks behind it, so the two readings agree on real traffic; they differ only
+for a client that states a legacy preference ahead of the marker, and there the client's stated
+preference is the answer.
+
+### 1.5 An illegal transition terminates the connection (`rmp` #910)
+
+**Ratified rule: a message for which the current state defines no transition at all closes the
+connection.** The `FAILURE` carries `Neo.ClientError.Request.Invalid` and the socket is closed; there
+is no state in which an illegal transition is survivable.
+
+This is a *different fault* from a message that is legal in the state and merely **fails** — a bad
+query, a refused impersonation (§3.6.1), a serialization conflict. Those enter the RESET-recoverable
+`FAILED` state, because the server-state tables name `FAILED` as their failure target. An
+out-of-order message appears in no table entry at all, and the reference server terminates it:
+`IllegalTransitionException implements ConnectionTerminating`, whose `shouldTerminateConnection()` is
+`true`, carrying `Request.Invalid` — the same code Graphus sends.
+
+* **Why it matters beyond conformance.** A recoverable illegal transition lets a peer walk every
+  message against every state on a single connection, each attempt costing it one `RESET`. Closing
+  the connection makes each probe cost a full handshake and authentication.
+* **Uniformity.** Pre-authentication this was already terminal (`rmp` #820: a recoverable `FAILED`
+  let a later `RESET` resurrect an unauthenticated connection into `READY` with a `None` — i.e.
+  unrestricted — principal). The post-authentication half now matches, so the rule needs no state
+  qualifier.
+* **`LOGOFF`** has exactly one source state, `READY`. A `LOGOFF` anywhere else is therefore an
+  illegal transition and terminates, including inside an open explicit transaction — where it must
+  additionally *not* drop the session principal.
+* **No transaction may leak.** The terminal path rolls back any open explicit transaction
+  **unconditionally** before closing. `Flow::Stop` returns from the message loop without passing
+  through the EOF arm's cleanup, so without this an illegal transition sent inside a transaction
+  would leave it pinning the GC watermark and holding its intents until the executor's `Drop`
+  backstop ran (`rmp` #444). The rollback is deliberately ungated: gating it is precisely how
+  `rmp` #613 leaked a transaction across a `RESET`.
+
+#### 1.5.1 Ratified deviation: pre-authentication `TELEMETRY` is `DEFUNCT`, not `FAILED`
+
+The Bolt server-state documentation's worked example shows a `TELEMETRY` sent outside `READY`
+answered with `FAILURE` into the recoverable `FAILED` state. Graphus **deviates deliberately**: when
+that `TELEMETRY` arrives *before authentication* (in `NEGOTIATION` or `AUTHENTICATION`), the
+connection becomes `DEFUNCT`.
+
+The deviation is security-motivated and was ratified with `rmp` #820. `RESET` is not a valid message
+before authentication, and the same document's own state tables transition `NEGOTIATION` and
+`AUTHENTICATION` to `DEFUNCT` on failure — so the example and the tables disagree. Following the
+example would leave an *unauthenticated* connection in a state a subsequent `RESET` could return to
+`READY` with a `None` principal, which the engine seam treats as unrestricted: an authentication
+bypass reachable with two messages. The tables are followed; the example is not.
+
+The deviation costs no interoperability: `TELEMETRY` exists only from 5.4, is advisory, and no
+driver sends it before authenticating. Post-authentication `TELEMETRY` outside `READY` is an ordinary
+illegal transition and is governed by §1.5 like every other message. A `TELEMETRY` *in* `READY` whose
+`api` value is outside `0..=3` is a different case again — a legal message with a bad argument — and
+takes the recoverable `FAILED` state the message specification mandates for it.
+
 ---
 
 ## 2. TCK error-classification model

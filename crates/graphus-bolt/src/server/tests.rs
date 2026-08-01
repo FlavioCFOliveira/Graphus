@@ -1763,9 +1763,12 @@ fn pull_accepts_the_open_qid_and_minus_one() {
 
 #[test]
 fn logoff_in_tx_ready_is_rejected_and_rolls_back() {
-    // rmp #392 / Bolt spec: LOGOFF is valid only in READY. Inside an open explicit transaction it
-    // must FAILURE → FAILED, the principal must stay set (not dropped), and the open tx must be
-    // rolled back (not left dangling).
+    // rmp #392 / Bolt spec: LOGOFF is valid only in READY. Inside an open explicit transaction it is
+    // an illegal transition, so (`rmp` #910) it must FAILURE and CLOSE the connection, the principal
+    // must stay set (not dropped), and the open tx must be rolled back (not left dangling).
+    //
+    // The GOODBYE below is never processed: the connection is already gone. That is the assertion —
+    // a session that reached GOODBYE would mean the LOGOFF had been survivable.
     let exec = MockExecutor::new();
     let input = session_input(&[
         hello(),
@@ -1779,17 +1782,17 @@ fn logoff_in_tx_ready_is_rejected_and_rolls_back() {
     {
         let mut session = BoltSession::new(&mut transport, exec, &auth);
         session.run().unwrap();
-        assert_eq!(session.state(), State::Defunct); // GOODBYE after the FAILURE
+        assert_eq!(session.state(), State::Defunct); // terminated BY the invalid LOGOFF
         // The principal is NOT dropped by an invalid LOGOFF.
         assert_eq!(session.principal(), Some("alice"));
-        // The transaction was rolled back, not left open.
+        // The transaction was rolled back, not left open — terminating must not leak it.
         assert!(
             !session.executor().tx_open,
             "tx rolled back on invalid LOGOFF"
         );
         let log = &session.executor().log;
         assert!(
-            log.contains(&"rollback".to_owned()),
+            log.contains(&"rollback_open_tx".to_owned()),
             "invalid LOGOFF rolls the tx back: {log:?}"
         );
     }
@@ -3938,8 +3941,8 @@ fn commit_while_streams_are_open_is_rejected_rmp_907() {
     // `TX_READY` only, and says the open results "must be fully consumed or discarded by a client
     // before the server can transition to the TX_READY state". The official drivers honour this: the
     // Neo4j Python driver's `_commit` calls `_consume_results()` first ("DISCARD pending records then
-    // do a commit"), so a conformant client never sends COMMIT here. It is therefore an out-of-order
-    // message: FAILURE → FAILED, recoverable with RESET.
+    // do a commit"), so a conformant client never sends COMMIT here. It is therefore an illegal
+    // transition: FAILURE, and the connection CLOSES (`rmp` #910).
     let exec = MockExecutor::new().on_query("A", int_rows("a", &[1, 2, 3]));
 
     let (r, log) = drive_with_log(
@@ -3951,6 +3954,8 @@ fn commit_while_streams_are_open_is_rejected_rmp_907() {
             run_req("A"),
             Request::Pull { n: 1, qid: None }, // leaves the stream open
             Request::Commit,
+            // Neither of these is ever processed — the connection is gone after the COMMIT. Their
+            // absence from the response list below is the assertion that it terminated.
             Request::Reset,
             Request::Goodbye,
         ],
@@ -3968,14 +3973,18 @@ fn commit_while_streams_are_open_is_rejected_rmp_907() {
         }
         other => panic!("COMMIT in TX_STREAMING must FAILURE, got {other:?}"),
     }
-    assert!(matches!(r[7], Response::Success { .. }), "RESET recovers");
+    assert_eq!(
+        r.len(),
+        7,
+        "the connection closes on the illegal transition: the RESET must NOT be answered: {r:?}"
+    );
     assert!(
         !log.contains(&"commit".to_owned()),
         "the executor must never be asked to commit a transaction with open results: {log:?}"
     );
     assert!(
         log.contains(&"rollback_open_tx".to_owned()),
-        "RESET must roll the transaction back: {log:?}"
+        "terminating must roll the transaction back, not leak it: {log:?}"
     );
 }
 
@@ -4004,11 +4013,16 @@ fn rollback_while_streams_are_open_is_rejected_rmp_907() {
         Response::Failure(f) => assert_eq!(f.code, "Neo.ClientError.Request.Invalid"),
         other => panic!("ROLLBACK in TX_STREAMING must FAILURE, got {other:?}"),
     }
-    assert!(matches!(r[7], Response::Success { .. }), "RESET recovers");
-    // The transaction is still cleaned up — by RESET, which rolls it back unconditionally (rmp #613).
+    assert_eq!(
+        r.len(),
+        7,
+        "the connection closes on the illegal transition: the RESET must NOT be answered: {r:?}"
+    );
+    // The transaction is still cleaned up — now by the terminal path itself, which rolls it back
+    // unconditionally (`rmp` #910, keeping the #613 lesson that the rollback must not be gated).
     assert!(
         log.contains(&"rollback_open_tx".to_owned()),
-        "RESET must roll the transaction back: {log:?}"
+        "terminating must roll the transaction back: {log:?}"
     );
 }
 
@@ -4376,4 +4390,165 @@ fn discard_of_one_of_several_streams_keeps_the_connection_streaming_rmp_907() {
     assert_drained(&r[9], "stream A");
     assert!(matches!(r[10], Response::Success { .. }), "COMMIT");
     assert_eq!(r.len(), 11);
+}
+
+// ---- rmp #910: an illegal transition closes the connection ---------------------------------------
+
+/// **The task's own reproduction: `COMMIT` with no open transaction, after authenticating.**
+///
+/// `COMMIT` is a `TX_READY` transition; in `READY` it appears in no entry of the server-state tables,
+/// so it is an illegal transition and not a message that is legal-but-failed. Graphus used to answer
+/// it with the RESET-recoverable `FAILED` state, where the reference terminates the connection
+/// (`IllegalTransitionException implements ConnectionTerminating`).
+#[test]
+fn commit_with_no_open_transaction_closes_the_connection() {
+    let exec = MockExecutor::new().with_default(CannedResult::rows(&[], vec![]));
+    let (r, log) = drive_with_log(
+        exec,
+        &[
+            hello(),
+            logon_alice(),
+            Request::Commit,
+            // Neither of these is ever processed: the connection is already gone. Their absence from
+            // the response list IS the assertion — before the fix, the RESET was answered SUCCESS and
+            // the session carried on serving.
+            Request::Reset,
+            Request::Run {
+                query: "RETURN 1".to_owned(),
+                parameters: vec![],
+                extra: vec![],
+            },
+        ],
+    );
+    match &r[2] {
+        Response::Failure(f) => {
+            assert_eq!(f.code, "Neo.ClientError.Request.Invalid");
+            assert!(
+                f.message.contains("COMMIT") && f.message.contains("Ready"),
+                "the failure must name the message and the state it was illegal in: {:?}",
+                f.message
+            );
+        }
+        other => panic!("COMMIT in READY must FAILURE, got {other:?}"),
+    }
+    assert_eq!(
+        r.len(),
+        3,
+        "nothing after the illegal transition is answered: {r:?}"
+    );
+    // The load-bearing half: the session did not merely stop replying, it never ran the statement.
+    assert!(
+        !log.iter().any(|l| l.contains("RETURN 1")),
+        "no statement runs after the connection is terminated: {log:?}"
+    );
+}
+
+/// The same rule from the other side: an illegal transition sent **inside an open explicit
+/// transaction** terminates, and the transaction is rolled back rather than leaked.
+///
+/// This is the case the terminal path had to grow a rollback for (`rmp` #910): before it, `BEGIN`
+/// then an illegal transition would have left the transaction pinning the GC watermark and holding
+/// its intents until the executor's `Drop` backstop ran (`rmp` #444), because `Flow::Stop` returns
+/// from the message loop without passing through the EOF arm's cleanup.
+#[test]
+fn an_illegal_transition_inside_a_transaction_rolls_it_back_before_closing() {
+    let exec = MockExecutor::new().with_default(CannedResult::rows(&[], vec![]));
+    let (r, log) = drive_with_log(
+        exec,
+        &[
+            hello(),
+            logon_alice(),
+            Request::Begin { extra: vec![] },
+            // BEGIN is not a TX_READY transition: a second one is illegal.
+            Request::Begin { extra: vec![] },
+            Request::Reset,
+        ],
+    );
+    assert!(
+        matches!(&r[3], Response::Failure(f) if f.code == "Neo.ClientError.Request.Invalid"),
+        "a second BEGIN is an illegal transition: {r:?}"
+    );
+    assert_eq!(r.len(), 4, "the connection closes: {r:?}");
+    assert!(
+        log.contains(&"rollback_open_tx".to_owned()),
+        "the open transaction is rolled back before the socket closes: {log:?}"
+    );
+    // Non-vacuity: the transaction really was open when the illegal message arrived — the executor
+    // logged exactly one successful begin. A gate that never opened one would prove nothing about
+    // the rollback.
+    assert_eq!(
+        log.iter().filter(|l| l.starts_with("begin(")).count(),
+        1,
+        "exactly one transaction was opened, and it was open at the illegal transition: {log:?}"
+    );
+}
+
+/// `LOGOFF` outside `READY` closes the connection, in a state that is *not* `TX_READY`.
+///
+/// `TX_READY` has its own dispatch arm (it must roll the transaction back), so it cannot stand in for
+/// the general rule. `STREAMING` reaches the shared `unexpected` path instead, which is what makes
+/// this the gate for "LOGOFF outside READY closes the connection" rather than a second test of the
+/// `TX_READY` arm.
+#[test]
+fn logoff_while_streaming_closes_the_connection() {
+    let exec = MockExecutor::new().on_query("A", int_rows("a", &[1, 2, 3]));
+    let (r, log) = drive_with_log(
+        exec,
+        &[
+            hello(),
+            logon_alice(),
+            run_req("A"),
+            Request::Pull { n: 1, qid: None }, // leaves the stream open → STREAMING
+            Request::Logoff,
+            Request::Reset,
+        ],
+    );
+    assert_has_more(&r[4], "the stream is still open when LOGOFF arrives");
+    assert!(
+        matches!(&r[5], Response::Failure(f) if f.code == "Neo.ClientError.Request.Invalid"),
+        "LOGOFF outside READY is an illegal transition: {r:?}"
+    );
+    assert_eq!(r.len(), 6, "the connection closes: {r:?}");
+    let _ = log;
+}
+
+/// A message that is **legal in this state and merely fails** stays RESET-recoverable.
+///
+/// The control that stops `rmp` #910 from being "terminate on every failure". The two classes are
+/// different — no transition at all (terminal) versus a transition whose target is `FAILED` — and
+/// collapsing them would turn every bad query into a dropped connection, which no driver expects and
+/// the state tables do not say.
+#[test]
+fn a_failing_but_legal_message_is_still_recoverable_with_reset() {
+    let exec = MockExecutor::new()
+        .on_query_error("BAD", GraphusError::Compile("boom".to_owned()))
+        .with_default(CannedResult::rows(&[], vec![]));
+    let (r, log) = drive_with_log(
+        exec,
+        &[
+            hello(),
+            logon_alice(),
+            run_req("BAD"), // legal in READY, fails at the executor
+            Request::Reset,
+            Request::Run {
+                query: "RETURN 1".to_owned(),
+                parameters: vec![],
+                extra: vec![],
+            },
+            Request::Pull { n: ALL, qid: None },
+            Request::Goodbye,
+        ],
+    );
+    assert!(
+        matches!(&r[2], Response::Failure(_)),
+        "the statement fails: {r:?}"
+    );
+    assert!(
+        matches!(&r[3], Response::Success { .. }),
+        "RESET still recovers a legal-but-failed message: {r:?}"
+    );
+    assert!(
+        log.iter().any(|l| l.contains("RETURN 1")),
+        "the connection keeps serving after RESET: {log:?}"
+    );
 }

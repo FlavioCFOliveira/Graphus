@@ -244,10 +244,16 @@ mod tests {
 
     /// State-machine abuse — **BEGIN-without-COMMIT loop** (rmp #469): a client that opens an explicit
     /// transaction then sends `BEGIN` again (and again …) must NOT stack nested transactions. The
-    /// first `BEGIN` succeeds (→ `TX_READY`); the second is an unexpected message in `TX_READY` →
-    /// `FAILURE` → `FAILED`; every subsequent `BEGIN` is `IGNORED` until the connection closes (the
-    /// abandoned tx is rolled back on `GOODBYE`). Only one transaction is ever open — bounded state,
-    /// deterministic rejection, no panic, no unbounded tx accumulation.
+    /// first `BEGIN` succeeds (→ `TX_READY`); the second has no transition in `TX_READY`, so it is an
+    /// illegal transition → `FAILURE` and the connection **closes** (`rmp` #910, which rolls the
+    /// abandoned transaction back on the way out). Every later `BEGIN` in the script is never read.
+    /// Only one transaction is ever open — bounded state, deterministic rejection, no panic, no
+    /// unbounded tx accumulation.
+    ///
+    /// The `rmp` #469 property this guards is unchanged and is now met more strongly: the abuse used
+    /// to cost the server one `IGNORED` per remaining message on a live connection, and now costs it
+    /// nothing at all beyond the close. The gate is written as "the flood after the rejection is not
+    /// serviced", so it states the property rather than the response count of either behaviour.
     #[test]
     fn begin_without_commit_loop_opens_at_most_one_tx() {
         let auth = sim_auth();
@@ -264,18 +270,24 @@ mod tests {
             .iter()
             .filter(|r| matches!(r, graphus_bolt::Response::Ignored))
             .count();
-        // Exactly one repeated-BEGIN rejection (the 2nd BEGIN), then the rest are IGNORED in FAILED.
+        // Exactly one repeated-BEGIN rejection (the 2nd BEGIN) — never a second transaction.
         assert_eq!(
             failures, 1,
             "a second BEGIN must be rejected exactly once (no nested tx): {failures} failures",
         );
+        // The connection is gone after that rejection, so the remaining 998 BEGINs are never even
+        // read — no per-message work at all, not one IGNORED apiece.
         assert_eq!(
-            ignored,
-            LOOP - 2,
-            "every BEGIN after the rejection is IGNORED until close (bounded state)",
+            ignored, 0,
+            "an illegal transition closes the connection, so nothing after it is serviced",
         );
-        // Bounded: 2 login SUCCESS + 1 BEGIN SUCCESS + 1 FAILURE + (LOOP-2) IGNORED.
-        assert_eq!(responses.len(), LOOP + 2);
+        // Bounded, and now tightly: 2 login SUCCESS + 1 BEGIN SUCCESS + 1 FAILURE. The flood of 998
+        // further BEGINs and the GOODBYE cost the server nothing.
+        assert_eq!(
+            responses.len(),
+            4,
+            "the whole abuse costs 4 responses regardless of how long the flood is: {responses:?}",
+        );
     }
 
     /// State-machine abuse — **oversized HELLO metadata map** (rmp #469): a `HELLO` whose `extra`

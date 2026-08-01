@@ -110,12 +110,16 @@ dialing. To use UDS you therefore speak Bolt directly over the socket. Two optio
 
 ## Protocol details
 
-- **Handshake.** The client opens with the 4-byte magic preamble `60 60 B0 17` followed by
-  four 32-bit version proposals. Graphus negotiates the highest mutually supported minor in
-  the 5.0–5.4 window and replies with the chosen 4-byte version (or `00 00 00 00` to
-  reject). The modern Manifest-v1 handshake is also supported. The top of that window can be
-  capped with the `bolt_max_protocol_minor` startup option (both handshake forms honour the
-  same cap); see
+- **Handshake, and your slot order is honoured.** The client opens with the 4-byte magic preamble
+  `60 60 B0 17` followed by four 32-bit version proposals. Graphus reads them **in the order you sent
+  them** and answers the first it can serve within the 5.0–5.4 window, replying with that 4-byte
+  version (or `00 00 00 00` to reject). So listing `5.1` ahead of `5.3` gets you 5.1 — the slot order
+  is how the handshake lets a client state a preference, and it is binding. Within a *single*
+  range-encoded proposal (which offers a span of minors) the highest supported minor of that span is
+  chosen, since a range means "any of these". The modern Manifest-v1 handshake is also supported, and
+  its marker slot competes by position on the same terms: a legacy proposal listed ahead of it wins.
+  The top of the window can be capped with the `bolt_max_protocol_minor` startup option (both
+  handshake forms honour the same cap); see
   [configuration.md](configuration.md#bolt-protocol-version-cap).
 - **Authentication depends on the negotiated version.** From Bolt **5.1** the `HELLO` only
   negotiates and a separate `LOGON` authenticates. At Bolt **5.0** the `HELLO` does both: the
@@ -141,6 +145,17 @@ dialing. To use UDS you therefore speak Bolt directly over the socket. Two optio
 - **Errors.** A server-side problem arrives as a Bolt `FAILURE` carrying a Neo4j-style
   `code` and a human-readable `message`, after which the connection is `FAILED` until a
   `RESET`.
+- **An out-of-order message closes the connection.** A message the current state defines no
+  transition for at all — `COMMIT` with no open transaction, `LOGOFF` outside `READY`, `COMMIT` or
+  `ROLLBACK` while a result is still streaming — is answered with
+  `FAILURE {code: "Neo.ClientError.Request.Invalid"}` and the connection is then **closed**. It is
+  not recoverable with `RESET`, matching the reference server, which treats an illegal transition as
+  connection-terminating. Any open explicit transaction is rolled back first, so nothing is left
+  half-applied or pinned. This is a different case from a message that is *legal* here and simply
+  fails (a bad query, a refused impersonation): those leave the connection `FAILED` and a `RESET`
+  recovers it as usual. The official drivers already avoid out-of-order messages — the Python
+  driver's `_commit` consumes pending results before committing — so a conformant client never
+  reaches this.
 - **Impersonation (`imp_user`) is refused, never ignored.** `BEGIN`, `RUN` and `ROUTE` may carry an
   `imp_user` field naming the principal the client wants the server to act as. Graphus does **not**
   implement impersonation, so it **refuses** any message that carries one, with

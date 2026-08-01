@@ -36,16 +36,28 @@
 //! The varint is the Bolt LEB128 form: 7 bits per byte, least-significant group first, the high bit
 //! of each byte a continuation flag. Graphus advertises **one** range (5.0–5.4) and **no**
 //! capabilities, so its manifest is short and constant; both handshake forms negotiate the *same*
-//! version window. [`detect_manifest_request`], [`encode_server_manifest`] and
-//! [`parse_manifest_choice`] are the manifest primitives; the legacy path
-//! ([`parse_client_handshake`] / [`negotiate`] / [`server_reply`]) is unchanged.
+//! version window. [`encode_server_manifest`] and [`parse_manifest_choice`] are the manifest
+//! primitives; the legacy path is [`parse_client_handshake`] / [`negotiate`] / [`server_reply`].
+//! [`select_within`] is the single ordered scan that decides *which of the two forms* a given
+//! handshake asks for (`rmp` #910) — the marker competes for the server's attention by slot position
+//! like every other proposal, so a client that lists a legacy proposal ahead of it gets the legacy
+//! form. [`detect_manifest_request`] remains as a positional-agnostic predicate for callers that only
+//! want to know whether a marker is present anywhere.
 //!
 //! ## What Graphus negotiates
 //!
 //! Graphus pins **5.4 as the maximum** (`06 §1`) and negotiates **down to any 5.0–5.4 minor** a
-//! client requests within that window. [`negotiate`] picks the **highest** mutually-supported minor
-//! across the four proposals (drivers list their preference highest-first; choosing the highest
-//! offered minor that we support is the standard, driver-friendly rule).
+//! client requests within that window. Two distinct rules decide which one, and both come from the
+//! reference server (`rmp` #910):
+//!
+//! - **Across the four slots**, [`negotiate`] takes the **first** one it can satisfy, in the client's
+//!   own order — the slot order *is* the client's stated preference, and the reference walks
+//!   "every suggested protocol revision (in order of occurrence)" until one is servable
+//!   (`LegacyProtocolHandshakeHandler`). Graphus previously took the highest minor found anywhere,
+//!   which quietly overrode a client that had ordered its proposals deliberately.
+//! - **Within one slot**, a range proposal means "any minor in this span", so the **highest**
+//!   supported minor of the span wins ([`Proposal::best_supported_minor_within`]), matching the
+//!   reference's `max` over the versions a single proposal matches (`DefaultBoltProtocolRegistry`).
 //!
 //! ## Capping the advertised window (`bolt_max_protocol_minor`; rmp #906)
 //!
@@ -247,9 +259,9 @@ pub fn parse_client_handshake(bytes: &[u8]) -> BoltResult<[Proposal; PROPOSAL_SL
 
 /// Chooses the version Graphus will speak from the client's four proposals (`04 §8.1`, `06 §1`).
 ///
-/// Returns the **highest** Bolt 5.x minor (within `5.0..=5.4`) that any proposal offers; `None` if
-/// no proposal overlaps Graphus's supported window. A `00 00 00 00` unused slot decodes to major 0
-/// and is naturally unsupported, so empty slots are ignored.
+/// Returns the version of the **first** slot, in the client's own order, that Graphus can satisfy;
+/// `None` if no proposal overlaps Graphus's supported window. A `00 00 00 00` unused slot decodes to
+/// major 0 and is naturally unsupported, so empty slots are skipped.
 #[must_use]
 pub fn negotiate(proposals: &[Proposal]) -> Option<Version> {
     negotiate_within(proposals, MAX_MINOR)
@@ -261,13 +273,68 @@ pub fn negotiate(proposals: &[Proposal]) -> Option<Version> {
 /// [`clamp_max_minor`]) instead of the compiled [`MAX_MINOR`], so a listener configured with
 /// `bolt_max_protocol_minor` negotiates within exactly the window it advertises. Passing
 /// [`MAX_MINOR`] reproduces [`negotiate`] bit-for-bit.
+///
+/// # Slot order is the client's preference, and it is binding (`rmp` #910)
+///
+/// The scan is **first match wins**, not "best match across all slots". Graphus previously took the
+/// highest supported minor found anywhere in the four slots, which silently overrode a client that
+/// had deliberately ordered its proposals — the one mechanism the handshake gives a client to express
+/// a preference. The reference server iterates "every suggested protocol revision (in order of
+/// occurrence) and check[s] whether we are able to satisfy it"
+/// (`LegacyProtocolHandshakeHandler.channelRead0`), stopping at the first it can serve.
+///
+/// The two rules compose and are easy to confuse, so both are exercised in the tests:
+///
+/// * **Across slots** — first supported slot wins, however low its minor.
+/// * **Within one slot** — a *range* proposal (`minor - range ..= minor`) means "any of these", so the
+///   **highest** supported minor in that span wins ([`Proposal::best_supported_minor_within`]),
+///   matching the reference's `max(Comparator.comparing(BoltProtocol::version))` over the versions one
+///   proposal matches (`DefaultBoltProtocolRegistry.get`).
 #[must_use]
 pub fn negotiate_within(proposals: &[Proposal], max_minor: u8) -> Option<Version> {
     proposals
         .iter()
-        .filter_map(|p| p.best_supported_minor_within(max_minor))
-        .max()
+        .find_map(|p| p.best_supported_minor_within(max_minor))
         .map(|minor| Version::new(SUPPORTED_MAJOR, minor))
+}
+
+/// What the client's four handshake slots ask the server to do, resolved **in the client's own slot
+/// order** (`rmp` #910).
+///
+/// The manifest request is not a version — it is a request to switch to a different negotiation
+/// protocol entirely — so it cannot be folded into [`negotiate_within`]'s version comparison. But it
+/// occupies a slot like any other proposal, and the reference resolves it positionally: its single
+/// ordered loop switches to the modern handshake only when it *reaches* a manifest slot, having
+/// already stopped at any earlier legacy proposal it could serve
+/// (`LegacyProtocolHandshakeHandler.channelRead0`). [`HandshakeChoice`] is that one ordered decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandshakeChoice {
+    /// The first satisfiable slot is a legacy version proposal: reply with this version.
+    Version(Version),
+    /// The first satisfiable slot is the Manifest-v1 marker: run the manifest exchange instead
+    /// ([`encode_server_manifest`] then [`parse_manifest_choice`]).
+    Manifest,
+}
+
+/// Resolves the client's four slots into the single [`HandshakeChoice`] the server acts on, scanning
+/// them **in order** and stopping at the first it can satisfy (`rmp` #910).
+///
+/// `None` means no slot was satisfiable: the server replies [`REJECTION`] and closes.
+///
+/// In practice every official driver puts [`MANIFEST_V1_REQUEST`] in its first slot and legacy
+/// proposals after it as a fallback, so the ordered scan and a "manifest anywhere wins" scan agree on
+/// real traffic. They differ only for a client that lists a legacy proposal *before* the marker — and
+/// there the ordered answer is the client's stated preference, which is the whole point of the slot
+/// order.
+#[must_use]
+pub fn select_within(proposals: &[Proposal], max_minor: u8) -> Option<HandshakeChoice> {
+    proposals.iter().find_map(|p| {
+        if p.to_wire() == MANIFEST_V1_REQUEST {
+            return Some(HandshakeChoice::Manifest);
+        }
+        p.best_supported_minor_within(max_minor)
+            .map(|minor| HandshakeChoice::Version(Version::new(SUPPORTED_MAJOR, minor)))
+    })
 }
 
 /// The 4 wire bytes the server sends in reply: the chosen version, or [`REJECTION`].
@@ -502,8 +569,11 @@ mod tests {
     }
 
     #[test]
-    fn highest_across_slots_wins() {
-        // Slot 1 offers 5.1, slot 2 offers 5.3: pick 5.3.
+    fn the_first_supported_slot_wins_not_the_highest() {
+        // THE `rmp` #910 GATE. Slot 1 offers 5.1, slot 2 offers 5.3. Graphus used to answer 5.3 —
+        // the highest anywhere in the four slots — which silently overrode the only mechanism the
+        // handshake gives a client to express a preference. The reference iterates the slots "in
+        // order of occurrence" and stops at the first it can satisfy, so the answer is 5.1.
         let bytes = client_bytes([
             Proposal::exact(5, 1),
             Proposal::exact(5, 3),
@@ -511,7 +581,35 @@ mod tests {
             Proposal::exact(0, 0),
         ]);
         let proposals = parse_client_handshake(&bytes).unwrap();
-        assert_eq!(negotiate(&proposals), Some(Version::new(5, 3)));
+        assert_eq!(
+            negotiate(&proposals),
+            Some(Version::new(5, 1)),
+            "the client asked for 5.1 first; a higher minor later in the list does not override it"
+        );
+
+        // The control that keeps the gate from passing for the wrong reason (e.g. "always take slot
+        // 1"): reversing the two slots reverses the answer, so the *order* is what decides.
+        let reversed = client_bytes([
+            Proposal::exact(5, 3),
+            Proposal::exact(5, 1),
+            Proposal::exact(5, 0),
+            Proposal::exact(0, 0),
+        ]);
+        let reversed = parse_client_handshake(&reversed).unwrap();
+        assert_eq!(negotiate(&reversed), Some(Version::new(5, 3)));
+
+        // An UNSUPPORTED first slot is skipped, not fatal: the scan continues to the next one.
+        let leading_junk = [
+            Proposal::exact(4, 4), // a major we do not speak
+            Proposal::exact(0, 0), // an unused padding slot
+            Proposal::exact(5, 2),
+            Proposal::exact(5, 4),
+        ];
+        assert_eq!(
+            negotiate(&leading_junk),
+            Some(Version::new(5, 2)),
+            "unsatisfiable slots are skipped; the first SUPPORTED one wins"
+        );
     }
 
     #[test]
@@ -549,7 +647,71 @@ mod tests {
         assert!(!Version::new(4, 4).is_supported());
     }
 
+    #[test]
+    fn a_range_slot_still_takes_the_highest_minor_it_spans() {
+        // The rule that must NOT change with `rmp` #910, and the one easiest to break while making
+        // the across-slot scan ordered. The two rules are different by design and both come from the
+        // reference: across slots, the first satisfiable one wins; WITHIN one slot, a range proposal
+        // means "any of these", so the highest supported minor in the span wins
+        // (`DefaultBoltProtocolRegistry.get` maxes over the versions one proposal matches).
+        let proposals = [
+            Proposal::range(5, 4, 4), // spans 5.0..=5.4 — all supported
+            Proposal::exact(5, 0),
+        ];
+        assert_eq!(
+            negotiate(&proposals),
+            Some(Version::new(5, 4)),
+            "the FIRST slot wins, and within it the HIGHEST minor of its span"
+        );
+    }
+
     // ---- Manifest-v1 handshake (rmp #95) ------------------------------------------------------
+
+    #[test]
+    fn the_manifest_marker_competes_by_slot_position() {
+        // `rmp` #910: the manifest request occupies a slot like any other proposal, and the reference
+        // resolves it positionally — its single ordered loop switches to the modern handshake only on
+        // REACHING a manifest slot, having already stopped at any earlier legacy proposal it could
+        // serve. Graphus previously scanned every slot for the marker and preferred it regardless of
+        // where it sat.
+        let marker = Proposal::from_wire(MANIFEST_V1_REQUEST);
+
+        // The real-world shape: drivers put the marker first, with legacy fallbacks after it.
+        assert_eq!(
+            select_within(&[marker, Proposal::exact(5, 4)], MAX_MINOR),
+            Some(HandshakeChoice::Manifest),
+            "a marker in the first slot selects the manifest exchange"
+        );
+
+        // The discriminating shape: a legacy proposal the server can serve comes FIRST, so the
+        // client's stated preference is the legacy form and the marker is never reached.
+        assert_eq!(
+            select_within(&[Proposal::exact(5, 2), marker], MAX_MINOR),
+            Some(HandshakeChoice::Version(Version::new(5, 2))),
+            "an earlier satisfiable legacy slot wins over a later manifest marker"
+        );
+
+        // An UNSATISFIABLE earlier slot does not shadow the marker — the scan skips it.
+        assert_eq!(
+            select_within(&[Proposal::exact(4, 4), marker], MAX_MINOR),
+            Some(HandshakeChoice::Manifest),
+            "an unsatisfiable earlier slot is skipped, not preferred"
+        );
+
+        // Nothing satisfiable at all is still a rejection.
+        assert_eq!(
+            select_within(&[Proposal::exact(4, 4), Proposal::exact(0, 0)], MAX_MINOR),
+            None
+        );
+
+        // The cap is honoured by the same scan (`rmp` #906): with the window capped at 5.1, a 5.4
+        // exact slot is unsatisfiable and the marker behind it is reached.
+        assert_eq!(
+            select_within(&[Proposal::exact(5, 4), marker], 1),
+            Some(HandshakeChoice::Manifest),
+            "a slot outside the CAPPED window is unsatisfiable, so the scan moves on"
+        );
+    }
 
     #[test]
     fn varint_round_trips_across_boundaries() {

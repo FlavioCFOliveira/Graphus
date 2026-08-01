@@ -114,8 +114,8 @@ use crate::error::{
 use crate::executor::{AccessMode, BoltExecutor, Record, RecordStream, TxControl};
 use crate::framing::{Dechunker, Frame, chunk_message_into};
 use crate::handshake::{
-    MAGIC, Version, detect_manifest_request, graphus_manifest_within, negotiate_within,
-    parse_client_handshake, parse_manifest_choice, server_reply, version_supported_within,
+    HandshakeChoice, MAGIC, Version, graphus_manifest_within, parse_client_handshake,
+    parse_manifest_choice, select_within, server_reply, version_supported_within,
 };
 use crate::message::{ALL, Request, Response};
 use crate::packstream::Packer;
@@ -628,10 +628,11 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
     /// Reads the 20-byte client handshake and negotiates a version, over either the **legacy** 4-slot
     /// reply or the **Manifest-v1** exchange (rmp #95).
     ///
-    /// The first transmission is always magic + 4 proposals (20 bytes). If one slot is the
-    /// Manifest-v1 marker (`00 00 01 FF`), the server replies with its manifest and reads the
-    /// client's chosen version + capabilities (a second round); otherwise it replies with the single
-    /// negotiated version exactly as before. Both forms converge on the same version window.
+    /// The first transmission is always magic + 4 proposals (20 bytes). The four slots are resolved
+    /// **in the client's own order** and the first one the server can satisfy wins (`rmp` #910): if
+    /// that slot is the Manifest-v1 marker (`00 00 01 FF`), the server replies with its manifest and
+    /// reads the client's chosen version + capabilities (a second round); otherwise it replies with
+    /// that slot's negotiated version. Both forms converge on the same version window.
     ///
     /// # Errors
     /// [`BoltError::Handshake`] if the magic/length is wrong, no version is acceptable, or (manifest)
@@ -642,14 +643,22 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
         let bytes = self.read_exact_bytes(HANDSHAKE_LEN)?;
         let proposals = parse_client_handshake(&bytes)?;
 
-        if detect_manifest_request(&proposals) {
+        // One ordered scan decides between the two handshake forms and the version (`rmp` #910):
+        // slot order is the client's stated preference, and the reference honours it positionally —
+        // it switches to the manifest exchange only on *reaching* a manifest slot, having already
+        // stopped at any earlier legacy proposal it could serve. Negotiating within the configured
+        // window (rmp #906): `SessionConfig::max_protocol_minor` defaults to the compiled
+        // `MAX_MINOR`, so an unconfigured listener offers the full window; a capped listener offers
+        // only up to its cap.
+        let selected = select_within(&proposals, self.config.max_protocol_minor);
+        if selected == Some(HandshakeChoice::Manifest) {
             return self.do_manifest_handshake();
         }
-
-        // Negotiate within the configured window (rmp #906): `SessionConfig::max_protocol_minor`
-        // defaults to the compiled `MAX_MINOR`, so an unconfigured listener negotiates exactly as
-        // before; a capped listener offers only up to its cap.
-        let chosen = negotiate_within(&proposals, self.config.max_protocol_minor);
+        let chosen = match selected {
+            Some(HandshakeChoice::Version(v)) => Some(v),
+            // `Manifest` is returned above; `None` is "no slot was satisfiable".
+            Some(HandshakeChoice::Manifest) | None => None,
+        };
         self.transport.write_all(&server_reply(chosen))?;
         match chosen {
             Some(v) => {
@@ -1095,13 +1104,17 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
                 Ok(Flow::Continue)
             }
             (State::TxReady, Request::Logoff) => {
-                // LOGOFF inside an open explicit transaction is an invalid transition (the previous
+                // LOGOFF inside an open explicit transaction is an illegal transition (the pre-rmp-#392
                 // wildcard arm wrongly accepted it, dropping the principal and leaving the tx
-                // dangling — rmp #392). Roll the transaction back so it does not leak (mirrors RESET
-                // / the EOF arm), then FAILURE → FAILED per the spec; the client recovers with RESET.
-                let _ = self.executor.rollback();
-                self.fail_protocol("LOGOFF is only valid in the READY state")?;
-                Ok(Flow::Continue)
+                // dangling). It is TERMINAL like every other illegal transition (`rmp` #910) — the
+                // spec gives LOGOFF one source state, READY, so a LOGOFF anywhere else appears in no
+                // table entry and the reference's `IllegalTransitionException` closes the connection.
+                // It gets its own arm rather than falling through to `unexpected` only so the message
+                // can name the rule; `fail_terminal` rolls the transaction back, so it cannot leak.
+                self.fail_terminal(Failure::new(
+                    "Neo.ClientError.Request.Invalid",
+                    "LOGOFF is only valid in the READY state",
+                ))
             }
             (_, Request::Reset) => self.handle_reset(),
             (_, other) => self.unexpected(&other),
@@ -1543,41 +1556,60 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
         Ok(())
     }
 
-    /// Sends a `FAILURE` for a **pre-authentication** fault and makes the connection TERMINAL
+    /// Sends a `FAILURE` for a fault the connection cannot survive and makes it TERMINAL
     /// ([`State::Defunct`] + [`Flow::Stop`]), so the message loop flushes the failure and closes the
     /// socket instead of returning to a recoverable state.
     ///
-    /// The Bolt server-state spec transitions NEGOTIATION and AUTHENTICATION to DEFUNCT on a failed
-    /// HELLO / LOGON (never to the RESET-recoverable FAILED state), and RESET is not a valid message
-    /// before authentication (neo4j.com/docs/bolt/current/bolt/server-state/). Using FAILED here was
-    /// an authentication bypass: a later RESET reset the connection to READY with a `None` principal,
-    /// which the engine seam treats as unrestricted (rmp #820). No transaction can be open before
-    /// authentication, so there is nothing to roll back.
+    /// Two classes of fault reach here:
+    ///
+    /// * **Pre-authentication faults.** The Bolt server-state spec transitions NEGOTIATION and
+    ///   AUTHENTICATION to DEFUNCT on a failed HELLO / LOGON (never to the RESET-recoverable FAILED
+    ///   state), and RESET is not a valid message before authentication
+    ///   (neo4j.com/docs/bolt/current/bolt/server-state/). Using FAILED here was an authentication
+    ///   bypass: a later RESET reset the connection to READY with a `None` principal, which the engine
+    ///   seam treats as unrestricted (rmp #820).
+    /// * **Illegal transitions**, at any point in the session — see [`Self::unexpected`] (`rmp` #910).
+    ///
+    /// The transaction rollback is **unconditional**, not gated on the state: it is a no-op when
+    /// nothing is open (which is every pre-authentication caller), and gating it on a condition is
+    /// exactly how `rmp` #613 leaked a transaction across a `RESET`. Without it, terminating on an
+    /// illegal transition sent inside an open explicit transaction would leave that transaction
+    /// pinning the GC watermark and holding its intents until the executor's `Drop` backstop ran
+    /// (rmp #444).
     fn fail_terminal(&mut self, failure: Failure) -> BoltResult<Flow> {
         self.close_all_streams();
+        self.executor.rollback_open_tx();
         self.send_failure(failure)?;
         self.state = State::Defunct;
         Ok(Flow::Stop)
     }
 
-    /// An unexpected request for the current state: an out-of-order message (`04 §8.1`). Before
-    /// authentication this is TERMINAL (DEFUNCT); after authentication it is the recoverable FAILED
-    /// state (fail-then-ignore-until-RESET).
+    /// An unexpected request for the current state: an **illegal transition** (`04 §8.1`). It is
+    /// TERMINAL — the `FAILURE` is sent and the connection closes (`rmp` #910).
+    ///
+    /// This is the state machine having no transition at all for `request`, which is a different
+    /// fault from a message that is legal here and *fails* (a bad query, a refused impersonation):
+    /// those enter the RESET-recoverable [`State::Failed`] because the state tables name `FAILED` as
+    /// their failure target. An out-of-order message appears in no table entry, and the reference
+    /// server terminates it — `IllegalTransitionException implements ConnectionTerminating`, whose
+    /// `shouldTerminateConnection()` is `true` — carrying `Request.Invalid`, the same code used here.
+    ///
+    /// Terminating rather than recovering also removes a cheap probing surface: a peer could
+    /// otherwise walk every message against every state on one connection, each attempt costing it a
+    /// `RESET` and nothing more. Pre-authentication this was already terminal (`rmp` #820, where a
+    /// recoverable FAILED let a later `RESET` resurrect an unauthenticated connection to `READY` with
+    /// a `None` — i.e. unrestricted — principal); the post-authentication half is now the same, so
+    /// the rule is uniform and there is no state in which an illegal transition is survivable.
+    ///
+    /// Any open explicit transaction is rolled back by [`Self::fail_terminal`] before the socket
+    /// closes, so terminating here can never leak one.
     fn unexpected(&mut self, request: &Request) -> BoltResult<Flow> {
         let msg = format!(
             "request {} is not valid in state {:?}",
             request_name(request),
             self.state
         );
-        // A pre-authentication out-of-order message must not enter the RESET-recoverable FAILED state
-        // (which a later RESET could turn into an unauthenticated, `None`-principal, unrestricted
-        // READY — rmp #820): NEGOTIATION / AUTHENTICATION transition to DEFUNCT on failure and RESET
-        // is not valid pre-auth. After authentication an out-of-order message stays recoverable.
-        if matches!(self.state, State::Connected | State::Authentication) {
-            return self.fail_terminal(Failure::new("Neo.ClientError.Request.Invalid", msg));
-        }
-        self.fail_protocol(&msg)?;
-        Ok(Flow::Continue)
+        self.fail_terminal(Failure::new("Neo.ClientError.Request.Invalid", msg))
     }
 
     // ---- Auth ------------------------------------------------------------------------------------
