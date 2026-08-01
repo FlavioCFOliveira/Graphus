@@ -65,7 +65,7 @@ fn run(handle: &EngineHandle, mode: AccessMode, stmt: &str) -> (bool, Option<i64
     let Ok(ticket) = handle.begin_auto_commit_blocking(mode) else {
         return (false, None);
     };
-    match handle.run_blocking(ticket, stmt.to_owned(), vec![], true, None) {
+    match handle.run_blocking(ticket, stmt.to_owned(), vec![], true, None, None) {
         Ok(mut reply) => {
             let mut first: Option<i64> = None;
             loop {
@@ -100,7 +100,7 @@ fn run_explicit_read(handle: &EngineHandle, stmt: &str) -> (bool, Option<i64>) {
         return (false, None);
     };
     let mut first: Option<i64> = None;
-    let stream_ok = match handle.run_blocking(ticket, stmt.to_owned(), vec![], false, None) {
+    let stream_ok = match handle.run_blocking(ticket, stmt.to_owned(), vec![], false, None, None) {
         Ok(mut reply) => loop {
             match reply.rows.next() {
                 Ok(Some(cells)) => {

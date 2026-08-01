@@ -74,7 +74,7 @@ fn run(handle: &EngineHandle, stmt: &str) {
         .begin_auto_commit_blocking(AccessMode::Write)
         .expect("begin");
     let mut reply = handle
-        .run_blocking(ticket, stmt.to_owned(), vec![], true, None)
+        .run_blocking(ticket, stmt.to_owned(), vec![], true, None, None)
         .expect("run");
     while reply.rows.next().expect("rows pull").is_some() {}
 }

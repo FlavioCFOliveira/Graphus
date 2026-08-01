@@ -101,13 +101,15 @@
 //! (`06 §3.1`). `DISCARD` drops the remaining rows and emits only the trailing `SUCCESS`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use graphus_auth::{AuthProvider, AuthThrottle, VerifyLimiter};
 use graphus_core::Value;
 use graphus_core::capability::Clock;
 
 use crate::error::{
-    BoltError, BoltResult, CODE_SERVER_BUSY, CODE_UNAUTHORIZED, Failure, failure_from_error,
+    BoltError, BoltResult, CODE_FORBIDDEN, CODE_SERVER_BUSY, CODE_UNAUTHORIZED, Failure,
+    failure_from_error,
 };
 use crate::executor::{AccessMode, BoltExecutor, Record, RecordStream, TxControl};
 use crate::framing::{Dechunker, Frame, chunk_message_into};
@@ -959,12 +961,18 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
                     extra,
                 },
             ) => {
-                let mode = access_mode_from_extra(&extra);
-                let db = db_from_extra(&extra);
+                let extra = match parse_tx_extra(&extra) {
+                    Ok(extra) => extra,
+                    Err(rejection) => return self.refuse_extra(rejection, "RUN"),
+                };
                 self.handle_run(
                     &query,
                     parameters,
-                    TxControl::AutoCommit { mode, db },
+                    TxControl::AutoCommit {
+                        mode: extra.mode,
+                        db: extra.db,
+                        timeout: extra.timeout,
+                    },
                     State::Streaming,
                 )
             }
@@ -978,18 +986,26 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
             ) => {
                 // The transaction is pinned to the database named at BEGIN; the executor rejects a
                 // different non-empty `db` here (cannot switch databases mid-transaction).
-                let db = db_from_extra(&extra);
+                let extra = match parse_tx_extra(&extra) {
+                    Ok(extra) => extra,
+                    Err(rejection) => return self.refuse_extra(rejection, "RUN"),
+                };
                 self.handle_run(
                     &query,
                     parameters,
-                    TxControl::InExplicit { db },
+                    TxControl::InExplicit { db: extra.db },
                     State::TxStreaming,
                 )
             }
             (State::Ready, Request::Begin { extra }) => {
-                let mode = access_mode_from_extra(&extra);
-                let db = db_from_extra(&extra);
-                match self.executor.begin(mode, db.as_deref()) {
+                let extra = match parse_tx_extra(&extra) {
+                    Ok(extra) => extra,
+                    Err(rejection) => return self.refuse_extra(rejection, "BEGIN"),
+                };
+                match self
+                    .executor
+                    .begin(extra.mode, extra.db.as_deref(), extra.timeout)
+                {
                     Ok(()) => {
                         // A fresh transaction restarts qid assignment at 0 (`04 §8.1`; qids are
                         // scoped to the transaction — rmp #391), and nothing is open in it yet.
@@ -1028,7 +1044,17 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
                 // A routing (`neo4j://`) driver asks for the cluster routing table. Graphus is a
                 // single instance, so every role resolves to this one server (rmp #95). ROUTE is a
                 // READY-state request: it does not open a result, so the state is unchanged.
-                let db = db_from_extra(&extra);
+                //
+                // `ROUTE` carries `imp_user` too (the reference server routes it through the same
+                // impersonation transition as `BEGIN`/`RUN` — `RouteStateTransition` extends
+                // `SimpleImpersonationStateTransition`), so it is refused here on the same terms: a
+                // routing table resolved for the *connection* principal, handed to a client that
+                // asked for another principal's home database, is a silent answer to a question the
+                // client did not ask (`rmp` #909).
+                let db = match parse_route_extra(&extra) {
+                    Ok(db) => db,
+                    Err(rejection) => return self.refuse_extra(rejection, "ROUTE"),
+                };
                 self.handle_route(db.as_deref())?;
                 Ok(Flow::Continue)
             }
@@ -1116,11 +1142,14 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
                 // A further statement in the same explicit transaction. The transaction is pinned to
                 // the database named at BEGIN; the executor rejects a different non-empty `db` here,
                 // exactly as it does for the TX_READY RUN.
-                let db = db_from_extra(&extra);
+                let extra = match parse_tx_extra(&extra) {
+                    Ok(extra) => extra,
+                    Err(rejection) => return self.refuse_extra(rejection, "RUN"),
+                };
                 self.handle_run(
                     &query,
                     parameters,
-                    TxControl::InExplicit { db },
+                    TxControl::InExplicit { db: extra.db },
                     State::TxStreaming,
                 )
             }
@@ -1450,6 +1479,70 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
         Ok(())
     }
 
+    /// Refuses a message whose `extra` map asked for something the server will not silently ignore
+    /// (`rmp` #909), replying `FAILURE` and entering the RESET-recoverable [`State::Failed`].
+    ///
+    /// `message` names the refused request (`"BEGIN"`, `"RUN"`, `"ROUTE"`) so the client can tell
+    /// *which* of its messages was rejected. This is only ever reached from a post-authentication
+    /// dispatch arm, so the recoverable `FAILED` state is correct: the pre-authentication states
+    /// terminate instead (`rmp` #820), and this guard is deliberately placed *after* the state match
+    /// so an out-of-order message is still reported as an illegal transition rather than as an
+    /// impersonation refusal.
+    fn refuse_extra(&mut self, rejection: ExtraRejected, message: &str) -> BoltResult<Flow> {
+        match rejection {
+            ExtraRejected::Impersonation => self.refuse_impersonation(message)?,
+            ExtraRejected::MalformedTxTimeout => self.fail_protocol(&format!(
+                "{message} `{TX_TIMEOUT_FIELD}` must be an integer number of milliseconds"
+            ))?,
+        }
+        Ok(Flow::Continue)
+    }
+
+    /// Refuses a client's request to run as another principal (`rmp` #909).
+    ///
+    /// Graphus does not implement impersonation. The only two honest answers are to *enforce* it or
+    /// to *refuse* it; accepting the field and running as the connection principal anyway is the one
+    /// answer that is unsafe, because `imp_user` exists to **drop** privileges. The standard
+    /// middle-tier pattern — one pooled connection authenticated as a service principal, each request
+    /// impersonating its end user — would then silently execute every tenant's request with the
+    /// service principal's full rights, and the application would have no way to notice.
+    ///
+    /// ## Why this code
+    ///
+    /// [`CODE_FORBIDDEN`] (`Neo.ClientError.Security.Forbidden`, documented by Neo4j as "An attempt
+    /// was made to perform an unauthorized action"). The reference server answers a rejected
+    /// impersonation in the authentication/authorization class as well
+    /// (`SimpleImpersonationStateTransition` wraps the realm's `AuthenticationException` into
+    /// `AuthenticationStateTransitionException`, which carries that exception's security status).
+    /// The alternatives were considered and rejected: `Neo.ClientError.Statement.ArgumentError` is
+    /// what Neo4j *Community* happens to raise (`BasicSystemGraphRealm.impersonate` throws
+    /// `InvalidArgumentException.unsupportedInCommunity`), but it is indistinguishable from "your
+    /// query's arguments are wrong"; [`CODE_UNAUTHORIZED`] means "your credentials were not accepted"
+    /// and would make a driver invalidate a perfectly good auth token.
+    ///
+    /// ## Why it does not leak
+    ///
+    /// The refusal is **unconditional and identical** for every value: the requested principal is
+    /// never looked up, never compared against the connection's own principal, and never echoed. A
+    /// client learns only that Graphus refuses impersonation — never whether a principal exists
+    /// (`rmp` #812's constant-work property). Impersonating *yourself* is refused on the same terms:
+    /// the reference server also treats it as an impersonation
+    /// (`if (message.impersonatedUser() != null)`, with no self-check), and a rule whose outcome
+    /// depended on matching the connection's principal would make the server's behaviour a function
+    /// of a name the client supplied — a needless comparison oracle for no benefit.
+    fn refuse_impersonation(&mut self, message: &str) -> BoltResult<()> {
+        self.close_all_streams();
+        self.send_failure(Failure::new(
+            CODE_FORBIDDEN,
+            format!(
+                "{message} requested impersonation via `{IMP_USER_FIELD}`, which this server does \
+                 not support; the statement was NOT run as the connection's own principal"
+            ),
+        ))?;
+        self.state = State::Failed;
+        Ok(())
+    }
+
     /// Sends a `FAILURE` for a **pre-authentication** fault and makes the connection TERMINAL
     /// ([`State::Defunct`] + [`Flow::Stop`]), so the message loop flushes the failure and closes the
     /// socket instead of returning to a recoverable state.
@@ -1617,22 +1710,140 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
 
 // ---- free helpers --------------------------------------------------------------------------------
 
-/// Reads the `mode` field from a `RUN`/`BEGIN` extra map (`"r"` = read, anything else / absent =
-/// write, matching Bolt's default and `06 §4`).
-fn access_mode_from_extra(extra: &[(String, Value)]) -> AccessMode {
-    match map_str(extra, "mode") {
-        Some("r") => AccessMode::Read,
-        _ => AccessMode::Write,
-    }
+/// The `extra` field naming the principal a client wants to run as (`04 §8.4`; Bolt `BEGIN`, `RUN`
+/// and `ROUTE`). Graphus refuses it — see [`BoltSession::refuse_impersonation`] (`rmp` #909).
+const IMP_USER_FIELD: &str = "imp_user";
+
+/// The `extra` field carrying the client's transaction timeout **in milliseconds** (Bolt `BEGIN` and
+/// auto-commit `RUN`). See [`tx_timeout_from_extra`] (`rmp` #909).
+const TX_TIMEOUT_FIELD: &str = "tx_timeout";
+
+/// The client-controlled fields Graphus reads from a **transaction-initiating** `extra` map — the
+/// map carried by `BEGIN` and by `RUN` (`04 §8.1`; Neo4j's `AbstractTransactionInitiatingMessage`).
+///
+/// It exists so that reading the map is **one operation, validated once** (`rmp` #909). Previously
+/// each dispatch arm picked out `mode` and `db` with its own helper, and every other field the client
+/// sent — including `imp_user` and `tx_timeout`, both of which change what the client believes the
+/// server is doing — was silently discarded. Making [`parse_tx_extra`] the only constructor means a
+/// new dispatch arm cannot obtain `db`/`mode` without also submitting to the validation: forgetting a
+/// field is a compile-time impossibility rather than a silent security regression.
+struct TxExtra {
+    /// The `mode` field: `"r"` = read, anything else / absent = write (Bolt's default, `06 §4`).
+    mode: AccessMode,
+    /// The `db` field (Bolt 5.x database targeting). An absent or **empty** value means "the default
+    /// database" and is normalised to `None` (drivers send `""` or omit the field for the home
+    /// database), exactly as the reference decoder does
+    /// (`TransactionInitiatingMetadataParser.readDatabaseName`: "we permit both empty strings and
+    /// null values as a reference to the default … database, so we'll unify it at decoder level").
+    db: Option<String>,
+    /// The normalised `tx_timeout` (`rmp` #909): `None` when the client imposed no bound of its own.
+    timeout: Option<Duration>,
 }
 
-/// Reads the `db` field from a `RUN`/`BEGIN` extra map (Bolt 5.x database targeting). An absent or
-/// **empty** value means "the default database" and is normalised to `None` (drivers send `""` or
-/// omit the field for the home database).
+/// Why a client's `extra` map was refused before the message it belongs to ran (`rmp` #909).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExtraRejected {
+    /// The map carries `imp_user`: the client asked the server to act as a different principal.
+    Impersonation,
+    /// The map carries a `tx_timeout` that is not an integer.
+    MalformedTxTimeout,
+}
+
+/// Reads and validates a transaction-initiating `extra` map (`BEGIN` / `RUN`).
+///
+/// # Errors
+/// [`ExtraRejected`] when the map asks for something the server will not silently ignore.
+fn parse_tx_extra(extra: &[(String, Value)]) -> Result<TxExtra, ExtraRejected> {
+    if impersonation_requested(extra) {
+        return Err(ExtraRejected::Impersonation);
+    }
+    Ok(TxExtra {
+        mode: match map_str(extra, "mode") {
+            Some("r") => AccessMode::Read,
+            _ => AccessMode::Write,
+        },
+        db: db_from_extra(extra),
+        timeout: tx_timeout_from_extra(extra)?,
+    })
+}
+
+/// Reads and validates a `ROUTE` `extra` map, yielding the requested `db`.
+///
+/// `ROUTE`'s `extra` is a *routing-context* map, not a transaction-initiating one: the reference
+/// decoder (`RouteMessageDecoder`) reads exactly `db` and `imp_user` from it, and `tx_timeout` is not
+/// defined for `ROUTE`. So this validates the impersonation field only — refusing an undefined field
+/// the specification does not give `ROUTE` would be over-strict, not more conformant.
+///
+/// # Errors
+/// [`ExtraRejected::Impersonation`] when the map carries `imp_user`.
+fn parse_route_extra(extra: &[(String, Value)]) -> Result<Option<String>, ExtraRejected> {
+    if impersonation_requested(extra) {
+        return Err(ExtraRejected::Impersonation);
+    }
+    Ok(db_from_extra(extra))
+}
+
+/// Whether an `extra` map asks the server to run as another principal (`rmp` #909).
+///
+/// The test is **presence of a non-null value**, not "a non-empty string", and that is deliberate:
+///
+/// * It mirrors the reference server, which gates on `message.impersonatedUser() != null`
+///   (`CreateTransactionStateTransition`, `CreateAutocommitStatementStateTransition`,
+///   `SimpleImpersonationStateTransition`) after a decode that — unlike `db` — does **not** fold the
+///   empty string into "absent" (`TransactionInitiatingMetadataParser.readImpersonatedUser`).
+/// * It cannot be bypassed by type confusion. Were this a `map_str` lookup, `imp_user` sent as an
+///   integer, a list, or a map would read as absent and the request would run as the connection
+///   principal — reintroducing the very defect this closes. Any present, non-null value is treated
+///   as an impersonation request and refused.
+/// * A `Value::Null` is treated as absent, matching the reference decoder's
+///   `asNullableStringValue`, which yields `null` for a null value.
+///
+/// No official driver sends an empty `imp_user`: they guard the field on the impersonated user being
+/// set (the JavaScript driver's `buildTxMetadata`/`routeV4x4` emit `imp_user` only
+/// `if (impersonatedUser)`), so the strictness costs no interoperability.
+fn impersonation_requested(extra: &[(String, Value)]) -> bool {
+    extra
+        .iter()
+        .any(|(key, value)| key == IMP_USER_FIELD && !matches!(value, Value::Null))
+}
+
+/// Reads the `db` field from an `extra` map, normalising absent/empty to `None`.
 fn db_from_extra(extra: &[(String, Value)]) -> Option<String> {
     map_str(extra, "db")
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
+}
+
+/// Reads the client's `tx_timeout` (milliseconds) from an `extra` map (`rmp` #909).
+///
+/// Semantics, matching the reference server:
+///
+/// * **Absent or null** → `None`: no client-imposed bound.
+/// * **A strictly positive integer** → `Some(duration)`: the client's own ceiling. The server clamps
+///   it downward against its configured bounds; it can only shorten them, never extend them.
+/// * **Zero or negative** → `None`. Neo4j documents `Duration.ZERO` as "transaction does not have a
+///   timeout" (`TransactionTimeout`), and its expiry sweep gates on `timeoutNanos > 0`
+///   (`TransactionMonitor.checkExpiredTransaction`), so a non-positive value is simply "no
+///   client-imposed timeout" — never an error, and never a way to run unbounded, because the
+///   server's own bounds still apply unchanged. (The official drivers reject a negative timeout
+///   client-side, so only a hand-rolled client can send one.)
+/// * **Any other type** → refused. The reference decoder raises `Illegal value for field
+///   "tx_timeout": Expected long`; accepting it silently would be exactly the "the client believes it
+///   has a lever it does not have" defect this closes.
+///
+/// # Errors
+/// [`ExtraRejected::MalformedTxTimeout`] when the field is present with a non-integer, non-null value.
+fn tx_timeout_from_extra(extra: &[(String, Value)]) -> Result<Option<Duration>, ExtraRejected> {
+    let Some((_, value)) = extra.iter().find(|(k, _)| k == TX_TIMEOUT_FIELD) else {
+        return Ok(None);
+    };
+    match value {
+        Value::Null => Ok(None),
+        // `> 0` makes `unsigned_abs` exactly the value: an i64 millisecond count always fits a u64.
+        Value::Integer(ms) if *ms > 0 => Ok(Some(Duration::from_millis(ms.unsigned_abs()))),
+        Value::Integer(_) => Ok(None),
+        _ => Err(ExtraRejected::MalformedTxTimeout),
+    }
 }
 
 /// Builds the Bolt **5.0** authentication token from a `HELLO` `extra` map: every entry that is not

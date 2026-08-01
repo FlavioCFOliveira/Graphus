@@ -59,7 +59,12 @@ impl BoltExecutor for TrivialExecutor {
     ) -> Result<Self::Stream, GraphusError> {
         Ok(EmptyStream { fields: vec![] })
     }
-    fn begin(&mut self, _mode: AccessMode, _db: Option<&str>) -> Result<(), GraphusError> {
+    fn begin(
+        &mut self,
+        _mode: AccessMode,
+        _db: Option<&str>,
+        _timeout: Option<std::time::Duration>,
+    ) -> Result<(), GraphusError> {
         Ok(())
     }
     fn commit(&mut self) -> Result<QuerySummary, GraphusError> {

@@ -141,6 +141,46 @@ dialing. To use UDS you therefore speak Bolt directly over the socket. Two optio
 - **Errors.** A server-side problem arrives as a Bolt `FAILURE` carrying a Neo4j-style
   `code` and a human-readable `message`, after which the connection is `FAILED` until a
   `RESET`.
+- **Impersonation (`imp_user`) is refused, never ignored.** `BEGIN`, `RUN` and `ROUTE` may carry an
+  `imp_user` field naming the principal the client wants the server to act as. Graphus does **not**
+  implement impersonation, so it **refuses** any message that carries one, with
+  `FAILURE {code: "Neo.ClientError.Security.Forbidden"}`, and does not run the statement. It is
+  refused rather than ignored because `imp_user` *drops* privileges: a server that accepted the field
+  and ran as the connection's own principal would hand a middle-tier application (one pooled
+  connection as a service principal, impersonating its end user per request) the service principal's
+  full rights while the application believed it was scoped to one tenant.
+  The refusal is unconditional and identical for every value — the named principal is never looked
+  up, so the response reveals nothing about who exists. Any present, non-null value counts, including
+  the empty string, a non-string value, and the connection's own principal; only an explicit `null`
+  means "no impersonation requested". The connection enters `FAILED` and recovers with `RESET` like
+  any other statement failure. Applications needing per-request identity should open a connection per
+  principal, or authenticate the end user with `LOGON` (Bolt 5.1+ re-authentication).
+- **Transaction timeout (`tx_timeout`) is honoured, and clamped downward only.** `BEGIN` and an
+  auto-commit `RUN` may carry `tx_timeout`, a transaction budget **in milliseconds**. Graphus applies
+  it as follows:
+  - A **positive** value is honoured as an upper bound. On `BEGIN` it bounds the **whole**
+    transaction, not each statement: every statement in it is limited to what remains of the budget,
+    and a `COMMIT` arriving after the budget has run out is refused and the transaction rolled back —
+    so a timed-out transaction never leaves half-applied state. On an auto-commit `RUN`, where the
+    statement *is* the transaction, it bounds that statement.
+  - The clamp is **downward only**. The effective per-statement budget is the *smaller* of the
+    client's value and the server's configured `timing.statement_timeout_ms` (2 minutes by default);
+    a client asking for more than the server allows gets the server's bound. The server's
+    `timing.max_transaction_age_ms` sweep likewise still applies. A client can therefore always
+    self-limit, and never buy itself more time than the operator allows.
+  - **Zero or negative** means "the client sets no bound of its own", matching the reference server
+    (which documents a zero duration as "the transaction does not have a timeout" and skips expiry
+    for any non-positive value). The server's own bounds still apply, so this is not a way to run
+    unbounded. The official drivers reject a negative value client-side.
+  - A **non-integer** `tx_timeout` is refused with
+    `FAILURE {code: "Neo.ClientError.Request.Invalid"}` rather than silently dropped.
+  - When the budget expires, the failure carries
+    `Neo.ClientError.Transaction.TransactionTimedOutClientConfiguration` — the reference server's
+    title for a bound the *client* configured. It is a non-retryable `ClientError`, because replaying
+    a transaction that exhausted its own budget would simply exhaust it again. A statement cancelled
+    mid-execution by the deadline currently surfaces the generic cancellation failure
+    (`Neo.ClientError.Statement.ArgumentError`, message `query cancelled`) — the same non-retryable
+    classification, with a less specific title.
 - **Result summary.** After a query's records, the trailing `SUCCESS` carries the summary:
   `type` — the query type (`r` read, `w` write, `rw` read-write, `s` schema/admin) — and
   `stats`, the side-effect counters (`nodes-created`/`-deleted`, `relationships-created`/`-deleted`,

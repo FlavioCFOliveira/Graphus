@@ -288,6 +288,7 @@ impl Server {
                 TxControl::AutoCommit {
                     mode: BoltAccessMode::Write,
                     db: Some(DB.to_owned()),
+                    timeout: None,
                 },
             )
             .expect("TERMINATE TRANSACTIONS is an admin statement the seam executes");
@@ -316,6 +317,7 @@ impl Server {
                 "MATCH (n:Marker) RETURN count(n) AS c".to_owned(),
                 vec![],
                 true,
+                None,
                 None,
             )
             .expect("count read runs");
@@ -431,7 +433,7 @@ async fn bolt_and_rest_answer_a_terminated_commit_identically() {
 
     // ---- Bolt ----------------------------------------------------------------------------------
     let mut bolt = server.bolt();
-    bolt.begin(BoltAccessMode::Write, Some(DB))
+    bolt.begin(BoltAccessMode::Write, Some(DB), None)
         .expect("BEGIN opens an explicit Bolt transaction");
     {
         let mut stream = bolt
@@ -498,7 +500,8 @@ async fn bolt_and_rest_refuse_the_next_statement_identically() {
 
     // ---- Bolt ----------------------------------------------------------------------------------
     let mut bolt = server.bolt();
-    bolt.begin(BoltAccessMode::Write, Some(DB)).expect("BEGIN");
+    bolt.begin(BoltAccessMode::Write, Some(DB), None)
+        .expect("BEGIN");
     {
         let mut stream = bolt
             .run("RETURN 1", vec![], TxControl::InExplicit { db: None })
@@ -591,7 +594,8 @@ async fn bolt_and_rest_both_still_roll_a_terminated_transaction_back() {
 
     // ---- Bolt ----------------------------------------------------------------------------------
     let mut bolt = server.bolt();
-    bolt.begin(BoltAccessMode::Write, Some(DB)).expect("BEGIN");
+    bolt.begin(BoltAccessMode::Write, Some(DB), None)
+        .expect("BEGIN");
     {
         let mut stream = bolt
             .run(
@@ -647,6 +651,7 @@ fn seed_people(handle: &EngineHandle, n: usize) {
             "UNWIND range(1, $n) AS i CREATE (:P {email: 'user' + toString(i)})".to_owned(),
             vec![("n".to_owned(), graphus_core::Value::Integer(n as i64))],
             true,
+            None,
             None,
         )
         .expect("seed runs");
@@ -718,6 +723,7 @@ async fn a_terminated_constraint_ddl_is_honoured_identically_over_both_seams() {
             TxControl::AutoCommit {
                 mode: BoltAccessMode::Write,
                 db: Some(DB.to_owned()),
+                timeout: None,
             },
         );
         match outcome {
@@ -782,6 +788,7 @@ async fn a_terminated_constraint_ddl_is_honoured_identically_over_both_seams() {
                 "MATCH (p:P) SET p.email2 = p.email".to_owned(),
                 vec![],
                 true,
+                None,
                 None,
             )
             .expect("backfill runs");

@@ -444,6 +444,100 @@ driver's usage. Exceeding it answers the offending `RUN` with `Neo.ClientError.R
 `FAILED` — a *client* error, because retrying would hit the same limit and it must not look
 retryable to a driver — and the refused statement is never started.
 
+### 3.6 Transaction-initiating `extra` fields: `imp_user` and `tx_timeout` (`rmp` #909)
+
+`BEGIN`, `RUN` and `ROUTE` carry an `extra` map that is *entirely client-controlled*. Graphus read
+`mode` and `db` from it and discarded the rest. Two of the discarded fields change what the client
+believes the server is doing, so silently dropping them is a conformance defect with a security
+consequence, not a missing nicety.
+
+**Ratified rule: a transaction-initiating `extra` field is either honoured or refused. It is never
+accepted and ignored.** Reading the map is therefore a single validated parse (`parse_tx_extra` /
+`parse_route_extra` in `graphus-bolt`'s `server.rs`), and the `mode`/`db` accessors are only reachable
+through it — so a future dispatch arm cannot obtain `db` while dropping a field that matters.
+
+#### 3.6.1 `imp_user` — refused
+
+Graphus does not implement impersonation. Any `BEGIN`/`RUN`/`ROUTE` whose `extra` carries a
+**present, non-null** `imp_user` is answered with `FAILURE`
+`Neo.ClientError.Security.Forbidden` → `FAILED` (RESET-recoverable), and the statement is not run.
+
+* **Why refuse rather than ignore.** `imp_user` *drops* privileges. Running as the connection
+  principal instead is a failure to downgrade: the middle-tier multi-tenant pattern (one pooled
+  connection as a service principal, impersonating the end user per request) would execute every
+  tenant's request with the service principal's full rights, and the application would have no signal.
+* **Why this code.** The reference server answers a rejected impersonation in the
+  authentication/authorization class (`SimpleImpersonationStateTransition` wraps the realm's
+  `AuthenticationException` into `AuthenticationStateTransitionException`, carrying its security
+  status). `Neo.ClientError.Security.Forbidden` is documented by Neo4j as "An attempt was made to
+  perform an unauthorized action". **Deliberate deviation:** Neo4j *Community* happens to raise
+  `Neo.ClientError.Statement.ArgumentError` (`BasicSystemGraphRealm.impersonate` throws
+  `InvalidArgumentException.unsupportedInCommunity`); that title is indistinguishable from "your
+  query's arguments are wrong", and a client must be able to tell "impersonation refused" from a
+  malformed statement. `Neo.ClientError.Security.Unauthorized` was also rejected: it means "your
+  credentials were not accepted" and would make a driver invalidate a valid auth token.
+* **Driver behaviour** (verified against the official `neo4j-driver` 6.2.0 sources): a
+  non-retryable `ClientError`; not listed by the static/basic auth-token managers, so no
+  credential-refresh loop; and the pooled connection provider closes the connection carrying it,
+  which matches the reference server terminating a connection whose impersonation fails
+  (`AuthenticationStateTransitionException implements ConnectionTerminating`).
+* **Boundary cases, all ratified as refusals:** the empty string (the reference decoder does *not*
+  fold `""` into "absent" the way it does for `db`); a non-string value (otherwise `imp_user: 1`
+  would read as absent and be a bypass straight back to running as the connection principal); and
+  the connection's **own** principal (the reference gates on `!= null` with no self-check, and a rule
+  whose outcome depended on matching the session principal would make behaviour a function of a
+  client-supplied name for no benefit). Only an explicit `null` means "absent".
+* **No principal-existence oracle.** The refusal is unconditional and identical for every value: the
+  named principal is never looked up, never compared, never echoed, so the response carries no
+  signal about who exists (preserving `rmp` #812's constant-work property).
+* **Connection state.** `FAILED`, not `DEFUNCT`. The Bolt server-state tables give `FAILED` as the
+  failure target for `BEGIN`/`RUN` in `READY`; termination is reserved for the pre-authentication
+  states (`rmp` #820). The guard sits *after* the state match, so an out-of-order message is still
+  reported as an illegal transition and a pre-authentication failure stays terminal.
+* **Not delivered here:** real impersonation (resolving the impersonated principal's
+  `EffectivePrivileges` for the transaction, gated on an impersonation privilege). It is a separate,
+  larger change; until it lands the refusal is the only correct behaviour.
+
+#### 3.6.2 `tx_timeout` — honoured, clamped downward only
+
+`tx_timeout` is a transaction budget in **milliseconds**.
+
+| value | effect |
+|---|---|
+| absent / `null` | no client-imposed bound (unchanged behaviour) |
+| `> 0` | honoured as an upper bound, clamped against the server's |
+| `<= 0` | no client-imposed bound |
+| non-integer | `FAILURE` `Neo.ClientError.Request.Invalid` → `FAILED` |
+
+* **Scope.** On `BEGIN` it bounds the **transaction**: an absolute deadline is fixed at `BEGIN`, every
+  statement inside is limited to what *remains*, and a `COMMIT` arriving after it is refused with the
+  transaction rolled back (no half-applied state). A per-statement reading would let a client hold a
+  transaction open indefinitely by running one cheap statement after another — exactly the
+  GC-watermark pin `timing.max_transaction_age_ms` exists to prevent. On an auto-commit `RUN` the
+  statement is the transaction, so it bounds the statement.
+* **The clamp is downward only.** The effective per-statement budget is
+  `min(timing.statement_timeout_ms, tx_timeout)`, computed at the single authoritative point
+  (`exec::effective_statement_timeout`), and `timing.max_transaction_age_ms` still applies. A client
+  can always self-limit and can never raise its own ceiling — otherwise `tx_timeout` would be a
+  one-field escape from the CPU-exhaustion defence of `rmp` #476. This matches the contract the
+  official drivers document for Neo4j 4.2–5.2 ("values higher than the server's configured timeout
+  are ignored"); Graphus applies it at every version.
+* **Non-positive values.** Neo4j documents `Duration.ZERO` as "the transaction does not have a
+  timeout" (`TransactionTimeout`) and its expiry sweep gates on `timeoutNanos > 0`
+  (`TransactionMonitor.checkExpiredTransaction`), so a non-positive value is neither an error nor a
+  licence to run unbounded: it means the client set no bound, leaving the server's bounds in charge.
+* **Expiry status code.** `Neo.ClientError.Transaction.TransactionTimedOutClientConfiguration` — the
+  reference server's title for a bound the *client* configured (`KernelImpl` selects between it and
+  `TransactionTimedOut` by who supplied the value). It is a **non-retryable** `ClientError`, as in the
+  reference: replaying a transaction that exhausted its own budget would exhaust it again, and a
+  `TransientError` would make the drivers' managed-transaction retry burn its budget on it.
+* **Overflow.** The deadline is built with `Instant::checked_add`, never `+`: `Instant + Duration`
+  panics on overflow and the addend is client-chosen (`tx_timeout: i64::MAX` normalises to a
+  ~292-million-year duration, whose representability depends on the platform's `Instant`). An
+  unrepresentable deadline degrades to "no client bound", which raises no ceiling.
+* **Interfaces.** `tx_timeout` is a Bolt `extra` field; REST carries no per-request statement budget
+  and is unchanged.
+
 ---
 
 ## 4. REST transactional API — read/write access mode

@@ -463,6 +463,9 @@ async fn count_all_nodes(engine: &EngineHandle) -> Result<i64, GraphusError> {
             Vec::new(),
             true,
             None,
+            // No caller-supplied statement budget (`rmp` #909): the operator's configured
+            // per-statement timeout governs this internal count, as it did before.
+            None,
         )
         .await?;
     let mut count = 0i64;

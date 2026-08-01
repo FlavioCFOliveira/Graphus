@@ -782,7 +782,7 @@ mod tests {
             .await
             .expect("begin read");
         let mut reply = handle
-            .run(ticket, stmt.to_owned(), vec![], true, None)
+            .run(ticket, stmt.to_owned(), vec![], true, None, None)
             .await
             .expect("run");
         let mut v = 0;
@@ -825,6 +825,7 @@ mod tests {
                 vec![],
                 false,
                 None,
+                None,
             )
             .await
             .expect("trdr read");
@@ -838,12 +839,13 @@ mod tests {
                 vec![],
                 false,
                 None,
+                None,
             )
             .await
             .expect("r reads LINK predicate");
         while reply.rows.next().expect("drain").is_some() {}
         let mut reply = handle
-            .run(r, "CREATE (:Marker)".to_owned(), vec![], false, None)
+            .run(r, "CREATE (:Marker)".to_owned(), vec![], false, None, None)
             .await
             .expect("r writes Marker predicate");
         while reply.rows.next().expect("drain").is_some() {}

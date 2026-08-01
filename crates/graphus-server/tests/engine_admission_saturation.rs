@@ -91,7 +91,7 @@ fn teardown(engine: Engine, handle: EngineHandle) {
 fn scalar(handle: &EngineHandle, stmt: &str) -> Option<i64> {
     let ticket = handle.begin_auto_commit_blocking(AccessMode::Read).ok()?;
     let mut reply = handle
-        .run_blocking(ticket, stmt.to_owned(), vec![], true, None)
+        .run_blocking(ticket, stmt.to_owned(), vec![], true, None, None)
         .ok()?;
     let mut v = None;
     while let Ok(Some(cells)) = reply.rows.next() {
@@ -108,7 +108,8 @@ fn drain_read(handle: &EngineHandle, stmt: &str) -> bool {
     let Ok(ticket) = handle.begin_auto_commit_blocking(AccessMode::Read) else {
         return false;
     };
-    let Ok(mut reply) = handle.run_blocking(ticket, stmt.to_owned(), vec![], true, None) else {
+    let Ok(mut reply) = handle.run_blocking(ticket, stmt.to_owned(), vec![], true, None, None)
+    else {
         return false;
     };
     loop {
@@ -140,6 +141,7 @@ fn commit_one_edge(handle: &EngineHandle, leaf: i64) -> bool {
         "MATCH (h:Hub {id: 0}) CREATE (h)-[:LINK]->(:Leaf {id: $l})".to_owned(),
         vec![("l".to_owned(), Value::Integer(leaf))],
         false,
+        None,
         None,
     ) {
         Ok(mut reply) => {
@@ -180,6 +182,7 @@ fn rollback_one_edge(handle: &EngineHandle, leaf: i64) -> bool {
             vec![("l".to_owned(), Value::Integer(leaf))],
             false,
             None,
+            None,
         )
         .map(|mut reply| while let Ok(Some(_)) = reply.rows.next() {})
         .is_ok();
@@ -198,6 +201,7 @@ fn create_hub(handle: &EngineHandle) {
             "CREATE (:Hub {id: 0})".to_owned(),
             vec![],
             true,
+            None,
             None,
         )
         .expect("create hub");
@@ -615,6 +619,7 @@ fn begin_commit_abort_with_reads_churn_no_deadlock_no_leak() {
                                     "MATCH (l:Leaf) RETURN count(l)".to_owned(),
                                     vec![],
                                     false,
+                                    None,
                                     None,
                                 ) {
                                     while let Ok(Some(_)) = reply.rows.next() {}

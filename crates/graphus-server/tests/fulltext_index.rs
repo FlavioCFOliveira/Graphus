@@ -104,7 +104,7 @@ async fn run(handle: &EngineHandle, query: &str) -> Vec<Vec<MaterializedValue>> 
         .await
         .expect("begin auto-commit");
     let reply = handle
-        .run(ticket, query.to_owned(), Vec::new(), true, None)
+        .run(ticket, query.to_owned(), Vec::new(), true, None, None)
         .await
         .expect("run");
     tokio::task::spawn_blocking(move || {
@@ -349,6 +349,7 @@ async fn drop_index_then_query_errors() {
             Vec::new(),
             true,
             None,
+            None,
         )
         .await;
     // The error may surface at run() or while draining; either way the query must not succeed-empty.
@@ -552,6 +553,7 @@ async fn relationship_fulltext_query_over_a_real_server() {
                 .to_owned(),
             Vec::new(),
             true,
+            None,
             None,
         )
         .await;

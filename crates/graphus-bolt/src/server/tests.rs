@@ -1173,8 +1173,409 @@ fn db_field_from_extras_reaches_the_executor() {
         "empty RUN db is the default database: {log:?}"
     );
     assert!(
-        log.contains(&"begin(Write, db=Some(\"sales\"))".to_owned()),
+        log.contains(&"begin(Write, db=Some(\"sales\"), timeout=None)".to_owned()),
         "BEGIN db reaches the executor: {log:?}"
+    );
+}
+
+// ---- rmp #909: `imp_user` is refused, `tx_timeout` is honoured ------------------------------------
+
+/// The Neo4j status code Graphus answers an impersonation request with. Spelled out literally here
+/// (rather than importing the constant) so a change to the wire contract has to be made twice, on
+/// purpose: an application may switch on this exact string.
+const IMPERSONATION_REFUSED_CODE: &str = "Neo.ClientError.Security.Forbidden";
+
+/// An `extra` map asking to run as `who`.
+fn imp_user_extra(who: &str) -> Vec<(String, Value)> {
+    vec![(IMP_USER_FIELD.to_owned(), Value::String(who.to_owned()))]
+}
+
+/// The single `FAILURE` in `responses`, or a panic naming what was found instead.
+fn only_failure(responses: &[Response]) -> &Failure {
+    let failures: Vec<&Failure> = responses
+        .iter()
+        .filter_map(|r| match r {
+            Response::Failure(f) => Some(f),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(failures.len(), 1, "exactly one FAILURE: {responses:?}");
+    failures[0]
+}
+
+#[test]
+fn begin_with_imp_user_is_refused_and_opens_no_transaction() {
+    // The defect this closes: `imp_user` was parsed by nobody, so a BEGIN asking to act as another
+    // principal opened a transaction running as the CONNECTION's principal and told the client
+    // nothing. `imp_user` DROPS privileges, so silently ignoring it hands a middle-tier application
+    // the service principal's full rights while it believes it is scoped to one tenant.
+    let exec = MockExecutor::new().with_default(CannedResult::rows(&[], vec![]));
+    let requests = vec![
+        hello(),
+        logon_alice(),
+        Request::Begin {
+            extra: imp_user_extra("tenant-42"),
+        },
+        Request::Goodbye,
+    ];
+    let (responses, log) = drive_with_log(exec, &requests);
+    let failure = only_failure(&responses);
+    assert_eq!(failure.code, IMPERSONATION_REFUSED_CODE);
+    assert!(
+        failure.message.contains(IMP_USER_FIELD),
+        "the message names the refused field: {failure:?}"
+    );
+    // The load-bearing half: no transaction was ever started. A refusal that still opened the
+    // transaction would leave the client's next statement running as the connection principal.
+    assert!(
+        !log.iter().any(|l| l.starts_with("begin(")),
+        "no transaction is opened for a refused BEGIN: {log:?}"
+    );
+}
+
+#[test]
+fn autocommit_run_with_imp_user_is_refused_and_the_statement_never_runs() {
+    let exec = MockExecutor::new().with_default(CannedResult::rows(&[], vec![]));
+    let requests = vec![
+        hello(),
+        logon_alice(),
+        Request::Run {
+            query: "MATCH (n) RETURN n".to_owned(),
+            parameters: vec![],
+            extra: imp_user_extra("tenant-42"),
+        },
+        Request::Goodbye,
+    ];
+    let (responses, log) = drive_with_log(exec, &requests);
+    assert_eq!(only_failure(&responses).code, IMPERSONATION_REFUSED_CODE);
+    assert!(
+        !responses
+            .iter()
+            .any(|r| matches!(r, Response::Record { .. })),
+        "no rows are produced for a refused RUN: {responses:?}"
+    );
+    assert!(
+        !log.iter().any(|l| l.starts_with("run(")),
+        "the statement is never executed: {log:?}"
+    );
+}
+
+#[test]
+fn in_transaction_run_with_imp_user_is_refused_on_both_streaming_and_ready() {
+    // `imp_user` is legal on every `RUN`, so the guard must sit on EVERY arm that accepts one — the
+    // TX_READY arm and the TX_STREAMING arm (`rmp` #907) alike. A guard on only one of them would
+    // leave a bypass reachable by running a second statement while a first is still streaming.
+    let exec = MockExecutor::new()
+        .on_query(
+            "MATCH (n) RETURN n",
+            CannedResult::rows(
+                &["n"],
+                vec![vec![Value::Integer(1)], vec![Value::Integer(2)]],
+            ),
+        )
+        .with_default(CannedResult::rows(&[], vec![]));
+    let requests = vec![
+        hello(),
+        logon_alice(),
+        Request::Begin { extra: vec![] },
+        // (a) TX_READY: a first RUN carrying `imp_user`.
+        Request::Run {
+            query: "SHOULD NOT RUN (tx_ready)".to_owned(),
+            parameters: vec![],
+            extra: imp_user_extra("tenant-42"),
+        },
+        Request::Reset,
+        // (b) TX_STREAMING: open a stream with a bounded PULL, then RUN carrying `imp_user`.
+        Request::Begin { extra: vec![] },
+        Request::Run {
+            query: "MATCH (n) RETURN n".to_owned(),
+            parameters: vec![],
+            extra: vec![],
+        },
+        Request::Pull { n: 1, qid: None },
+        Request::Run {
+            query: "SHOULD NOT RUN (tx_streaming)".to_owned(),
+            parameters: vec![],
+            extra: imp_user_extra("tenant-42"),
+        },
+        Request::Goodbye,
+    ];
+    let (responses, log) = drive_with_log(exec, &requests);
+    let failures: Vec<&Failure> = responses
+        .iter()
+        .filter_map(|r| match r {
+            Response::Failure(f) => Some(f),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(failures.len(), 2, "one refusal per arm: {responses:?}");
+    for f in &failures {
+        assert_eq!(f.code, IMPERSONATION_REFUSED_CODE, "{f:?}");
+    }
+    assert!(
+        !log.iter().any(|l| l.contains("SHOULD NOT RUN")),
+        "neither statement is executed: {log:?}"
+    );
+    // Non-vacuity control: the TX_STREAMING case genuinely reached TX_STREAMING — the bounded PULL
+    // returned a row and left the stream open (`has_more`), which is the state the second arm guards.
+    assert!(
+        responses
+            .iter()
+            .any(|r| matches!(r, Response::Record { .. })),
+        "the first statement really did stream: {responses:?}"
+    );
+    assert!(
+        responses.iter().any(|r| matches!(
+            r,
+            Response::Success { metadata } if metadata.iter().any(|(k, v)| k == "has_more" && *v == Value::Boolean(true))
+        )),
+        "the stream was still open when the second RUN arrived: {responses:?}"
+    );
+}
+
+#[test]
+fn route_with_imp_user_is_refused_and_returns_no_routing_table() {
+    // ROUTE carries `imp_user` too: the reference server routes it through the same impersonation
+    // transition as BEGIN/RUN (`RouteStateTransition extends SimpleImpersonationStateTransition`).
+    // A routing table resolved for the connection principal is a silent answer to a question the
+    // client did not ask.
+    let exec = MockExecutor::new().with_default(CannedResult::rows(&[], vec![]));
+    let requests = vec![
+        hello(),
+        logon_alice(),
+        Request::Route {
+            routing: vec![],
+            bookmarks: vec![],
+            extra: imp_user_extra("tenant-42"),
+        },
+        Request::Goodbye,
+    ];
+    let responses = drive(exec, &requests);
+    assert_eq!(only_failure(&responses).code, IMPERSONATION_REFUSED_CODE);
+    assert!(
+        !responses.iter().any(|r| matches!(
+            r,
+            Response::Success { metadata } if metadata.iter().any(|(k, _)| k == "rt")
+        )),
+        "no routing table is handed back: {responses:?}"
+    );
+}
+
+#[test]
+fn every_imp_user_shape_is_refused_and_null_alone_means_absent() {
+    // The boundary cases, each decided against the reference server:
+    //
+    // * the connection's OWN principal — still an impersonation (`if (impersonatedUser != null)` has
+    //   no self-check), and a rule that compared the value against the session principal would make
+    //   the answer depend on a client-supplied name for no benefit;
+    // * the EMPTY string — `readImpersonatedUser` does not fold "" into absent the way
+    //   `readDatabaseName` does, and no official driver sends it (`if (impersonatedUser)`);
+    // * a NON-STRING value — must not read as absent, or `imp_user: 1` would be a bypass straight
+    //   back to running as the connection principal;
+    // * an explicit NULL — the one shape that IS absent (`asNullableStringValue` yields null).
+    for value in [
+        Value::String("alice".to_owned()), // the connection's own principal
+        Value::String(String::new()),      // empty
+        Value::Integer(1),                 // type confusion
+        Value::List(vec![Value::String("alice".to_owned())]),
+        Value::Map(vec![("user".to_owned(), Value::String("alice".to_owned()))]),
+        Value::Boolean(true),
+    ] {
+        let exec = MockExecutor::new().with_default(CannedResult::rows(&[], vec![]));
+        let requests = vec![
+            hello(),
+            logon_alice(),
+            Request::Run {
+                query: "SHOULD NOT RUN".to_owned(),
+                parameters: vec![],
+                extra: vec![(IMP_USER_FIELD.to_owned(), value.clone())],
+            },
+            Request::Goodbye,
+        ];
+        let (responses, log) = drive_with_log(exec, &requests);
+        assert_eq!(
+            only_failure(&responses).code,
+            IMPERSONATION_REFUSED_CODE,
+            "imp_user {value:?} must be refused"
+        );
+        assert!(
+            !log.iter().any(|l| l.starts_with("run(")),
+            "imp_user {value:?} must not run the statement"
+        );
+    }
+
+    // NULL is the sole shape that means "no impersonation requested" — the statement runs normally.
+    let exec = MockExecutor::new().with_default(CannedResult::rows(&[], vec![]));
+    let requests = vec![
+        hello(),
+        logon_alice(),
+        Request::Run {
+            query: "RETURN 1".to_owned(),
+            parameters: vec![],
+            extra: vec![(IMP_USER_FIELD.to_owned(), Value::Null)],
+        },
+        Request::Pull { n: ALL, qid: None },
+        Request::Goodbye,
+    ];
+    let (responses, log) = drive_with_log(exec, &requests);
+    assert!(
+        !responses.iter().any(|r| matches!(r, Response::Failure(_))),
+        "a null imp_user is absent, not a request: {responses:?}"
+    );
+    assert!(
+        log.iter().any(|l| l.contains("RETURN 1")),
+        "the statement runs: {log:?}"
+    );
+}
+
+#[test]
+fn an_impersonation_refusal_is_recoverable_with_reset() {
+    // The refusal is a post-authentication FAILURE, so it enters the RESET-recoverable FAILED state
+    // (the Bolt server-state tables give FAILED as the failure target for BEGIN/RUN in READY;
+    // terminating is reserved for the pre-authentication states — `rmp` #820). The connection must
+    // therefore be usable again after a RESET.
+    let exec = MockExecutor::new().with_default(CannedResult::rows(&[], vec![]));
+    let requests = vec![
+        hello(),
+        logon_alice(),
+        Request::Run {
+            query: "SHOULD NOT RUN".to_owned(),
+            parameters: vec![],
+            extra: imp_user_extra("tenant-42"),
+        },
+        Request::Reset,
+        Request::Run {
+            query: "RETURN 1".to_owned(),
+            parameters: vec![],
+            extra: vec![],
+        },
+        Request::Pull { n: ALL, qid: None },
+        Request::Goodbye,
+    ];
+    let (responses, log) = drive_with_log(exec, &requests);
+    assert_eq!(only_failure(&responses).code, IMPERSONATION_REFUSED_CODE);
+    assert!(
+        log.iter().any(|l| l.contains("RETURN 1")),
+        "the connection works again after RESET: {log:?}"
+    );
+    assert!(
+        !log.iter().any(|l| l.contains("SHOULD NOT RUN")),
+        "the refused statement never ran: {log:?}"
+    );
+}
+
+#[test]
+fn tx_timeout_reaches_the_executor_on_begin_and_on_an_autocommit_run() {
+    // `tx_timeout` had ZERO hits repo-wide: a client self-limiting to 1 s silently got the server's
+    // whole per-statement budget. It must arrive at the executor, which clamps it downward.
+    let exec = MockExecutor::new().with_default(CannedResult::rows(&[], vec![]));
+    let requests = vec![
+        hello(),
+        logon_alice(),
+        Request::Run {
+            query: "RETURN 1".to_owned(),
+            parameters: vec![],
+            extra: vec![(TX_TIMEOUT_FIELD.to_owned(), Value::Integer(1_500))],
+        },
+        Request::Pull { n: ALL, qid: None },
+        Request::Begin {
+            extra: vec![(TX_TIMEOUT_FIELD.to_owned(), Value::Integer(2_000))],
+        },
+        Request::Rollback,
+        Request::Goodbye,
+    ];
+    let (_, log) = drive_with_log(exec, &requests);
+    assert!(
+        log.iter()
+            .any(|l| l.contains("RETURN 1") && l.contains("timeout: Some(1.5s)")),
+        "the RUN's tx_timeout reaches the executor: {log:?}"
+    );
+    assert!(
+        log.contains(&"begin(Write, db=None, timeout=Some(2s))".to_owned()),
+        "the BEGIN's tx_timeout reaches the executor: {log:?}"
+    );
+}
+
+#[test]
+fn a_non_positive_tx_timeout_is_no_client_bound_and_a_malformed_one_is_refused() {
+    // Zero and negative are NOT errors and NOT "unbounded": Neo4j documents `Duration.ZERO` as "the
+    // transaction does not have a timeout" and its sweep gates on `timeoutNanos > 0`, so both mean
+    // "the client set no bound of its own" — leaving the SERVER's bound in sole charge, which is the
+    // only reading that cannot be used to raise a ceiling.
+    for value in [Value::Integer(0), Value::Integer(-1), Value::Null] {
+        let exec = MockExecutor::new().with_default(CannedResult::rows(&[], vec![]));
+        let requests = vec![
+            hello(),
+            logon_alice(),
+            Request::Begin {
+                extra: vec![(TX_TIMEOUT_FIELD.to_owned(), value.clone())],
+            },
+            Request::Rollback,
+            Request::Goodbye,
+        ];
+        let (_, log) = drive_with_log(exec, &requests);
+        assert!(
+            log.contains(&"begin(Write, db=None, timeout=None)".to_owned()),
+            "tx_timeout {value:?} imposes no client bound: {log:?}"
+        );
+    }
+
+    // A non-integer is refused, exactly as the reference decoder refuses it ("Illegal value for field
+    // \"tx_timeout\": Expected long"). Accepting it silently is the defect, in miniature.
+    let exec = MockExecutor::new().with_default(CannedResult::rows(&[], vec![]));
+    let requests = vec![
+        hello(),
+        logon_alice(),
+        Request::Begin {
+            extra: vec![(
+                TX_TIMEOUT_FIELD.to_owned(),
+                Value::String("1000".to_owned()),
+            )],
+        },
+        Request::Goodbye,
+    ];
+    let (responses, log) = drive_with_log(exec, &requests);
+    let failure = only_failure(&responses);
+    assert_eq!(failure.code, "Neo.ClientError.Request.Invalid");
+    assert!(
+        failure.message.contains(TX_TIMEOUT_FIELD),
+        "the message names the offending field: {failure:?}"
+    );
+    assert!(
+        !log.iter().any(|l| l.starts_with("begin(")),
+        "no transaction is opened for a malformed tx_timeout: {log:?}"
+    );
+}
+
+#[test]
+fn tx_timeout_parsing_is_exact() {
+    // Direct unit coverage of the normalisation table, independent of the session loop.
+    let ms = |v: i64| vec![(TX_TIMEOUT_FIELD.to_owned(), Value::Integer(v))];
+    assert_eq!(tx_timeout_from_extra(&[]), Ok(None), "absent");
+    assert_eq!(
+        tx_timeout_from_extra(&ms(1)),
+        Ok(Some(Duration::from_millis(1))),
+        "the smallest honoured value"
+    );
+    assert_eq!(
+        tx_timeout_from_extra(&ms(60_000)),
+        Ok(Some(Duration::from_secs(60)))
+    );
+    assert_eq!(tx_timeout_from_extra(&ms(0)), Ok(None), "zero = no bound");
+    assert_eq!(
+        tx_timeout_from_extra(&ms(i64::MIN)),
+        Ok(None),
+        "no panic on the extreme negative (an `abs` would overflow here)"
+    );
+    assert_eq!(
+        tx_timeout_from_extra(&ms(i64::MAX)),
+        Ok(Some(Duration::from_millis(i64::MAX.unsigned_abs()))),
+        "no truncation at the extreme positive"
+    );
+    assert_eq!(
+        tx_timeout_from_extra(&[(TX_TIMEOUT_FIELD.to_owned(), Value::Float(1.5))]),
+        Err(ExtraRejected::MalformedTxTimeout),
+        "a float is not a millisecond count"
     );
 }
 

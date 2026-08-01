@@ -95,7 +95,7 @@ fn run_drain(
     stmt: &str,
     _auto: bool,
 ) -> (bool, Vec<Vec<Value>>) {
-    match handle.run_blocking(ticket, stmt.to_owned(), vec![], true, None) {
+    match handle.run_blocking(ticket, stmt.to_owned(), vec![], true, None, None) {
         Ok(mut reply) => {
             let mut rows = Vec::new();
             loop {

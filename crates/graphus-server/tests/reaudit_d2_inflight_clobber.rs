@@ -114,6 +114,7 @@ fn seed(handle: &EngineHandle) {
             vec![],
             true,
             None,
+            None,
         )
         .expect("seed runs");
     while let Ok(Some(_)) = reply.rows.next() {}
@@ -136,7 +137,8 @@ fn start_explicit_wide_read(
             ticket,
             "MATCH (n:N) RETURN n.id AS id".to_owned(),
             vec![],
-            false, // explicit txn ⇒ inline ⇒ can suspend on a full egress
+            false,
+            None,
             None,
         )
         .expect("the RUN reply arrives before the first row (sent up front)");

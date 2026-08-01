@@ -175,6 +175,31 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     /// Dispatches one command inline against the coordinator, returning whether the engine is still
     /// live (`false` after a [`EngineCommand::Shutdown`] consumed the coordinator).
     fn dispatch(&mut self, cmd: EngineCommand) -> bool {
+        // Strip any caller-supplied per-statement budget (`rmp` #909) before dispatching. Honouring it
+        // would compute `Instant::now() + timeout` on the executor's wall clock, which is exactly the
+        // non-determinism the `statement_timeout = None` argument below exists to keep out of the VOPR
+        // replay. Re-asserted here (not only at [`Self::run`]) so no other command source — a seam
+        // driven by a simulated Bolt session, say — can smuggle a wall-clock deadline into a replay.
+        let cmd = match cmd {
+            EngineCommand::Run {
+                ticket,
+                query,
+                params,
+                auto_commit,
+                privileges,
+                timeout: _,
+                reply,
+            } => EngineCommand::Run {
+                ticket,
+                query,
+                params,
+                auto_commit,
+                privileges,
+                timeout: None,
+                reply,
+            },
+            other => other,
+        };
         // The inline DST driver uses an UNBOUNDED egress channel (`LOCAL_RESULT_BUFFER`), so
         // `try_send` never reports `Full` and the resumable-cursor path (`rmp` task #372) never
         // suspends — `handle_run` always returns `Done`/`OffThreadReader`. A never-populated slot
@@ -319,6 +344,10 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             params,
             auto_commit,
             privileges: privileges.map(Box::new),
+            // No caller-supplied statement budget (`rmp` #909): like the configured statement timeout
+            // below, a wall-clock deadline would read `Instant::now()` and leak non-determinism into
+            // the VOPR replay. `dispatch` re-asserts this for every command it processes.
+            timeout: None,
             reply,
         });
         rx.recv().map_err(|_| gone())?

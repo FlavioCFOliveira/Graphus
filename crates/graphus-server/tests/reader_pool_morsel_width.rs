@@ -171,7 +171,7 @@ fn run_auto(
         .expect("begin auto-commit");
     let params = vec![("id".to_owned(), Value::Integer(id))];
     let mut rows = Vec::new();
-    match handle.run_blocking(ticket, stmt.to_owned(), params, true, None) {
+    match handle.run_blocking(ticket, stmt.to_owned(), params, true, None, None) {
         Ok(mut reply) => loop {
             match reply.rows.next() {
                 Ok(Some(cells)) => rows.push(cells),
@@ -196,7 +196,7 @@ fn run_explicit(
         .expect("begin explicit");
     let params = vec![("id".to_owned(), Value::Integer(id))];
     let mut rows = Vec::new();
-    match handle.run_blocking(ticket, stmt.to_owned(), params, false, None) {
+    match handle.run_blocking(ticket, stmt.to_owned(), params, false, None, None) {
         Ok(mut reply) => loop {
             match reply.rows.next() {
                 Ok(Some(cells)) => rows.push(cells),
@@ -430,7 +430,7 @@ fn run_write(handle: &EngineHandle, stmt: &str) -> bool {
     let Ok(ticket) = handle.begin_auto_commit_blocking(AccessMode::Write) else {
         return false;
     };
-    match handle.run_blocking(ticket, stmt.to_owned(), vec![], true, None) {
+    match handle.run_blocking(ticket, stmt.to_owned(), vec![], true, None, None) {
         Ok(mut reply) => loop {
             match reply.rows.next() {
                 Ok(Some(_)) => {}

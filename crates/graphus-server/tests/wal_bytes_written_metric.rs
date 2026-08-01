@@ -197,7 +197,7 @@ fn write(handle: &EngineHandle, stmt: &str) {
         .begin_auto_commit_blocking(AccessMode::Write)
         .expect("begin auto-commit");
     let mut reply = handle
-        .run_blocking(ticket, stmt.to_owned(), vec![], true, None)
+        .run_blocking(ticket, stmt.to_owned(), vec![], true, None, None)
         .unwrap_or_else(|e| panic!("run {stmt:?}: {e:?}"));
     while reply.rows.next().expect("drain rows").is_some() {}
 }
@@ -344,7 +344,8 @@ fn wal_bytes_written_captures_the_shutdown_drain_of_an_open_transaction() {
                     "CREATE (:Doomed {{id: {i}, pad: 'yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy'}})"
                 ),
                 vec![],
-                false, // explicit transaction: do NOT auto-commit — it must stay open for the drain
+                false,
+                None,
                 None,
             )
             .expect("run inside explicit txn");

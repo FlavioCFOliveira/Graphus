@@ -113,6 +113,7 @@ fn seed_people(handle: &EngineHandle, n: usize) {
             vec![("n".to_owned(), graphus_core::Value::Integer(n as i64))],
             true,
             None,
+            None,
         )
         .expect("seed runs");
     let mut rows = reply.rows;
@@ -321,6 +322,7 @@ fn terminating_a_running_constraint_ddl_leaves_no_half_applied_schema() {
             "MATCH (p:P) RETURN count(p) AS c".to_owned(),
             vec![],
             true,
+            None,
             None,
         )
         .expect("the engine still serves after a terminated DDL");

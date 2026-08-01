@@ -84,7 +84,12 @@ impl BoltExecutor for BigExecutor {
             n: self.rows,
         })
     }
-    fn begin(&mut self, _mode: AccessMode, _db: Option<&str>) -> Result<(), GraphusError> {
+    fn begin(
+        &mut self,
+        _mode: AccessMode,
+        _db: Option<&str>,
+        _timeout: Option<std::time::Duration>,
+    ) -> Result<(), GraphusError> {
         Ok(())
     }
     fn commit(&mut self) -> Result<QuerySummary, GraphusError> {

@@ -58,7 +58,7 @@ fn run(handle: &EngineHandle, stmt: &str) -> (bool, Option<i64>) {
     else {
         return (false, None);
     };
-    match handle.run_blocking(ticket, stmt.to_owned(), vec![], true, None) {
+    match handle.run_blocking(ticket, stmt.to_owned(), vec![], true, None, None) {
         Ok(mut reply) => {
             let mut first = None;
             loop {

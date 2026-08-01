@@ -2450,6 +2450,7 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             params,
             auto_commit,
             privileges,
+            timeout,
             reply,
         } => {
             // `rmp` task #386: isolate per-statement execution behind a panic boundary so a panic in
@@ -2480,6 +2481,7 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
                 degraded,
                 clock,
                 statement_timeout,
+                timeout,
                 commit_batch,
                 reply,
             );
@@ -2738,6 +2740,10 @@ fn run_statement_isolated<
     degraded: &EngineDegraded,
     clock: &Arc<dyn graphus_core::capability::Clock + Send + Sync>,
     statement_timeout: Option<std::time::Duration>,
+    // The caller's own budget for THIS statement (`rmp` #909) — the Bolt `tx_timeout` a client set on
+    // its `BEGIN` / auto-commit `RUN`, already normalised. It can only tighten `statement_timeout`
+    // (`exec::handle_run` takes the smaller of the two), never relax it.
+    client_timeout: Option<std::time::Duration>,
     // Group commit (`rmp` #566): a durable auto-commit WRITE that finishes within its visit PREPAREs +
     // defers its ack into this batch (a clone of its egress sender held open until the batch harden),
     // instead of the pre-#566 inline `fdatasync` per statement — so concurrent auto-commit writers
@@ -2775,6 +2781,7 @@ fn run_statement_isolated<
             degraded,
             clock,
             statement_timeout,
+            client_timeout,
             commit_batch,
             reply,
         )

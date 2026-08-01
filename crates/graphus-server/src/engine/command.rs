@@ -660,6 +660,17 @@ pub enum EngineCommand {
         /// command channel (it is `None` on the common unrestricted path; one heap allocation per
         /// restricted statement is negligible against compiling and executing the query).
         privileges: Option<Box<EffectivePrivileges>>,
+        /// A **caller-supplied upper bound** on this statement's execution time (`rmp` #909), or
+        /// `None` when the caller imposes none.
+        ///
+        /// It exists so a *client* can shorten its own budget — the Bolt `tx_timeout` field of
+        /// `BEGIN` / auto-commit `RUN`. The engine combines it with its configured
+        /// [`statement_timeout`](crate::config::TimingConfig::statement_timeout_ms) by taking the
+        /// **smaller** of the two, so this can only ever tighten the deadline, never relax it: a
+        /// client cannot raise its own ceiling above what the operator configured. `None` leaves the
+        /// configured timeout in sole charge, which is the behaviour of every caller that does not
+        /// carry a client budget (REST, the admin surface, the internal/test paths).
+        timeout: Option<std::time::Duration>,
         /// Reply channel: the result stream, or a compile/runtime/transaction error.
         reply: Reply<Result<RunReply, GraphusError>>,
     },

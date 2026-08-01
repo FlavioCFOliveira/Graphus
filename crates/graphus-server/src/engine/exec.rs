@@ -284,6 +284,42 @@ fn register_builtin_extensions(reg: &mut ExtensionRegistry) {
     }
 }
 
+/// Combines the operator's configured per-statement timeout with a caller-supplied one, **clamping
+/// downward only** (`rmp` #909).
+///
+/// `configured` is [`crate::config::TimingConfig::statement_timeout`] (`None` = the operator disabled
+/// the per-statement budget). `client` is the budget the caller asked for — on Bolt, the normalised
+/// `tx_timeout` of `BEGIN` / an auto-commit `RUN` (`None` = the client asked for no bound of its own).
+///
+/// The result is the **smaller** of whichever are present:
+///
+/// | configured | client | effective | meaning |
+/// |---|---|---|---|
+/// | `None` | `None` | `None` | unbounded, as before |
+/// | `Some(s)` | `None` | `Some(s)` | the operator's bound, as before |
+/// | `None` | `Some(c)` | `Some(c)` | the client self-limits where the operator set no bound |
+/// | `Some(s)` | `Some(c)` | `Some(min(s, c))` | the client may tighten, never relax |
+///
+/// The last row is the security-relevant one: a client asking for **more** time than the operator
+/// allows gets the operator's bound, so `tx_timeout` can never be used to escape the CPU-exhaustion
+/// defence (`rmp` #476) it rides on. This mirrors the Neo4j 4.2–5.2 contract the official drivers
+/// document for the same field ("values higher than the server's configured transaction timeout are
+/// ignored and fall back to the default"); Graphus applies the rule at every version rather than
+/// letting a client raise its ceiling.
+///
+/// A client asking for *no* bound (`tx_timeout: 0`, which Neo4j documents as "transaction does not
+/// have a timeout") reaches here as `None`, so it likewise cannot lift the operator's bound.
+pub(super) fn effective_statement_timeout(
+    configured: Option<Duration>,
+    client: Option<Duration>,
+) -> Option<Duration> {
+    match (configured, client) {
+        (Some(configured), Some(client)) => Some(configured.min(client)),
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (None, None) => None,
+    }
+}
+
 /// Handles a [`super::EngineCommand::Run`]: resolves the transaction, compiles + binds the query,
 /// then streams its rows.
 ///
@@ -321,6 +357,11 @@ pub(super) fn handle_run<
     degraded: &super::EngineDegraded,
     clock: &Arc<dyn Clock + Send + Sync>,
     statement_timeout: Option<Duration>,
+    // The caller's own budget for THIS statement (`rmp` #909): the Bolt `tx_timeout` a client set on its
+    // `BEGIN` / auto-commit `RUN`, already normalised and — for a statement inside an explicit
+    // transaction — already reduced to the transaction's *remaining* budget by the connection seam.
+    // Combined with `statement_timeout` by [`effective_statement_timeout`], which takes the smaller.
+    client_timeout: Option<Duration>,
     // Group commit (`rmp` #566): when this statement finishes within its visit as a durable auto-commit
     // WRITE, [`finalize_inflight`] PREPAREs it and defers its ack into this batch (a clone of its egress
     // sender held open until the batch harden), instead of an inline `fdatasync` per statement — so
@@ -336,7 +377,17 @@ pub(super) fn handle_run<
     // leaves the executor wall-clock-free — byte-identical to before. Carried into both the inline cursor
     // and the off-thread reader's `ReadTask`, and it survives suspend/resume (the token lives on the
     // cursor), so the same budget governs every batch of the statement.
-    let deadline: Option<Instant> = statement_timeout.map(|d| Instant::now() + d);
+    //
+    // `rmp` #909: the budget is the *smaller* of the operator's configured timeout and the client's own
+    // (`tx_timeout`) — see [`effective_statement_timeout`].
+    //
+    // `checked_add`, never `+`: `Instant + Duration` PANICS on overflow, and the client half of that sum
+    // is attacker-chosen (a `tx_timeout` of `i64::MAX` milliseconds is ~292 million years, and whether
+    // that overflows depends on the platform's `Instant` representation). An absurd budget degrades to
+    // "no deadline", which is safe — it is exactly the operator's own `statement_timeout_ms = 0`
+    // behaviour, so no ceiling is raised — instead of a panic on the engine thread.
+    let deadline: Option<Instant> = effective_statement_timeout(statement_timeout, client_timeout)
+        .and_then(|d| Instant::now().checked_add(d));
 
     // Resolve the open transaction.
     let Some(tx) = open.get(&ticket.0) else {
@@ -1966,5 +2017,52 @@ mod tests {
         assert_eq!(query_type_code(QueryType::Read), "r");
         assert_eq!(query_type_code(QueryType::Write), "w");
         assert_eq!(query_type_code(QueryType::ReadWrite), "rw");
+    }
+
+    // ---- rmp #909: the client's `tx_timeout` clamps DOWNWARD only ------------------------------
+
+    #[test]
+    fn a_client_budget_can_only_shorten_the_configured_one() {
+        let s = Duration::from_secs(120); // the shipped `statement_timeout_ms` default
+        let short = Duration::from_secs(1);
+        let long = Duration::from_secs(3_600);
+
+        // Neither side set a bound: unbounded, exactly as before the field existed.
+        assert_eq!(effective_statement_timeout(None, None), None);
+        // Only the operator: their bound, untouched.
+        assert_eq!(effective_statement_timeout(Some(s), None), Some(s));
+        // Only the client (the operator disabled the per-statement budget): the client self-limits.
+        assert_eq!(effective_statement_timeout(None, Some(short)), Some(short));
+
+        // THE CONTRACT. Below the server bound the client's figure is honoured...
+        assert_eq!(
+            effective_statement_timeout(Some(s), Some(short)),
+            Some(short)
+        );
+        // ...and above it the SERVER's bound wins. This is the security-relevant direction: were it
+        // the other way round, `tx_timeout` would be a one-field escape from the CPU-exhaustion
+        // defence the per-statement deadline exists to provide (`rmp` #476).
+        assert_eq!(effective_statement_timeout(Some(s), Some(long)), Some(s));
+        // Equal values are a no-op either way.
+        assert_eq!(effective_statement_timeout(Some(s), Some(s)), Some(s));
+    }
+
+    #[test]
+    fn an_absurd_client_budget_degrades_instead_of_panicking() {
+        // A hand-rolled client can put `i64::MAX` in `tx_timeout`; the server normalises that to a
+        // ~292-million-year `Duration`. `Instant + Duration` PANICS on overflow, and whether this
+        // particular sum overflows depends on the platform's `Instant` representation — so the
+        // deadline is built with `checked_add` and an unrepresentable one simply means "no deadline".
+        let absurd = Duration::from_millis(i64::MAX.unsigned_abs());
+        // The clamp still prefers the operator's bound, which is the only outcome that matters here.
+        assert_eq!(
+            effective_statement_timeout(Some(Duration::from_secs(120)), Some(absurd)),
+            Some(Duration::from_secs(120)),
+            "an absurd client budget is clamped to the operator's, so it never reaches the addition"
+        );
+        // And if the operator disabled their own budget, the addition is still panic-free.
+        let effective =
+            effective_statement_timeout(None, Some(absurd)).expect("client-only budget");
+        let _: Option<Instant> = Instant::now().checked_add(effective);
     }
 }

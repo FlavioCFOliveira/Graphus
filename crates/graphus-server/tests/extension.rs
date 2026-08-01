@@ -100,7 +100,7 @@ async fn run(handle: &EngineHandle, query: &str) -> Vec<Vec<MaterializedValue>> 
         .await
         .expect("begin auto-commit");
     let reply = handle
-        .run(ticket, query.to_owned(), Vec::new(), true, None)
+        .run(ticket, query.to_owned(), Vec::new(), true, None, None)
         .await
         .expect("run");
     tokio::task::spawn_blocking(move || {

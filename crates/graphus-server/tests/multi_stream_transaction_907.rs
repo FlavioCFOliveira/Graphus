@@ -129,6 +129,7 @@ fn seed(handle: &EngineHandle) {
             vec![],
             true,
             None,
+            None,
         )
         .expect("seed run");
     while reply.rows.next().expect("seed rows").is_some() {}
@@ -153,6 +154,7 @@ fn markers(handle: &EngineHandle, k: i64) -> i64 {
             "MATCH (m:Marker) WHERE m.k = $k RETURN count(m) AS c".to_owned(),
             vec![("k".to_owned(), Value::Integer(k))],
             true,
+            None,
             None,
         )
         .expect("marker read");
@@ -191,6 +193,7 @@ fn two_statements_are_in_flight_on_one_ticket_and_commit_keeps_both_their_effect
                 vec![],
                 false,
                 None,
+                None,
             )
             .expect("RUN A");
         let first = a.rows.next().expect("A rows").expect("A has rows");
@@ -199,7 +202,14 @@ fn two_statements_are_in_flight_on_one_ticket_and_commit_keeps_both_their_effect
         // B: a second statement on the SAME ticket while A is parked. This is the call that proves
         // the premise; before the multi-stream work nothing in the Bolt layer could ever issue it.
         let mut b = handle
-            .run_blocking(ticket, "RETURN 1 AS one".to_owned(), vec![], false, None)
+            .run_blocking(
+                ticket,
+                "RETURN 1 AS one".to_owned(),
+                vec![],
+                false,
+                None,
+                None,
+            )
             .expect("RUN B on the same ticket while A is parked");
         let b_row = b.rows.next().expect("B rows").expect("B has a row");
         assert_eq!(int_of(&b_row, "B row"), 1, "B must yield ITS own record");
@@ -212,6 +222,7 @@ fn two_statements_are_in_flight_on_one_ticket_and_commit_keeps_both_their_effect
                 "CREATE (:Marker {k: 1})".to_owned(),
                 vec![],
                 false,
+                None,
                 None,
             )
             .expect("RUN C on the same ticket while A is parked");
@@ -261,6 +272,7 @@ fn rollback_with_two_statements_in_flight_discards_every_effect() {
                 vec![],
                 false,
                 None,
+                None,
             )
             .expect("RUN A");
         assert!(a.rows.next().expect("A rows").is_some());
@@ -271,6 +283,7 @@ fn rollback_with_two_statements_in_flight_discards_every_effect() {
                 "CREATE (:Marker {k: 2})".to_owned(),
                 vec![],
                 false,
+                None,
                 None,
             )
             .expect("RUN C while A is parked");
@@ -319,7 +332,6 @@ fn a_terminal_error_on_a_full_egress_channel_does_not_stall_the_engine_thread() 
         let stalled = handle
             .run_blocking(
                 ticket,
-                // `EGRESS` good rows (i = 1..=EGRESS), then a division by zero at i = EGRESS + 1.
                 format!(
                     "UNWIND range(1, {}) AS i RETURN 1 / (i - {}) AS x",
                     EGRESS + 1,
@@ -327,6 +339,7 @@ fn a_terminal_error_on_a_full_egress_channel_does_not_stall_the_engine_thread() 
                 ),
                 vec![],
                 false,
+                None,
                 None,
             )
             .expect("RUN the stalled statement");
@@ -340,7 +353,14 @@ fn a_terminal_error_on_a_full_egress_channel_does_not_stall_the_engine_thread() 
         // instead: if the engine thread is blocked inside the terminal `send`, this never returns and
         // the watchdog fires.
         let mut other = handle
-            .run_blocking(ticket, "RETURN 7 AS seven".to_owned(), vec![], false, None)
+            .run_blocking(
+                ticket,
+                "RETURN 7 AS seven".to_owned(),
+                vec![],
+                false,
+                None,
+                None,
+            )
             .expect("the engine must still serve other statements");
         let row = other
             .rows

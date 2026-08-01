@@ -117,7 +117,7 @@ async fn try_run(
         .await
         .expect("begin auto-commit");
     let reply = match handle
-        .run(ticket, query.to_owned(), Vec::new(), true, None)
+        .run(ticket, query.to_owned(), Vec::new(), true, None, None)
         .await
     {
         Ok(reply) => reply,

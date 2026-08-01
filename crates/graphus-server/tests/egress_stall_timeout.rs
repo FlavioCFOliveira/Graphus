@@ -98,6 +98,7 @@ fn seed_nodes(handle: &EngineHandle, n: usize) {
             vec![],
             true,
             None,
+            None,
         )
         .expect("seed run");
     while let Ok(Some(_)) = reply.rows.next() {}
@@ -110,7 +111,7 @@ fn run_auto(handle: &EngineHandle, stmt: &str) -> Result<(), ()> {
         .begin_auto_commit_blocking(AccessMode::Read)
         .map_err(|_| ())?;
     let mut reply = handle
-        .run_blocking(ticket, stmt.to_owned(), vec![], true, None)
+        .run_blocking(ticket, stmt.to_owned(), vec![], true, None, None)
         .map_err(|_| ())?;
     loop {
         match reply.rows.next() {
@@ -173,6 +174,7 @@ fn egress_stall_ceiling_releases_a_stalled_offthread_reader_with_timeout_disable
             "MATCH (n:N) RETURN n".to_owned(),
             vec![],
             true,
+            None,
             None,
         )
         .expect("off-thread read dispatched");
@@ -244,6 +246,7 @@ fn egress_stall_ceiling_does_not_abort_a_slow_but_progressing_consumer() {
             "MATCH (n:N) RETURN n".to_owned(),
             vec![],
             true,
+            None,
             None,
         )
         .expect("off-thread read dispatched");

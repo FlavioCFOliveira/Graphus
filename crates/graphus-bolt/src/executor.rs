@@ -26,6 +26,8 @@
 //! client, honouring the client's `PULL n` fetch size (`-1` = all). The stream reports completion
 //! and the result summary so the server can emit the trailing `SUCCESS` (`06 §3.1`).
 
+use std::time::Duration;
+
 use graphus_core::{GraphusError, Value};
 
 use crate::packstream::BoltValue;
@@ -152,6 +154,13 @@ pub enum TxControl {
         /// The target database from the `RUN` extra's `db` field (`None` = absent/empty = the
         /// executor's default database).
         db: Option<String>,
+        /// The client's transaction timeout from the `RUN` extra's `tx_timeout` field (`rmp` #909),
+        /// already normalised by the server: `None` means the client set no bound of its own.
+        ///
+        /// An auto-commit statement *is* its transaction, so this bounds the statement. It may only
+        /// **shorten** the executor's own per-statement budget, never extend it — see
+        /// [`BoltExecutor::begin`] for the full contract.
+        timeout: Option<Duration>,
     },
     /// Run inside the currently-open explicit transaction (opened by a prior `BEGIN`).
     InExplicit {
@@ -194,10 +203,22 @@ pub trait BoltExecutor {
     /// field; `None` = absent/empty = the executor's default database). The transaction stays
     /// pinned to that database for its whole lifetime (Bolt 5.x semantics).
     ///
+    /// `timeout` is the client's `tx_timeout` (`rmp` #909), already normalised by the server:
+    /// `Some(d)` asks that this transaction — not merely one statement in it — be abandoned once it
+    /// has run for `d`; `None` means the client set no bound of its own. The contract is
+    /// **clamp-downward-only**: an implementation may use `timeout` to *shorten* the budget it would
+    /// otherwise apply, and MUST NOT let it lengthen any server-configured bound. A client can
+    /// therefore self-limit, but can never buy itself more time than the operator allows.
+    ///
     /// # Errors
     /// [`GraphusError::Transaction`] if a transaction is already open or cannot be started, or
     /// [`GraphusError::Protocol`] if `db` names no servable database.
-    fn begin(&mut self, mode: AccessMode, db: Option<&str>) -> Result<(), GraphusError>;
+    fn begin(
+        &mut self,
+        mode: AccessMode,
+        db: Option<&str>,
+        timeout: Option<Duration>,
+    ) -> Result<(), GraphusError>;
 
     /// Commits the open explicit transaction (a `COMMIT`).
     ///
@@ -262,7 +283,9 @@ pub trait BoltExecutor {
 pub(crate) mod mock {
     //! A scriptable in-memory [`BoltExecutor`] for the state-machine tests.
 
-    use super::{AccessMode, BoltExecutor, QuerySummary, Record, RecordStream, TxControl};
+    use super::{
+        AccessMode, BoltExecutor, Duration, QuerySummary, Record, RecordStream, TxControl,
+    };
     use crate::packstream::BoltValue;
     use graphus_core::{GraphusError, Value};
     use std::collections::HashMap;
@@ -401,8 +424,14 @@ pub(crate) mod mock {
             })
         }
 
-        fn begin(&mut self, mode: AccessMode, db: Option<&str>) -> Result<(), GraphusError> {
-            self.log.push(format!("begin({mode:?}, db={db:?})"));
+        fn begin(
+            &mut self,
+            mode: AccessMode,
+            db: Option<&str>,
+            timeout: Option<Duration>,
+        ) -> Result<(), GraphusError> {
+            self.log
+                .push(format!("begin({mode:?}, db={db:?}, timeout={timeout:?})"));
             if self.tx_open {
                 return Err(GraphusError::Transaction(
                     "transaction already open".to_owned(),
@@ -495,6 +524,7 @@ mod tests {
                 TxControl::AutoCommit {
                     mode: AccessMode::Read,
                     db: None,
+                    timeout: None,
                 },
             )
             .unwrap();
@@ -511,10 +541,10 @@ mod tests {
     fn mock_tracks_transaction_lifecycle() {
         let mut exec = MockExecutor::new();
         assert!(!exec.tx_open);
-        exec.begin(AccessMode::Write, None).unwrap();
+        exec.begin(AccessMode::Write, None, None).unwrap();
         assert!(exec.tx_open);
         // A second begin without commit is an error.
-        assert!(exec.begin(AccessMode::Write, None).is_err());
+        assert!(exec.begin(AccessMode::Write, None, None).is_err());
         exec.commit().unwrap();
         assert!(!exec.tx_open);
         assert!(exec.rollback().is_err()); // nothing open
@@ -531,6 +561,7 @@ mod tests {
                 TxControl::AutoCommit {
                     mode: AccessMode::Write,
                     db: None,
+                    timeout: None,
                 },
             )
             .unwrap_err();

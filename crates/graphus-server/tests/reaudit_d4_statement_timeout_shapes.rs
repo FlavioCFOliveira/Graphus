@@ -80,7 +80,7 @@ fn engine_with_timeout(timeout: Option<Duration>) -> Engine {
 fn run_auto(handle: &EngineHandle, mode: AccessMode, stmt: &str) -> Result<(), ()> {
     let ticket = handle.begin_auto_commit_blocking(mode).map_err(|_| ())?;
     let mut reply = handle
-        .run_blocking(ticket, stmt.to_owned(), vec![], true, None)
+        .run_blocking(ticket, stmt.to_owned(), vec![], true, None, None)
         .map_err(|_| ())?;
     loop {
         match reply.rows.next() {
@@ -95,7 +95,7 @@ fn run_auto(handle: &EngineHandle, mode: AccessMode, stmt: &str) -> Result<(), (
 /// (never dispatched off-thread). Rolls the transaction back afterward regardless.
 fn run_explicit_read(handle: &EngineHandle, stmt: &str) -> Result<(), ()> {
     let ticket = handle.begin_blocking(AccessMode::Read).map_err(|_| ())?;
-    let outcome = match handle.run_blocking(ticket, stmt.to_owned(), vec![], false, None) {
+    let outcome = match handle.run_blocking(ticket, stmt.to_owned(), vec![], false, None, None) {
         Ok(mut reply) => loop {
             match reply.rows.next() {
                 Ok(Some(_)) => {}

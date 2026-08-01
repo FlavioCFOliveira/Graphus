@@ -159,7 +159,18 @@ impl BoltExecutor for LocalBoltExecutor {
         Ok(LocalRecordStream { reply })
     }
 
-    fn begin(&mut self, mode: BoltAccessMode, _db: Option<&str>) -> Result<(), GraphusError> {
+    fn begin(
+        &mut self,
+        mode: BoltAccessMode,
+        _db: Option<&str>,
+        // The client's `tx_timeout` (`rmp` #909) is accepted and recorded by the server before it
+        // reaches here, but the DETERMINISTIC engine deliberately runs statements with no wall-clock
+        // deadline (see `LocalEngine::dispatch`): honouring it would read `Instant::now()` and leak
+        // non-determinism into the VOPR replay. The simulator therefore proves the *protocol* half of
+        // the contract (parse, validate, refuse, carry) and leaves the firing half to the real
+        // threaded engine, which is where a wall clock belongs.
+        _timeout: Option<std::time::Duration>,
+    ) -> Result<(), GraphusError> {
         let ticket = self.engine.borrow_mut().begin(map_mode(mode))?;
         self.explicit = Some(ticket);
         Ok(())
@@ -1562,5 +1573,115 @@ mod tests {
             )
         };
         assert_eq!(run(), run(), "same seed ⇒ identical faulted REST outcome");
+    }
+
+    // ---- rmp #909: `imp_user` is refused end-to-end over the simulated wire -----------------------
+
+    /// **A Bolt `imp_user` is refused, and the impersonated statement never touches the database**
+    /// (`rmp` task #909), driven deterministically through the REAL `BoltSession` and the REAL engine
+    /// over the simulated network.
+    ///
+    /// `imp_user` asks the server to run as a *different, less privileged* principal. Ignoring it — the
+    /// behaviour before #909 — silently runs the statement as the connection's own principal, so the
+    /// standard middle-tier pattern (one pooled connection as a service principal, each request
+    /// impersonating its end user) executes every tenant's request with the service principal's full
+    /// rights while the application believes it is scoped to one tenant.
+    ///
+    /// This is the simulator's half of the contract: that the refusal holds **end to end**, over real
+    /// framing and a real session loop, and — the property a unit test on a mock executor cannot
+    /// establish — that the refused write left **nothing in the database**. The other half, the
+    /// per-message state-machine detail (which code, which states, every `imp_user` shape), is asserted
+    /// in `graphus-bolt`'s own session tests.
+    #[test]
+    fn bolt_imp_user_is_refused_and_the_impersonated_write_never_lands() {
+        let eng = engine();
+
+        // CONTROL: the identical write with NO `imp_user` commits and is readable. Without it, a gate
+        // asserting "no node exists" would pass on a server that simply never wrote anything.
+        let mut reqs = login_prologue();
+        reqs.extend([
+            Request::Run {
+                query: "CREATE (:Probe {id: 1})".to_owned(),
+                parameters: vec![],
+                extra: vec![],
+            },
+            Request::Pull { n: -1, qid: None },
+            Request::Goodbye,
+        ]);
+        let auth = sim_auth();
+        let control = run_scripted_bolt_session(eng.clone(), 909, &auth, &reqs)
+            .expect("control session runs");
+        assert!(
+            !control
+                .iter()
+                .any(|r| matches!(r, Response::Failure { .. })),
+            "CONTROL: an unimpersonated write succeeds: {control:?}"
+        );
+        assert_eq!(
+            count_probe_nodes(eng.clone()),
+            1,
+            "CONTROL: the unimpersonated write landed"
+        );
+
+        // THE GATE: the same write, now asking to run as another principal.
+        let mut reqs = login_prologue();
+        reqs.extend([
+            Request::Run {
+                query: "CREATE (:Probe {id: 2})".to_owned(),
+                parameters: vec![],
+                extra: vec![("imp_user".to_owned(), Value::String("tenant-42".to_owned()))],
+            },
+            Request::Pull { n: -1, qid: None },
+            Request::Goodbye,
+        ]);
+        let responses =
+            run_scripted_bolt_session(eng.clone(), 909, &auth, &reqs).expect("session runs");
+
+        let failures: Vec<_> = responses
+            .iter()
+            .filter_map(|r| match r {
+                Response::Failure(f) => Some(f),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !failures.is_empty(),
+            "an impersonation request must be refused, not silently ignored: {responses:?}"
+        );
+        assert_eq!(
+            failures[0].code, "Neo.ClientError.Security.Forbidden",
+            "the client must be able to tell `impersonation refused` from a malformed statement: \
+             {responses:?}"
+        );
+
+        // The load-bearing assertion: the impersonated write never reached the database. Still exactly
+        // the one node the control committed.
+        assert_eq!(
+            count_probe_nodes(eng),
+            1,
+            "the impersonated statement must NOT have run as the connection principal"
+        );
+    }
+
+    /// The refusal is deterministic: the same seed reproduces the same exchange, byte for byte.
+    #[test]
+    fn bolt_imp_user_refusal_is_deterministic() {
+        let run = || {
+            let eng = engine();
+            let mut reqs = login_prologue();
+            reqs.extend([
+                Request::Run {
+                    query: "CREATE (:Probe {id: 7})".to_owned(),
+                    parameters: vec![],
+                    extra: vec![("imp_user".to_owned(), Value::String("tenant-42".to_owned()))],
+                },
+                Request::Goodbye,
+            ]);
+            let auth = sim_auth();
+            let responses =
+                run_scripted_bolt_session(eng.clone(), 4242, &auth, &reqs).expect("session runs");
+            (format!("{responses:?}"), count_probe_nodes(eng))
+        };
+        assert_eq!(run(), run(), "same seed => identical refused exchange");
     }
 }

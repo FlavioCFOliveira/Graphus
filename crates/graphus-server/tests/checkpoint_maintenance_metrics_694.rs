@@ -71,7 +71,7 @@ fn write(handle: &EngineHandle, stmt: &str) {
         .begin_auto_commit_blocking(AccessMode::Write)
         .expect("begin auto-commit write");
     let mut reply = handle
-        .run_blocking(ticket, stmt.to_owned(), vec![], true, None)
+        .run_blocking(ticket, stmt.to_owned(), vec![], true, None, None)
         .unwrap_or_else(|e| panic!("run {stmt:?}: {e:?}"));
     while reply.rows.next().expect("drain rows").is_some() {}
 }
@@ -178,6 +178,7 @@ fn operator_checkpoint_increments_the_maintenance_counters() {
             "MATCH (c:Churn) RETURN count(c) AS c".to_owned(),
             vec![],
             true,
+            None,
             None,
         )
         .expect("count after reclaim");

@@ -37,7 +37,9 @@ use graphus_bolt::executor::{
     AccessMode as BoltAccessMode, BoltExecutor, QuerySummary, Record, RecordStream, TxControl,
 };
 use graphus_bolt::packstream::BoltValue;
-use graphus_core::{GraphusError, Value};
+use std::time::{Duration, Instant};
+
+use graphus_core::{GraphusError, Value, wire_status_code_message};
 
 use crate::admin::{AdminContext, AdminParse, AdminResult};
 use crate::audit::{
@@ -82,6 +84,18 @@ struct OpenTx {
     /// `TERMINATE TRANSACTIONS` flag. Dropping it (on COMMIT/ROLLBACK/disconnect) deregisters the
     /// transaction, so it can never leak into the registry.
     txn: crate::txn_registry::TxnGuard,
+    /// The instant this transaction's **client-requested** budget expires (`rmp` #909), fixed at
+    /// `BEGIN` from the `tx_timeout` field, or `None` when the client asked for no bound of its own.
+    ///
+    /// It is deliberately an absolute [`Instant`], not a duration: Bolt's `tx_timeout` bounds *the
+    /// transaction*, not each statement in it, so a client that sets 5 s and then runs ten statements
+    /// gets 5 s in total — the budget every statement is measured against shrinks as the transaction
+    /// proceeds. [`BoltEngineExecutor::remaining_tx_budget`] turns it back into the per-statement
+    /// value handed to the engine.
+    ///
+    /// This never *extends* anything: the operator's per-statement timeout and the engine's
+    /// max-transaction-age sweep apply unchanged on top of it.
+    deadline: Option<Instant>,
 }
 
 impl BoltEngineExecutor {
@@ -132,6 +146,29 @@ impl BoltEngineExecutor {
         )
     }
 
+    /// This statement's share of the open transaction's client-requested budget (`rmp` #909).
+    ///
+    /// * No open transaction, or the client set no `tx_timeout` on its `BEGIN` → `Ok(None)`: the
+    ///   operator's configured per-statement timeout is the only bound, exactly as before.
+    /// * The budget is still running → `Ok(Some(remaining))`, so the statement inherits **what is left
+    ///   of the transaction**, not a fresh copy of the client's figure. This is what makes the value a
+    ///   transaction-wide bound rather than a per-statement one.
+    /// * The budget is already spent → `Err`. The statement is refused before it starts rather than
+    ///   given a zero-length deadline (which the executor would only notice at its next safe point).
+    ///
+    /// # Errors
+    /// [`GraphusError::Transaction`] when the transaction's own timeout has already elapsed.
+    fn remaining_tx_budget(&self) -> Result<Option<Duration>, GraphusError> {
+        let Some(deadline) = self.current_tx.as_ref().and_then(|tx| tx.deadline) else {
+            return Ok(None);
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(tx_timeout_elapsed());
+        }
+        Ok(Some(remaining))
+    }
+
     /// Admits and runs one statement on `handle` inside `ticket` against database `db`, wrapping the
     /// engine reply as the Bolt stream. Admission is taken on the **target database's** handle (per-db
     /// limits).
@@ -139,6 +176,12 @@ impl BoltEngineExecutor {
     /// `db` is the canonical session database the statement runs against; it scopes the principal's
     /// fine-grained privileges (rmp #93), resolved once here from the shared live security catalog and
     /// threaded into the engine so the executor enforces label/relationship/property access uniformly.
+    ///
+    /// `timeout` is the client's own budget for this statement (`rmp` #909) — its `tx_timeout`, or what
+    /// remains of it inside an explicit transaction ([`Self::remaining_tx_budget`]). The engine takes
+    /// the **smaller** of it and the operator's configured per-statement timeout
+    /// (`exec::effective_statement_timeout`), so it can only tighten the deadline, never relax it.
+    #[allow(clippy::too_many_arguments)] // one statement's whole execution context, threaded through
     fn run_on(
         &self,
         handle: &EngineHandle,
@@ -147,6 +190,7 @@ impl BoltEngineExecutor {
         query: &str,
         parameters: Vec<(String, Value)>,
         auto_commit: bool,
+        timeout: Option<Duration>,
     ) -> Result<BoltEngineStream, GraphusError> {
         // Admission control: fast-reject when saturated (`04 §9.3`). The permit is held by the
         // returned stream for the whole result.
@@ -167,6 +211,7 @@ impl BoltEngineExecutor {
             parameters,
             auto_commit,
             privileges,
+            timeout,
         )?;
         Ok(BoltEngineStream {
             fields: reply.fields,
@@ -304,6 +349,21 @@ impl BoltExecutor for BoltEngineExecutor {
         parameters: Vec<(String, Value)>,
         tx: TxControl,
     ) -> Result<Self::Stream, GraphusError> {
+        // This statement's client-requested budget (`rmp` #909), resolved once and threaded into every
+        // path below (including the admin `SHOW …` re-runs) so no route silently drops it:
+        //
+        // * auto-commit — the statement *is* the transaction, so the `RUN`'s own `tx_timeout` applies;
+        // * inside an explicit transaction — what is LEFT of the budget the `BEGIN` set, so the client's
+        //   figure bounds the transaction as a whole rather than being refreshed by each statement. A
+        //   budget that has already run out fails the statement here, before any work is admitted.
+        //
+        // The engine clamps whatever arrives against the operator's configured per-statement timeout
+        // (`exec::effective_statement_timeout`), so this can only ever shorten the deadline.
+        let client_timeout = match &tx {
+            TxControl::AutoCommit { timeout, .. } => *timeout,
+            TxControl::InExplicit { .. } => self.remaining_tx_budget()?,
+        };
+
         // Administrative statements are intercepted BEFORE Cypher compilation (rmp #84/#91): the
         // grammar is strict, so regular Cypher always falls through to the engine untouched.
         match crate::admin::parse_admin_statement(query) {
@@ -395,7 +455,13 @@ impl BoltExecutor for BoltEngineExecutor {
                             // Re-run as a normal auto-commit READ on the target database's engine.
                             let ticket = handle.begin_auto_commit_blocking(AccessMode::Read)?;
                             self.run_on(
-                                &handle, ticket, &name, &query, params, /* auto_commit */ true,
+                                &handle,
+                                ticket,
+                                &name,
+                                &query,
+                                params,
+                                /* auto_commit */ true,
+                                client_timeout,
                             )
                         },
                         BoltEngineStream::admin,
@@ -483,7 +549,13 @@ impl BoltExecutor for BoltEngineExecutor {
                             // Re-run as a normal auto-commit READ on the target database's engine.
                             let ticket = handle.begin_auto_commit_blocking(AccessMode::Read)?;
                             self.run_on(
-                                &handle, ticket, &name, &query, params, /* auto_commit */ true,
+                                &handle,
+                                ticket,
+                                &name,
+                                &query,
+                                params,
+                                /* auto_commit */ true,
+                                client_timeout,
                             )
                         },
                         BoltEngineStream::admin,
@@ -509,7 +581,7 @@ impl BoltExecutor for BoltEngineExecutor {
         }
 
         match tx {
-            TxControl::AutoCommit { mode, db } => {
+            TxControl::AutoCommit { mode, db, .. } => {
                 // Resolve the target database at transaction begin (rmp #84): absent/empty `db`
                 // is the default database; a named one resolves through the catalog.
                 let (name, handle) = self.context.resolve(db.as_deref())?;
@@ -517,7 +589,13 @@ impl BoltExecutor for BoltEngineExecutor {
                 // Open an internal auto-commit transaction the engine finalises on stream drain.
                 let ticket = handle.begin_auto_commit_blocking(engine_mode)?;
                 let stream = self.run_on(
-                    &handle, ticket, &name, query, parameters, /* auto_commit */ true,
+                    &handle,
+                    ticket,
+                    &name,
+                    query,
+                    parameters,
+                    /* auto_commit */ true,
+                    client_timeout,
                 );
                 // Data-change audit (rmp #70, config-gated): a write that the engine ACCEPTED is
                 // audited at this seam (the row stream is lazy; acceptance is the correct,
@@ -573,7 +651,13 @@ impl BoltExecutor for BoltEngineExecutor {
                 let (handle, ticket, pinned_db, tx_mode) =
                     (open.handle.clone(), open.ticket, open.db.clone(), open.mode);
                 let stream = self.run_on(
-                    &handle, ticket, &pinned_db, query, parameters, /* auto_commit */ false,
+                    &handle,
+                    ticket,
+                    &pinned_db,
+                    query,
+                    parameters,
+                    /* auto_commit */ false,
+                    client_timeout,
                 );
                 // Data-change audit (rmp #70, config-gated): a write inside a write-mode explicit
                 // transaction is a data change at acceptance, exactly as the auto-commit path.
@@ -592,7 +676,12 @@ impl BoltExecutor for BoltEngineExecutor {
         }
     }
 
-    fn begin(&mut self, mode: BoltAccessMode, db: Option<&str>) -> Result<(), GraphusError> {
+    fn begin(
+        &mut self,
+        mode: BoltAccessMode,
+        db: Option<&str>,
+        timeout: Option<Duration>,
+    ) -> Result<(), GraphusError> {
         if self.current_tx.is_some() {
             return Err(GraphusError::Transaction(
                 "a transaction is already open".to_owned(),
@@ -618,6 +707,21 @@ impl BoltExecutor for BoltEngineExecutor {
             db: name,
             mode: engine_mode,
             txn,
+            // The client's `tx_timeout` (`rmp` #909) becomes an absolute instant now, so it bounds the
+            // WHOLE transaction: every statement in it is measured against what is left, and a `COMMIT`
+            // arriving after it is refused. It is stored unclamped because it can only ever *shorten*
+            // things — the operator's per-statement timeout still clamps each statement
+            // (`exec::effective_statement_timeout`) and the engine's max-transaction-age sweep
+            // (`rmp` #477) still reaps the transaction on its own schedule, so a client asking for more
+            // time than either allows gains nothing.
+            //
+            // `checked_add`, never `+`: `Instant + Duration` PANICS on overflow and this addend comes
+            // straight off the wire (`tx_timeout` is a client-chosen `i64`), so `+` would hand an
+            // authenticated peer a one-message panic on its session thread. An unrepresentable deadline
+            // degrades to `None` — "the client set no bound of its own" — which cannot raise any
+            // ceiling, since the operator's per-statement timeout and the max-transaction-age sweep are
+            // unaffected either way.
+            deadline: timeout.and_then(|t| Instant::now().checked_add(t)),
         });
         Ok(())
     }
@@ -626,6 +730,18 @@ impl BoltExecutor for BoltEngineExecutor {
         let open = self.current_tx.take().ok_or_else(|| {
             GraphusError::Transaction("COMMIT with no open transaction".to_owned())
         })?;
+        // The client's own transaction timeout (`rmp` #909). A transaction that outlived the budget its
+        // `BEGIN` asked for must NOT commit — that is the whole point of the field, and it is also the
+        // only place the bound is observable when the transaction spent its time *between* statements
+        // rather than inside one. Roll back instead, so nothing is half-applied, and report the
+        // timeout; `open` drops here either way, deregistering the registry entry.
+        if open
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            let _ = ManagedTx::new(&open.handle, open.ticket, &open.txn).rollback();
+            return Err(tx_timeout_elapsed());
+        }
         // Through the shared guard (`rmp` task #957): a terminated transaction (rmp #637) is rolled
         // back and fails with the non-retryable terminated error instead of committing. `open` drops
         // here either way, deregistering it from the registry.
@@ -674,4 +790,38 @@ impl BoltExecutor for BoltEngineExecutor {
                 .detail(format!("LOGON basic: {reason}")),
         );
     }
+}
+
+/// The Neo4j leaf status code for "the transaction ran past the timeout **the client** set at its
+/// start" (`rmp` #909).
+///
+/// Neo4j keeps two distinct titles here and picks between them by *who* configured the bound —
+/// `TransactionTimedOut` when the server's own `db.transaction.timeout` expired,
+/// `TransactionTimedOutClientConfiguration` when the value came from the client (`KernelImpl`
+/// constructs `TransactionTimeout(config…, TransactionTimedOut)` and
+/// `TransactionTimeout(Duration.ofMillis(timeout), TransactionTimedOutClientConfiguration)`
+/// respectively). This is the second: it is reached only when a Bolt `tx_timeout` elapsed.
+///
+/// Both are classified `ClientError` in the reference server's `Status.Transaction`, so a driver
+/// treats them as **non-retryable** — which is right: replaying a transaction that ran out of its own
+/// budget would simply run out again. Emitting it as a `TransientError` would make the official
+/// drivers' managed-transaction retry loop burn its whole budget on a doomed statement.
+const CODE_TX_TIMEOUT_CLIENT: &str =
+    "Neo.ClientError.Transaction.TransactionTimedOutClientConfiguration";
+
+/// The error raised when an explicit transaction outlives the `tx_timeout` its `BEGIN` requested.
+///
+/// It is carried on [`GraphusError::Runtime`] with the
+/// [`wire_status_code_message`](graphus_core::wire_status_code_message) sentinel (`rmp` #814), so the
+/// Bolt `FAILURE` (and the REST problem document) carry [`CODE_TX_TIMEOUT_CLIENT`] verbatim. The
+/// carrier variant is chosen to *agree* with that code's classification, as that mechanism requires:
+/// `Runtime` falls back to `Neo.ClientError.Statement.ArgumentError`, likewise a non-retryable
+/// `ClientError`, so the coarse classification a driver acts on is identical whether or not the
+/// verbatim code survives.
+fn tx_timeout_elapsed() -> GraphusError {
+    GraphusError::Runtime(wire_status_code_message(
+        CODE_TX_TIMEOUT_CLIENT,
+        "the transaction has not completed within the timeout specified at its start by the client \
+         (Bolt `tx_timeout`); it has been rolled back",
+    ))
 }

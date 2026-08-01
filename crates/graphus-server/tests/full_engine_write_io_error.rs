@@ -199,6 +199,7 @@ fn write_acct(handle: &EngineHandle, id: i64) -> bool {
         vec![("id".to_owned(), Value::Integer(id))],
         true,
         None,
+        None,
     ) {
         Ok(mut reply) => loop {
             match reply.rows.next() {
@@ -220,6 +221,7 @@ fn count_accts(handle: &EngineHandle) -> Option<i64> {
             "MATCH (n:Acct) RETURN count(n)".to_owned(),
             vec![],
             true,
+            None,
             None,
         )
         .ok()?;

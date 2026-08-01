@@ -233,9 +233,26 @@ pub const CODE_UNAUTHORIZED: &str = "Neo.ClientError.Security.Unauthorized";
 /// user-existence signal (preserving the rmp #812 constant-work property).
 pub const CODE_SERVER_BUSY: &str = "Neo.TransientError.General.DatabaseUnavailable";
 
-/// Best-effort code for an authorization failure: the authenticated principal lacks the privilege
-/// the operation requires ([`GraphusError::Security`], `04 §8.4`).
-const CODE_FORBIDDEN: &str = "Neo.ClientError.Security.Forbidden";
+/// Code for an authorization failure: the authenticated principal lacks the privilege the operation
+/// requires ([`GraphusError::Security`], `04 §8.4`).
+///
+/// Neo4j documents it as "An attempt was made to perform an unauthorized action"
+/// (neo4j.com/docs/status-codes/current/errors/all-errors/). It is also the code the server sends
+/// when it refuses a Bolt **impersonation** request (`imp_user`) — see
+/// [`crate::server`]'s `refuse_impersonation` (`rmp` #909) — because a refusal to *drop* privileges
+/// must be distinguishable both from a malformed statement argument
+/// (`Neo.ClientError.Statement.ArgumentError`) and from a credential failure
+/// ([`CODE_UNAUTHORIZED`]).
+///
+/// Driver behaviour (verified against the official `neo4j-driver` 6.2.0 sources): it is a
+/// `ClientError`, so `isRetryable()` is **false** (`_isRetryableCode` covers only
+/// `SERVICE_UNAVAILABLE`, `SESSION_EXPIRED`, `AuthorizationExpired` and `TransientError`); it is not
+/// listed by the static/basic auth-token managers (which react only to `Unauthorized` /
+/// `TokenExpired`), so it never triggers a credential-refresh loop; and the pooled connection
+/// provider's `_handleSecurityError` closes the connection carrying it — matching the reference
+/// server, which terminates a connection whose impersonation fails
+/// (`AuthenticationStateTransitionException implements ConnectionTerminating`).
+pub const CODE_FORBIDDEN: &str = "Neo.ClientError.Security.Forbidden";
 
 /// Removes the `GraphusError::Display` layer prefix (`"<layer> error: "`) so the `FAILURE` message
 /// is the bare human description.

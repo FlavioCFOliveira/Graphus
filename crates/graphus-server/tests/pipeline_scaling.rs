@@ -137,6 +137,7 @@ fn write_acct(handle: &EngineHandle, id: i64) -> bool {
         vec![("id".to_owned(), Value::Integer(id))],
         true,
         None,
+        None,
     ) {
         Ok(mut reply) => loop {
             match reply.rows.next() {

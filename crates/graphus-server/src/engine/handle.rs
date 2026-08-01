@@ -210,7 +210,9 @@ impl EngineHandle {
     /// Runs `query` with `params` inside `ticket`, returning the result stream.
     ///
     /// `privileges` carries the principal's resolved fine-grained RBAC for this statement (rmp #93);
-    /// `None` (or an admin/unrestricted set) disables filtering. See [`EngineCommand::Run`].
+    /// `None` (or an admin/unrestricted set) disables filtering. `timeout` is an optional
+    /// caller-supplied budget that can only *shorten* the engine's configured per-statement timeout
+    /// (`rmp` #909). See [`EngineCommand::Run`].
     ///
     /// # Errors
     /// [`GraphusError`] for a compile/runtime/transaction error raised before the first row.
@@ -221,6 +223,7 @@ impl EngineHandle {
         params: Vec<(String, Value)>,
         auto_commit: bool,
         privileges: Option<EffectivePrivileges>,
+        timeout: Option<std::time::Duration>,
     ) -> Result<RunReply, GraphusError> {
         let (reply, rx) = reply_channel();
         self.submit(EngineCommand::Run {
@@ -229,6 +232,7 @@ impl EngineHandle {
             params,
             auto_commit,
             privileges: privileges.map(Box::new),
+            timeout,
             reply,
         })
         .await?;
@@ -458,6 +462,7 @@ impl EngineHandle {
         params: Vec<(String, Value)>,
         auto_commit: bool,
         privileges: Option<EffectivePrivileges>,
+        timeout: Option<std::time::Duration>,
     ) -> Result<RunReply, GraphusError> {
         let (reply, rx) = reply_channel();
         self.submit_blocking(EngineCommand::Run {
@@ -466,6 +471,7 @@ impl EngineHandle {
             params,
             auto_commit,
             privileges: privileges.map(Box::new),
+            timeout,
             reply,
         })?;
         recv_blocking(rx)?

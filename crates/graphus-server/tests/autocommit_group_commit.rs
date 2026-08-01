@@ -176,6 +176,7 @@ fn write_acct(handle: &EngineHandle, id: i64) -> bool {
         vec![("id".to_owned(), Value::Integer(id))],
         true,
         None,
+        None,
     ) {
         Ok(mut reply) => loop {
             match reply.rows.next() {
@@ -199,6 +200,7 @@ fn count_accts(handle: &EngineHandle) -> i64 {
             "MATCH (n:Acct) RETURN count(n)".to_owned(),
             vec![],
             true,
+            None,
             None,
         )
         .expect("count runs");
@@ -436,6 +438,7 @@ fn autocommit_write_summary_carries_a_monotonic_bookmark_and_a_read_carries_a_mo
                 vec![("id".to_owned(), Value::Integer(id))],
                 true,
                 None,
+                None,
             )
             .expect("write runs");
         while let Ok(Some(_)) = reply.rows.next() {}
@@ -457,6 +460,7 @@ fn autocommit_write_summary_carries_a_monotonic_bookmark_and_a_read_carries_a_mo
                 "MATCH (n:Acct) RETURN count(n)".to_owned(),
                 vec![],
                 true,
+                None,
                 None,
             )
             .expect("read runs");

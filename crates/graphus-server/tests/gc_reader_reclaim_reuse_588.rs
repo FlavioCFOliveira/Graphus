@@ -80,7 +80,7 @@ fn run_drain(
     ticket: TxTicket,
     stmt: &str,
 ) -> (bool, Vec<Vec<Value>>, Option<String>) {
-    match handle.run_blocking(ticket, stmt.to_owned(), vec![], true, None) {
+    match handle.run_blocking(ticket, stmt.to_owned(), vec![], true, None, None) {
         Ok(mut reply) => {
             let mut rows = Vec::new();
             loop {

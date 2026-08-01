@@ -88,7 +88,7 @@ fn teardown(engine: Engine, handle: EngineHandle) {
 fn scalar(handle: &EngineHandle, stmt: &str) -> Option<i64> {
     let ticket = handle.begin_auto_commit_blocking(AccessMode::Read).ok()?;
     let mut reply = handle
-        .run_blocking(ticket, stmt.to_owned(), vec![], true, None)
+        .run_blocking(ticket, stmt.to_owned(), vec![], true, None, None)
         .ok()?;
     let mut v = None;
     while let Ok(Some(cells)) = reply.rows.next() {
@@ -111,6 +111,7 @@ fn create_one_edge(handle: &EngineHandle, leaf: i64) -> bool {
         "MATCH (h:Hub {id: 0}) CREATE (h)-[:LINK]->(:Leaf {id: $l})".to_owned(),
         vec![("l".to_owned(), Value::Integer(leaf))],
         false,
+        None,
         None,
     );
     match run {
@@ -160,6 +161,7 @@ fn real_thread_supernode_keeps_committed_edges() {
                 "CREATE (:Hub {id: 0})".to_owned(),
                 vec![],
                 true,
+                None,
                 None,
             )
             .expect("create hub");
@@ -226,6 +228,7 @@ fn real_thread_supernode_with_concurrent_readers_stays_live() {
             "CREATE (:Hub {id: 0})".to_owned(),
             vec![],
             true,
+            None,
             None,
         )
         .expect("create hub");

@@ -292,6 +292,10 @@ impl RestEngineAdapter {
                             ));
                             let reply = handle.run_blocking(
                                 ticket, query, params, /* auto_commit */ true, privileges,
+                                // REST carries no per-request statement budget (`rmp` #909): the
+                                // client-settable `tx_timeout` is a Bolt `extra` field. The operator's
+                                // configured per-statement timeout governs, exactly as before.
+                                None,
                             )?;
                             Ok(RestEngineStream {
                                 fields: reply.fields,
@@ -383,6 +387,10 @@ impl RestEngineAdapter {
                             ));
                             let reply = handle.run_blocking(
                                 ticket, query, params, /* auto_commit */ true, privileges,
+                                // REST carries no per-request statement budget (`rmp` #909): the
+                                // client-settable `tx_timeout` is a Bolt `extra` field. The operator's
+                                // configured per-statement timeout governs, exactly as before.
+                                None,
                             )?;
                             Ok(RestEngineStream {
                                 fields: reply.fields,
@@ -662,6 +670,8 @@ impl RestEngine for RestEngineAdapter {
             parameters,
             /* auto_commit */ false,
             privileges,
+            // No REST-side statement budget (`rmp` #909) — see the note at the admin re-run above.
+            None,
         );
         // Data-change audit (rmp #70, config-gated): a write that the engine ACCEPTED is audited at
         // this seam (the row stream is lazy; acceptance is the cheap, correct point). Full query
@@ -744,6 +754,8 @@ impl RestEngine for RestEngineAdapter {
             parameters,
             /* auto_commit */ true,
             privileges,
+            // No REST-side statement budget (`rmp` #909) — see the note at the admin re-run above.
+            None,
         );
         // Data-change audit (rmp #70, config-gated): a write that the engine ACCEPTED is audited at
         // this seam (the row stream is lazy; acceptance is the cheap, correct point). Full query text is

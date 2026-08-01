@@ -67,7 +67,7 @@ fn run_autocommit(handle: &EngineHandle, mode: AccessMode, stmt: &str) -> bool {
     let Ok(ticket) = handle.begin_auto_commit_blocking(mode) else {
         return false;
     };
-    match handle.run_blocking(ticket, stmt.to_owned(), vec![], true, None) {
+    match handle.run_blocking(ticket, stmt.to_owned(), vec![], true, None, None) {
         Ok(mut reply) => loop {
             match reply.rows.next() {
                 Ok(Some(_)) => {}
@@ -107,6 +107,7 @@ fn slow_consumer_does_not_block_a_concurrent_command() {
             "MATCH (n:N) RETURN n.id AS id".to_owned(),
             vec![],
             false,
+            None,
             None,
         )
         .expect("the RUN reply arrives before the first row (it is sent up front)");
@@ -208,6 +209,7 @@ fn suspended_autocommit_write_still_commits() {
             vec![],
             true,
             None,
+            None,
         )
         .expect("RUN reply arrives up front");
 
@@ -247,6 +249,7 @@ fn suspended_autocommit_write_still_commits() {
             "MATCH (m:M) RETURN m.id AS id ORDER BY id".to_owned(),
             vec![],
             true,
+            None,
             None,
         )
         .unwrap();
@@ -297,6 +300,7 @@ fn mid_stream_error_is_terminal_after_suspension() {
             format!("UNWIND {list_lit} AS x RETURN 10 / x AS q"),
             vec![],
             true,
+            None,
             None,
         )
         .expect("RUN reply arrives up front");

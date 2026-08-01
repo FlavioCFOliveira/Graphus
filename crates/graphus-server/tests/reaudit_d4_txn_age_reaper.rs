@@ -84,7 +84,7 @@ fn run_auto_write(handle: &EngineHandle, stmt: &str) -> Result<(), ()> {
         .begin_auto_commit_blocking(AccessMode::Write)
         .map_err(|_| ())?;
     let mut reply = handle
-        .run_blocking(ticket, stmt.to_owned(), vec![], true, None)
+        .run_blocking(ticket, stmt.to_owned(), vec![], true, None, None)
         .map_err(|_| ())?;
     loop {
         match reply.rows.next() {
@@ -100,7 +100,14 @@ fn run_auto_write(handle: &EngineHandle, stmt: &str) -> Result<(), ()> {
 /// with a clean "unknown transaction" error). Does NOT commit/rollback — the transaction stays open.
 fn touch_explicit(handle: &EngineHandle, ticket: TxTicket) -> Result<(), ()> {
     let mut reply = handle
-        .run_blocking(ticket, "RETURN 1 AS one".to_owned(), vec![], false, None)
+        .run_blocking(
+            ticket,
+            "RETURN 1 AS one".to_owned(),
+            vec![],
+            false,
+            None,
+            None,
+        )
         .map_err(|_| ())?;
     loop {
         match reply.rows.next() {

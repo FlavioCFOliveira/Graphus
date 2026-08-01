@@ -82,6 +82,7 @@ fn seed_nodes(handle: &EngineHandle, n: usize) {
             vec![],
             true,
             None,
+            None,
         )
         .expect("seed run");
     // Drain to completion (the write commits when its stream is drained).
@@ -94,7 +95,7 @@ fn seed_nodes(handle: &EngineHandle, n: usize) {
 fn run_auto(handle: &EngineHandle, mode: AccessMode, stmt: &str) -> Result<(), ()> {
     let ticket = handle.begin_auto_commit_blocking(mode).map_err(|_| ())?;
     let mut reply = handle
-        .run_blocking(ticket, stmt.to_owned(), vec![], true, None)
+        .run_blocking(ticket, stmt.to_owned(), vec![], true, None, None)
         .map_err(|_| ())?;
     loop {
         match reply.rows.next() {
@@ -110,7 +111,7 @@ fn run_auto(handle: &EngineHandle, mode: AccessMode, stmt: &str) -> Result<(), (
 /// The transaction is rolled back afterward regardless.
 fn run_explicit_read(handle: &EngineHandle, stmt: &str) -> Result<(), ()> {
     let ticket = handle.begin_blocking(AccessMode::Read).map_err(|_| ())?;
-    let outcome = match handle.run_blocking(ticket, stmt.to_owned(), vec![], false, None) {
+    let outcome = match handle.run_blocking(ticket, stmt.to_owned(), vec![], false, None, None) {
         Ok(mut reply) => loop {
             match reply.rows.next() {
                 Ok(Some(_)) => {}
@@ -268,6 +269,7 @@ fn statement_timeout_bounds_a_stalled_offthread_reader() {
             "MATCH (n:N) RETURN n".to_owned(),
             vec![],
             true,
+            None,
             None,
         )
         .expect("off-thread read dispatched");

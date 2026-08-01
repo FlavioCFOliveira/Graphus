@@ -93,7 +93,7 @@ fn run_stmt(
         .begin_auto_commit_blocking(mode)
         .map_err(|e| format!("begin: {e}"))?;
     let mut reply = handle
-        .run_blocking(ticket, stmt.to_owned(), params, true, None)
+        .run_blocking(ticket, stmt.to_owned(), params, true, None, None)
         .map_err(|e| format!("run: {e}"))?;
     loop {
         match reply.rows.next() {

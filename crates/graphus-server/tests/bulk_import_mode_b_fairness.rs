@@ -143,6 +143,7 @@ async fn run_foreground_probe(
                 vec![],
                 true,
                 None,
+                None,
             )
             .await
             .expect("foreground probe runs");
