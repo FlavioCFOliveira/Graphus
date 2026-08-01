@@ -215,14 +215,44 @@ permit) borrows rather than producing a negative component.
 
 #### 1.6.2 Checked arithmetic, never clamping
 
-The UTC-to-local combination (`local = utc + offset`) and the nanosecond carry use **checked**
-arithmetic and refuse on overflow. Saturating silently discards the offset at the edges of the range,
-so `DateTime { seconds: i64::MAX, offset: 3600 }` decoded to a *different* instant than it named and
-re-encoded to *different bytes* — a value that fails no check anywhere and is simply wrong.
+On **decode**, the UTC-to-local combination (`local = utc + offset`) and the nanosecond carry use
+**checked** arithmetic and refuse on overflow. Saturating silently discards the offset at the edges of
+the range, so `DateTime { seconds: i64::MAX, offset: 3600 }` decoded to a *different* instant than it
+named and re-encoded to *different bytes* — a value that fails no check anywhere and is simply wrong.
 
 For `DateTimeZoneId` the nanosecond carry is applied **before** the zone lookup: the offset a zone
 resolves to is a function of the instant (`rmp` #908 localizes at the decoded instant), and a carry
 can move the instant across a DST boundary.
+
+On **encode** the inverse combination (`utc = local - offset`) is written as a checked subtraction,
+but the encoder stays **infallible** by design and this is a ratified decision, not an oversight. It
+is called mid-`RECORD`, after the chunk framing is committed to the wire, so there is no point at
+which returning an error would leave the stream in a state a client could act on. That is sound
+because the subtraction cannot overflow for any value the system can hold, and the property has two
+independent guards: a client's value passed the decode bounds above, and an engine-built value came
+from `temporal_fns`, which works in the openCypher year range — `|epoch_seconds| ≤ ~3.2e16`, five
+orders of magnitude below `i64::MAX`, against an offset of at most 64800. The invariant is proven over
+the whole representable domain by a test, and the year-range bound is additionally asserted at
+**compile time**, so widening the range fails the build rather than silently invalidating the
+argument.
+
+#### 1.6.5 `element_id` is preserved on the client paths
+
+`graphus-bolt` is the codec for Graphus's **clients** — the CLI and the DST simulator — as well as its
+server. As a server, Graphus is single-instance and mints the `element_id` as the decimal of the
+integer id (`04 §8.3`). As a client, it decodes entities produced by a server that need not be
+Graphus, whose `element_id` is an opaque string with no relationship to the integer id.
+
+Graphus discarded the field on decode and regenerated `id.to_string()` on re-encode, so a client
+silently **rewrote entity identity**: the value it forwarded was not the value it received, and
+nothing reported it. A decoded entity now carries the `element_id` strings it arrived with (all three
+for a relationship, endpoints included) and re-emits them unchanged.
+
+The carrier is a single optional boxed record, not inline fields, because the **server** path — every
+entity of every result row — always synthesises and never carries: `None` is one null pointer and no
+allocation there, against the ~72 bytes three inline optional strings would add to every node and
+relationship in every row. The allocation happens only on the decode path, which is the client's, and
+where the strings exist anyway.
 
 #### 1.6.3 Structure signatures are bounded to `0..=127`
 

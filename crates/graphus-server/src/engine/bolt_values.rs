@@ -39,6 +39,10 @@ fn materialized_node_to_bolt(n: MaterializedNode) -> BoltNode {
         id: i64::try_from(n.id).unwrap_or(i64::MAX),
         labels: n.labels,
         properties: n.properties,
+        // The SERVER always synthesises the element id from the integer id (`04 §8.3`), so nothing is
+        // carried here: `None` is one null pointer per node and no allocation, which is what keeps
+        // `rmp` #911's client-side identity preservation off this hot path entirely.
+        element_ids: None,
     }
 }
 
@@ -51,6 +55,8 @@ pub fn materialized_rel_to_bolt(r: MaterializedRel) -> BoltRelationship {
         end: i64::try_from(r.end).unwrap_or(i64::MAX),
         rel_type: r.rel_type,
         properties: r.properties,
+        // Synthesised from the ids on the server path — see `materialized_node_to_bolt`.
+        element_ids: None,
     }
 }
 

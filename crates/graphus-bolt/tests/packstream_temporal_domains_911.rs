@@ -370,3 +370,192 @@ fn a_wire_value_and_its_in_engine_twin_are_the_same_value() {
         );
     }
 }
+
+/// **The encoder's `utc = local - offset` can never need to saturate** (`rmp` #911, criterion 5's
+/// encode half).
+///
+/// `pack_value` is infallible by design — it is called mid-`RECORD`, after the chunk framing is
+/// committed, so there is no point at which an error could leave the stream in a state a client
+/// could act on. That is sound only if the subtraction cannot overflow for any value the system can
+/// hold, so this gate proves the property instead of asserting it.
+///
+/// Two guards make it hold, and the test exercises the union of what they admit:
+///
+/// * a value from a client passed `unpack_value`, which bounds the offset to ±18 h and refuses an
+///   unrepresentable `local = utc + offset`;
+/// * a value the engine built came from `temporal_fns`, which works in the openCypher year range, so
+///   `|epoch_seconds| ≤ ~3.2e16` — five orders of magnitude below `i64::MAX`.
+#[test]
+fn encoding_a_zoned_date_time_never_needs_to_saturate() {
+    use graphus_core::value::temporal::ZonedDateTime;
+
+    /// The largest `|epoch_seconds|` the openCypher year range can produce: 999999999 years, taken
+    /// generously at 366 days each so the bound is an over-estimate, never an under-estimate.
+    const MAX_ENGINE_SECONDS: i64 = 999_999_999 * 366 * 86_400;
+
+    // The bound really is far from the edge — the load-bearing arithmetic fact behind the encoder's
+    // infallibility. Asserted at COMPILE time: it is a statement about the constants themselves, so a
+    // future widening of the year range must fail the build rather than wait for this test to run.
+    const _: () = assert!(
+        MAX_ENGINE_SECONDS < i64::MAX / 100,
+        "the openCypher range must sit orders of magnitude below i64::MAX, else the encoder's \
+         infallibility argument does not hold"
+    );
+
+    // Every extreme the two guards jointly admit: both ends of the range, both offset extremes, and
+    // the zero point — the full corner set for a subtraction.
+    for seconds in [
+        MAX_ENGINE_SECONDS,
+        -MAX_ENGINE_SECONDS,
+        0,
+        i64::from(i32::MAX),
+        i64::from(i32::MIN),
+    ] {
+        for offset in [MAX_OFFSET as i32, -(MAX_OFFSET as i32), 0] {
+            assert!(
+                seconds.checked_sub(i64::from(offset)).is_some(),
+                "utc = local - offset must be representable for every value the system can hold \
+                 (local {seconds}, offset {offset})"
+            );
+
+            // And the value really does round-trip through the encoder to the same instant, so the
+            // check above is about the value the encoder actually writes.
+            let v = Value::zoned_date_time(ZonedDateTime {
+                local: LocalDateTime {
+                    epoch_seconds: seconds,
+                    nanos: 0,
+                },
+                offset_seconds: offset,
+                zone_id: String::new(),
+            });
+            let mut p = Packer::new();
+            pack_value(&mut p, &v);
+            let bytes = p.into_inner();
+            let mut u = Unpacker::new(&bytes);
+            let back = unpack_value(&mut u).expect("an in-range zoned date-time must round-trip");
+            assert_eq!(back, v, "local {seconds}, offset {offset}");
+        }
+    }
+
+    // NON-VACUITY: the decoder is what closes the loop, so confirm it genuinely refuses the values
+    // this argument relies on it refusing. Without this the invariant would rest on an unchecked
+    // claim about the boundary.
+    decode_err(tag::DATE_TIME, &[i64::MAX, 0, 3600], "overflow");
+    decode_err(tag::DATE_TIME, &[0, 0, MAX_OFFSET + 1], "out of range");
+}
+
+/// **A decoded `element_id` survives re-encoding unchanged** (`rmp` #911, criterion 6).
+///
+/// `graphus-bolt` is the codec for Graphus's **clients** — the CLI and the DST simulator — as well as
+/// its server. A client decodes entities produced by a server that is not necessarily Graphus, whose
+/// `element_id` is an opaque string with no relationship to the integer id (a real Neo4j emits a
+/// UUID-shaped one). Graphus discarded it on decode and regenerated `id.to_string()` on re-encode,
+/// so a client silently **rewrote entity identity**: the value it forwarded was not the value it
+/// received, and nothing reported it.
+///
+/// The gate uses an element id that could not possibly be derived from the integer id, which is what
+/// makes it discriminating: a codec that regenerates from the id cannot produce this string.
+#[test]
+fn an_opaque_element_id_survives_a_client_decode_and_re_encode() {
+    use graphus_bolt::{BoltNode, BoltRelationship, BoltValue, pack_bolt_value, unpack_bolt_value};
+
+    const NODE_EID: &str = "4:9f2c1e5a-7b3d-4f18-8a6c-2d0e1b4c7a99:12";
+    const REL_EID: &str = "5:9f2c1e5a-7b3d-4f18-8a6c-2d0e1b4c7a99:77";
+    const START_EID: &str = "4:9f2c1e5a-7b3d-4f18-8a6c-2d0e1b4c7a99:12";
+    const END_EID: &str = "4:9f2c1e5a-7b3d-4f18-8a6c-2d0e1b4c7a99:34";
+
+    // A NODE as some other server would emit it: integer id 12, opaque element id.
+    let mut p = Packer::new();
+    p.write_struct_header(0x4E, 4).expect("Node header");
+    p.write_int(12);
+    p.write_list_header(1);
+    p.write_string("Person");
+    p.write_map_header(0);
+    p.write_string(NODE_EID);
+    let node_bytes = p.into_inner();
+
+    let mut u = Unpacker::new(&node_bytes);
+    let decoded = unpack_bolt_value(&mut u).expect("a foreign node must decode");
+    match &decoded {
+        BoltValue::Node(BoltNode {
+            id, element_ids, ..
+        }) => {
+            assert_eq!(*id, 12);
+            assert_eq!(
+                element_ids.as_deref().map(|ids| ids.element_id.as_str()),
+                Some(NODE_EID),
+                "the opaque element_id must be kept, not discarded"
+            );
+        }
+        other => panic!("expected a node, got {other:?}"),
+    }
+    let mut p = Packer::new();
+    pack_bolt_value(&mut p, &decoded);
+    assert_eq!(
+        p.into_inner(),
+        node_bytes,
+        "re-encoding must reproduce the foreign node byte for byte"
+    );
+
+    // A RELATIONSHIP, where all THREE element-id strings must survive — the endpoints too, which a
+    // node-only fix would miss.
+    let mut p = Packer::new();
+    p.write_struct_header(0x52, 8).expect("Relationship header");
+    p.write_int(77);
+    p.write_int(12);
+    p.write_int(34);
+    p.write_string("KNOWS");
+    p.write_map_header(0);
+    p.write_string(REL_EID);
+    p.write_string(START_EID);
+    p.write_string(END_EID);
+    let rel_bytes = p.into_inner();
+
+    let mut u = Unpacker::new(&rel_bytes);
+    let decoded = unpack_bolt_value(&mut u).expect("a foreign relationship must decode");
+    match &decoded {
+        BoltValue::Relationship(BoltRelationship { element_ids, .. }) => {
+            let ids = element_ids.as_deref().expect("the ids must be kept");
+            assert_eq!(ids.element_id, REL_EID);
+            assert_eq!(ids.start_element_id, START_EID);
+            assert_eq!(ids.end_element_id, END_EID);
+        }
+        other => panic!("expected a relationship, got {other:?}"),
+    }
+    let mut p = Packer::new();
+    pack_bolt_value(&mut p, &decoded);
+    assert_eq!(
+        p.into_inner(),
+        rel_bytes,
+        "re-encoding must reproduce the foreign relationship byte for byte"
+    );
+
+    // NON-VACUITY: the opaque ids really are un-derivable from the integer ids, so a codec that
+    // regenerated them could not have produced these bytes. Without this the gate would pass for the
+    // very implementation it exists to catch.
+    assert_ne!(NODE_EID, "12");
+    assert_ne!(REL_EID, "77");
+    assert_ne!(START_EID, "12");
+    assert_ne!(END_EID, "34");
+
+    // CONTROL: the SERVER path is unchanged — an entity built with no carried ids still emits the
+    // synthesised decimals, so this change costs the hot path nothing and alters no server output.
+    let server_node = BoltValue::Node(BoltNode {
+        id: 12,
+        labels: vec!["Person".to_owned()],
+        properties: vec![],
+        element_ids: None,
+    });
+    let mut p = Packer::new();
+    pack_bolt_value(&mut p, &server_node);
+    let server_bytes = p.into_inner();
+    let mut u = Unpacker::new(&server_bytes);
+    match unpack_bolt_value(&mut u).expect("decode") {
+        BoltValue::Node(n) => assert_eq!(
+            n.element_ids.as_deref().map(|ids| ids.element_id.as_str()),
+            Some("12"),
+            "the server still synthesises the element id from the integer id"
+        ),
+        other => panic!("expected a node, got {other:?}"),
+    }
+}

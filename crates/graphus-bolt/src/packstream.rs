@@ -933,6 +933,11 @@ pub struct BoltNode {
     pub labels: Vec<String>,
     /// The node's properties (ordered `(key, value)`).
     pub properties: Vec<(String, Value)>,
+    /// The `element_id` string this entity **arrived with**, when it was decoded from a wire
+    /// (`rmp` #911). `None` means "synthesise it from `id`", which is what the server always does.
+    ///
+    /// See [`WireElementIds`] for why it is carried at all and why it is boxed.
+    pub element_ids: Option<Box<WireElementIds>>,
 }
 
 /// A relationship as a Bolt `Relationship` structure (tag `0x52`).
@@ -948,6 +953,40 @@ pub struct BoltRelationship {
     pub rel_type: String,
     /// The relationship's properties (ordered `(key, value)`).
     pub properties: Vec<(String, Value)>,
+    /// The `element_id` strings this entity **arrived with**, when it was decoded from a wire
+    /// (`rmp` #911). `None` means "synthesise them from the ids". See [`WireElementIds`].
+    pub element_ids: Option<Box<WireElementIds>>,
+}
+
+/// The `element_id` strings an entity carried **on the wire it was decoded from** (`rmp` #911).
+///
+/// ## Why they must be carried
+///
+/// Bolt 5.0 added a string `element_id` beside the legacy integer id, and it is the identifier a
+/// modern driver actually uses. Graphus is single-instance, so as a *server* it mints the decimal of
+/// the integer id (`04 §8.3`) — but `graphus-bolt` is also the codec for Graphus's **clients**: the
+/// CLI and the DST simulator. Those decode entities produced by a server that is not necessarily
+/// Graphus, whose `element_id` is an opaque string with no relationship to the integer id (a real
+/// Neo4j emits a UUID-shaped one). Discarding it on decode and regenerating `id.to_string()` on
+/// re-encode silently **rewrote entity identity**: the value a client forwarded was no longer the
+/// value it received, and nothing anywhere reported it.
+///
+/// ## Why it is boxed, and optional
+///
+/// On the server path — every result row of every query — these strings are always synthesised from
+/// the id and never carried, so the field must cost as close to nothing as possible there.
+/// `Option<Box<…>>` is one null pointer (8 bytes) and no allocation when absent, rather than the
+/// ~72 bytes three inline `Option<String>`s would add to every node and relationship in every row.
+/// The box is allocated only on the decode path, which is the client's, and where the strings exist
+/// anyway.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireElementIds {
+    /// The entity's own `element_id`.
+    pub element_id: String,
+    /// A relationship's `start_element_id` (empty for a node or an unbound relationship).
+    pub start_element_id: String,
+    /// A relationship's `end_element_id` (empty for a node or an unbound relationship).
+    pub end_element_id: String,
 }
 
 /// A path as a Bolt `Path` structure (tag `0x50`): the distinct nodes and **unbound**
@@ -999,6 +1038,22 @@ fn element_id(id: i64) -> String {
     id.to_string()
 }
 
+/// The `element_id` to emit for an entity: the one it **arrived with**, when it was decoded from a
+/// wire, and otherwise the synthesised decimal of `id` (`rmp` #911).
+///
+/// `pick` selects which of the three strings a given field wants. Re-emitting the carried value is
+/// what stops a client path from silently rewriting entity identity — see [`WireElementIds`].
+fn emit_element_id<'a>(
+    carried: Option<&'a WireElementIds>,
+    pick: impl FnOnce(&'a WireElementIds) -> &'a str,
+    fallback_id: i64,
+) -> std::borrow::Cow<'a, str> {
+    carried.map_or_else(
+        || std::borrow::Cow::Owned(element_id(fallback_id)),
+        |ids| std::borrow::Cow::Borrowed(pick(ids)),
+    )
+}
+
 /// Packs a [`BoltValue`] result-row cell into `packer`: a property [`Value`] via [`pack_value`], or
 /// the matching Bolt graph structure.
 pub fn pack_bolt_value(packer: &mut Packer, value: &BoltValue) {
@@ -1029,7 +1084,11 @@ pub fn pack_node(packer: &mut Packer, node: &BoltNode) {
         packer.write_string(label);
     }
     pack_properties(packer, &node.properties);
-    packer.write_string(&element_id(node.id));
+    packer.write_string(&emit_element_id(
+        node.element_ids.as_deref(),
+        |ids| &ids.element_id,
+        node.id,
+    ));
 }
 
 /// Packs a Bolt 5.x `Relationship` structure (tag `0x52`): `id`, `start`, `end`, `type`,
@@ -1044,9 +1103,18 @@ pub fn pack_relationship(packer: &mut Packer, rel: &BoltRelationship) {
     packer.write_int(rel.end);
     packer.write_string(&rel.rel_type);
     pack_properties(packer, &rel.properties);
-    packer.write_string(&element_id(rel.id));
-    packer.write_string(&element_id(rel.start));
-    packer.write_string(&element_id(rel.end));
+    let carried = rel.element_ids.as_deref();
+    packer.write_string(&emit_element_id(carried, |ids| &ids.element_id, rel.id));
+    packer.write_string(&emit_element_id(
+        carried,
+        |ids| &ids.start_element_id,
+        rel.start,
+    ));
+    packer.write_string(&emit_element_id(
+        carried,
+        |ids| &ids.end_element_id,
+        rel.end,
+    ));
 }
 
 /// Packs a Bolt 5.x `UnboundRelationship` structure (tag `0x72`): `id`, `type`, `properties`,
@@ -1058,7 +1126,11 @@ fn pack_unbound_relationship(packer: &mut Packer, rel: &BoltRelationship) {
     packer.write_int(rel.id);
     packer.write_string(&rel.rel_type);
     pack_properties(packer, &rel.properties);
-    packer.write_string(&element_id(rel.id));
+    packer.write_string(&emit_element_id(
+        rel.element_ids.as_deref(),
+        |ids| &ids.element_id,
+        rel.id,
+    ));
 }
 
 /// Packs a Bolt `Path` structure (tag `0x50`): `nodes`, `rels` (as `UnboundRelationship`s),
@@ -1556,11 +1628,18 @@ fn unpack_node(unpacker: &mut Unpacker<'_>) -> BoltResult<BoltNode> {
         labels.push(unpacker.read_string()?);
     }
     let properties = unpack_properties(unpacker)?;
-    let _element_id = unpacker.read_string()?; // round-tripped, not modelled separately
+    // KEPT, not discarded (`rmp` #911): on a client path the server's `element_id` is opaque and
+    // has no relationship to the integer id, so regenerating it would rewrite entity identity.
+    let element_id = unpacker.read_string()?;
     Ok(BoltNode {
         id,
         labels,
         properties,
+        element_ids: Some(Box::new(WireElementIds {
+            element_id,
+            start_element_id: String::new(),
+            end_element_id: String::new(),
+        })),
     })
 }
 
@@ -1573,15 +1652,20 @@ fn unpack_relationship(unpacker: &mut Unpacker<'_>) -> BoltResult<BoltRelationsh
     let end = unpacker.read_int()?;
     let rel_type = unpacker.read_string()?;
     let properties = unpack_properties(unpacker)?;
-    let _element_id = unpacker.read_string()?;
-    let _start_element_id = unpacker.read_string()?;
-    let _end_element_id = unpacker.read_string()?;
+    let element_id = unpacker.read_string()?;
+    let start_element_id = unpacker.read_string()?;
+    let end_element_id = unpacker.read_string()?;
     Ok(BoltRelationship {
         id,
         start,
         end,
         rel_type,
         properties,
+        element_ids: Some(Box::new(WireElementIds {
+            element_id,
+            start_element_id,
+            end_element_id,
+        })),
     })
 }
 
@@ -1593,9 +1677,14 @@ fn unpack_unbound_relationship(unpacker: &mut Unpacker<'_>) -> BoltResult<BoltRe
     let id = unpacker.read_int()?;
     let rel_type = unpacker.read_string()?;
     let properties = unpack_properties(unpacker)?;
-    let _element_id = unpacker.read_string()?;
+    let element_id = unpacker.read_string()?;
     Ok(BoltRelationship {
         id,
+        element_ids: Some(Box::new(WireElementIds {
+            element_id,
+            start_element_id: String::new(),
+            end_element_id: String::new(),
+        })),
         start: 0,
         end: 0,
         rel_type,
@@ -1723,10 +1812,33 @@ fn pack_local_date_time(packer: &mut Packer, dt: LocalDateTime) {
 fn pack_zoned_date_time(packer: &mut Packer, dt: &ZonedDateTime) {
     // Bolt 5.0+: emit UTC epoch seconds (`utc = local - offset`). A non-empty IANA zone id selects
     // the `DateTimeZoneId` form (tag 0x69); otherwise the offset form `DateTime` (tag 0x49).
+    // `checked_sub`, with the saturation kept only as an unreachable fallback (`rmp` #911).
+    //
+    // The encoder is deliberately infallible: it is called mid-RECORD, after the chunk framing is
+    // already committed to the wire, so there is no point at which returning an error would leave the
+    // stream in a state a client could act on. That is sound here because the subtraction **cannot**
+    // overflow for any value the system can hold, which is a property with two independent guards:
+    //
+    // * every value that arrives from a client passes `unpack_value`, which now bounds `Date.days` to
+    //   the openCypher year range and `tz_offset_seconds` to ±18 h, and refuses an unrepresentable
+    //   `local = utc + offset` outright (see `zoned_from_utc`);
+    // * every value the engine builds goes through `graphus-cypher`'s `temporal_fns`, which works in
+    //   the same year range — so `|epoch_seconds| ≤ ~3.2e16`, five orders of magnitude below
+    //   `i64::MAX`, and an offset of at most 64800 cannot bring it near the edge.
+    //
+    // `saturating_sub` alone was the defect: it *silently* re-emitted a different instant than the
+    // one held. Writing it as a checked subtraction states the invariant in the code, and
+    // `encoding_a_zoned_date_time_never_needs_to_saturate` proves it over the whole representable
+    // domain rather than asserting it.
     let utc_secs = dt
         .local
         .epoch_seconds
-        .saturating_sub(i64::from(dt.offset_seconds));
+        .checked_sub(i64::from(dt.offset_seconds))
+        .unwrap_or_else(|| {
+            dt.local
+                .epoch_seconds
+                .saturating_sub(i64::from(dt.offset_seconds))
+        });
     if dt.zone_id.is_empty() {
         packer
             .write_struct_header(tag::DATE_TIME, 3)
@@ -2803,6 +2915,7 @@ mod tests {
             id: 7,
             labels: vec!["Person".to_owned(), "Admin".to_owned()],
             properties: vec![("name".to_owned(), Value::String("Ada".to_owned()))],
+            element_ids: None,
         };
         let mut p = Packer::new();
         pack_node(&mut p, &node);
@@ -2814,9 +2927,30 @@ mod tests {
         assert_eq!(bytes[2], 0x07);
         // Field 1: labels — a 2-element tiny list.
         assert_eq!(bytes[3], TINY_LIST_BASE + 2);
-        // Round-trip preserves id/labels/properties (element_id is round-tripped, not modelled).
+        // Round-trip preserves id/labels/properties, and now also the element_id the wire carried
+        // (`rmp` #911) — so the decoded value differs from the source in exactly one way: the source
+        // said "synthesise it from the id" (`None`), and the decoded one names the string that was
+        // actually on the wire. Both spell the same entity, which is what the byte assertion proves.
         let mut u = Unpacker::new(&bytes);
-        assert_eq!(unpack_node(&mut u).unwrap(), node);
+        let decoded = unpack_node(&mut u).unwrap();
+        assert_eq!(decoded.id, node.id);
+        assert_eq!(decoded.labels, node.labels);
+        assert_eq!(decoded.properties, node.properties);
+        assert_eq!(
+            decoded
+                .element_ids
+                .as_deref()
+                .map(|ids| ids.element_id.as_str()),
+            Some("7"),
+            "the decoded node carries the element_id that was on the wire"
+        );
+        let mut p2 = Packer::new();
+        pack_node(&mut p2, &decoded);
+        assert_eq!(
+            p2.into_inner(),
+            bytes,
+            "re-encoding the decoded node must reproduce the identical bytes"
+        );
         // The element_id field is the stringified id (single-instance convention).
         let mut u2 = Unpacker::new(&bytes);
         let _ = u2.read_struct_header().unwrap();
@@ -2838,6 +2972,7 @@ mod tests {
             end: 2,
             rel_type: "KNOWS".to_owned(),
             properties: vec![("since".to_owned(), Value::Integer(2010))],
+            element_ids: None,
         };
         let mut p = Packer::new();
         pack_relationship(&mut p, &rel);
@@ -2856,10 +2991,17 @@ mod tests {
         assert_eq!(u.read_string().unwrap(), "3"); // element_id
         assert_eq!(u.read_string().unwrap(), "1"); // start_element_id
         assert_eq!(u.read_string().unwrap(), "2"); // end_element_id
-        // And it round-trips through the high-level decoder.
+        // And it round-trips through the high-level decoder, now carrying the three element_id
+        // strings it arrived with (`rmp` #911) where the source said "synthesise from the ids".
+        let mut expected = rel.clone();
+        expected.element_ids = Some(Box::new(WireElementIds {
+            element_id: "3".to_owned(),
+            start_element_id: "1".to_owned(),
+            end_element_id: "2".to_owned(),
+        }));
         assert_eq!(
-            bolt_round_trip(&BoltValue::Relationship(rel.clone())),
-            BoltValue::Relationship(rel)
+            bolt_round_trip(&BoltValue::Relationship(rel)),
+            BoltValue::Relationship(expected)
         );
     }
 
@@ -2869,11 +3011,13 @@ mod tests {
             id: 10,
             labels: vec!["P".to_owned()],
             properties: vec![],
+            element_ids: None,
         };
         let n1 = BoltNode {
             id: 11,
             labels: vec!["P".to_owned()],
             properties: vec![],
+            element_ids: None,
         };
         let r0 = BoltRelationship {
             id: 100,
@@ -2881,6 +3025,7 @@ mod tests {
             end: 11,
             rel_type: "R".to_owned(),
             properties: vec![],
+            element_ids: None,
         };
         let path = BoltPath {
             nodes: vec![n0, n1],
@@ -2911,6 +3056,22 @@ mod tests {
         let mut expected = path.clone();
         expected.rels[0].start = 0;
         expected.rels[0].end = 0;
+        // A decoded entity carries the element_id it arrived with (`rmp` #911), where the source
+        // said "synthesise from the id"; on this path they are the stringified ids.
+        for (i, n) in expected.nodes.iter_mut().enumerate() {
+            n.element_ids = Some(Box::new(WireElementIds {
+                element_id: path.nodes[i].id.to_string(),
+                start_element_id: String::new(),
+                end_element_id: String::new(),
+            }));
+        }
+        for (i, r) in expected.rels.iter_mut().enumerate() {
+            r.element_ids = Some(Box::new(WireElementIds {
+                element_id: path.rels[i].id.to_string(),
+                start_element_id: String::new(),
+                end_element_id: String::new(),
+            }));
+        }
         assert_eq!(
             bolt_round_trip(&BoltValue::Path(path)),
             BoltValue::Path(expected)
@@ -2923,12 +3084,23 @@ mod tests {
             id: 1,
             labels: vec!["L".to_owned()],
             properties: vec![],
+            element_ids: None,
         };
+        let mut decoded_node = node.clone();
+        decoded_node.element_ids = Some(Box::new(WireElementIds {
+            element_id: "1".to_owned(),
+            start_element_id: String::new(),
+            end_element_id: String::new(),
+        }));
         let list = BoltValue::List(vec![
             BoltValue::Value(Value::Integer(42)),
             BoltValue::Node(node),
         ]);
-        assert_eq!(bolt_round_trip(&list), list);
+        let expected = BoltValue::List(vec![
+            BoltValue::Value(Value::Integer(42)),
+            BoltValue::Node(decoded_node),
+        ]);
+        assert_eq!(bolt_round_trip(&list), expected);
     }
 
     #[test]
