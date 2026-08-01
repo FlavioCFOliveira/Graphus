@@ -125,7 +125,11 @@ fn zoned_by_zone_id() -> impl Strategy<Value = Value> {
 /// Every temporal `Value` class.
 fn temporal_value() -> impl Strategy<Value = Value> {
     prop_oneof![
-        any::<i64>().prop_map(|d| Value::Date(Date {
+        // Days stay inside the openCypher proleptic-Gregorian year range. `i64` spans ~±25 billion
+        // years, but a `Date` outside `-999999999..=999999999` is not a value the engine can hold or
+        // render, and the decoder refuses it at the boundary rather than storing it (`rmp` #911) —
+        // so generating one would be asserting a round-trip for a value that must not round-trip.
+        (-365_243_219_162i64..=365_241_780_471).prop_map(|d| Value::Date(Date {
             days_since_epoch: d
         })),
         // nanos-of-day stays within a day.
@@ -162,14 +166,27 @@ fn temporal_value() -> impl Strategy<Value = Value> {
         // Zone-id-form zoned date-time (non-empty zone id ⇒ DateTimeZoneId tag). See
         // `zoned_by_zone_id` for why the offset is derived rather than generated.
         zoned_by_zone_id(),
-        (any::<i64>(), any::<i64>(), any::<i64>(), any::<i32>()).prop_map(|(mo, d, s, ns)| {
-            Value::Duration(Duration {
-                months: mo,
-                days: d,
-                seconds: s,
-                nanos: ns,
-            })
-        }),
+        // Sub-second nanoseconds stay in `0..1e9`, the **normalised** domain. Every construction
+        // site in `graphus-cypher`'s `temporal_fns` carries the overflow into the seconds with
+        // `div_euclid`/`rem_euclid` before building a `Duration`, so that is the whole set of values
+        // the engine can hold. The decoder normalises the wider wire domain into it the same way
+        // (`rmp` #911, matching `DurationValue`'s constructor), which is precisely why a raw
+        // `nanos: 1_000_000_000` or `nanos: -1` must NOT round-trip verbatim: those are alternative
+        // spellings that decode to their normal form, not distinct values.
+        (
+            any::<i64>(),
+            any::<i64>(),
+            any::<i64>(),
+            0i32..1_000_000_000
+        )
+            .prop_map(|(mo, d, s, ns)| {
+                Value::Duration(Duration {
+                    months: mo,
+                    days: d,
+                    seconds: s,
+                    nanos: ns,
+                })
+            }),
     ]
 }
 

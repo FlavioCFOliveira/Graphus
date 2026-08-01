@@ -176,6 +176,74 @@ illegal transition and is governed by §1.5 like every other message. A `TELEMET
 `api` value is outside `0..=3` is a different case again — a legal message with a bad argument — and
 takes the recoverable `FAILED` state the message specification mandates for it.
 
+### 1.6 PackStream decode domains (`rmp` #911)
+
+**Ratified rule: an out-of-domain temporal field is handled at the boundary — never stored, never
+re-emitted.** Graphus accepted a `Time` past midnight, a `DateTime`/`LocalDateTime` nanosecond field
+up to `u32::MAX`, an unbounded `Date.days` and any `tz_offset_seconds`, then **re-emitted** them, so
+the failure surfaced at the client as a corrupt server response instead of at the boundary as a
+client error — and the bad value could be stored as a property in between.
+
+The larger consequence was an **identity divergence** of the same class as `rmp` #908: the wire kept
+`nanos: 1_500_000_000` while the engine normalises the same instant to `(+1 s, 500_000_000)`, and the
+temporal types derive `Eq`/`Ord`/`Hash` **component-wise** — so one instant with two spellings
+compared unequal and *sorted apart*, and a property indexed under one spelling could not be found by
+a query written with the other.
+
+#### 1.6.1 The rules are per-tag, and they disagree
+
+The reference readers do **not** apply a single rule, and the differences are load-bearing. Each rule
+below is taken from the reader class for that tag:
+
+| tag | field | rule | reference |
+|---|---|---|---|
+| `Date` 0x44 | `days` | **reject** outside years `-999999999..=999999999` | `DateValue.epochDateRaw` → `assertValidArgument(LocalDate.ofEpochDay)` |
+| `LocalTime` 0x74 | `nanoseconds` | **reject** outside one day | `LocalTimeValue.localTimeRaw` → `assertValidArgument(LocalTime.ofNanoOfDay)` |
+| `Time` 0x54 | `nanoseconds` | **normalise** (wrap into the day) | `TimeValue.timeRaw` → `OffsetTime.ofInstant(Instant.ofEpochSecond(0, n), offset)` |
+| `Time` / `DateTime` | `tz_offset_seconds` | **reject** beyond ±64800 s (18 h) | `zoneOffsetOfTotalSeconds` → `ZoneOffset.ofTotalSeconds` |
+| `LocalDateTime` 0x64 | `nanoseconds` | **normalise** into the seconds | `LocalDateTimeValue.localDateTimeRaw` → `ofInstant(Instant.ofEpochSecond(s, n), UTC)` |
+| `DateTime` 0x49, `DateTimeZoneId` 0x69 | `nanoseconds` | bound to signed 32-bit, then **normalise** | the readers' explicit `Integer` bound + `Instant.ofEpochSecond` |
+| `Duration` 0x45 | `nanoseconds` | full `i64`, then **normalise** into the seconds | `DurationValue`'s constructor carries `nanos / 1e9` into `seconds` |
+
+`Time` and `LocalTime` carry the same field name and take **opposite** rules. Three of the four
+premises this rule set was drafted from were wrong when checked against the source, so the rule for
+any future temporal tag MUST be read off that tag's reader rather than inferred from a neighbour.
+
+Normalisation here is not leniency — it is what makes a wire value and its in-engine twin *the same
+value*. It is applied with **Euclidean** division, so a negative field (which the readers explicitly
+permit) borrows rather than producing a negative component.
+
+#### 1.6.2 Checked arithmetic, never clamping
+
+The UTC-to-local combination (`local = utc + offset`) and the nanosecond carry use **checked**
+arithmetic and refuse on overflow. Saturating silently discards the offset at the edges of the range,
+so `DateTime { seconds: i64::MAX, offset: 3600 }` decoded to a *different* instant than it named and
+re-encoded to *different bytes* — a value that fails no check anywhere and is simply wrong.
+
+For `DateTimeZoneId` the nanosecond carry is applied **before** the zone lookup: the offset a zone
+resolves to is a function of the instant (`rmp` #908 localizes at the decoded instant), and a carry
+can move the instant across a DST boundary.
+
+#### 1.6.3 Structure signatures are bounded to `0..=127`
+
+PackStream specifies a structure's signature as a single **signed** byte, so the high bit is not part
+of the tag space. Graphus accepted the full `0..=255`. The two agree behaviourally today — every tag
+above `0x7F` is unknown and refused either way — but the bound makes the refusal name the real fault
+and stops a future tag table claiming a byte the specification does not give it.
+
+#### 1.6.4 Ratified deviation: strict UTF-8, not lossy substitution
+
+A PackStream string whose bytes are not valid UTF-8 is a **decode error**. The reference server
+substitutes U+FFFD for the malformed sequences and carries on.
+
+Graphus deviates deliberately. Lossy substitution silently changes the client's data: a string that
+arrives malformed is stored, indexed and compared as a *different* string than the one sent, and no
+party is told. That directly contradicts the property everything else in this section exists to
+protect — that a value is either the client's value or an error, never a third thing. Refusing costs
+no interoperability, because every official driver encodes its strings as valid UTF-8; only a
+hand-rolled or corrupting client can produce the case, and such a client is better served by a clear
+error than by silently mangled data.
+
 ---
 
 ## 2. TCK error-classification model

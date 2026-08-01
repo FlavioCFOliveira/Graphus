@@ -124,6 +124,9 @@ pub(crate) const TINY_STRUCT_BASE: u8 = 0xB0; // 0xB0..=0xBF: 0..=15 fields
 const MAX_COLLECTION_LEN: usize = i32::MAX as usize;
 /// A structure has at most 15 fields (the tiny-struct nibble); Bolt never exceeds this.
 pub(crate) const MAX_STRUCT_FIELDS: usize = 15;
+/// The largest valid structure signature (`rmp` #911). PackStream specifies the signature as a
+/// single **signed** byte, so the tag space is `0..=127`; the high bit is not part of it.
+const MAX_STRUCT_TAG: u8 = 0x7F;
 
 /// Upper bound on the number of elements **pre-allocated** from a wire-supplied collection length,
 /// before a single element has been read.
@@ -802,6 +805,19 @@ impl<'a> Unpacker<'a> {
             let field_count = usize::from(m - TINY_STRUCT_BASE);
             debug_assert!(field_count <= MAX_STRUCT_FIELDS);
             let tag = self.read_u8()?;
+            // PackStream bounds a structure's signature to `0..=127` — it is specified as a single
+            // *signed* byte, so the high bit is not part of the tag space (`rmp` #911). Graphus
+            // accepted the full `0..=255`. Behaviourally the two agree today, since every tag above
+            // 0x7F is unknown and rejected a few lines later either way; the bound is tightened here
+            // so the refusal names the real fault ("not a valid signature") instead of "unknown
+            // structure", and so a future tag table can never accidentally claim a byte the
+            // specification does not give it.
+            if tag > MAX_STRUCT_TAG {
+                return Err(BoltError::Decode(format!(
+                    "structure signature {tag:#04x} is out of range: a PackStream signature is a \
+                     signed byte and must be {MAX_STRUCT_TAG:#04x} or below"
+                )));
+            }
             Ok((tag, field_count))
         } else {
             Err(BoltError::Decode(format!(
@@ -1284,34 +1300,68 @@ fn unpack_structured_value(unpacker: &mut Unpacker<'_>) -> BoltResult<Value> {
             // PackStream INTEGER carries the full i64; `Date` is i64 days-since-epoch (#141), so the
             // value is taken as-is with no narrowing.
             let days = unpacker.read_int()?;
+            if !(MIN_EPOCH_DAY..=MAX_EPOCH_DAY).contains(&days) {
+                return Err(BoltError::Decode(format!(
+                    "Date.days {days} is out of range: a date must fall in the proleptic-Gregorian \
+                     years -999999999..=999999999 ({MIN_EPOCH_DAY}..={MAX_EPOCH_DAY} days from the \
+                     epoch)"
+                )));
+            }
             Ok(Value::Date(Date {
                 days_since_epoch: days,
             }))
         }
         tag::LOCAL_TIME => {
             expect_fields(t, field_count, 1)?;
+            // REJECT, not normalise — `LocalTime` is the one temporal tag whose reference reader
+            // bounds its nanosecond field (`LocalTime.ofNanoOfDay`, which throws outside one day)
+            // rather than normalising it. `Time` (0x54), which looks identical, does the opposite;
+            // see the table by `split_nanos`.
             let nanos = read_u64_field(unpacker, "LocalTime.nanoseconds")?;
+            if nanos >= graphus_core::value::temporal::NANOS_PER_DAY {
+                return Err(BoltError::Decode(format!(
+                    "LocalTime.nanoseconds {nanos} is out of range: a time of day must be less than \
+                     one day ({} nanoseconds)",
+                    graphus_core::value::temporal::NANOS_PER_DAY
+                )));
+            }
             Ok(Value::LocalTime(LocalTime {
                 nanos_of_day: nanos,
             }))
         }
         tag::TIME => {
             expect_fields(t, field_count, 2)?;
-            let nanos = read_u64_field(unpacker, "Time.nanoseconds")?;
-            let offset = read_i32_field(unpacker, "Time.tz_offset_seconds")?;
+            // NORMALISE, not reject. The reference builds the value as
+            // `OffsetTime.ofInstant(Instant.ofEpochSecond(0, nanosOfDayUTC), offset)`, which wraps
+            // the count into a day (and back through the offset, which cancels) — so a raw count
+            // past midnight, or a negative one, is a legal spelling of a time of day rather than a
+            // fault. Storing it un-wrapped would break `graphus-core`'s documented
+            // `nanos_of_day < NANOS_PER_DAY` invariant and sort the value apart from its own twin.
+            let raw_nanos = unpacker.read_int()?;
+            let offset = checked_tz_offset(
+                read_i32_field(unpacker, "Time.tz_offset_seconds")?,
+                "Time.tz_offset_seconds",
+            )?;
+            let day = i64::try_from(graphus_core::value::temporal::NANOS_PER_DAY)
+                .expect("INVARIANT: NANOS_PER_DAY is 86_400_000_000_000, well within i64");
+            let nanos_of_day = u64::try_from(raw_nanos.rem_euclid(day))
+                .expect("INVARIANT: rem_euclid on a positive divisor is non-negative");
             Ok(Value::ZonedTime(ZonedTime {
-                time: LocalTime {
-                    nanos_of_day: nanos,
-                },
+                time: LocalTime { nanos_of_day },
                 offset_seconds: offset,
             }))
         }
         tag::LOCAL_DATE_TIME => {
             expect_fields(t, field_count, 2)?;
+            // NORMALISE: `localDateTimeRaw` is `ofInstant(Instant.ofEpochSecond(s, n), UTC)`, and
+            // `Instant.ofEpochSecond` carries the overflow into the seconds. Unlike `DateTime`, this
+            // reader applies no `i32` bound first — it hands the raw long straight through.
             let secs = unpacker.read_int()?;
-            let nanos = read_u32_field(unpacker, "LocalDateTime.nanoseconds")?;
+            let raw_nanos = unpacker.read_int()?;
+            let (carry, nanos) = split_nanos(raw_nanos);
+            let epoch_seconds = checked_seconds(secs, carry, "LocalDateTime")?;
             Ok(Value::LocalDateTime(LocalDateTime {
-                epoch_seconds: secs,
+                epoch_seconds,
                 nanos,
             }))
         }
@@ -1320,20 +1370,29 @@ fn unpack_structured_value(unpacker: &mut Unpacker<'_>) -> BoltResult<Value> {
             // Bolt 5.0+ DateTime carries UTC epoch seconds; reconstruct the stored local instant by
             // re-applying the offset so the round-trip preserves `ZonedDateTime.local`.
             let utc_secs = unpacker.read_int()?;
-            let nanos = read_u32_field(unpacker, "DateTime.nanoseconds")?;
-            let offset = read_i32_field(unpacker, "DateTime.tz_offset_seconds")?;
+            let (carry, nanos) = read_normalised_nanos_i32(unpacker, "DateTime.nanoseconds")?;
+            let offset = checked_tz_offset(
+                read_i32_field(unpacker, "DateTime.tz_offset_seconds")?,
+                "DateTime.tz_offset_seconds",
+            )?;
+            let utc_secs = checked_seconds(utc_secs, carry, "DateTime")?;
             Ok(Value::zoned_date_time(zoned_from_utc(
                 utc_secs,
                 nanos,
                 offset,
                 String::new(),
-            )))
+            )?))
         }
         tag::DATE_TIME_ZONE_ID => {
             expect_fields(t, field_count, 3)?;
             let utc_secs = unpacker.read_int()?;
-            let nanos = read_u32_field(unpacker, "DateTimeZoneId.nanoseconds")?;
+            let (carry, nanos) = read_normalised_nanos_i32(unpacker, "DateTimeZoneId.nanoseconds")?;
             let zone_id = unpacker.read_string()?;
+            // The nanosecond carry is applied BEFORE the zone lookup, not after: the offset a zone
+            // resolves to is a function of the instant (`rmp` #908 localizes at the decoded instant),
+            // and a carry can move the instant across a DST boundary. Localizing first and carrying
+            // afterwards would resolve the offset for a different instant than the one stored.
+            let utc_secs = checked_seconds(utc_secs, carry, "DateTimeZoneId")?;
             // PackStream specifies `DateTimeZoneId` deserialization as *two* steps: build the UTC
             // instant from (seconds, nanoseconds), THEN **localize it to `tz_id`**. The wire form
             // carries no numeric offset precisely because the zone id determines it, so the codec
@@ -1359,14 +1418,25 @@ fn unpack_structured_value(unpacker: &mut Unpacker<'_>) -> BoltResult<Value> {
                 nanos,
                 offset,
                 canonical.to_owned(),
-            )))
+            )?))
         }
         tag::DURATION => {
             expect_fields(t, field_count, 4)?;
             let months = unpacker.read_int()?;
             let days = unpacker.read_int()?;
             let seconds = unpacker.read_int()?;
-            let nanos = read_i32_field(unpacker, "Duration.nanoseconds")?;
+            // The full `i64` range, as the reference accepts (`DurationValue.duration` takes four
+            // `long`s), then NORMALISED into the seconds exactly as its constructor does
+            // (`seconds = secondsWithNanos(seconds, nanos); nanos %= NANOS_PER_SECOND;` with the
+            // negative case borrowing a second). Graphus narrowed the field to `i32` and rejected
+            // anything larger, so a driver could not express a duration the reference accepts —
+            // and `graphus-core`'s `Duration.nanos` is already the post-normalisation `i32`, so no
+            // wider representation is needed to carry the wider wire domain (`rmp` #911).
+            let raw_nanos = unpacker.read_int()?;
+            let (carry, sub_nanos) = split_nanos(raw_nanos);
+            let seconds = checked_seconds(seconds, carry, "Duration")?;
+            let nanos = i32::try_from(sub_nanos)
+                .expect("INVARIANT: split_nanos yields 0..1e9, which fits i32");
             Ok(Value::Duration(Duration {
                 months,
                 days,
@@ -1569,21 +1639,37 @@ fn unpack_path(unpacker: &mut Unpacker<'_>) -> BoltResult<BoltPath> {
 /// `DateTime` (`0x49`), or the value [`timezone::localize_instant`] resolves for
 /// `DateTimeZoneId` (`0x69`). It is the exact inverse of the encoder's `utc = local - offset`,
 /// so the pair round-trips byte-for-byte.
+/// # Errors
+/// [`BoltError::Decode`] when `utc_secs + offset_seconds` is not representable (`rmp` #911).
+///
+/// The addition is **checked**, not saturating. Saturating silently discards the offset at the edges
+/// of the range, so `DateTime { seconds: i64::MAX, offset: 3600 }` decoded to a *different* instant
+/// than it named and then re-encoded to *different bytes* — a value that fails no check anywhere and
+/// is simply wrong. The reference throws (`Instant.ofEpochSecond` / `ZonedDateTime.ofInstant` raise
+/// `DateTimeException`/`ArithmeticException`, which `DateTimeReader` turns into
+/// `invalidTemporalComponent`), and refusing is the only answer that cannot corrupt.
 fn zoned_from_utc(
     utc_secs: i64,
     nanos: u32,
     offset_seconds: i32,
     zone_id: String,
-) -> ZonedDateTime {
-    let local_secs = utc_secs.saturating_add(i64::from(offset_seconds));
-    ZonedDateTime {
+) -> BoltResult<ZonedDateTime> {
+    let local_secs = utc_secs
+        .checked_add(i64::from(offset_seconds))
+        .ok_or_else(|| {
+            BoltError::Decode(format!(
+                "the local instant of a zoned date-time overflows the representable range \
+                 (utc seconds {utc_secs}, offset {offset_seconds})"
+            ))
+        })?;
+    Ok(ZonedDateTime {
         local: LocalDateTime {
             epoch_seconds: local_secs,
             nanos,
         },
         offset_seconds,
         zone_id,
-    }
+    })
 }
 
 fn unpack_bytes(unpacker: &mut Unpacker<'_>) -> BoltResult<Value> {
@@ -1685,9 +1771,105 @@ fn read_u64_field(unpacker: &mut Unpacker<'_>, what: &str) -> BoltResult<u64> {
     u64::try_from(n).map_err(|_| BoltError::Decode(format!("{what} is negative")))
 }
 
-fn read_u32_field(unpacker: &mut Unpacker<'_>, what: &str) -> BoltResult<u32> {
-    let n = unpacker.read_int()?;
-    u32::try_from(n).map_err(|_| BoltError::Decode(format!("{what} out of u32 range")))
+// ---- Temporal domain validation (`rmp` #911) ----------------------------------------------------
+//
+// Every rule below was read off the reference reader for that specific tag, because the readers do
+// NOT agree with one another and the differences are load-bearing. Three of the four premises this
+// task started from turned out to be wrong when checked against the source, so each rule cites the
+// class it came from:
+//
+// | tag                    | field              | behaviour  | reference                                                            |
+// |------------------------|--------------------|------------|----------------------------------------------------------------------|
+// | `Date` 0x44            | `days`             | REJECT     | `DateValue.epochDateRaw` -> `assertValidArgument(LocalDate.ofEpochDay)` |
+// | `LocalTime` 0x74       | `nanoseconds`      | REJECT     | `LocalTimeValue.localTimeRaw` -> `assertValidArgument(LocalTime.ofNanoOfDay)` |
+// | `Time` 0x54            | `nanoseconds`      | NORMALISE  | `TimeValue.timeRaw` -> `OffsetTime.ofInstant(Instant.ofEpochSecond(0, n), offset)` |
+// | `Time` 0x54            | `tz_offset_seconds`| REJECT     | `zoneOffsetOfTotalSeconds` -> `ZoneOffset.ofTotalSeconds`             |
+// | `LocalDateTime` 0x64   | `nanoseconds`      | NORMALISE  | `LocalDateTimeValue.localDateTimeRaw` -> `ofInstant(Instant.ofEpochSecond(s, n), UTC)` |
+// | `DateTime` 0x49        | `nanoseconds`      | i32, then NORMALISE | `DateTimeReader` bound + `Instant.ofEpochSecond`             |
+// | `DateTime` 0x49        | `tz_offset_seconds`| i32, then REJECT    | `DateTimeReader` bound + `zoneOffsetOfTotalSeconds`          |
+// | `DateTimeZoneId` 0x69  | `nanoseconds`      | i32, then NORMALISE | `DateTimeZoneIdReader` bound + `Instant.ofEpochSecond`       |
+// | `Duration` 0x45        | `nanoseconds`      | i64, then NORMALISE | `DurationValue`'s constructor carries `nanos / 1e9` into seconds |
+//
+// NORMALISE is not leniency: it is what makes a wire value and its in-engine twin the SAME value.
+// `graphus-core` documents `LocalDateTime.nanos < 1_000_000_000` and `LocalTime.nanos_of_day <
+// NANOS_PER_DAY`, and derives `Eq`/`Ord`/`Hash` component-wise — so storing an un-normalised field
+// would make two spellings of one instant compare unequal and SORT APART, which is the identity
+// divergence `rmp` #908 closed for zone ids.
+
+/// Nanoseconds in one second.
+const NANOS_PER_SECOND: i64 = 1_000_000_000;
+
+/// The largest absolute UTC offset a `Time` / `DateTime` may carry, in seconds: **18 hours**.
+///
+/// This is `ZoneOffset.ofTotalSeconds`'s documented bound, which the reference reaches through
+/// `zoneOffsetOfTotalSeconds` on both tags. Graphus accepted any `i32` and then used the value as an
+/// **ordering key** (`ZonedTime` orders by `local - offset`), so an absurd offset was not merely
+/// non-conformant — it displaced the value in every index and comparison it took part in.
+const MAX_TZ_OFFSET_SECONDS: i32 = 18 * 60 * 60;
+
+/// Epoch-day bounds of the openCypher proleptic-Gregorian year range `-999_999_999 ..= 999_999_999`,
+/// which is `LocalDate.MIN.toEpochDay()` / `LocalDate.MAX.toEpochDay()` in the reference.
+const MIN_EPOCH_DAY: i64 = -365_243_219_162;
+/// See [`MIN_EPOCH_DAY`].
+const MAX_EPOCH_DAY: i64 = 365_241_780_471;
+
+/// Validates a `tz_offset_seconds` field against the reference's 18-hour bound (`rmp` #911).
+///
+/// # Errors
+/// [`BoltError::Decode`] when the absolute offset exceeds [`MAX_TZ_OFFSET_SECONDS`].
+fn checked_tz_offset(offset: i32, what: &str) -> BoltResult<i32> {
+    if offset.unsigned_abs() > MAX_TZ_OFFSET_SECONDS.unsigned_abs() {
+        return Err(BoltError::Decode(format!(
+            "{what} {offset} is out of range: a UTC offset may not exceed \
+             ±{MAX_TZ_OFFSET_SECONDS} seconds (18 hours)"
+        )));
+    }
+    Ok(offset)
+}
+
+/// Splits a raw nanosecond count into `(whole seconds to carry, sub-second nanos in `0..1e9`)`
+/// (`rmp` #911).
+///
+/// This is `Instant.ofEpochSecond(seconds, nanos)`'s normalisation, which the reference reaches for
+/// `Time`, `LocalDateTime`, `DateTime`, `DateTimeZoneId` and `Duration`. Euclidean division is what
+/// makes it correct for a **negative** raw value — which the reference readers explicitly permit
+/// (they bound `nanos` to the signed `Integer` range, not to `0..`): `-1` nanosecond becomes
+/// `(-1 second, 999_999_999 nanos)`, not `(0, -1)`.
+fn split_nanos(nanos: i64) -> (i64, u32) {
+    let carry = nanos.div_euclid(NANOS_PER_SECOND);
+    // `rem_euclid` on a positive divisor yields `0..NANOS_PER_SECOND`, which always fits `u32`.
+    let sub = u32::try_from(nanos.rem_euclid(NANOS_PER_SECOND))
+        .expect("INVARIANT: rem_euclid(1e9) is in 0..1e9, which fits u32");
+    (carry, sub)
+}
+
+/// Reads a `nanoseconds` field bounded to the signed 32-bit range and normalises it, returning the
+/// seconds to carry and the sub-second remainder (`rmp` #911).
+///
+/// The `i32` bound is the reference's, on `DateTime` and `DateTimeZoneId` alike
+/// (`wrongTypeForFieldNameOrOutOfRange("nanoseconds", "INTEGER", …)`). It is **signed**: Graphus read
+/// these fields as `u32`, which is the wrong domain in both directions — it rejected the negatives the
+/// reference accepts, and accepted values above `i32::MAX` that the reference rejects.
+///
+/// # Errors
+/// [`BoltError::Decode`] when the field is outside the signed 32-bit range.
+fn read_normalised_nanos_i32(unpacker: &mut Unpacker<'_>, what: &str) -> BoltResult<(i64, u32)> {
+    let raw = i64::from(read_i32_field(unpacker, what)?);
+    Ok(split_nanos(raw))
+}
+
+/// Adds `carry` seconds to `seconds` with **checked** arithmetic (`rmp` #911).
+///
+/// # Errors
+/// [`BoltError::Decode`] on overflow. Saturating here would silently move the instant, which is worse
+/// than refusing it: the value would be stored, indexed and re-emitted as a *different* time than the
+/// one the client sent, with nothing anywhere reporting a fault.
+fn checked_seconds(seconds: i64, carry: i64, what: &str) -> BoltResult<i64> {
+    seconds.checked_add(carry).ok_or_else(|| {
+        BoltError::Decode(format!(
+            "{what}: the combination of seconds and nanoseconds overflows the representable range"
+        ))
+    })
 }
 
 fn read_i32_field(unpacker: &mut Unpacker<'_>, what: &str) -> BoltResult<i32> {

@@ -321,8 +321,16 @@ pub mod value {
             pub days: i64,
             /// Whole seconds.
             pub seconds: i64,
-            /// Sub-second nanoseconds (may be negative to share the seconds' sign in
-            /// some constructions; consumers normalise as needed).
+            /// Sub-second nanoseconds, **normalised** to `0 ..= 999_999_999`.
+            ///
+            /// Every producer normalises before constructing: `graphus-cypher`'s
+            /// `temporal_fns` carries the overflow into `seconds` with
+            /// `div_euclid`/`rem_euclid`, and the PackStream decoder does the same
+            /// with the wider `i64` nanosecond field the wire allows (`rmp` #911,
+            /// matching the reference `DurationValue` constructor). So a negative or
+            /// ≥1e9 value is not a spelling this type carries — it is normalised
+            /// away first. Equality is component-wise, so admitting alternative
+            /// spellings would make one duration compare unequal to itself.
             pub nanos: i32,
         }
     }
