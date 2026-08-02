@@ -1,5 +1,12 @@
-//! The **frame-latch tripwire** (`rmp` #974): a debug-build guard proving that no durability
-//! barrier is ever issued while a buffer-pool frame latch is held.
+//! **Lock-held tripwires**: debug-build guards proving that no durability barrier is ever issued
+//! while a lock that must not span I/O is held.
+//!
+//! Two are defined here, one per lock that was measured to convoy behind a barrier:
+//!
+//! * the **frame-latch tripwire** ([`FrameLatchScope`], `rmp` #974) — the buffer pool's per-frame
+//!   latch;
+//! * the **doublewrite-lock tripwire** ([`DwbLockScope`], `rmp` #993) — the mutex guarding the
+//!   doublewrite buffer's device.
 //!
 //! # Why this exists
 //!
@@ -23,15 +30,27 @@
 //! `debug_assertions` on by default, so the whole workspace test suite (including the DST scenarios
 //! and the crash/recovery batteries) exercises the tripwire on every run.
 //!
-//! # Scope of the guarantee
+//! # Scope of each guarantee
 //!
-//! The tripwire covers the **write-ahead-log** barrier, which is the one `rmp` #974 hoisted and the
-//! one whose mutex is shared with the commit path. The doublewrite-staging and home-file barriers
-//! still run under the victim's latch by construction — the frame's bytes must not change while
-//! they are in flight — but `rmp` #974 removed them from the pool's *device* lock, which is what
-//! concurrent readers contend on. Extending the tripwire to those barriers requires the
-//! PostgreSQL-style split of "content lock" from "I/O in progress" and is a separate, documented
+//! **Frame latch (`rmp` #974).** Covers the **write-ahead-log** barrier — the one whose mutex is
+//! shared with the store's commit path. The doublewrite-staging and home-file barriers still run
+//! under the victim's frame latch by construction: the frame's bytes must not change while they are
+//! in flight. What `rmp` #974 removed was their hold on the pool's *device* lock, which is what
+//! concurrent readers contend on. Taking them out of the frame latch as well needs the
+//! PostgreSQL-style split of "content lock" from "I/O in progress" and remains a documented
 //! follow-up.
+//!
+//! **Doublewrite lock (`rmp` #993).** Covers the doublewrite **staging** barrier. Measurement showed
+//! that lock held across its own `fdatasync` — ~96 % of each hold — which capped evictions at
+//! ~1750/s no matter how large the buffer pool was, because every evictor stages through it. The
+//! barrier now runs with the lock released, and this tripwire is what keeps it there.
+//!
+//! A device that offers no shared [`graphus_io::SyncHandle`] (the in-memory DST device; the
+//! encrypted device, whose sync also persists an AEAD nonce counter and so genuinely needs `&mut`)
+//! keeps the barrier under the lock. Those callers therefore do **not** arm the scope — the
+//! invariant is "when a `&self` barrier is available, it runs outside the lock", and arming a
+//! tripwire over a path that cannot satisfy it would only produce a false alarm. See
+//! `graphus_storage::dwb::DwbPageStager`.
 
 /// The current thread's frame-latch nesting depth.
 ///
@@ -100,6 +119,89 @@ impl Drop for FrameLatchScope {
         #[cfg(debug_assertions)]
         DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
     }
+}
+
+/// The current thread's doublewrite-lock nesting depth (`rmp` #993).
+///
+/// Non-zero means this thread is inside a region where it holds the doublewrite buffer's device
+/// mutex. Always `0` in a release build.
+#[cfg(debug_assertions)]
+#[must_use]
+pub fn dwb_lock_depth() -> u32 {
+    DWB_DEPTH.with(std::cell::Cell::get)
+}
+
+/// The current thread's doublewrite-lock nesting depth. Always `0` in a release build.
+#[cfg(not(debug_assertions))]
+#[must_use]
+pub const fn dwb_lock_depth() -> u32 {
+    0
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static DWB_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// An RAII marker for a region in which the current thread holds the doublewrite device mutex
+/// (`rmp` #993).
+///
+/// Construct one alongside the mutex guard and keep it alive for exactly as long as the guard. Like
+/// [`FrameLatchScope`] it is `!Send`/`!Sync`, because the depth is a thread-local and a scope
+/// created on one thread and dropped on another would corrupt both threads' counters.
+#[derive(Debug)]
+pub struct DwbLockScope {
+    _private: std::marker::PhantomData<*const ()>,
+}
+
+impl DwbLockScope {
+    /// Enters a doublewrite-lock region on the current thread.
+    #[must_use]
+    #[inline]
+    pub fn new() -> Self {
+        #[cfg(debug_assertions)]
+        DWB_DEPTH.with(|d| d.set(d.get().saturating_add(1)));
+        Self {
+            _private: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Default for DwbLockScope {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for DwbLockScope {
+    #[inline]
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        DWB_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// Panics (debug builds only) if the current thread holds the doublewrite device mutex.
+///
+/// Call this at every durability barrier that `rmp` #993 moved out of that mutex. `site` names the
+/// barrier so a failure points straight at the offending path.
+///
+/// # Panics
+/// Panics in a debug build if [`dwb_lock_depth`] is non-zero. Compiled out in release.
+#[inline]
+pub fn assert_no_dwb_lock_held(site: &str) {
+    #[cfg(debug_assertions)]
+    {
+        let depth = dwb_lock_depth();
+        assert!(
+            depth == 0,
+            "{site}: a durability barrier (fsync/fdatasync) was issued while holding the \
+             doublewrite device mutex ({depth} deep). This is the `rmp` #993 convoy: every evictor \
+             stages through that mutex, so a barrier inside it serialises all of them regardless of \
+             buffer-pool size. Issue the barrier with the lock released (see `graphus_core::latch`)."
+        );
+    }
+    let _ = site;
 }
 
 /// Panics (debug builds only) if the current thread holds a buffer-pool frame latch.

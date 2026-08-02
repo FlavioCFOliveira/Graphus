@@ -378,6 +378,34 @@ impl<D: BlockDevice> Dwb<D> {
         batch: &[(PageId, &Page)],
         floor: graphus_core::Lsn,
     ) -> Result<()> {
+        self.stage_into_no_sync(region, batch, floor)?;
+        // 2. Make the whole batch durable before the home write may begin.
+        self.sync_device()
+    }
+
+    /// The **write half** of [`stage_into`](Self::stage_into): places the batch's images and header on
+    /// the device but issues **no durability barrier** (`rmp` #993).
+    ///
+    /// Split out so a caller can release the DWB device lock before the barrier. The barrier does not
+    /// need `&mut` access to the device — on a Unix file it is `fsync`/`fdatasync` on a descriptor,
+    /// safe to issue concurrently with reads and with writes through any descriptor for the same
+    /// file — but the `BlockDevice` sync methods take `&mut self`, so holding the lock across the
+    /// barrier was forced by the signature rather than by the protocol. Measurement put that hold at
+    /// ~96 % barrier and it capped evictions at ~1750/s regardless of buffer-pool size.
+    ///
+    /// # The caller's obligation
+    ///
+    /// The staged copy is **not durable** when this returns. A caller MUST issue the barrier — via
+    /// [`sync_device`](Self::sync_device) or a [`graphus_io::SyncHandle`] over the same device — and
+    /// see it succeed **before** writing any of these pages to their home locations. Writing home
+    /// first would defeat the entire purpose of the doublewrite buffer: a torn home write would have
+    /// no durable copy to repair from.
+    fn stage_into_no_sync(
+        &mut self,
+        region: &Region,
+        batch: &[(PageId, &Page)],
+        floor: graphus_core::Lsn,
+    ) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
@@ -398,9 +426,32 @@ impl<D: BlockDevice> Dwb<D> {
         let homes: Vec<PageId> = batch.iter().map(|(p, _)| *p).collect();
         let hdr = Self::encode_header(&homes, floor);
         self.device.write_page(PageId(region.header_slot), &hdr)?;
-        // 2. Make the whole batch durable before the home write may begin.
-        self.device.sync_data()?;
         Ok(())
+    }
+
+    /// Issues the DWB durability barrier through the owned device (`&mut`, so the caller must hold
+    /// the DWB lock). This is the fallback for a device that offers no shared
+    /// [`graphus_io::SyncHandle`]; the eviction path prefers the handle so the barrier runs with the
+    /// lock released (`rmp` #993).
+    ///
+    /// # Errors
+    /// Propagates the device sync failure. Never swallowed: without a durable copy the caller must
+    /// not write home.
+    pub fn sync_device(&mut self) -> Result<()> {
+        self.device.sync_data()
+    }
+
+    /// The device's **shared** durability handle, if it offers one (`rmp` #974/#993).
+    ///
+    /// When present, the eviction path issues its staging barrier through this handle **with the DWB
+    /// device lock released**, so evictors staging into disjoint ring slots no longer serialise
+    /// behind one another's `fdatasync`. `None` for a device that cannot offer one (the in-memory DST
+    /// device; the encrypted device, whose sync also persists the AEAD nonce counter and so genuinely
+    /// needs `&mut self`), in which case the caller keeps the lock across
+    /// [`sync_device`](Self::sync_device) — correct, just not concurrent.
+    #[must_use]
+    pub fn sync_handle(&self) -> Option<std::sync::Arc<dyn graphus_io::SyncHandle>> {
+        self.device.sync_handle()
     }
 
     /// Stages a batch of dirty home pages into the **checkpoint** ([`BATCH_REGION`]) region and makes
@@ -422,6 +473,18 @@ impl<D: BlockDevice> Dwb<D> {
         self.stage_into(&BATCH_REGION, batch, self.floor)
     }
 
+    /// The **write half** of [`stage_batch`](Self::stage_batch): places the batch's images and header
+    /// in the checkpoint region but issues **no durability barrier** (`rmp` #993).
+    ///
+    /// The staged batch is NOT durable when this returns — see
+    /// [`stage_into_no_sync`](Self::stage_into_no_sync) for the caller's obligation.
+    ///
+    /// # Errors
+    /// Returns a storage error if the batch exceeds [`DWB_MAX_BATCH`] or if a DWB write fails.
+    pub fn stage_batch_no_sync(&mut self, batch: &[(PageId, &Page)]) -> Result<()> {
+        self.stage_into_no_sync(&BATCH_REGION, batch, self.floor)
+    }
+
     /// Stages a single evicted home page into eviction-ring **slot** `slot` and makes it durable —
     /// disjoint from the checkpoint batch region and from every other ring slot, so a concurrent
     /// checkpoint or another evictor can never clobber it and vice versa (`rmp` #412 / `rmp` #431).
@@ -437,6 +500,27 @@ impl<D: BlockDevice> Dwb<D> {
         page_id: PageId,
         image: &Page,
     ) -> Result<()> {
+        self.stage_eviction_slot_no_sync(slot, page_id, image)?;
+        self.sync_device()
+    }
+
+    /// The **write half** of [`stage_eviction_slot`](Self::stage_eviction_slot): places the image and
+    /// its header in ring slot `slot` but issues **no durability barrier** (`rmp` #993).
+    ///
+    /// The staged copy is NOT durable when this returns — see
+    /// [`stage_into_no_sync`](Self::stage_into_no_sync) for the caller's obligation. The bytes written
+    /// are byte-for-byte identical to `stage_eviction_slot`'s, and in the same order (data slot, then
+    /// header), so the on-disk protocol and everything [`recover_home`](Self::recover_home) relies on
+    /// are unchanged; only *when* the barrier is issued moves.
+    ///
+    /// # Errors
+    /// Returns a storage error if `slot` is out of range or if a DWB write fails.
+    pub fn stage_eviction_slot_no_sync(
+        &mut self,
+        slot: usize,
+        page_id: PageId,
+        image: &Page,
+    ) -> Result<()> {
         if slot >= DWB_EVICT_RING_SLOTS {
             return Err(GraphusError::Storage(format!(
                 "doublewrite eviction ring slot {slot} out of range (0..{DWB_EVICT_RING_SLOTS})"
@@ -444,7 +528,7 @@ impl<D: BlockDevice> Dwb<D> {
         }
         let region = evict_ring_region(slot);
         // A ring slot never carries a floor — only the batch region does (`rmp` #437).
-        self.stage_into(&region, &[(page_id, image)], graphus_core::Lsn(0))
+        self.stage_into_no_sync(&region, &[(page_id, image)], graphus_core::Lsn(0))
     }
 
     /// Invalidates the **checkpoint** region's batch (so a later recovery finds no batch to repair
@@ -843,12 +927,40 @@ impl Backoff {
 ///
 /// Now each evictor:
 /// 1. **claims** a free ring slot from the [`FreeSlots`] allocator (a brief lock, no I/O held);
-/// 2. **stages** its page into that slot and fsyncs the DWB (holds the DWB device mutex only for this
-///    write+fsync, then releases it);
-/// 3. runs `home_write` to write the page home and fsync the home device — holding **no** DWB lock,
+/// 2. **writes** its page and header into that slot, holding the DWB device mutex **only for the two
+///    `pwrite`s** — then releases it;
+/// 3. **issues the staging barrier with the mutex released** (`rmp` #993), through the device's
+///    shared [`graphus_io::SyncHandle`];
+/// 4. runs `home_write` to write the page home and fsync the home device — holding **no** DWB lock,
 ///    so up to [`DWB_EVICT_RING_SLOTS`] evictors run their home writes concurrently;
-/// 4. **frees** its slot (a brief lock), making it reusable — and, crucially, only *after* the home
-///    write is durable (step 3 returned), so the reuse-after-durable invariant (`rmp` #411) holds.
+/// 5. **frees** its slot (a brief lock), making it reusable — and, crucially, only *after* the home
+///    write is durable (step 4 returned), so the reuse-after-durable invariant (`rmp` #411) holds.
+///
+/// ## Why step 3 is separate from step 2 (`rmp` #993)
+///
+/// `rmp` #431 removed the *home write* from the DWB mutex but left the **staging fsync** inside it,
+/// because `BlockDevice::sync_data` takes `&mut self` and the device lives behind the mutex. So every
+/// evictor still serialised through one `fdatasync`. Measured: that hold was ~96 % barrier, and it
+/// pinned evictions at ~1750/s **independently of buffer-pool size** — with the doublewrite detached,
+/// the same read workload went from 35 950 to 659 590 ops/s at 16 readers, an 18x gap that was
+/// entirely this lock.
+///
+/// The barrier never needed exclusive access: on a Unix file it is `fsync`/`fdatasync` on a
+/// descriptor, which the kernel applies to the *file*, and it is safe to issue concurrently with
+/// reads and with writes through any descriptor for the same file. The `&mut self` signature — not
+/// the protocol — was forcing the serialisation. Splitting the write half from the barrier and
+/// issuing the barrier through a duplicated descriptor keeps the on-disk protocol byte-for-byte
+/// identical while letting evictors on disjoint ring slots overlap.
+///
+/// **Why this is still correct.** Ring slots are byte-disjoint and each evictor owns its slot
+/// exclusively, so a peer's interleaved writes never touch this evictor's bytes. This evictor's
+/// `pwrite`s have *returned* before it issues its barrier, so the barrier covers them (it may also
+/// flush a peer's bytes — harmless, a barrier is never scoped to a region). When the barrier returns,
+/// this slot's copy is durable, which is exactly the precondition step 4 requires.
+///
+/// A device that offers no shared handle (the in-memory DST device; the encrypted device, whose sync
+/// also persists an AEAD nonce counter and so genuinely needs `&mut self`) keeps the barrier inside
+/// the mutex — correct, simply not concurrent.
 ///
 /// Each in-flight evictor owns a **distinct** slot (the allocator hands out distinct indices), so the
 /// slots are byte-disjoint and no evictor can clobber another's copy or the checkpoint batch region
@@ -868,17 +980,99 @@ pub struct DwbPageStager<D: BlockDevice> {
     /// mutex so claiming/freeing a slot never blocks behind another evictor's staging fsync or home
     /// write — that is what removes the convoy.
     free_slots: std::sync::Arc<std::sync::Mutex<FreeSlots>>,
+    /// The DWB device's **shared** durability handle (`rmp` #993), captured once at construction.
+    ///
+    /// When present, the staging barrier is issued through it with the DWB device mutex **released**,
+    /// so evictors on disjoint ring slots no longer serialise behind one another's `fdatasync`.
+    /// `None` for a device that cannot offer one, in which case the barrier stays inside the mutex
+    /// (correct, just not concurrent) — see the type docs.
+    sync_handle: Option<std::sync::Arc<dyn graphus_io::SyncHandle>>,
+    /// Staging timers (`rmp` #993, `dwb-probe` feature only). Compiled out of the production build.
+    #[cfg(feature = "dwb-probe")]
+    probe: std::sync::Arc<probe::DwbProbe>,
+    /// **Measurement-only** A/B switch (`dwb-probe` feature only): when set, the staging barrier is
+    /// issued *inside* the device mutex, reproducing the pre-`rmp` #993 shape.
+    ///
+    /// It exists so a single binary can measure both arms under identical instrumentation, instead of
+    /// comparing two builds patched at different times. The production build does not compile it —
+    /// there is no runtime switch on a durability path.
+    #[cfg(feature = "dwb-probe")]
+    barrier_under_lock: std::sync::atomic::AtomicBool,
 }
 
 impl<D: BlockDevice> DwbPageStager<D> {
     /// Wraps the shared persistent DWB so the pool can stage evicted pages into it, initialising the
     /// eviction-ring free-slot allocator (all [`DWB_EVICT_RING_SLOTS`] slots free).
+    ///
+    /// The device's durability handle is taken **once**, here, and reused for the stager's lifetime,
+    /// so duplicating a descriptor never lands on the eviction path.
     #[must_use]
     pub fn new(dwb: std::sync::Arc<std::sync::Mutex<Dwb<D>>>) -> Self {
+        let sync_handle = dwb
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sync_handle();
         Self {
             dwb,
             free_slots: std::sync::Arc::new(std::sync::Mutex::new(FreeSlots::new())),
+            sync_handle,
+            #[cfg(feature = "dwb-probe")]
+            probe: std::sync::Arc::new(probe::DwbProbe::default()),
+            #[cfg(feature = "dwb-probe")]
+            barrier_under_lock: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// A snapshot of the staging timers (`rmp` #993, `dwb-probe` feature only).
+    #[cfg(feature = "dwb-probe")]
+    #[must_use]
+    pub fn probe_snapshot(&self) -> probe::DwbProbeSnapshot {
+        self.probe.snapshot()
+    }
+
+    /// **Measurement only** (`dwb-probe` feature): selects which arm the staging barrier takes.
+    /// `true` reproduces the pre-`rmp` #993 shape (barrier inside the device mutex).
+    #[cfg(feature = "dwb-probe")]
+    pub fn set_barrier_under_lock(&self, under_lock: bool) {
+        self.barrier_under_lock
+            .store(under_lock, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the staging barrier should run inside the device mutex. Always `false` in a build
+    /// without the `dwb-probe` feature — the production path has no switch.
+    #[inline]
+    fn barrier_inside_lock(&self) -> bool {
+        #[cfg(feature = "dwb-probe")]
+        {
+            self.barrier_under_lock
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }
+        #[cfg(not(feature = "dwb-probe"))]
+        {
+            false
+        }
+    }
+
+    /// Issues the DWB staging barrier, preferring the shared handle so the device mutex is **not**
+    /// held for the duration (`rmp` #993).
+    ///
+    /// Returns `true` when the barrier was issued through the handle (lock-free). `false` means the
+    /// device offers no handle and the caller must fall back to
+    /// [`Dwb::sync_device`](Dwb::sync_device) under the mutex.
+    fn barrier_off_lock(&self) -> Option<Result<()>> {
+        if self.barrier_inside_lock() {
+            return None; // measurement arm: the barrier already ran inside the mutex.
+        }
+        let handle = self.sync_handle.as_ref()?;
+        // The tripwire: this barrier is the one `rmp` #993 moved out of the mutex, and this assertion
+        // is what keeps it out. Compiled out in release.
+        graphus_core::latch::assert_no_dwb_lock_held("DwbPageStager staging barrier");
+        #[cfg(feature = "dwb-probe")]
+        let start = std::time::Instant::now();
+        let r = handle.sync_data();
+        #[cfg(feature = "dwb-probe")]
+        self.probe.record_barrier(start.elapsed().as_nanos() as u64);
+        Some(r)
     }
 
     /// Claims a free eviction-ring slot, **blocking** until one is free, and returns its index. The
@@ -956,19 +1150,53 @@ impl<D: BlockDevice + Send> graphus_bufpool::PageStager for DwbPageStager<D> {
         // explicitly only on the success path and on a staging error (no home write happened); on a
         // home-write error the slot stays claimed by-value here and is freed in the closing block.
         //
-        // 2. STAGE the copy into the claimed slot and make it durable in the DWB. We hold the DWB
-        //    device mutex only for this write+fsync, then release it — so other evictors stage/home
-        //    concurrently. If staging fails, no home write happened and nothing is in flight for this
-        //    slot, so free it and propagate.
+        // 2. WRITE the copy into the claimed slot. The DWB device mutex is held for the two `pwrite`s
+        //    ONLY — the barrier is step 2b, with the mutex released (`rmp` #993). The bytes and their
+        //    order are unchanged (data slot, then header), so the on-disk protocol and everything
+        //    `recover_home` relies on are identical; only the barrier's position moves.
+        #[cfg(feature = "dwb-probe")]
+        let wait_start = std::time::Instant::now();
         let stage_result = {
+            let _dwb_scope = graphus_core::latch::DwbLockScope::new();
             let mut dwb = self
                 .dwb
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            dwb.stage_eviction_slot(slot, page_id, page)
-            // DWB device mutex released here.
+            #[cfg(feature = "dwb-probe")]
+            let hold_start = {
+                let now = std::time::Instant::now();
+                self.probe
+                    .record_lock_wait(now.duration_since(wait_start).as_nanos() as u64);
+                now
+            };
+            let r = if self.sync_handle.is_some() && !self.barrier_inside_lock() {
+                dwb.stage_eviction_slot_no_sync(slot, page_id, page)
+            } else {
+                // No shared handle (in-memory DST device, encrypted device): the barrier needs
+                // `&mut`, so it stays inside the mutex. The scope is deliberately NOT armed around it
+                // — this path cannot satisfy the invariant the tripwire checks, and asserting over it
+                // would be a false alarm rather than a finding.
+                drop(_dwb_scope);
+                dwb.stage_eviction_slot(slot, page_id, page)
+            };
+            drop(dwb);
+            #[cfg(feature = "dwb-probe")]
+            self.probe
+                .record_lock_hold(hold_start.elapsed().as_nanos() as u64);
+            r
+            // DWB device mutex released above.
         };
         if let Err(e) = stage_result {
+            self.free_slot(slot);
+            return Err(e);
+        }
+        // 2b. BARRIER, with the DWB mutex released. Until this returns the staged copy is NOT durable,
+        //     so it MUST precede the home write below — that ordering is the whole point of the
+        //     doublewrite buffer. Our `pwrite`s have already returned, so this barrier covers them;
+        //     a peer staging into a disjoint slot may have its bytes flushed too, which is harmless.
+        if let Some(Err(e)) = self.barrier_off_lock() {
+            // No durable copy ⇒ no home write. Free the slot (nothing is in flight for it) and
+            // propagate: the pool leaves the frame dirty and the page stays resident.
             self.free_slot(slot);
             return Err(e);
         }
@@ -999,7 +1227,7 @@ impl<D: BlockDevice + Send> graphus_bufpool::PageStager for DwbPageStager<D> {
     fn stage_batch_and_sync(&self, batch: &[(PageId, &[u8])]) -> Result<()> {
         // Reborrow each `&[u8]` image as a `&Page` (each is exactly one page; the pool stamped the
         // checksum before calling). The whole batch is staged as ONE durable DWB batch (a single
-        // `sync_data` inside `stage_batch`), so every page is protected before any home write.
+        // barrier), so every page is protected before any home write.
         let mut pages: Vec<(PageId, &Page)> = Vec::with_capacity(batch.len());
         for (page_id, image) in batch {
             let page: &Page = (*image).try_into().map_err(|_| {
@@ -1011,11 +1239,117 @@ impl<D: BlockDevice + Send> graphus_bufpool::PageStager for DwbPageStager<D> {
             })?;
             pages.push((*page_id, page));
         }
-        let mut dwb = self
-            .dwb
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        dwb.stage_batch(&pages)
+        // Same split as the eviction path (`rmp` #993): the mutex covers the writes, the barrier runs
+        // with it released. This path is the checkpoint's, and the checkpoint holds every dirty
+        // frame's latch while it runs — so a barrier inside this mutex blocks concurrent evictors
+        // (which need the same mutex to stage) for its whole duration, on top of the latches the
+        // checkpoint already holds.
+        {
+            let _dwb_scope = graphus_core::latch::DwbLockScope::new();
+            let mut dwb = self
+                .dwb
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if self.sync_handle.is_some() && !self.barrier_inside_lock() {
+                dwb.stage_batch_no_sync(&pages)?;
+            } else {
+                drop(_dwb_scope);
+                return dwb.stage_batch(&pages);
+            }
+        }
+        // The batch is NOT durable until this returns, and every caller writes these pages home only
+        // afterwards.
+        match self.barrier_off_lock() {
+            Some(r) => r,
+            None => Ok(()),
+        }
+    }
+}
+
+/// Doublewrite staging timers (`rmp` #993, `dwb-probe` feature only).
+///
+/// These attribute where an eviction's staging step spends its time — waiting for the device mutex,
+/// holding it, and inside the barrier itself — which is what turns "the doublewrite lock is the
+/// bottleneck" from a hypothesis into a measurement. The whole module is compiled out of the
+/// production build.
+#[cfg(feature = "dwb-probe")]
+pub mod probe {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Per-stager staging counters.
+    #[derive(Default)]
+    pub struct DwbProbe {
+        stages: AtomicU64,
+        lock_wait_nanos: AtomicU64,
+        lock_hold_nanos: AtomicU64,
+        barrier_nanos: AtomicU64,
+        barriers: AtomicU64,
+    }
+
+    impl DwbProbe {
+        /// Records the time one staging step spent **waiting** for the device mutex. This is the
+        /// call that counts the step, so `stages` equals the number of staging steps exactly.
+        #[inline]
+        pub(super) fn record_lock_wait(&self, nanos: u64) {
+            self.stages.fetch_add(1, Ordering::Relaxed);
+            self.lock_wait_nanos.fetch_add(nanos, Ordering::Relaxed);
+        }
+
+        /// Records the time one staging step spent **holding** the device mutex.
+        #[inline]
+        pub(super) fn record_lock_hold(&self, nanos: u64) {
+            self.lock_hold_nanos.fetch_add(nanos, Ordering::Relaxed);
+        }
+
+        /// Records one staging barrier taking `nanos`.
+        #[inline]
+        pub(super) fn record_barrier(&self, nanos: u64) {
+            self.barriers.fetch_add(1, Ordering::Relaxed);
+            self.barrier_nanos.fetch_add(nanos, Ordering::Relaxed);
+        }
+
+        /// A consistent-enough snapshot of the counters (each is read independently; they are
+        /// diagnostics, not a transactional view).
+        #[must_use]
+        pub fn snapshot(&self) -> DwbProbeSnapshot {
+            DwbProbeSnapshot {
+                stages: self.stages.load(Ordering::Relaxed),
+                lock_wait_nanos: self.lock_wait_nanos.load(Ordering::Relaxed),
+                lock_hold_nanos: self.lock_hold_nanos.load(Ordering::Relaxed),
+                barriers: self.barriers.load(Ordering::Relaxed),
+                barrier_nanos: self.barrier_nanos.load(Ordering::Relaxed),
+            }
+        }
+    }
+
+    /// A snapshot of [`DwbProbe`]. All times are wall-clock nanoseconds summed across every thread,
+    /// so a figure may exceed the elapsed wall time of the run.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct DwbProbeSnapshot {
+        /// Staging steps performed (one per dirty eviction).
+        pub stages: u64,
+        /// Total time spent **waiting** for the DWB device mutex.
+        pub lock_wait_nanos: u64,
+        /// Total time spent **holding** the DWB device mutex.
+        pub lock_hold_nanos: u64,
+        /// Staging barriers issued.
+        pub barriers: u64,
+        /// Total time spent inside the staging barrier.
+        pub barrier_nanos: u64,
+    }
+
+    impl DwbProbeSnapshot {
+        /// The element-wise difference `self - before`, for measuring one window.
+        #[must_use]
+        pub fn since(&self, before: &Self) -> Self {
+            Self {
+                stages: self.stages - before.stages,
+                lock_wait_nanos: self.lock_wait_nanos - before.lock_wait_nanos,
+                lock_hold_nanos: self.lock_hold_nanos - before.lock_hold_nanos,
+                barriers: self.barriers - before.barriers,
+                barrier_nanos: self.barrier_nanos - before.barrier_nanos,
+            }
+        }
     }
 }
 

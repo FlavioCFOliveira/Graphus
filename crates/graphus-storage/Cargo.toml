@@ -33,6 +33,12 @@ check-cold-assert = []
 # to certify. Behind a feature, the default gate runs the production shape and the bench opts in.
 bufpool-probe = ["graphus-bufpool/bufpool-probe"]
 
+# Doublewrite staging timers plus the measurement-only A/B switch for where the staging barrier runs
+# (`rmp` #993). Same reasoning as `bufpool-probe`: a feature, not a dev-dependency, so the default
+# certification gate compiles the production shape — and so the barrier-position switch, which must
+# never exist on a durability path in production, is absent from that build entirely.
+dwb-probe = []
+
 [dependencies]
 graphus-core = { path = "../graphus-core" }
 graphus-io = { path = "../graphus-io" }
@@ -82,8 +88,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 # Criterion bench (it drives its own threads and reports a table), so the default harness is off.
 # It reads the pool's write-back timers, hence `required-features` — which also keeps that
 # instrumentation out of the default test gate.
-#   cargo bench -p graphus-storage --bench eviction_convoy --features bufpool-probe
+#   cargo bench -p graphus-storage --bench eviction_convoy --features bufpool-probe,dwb-probe
 [[bench]]
 name = "eviction_convoy"
 harness = false
-required-features = ["bufpool-probe"]
+required-features = ["bufpool-probe", "dwb-probe"]

@@ -175,6 +175,8 @@ struct Rig {
     pool: Arc<Pool>,
     wal: SharedWal<FileLogSink>,
     dir: PathBuf,
+    /// The doublewrite stager, kept so its staging timers can be read (`None` when `CONVOY_DWB=0`).
+    stager: Option<Arc<DwbPageStager<FileBlockDevice>>>,
 }
 
 impl Rig {
@@ -204,14 +206,27 @@ impl Rig {
         // (`CONVOY_DWB=0`) to *attribute* a bottleneck: the stager holds the DWB device mutex across
         // its own staging `fdatasync`, which serialises evictions independently of anything the pool
         // does, so an arm without it isolates the pool's own contention.
-        if env_usize("CONVOY_DWB", 1) != 0 {
+        let stager = if env_usize("CONVOY_DWB", 1) != 0 {
             let dwb_device =
                 FileBlockDevice::open(dir.join("doublewrite.dwb")).expect("open dwb device");
             let dwb = Arc::new(Mutex::new(Dwb::new(dwb_device).expect("build dwb")));
-            pool.set_page_stager(Arc::new(DwbPageStager::new(dwb)));
-        }
+            let stager = Arc::new(DwbPageStager::new(dwb));
+            // `CONVOY_DWB_BARRIER_UNDER_LOCK=1` reproduces the pre-`rmp` #993 shape (staging barrier
+            // inside the DWB device mutex), so both arms come from ONE binary under identical
+            // instrumentation instead of from two separately patched builds.
+            stager.set_barrier_under_lock(env_usize("CONVOY_DWB_BARRIER_UNDER_LOCK", 0) != 0);
+            pool.set_page_stager(Arc::clone(&stager) as Arc<dyn graphus_bufpool::PageStager>);
+            Some(stager)
+        } else {
+            None
+        };
 
-        Self { pool, wal, dir }
+        Self {
+            pool,
+            wal,
+            dir,
+            stager,
+        }
     }
 }
 
@@ -222,6 +237,7 @@ struct ArmResult {
     writer_ops: u64,
     elapsed: Duration,
     probe: graphus_bufpool::probe::WriteBackProbe,
+    dwb: graphus_storage::dwb::probe::DwbProbeSnapshot,
 }
 
 /// Runs one arm: `readers` reader threads and `writers` writer threads over a working set of
@@ -328,11 +344,21 @@ fn run_arm(
     reader_ops.store(0, Ordering::Relaxed);
     writer_ops.store(0, Ordering::Relaxed);
     let probe_before = pool.write_back_probe();
+    let dwb_before = rig
+        .stager
+        .as_ref()
+        .map(|s| s.probe_snapshot())
+        .unwrap_or_default();
     let start = Instant::now();
 
     std::thread::sleep(Duration::from_secs(secs));
     let elapsed = start.elapsed();
     let probe_after = pool.write_back_probe();
+    let dwb = rig
+        .stager
+        .as_ref()
+        .map(|s| s.probe_snapshot().since(&dwb_before))
+        .unwrap_or_default();
     stop.store(true, Ordering::Relaxed);
     for h in handles {
         h.join().expect("join worker");
@@ -361,6 +387,7 @@ fn run_arm(
         writer_ops: writer_ops.load(Ordering::Relaxed),
         elapsed,
         probe,
+        dwb,
     };
     // Free the arm's files: a long sweep would otherwise leave one store + WAL + DWB per arm behind.
     drop(rig.pool);
@@ -457,6 +484,22 @@ fn main() {
             r.probe.wal_ensure_calls,
             r.probe.wal_already_durable,
             r.probe.home_syncs,
+        );
+        let dwb_mean = |nanos: u64, count: u64| {
+            if count > 0 {
+                nanos as f64 / count as f64 / 1e6
+            } else {
+                0.0
+            }
+        };
+        println!(
+            "        # dwb: stages={} lock_hold={:.1}ms/s lock_wait={:.1}ms/s \
+             mean_hold={:.3}ms mean_barrier={:.3}ms",
+            r.dwb.stages,
+            r.dwb.lock_hold_nanos as f64 / 1e6 / secs_f,
+            r.dwb.lock_wait_nanos as f64 / 1e6 / secs_f,
+            dwb_mean(r.dwb.lock_hold_nanos, r.dwb.stages),
+            dwb_mean(r.dwb.barrier_nanos, r.dwb.barriers),
         );
         println!(
             "        # mean ms: write_back={:.3} wal_ensure={:.3} home_sync={:.3} \
