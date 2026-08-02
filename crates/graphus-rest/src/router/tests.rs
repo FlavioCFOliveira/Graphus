@@ -658,8 +658,12 @@ async fn auto_commit_single_read_returns_rows_and_summary() {
 }
 
 /// rmp #527 / `06 §4`: a single-statement auto-commit READ still rejects a write statement, surfaced as
-/// the same `409 Conflict` problem+json the explicit READ transaction produces — the engine enforces it
-/// on the auto-commit path identically.
+/// the same `400 Bad Request` problem+json the explicit READ transaction produces — the engine enforces
+/// it on the auto-commit path identically.
+///
+/// `rmp` #988: this used to be a `409 Conflict` carrying the **retriable**
+/// `Neo.TransientError.Transaction.Outdated`, which told an HTTP client to try again forever. Writing
+/// in read access mode is permanent, so it is now `Neo.ClientError.Statement.AccessMode` / 400.
 #[tokio::test]
 async fn auto_commit_single_read_rejects_write_statement() {
     let h = Harness::new();
@@ -675,10 +679,17 @@ async fn auto_commit_single_read_rejects_write_statement() {
             }),
         ))
         .await;
-    assert_eq!(resp.status(), StatusCode::CONFLICT); // transaction error → 409
+    // `rmp` #988: a permanent client fault → 400, and a NON-retriable `ClientError` code.
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     assert_eq!(content_type(&resp), crate::problem::PROBLEM_JSON);
     let problem = body_json(resp).await;
-    assert!(problem["detail"].as_str().unwrap().contains("read-only"));
+    assert_eq!(problem["code"], "Neo.ClientError.Statement.AccessMode");
+    assert!(
+        problem["detail"]
+            .as_str()
+            .unwrap()
+            .contains("read access mode")
+    );
     assert_eq!(h.registry.open_count(), 0);
 }
 
@@ -1319,10 +1330,18 @@ async fn read_transaction_rejects_write_statement() {
             json!({ "statements": [{ "statement": "CREATE (n)" }] }),
         ))
         .await;
-    assert_eq!(resp.status(), StatusCode::CONFLICT); // transaction error → 409
+    // `rmp` #988: permanent client fault → 400 with the non-retriable AccessMode code, not the
+    // retriable 409/`TransientError` this used to answer.
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     assert_eq!(content_type(&resp), crate::problem::PROBLEM_JSON);
     let problem = body_json(resp).await;
-    assert!(problem["detail"].as_str().unwrap().contains("read-only"));
+    assert_eq!(problem["code"], "Neo.ClientError.Statement.AccessMode");
+    assert!(
+        problem["detail"]
+            .as_str()
+            .unwrap()
+            .contains("read access mode")
+    );
 }
 
 #[tokio::test]
@@ -2102,7 +2121,8 @@ async fn graph_viz_scalar_only_result_is_empty_graph() {
 
 #[tokio::test]
 async fn graph_viz_forces_read_so_a_write_is_rejected() {
-    // The handler forces READ; a write statement is rejected by the engine (→ 409 problem).
+    // The handler forces READ; a write statement is rejected by the engine (→ 400 problem, `rmp` #988:
+    // a permanent access-mode violation, not a retriable conflict).
     let h = Harness::new();
     let token = h.token("alice"); // alice may write; the READ forcing still rejects the statement.
     let resp = h
@@ -2112,7 +2132,7 @@ async fn graph_viz_forces_read_so_a_write_is_rejected() {
             json!({ "statements": [{ "statement": "CREATE (n)" }] }),
         ))
         .await;
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     assert_eq!(content_type(&resp), crate::problem::PROBLEM_JSON);
     // The transaction was opened READ then rolled back; nothing leaks.
     let log = h.engine.log();
@@ -2442,9 +2462,10 @@ async fn columnar_endpoint_forces_read_so_a_write_is_rejected() {
             json!({ "statements": [{ "statement": query }] }),
         ))
         .await;
-    // A write in a READ tx is a `GraphusError::Transaction` → 409 Conflict (the HTTP mapping every
-    // REST endpoint uses for a transaction error, `06 §3.3`).
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    // A write in a READ tx is a permanent access-mode violation → 400 Bad Request with the
+    // non-retriable `Neo.ClientError.Statement.AccessMode` (`rmp` #988; it used to be announced as a
+    // retriable 409/`TransientError`, which told an HTTP client to keep trying something impossible).
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     assert_eq!(content_type(&resp), crate::problem::PROBLEM_JSON);
 
     // It opened a READ tx (forced) and rolled back on the write rejection.

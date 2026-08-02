@@ -125,3 +125,57 @@ A statement or transaction under **Serializable** isolation (a write, or anythin
 explicit transaction) may be aborted with a retriable *serialization failure* to preserve
 serializability. This is normal and expected under contention: catch the error and retry the
 transaction. Standalone reads are never aborted this way.
+
+### Which failures a driver retries, and which it must not
+
+The official Neo4j drivers decide whether to replay a managed transaction
+(`session.executeRead` / `executeWrite`, `session.execute_read` / `execute_write`) from the
+**classification** of the status code Graphus sends: a `TransientError` is replayed with backoff for
+up to `maxTransactionRetryTime` (30 seconds by default), and anything else fails the call at once.
+
+Graphus is deliberate about which side of that line each failure falls on, so a client can always
+tell "try again" from "this can never work":
+
+| What happened | Status code | Retried? | REST |
+| --- | --- | --- | --- |
+| Serialization failure (the case above) | `Neo.TransientError.Transaction.Outdated` | **yes** | `409` |
+| The database is unavailable (server shutting down) | `Neo.TransientError.General.DatabaseUnavailable` | **yes** | `503` |
+| A write statement inside a `READ` transaction | `Neo.ClientError.Statement.AccessMode` | no | `400` |
+| The transaction does not exist — never opened, or already committed / rolled back | `Neo.ClientError.Transaction.TransactionNotFound` | no | `404` |
+| A message that is illegal for the transaction's current state | `Neo.ClientError.Request.Invalid` | no | `400` |
+| The server's `timing.max_transaction_age_ms` elapsed | `Neo.ClientError.Transaction.TransactionTimedOut` | no | `400` |
+| The `tx_timeout` you set at `BEGIN` elapsed | `Neo.ClientError.Transaction.TransactionTimedOutClientConfiguration` | no | `400` |
+| An administrator ran `TERMINATE TRANSACTIONS` | `Neo.ClientError.Statement.ArgumentError` | no | `400` |
+
+The practical consequence: `session.executeRead(tx => tx.run("CREATE (n)"))` fails **immediately**
+with `Neo.ClientError.Statement.AccessMode`. It does not spend the retry budget first, because no
+number of replays makes a write legal in a read transaction — use `executeWrite` instead.
+
+You rarely need to write the retry loop yourself: the drivers' managed-transaction helpers already
+implement exactly this rule.
+
+### A transaction the server reaped for age
+
+The server rolls back any explicit transaction that has been open longer than
+`timing.max_transaction_age_ms` (it pins the MVCC garbage-collection watermark, so an
+indefinitely-held transaction would stop reclamation). The next statement or `COMMIT` on that
+transaction reports **`Neo.ClientError.Transaction.TransactionTimedOut`**, naming the setting that
+stopped it.
+
+That is deliberately a *different* code from `TransactionNotFound`. Both are permanent and
+non-retriable, so a driver behaves identically either way — but they are different facts, and only one
+of them is a diagnosis. "Does not exist" would send you looking for a transaction-lifecycle bug when
+the real cause is a configuration bound; `TransactionTimedOut` tells you to look at
+`timing.max_transaction_age_ms` (or to stop holding the transaction open). `TransactionNotFound` stays
+reserved for an id that was never issued or is already spent.
+
+Graphus emits the same pair the reference server does, split by *who configured the bound*:
+
+| Bound | Code |
+| --- | --- |
+| the server's `timing.max_transaction_age_ms` | `Neo.ClientError.Transaction.TransactionTimedOut` |
+| the client's Bolt `tx_timeout`, sent on `BEGIN` | `Neo.ClientError.Transaction.TransactionTimedOutClientConfiguration` |
+
+Recovering means opening a **new** transaction and doing the work again. That is not something the
+driver may do silently on your behalf: the reaped transaction's earlier statements were rolled back,
+so the application has to know.

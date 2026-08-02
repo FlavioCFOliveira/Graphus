@@ -147,9 +147,13 @@ impl BoltExecutor for LocalBoltExecutor {
         let (ticket, auto_commit) = match tx {
             TxControl::AutoCommit { mode, .. } => (eng.begin_auto_commit(map_mode(mode))?, true),
             TxControl::InExplicit { .. } => {
+                // The simulator's wire seam mirrors the real Bolt seam's classification (`rmp` #988):
+                // a Bolt state-machine violation is the non-retryable
+                // `Neo.ClientError.Request.Invalid`, never the retryable serialization-abort class.
+                // Keeping the two in step is what lets a DST scenario reproduce the real contract.
                 let ticket = self.explicit.ok_or_else(|| {
-                    GraphusError::Transaction(
-                        "RUN in explicit mode with no open transaction".into(),
+                    graphus_core::status::illegal_transaction_request(
+                        "RUN in explicit mode with no open transaction",
                     )
                 })?;
                 (ticket, false)
@@ -177,19 +181,17 @@ impl BoltExecutor for LocalBoltExecutor {
     }
 
     fn commit(&mut self) -> Result<QuerySummary, GraphusError> {
-        let ticket = self
-            .explicit
-            .take()
-            .ok_or_else(|| GraphusError::Transaction("COMMIT with no open transaction".into()))?;
+        let ticket = self.explicit.take().ok_or_else(|| {
+            graphus_core::status::illegal_transaction_request("COMMIT with no open transaction")
+        })?;
         self.engine.borrow_mut().commit(ticket)?;
         Ok(QuerySummary::default())
     }
 
     fn rollback(&mut self) -> Result<(), GraphusError> {
-        let ticket = self
-            .explicit
-            .take()
-            .ok_or_else(|| GraphusError::Transaction("ROLLBACK with no open transaction".into()))?;
+        let ticket = self.explicit.take().ok_or_else(|| {
+            graphus_core::status::illegal_transaction_request("ROLLBACK with no open transaction")
+        })?;
         self.engine.borrow_mut().rollback(ticket)
     }
 }

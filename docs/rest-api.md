@@ -246,17 +246,17 @@ Errors use `Content-Type: application/problem+json`:
 
 | HTTP  | When |
 | ----- | ---- |
-| `400` | Cypher syntax/argument error; malformed body; invalid `access_mode`; `/admin/db/{db}/bulk-import`: neither `phase` nor `end=true` given, an invalid `phase` value, an invalid `{db}` name, an invalid `mode`/`session` value, `mode=fresh` combined with `session=...`, or Mode B's `end=true` with no `session` |
+| `400` | Cypher syntax/argument error; malformed body; invalid `access_mode`; a **write statement in a `READ` transaction** (`Neo.ClientError.Statement.AccessMode` — permanent, do not retry); `/admin/db/{db}/bulk-import`: neither `phase` nor `end=true` given, an invalid `phase` value, an invalid `{db}` name, an invalid `mode`/`session` value, `mode=fresh` combined with `session=...`, or Mode B's `end=true` with no `session` |
 | `401` | missing / invalid / expired Bearer token (and failed `/auth/login`) |
 | `403` | valid token but the principal lacks the required privilege |
-| `404` | unknown / expired transaction id (or one owned by another principal); `/admin/db/{db}/bulk-import`: unknown database |
+| `404` | unknown transaction id — never issued or already spent (or one owned by another principal) — `Neo.ClientError.Transaction.TransactionNotFound`, permanent, do not retry (a transaction the server's max-age sweep stopped is a `400` carrying `Neo.ClientError.Transaction.TransactionTimedOut` instead); `/admin/db/{db}/bulk-import`: unknown database |
 | `406` / `415` | unacceptable `Accept` / unsupported `Content-Type` (`/admin/db/{db}/bulk-import`: an unrecognized `Content-Type` on a `phase=...` call) |
 | `408` | `/admin/db/{db}/bulk-import` only: the session timeout (`bulk_import.session_timeout_ms`) elapsed |
-| `409` | serialization conflict (retriable); `/admin/db/{db}/bulk-import` Mode A: the target database is already `Loading` (a concurrent session), not `Online`, or not empty; Mode B: the database is not `Online`, the named `session` is unknown/expired/busy/belongs to a different database, or a batch exhausted all automatic retries on a persistent SSI conflict |
+| `409` | serialization conflict — `Neo.TransientError.Transaction.Outdated`, **retriable**; `/admin/db/{db}/bulk-import` Mode A: the target database is already `Loading` (a concurrent session), not `Online`, or not empty; Mode B: the database is not `Online`, the named `session` is unknown/expired/busy/belongs to a different database, or a batch exhausted all automatic retries on a persistent SSI conflict |
 | `413` | request body over 4 MiB (over the configured quota for `/admin/db/{db}/bulk-import`) |
 | `429` | too many open transactions, or `/auth/login` rate-limited (retriable) |
 | `500` | internal fault (detail redacted; logged server-side) |
-| `503` | `/admin/db/{db}/bulk-import` Mode B only: the server-wide `mode_b_max_concurrent_sessions` cap is saturated |
+| `503` | the database is unavailable (server shutting down) — `Neo.TransientError.General.DatabaseUnavailable`, **retriable**; the login path is momentarily at its credential-verification capacity; `/admin/db/{db}/bulk-import` Mode B only: the server-wide `mode_b_max_concurrent_sessions` cap is saturated |
 | `507` | insufficient free disk space (`/admin/db/{db}/bulk-import` only) |
 
 ---

@@ -65,7 +65,7 @@ use graphus_cypher::{GraphAccess, NodeId, TxnCoordinator};
 use graphus_io::BlockDevice;
 use graphus_wal::LogSink;
 
-use super::{OpenTx, TxTicket};
+use super::{OpenTxTable, TxTicket};
 
 /// One chunk of already-parsed CSV rows submitted to the engine for Mode B ingestion (`rmp` #520).
 /// Parsing (header decode, `csv::StringRecord` splitting) happens OFF the engine thread (the async
@@ -136,7 +136,7 @@ pub struct BulkImportModeBChunkOutcome {
 ///   `matches!(err, GraphusError::Transaction(_))`.
 pub(super) fn ingest_mode_b_chunk<D, S>(
     coordinator: &TxnCoordinator<D, S>,
-    open: &HashMap<u64, OpenTx>,
+    open: &OpenTxTable,
     ticket: TxTicket,
     chunk: BulkImportModeBChunkInput,
 ) -> Result<BulkImportModeBChunkOutcome>
@@ -262,7 +262,7 @@ mod tests {
 
     fn open_txn(
         coord: &mut TxnCoordinator<MemBlockDevice, MemLogSink>,
-        open: &mut HashMap<u64, OpenTx>,
+        open: &mut OpenTxTable,
         next_ticket: &mut u64,
     ) -> TxTicket {
         let txn = coord.begin(IsolationLevel::Serializable);
@@ -273,7 +273,7 @@ mod tests {
         // visible in the defining module and all its descendants).
         open.insert(
             ticket,
-            OpenTx {
+            super::super::OpenTx {
                 txn,
                 mode: super::super::AccessMode::Write,
                 auto_commit: false,
@@ -285,7 +285,7 @@ mod tests {
     #[test]
     fn unknown_ticket_is_a_clean_transaction_error() {
         let coord = coordinator();
-        let open = HashMap::new();
+        let open = OpenTxTable::new();
         let err = ingest_mode_b_chunk(
             &coord,
             &open,
@@ -302,7 +302,7 @@ mod tests {
     #[test]
     fn ingests_node_chunk_through_the_graph_access_seam() {
         let mut coord = coordinator();
-        let mut open = HashMap::new();
+        let mut open = OpenTxTable::new();
         let mut next_ticket = 0u64;
         let ticket = open_txn(&mut coord, &mut open, &mut next_ticket);
 
@@ -329,7 +329,7 @@ mod tests {
     #[test]
     fn ingests_rel_chunk_resolving_against_the_confirmed_id_map() {
         let mut coord = coordinator();
-        let mut open = HashMap::new();
+        let mut open = OpenTxTable::new();
         let mut next_ticket = 0u64;
         let ticket = open_txn(&mut coord, &mut open, &mut next_ticket);
 
@@ -368,7 +368,7 @@ mod tests {
     #[test]
     fn unknown_endpoint_is_a_terminal_storage_error() {
         let mut coord = coordinator();
-        let mut open = HashMap::new();
+        let mut open = OpenTxTable::new();
         let mut next_ticket = 0u64;
         let ticket = open_txn(&mut coord, &mut open, &mut next_ticket);
 
@@ -389,7 +389,7 @@ mod tests {
     #[test]
     fn malformed_typed_cell_is_a_terminal_parse_error() {
         let mut coord = coordinator();
-        let mut open = HashMap::new();
+        let mut open = OpenTxTable::new();
         let mut next_ticket = 0u64;
         let ticket = open_txn(&mut coord, &mut open, &mut next_ticket);
 

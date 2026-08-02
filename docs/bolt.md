@@ -196,6 +196,21 @@ dialing. To use UDS you therefore speak Bolt directly over the socket. Two optio
     mid-execution by the deadline currently surfaces the generic cancellation failure
     (`Neo.ClientError.Statement.ArgumentError`, message `query cancelled`) — the same non-retryable
     classification, with a less specific title.
+- **Retryability.** The `FAILURE` code's classification segment tells the driver whether to replay a
+  managed transaction (`session.executeRead` / `executeWrite`): `TransientError` is replayed for up
+  to `maxTransactionRetryTime` (30 s by default), everything else fails immediately. Graphus sends
+  `Neo.TransientError.Transaction.Outdated` for a **serialization abort** and
+  `Neo.TransientError.General.DatabaseUnavailable` for an unavailable database — both retriable —
+  and non-retriable `ClientError` codes for the permanent faults:
+  `Neo.ClientError.Statement.AccessMode` (a write statement inside a `BEGIN {mode: "r"}`
+  transaction), `Neo.ClientError.Transaction.TransactionNotFound` (a `RUN`/`COMMIT` naming a
+  transaction that was never opened or is already spent),
+  `Neo.ClientError.Transaction.TransactionTimedOut` (one the server's
+  `timing.max_transaction_age_ms` sweep stopped — the server-configured twin of the
+  client-configured `tx_timeout` code above), and `Neo.ClientError.Request.Invalid` (a message illegal
+  for the session's transaction state: `RUN` with no transaction open, `BEGIN` when one already is,
+  `COMMIT`/`ROLLBACK` with none). The full contract, and why each code was chosen, is
+  `specification/06-bolt-and-error-shapes.md` §2.5.
 - **Result summary.** After a query's records, the trailing `SUCCESS` carries the summary:
   `type` — the query type (`r` read, `w` write, `rw` read-write, `s` schema/admin) — and
   `stats`, the side-effect counters (`nodes-created`/`-deleted`, `relationships-created`/`-deleted`,

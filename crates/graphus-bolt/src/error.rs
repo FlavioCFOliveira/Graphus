@@ -119,6 +119,29 @@ impl Failure {
 /// faithfully derived from the variant; only the fine-grained third/fourth segments are the
 /// best-effort placeholders the `06 §2.4` flag will pin verbatim.
 ///
+/// ## The variant is the fallback, not the retryability decision (`rmp` task #988)
+///
+/// The row for [`GraphusError::Transaction`] reads "retriable serialization/abort" because that is
+/// now all it carries. It used to carry much more: a write attempted in a READ transaction, a request
+/// naming a transaction that does not exist, an illegal message for the session's transaction state,
+/// and an engine that had shut down were **all** announced as
+/// `Neo.TransientError.Transaction.Outdated`. A driver reading that classification replays the unit
+/// of work until `maxTransactionRetryTime` (30 s) is spent and then reports a timeout instead of the
+/// real, permanent cause — so `session.executeRead` running a `CREATE` failed after 30 seconds with
+/// the wrong error.
+///
+/// Those conditions are now constructed by [`graphus_core::status`], which pairs each with a verbatim
+/// Neo4j leaf code **and** a carrier variant of the matching classification, so the retry answer is
+/// right whether or not the verbatim code survives:
+///
+/// | condition | `code` | retriable |
+/// | --- | --- | --- |
+/// | write statement in a READ transaction | `Neo.ClientError.Statement.AccessMode` | no |
+/// | unknown / spent transaction ticket | `Neo.ClientError.Transaction.TransactionNotFound` | no |
+/// | illegal request for the transaction state | `Neo.ClientError.Request.Invalid` | no |
+/// | engine unavailable (shutting down) | `Neo.TransientError.General.DatabaseUnavailable` | **yes** |
+/// | serialization abort (SSI pivot / write-write) | `Neo.TransientError.Transaction.Outdated` | **yes** |
+///
 /// ## Verbatim leaf codes for common driver-observable errors (`rmp` task #814)
 ///
 /// A few Neo4j leaf codes are *driver-observable* — an application switches on the exact string

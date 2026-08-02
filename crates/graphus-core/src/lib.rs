@@ -30,6 +30,11 @@ pub mod temporal_calc;
 /// (instant → offset, and local wall clock → offset with the DST gap/overlap rules).
 pub mod timezone;
 
+/// Verbatim Neo4j status codes for the driver-observable transaction failures, and the constructors
+/// that pair each code with a carrier [`GraphusError`] variant of the same classification
+/// (`rmp` task #988). This is where "may the client retry this?" is decided — see the module docs.
+pub mod status;
+
 /// Identifier newtypes used across the storage, transaction, and query layers.
 pub mod ids {
     /// Physical page identifier within a store file.

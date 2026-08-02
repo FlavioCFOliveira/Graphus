@@ -41,6 +41,25 @@
 //!
 //! A 409 (Conflict) for a transaction error is the HTTP-idiomatic "retriable conflict" signal,
 //! matching the Bolt `TransientError` classification drivers act on.
+//!
+//! ## Retryability does not come from the variant alone (`rmp` task #988)
+//!
+//! The table above is the **fallback**. [`GraphusError::Transaction`] used to be the carrier for both
+//! a genuine serialization abort (retriable) and a pile of permanent misuse errors — writing in a
+//! READ transaction, naming a transaction that does not exist, an illegal message for the current
+//! transaction state — so every one of those was announced as a retriable 409/`TransientError`. Those
+//! conditions now travel on a carrier variant of the correct class, carrying a verbatim Neo4j leaf
+//! code (see [`graphus_core::status`]), and are answered here with the status that code deserves:
+//!
+//! | condition | `code` | HTTP |
+//! | --- | --- | --- |
+//! | write statement in a READ transaction | `Neo.ClientError.Statement.AccessMode` | 400 |
+//! | unknown / spent transaction handle | `Neo.ClientError.Transaction.TransactionNotFound` | 404 |
+//! | illegal request for the transaction state | `Neo.ClientError.Request.Invalid` | 400 |
+//! | engine unavailable (shutting down) | `Neo.TransientError.General.DatabaseUnavailable` | 503 |
+//!
+//! A genuine serialization abort is unchanged: 409 with
+//! `Neo.TransientError.Transaction.Outdated`, retriable.
 
 use graphus_auth::AuthError;
 use graphus_core::{
@@ -432,7 +451,40 @@ const CODE_SERVER_BUSY: &str = "Neo.TransientError.General.DatabaseUnavailable";
 /// - `DatabaseError` → **500 Internal Server Error** (server fault);
 /// - anything else (`ClientError`, or a malformed code) → **400 Bad Request** (client fault) — the
 ///   conservative default that matches the `Neo.ClientError.Request.Invalid` these codes refine.
+///
+/// Two leaf codes are answered more precisely than their classification alone would give (`rmp` task
+/// #988), because HTTP has a *better* status for them than the class default and REST clients branch
+/// on the status long before they read the body:
+///
+/// - `Neo.ClientError.Transaction.TransactionNotFound` → **404 Not Found**, not the ClientError
+///   default of 400. The named resource is a transaction that does not exist, which is what 404
+///   means; it is also what the reference server answers (`TransactionNotFoundException` passes
+///   `Response.Status.NOT_FOUND`) and what [`Problem::unknown_transaction`] — the twin the router
+///   raises when it fails to resolve the id itself — has always answered. Routing both to the same
+///   status *and* the same `type` URN means one condition has one REST shape however it is detected.
+/// - `Neo.TransientError.General.DatabaseUnavailable` → **503 Service Unavailable**, not the
+///   TransientError default of 409. 409 means "conflict with the target resource's current state"
+///   (RFC 9110 §15.5.10) — a serialization abort — whereas this code means the server cannot serve
+///   the request at all right now, which is precisely 503 (RFC 9110 §15.6.4). It is also the status
+///   [`Problem::service_unavailable`] already answers for the same leaf code, so the two agree.
 fn problem_shape_for_leaf_code(code: &str) -> (StatusCode, &'static str, &'static str) {
+    match code {
+        CODE_TXN_NOT_FOUND => {
+            return (
+                StatusCode::NOT_FOUND,
+                "unknown-transaction",
+                "unknown transaction",
+            );
+        }
+        CODE_SERVER_BUSY => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service-unavailable",
+                "service unavailable",
+            );
+        }
+        _ => {}
+    }
     match code.split('.').nth(1) {
         Some("TransientError") => (StatusCode::CONFLICT, "transient", "transient error"),
         Some("DatabaseError") => (
@@ -545,8 +597,11 @@ mod tests {
             problem_shape_for_leaf_code("Neo.ClientError.Database.DatabaseNotFound").0,
             StatusCode::BAD_REQUEST
         );
+        // A TransientError leaf with no more precise HTTP answer keeps the class default of 409.
+        // (`Neo.TransientError.General.DatabaseUnavailable` is deliberately NOT the probe here — it
+        // is one of the two codes `rmp` #988 refines; see the test below.)
         assert_eq!(
-            problem_shape_for_leaf_code("Neo.TransientError.General.DatabaseUnavailable").0,
+            problem_shape_for_leaf_code("Neo.TransientError.Transaction.DeadlockDetected").0,
             StatusCode::CONFLICT
         );
         assert_eq!(
@@ -561,6 +616,59 @@ mod tests {
         let p = Problem::from_graphus_error(&GraphusError::Storage(msg));
         assert_eq!(p.status, 500);
         assert_eq!(p.detail.as_deref(), Some(GENERIC_SERVER_FAULT_DETAIL));
+    }
+
+    #[test]
+    fn the_two_refined_leaf_codes_get_a_better_status_than_their_class_default() {
+        // `rmp` #988. Both of these would land on their classification default (400 / 409) if the
+        // shape were derived from the classification segment alone, and both have a strictly better
+        // HTTP answer that REST clients branch on before they read the body.
+
+        // An unknown/spent transaction handle is a missing resource: 404, not 400.
+        let (status, kind, title) =
+            problem_shape_for_leaf_code("Neo.ClientError.Transaction.TransactionNotFound");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        // ... and it lands on the SAME `type` URN + title as `Problem::unknown_transaction`, the twin
+        // the router raises when it fails to resolve the id itself: one condition, one REST shape,
+        // however it is detected.
+        let router_twin = Problem::unknown_transaction("7");
+        assert_eq!(format!("urn:graphus:error:{kind}"), router_twin.type_uri);
+        assert_eq!(title, router_twin.title);
+        assert_eq!(status.as_u16(), router_twin.status);
+
+        // An unavailable engine cannot serve the request at all: 503, not 409 ("conflict with the
+        // target resource's current state", RFC 9110 §15.5.10, which this is not).
+        let (status, kind, title) =
+            problem_shape_for_leaf_code("Neo.TransientError.General.DatabaseUnavailable");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        // Same agreement with `Problem::service_unavailable`, which already answers 503 for this leaf.
+        let busy_twin = Problem::service_unavailable("busy");
+        assert_eq!(format!("urn:graphus:error:{kind}"), busy_twin.type_uri);
+        assert_eq!(status.as_u16(), busy_twin.status);
+        assert_eq!(title, "service unavailable");
+
+        // End to end, through the constructor a seam actually calls.
+        let p = Problem::from_graphus_error(&graphus_core::status::database_unavailable(
+            "engine unavailable (server shutting down)",
+        ));
+        assert_eq!(p.status, 503);
+        assert_eq!(
+            p.code.as_deref(),
+            Some("Neo.TransientError.General.DatabaseUnavailable")
+        );
+        // Still a retriable TransientError — this fix moves the STATUS, never the retryability.
+        assert!(p.code.as_deref().unwrap().contains("TransientError"));
+
+        let p = Problem::from_graphus_error(&graphus_core::status::transaction_not_found(
+            "transaction handle 7",
+        ));
+        assert_eq!(p.status, 404);
+        assert_eq!(
+            p.code.as_deref(),
+            Some("Neo.ClientError.Transaction.TransactionNotFound")
+        );
+        // Non-retryable: a ClientError, NOT the transient class it used to be announced as.
+        assert!(!p.code.as_deref().unwrap().contains("TransientError"));
     }
 
     #[test]

@@ -6,7 +6,6 @@
 //! All of this runs on the **single engine thread** (see [`super`]), so it may block freely (storage
 //! I/O, the WAL group-commit `fdatasync`) without touching a Tokio runtime worker (`04 §9.1`).
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -29,7 +28,7 @@ use super::command::{AccessMode, QueryPlan, Reply};
 use super::privileges::EffectivePrivileges;
 use super::read_pool::{ReadDispatch, ReadTask};
 use super::stream::{RowReceiver, RowSender, SummarySink};
-use super::{OpenTx, RunReply, RunSummary, TxTicket};
+use super::{OpenTxTable, RunReply, RunSummary, TxTicket};
 use crate::metrics::Metrics;
 
 /// The default capacity of the engine's compiled-plan cache (`rmp` task #322). A few hundred distinct
@@ -333,7 +332,7 @@ pub(super) fn handle_run<
     S: LogSink + Send + Sync + 'static,
 >(
     coordinator: &mut TxnCoordinator<D, S>,
-    open: &mut HashMap<u64, OpenTx>,
+    open: &mut OpenTxTable,
     plan_cache: &mut EnginePlanCache,
     ticket: TxTicket,
     query: &str,
@@ -390,15 +389,20 @@ pub(super) fn handle_run<
         .and_then(|d| Instant::now().checked_add(d));
 
     // Resolve the open transaction.
-    let Some(tx) = open.get(&ticket.0) else {
-        let _ = reply.send(Err(GraphusError::Transaction(format!(
-            "run in unknown transaction {}",
-            ticket.0
-        ))));
+    // Both fields are `Copy`, so they are lifted out of the entry here: that ends the immutable borrow
+    // of `open` immediately, leaving the `else` arm free to take the `&mut` its error path needs.
+    let Some((txn, mode)) = open.get(&ticket.0).map(|tx| (tx.txn, tx.mode)) else {
+        // A permanent, NON-retryable client fault (`rmp` #988): the ticket names a transaction the
+        // engine does not have. Replaying this RUN against this ticket can never find it, so it must
+        // NOT be announced as the retryable serialization-abort class, which used to send the driver's
+        // managed-transaction loop round for its full 30 s budget. `unknown_ticket_error` separates
+        // "the age sweep stopped it" (`TransactionTimedOut`) from "it never existed / is spent"
+        // (`TransactionNotFound`) — same class either way, but only one of them tells an operator why.
+        let _ = reply.send(Err(
+            open.unknown_ticket_error(ticket.0, "RUN in transaction")
+        ));
         return RunOutcome::Done;
     };
-    let txn = tx.txn;
-    let mode = tx.mode;
 
     // Compile + bind off any store borrow (pure pipeline). A compile error is raised before any side
     // effect, exactly as the TCK requires (`04 §7.3`). The catalog reflects the coordinator's current
@@ -447,9 +451,13 @@ pub(super) fn handle_run<
     // miss a child-bearing operator and let a nested write escape the READ-mode gate).
     if mode == AccessMode::Read && plan_query_type != graphus_cypher::QueryType::Read {
         finish_failed_autocommit(coordinator, open, ticket, auto_commit, metrics, db);
-        let _ = reply.send(Err(GraphusError::Transaction(
-            "write statement attempted in a READ transaction".to_owned(),
-        )));
+        // A permanent, NON-retryable client fault (`rmp` #988): the reference server's
+        // `Neo.ClientError.Statement.AccessMode`. This is the headline case — a client that calls
+        // `session.executeRead` and runs a `CREATE` used to be told the retryable
+        // `Neo.TransientError.Transaction.Outdated`, so the driver replayed the doomed unit of work
+        // until `maxTransactionRetryTime` (30 s) expired and then reported a timeout instead of the
+        // real cause. No replay makes a write legal in a READ transaction.
+        let _ = reply.send(Err(graphus_core::status::write_in_read_access_mode()));
         return RunOutcome::Done;
     }
 
@@ -1367,7 +1375,7 @@ pub(super) fn resume_inflight<
 >(
     inflight: &mut InFlightInline,
     coordinator: &mut TxnCoordinator<D, S>,
-    open: &mut HashMap<u64, OpenTx>,
+    open: &mut OpenTxTable,
     extensions: &ExtensionRegistry,
     metrics: &Metrics,
     db: &str,
@@ -1592,7 +1600,7 @@ fn unwrap_row(item: super::stream::RowItem) -> Vec<graphus_cypher::MaterializedV
 fn finalize_inflight<D: BlockDevice, S: LogSink>(
     inflight: &mut InFlightInline,
     coordinator: &mut TxnCoordinator<D, S>,
-    open: &mut HashMap<u64, OpenTx>,
+    open: &mut OpenTxTable,
     produced_ok: bool,
     metrics: &Metrics,
     db: &str,
@@ -1750,7 +1758,7 @@ fn to_parameters(params: Vec<(String, graphus_core::Value)>) -> Parameters {
 #[allow(clippy::too_many_arguments)] // commit bookkeeping + the #566 group-commit batch, all positional
 fn finish_autocommit<D: BlockDevice, S: LogSink>(
     coordinator: &mut TxnCoordinator<D, S>,
-    open: &mut HashMap<u64, OpenTx>,
+    open: &mut OpenTxTable,
     ticket: TxTicket,
     produced_ok: bool,
     row_tx: &RowSender,
@@ -1850,7 +1858,7 @@ pub(super) fn bookmark_token(db: &str, commit_ts: graphus_core::Timestamp) -> St
 /// for an explicit transaction (the caller still owns it).
 fn finish_failed_autocommit<D: BlockDevice, S: LogSink>(
     coordinator: &mut TxnCoordinator<D, S>,
-    open: &mut HashMap<u64, OpenTx>,
+    open: &mut OpenTxTable,
     ticket: TxTicket,
     auto_commit: bool,
     metrics: &Metrics,

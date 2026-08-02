@@ -521,14 +521,33 @@ function fail(msg) {
 }
 
 // Resolve the driver's own view of retryability robustly across driver minors: the preferred
-// `err.retryable` boolean (falls back to the static isRetryable/isRetriable helpers).
+// `err.retryable` boolean, falling back to the static isRetryable/isRetriable helpers.
+//
+// Every candidate is guarded: in neo4j-driver 6.2.0 the module-level `neo4j.isRetriableError` is
+// `Neo4jError.isRetriable` re-exported DETACHED from its class, so calling it throws
+// `TypeError: this.isRetryable is not a function`. A candidate that throws must be skipped, not
+// allowed to abort the probe. Returns `null` only when NO mechanism answered — which the caller
+// treats as a hard failure, never as a pass (`rmp` #988: this returned `null` silently and the
+// `retryable === true` check below could therefore never fire).
 function driverRetryable(err) {
-  if (typeof err.retryable === 'boolean') return err.retryable;
-  if (typeof err.retriable === 'boolean') return err.retriable;
-  const E = neo4j.Neo4jError;
-  if (E && typeof E.isRetryable === 'function') return E.isRetryable(err);
-  if (E && typeof E.isRetriable === 'function') return E.isRetriable(err);
-  return null; // unknown to this driver version
+  const rejected = [];
+  const candidates = [
+    ['err.retryable', () => err.retryable],
+    ['err.retriable', () => err.retriable],
+    ['Neo4jError.isRetryable', () => neo4j.Neo4jError.isRetryable(err)],
+    ['Neo4jError.isRetriable', () => neo4j.Neo4jError.isRetriable(err)],
+    ['neo4j.isRetryableError', () => neo4j.isRetryableError(err)],
+  ];
+  for (const [name, probe] of candidates) {
+    try {
+      const v = probe();
+      if (typeof v === 'boolean') return { value: v, mechanism: name, rejected };
+      rejected.push(name + '=' + JSON.stringify(v));
+    } catch (e) {
+      rejected.push(name + '=threw(' + (e && e.message ? e.message : String(e)) + ')');
+    }
+  }
+  return { value: null, mechanism: null, rejected };
 }
 
 (async () => {
@@ -560,10 +579,21 @@ function driverRetryable(err) {
     if (classification !== 'ClientError') {
       fail(`classification = ${classification}, expected ClientError (retryability must not move)`);
     }
-    // (c) The driver's own retryability view must not be true (non-retryable), whenever it exposes one.
-    const retryable = driverRetryable(caught);
-    if (retryable === true) {
+    // (c) The driver's own retryability view must be FALSE. Asserted positively, never as
+    // "not true": a mechanism that answered nothing used to leave this gate passing vacuously.
+    const probe = driverRetryable(caught);
+    const retryable = probe.value;
+    if (retryable === null) {
+      fail('no driver mechanism reported retryability, so this gate would pass vacuously; tried: ' + probe.rejected.join(', '));
+    }
+    if (retryable !== false) {
       fail('driver reports the DatabaseNotFound error as retryable — classification moved to transient');
+    }
+    // Non-vacuity of the mechanism itself: the SAME resolver must answer `true` for a code that IS
+    // retryable, so a stub that always returned `false` could not green this assertion.
+    const transientProbe = driverRetryable(new neo4j.Neo4jError('synthetic', 'Neo.TransientError.Transaction.Outdated'));
+    if (transientProbe.value !== true) {
+      fail('the retryability resolver (' + probe.mechanism + ') did not report a genuine TransientError as retryable, so its `false` above proves nothing; got ' + JSON.stringify(transientProbe.value));
     }
 
     // (d) The connection stays usable: a query against the real default database still round-trips.
@@ -578,7 +608,241 @@ function driverRetryable(err) {
       }
     }
 
-    console.log('GRAPHUS_DBNOTFOUND_OK:retryable=' + JSON.stringify(retryable));
+    console.log('GRAPHUS_DBNOTFOUND_OK:retryable=' + JSON.stringify(retryable) + ' mechanism=' + probe.mechanism);
+    process.exit(0);
+  } catch (err) {
+    fail((err && err.stack) ? err.stack : String(err));
+  } finally {
+    await driver.close();
+  }
+})();
+"#;
+
+/// A Node.js script that proves a write inside `session.executeRead` is answered with the verbatim,
+/// NON-retryable `Neo.ClientError.Statement.AccessMode` and is **not replayed** by the official
+/// driver (rmp #988).
+///
+/// This is the headline case of #988: Graphus used to announce that permanent fault as the
+/// **retryable** `Neo.TransientError.Transaction.Outdated`, so the official driver's managed-transaction
+/// executor replayed the doomed unit of work until `maxTransactionRetryTime` (30 s by default) was
+/// spent and then reported a *timeout* instead of the real cause. Only the reference driver can prove
+/// the fix reaches the wire as the ecosystem reads it, because the retry decision is made **inside the
+/// driver** from the classification segment of the code.
+///
+/// It asserts, in order:
+///
+/// - **(a) non-vacuity control first** — the *identical* `CREATE` statement inside `session.executeWrite`
+///   SUCCEEDS (and the node is really there). Without this the rejection below could come from an
+///   unrelated fault and would prove nothing; a control failure is reported under its own distinct
+///   `ACCESSMODE CONTROL FAILURE` label;
+/// - **(b)** the same statement inside `session.executeRead` REJECTS;
+/// - **(c)** `err.code === 'Neo.ClientError.Statement.AccessMode'` (and the classification segment is
+///   `ClientError`);
+/// - **(d)** the DRIVER itself considers it non-retryable, resolved through the driver's own public
+///   surface and printed with the mechanism that produced it. A verdict that is not a boolean is a
+///   HARD failure, so the assertion can never pass vacuously — and the very same mechanism is
+///   cross-checked to report `true` for a synthetic `Neo.TransientError.Transaction.Outdated`, so a
+///   mechanism that answered a constant `false` cannot green this test;
+/// - **(e) timing** — the wall-clock around `executeRead` is far under the driver's 30 s
+///   `maxTransactionRetryTime` (ceiling: 5 s). The retry budget is deliberately **left at its default**
+///   (never lowered), so this is what distinguishes "failed immediately" from "burned the budget";
+/// - the rejected write left NO node behind, and the connection keeps serving afterwards.
+///
+/// Prints the measured elapsed ms and the code, then `GRAPHUS_ACCESSMODE_OK` and exits 0 only on full
+/// success; any mismatch exits 1 with a clear message. Connection params arrive via argv.
+const READ_ACCESS_MODE_SCRIPT: &str = r#"
+'use strict';
+const neo4j = require('neo4j-driver');
+
+const [, , port, user, password] = process.argv;
+const uri = `bolt+ssc://127.0.0.1:${port}`;
+
+// The one statement under test. It is run VERBATIM twice: once in a WRITE managed transaction (the
+// non-vacuity control, which must succeed) and once in a READ managed transaction (the probe, which
+// must be permanently rejected). Plain ASCII label on purpose.
+const WRITE_STATEMENT = 'CREATE (:InteropReadProbe {v: 1})';
+const EXPECTED_CODE = 'Neo.ClientError.Statement.AccessMode';
+// The driver's own default managed-transaction retry budget
+// (`packages/core/src/internal/transaction-executor.ts`: DEFAULT_MAX_RETRY_TIME_MS = 30 * 1000).
+// It is NEVER overridden below: the point of the timing assertion is to show the budget is not
+// entered at all, which a lowered budget would make unfalsifiable.
+const DEFAULT_MAX_RETRY_MS = 30000;
+// Generous ceiling: a permanent rejection costs one round trip, so anything at this scale still
+// proves no replay loop ran. 6x under the budget.
+const CEILING_MS = 5000;
+
+function fail(msg) {
+  console.error('ACCESSMODE FAILURE: ' + msg);
+  process.exit(1);
+}
+
+// A control failure means the probe below would prove nothing, so it is reported distinctly.
+function failControl(msg) {
+  console.error('ACCESSMODE CONTROL FAILURE (the probe would prove nothing): ' + msg);
+  process.exit(1);
+}
+
+const toNum = (v) => (neo4j.isInt(v) ? v.toNumber() : v);
+
+// The driver-side surfaces that answer "would the driver retry this?", most-preferred first.
+//
+// `neo4j.isRetriableError` is asked for by name, but note it is the DEPRECATED spelling and driver
+// 6.2.0 exports it as the DETACHED static `Neo4jError.isRetriable`, whose body is
+// `return this.isRetryable(error)` — invoked off the class, `this` is undefined and it throws
+// `TypeError: this.isRetryable is not a function`. Every candidate is therefore probed under
+// try/catch and a throwing one falls through to the next instead of sinking the test; the mechanism
+// that actually produced the verdict is printed.
+const RETRYABILITY_MECHANISMS = [
+  ['neo4j.isRetriableError', (e) => (typeof neo4j.isRetriableError === 'function' ? neo4j.isRetriableError(e) : undefined)],
+  ['neo4j.isRetryableError', (e) => (typeof neo4j.isRetryableError === 'function' ? neo4j.isRetryableError(e) : undefined)],
+  ['err.retriable', (e) => e.retriable],
+  ['err.retryable', (e) => e.retryable],
+  ['Neo4jError.isRetryable', (e) => (neo4j.Neo4jError && typeof neo4j.Neo4jError.isRetryable === 'function' ? neo4j.Neo4jError.isRetryable(e) : undefined)],
+];
+
+// Runs ONE named mechanism against an error, returning its boolean verdict or undefined.
+function retryabilityBy(name, err) {
+  const entry = RETRYABILITY_MECHANISMS.find((m) => m[0] === name);
+  if (!entry) return undefined;
+  try {
+    const v = entry[1](err);
+    return typeof v === 'boolean' ? v : undefined;
+  } catch (e) {
+    return undefined;
+  }
+}
+
+// Resolves the driver's retryability verdict, reporting which mechanism produced it and what every
+// rejected candidate answered (so a hard failure is diagnosable).
+function resolveRetryable(err) {
+  const attempts = [];
+  for (const [name, probe] of RETRYABILITY_MECHANISMS) {
+    let v;
+    try {
+      v = probe(err);
+    } catch (e) {
+      attempts.push(name + '=threw(' + (e && e.message) + ')');
+      continue;
+    }
+    if (typeof v === 'boolean') return { mechanism: name, value: v, attempts: attempts };
+    attempts.push(name + '=' + String(v));
+  }
+  return { mechanism: null, value: undefined, attempts: attempts };
+}
+
+async function countProbes(driver) {
+  const session = driver.session();
+  try {
+    const res = await session.run('MATCH (n:InteropReadProbe) RETURN count(n) AS c');
+    return toNum(res.records[0].get('c'));
+  } finally {
+    await session.close();
+  }
+}
+
+(async () => {
+  // No `maxTransactionRetryTime` here (nor on any session below): the driver default of 30 s is in
+  // force, which is exactly what makes the elapsed-time assertion meaningful.
+  const driver = neo4j.driver(uri, neo4j.auth.basic(user, password));
+  try {
+    await driver.verifyConnectivity();
+
+    // Guard the guard: if some future edit ever pins the retry budget, the timing assertion silently
+    // stops proving anything. The driver keeps its validated options on `_config`; only assert when
+    // that object is actually there, so a driver refactor cannot fail this test spuriously.
+    if (driver._config && typeof driver._config === 'object' &&
+        driver._config.maxTransactionRetryTime !== undefined) {
+      fail('maxTransactionRetryTime was overridden to ' + driver._config.maxTransactionRetryTime +
+        ' — the timing assertion only means something at the driver default of ' + DEFAULT_MAX_RETRY_MS + ' ms');
+    }
+
+    // ---- (a) NON-VACUITY CONTROL: the IDENTICAL statement in a WRITE transaction must SUCCEED ----
+    {
+      const session = driver.session();
+      try {
+        await session.executeWrite((tx) => tx.run(WRITE_STATEMENT));
+      } catch (err) {
+        failControl('the identical CREATE inside executeWrite FAILED: ' +
+          ((err && err.stack) ? err.stack : String(err)));
+      } finally {
+        await session.close();
+      }
+    }
+    const afterControl = await countProbes(driver);
+    if (afterControl !== 1) {
+      failControl(`executeWrite reported success but MATCH found ${afterControl} :InteropReadProbe nodes, expected 1`);
+    }
+
+    // ---- (b) THE REPRODUCTION: the same statement inside executeRead must REJECT ----
+    let caught = null;
+    let elapsedMs = -1;
+    {
+      const session = driver.session();
+      const started = Date.now();
+      try {
+        await session.executeRead((tx) => tx.run(WRITE_STATEMENT));
+        elapsedMs = Date.now() - started;
+        fail(`a CREATE inside session.executeRead SUCCEEDED (after ${elapsedMs} ms) — a write in READ access mode must be rejected`);
+      } catch (err) {
+        elapsedMs = Date.now() - started;
+        caught = err;
+      } finally {
+        await session.close();
+      }
+    }
+    if (!caught) fail('no error was thrown for a write inside session.executeRead');
+    console.log('accessmode elapsed_ms=' + elapsedMs + ' budget_ms=' + DEFAULT_MAX_RETRY_MS +
+      ' ceiling_ms=' + CEILING_MS);
+    console.log('accessmode code=' + JSON.stringify(caught.code));
+
+    // ---- (c) exact verbatim leaf code + ClientError classification ----
+    if (caught.code !== EXPECTED_CODE) {
+      fail(`code = ${JSON.stringify(caught.code)}, expected ${JSON.stringify(EXPECTED_CODE)} ` +
+        `(message: ${caught.message})`);
+    }
+    const classification = String(caught.code).split('.')[1];
+    if (classification !== 'ClientError') {
+      fail(`classification = ${classification}, expected ClientError (a TransientError would be replayed)`);
+    }
+
+    // ---- (d) the DRIVER's own verdict: non-retryable, resolved through a mechanism that works ----
+    const verdict = resolveRetryable(caught);
+    if (verdict.mechanism === null) {
+      fail('no driver-side retryability mechanism produced a boolean — the non-retryability assertion ' +
+        'cannot be made and must not pass vacuously. Attempts: ' + verdict.attempts.join(', '));
+    }
+    console.log('accessmode retryable=' + verdict.value + ' mechanism=' + verdict.mechanism +
+      ' rejected=[' + verdict.attempts.join(', ') + ']');
+    if (verdict.value !== false) {
+      fail(`the driver reports the AccessMode error as retryable=${verdict.value} via ${verdict.mechanism} ` +
+        '— the official driver would replay the write until maxTransactionRetryTime expired');
+    }
+    // Non-vacuity of the mechanism itself: the SAME surface must answer `true` for a genuinely
+    // retryable code, otherwise a constant-false stub would green this test.
+    const syntheticTransient = new neo4j.Neo4jError('synthetic', 'Neo.TransientError.Transaction.Outdated');
+    const transientVerdict = retryabilityBy(verdict.mechanism, syntheticTransient);
+    if (transientVerdict !== true) {
+      fail(`${verdict.mechanism} answered ${String(transientVerdict)} for a synthetic ` +
+        'Neo.TransientError.Transaction.Outdated — the mechanism does not discriminate, so ' +
+        'retryable=false above proves nothing');
+    }
+
+    // ---- (e) TIMING: it failed immediately; the 30 s retry budget was never entered ----
+    if (!(elapsedMs < CEILING_MS)) {
+      fail(`executeRead took ${elapsedMs} ms (ceiling ${CEILING_MS} ms, driver retry budget ` +
+        `${DEFAULT_MAX_RETRY_MS} ms) — that is a replay loop, not an immediate permanent failure`);
+    }
+
+    // The rejected write must have left NOTHING behind (only the control's node), and the connection
+    // must keep serving afterwards.
+    const afterProbe = await countProbes(driver);
+    if (afterProbe !== 1) {
+      fail(`after the rejected executeRead there are ${afterProbe} :InteropReadProbe nodes, expected 1 ` +
+        '(the control\'s node only — the refused write must not have landed)');
+    }
+
+    console.log('GRAPHUS_ACCESSMODE_OK code=' + caught.code + ' elapsed_ms=' + elapsedMs +
+      ' retryable=' + verdict.value + ' mechanism=' + verdict.mechanism);
     process.exit(0);
   } catch (err) {
     fail((err && err.stack) ? err.stack : String(err));
@@ -1780,6 +2044,69 @@ async fn official_neo4j_driver_reports_database_not_found_leaf_code() {
     assert!(
         stdout.contains("GRAPHUS_DBNOTFOUND_OK"),
         "driver exited 0 but the DatabaseNotFound success marker was missing.\n\
+         --- node stdout ---\n{stdout}\n--- node stderr ---\n{stderr}",
+    );
+
+    server.shutdown().await.expect("clean shutdown");
+}
+
+/// A write inside `session.executeRead` fails **immediately** and is **not retried** by the OFFICIAL
+/// Neo4j driver (rmp #988).
+///
+/// This is the headline regression of #988: writing in a READ-access-mode transaction is a permanent
+/// fault, but Graphus announced it as the *retryable* `Neo.TransientError.Transaction.Outdated`. The
+/// official driver reads retryability off the classification segment of the code, so it replayed the
+/// doomed unit of work until `maxTransactionRetryTime` (30 s default) was spent and then reported a
+/// **timeout** — hiding the real cause for half a minute on every occurrence. The condition is now
+/// answered with the reference server's verbatim `Neo.ClientError.Statement.AccessMode`, a
+/// `ClientError` the drivers never replay.
+///
+/// The driver-side retry decision cannot be proven by any in-process test: it happens inside the
+/// driver's transaction executor. So this boots a real Graphus server (Bolt-TCP+TLS) and drives it
+/// with the genuine `neo4j-driver` npm package, which asserts the exact leaf code, the driver's own
+/// non-retryable verdict (through a mechanism cross-checked to still answer `true` for a genuinely
+/// transient code), and — the assertion that actually separates "failed immediately" from "burned the
+/// retry budget" — that the call returned in well under 5 s with the 30 s budget left at its default.
+/// A non-vacuity control runs the identical `CREATE` in `executeWrite` first: if that does not
+/// succeed, the rejection proves nothing and the script says so under its own label.
+///
+/// Like the other real-ecosystem interop tests it lives behind the `neo4j-interop` feature and not in
+/// the DST simulator: DST is in-process and cannot drive the external official driver over a TLS
+/// socket — exercising that exact wire path, and the driver's own retry logic, is the entire point.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn official_neo4j_driver_does_not_retry_write_in_execute_read() {
+    let dir = TempDir::new();
+
+    // Self-signed cert/key for the TLS listener (`bolt+ssc://` trusts it).
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    let cert_path = dir.path.join("cert.pem");
+    let key_path = dir.path.join("key.pem");
+    std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+    std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
+
+    // Boot the real server and read back the OS-assigned ephemeral Bolt-TCP port. The store is fresh
+    // per test, so the `:InteropReadProbe` label the script asserts counts over starts empty.
+    let config = config_for(&dir, cert_path, key_path, None, None);
+    let server = boot(config).await;
+    let bolt: SocketAddr = server.bolt_tcp_addr.expect("Bolt-TCP listener enabled");
+
+    // Drive the read-access-mode probe against the live server.
+    let (stdout, stderr, ok) = install_and_run_driver(
+        dir.path.join("node-accessmode"),
+        READ_ACCESS_MODE_SCRIPT,
+        bolt.port(),
+    )
+    .await;
+
+    assert!(
+        ok,
+        "a write inside session.executeRead was NOT answered with an immediate, non-retryable \
+         Neo.ClientError.Statement.AccessMode.\n\
+         --- node stdout ---\n{stdout}\n--- node stderr ---\n{stderr}",
+    );
+    assert!(
+        stdout.contains("GRAPHUS_ACCESSMODE_OK"),
+        "driver exited 0 but the AccessMode success marker was missing.\n\
          --- node stdout ---\n{stdout}\n--- node stderr ---\n{stderr}",
     );
 

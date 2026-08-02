@@ -393,6 +393,58 @@ once those artifacts are in hand.
   13). Until then, a `FAILURE` carries the engine's own classified `(phase, type, detail)` rendered
   into its `code`/`message` fields (§3.1).
 
+### 2.5 Retryability is part of the contract, and is not derived from the error variant (`rmp` #988)
+
+The **classification** segment of a status code — the `<Classification>` in
+`Neo.<Classification>.<Category>.<Title>` — is not descriptive. It is an **instruction to the
+client**, and the official Neo4j drivers execute it: for a managed transaction
+(`session.executeRead` / `executeWrite`, `session.execute_read` / `execute_write`) a
+`TransientError` makes the driver **replay the unit of work**, with exponential backoff, until
+`maxTransactionRetryTime` — **30 s** by default in every official driver — is spent.
+
+Announcing a **permanent** fault as `TransientError` therefore does not merely mislabel it: the
+client cannot complete, cannot fail fast, and is finally handed a *timeout* in place of the real
+cause. Under MVCC this cuts both ways, because a genuine serialization abort is a normal and
+expected outcome of contention and *must* stay retryable. The two answers must be distinguishable,
+so **retryability is specified per condition**, never inferred from an internal error variant:
+
+| Condition | `code` | Class | Driver retries? | REST |
+| --- | --- | --- | --- | --- |
+| Serialization abort (SSI pivot / write-write conflict) | `Neo.TransientError.Transaction.Outdated` | `TransientError` | **yes** | `409` |
+| Database/engine unavailable (shutting down) | `Neo.TransientError.General.DatabaseUnavailable` | `TransientError` | **yes** | `503` |
+| Write statement in a `READ`-access-mode transaction (§4) | `Neo.ClientError.Statement.AccessMode` | `ClientError` | no | `400` |
+| Request names a transaction that does not exist (never issued, or already spent) | `Neo.ClientError.Transaction.TransactionNotFound` | `ClientError` | no | `404` |
+| Server-configured maximum transaction age elapsed (`timing.max_transaction_age_ms`) | `Neo.ClientError.Transaction.TransactionTimedOut` | `ClientError` | no | `400` |
+| Message illegal for the session's transaction state (`RUN` with none open, `BEGIN` when one is, `COMMIT`/`ROLLBACK` with none) | `Neo.ClientError.Request.Invalid` | `ClientError` | no | `400` |
+| Client `tx_timeout` elapsed (§3.6.2) | `Neo.ClientError.Transaction.TransactionTimedOutClientConfiguration` | `ClientError` | no | `400` |
+| Terminated by `TERMINATE TRANSACTIONS` | `Neo.ClientError.Statement.ArgumentError` | `ClientError` | no | `400` |
+
+The two transaction timeouts are a **deliberate pair**, split exactly as the reference server splits
+them — by *who configured the bound*. `KernelImpl` constructs
+`TransactionTimeout(config.get(transaction_timeout), TransactionTimedOut)` for the server's own
+setting and `TransactionTimedOutClientConfiguration` for one the client supplied. Graphus mirrors
+both: the age sweep emits the former, the Bolt `tx_timeout` path (§3.6.2) the latter. A transaction the
+age sweep stopped is therefore **not** reported as `TransactionNotFound`: it existed and was killed for
+cause, and collapsing the two would discard the only fact that points an operator at the configuration
+rather than at a lifecycle bug.
+
+Every code above is **verbatim** from the reference server's `org.neo4j.kernel.api.exceptions.Status`
+catalogue; none is invented (which §2.4 forbids). Two properties are load-bearing and are enforced by
+test:
+
+- **The title must stay off the drivers' rewrite map.** Every official driver keeps an
+  `ERROR_REWRITE_MAP` that reclassifies `Neo.TransientError.Transaction.Terminated` and
+  `Neo.TransientError.Transaction.LockClientStopped` to a **non-retryable** `ClientError`, whatever
+  the server sent. A serialization abort labelled with either title silently loses managed-transaction
+  retry — a shipped defect (`rmp` #612). `Outdated` is not on that map.
+- **The code must be exactly four dotted segments, and no `ClientError` code may contain the
+  substring `TransientError`.** The drivers do not agree on *how* they read the classification: the
+  Python driver destructures `_, classification, category, title = code.split(".")` (any other arity
+  raises and silently degrades the error to a non-retryable `DatabaseError`), the Java driver takes
+  `code.split("\\.")[1]`, and the JavaScript driver applies an **unanchored substring** test,
+  `code.includes('TransientError')`. A malformed code therefore splits the ecosystem rather than
+  failing uniformly.
+
 ---
 
 ## 3. Bolt result and failure shapes
@@ -773,8 +825,13 @@ field (read vs write), but `04` §8.2 left the REST equivalent open. This spike 
   client error: the request is rejected with an RFC 9457 problem+json response (`04` §8.2) and the
   transaction is not opened.
 - **Enforcement.** A transaction opened with `access_mode` `"READ"` rejects any statement that would
-  produce a side effect (a write). The rejection is surfaced as the appropriate Cypher/transaction
-  error rendered as problem+json (§3.3), not as a server fault.
+  produce a side effect (a write). The rejection carries the reference server's verbatim
+  `Neo.ClientError.Statement.AccessMode` and is answered with HTTP **400**, rendered as problem+json
+  (§3.3) — a client fault, never a server fault. It is a **permanent, non-retryable** failure
+  (§2.5): no replay makes a write legal in a read transaction, so a driver must fail the call at once
+  rather than spend its `maxTransactionRetryTime` on it (`rmp` #988). The same rule and the same code
+  apply to the Bolt `BEGIN {mode: "r"}` transaction and to a `READ` auto-commit statement on either
+  interface, so the enforcement is identical wherever the mode is declared.
 
 ### 4.2 Rationale
 

@@ -630,8 +630,12 @@ impl BoltExecutor for BoltEngineExecutor {
                     }
                 }
                 let open = self.current_tx.as_ref().ok_or_else(|| {
-                    GraphusError::Transaction(
-                        "RUN in explicit transaction but none is open".to_owned(),
+                    // A Bolt state-machine violation, not a serialization abort (`rmp` #988): the
+                    // reference server answers exactly this with `Neo.ClientError.Request.Invalid`
+                    // (`IllegalTransitionException`), a NON-retryable client fault — replaying the
+                    // same message sequence reproduces the same violation.
+                    graphus_core::status::illegal_transaction_request(
+                        "RUN in explicit transaction but none is open",
                     )
                 })?;
                 // A transaction is pinned to its database: a different non-empty `db` on a RUN
@@ -683,8 +687,10 @@ impl BoltExecutor for BoltEngineExecutor {
         timeout: Option<Duration>,
     ) -> Result<(), GraphusError> {
         if self.current_tx.is_some() {
-            return Err(GraphusError::Transaction(
-                "a transaction is already open".to_owned(),
+            // A Bolt state-machine violation (`BEGIN` in `TX_READY`/`TX_STREAMING`), not a
+            // serialization abort: `Neo.ClientError.Request.Invalid`, non-retryable (`rmp` #988).
+            return Err(graphus_core::status::illegal_transaction_request(
+                "a transaction is already open",
             ));
         }
         // Resolve at begin; the transaction stays pinned to this database (rmp #84).
@@ -727,8 +733,10 @@ impl BoltExecutor for BoltEngineExecutor {
     }
 
     fn commit(&mut self) -> Result<QuerySummary, GraphusError> {
+        // A `COMMIT` outside a transaction is a Bolt state-machine violation, non-retryable
+        // (`Neo.ClientError.Request.Invalid` — `rmp` #988).
         let open = self.current_tx.take().ok_or_else(|| {
-            GraphusError::Transaction("COMMIT with no open transaction".to_owned())
+            graphus_core::status::illegal_transaction_request("COMMIT with no open transaction")
         })?;
         // The client's own transaction timeout (`rmp` #909). A transaction that outlived the budget its
         // `BEGIN` asked for must NOT commit — that is the whole point of the field, and it is also the
@@ -750,8 +758,9 @@ impl BoltExecutor for BoltEngineExecutor {
     }
 
     fn rollback(&mut self) -> Result<(), GraphusError> {
+        // Likewise a `ROLLBACK` outside a transaction (`rmp` #988).
         let open = self.current_tx.take().ok_or_else(|| {
-            GraphusError::Transaction("ROLLBACK with no open transaction".to_owned())
+            graphus_core::status::illegal_transaction_request("ROLLBACK with no open transaction")
         })?;
         // Unconditional, terminated or not — rolling a terminated transaction back is exactly what the
         // operator asked for (see [`super::managed`]).

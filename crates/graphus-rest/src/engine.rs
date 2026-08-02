@@ -218,8 +218,12 @@ pub trait RestEngine {
     ///
     /// # Errors
     /// [`GraphusError::Compile`] for a compile-time error (raised before any row — `06 §2.1`),
-    /// [`GraphusError::Runtime`] for an immediate runtime error, or [`GraphusError::Transaction`]
-    /// if `tx` is unknown or a **write statement is run in a `READ` transaction** (`06 §4`).
+    /// [`GraphusError::Runtime`] for an immediate runtime error, or one of the two **non-retryable**
+    /// permanent faults this call can raise (`rmp` #988; neither is a
+    /// [`GraphusError::Transaction`], which is reserved for the retryable serialization abort):
+    /// `Neo.ClientError.Transaction.TransactionNotFound` (HTTP 404) when `tx` is unknown or spent, and
+    /// `Neo.ClientError.Statement.AccessMode` (HTTP 400) when a **write statement is run in a `READ`
+    /// transaction** (`06 §4`).
     fn run(
         &self,
         tx: TxHandle,
@@ -246,9 +250,10 @@ pub trait RestEngine {
     ///
     /// # Errors
     /// [`GraphusError::Compile`] for a compile-time error (before any row — `06 §2.1`),
-    /// [`GraphusError::Runtime`] for an immediate runtime error, [`GraphusError::Transaction`] if a
-    /// **write statement runs in a `READ`** auto-commit (`06 §4`) or the engine cannot begin/admit the
-    /// statement, or [`GraphusError::Protocol`] if `db` names no servable database.
+    /// [`GraphusError::Runtime`] for an immediate runtime error, the non-retryable
+    /// `Neo.ClientError.Statement.AccessMode` (HTTP 400) if a **write statement runs in a `READ`**
+    /// auto-commit (`06 §4`, `rmp` #988), [`GraphusError::Transaction`] if the engine cannot
+    /// begin/admit the statement, or [`GraphusError::Protocol`] if `db` names no servable database.
     fn run_autocommit(
         &self,
         db: &str,
@@ -286,8 +291,10 @@ pub trait RestEngine {
     /// (`rmp` task #957), the same rule the Bolt seam applies to its `COMMIT`.
     ///
     /// # Errors
-    /// [`GraphusError::Transaction`] if `tx` is unknown, or on a serialization failure (retriable;
-    /// `04 §5.4`); the engine's terminated error if `tx` has been terminated.
+    /// The non-retryable `Neo.ClientError.Transaction.TransactionNotFound` (HTTP 404) if `tx` is
+    /// unknown or already spent (`rmp` #988); [`GraphusError::Transaction`] on a serialization failure
+    /// (**retriable**, `04 §5.4` — the one condition that variant now carries); the engine's
+    /// terminated error if `tx` has been terminated.
     fn commit(&self, tx: TxHandle) -> Result<RunSummary, GraphusError>;
 
     /// Rolls back the transaction identified by `tx`.
@@ -550,17 +557,18 @@ pub(crate) mod mock {
             {
                 let mut inner = self.inner.lock().expect("INVARIANT: mutex un-poisoned");
                 inner.log.push(format!("run(tx={}, q={query})", tx.0));
+                // The mock mirrors the REAL seam's error classification (`rmp` #988) — otherwise the
+                // router tests would assert an HTTP contract production no longer has.
                 let Some(state) = inner.txns.get(&tx.0) else {
-                    return Err(GraphusError::Transaction(format!(
-                        "unknown transaction handle {}",
+                    return Err(graphus_core::status::transaction_not_found(&format!(
+                        "transaction handle {}",
                         tx.0
                     )));
                 };
-                // `06 §4`: a READ transaction rejects any write statement.
+                // `06 §4`: a READ transaction rejects any write statement. A permanent, NON-retryable
+                // client fault: `Neo.ClientError.Statement.AccessMode` → HTTP 400.
                 if state.mode == AccessMode::Read && Self::is_write(query) {
-                    return Err(GraphusError::Transaction(
-                        "writing in read-only transaction is not allowed".to_owned(),
-                    ));
+                    return Err(graphus_core::status::write_in_read_access_mode());
                 }
             }
             if let Some(err) = self.errors.get(query) {
@@ -594,11 +602,10 @@ pub(crate) mod mock {
                 ));
             }
             // `06 §4`: a READ auto-commit rejects any write statement — the engine's auto-commit path
-            // enforces this identically to an explicit READ transaction.
+            // enforces this identically to an explicit READ transaction, with the identical
+            // non-retryable `Neo.ClientError.Statement.AccessMode` class (`rmp` #988).
             if mode == AccessMode::Read && Self::is_write(query) {
-                return Err(GraphusError::Transaction(
-                    "writing in read-only transaction is not allowed".to_owned(),
-                ));
+                return Err(graphus_core::status::write_in_read_access_mode());
             }
             if let Some(err) = self.errors.get(query) {
                 return Err(clone_error(err));
@@ -650,8 +657,8 @@ pub(crate) mod mock {
                     state.committed = true;
                     Ok(RunSummary::default())
                 }
-                None => Err(GraphusError::Transaction(format!(
-                    "unknown transaction handle {}",
+                None => Err(graphus_core::status::transaction_not_found(&format!(
+                    "COMMIT of transaction handle {}",
                     tx.0
                 ))),
             }
@@ -725,7 +732,15 @@ mod tests {
             .begin("neo4j", AccessMode::Read, TEST_ORIGIN)
             .unwrap();
         let err = engine.run(tx, "CREATE (n)", vec![]).unwrap_err();
-        assert!(matches!(err, GraphusError::Transaction(_)));
+        // `rmp` #988: a permanent, NON-retriable access-mode violation — NOT the retriable
+        // `GraphusError::Transaction` (serialization-abort) class this used to be.
+        assert!(matches!(err, GraphusError::Runtime(_)), "{err:?}");
+        let p = crate::problem::Problem::from_graphus_error(&err);
+        assert_eq!(
+            p.code.as_deref(),
+            Some("Neo.ClientError.Statement.AccessMode")
+        );
+        assert_eq!(p.status, 400);
     }
 
     #[test]
@@ -758,7 +773,14 @@ mod tests {
         let err = engine
             .run_autocommit("neo4j", AccessMode::Read, TEST_ORIGIN, "CREATE (n)", vec![])
             .unwrap_err();
-        assert!(matches!(err, GraphusError::Transaction(_)));
+        // `rmp` #988: the same non-retriable access-mode class as the explicit READ transaction.
+        assert!(matches!(err, GraphusError::Runtime(_)), "{err:?}");
+        let p = crate::problem::Problem::from_graphus_error(&err);
+        assert_eq!(
+            p.code.as_deref(),
+            Some("Neo.ClientError.Statement.AccessMode")
+        );
+        assert_eq!(p.status, 400);
     }
 
     #[test]

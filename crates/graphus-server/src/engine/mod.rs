@@ -703,6 +703,123 @@ struct OpenTx {
     auto_commit: bool,
 }
 
+/// How many reaped tickets [`ReapedTickets`] remembers before the oldest is forgotten.
+///
+/// Sized so a client that is going to come back at all has long since done so: the ledger only holds
+/// transactions the age sweep killed and whose owner has **not yet** been told, and each entry is
+/// dropped the moment its owner is told. Reaching this bound therefore needs a thousand-plus reaped
+/// transactions whose owners all vanished without ever touching them again.
+const REAPED_LEDGER_CAP: usize = 1024;
+
+/// A bounded, FIFO ledger of the tickets the maximum-transaction-age sweep rolled back (`rmp` #988).
+///
+/// # Why it exists
+///
+/// The sweep removes the transaction from the open table, so by the time its owner's next `RUN` or
+/// `COMMIT` arrives the ticket is simply *absent* — indistinguishable from an id that was never issued
+/// or one already spent. Both are permanent client faults, but they are **different** facts, and only
+/// one of them tells an operator what actually happened. Reporting a reaped transaction as
+/// "does not exist" sends them hunting a transaction-lifecycle bug when the cause is
+/// `timing.max_transaction_age_ms`. This ledger preserves that fact for exactly as long as it takes to
+/// deliver it.
+///
+/// # Why it is safe to bound
+///
+/// An entry is consumed the first time its owner is told, so the steady-state size is "reaped but not
+/// yet observed", which is the same order as the number of open transactions. The cap only matters if
+/// owners abandon their reaped transactions en masse, and overflowing it is a **graceful degradation**,
+/// never a correctness fault: the oldest entry is forgotten and that ticket falls back to
+/// `Neo.ClientError.Transaction.TransactionNotFound` — the same classification, the same
+/// non-retryability, the same HTTP class, only a less specific title.
+///
+/// Ticket ids are issued by a monotonically increasing counter and are **never reused**
+/// ([`open_tx`] post-increments `next_ticket`), so a remembered id can never be confused with a
+/// future transaction.
+#[derive(Debug, Default)]
+struct ReapedTickets {
+    /// The tickets currently remembered, for O(1) lookup.
+    ids: std::collections::HashSet<u64>,
+    /// The same ids in insertion order, so the oldest can be evicted at the cap.
+    order: VecDeque<u64>,
+}
+
+impl ReapedTickets {
+    /// Remembers `ticket` as reaped for age, evicting the oldest entry past [`REAPED_LEDGER_CAP`].
+    fn record(&mut self, ticket: u64) {
+        if self.ids.insert(ticket) {
+            self.order.push_back(ticket);
+        }
+        while self.order.len() > REAPED_LEDGER_CAP {
+            if let Some(oldest) = self.order.pop_front() {
+                self.ids.remove(&oldest);
+            }
+        }
+    }
+
+    /// Reports whether `ticket` was reaped for age, **consuming** the record.
+    ///
+    /// Consuming is deliberate: the fact exists to be delivered once, to the owner asking now. An id
+    /// left in `order` after its `ids` entry is taken is harmless — evicting it later removes an
+    /// already-absent key.
+    fn take(&mut self, ticket: u64) -> bool {
+        self.ids.remove(&ticket)
+    }
+}
+
+/// The engine's open-transaction table, plus the [`ReapedTickets`] ledger that travels with it.
+///
+/// The ledger is bundled here rather than threaded as a separate argument because it is needed at
+/// exactly the three places the table already reaches — the age sweep that writes it, and the `RUN`
+/// and `COMMIT` unknown-ticket paths that read it — and every one of those already receives `open`.
+/// [`Deref`]/[`DerefMut`] to the underlying map keep every existing `open.get` / `open.insert` /
+/// `open.remove` / `open.iter` call site working unchanged; only the sites that care about *reaping*
+/// use the two inherent methods, so an ordinary `remove` (a normal commit or rollback) can never
+/// accidentally record a reap.
+#[derive(Default)]
+struct OpenTxTable {
+    live: HashMap<u64, OpenTx>,
+    reaped: ReapedTickets,
+}
+
+impl OpenTxTable {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records that the age sweep rolled `ticket` back (see [`maybe_reap_aged`]).
+    fn record_reaped(&mut self, ticket: u64) {
+        self.reaped.record(ticket);
+    }
+
+    /// The error for a request naming `ticket`, which the table does not hold.
+    ///
+    /// Distinguishes the two permanent causes: a transaction the age sweep stopped
+    /// (`Neo.ClientError.Transaction.TransactionTimedOut` — it existed, and here is why it is gone)
+    /// from one that genuinely never existed or is already spent
+    /// (`Neo.ClientError.Transaction.TransactionNotFound`). Both are non-retryable `ClientError`s, so
+    /// the driver's behaviour is identical either way and only the diagnosis differs.
+    fn unknown_ticket_error(&mut self, ticket: u64, what: &str) -> GraphusError {
+        if self.reaped.take(ticket) {
+            graphus_core::status::transaction_timed_out(&format!("{what} {ticket}"))
+        } else {
+            graphus_core::status::transaction_not_found(&format!("{what} {ticket}"))
+        }
+    }
+}
+
+impl std::ops::Deref for OpenTxTable {
+    type Target = HashMap<u64, OpenTx>;
+    fn deref(&self) -> &Self::Target {
+        &self.live
+    }
+}
+
+impl std::ops::DerefMut for OpenTxTable {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.live
+    }
+}
+
 /// A write commit that has been group-commit **PREPAREd** (SSI-validated + `COMMIT` record appended,
 /// `fdatasync` deferred) and is awaiting the batch harden before its client is acknowledged (`rmp`
 /// #528/#532/#566, `04 §4.2`).
@@ -835,7 +952,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // This engine's contribution to the server-wide index-build gauges (`rmp` task #573), republished
     // every loop iteration so a build's start, progress, completion and parking are all visible.
     let mut index_builds = IndexBuildGauge::new(Arc::clone(&metrics));
-    let mut open: HashMap<u64, OpenTx> = HashMap::new();
+    let mut open: OpenTxTable = OpenTxTable::new();
     let mut next_ticket: u64 = 0;
     // The engine's compiled-plan cache (`rmp` task #322): reuses a compiled `PhysicalPlan` for an
     // identical query text instead of re-running the ~7–9 µs compile pipeline on every `Run`. Owned by
@@ -1189,7 +1306,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
 fn process_retirements<D: BlockDevice, S: LogSink>(
     retire_rx: &std::sync::mpsc::Receiver<read_pool::ReadRetirement>,
     coordinator: &mut Option<TxnCoordinator<D, S>>,
-    open: &mut HashMap<u64, OpenTx>,
+    open: &mut OpenTxTable,
     readers_inflight: &mut u64,
     metrics: &Metrics,
     db: &str,
@@ -1238,7 +1355,7 @@ fn process_retirements<D: BlockDevice, S: LogSink>(
 ///    fully drained (the reader sent this retirement post-drain). The `open` ticket is removed too.
 fn finish_reader<D: BlockDevice, S: LogSink>(
     coordinator: &mut TxnCoordinator<D, S>,
-    open: &mut HashMap<u64, OpenTx>,
+    open: &mut OpenTxTable,
     retirement: read_pool::ReadRetirement,
     metrics: &Metrics,
     db: &str,
@@ -1525,7 +1642,7 @@ fn maybe_run_maintenance<D: BlockDevice, S: LogSink>(
 #[allow(clippy::too_many_arguments)] // the engine loop threads its execution context through here
 fn maybe_reap_aged<D: BlockDevice, S: LogSink>(
     coordinator: &mut Option<TxnCoordinator<D, S>>,
-    open: &mut HashMap<u64, OpenTx>,
+    open: &mut OpenTxTable,
     parked: &VecDeque<exec::InFlightInline>,
     max_transaction_age: Option<std::time::Duration>,
     clock: &Arc<dyn graphus_core::capability::Clock + Send + Sync>,
@@ -1568,6 +1685,11 @@ fn maybe_reap_aged<D: BlockDevice, S: LogSink>(
         // it from the active set so `oldest_active_snapshot` advances. Idempotent-safe: `rollback` only
         // errs for an already-inactive txn, which cannot happen here (we just observed it active).
         if coord.rollback(txn).is_ok() {
+            // Remember WHY this ticket vanished (`rmp` #988). Without this the owner's next `RUN` or
+            // `COMMIT` could only be told "no such transaction", which is a different fact and sends
+            // an operator hunting a lifecycle bug instead of reading `timing.max_transaction_age_ms`.
+            // The record is consumed the first time it is delivered.
+            open.record_reaped(ticket);
             metrics.record_abort_for(db);
             reaped += 1;
         }
@@ -1603,7 +1725,7 @@ fn resume_parked_statements<
 >(
     parked: &mut VecDeque<exec::InFlightInline>,
     coordinator: &mut Option<TxnCoordinator<D, S>>,
-    open: &mut HashMap<u64, OpenTx>,
+    open: &mut OpenTxTable,
     extensions: &Arc<graphus_cypher::extension::ExtensionRegistry>,
     metrics: &Arc<Metrics>,
     db: &str,
@@ -1694,7 +1816,7 @@ fn resume_parked_statements<
 /// over a partial result (`rmp` #485 B2).
 fn recover_panicked_resume<D: BlockDevice, S: LogSink>(
     coord: &mut TxnCoordinator<D, S>,
-    open: &mut HashMap<u64, OpenTx>,
+    open: &mut OpenTxTable,
     txn: TxnId,
     metrics: &Metrics,
     db: &str,
@@ -1736,7 +1858,7 @@ fn enqueue_suspended<D: BlockDevice, S: LogSink>(
     just_suspended: &mut Option<exec::InFlightInline>,
     max_parked: usize,
     coordinator: &mut Option<TxnCoordinator<D, S>>,
-    open: &mut HashMap<u64, OpenTx>,
+    open: &mut OpenTxTable,
     metrics: &Metrics,
     db: &str,
     degraded: &EngineDegraded,
@@ -2185,7 +2307,7 @@ struct ProcessCtx<'a, D: BlockDevice + Send + Sync + 'static, S: LogSink + Send 
     /// The command channel, so a group-commit batch can non-blockingly drain further queued commits.
     rx: &'a std::sync::mpsc::Receiver<EngineCommand>,
     coordinator: &'a mut Option<TxnCoordinator<D, S>>,
-    open: &'a mut HashMap<u64, OpenTx>,
+    open: &'a mut OpenTxTable,
     next_ticket: &'a mut u64,
     plan_cache: &'a mut exec::EnginePlanCache,
     extensions: &'a Arc<graphus_cypher::extension::ExtensionRegistry>,
@@ -2385,7 +2507,7 @@ fn process_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
 fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>(
     cmd: EngineCommand,
     coordinator: &mut Option<TxnCoordinator<D, S>>,
-    open: &mut HashMap<u64, OpenTx>,
+    open: &mut OpenTxTable,
     next_ticket: &mut u64,
     plan_cache: &mut exec::EnginePlanCache,
     extensions: &Arc<graphus_cypher::extension::ExtensionRegistry>,
@@ -2723,7 +2845,7 @@ fn run_statement_isolated<
     S: LogSink + Send + Sync + 'static,
 >(
     coord: &mut TxnCoordinator<D, S>,
-    open: &mut HashMap<u64, OpenTx>,
+    open: &mut OpenTxTable,
     plan_cache: &mut exec::EnginePlanCache,
     ticket: TxTicket,
     query: &str,
@@ -2840,7 +2962,7 @@ fn run_mode_b_chunk_isolated<
     S: LogSink + Send + Sync + 'static,
 >(
     coord: &mut TxnCoordinator<D, S>,
-    open: &mut HashMap<u64, OpenTx>,
+    open: &mut OpenTxTable,
     ticket: TxTicket,
     chunk: bulk_load_b::BulkImportModeBChunkInput,
     metrics: &Metrics,
@@ -2901,7 +3023,7 @@ fn run_mode_b_chunk_isolated<
 #[allow(clippy::too_many_arguments)] // The recovery path threads its execution context here.
 fn rollback_panicked_statement<D: BlockDevice, S: LogSink>(
     coord: &mut TxnCoordinator<D, S>,
-    open: &mut HashMap<u64, OpenTx>,
+    open: &mut OpenTxTable,
     ticket: TxTicket,
     metrics: &Metrics,
     db: &str,
@@ -3554,7 +3676,7 @@ fn handle_constraint_ddl<D: BlockDevice, S: LogSink>(
 /// (excluded from the age sweep) or an explicit `BEGIN … COMMIT` (the sweep's target).
 fn open_tx<D: BlockDevice, S: LogSink>(
     coordinator: &mut TxnCoordinator<D, S>,
-    open: &mut HashMap<u64, OpenTx>,
+    open: &mut OpenTxTable,
     next_ticket: &mut u64,
     mode: AccessMode,
     auto_commit: bool,
@@ -3589,7 +3711,7 @@ fn open_tx<D: BlockDevice, S: LogSink>(
 #[allow(clippy::too_many_arguments)] // the commit path threads its execution context here
 fn commit_prepare_tx<D: BlockDevice, S: LogSink>(
     coordinator: &mut TxnCoordinator<D, S>,
-    open: &mut HashMap<u64, OpenTx>,
+    open: &mut OpenTxTable,
     ticket: TxTicket,
     reply: command::Reply<Result<RunSummary>>,
     commit_batch: &mut Vec<PendingCommit>,
@@ -3598,10 +3720,13 @@ fn commit_prepare_tx<D: BlockDevice, S: LogSink>(
     degraded: &EngineDegraded,
 ) {
     let Some(tx) = open.remove(&ticket.0) else {
-        let _ = reply.send(Err(GraphusError::Transaction(format!(
-            "commit of unknown transaction {}",
-            ticket.0
-        ))));
+        // The COMMIT twin of the unknown-ticket RUN in `exec.rs`: a permanent, NON-retryable client
+        // fault (`rmp` #988), not a serialization abort. `unknown_ticket_error` separates the two
+        // causes — a transaction the age sweep stopped (`TransactionTimedOut`, which says why) from
+        // one that never existed or is already spent (`TransactionNotFound`).
+        let _ = reply.send(Err(
+            open.unknown_ticket_error(ticket.0, "COMMIT of transaction")
+        ));
         return;
     };
     match coordinator.commit_prepare(tx.txn) {
@@ -3713,7 +3838,7 @@ fn pipelined_group_commit<
     wal_sync: &WalSyncThread,
     rx: &std::sync::mpsc::Receiver<EngineCommand>,
     coordinator: &mut Option<TxnCoordinator<D, S>>,
-    open: &mut HashMap<u64, OpenTx>,
+    open: &mut OpenTxTable,
     next_ticket: &mut u64,
     plan_cache: &mut exec::EnginePlanCache,
     extensions: &Arc<graphus_cypher::extension::ExtensionRegistry>,
@@ -3939,7 +4064,7 @@ fn drain_commit_batch<
 >(
     rx: &std::sync::mpsc::Receiver<EngineCommand>,
     coordinator: &mut Option<TxnCoordinator<D, S>>,
-    open: &mut HashMap<u64, OpenTx>,
+    open: &mut OpenTxTable,
     next_ticket: &mut u64,
     plan_cache: &mut exec::EnginePlanCache,
     extensions: &Arc<graphus_cypher::extension::ExtensionRegistry>,
@@ -4105,7 +4230,7 @@ fn checkpoint_after_batch<D: BlockDevice, S: LogSink>(
 /// failure of the statement, not only of the engine.
 fn rollback_tx<D: BlockDevice, S: LogSink>(
     coordinator: &mut TxnCoordinator<D, S>,
-    open: &mut HashMap<u64, OpenTx>,
+    open: &mut OpenTxTable,
     ticket: TxTicket,
     metrics: &Metrics,
     db: &str,
@@ -4142,7 +4267,7 @@ fn rollback_tx<D: BlockDevice, S: LogSink>(
 /// for the final flush.
 fn drain_inflight<D: BlockDevice, S: LogSink>(
     coordinator: &mut TxnCoordinator<D, S>,
-    open: &mut HashMap<u64, OpenTx>,
+    open: &mut OpenTxTable,
     metrics: &Metrics,
     db: &str,
 ) {
@@ -4681,7 +4806,7 @@ mod max_transaction_age_tests {
     #[test]
     fn reaps_over_age_explicit_txn_only() {
         let mut coord = fresh_coord();
-        let mut open: HashMap<u64, OpenTx> = HashMap::new();
+        let mut open: OpenTxTable = OpenTxTable::new();
         let mut next_ticket: u64 = 0;
         let cap = std::time::Duration::from_secs(60);
         let now = 61 * 1_000_000_000u64; // 61s in nanos — past the cap
@@ -4753,7 +4878,7 @@ mod max_transaction_age_tests {
     #[test]
     fn disabled_cap_reaps_nothing() {
         let mut coord = fresh_coord();
-        let mut open: HashMap<u64, OpenTx> = HashMap::new();
+        let mut open: OpenTxTable = OpenTxTable::new();
         let mut next_ticket: u64 = 0;
         let clock = clock_at(u64::MAX); // arbitrarily far in the future
         let metrics = Arc::new(Metrics::new());

@@ -576,8 +576,14 @@ fn recv_blocking<T>(rx: ReplyReceiver<T>) -> Result<T, GraphusError> {
 }
 
 /// The error when the engine task has stopped (channel closed / reply dropped).
+///
+/// Retryable, but a **different** transient class from a serialization abort (`rmp` #988): the
+/// reference server's `Neo.TransientError.General.DatabaseUnavailable`. `Outdated` would tell the
+/// client "your transaction lost a race, replay it against this database"; the truth is "this
+/// database cannot serve you at all right now" — the distinction a routing driver acts on when it
+/// decides whether to replay here or fail over.
 fn engine_gone() -> GraphusError {
-    GraphusError::Transaction("engine unavailable (server shutting down)".to_owned())
+    graphus_core::status::database_unavailable("engine unavailable (server shutting down)")
 }
 
 impl std::fmt::Debug for EngineHandle {

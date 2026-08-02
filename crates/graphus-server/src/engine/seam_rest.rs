@@ -134,8 +134,12 @@ impl RestEngineAdapter {
 
     /// Looks up (clones out) the open transaction for `tx`, briefly holding the table lock.
     fn lookup(&self, tx: TxHandle) -> Result<OpenTx, GraphusError> {
+        // A spent/unknown handle is a permanent client fault, not a serialization abort (`rmp` #988):
+        // `Neo.ClientError.Transaction.TransactionNotFound`, which the REST renderer answers with
+        // **404**, the same status `Problem::unknown_transaction` already uses for the twin the router
+        // detects.
         self.txns().get(&tx.0).cloned().ok_or_else(|| {
-            GraphusError::Transaction(format!("unknown transaction handle {}", tx.0))
+            graphus_core::status::transaction_not_found(&format!("transaction handle {}", tx.0))
         })
     }
 
@@ -797,7 +801,10 @@ impl RestEngine for RestEngineAdapter {
     fn commit(&self, tx: TxHandle) -> Result<RestRunSummary, GraphusError> {
         // Remove first: whatever the engine answers, the public handle is spent.
         let open = self.txns().remove(&tx.0).ok_or_else(|| {
-            GraphusError::Transaction(format!("unknown transaction handle {}", tx.0))
+            graphus_core::status::transaction_not_found(&format!(
+                "COMMIT of transaction handle {}",
+                tx.0
+            ))
         })?;
         // Through the shared guard (`rmp` task #957): a transaction terminated by
         // `TERMINATE TRANSACTIONS` (rmp #637) is rolled back and fails with the non-retryable
