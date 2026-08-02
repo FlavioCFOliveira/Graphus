@@ -4708,6 +4708,12 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// write. Best on a column clustered by node id (append-only timestamps / sequences); it degrades
     /// gracefully to a full scan on an unclustered column, and never changes a query's result.
     ///
+    /// The summary **prunes only**; the rows are decided one layer up, by
+    /// [`RecordStoreGraph::zone_scan_eq`](crate::record_graph::RecordStoreGraph::zone_scan_eq), which
+    /// re-checks every candidate against the reader's snapshot (`rmp` #958). This method therefore
+    /// never makes a visibility claim, and neither does anything else on [`TxnCoordinator`], which
+    /// holds no statement snapshot.
+    ///
     /// # Errors
     /// Returns a storage error if interning either token (or its committing transaction) fails.
     pub fn declare_zone_map(&mut self, label: &str, property: &str) -> Result<()> {
@@ -4741,28 +4747,45 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         Ok(())
     }
 
-    /// Rebuilds one declared zone-map column from the current store: scans the in-use nodes that carry
-    /// the label and captures `(id, value)` for the property, then installs the per-zone summary.
-    /// Reads without a snapshot, like the index rebuild.
+    /// Rebuilds one declared zone-map column from the current store: scans the slot-occupied nodes that
+    /// carry the label in the live-OR-retained sense and captures `(id, value)` for **every version**
+    /// of the property, then installs the per-zone summary. Reads without a snapshot, like the index
+    /// rebuild.
     ///
-    /// # A zone map PRUNES, so an omitted node is a lost row (`rmp` task #904)
+    /// # A zone map PRUNES, so an omitted value is a lost row (`rmp` tasks #904, #958)
     ///
-    /// This used to claim that "the scan's per-row re-check makes any later staleness harmless". That
-    /// is true of a *widened* zone and false of a *narrowed* one: `zone_scan_eq`'s re-check only ever
-    /// runs on the ids `candidate_ranges_eq` did not prune, so a node this rebuild leaves out of its
-    /// zone's `[min, max]` — when it was that zone's only carrier of the value — makes the whole id
-    /// range disappear before any re-check happens. The membership gate is therefore the live-OR-
-    /// retained label superset, exactly as the index refills use
-    /// ([`RecordStore::node_label_superset`](graphus_storage::RecordStore::node_label_superset)): a
-    /// rebuild run while a writer holds an uncommitted `REMOVE n:L` must not narrow a zone on the
-    /// strength of a change that writer may roll back. Nothing repairs a zone map afterwards — there is
-    /// no rebuild on open and no rollback hook, only a later write to the same node — so the loss would
-    /// be permanent.
+    /// This once claimed that "the scan's per-row re-check makes any later staleness harmless". That is
+    /// true of a *widened* zone and false of a *narrowed* one: the per-row re-check only ever runs on
+    /// the ids `candidate_ranges_eq` did not prune, so a value this rebuild leaves outside its zone's
+    /// `[min, max]` — when it was that zone's only carrier of it — makes the whole id range disappear
+    /// before any re-check happens. Nothing repairs a zone map afterwards (no rebuild on open, no
+    /// rollback hook, only a later write to the same node), so the loss is permanent. The rebuild is
+    /// therefore a **superset** on both axes, and fails closed on the third:
+    ///
+    /// * **labels** — the live-OR-retained union
+    ///   [`RecordStore::node_label_superset`](graphus_storage::RecordStore::node_label_superset),
+    ///   exactly as the index refills use (`rmp` #904), so a rebuild run while a writer holds an
+    ///   uncommitted `REMOVE n:L` does not narrow a zone on a change that writer may roll back;
+    /// * **values** — **every version** in the chain, not the newest (`rmp` #958). The newest version
+    ///   may belong to an uncommitted writer whose rollback restores the older one, and even when it is
+    ///   committed, a reader whose snapshot predates the overwrite resolves the *older* version
+    ///   (`rmp` #50, newest-**visible**-wins). Summarising the newest alone narrows the zone on both
+    ///   counts; the extra width only costs skipping, which the per-row re-check then recovers.
+    /// * **read faults** — a node the scan cannot read is a node whose values are unknown, and an
+    ///   unknown value cannot be excluded. The column is abandoned (it declines to a full scan until a
+    ///   later complete rebuild) rather than summarised over the part of the store that happened to be
+    ///   readable.
     fn rebuild_zone_column(&self, label_token: u32, prop_key: u32) {
         // Read-only store access (`rmp` #337 Slice 2): the rebuild scan only reads.
         let node_ids = match self.store.borrow().scan_node_ids() {
             Ok(ids) => ids,
-            Err(_) => return,
+            // The scan itself faulted: nothing was read, so nothing may be excluded (`rmp` #958).
+            Err(_) => {
+                self.zones
+                    .borrow_mut()
+                    .abandon_column(label_token, prop_key);
+                return;
+            }
         };
         let mut rows: Vec<(u64, Value)> = Vec::new();
         for id in node_ids {
@@ -4772,18 +4795,31 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 // method's doc for why a narrowed zone is unrecoverable.
                 let labels = match store.node_label_superset(id) {
                     Ok(l) => l,
-                    Err(_) => continue,
+                    Err(_) => {
+                        drop(store);
+                        self.zones
+                            .borrow_mut()
+                            .abandon_column(label_token, prop_key);
+                        return;
+                    }
                 };
                 let chain = match store.superset_scan_node_property_values(id) {
                     Ok(c) => c,
-                    Err(_) => continue,
+                    Err(_) => {
+                        drop(store);
+                        self.zones
+                            .borrow_mut()
+                            .abandon_column(label_token, prop_key);
+                        return;
+                    }
                 };
                 (labels, chain)
             };
             if !labels.contains(&label_token) {
                 continue;
             }
-            if let Some((_pid, _k, value)) = chain.iter().find(|(_, k, _)| *k == prop_key) {
+            // EVERY version of the key widens the zone (`rmp` #958), not just the chain head.
+            for (_pid, _k, value) in chain.iter().filter(|(_, k, _)| *k == prop_key) {
                 rows.push((id, value.clone()));
             }
         }
@@ -4792,90 +4828,17 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             .rebuild_column(label_token, prop_key, rows);
     }
 
-    /// Candidate-and-confirmed node ids for `label` whose `property` **equals** `value`, driven by the
-    /// zone-map data-skipping sidecar (`rmp` #331): only the id zones the summary cannot exclude are
-    /// examined, and each examined node is re-checked (in-use, label, value). `None` if no zone map is
-    /// declared for the column (the caller scans normally). After the call,
-    /// [`zone_map_zones_skipped`](Self::zone_map_zones_skipped) reports how many zones were pruned.
+    /// Zones the most recent zone-map skip query pruned (`rmp` #331 measurement).
     ///
-    /// # This reads CURRENT state, not a snapshot — it is not a transactional read path
-    ///
-    /// This doc used to promise "**exactly** the committed matching set regardless of zone staleness".
-    /// It delivers neither half (`rmp` task #904):
-    ///
-    /// * the re-check reads the **raw live** label word and `mvcc.in_use()`, not
-    ///   [`RecordStore::label_bitmap_at`](graphus_storage::RecordStore::label_bitmap_at) and
-    ///   `is_visible`, so a concurrent uncommitted `REMOVE n:L` hides a matching node and a concurrent
-    ///   uncommitted `SET n:L` yields a phantom — dirty reads in both directions;
-    /// * "regardless of zone staleness" holds only for a zone that is too WIDE. A zone the rebuild
-    ///   narrowed is pruned by `candidate_ranges_eq` before any re-check runs (see
-    ///   [`rebuild_zone_column`](Self::rebuild_zone_column), whose membership gate is widened for
-    ///   exactly this reason).
-    ///
-    /// [`TxnCoordinator`] holds no statement snapshot, so this cannot be made snapshot-isolated where
-    /// it stands: `label_bitmap_at` needs a `(Snapshot, CommitRegistry)` pair that only a statement seam
-    /// has. It is a **current-state** diagnostic surface, and the only callers today are
-    /// `tests/zone_map_skipping.rs`; no planner or executor path reaches it. Wiring it into a query
-    /// path requires moving it to a seam that carries a snapshot first.
-    #[must_use]
-    pub fn zone_scan_eq(&self, label: &str, property: &str, value: &Value) -> Option<Vec<u64>> {
-        let (label_token, prop_key) = {
-            let store = self.store.borrow();
-            (
-                store.token_id(Namespace::Label, label)?,
-                store.token_id(Namespace::PropKey, property)?,
-            )
-        };
-        let ranges = self
-            .zones
-            .borrow()
-            .candidate_ranges_eq(label_token, prop_key, value)?;
-        let high_water = self.store.borrow().node_high_water();
-        let mut out = Vec::new();
-        for (lo, hi) in ranges {
-            for id in lo.max(1)..hi.min(high_water) {
-                let (labels, chain) = {
-                    // Read-only store access (`rmp` #337 Slice 2): zone-scan re-check only reads.
-                    let store = self.store.borrow();
-                    let node = match store.node(id) {
-                        Ok(n) => n,
-                        Err(_) => continue,
-                    };
-                    if !node.mvcc.in_use() {
-                        continue;
-                    }
-                    let labels = match store.node_labels(id) {
-                        Ok(l) => l,
-                        Err(_) => continue,
-                    };
-                    let chain = match store.superset_scan_node_property_values(id) {
-                        Ok(c) => c,
-                        Err(_) => continue,
-                    };
-                    (labels, chain)
-                };
-                if !labels.contains(&label_token) {
-                    continue;
-                }
-                if chain
-                    .iter()
-                    .find(|(_, k, _)| *k == prop_key)
-                    .is_some_and(|(_, _, v)| v == value)
-                {
-                    out.push(id);
-                }
-            }
-        }
-        Some(out)
-    }
-
-    /// Zones the most recent [`zone_scan_eq`](Self::zone_scan_eq) pruned (`rmp` #331 measurement).
+    /// The skip query itself is
+    /// [`RecordStoreGraph::zone_scan_eq`](crate::record_graph::RecordStoreGraph::zone_scan_eq): the
+    /// zone map is shared with the statement seam, and the counters it updates are read back here.
     #[must_use]
     pub fn zone_map_zones_skipped(&self) -> u64 {
         self.zones.borrow().zones_skipped()
     }
 
-    /// Zones the most recent [`zone_scan_eq`](Self::zone_scan_eq) kept / scanned.
+    /// Zones the most recent zone-map skip query kept / scanned.
     #[must_use]
     pub fn zone_map_zones_scanned(&self) -> u64 {
         self.zones.borrow().zones_scanned()

@@ -15,20 +15,46 @@
 //! not a physical store page — this decouples the sidecar from the storage page layout while giving
 //! the same id-clustering benefit (BRIN's `pages_per_range`).
 //!
-//! # Correctness: conservative, never wrongly skips
+//! # Correctness: conservative, never wrongly skips (`rmp` tasks #904, #958)
 //!
-//! The skip decision must never exclude a zone that could hold a match (a subset is never correct).
-//! Two rules guarantee that:
+//! This structure sits at the **conservative** read polarity of `04-technical-design.md` §5.3 and
+//! [`graphus_storage::scan_polarity`]: it *excludes* id ranges, and the exclusion happens **before**
+//! any per-row re-check can see them. Nothing rebuilds a zone map afterwards — there is no rebuild on
+//! open and no rollback hook — so a range wrongly excluded is a row lost for the life of the process.
+//! The obligation is therefore one-directional: **never narrow on state that is not proven.** Four
+//! rules discharge it, and all four are load-bearing:
 //!
 //! * **Widening-only maintenance.** A write extends the affected zone's `[min, max]` to include the
 //!   new value; it never *shrinks* the interval (shrinking would need a full zone re-scan). An
-//!   over-wide interval only causes the scan to skip *less* — never to wrongly skip. A rebuild (on
-//!   declare / open) recomputes exact intervals.
-//! * **Conservative comparison + MVCC unchanged.** A zone is kept whenever its `[min, max]` overlaps
-//!   the predicate's value/range under the same Cypher ordering the executor uses; the per-row
-//!   visibility + exact-predicate re-check above the scan is **untouched**, so the zone map only ever
-//!   prunes provably-non-matching id ranges. An absent / stale zone map simply yields "scan all"
-//!   (the full candidate set), which is always correct.
+//!   over-wide interval only causes the scan to skip *less* — never to wrongly skip. This is why an
+//!   uncommitted writer needs no removal hook: its value widens the zone, and a rollback leaves the
+//!   zone merely over-wide.
+//! * **A rebuild summarises the SUPERSET, not the current image.** [`ZoneMap::rebuild_column`] is fed
+//!   every *version* of the property for every node that carries the label in the live-OR-retained
+//!   sense (`TxnCoordinator::rebuild_zone_column`). Summarising the newest version alone would narrow
+//!   a zone on an uncommitted overwrite a rollback then undoes, and would also drop the older
+//!   committed version an existing reader's snapshot still resolves.
+//! * **A partial summary is never installed.** A column that has not been summarised end-to-end —
+//!   never rebuilt, or rebuilt over a scan that faulted — **declines**
+//!   ([`candidate_ranges_eq`](ZoneMap::candidate_ranges_eq) and friends return [`None`], "scan
+//!   everything"), because a summary built over an incomplete scan can
+//!   exclude an id range it never looked at. Declining costs a full scan; pruning on a partial
+//!   summary costs rows. `None` is the decline; `Some(vec![])` means "no zone can hold this value",
+//!   which is an *answer*, and the two must never be confused (`rmp` #680/#738).
+//! * **The per-row re-check is snapshot-correct, and lives above this module.** A zone map produces
+//!   **candidates**, never rows: [`candidate_ranges_eq`](ZoneMap::candidate_ranges_eq) /
+//!   [`candidate_ids_eq`](ZoneMap::candidate_ids_eq) hand an id superset to a seam that owns the
+//!   reader's `(Snapshot, CommitRegistry)` pair — `RecordStoreGraph::zone_scan_eq`, which re-checks
+//!   through `label_bitmap_at` + `is_visible` exactly as every index seek does (`rmp` #958). This
+//!   module holds no snapshot and therefore decides nothing about visibility.
+//!
+//! # The maintenance invariant a caller must uphold
+//!
+//! `Some(candidates)` is only a correct answer while **every** write that can make a node match has
+//! widened that node's zone. On the coordinated path that is `RecordStoreGraph::reindex_node`, which
+//! runs on every node create, property write and label change. A write path that can create a match
+//! **without** going through it must re-summarise the column (or abandon it with
+//! [`abandon_column`](ZoneMap::abandon_column)); otherwise it leaves a zone narrower than the graph.
 
 use std::collections::HashMap;
 
@@ -106,16 +132,31 @@ impl Zone {
     }
 }
 
+/// One declared column's summary: the per-zone intervals, plus whether they were ever built from a
+/// **complete** scan.
+///
+/// The flag is the difference between "no zone can hold this value" and "this column cannot answer".
+/// A freshly declared column, and one whose rebuild scan faulted part-way, hold zones that describe
+/// only the ids the scan reached; pruning on those would exclude id ranges nobody looked at. Such a
+/// column declines instead (`rmp` #958).
+#[derive(Clone, Debug, Default)]
+struct Column {
+    /// The per-zone summaries, indexed by zone number (`id / ZONE_SIZE`); grows as higher ids appear.
+    zones: Vec<Zone>,
+    /// `true` once a complete scan has been summarised into `zones` (and kept true by the
+    /// widening-only maintenance, which can only make the intervals safer).
+    summarized: bool,
+}
+
 /// A derived per-`(label_token, prop_key)` zone-map over the node-id space (`rmp` #331). Owned by the
 /// [`TxnCoordinator`](crate::coordinator::TxnCoordinator) alongside the other derived structures and
-/// rebuilt on open; opt-in per column. Maintained by widening on write so its skip decision is always
-/// conservative (it can only ever skip provably-non-matching id zones).
+/// shared with the statement seam that consumes it; opt-in per column. Maintained by widening on write
+/// so its skip decision is always conservative (it can only ever skip provably-non-matching id zones).
 #[derive(Default)]
 #[must_use]
 pub struct ZoneMap {
-    /// Declared columns; a column is summarized iff declared. `Vec` of zones per column, indexed by
-    /// zone number (`id / ZONE_SIZE`); the vector grows as higher ids appear.
-    columns: HashMap<(u32, u32), Vec<Zone>>,
+    /// Declared columns; a column is summarized iff declared **and** completely scanned once.
+    columns: HashMap<(u32, u32), Column>,
     /// Count of zones the most recent skip query pruned (observability / measurement, `rmp` #331).
     zones_skipped: std::cell::Cell<u64>,
     /// Count of zones the most recent skip query kept (had to scan).
@@ -150,15 +191,45 @@ impl ZoneMap {
 
     /// Drops every summarized zone but keeps the declared column set, so a following rebuild
     /// re-summarizes exactly the declared columns (the zone-map analogue of `ColumnCache::clear`).
+    ///
+    /// Every column is left **unsummarized**, so a query issued between the clear and the rebuild
+    /// declines to a full scan instead of pruning against an empty summary — an empty summary would
+    /// otherwise exclude every zone and return no rows at all (`rmp` #958).
     pub fn clear(&mut self) {
-        for zones in self.columns.values_mut() {
-            zones.clear();
+        for column in self.columns.values_mut() {
+            column.zones.clear();
+            column.summarized = false;
         }
     }
 
-    /// Installs a freshly-scanned exact column summary for `(label_token, prop_key)` (called by the
-    /// coordinator rebuild with `(node_id, value)` rows in any order). A no-op for an undeclared
-    /// column. Builds zones widening-style, so the result is exact for the scanned rows.
+    /// Marks `(label_token, prop_key)` **unsummarized**, so it declines every skip query until a
+    /// complete rebuild re-summarizes it (`rmp` #958).
+    ///
+    /// This is what a rebuild whose scan faulted must call. A pruning structure cannot represent
+    /// "these ids are unknown to me": every id inside a summarized zone is decided by that zone's
+    /// interval, and every id past the last summarized zone is excluded outright. So a summary built
+    /// over an incomplete scan does not merely lose precision, it excludes id ranges nobody read.
+    /// Declining is the only conservative answer, and it costs one full scan.
+    pub fn abandon_column(&mut self, label_token: u32, prop_key: u32) {
+        if let Some(column) = self.columns.get_mut(&(label_token, prop_key)) {
+            column.zones.clear();
+            column.summarized = false;
+        }
+    }
+
+    /// Installs a freshly-scanned exact column summary for `(label_token, prop_key)` and marks the
+    /// column summarized (called by the coordinator rebuild with `(node_id, value)` rows in any
+    /// order). A no-op for an undeclared column. Builds zones widening-style, so the result is exact
+    /// for the scanned rows.
+    ///
+    /// # `rows` must be the value SUPERSET, not the current image
+    ///
+    /// Every `(id, value)` pair widens its zone, so the caller must pass **every version** of the
+    /// property for every node that carries the label in the live-OR-retained sense. Passing only the
+    /// newest version of each node narrows the zone on two unproven grounds at once: an uncommitted
+    /// overwrite that a rollback will undo, and an older committed version that a reader whose
+    /// snapshot predates the overwrite still resolves (`rmp` #50 newest-**visible**-wins). Either one
+    /// makes a committed row unreachable, permanently (`rmp` #904/#958).
     pub fn rebuild_column(
         &mut self,
         label_token: u32,
@@ -176,7 +247,13 @@ impl ZoneMap {
             }
             zones[z].widen(&value);
         }
-        self.columns.insert((label_token, prop_key), zones);
+        self.columns.insert(
+            (label_token, prop_key),
+            Column {
+                zones,
+                summarized: true,
+            },
+        );
     }
 
     /// Records (widens) node `id`'s current `value` for `(label_token, prop_key)` on a write, if the
@@ -184,22 +261,25 @@ impl ZoneMap {
     /// conservative across overwrites/removals (a since-removed value leaves the interval over-wide,
     /// which only reduces skipping, never correctness).
     pub fn record(&mut self, label_token: u32, prop_key: u32, id: u64, value: &Value) {
-        let Some(zones) = self.columns.get_mut(&(label_token, prop_key)) else {
+        let Some(column) = self.columns.get_mut(&(label_token, prop_key)) else {
             return;
         };
         let z = (id / ZONE_SIZE) as usize;
-        if z >= zones.len() {
-            while zones.len() <= z {
-                zones.push(Zone::empty());
-            }
+        while column.zones.len() <= z {
+            column.zones.push(Zone::empty());
         }
-        zones[z].widen(value);
+        column.zones[z].widen(value);
     }
 
-    /// The candidate node-id ranges (`[lo, hi)` half-open) that an equality predicate `prop = target`
-    /// could match: every zone whose `[min, max]` contains `target`. `None` if the column is not
-    /// summarized (caller scans everything). Updates the skip counters. The caller still re-checks
-    /// each candidate's visibility + exact value.
+    /// The **candidate** node-id ranges (`[lo, hi)` half-open) that an equality predicate
+    /// `prop = target` could match: every zone whose `[min, max]` contains `target`. Updates the skip
+    /// counters.
+    ///
+    /// [`None`] is a **decline** — the column is not declared, or has never been summarized from a
+    /// complete scan — and means "scan everything"; it is never "nothing matches". `Some(ranges)` is a
+    /// candidate superset over the node-id space, and the caller **must** re-check each candidate's
+    /// visibility, label membership and exact value against its own snapshot before returning a row
+    /// (`rmp` #958). An empty `Some` is a real answer: no summarized zone can hold the value.
     #[must_use]
     pub fn candidate_ranges_eq(
         &self,
@@ -207,12 +287,13 @@ impl ZoneMap {
         prop_key: u32,
         target: &Value,
     ) -> Option<Vec<(u64, u64)>> {
-        let zones = self.columns.get(&(label_token, prop_key))?;
-        Some(self.candidate_ranges(zones, |z| z.may_contain_eq(target)))
+        let column = self.summarized_column(label_token, prop_key)?;
+        Some(self.candidate_ranges(&column.zones, |z| z.may_contain_eq(target)))
     }
 
     /// The candidate node-id ranges for a range predicate `lo <= prop <= hi` (either bound optional):
-    /// every zone overlapping `[lo, hi]`. `None` if the column is not summarized.
+    /// every zone overlapping `[lo, hi]`. Same decline contract as
+    /// [`candidate_ranges_eq`](Self::candidate_ranges_eq).
     #[must_use]
     pub fn candidate_ranges_range(
         &self,
@@ -221,8 +302,38 @@ impl ZoneMap {
         lo: Option<&Value>,
         hi: Option<&Value>,
     ) -> Option<Vec<(u64, u64)>> {
-        let zones = self.columns.get(&(label_token, prop_key))?;
-        Some(self.candidate_ranges(zones, |z| z.may_overlap_range(lo, hi)))
+        let column = self.summarized_column(label_token, prop_key)?;
+        Some(self.candidate_ranges(&column.zones, |z| z.may_overlap_range(lo, hi)))
+    }
+
+    /// [`candidate_ranges_eq`](Self::candidate_ranges_eq) flattened into the **candidate node ids**
+    /// themselves, clipped to the store's live id space `1..high_water` (id `0` is the reserved null
+    /// pointer and `high_water` is one past the largest id ever allocated).
+    ///
+    /// The ids are candidates and nothing more: this module reads no record and holds no snapshot, so
+    /// every one of them still has to survive the reader's visibility + label + value re-check. The
+    /// decline contract of [`candidate_ranges_eq`](Self::candidate_ranges_eq) applies unchanged.
+    #[must_use]
+    pub fn candidate_ids_eq(
+        &self,
+        label_token: u32,
+        prop_key: u32,
+        target: &Value,
+        high_water: u64,
+    ) -> Option<Vec<u64>> {
+        let ranges = self.candidate_ranges_eq(label_token, prop_key, target)?;
+        let mut ids = Vec::new();
+        for (lo, hi) in ranges {
+            ids.extend(lo.max(1)..hi.min(high_water));
+        }
+        Some(ids)
+    }
+
+    /// The column's summary, or [`None`] when it is undeclared or not summarized from a complete scan.
+    fn summarized_column(&self, label_token: u32, prop_key: u32) -> Option<&Column> {
+        self.columns
+            .get(&(label_token, prop_key))
+            .filter(|c| c.summarized)
     }
 
     /// Collects the id ranges of zones passing `keep`, coalescing adjacent kept zones into one range,
@@ -264,7 +375,16 @@ impl ZoneMap {
     /// The number of summarized zones for a column (diagnostics / tests).
     #[must_use]
     pub fn zone_count(&self, label_token: u32, prop_key: u32) -> Option<usize> {
-        self.columns.get(&(label_token, prop_key)).map(Vec::len)
+        self.columns
+            .get(&(label_token, prop_key))
+            .map(|c| c.zones.len())
+    }
+
+    /// Whether `(label_token, prop_key)` has been summarized from a complete scan, and may therefore
+    /// prune (diagnostics / tests).
+    #[must_use]
+    pub fn is_summarized(&self, label_token: u32, prop_key: u32) -> bool {
+        self.summarized_column(label_token, prop_key).is_some()
     }
 }
 
@@ -375,5 +495,84 @@ mod tests {
     fn undeclared_column_yields_no_ranges() {
         let zm = ZoneMap::new();
         assert!(zm.candidate_ranges_eq(9, 9, &Value::Integer(1)).is_none());
+    }
+
+    /// `rmp` #958: a column that was declared but never summarized from a complete scan must
+    /// **decline** (`None` = "scan everything"), not answer `Some([])` (= "nothing matches"). The
+    /// distinction is the whole result set: pruning against an empty summary excludes every id.
+    #[test]
+    fn a_declared_but_unsummarized_column_declines_rather_than_pruning_everything() {
+        let mut zm = ZoneMap::new();
+        zm.declare(1, 2);
+        assert_eq!(
+            zm.candidate_ranges_eq(1, 2, &Value::Integer(7)),
+            None,
+            "an unsummarized column must decline to a full scan, never prune every zone",
+        );
+        assert_eq!(zm.candidate_ids_eq(1, 2, &Value::Integer(7), 4096), None);
+        assert!(!zm.is_summarized(1, 2));
+    }
+
+    /// A rebuild whose scan faulted part-way must leave the column declining, not summarized over the
+    /// prefix it managed to read (`rmp` #958).
+    #[test]
+    fn abandoning_a_column_makes_it_decline_again() {
+        let mut zm = ZoneMap::new();
+        zm.declare(1, 2);
+        zm.rebuild_column(1, 2, int_rows(&[(0, 10), (1, 20)]));
+        assert!(zm.is_summarized(1, 2));
+        assert!(
+            zm.candidate_ranges_eq(1, 2, &Value::Integer(5000))
+                .is_some()
+        );
+
+        zm.abandon_column(1, 2);
+        assert!(!zm.is_summarized(1, 2));
+        assert_eq!(zm.candidate_ranges_eq(1, 2, &Value::Integer(15)), None);
+        // Still declared, so a later complete rebuild re-summarizes it.
+        assert!(zm.is_declared(1, 2));
+        zm.rebuild_column(1, 2, int_rows(&[(0, 10), (1, 20)]));
+        assert!(zm.is_summarized(1, 2));
+    }
+
+    /// `clear()` leaves every column declining until the rebuild that follows it lands.
+    #[test]
+    fn clear_leaves_columns_declining_until_they_are_rebuilt() {
+        let mut zm = ZoneMap::new();
+        zm.declare(1, 2);
+        zm.rebuild_column(1, 2, int_rows(&[(0, 10)]));
+        zm.clear();
+        assert!(zm.is_declared(1, 2));
+        assert!(!zm.is_summarized(1, 2));
+        assert_eq!(zm.candidate_ranges_eq(1, 2, &Value::Integer(10)), None);
+    }
+
+    /// The flattened candidate ids honour the store's live id space: id `0` is the reserved null
+    /// pointer and `high_water` is exclusive.
+    #[test]
+    fn candidate_ids_are_clipped_to_the_live_id_space() {
+        let mut zm = ZoneMap::new();
+        zm.declare(1, 2);
+        // One zone (ids 0..1024) holding values 0..=3, so the equality keeps exactly that zone.
+        zm.rebuild_column(1, 2, int_rows(&[(0, 0), (3, 3)]));
+        let ids = zm.candidate_ids_eq(1, 2, &Value::Integer(3), 5).unwrap();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3, 4],
+            "0 is reserved, high_water is exclusive"
+        );
+    }
+
+    /// A summarized column that provably cannot hold the value answers `Some([])` — an answer, not a
+    /// decline. Its caller returns no rows for it, which is why only a complete summary may say it.
+    #[test]
+    fn a_summarized_column_that_cannot_match_answers_with_an_empty_candidate_set() {
+        let mut zm = ZoneMap::new();
+        zm.declare(1, 2);
+        zm.rebuild_column(1, 2, int_rows(&[(0, 10), (1, 20)]));
+        assert_eq!(
+            zm.candidate_ids_eq(1, 2, &Value::Integer(9_999), 4096),
+            Some(Vec::new()),
+        );
     }
 }

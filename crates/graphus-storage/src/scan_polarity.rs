@@ -38,12 +38,24 @@
 //!
 //! # Conservative — data-skipping structures
 //!
-//! A zone map is neither. It **prunes**: `zone_scan_eq`'s per-row re-check only ever runs on the ids
+//! A zone map is neither. It **prunes**: the per-row re-check only ever runs on the ids
 //! `candidate_ranges_eq` did *not* prune, so a narrowed zone removes a whole id range before any
 //! re-check can see it, and nothing rebuilds a zone map afterwards. A pruning structure may therefore
-//! only ever narrow on state it can prove, which in practice means it takes the same superset gate an
-//! index refill takes and never the live word (`rmp` task #904,
-//! `TxnCoordinator::rebuild_zone_column`).
+//! only ever narrow on state it can prove, which in practice means its rebuild takes the same superset
+//! gates an index refill takes and never the current image: the live-OR-retained label union rather
+//! than the live word (`rmp` task #904), and **every** property version rather than the chain head
+//! (`rmp` task #958) — both in `TxnCoordinator::rebuild_zone_column`. A rebuild whose scan faults
+//! abandons the column rather than summarising the part of the store it could read.
+//!
+//! The obligation has a second half that is easy to miss, because it is not about the summary at all:
+//! the structure must produce **candidates**, and the per-candidate re-check that turns them into rows
+//! must run at the reader's snapshot. `rmp` #958 was exactly that miss — the skip query re-checked its
+//! candidates against the raw live label word and `mvcc.in_use()` and then returned *rows*, so an
+//! uncommitted creation was served to every reader and an uncommitted `REMOVE n:L` hid a committed one,
+//! with nothing downstream able to repair either. The re-check therefore lives on the seam that owns
+//! the `(Snapshot, CommitRegistry)` pair (`RecordStoreGraph::zone_scan_eq`, sharing the same
+//! `index_seek_eq_recheck` body as every node equality seek), never on the coordinator, which has no
+//! snapshot to resolve against.
 //!
 //! # What this module enforces
 //!

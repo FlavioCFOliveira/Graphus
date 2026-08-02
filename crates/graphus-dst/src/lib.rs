@@ -67,6 +67,7 @@ pub mod vopr_property;
 pub mod vopr_repro;
 pub mod wire;
 pub mod workload;
+pub mod zone_map_dirty_read;
 
 pub use catalog_rollback_undo::{
     AOutcome, BEnding, CatalogRollbackReport, Crash, run_catalog_rollback_undo,
@@ -139,3 +140,11 @@ pub use vopr_oracle::{
 };
 pub use vopr_repro::{FailurePredicate, ReplayArtifact, ReplayMode, ReplayOutcome, ShrinkOutcome};
 pub use workload::{Op, PlannedTxn, TxnOutcome, WorkloadConfig};
+// The `rmp` #958 zone-map scenarios: a pruning structure may only prune, and the per-candidate re-check
+// that turns its candidates into rows must run at the reader's snapshot. `WriterEnding` is re-exported
+// under a qualified name for the same reason the vector scenario's is — it is a DISTINCT type from the
+// spatial one, structurally identical, and re-exporting it bare would let the wrong one be passed.
+pub use zone_map_dirty_read::{
+    WriterEnding as ZoneWriterEnding, ZoneDirtyReadReport, ZoneRebuildReport, ZoneVsRow,
+    run_zone_map_dirty_read, run_zone_rebuild_across_an_open_overwrite,
+};

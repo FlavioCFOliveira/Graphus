@@ -3498,6 +3498,95 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         }
     }
 
+    /// The **zone-map-accelerated** answer to `MATCH (n:label) WHERE n.property = value`
+    /// (`rmp` tasks #331 / #958): the zone map prunes whole id ranges it can prove cannot match, and
+    /// every surviving candidate is re-checked against **this statement's snapshot**, so the result is
+    /// exactly what [`scan_filter_eq`](GraphAccess::scan_filter_eq) returns over the same predicate.
+    /// `None` declines to that scan.
+    ///
+    /// # Why the re-check lives here and not on the coordinator (`rmp` task #958)
+    ///
+    /// The zone map is owned by the [`TxnCoordinator`](crate::coordinator::TxnCoordinator) and shared
+    /// with this seam, and the pruning half of the work is genuinely coordinator-level: a `[min, max]`
+    /// interval is a statement about physical id ranges, not about visibility. The *deciding* half is
+    /// not. It needs the `(Snapshot, CommitRegistry)` pair that only a statement owns, and the
+    /// coordinator has neither — which is exactly how the previous `TxnCoordinator::zone_scan_eq` came
+    /// to re-check candidates against the **raw live** label word and `mvcc.in_use()`, a dirty read in
+    /// both directions (it returned a row an uncommitted writer had created and would roll back, and
+    /// dropped a row an uncommitted writer had removed and would restore). Because it returned rows,
+    /// nothing downstream could repair either.
+    ///
+    /// So the zone map now produces **candidates only**
+    /// ([`ZoneMap::candidate_ids_eq`](crate::zone_map::ZoneMap::candidate_ids_eq)) and the decision is
+    /// taken here, through the one lifted re-check body every node equality seek already shares
+    /// ([`read_source::index_seek_eq_recheck`]): MVCC visibility, the label resolved *as of this
+    /// snapshot* via `label_bitmap_at`, the current-value residual under Cypher equality, the SIREAD
+    /// markers, the fail-closed handling of a read fault, and the dedup. Sharing that body is what makes
+    /// "the zone-map path and the scan return the same bag" a property of the code rather than of
+    /// review. It is also the discipline the references follow: PostgreSQL's BRIN is a lossy access
+    /// method whose bitmap heap scan re-checks every tuple under the reader's snapshot, and DuckDB
+    /// consumes its zone maps *inside* the scan (`row_group.cpp`), never beside it.
+    ///
+    /// # The two obligations
+    ///
+    /// * **Prune conservatively.** A zone map may exclude an id range only when it can prove the range
+    ///   cannot match; nothing repairs a zone map, so a wrongly excluded range is a row lost for the
+    ///   life of the process. That obligation is discharged by
+    ///   [`ZoneMap`](crate::zone_map::ZoneMap) (widening-only maintenance, a superset rebuild, and a
+    ///   decline whenever the column was never completely summarised).
+    /// * **Decline, never answer empty.** `None` here means "no usable zone map, scan normally". A
+    ///   `Some` carrying zero rows means the summary provably excluded everything, which only a
+    ///   complete summary is allowed to say (`rmp` #680/#738).
+    ///
+    /// # SSI footprint
+    ///
+    /// Identical to [`index_seek_eq`](GraphAccess::index_seek_eq): the precise
+    /// [`graphus_txn::PredicateRead::Equality`] marker plus a per-candidate
+    /// SIREAD on every id the pruning left. That is a **superset** of what `scan_filter_eq` registers
+    /// (which marks matching rows only), so serializability is at least as strong on this path as on
+    /// the scan it accelerates — pruning narrows the work, never the read dependencies of the rows it
+    /// returns.
+    pub fn zone_scan_eq(
+        &self,
+        label: &str,
+        property: &str,
+        seek: &Value,
+        carry: KeyValues,
+    ) -> Option<IndexSeekHits> {
+        // Only the coordinated path carries the shared sidecar; the standalone path declines.
+        let zones = self.zones.as_ref()?;
+        // Resolve tokens without interning (a read never mints one). An un-interned label/property
+        // cannot be summarised, so declining is also the only correct answer here.
+        let label_token = self.label_id_existing(label)?;
+        let (prop_key, high_water) = {
+            let store = self.store.borrow();
+            (
+                store.token_id(Namespace::PropKey, property)?,
+                store.node_high_water(),
+            )
+        };
+        // CANDIDATES. No record is read here and no visibility is decided; `None` is the decline
+        // (undeclared column, or one never summarised from a complete scan) and routes the caller to
+        // the exact scan.
+        let candidates =
+            zones
+                .borrow()
+                .candidate_ids_eq(label_token, prop_key, seek, high_water)?;
+
+        // The decision, under THIS statement's snapshot, in the body every node equality seek shares.
+        Some(read_source::index_seek_eq_recheck(
+            &LiveSource(&*self.store.borrow()),
+            &self.vis_ctx(),
+            self,
+            label_token,
+            prop_key,
+            property,
+            seek,
+            candidates,
+            carry,
+        ))
+    }
+
     /// The **complementary columnar** answer to an analytical property scan over `(label, property)`
     /// (`rmp` tasks #329 / #330): the `(node, value)` pairs the row path would produce
     /// (`scan_nodes_by_label` filtered to the nodes whose `property` is present), read from the

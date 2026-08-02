@@ -592,8 +592,21 @@ over a property that was gone.
 *Conservative* is a data-skipping structure. A zone map **prunes**: the per-row re-check only ever
 runs on the ids the summary did not exclude, so a narrowed zone removes a whole id range before any
 re-check can see it, and nothing rebuilds a zone map afterwards. A pruning structure may therefore
-only narrow on state it can prove, which in practice means it takes the same superset gate a refill
-takes.
+only narrow on state it can prove, which in practice means its rebuild takes the same superset gates a
+refill takes — the live-OR-retained label union, and *every* property version rather than the newest,
+since the newest may belong to an open writer and even a committed one leaves an older reader
+resolving the version underneath it. A rebuild whose scan faults abandons the column instead of
+summarising the part of the store it managed to read, and a column that has never been summarised
+end-to-end **declines** ("scan everything") rather than pruning against an empty summary.
+
+The conservative polarity has a second obligation that is about the *consumer* rather than the
+summary: a pruning structure yields **candidates**, and the re-check that turns them into rows must run
+at the reader's snapshot, on a seam that owns one. Performing it on a seam that holds no snapshot is a
+dirty read in both directions — an uncommitted creation returned to every reader, and a committed row
+hidden by an uncommitted label removal — and when rows rather than candidates are returned, nothing
+downstream can repair either. The skip query therefore sits on the statement seam and shares the same
+per-candidate re-check body as every index seek, so the accelerated answer and the scan it replaces are
+the same set by construction.
 
 Two shapes sit outside the three and must not be mistaken for them. The **write path** reads the
 entity's current image, because the state it is announcing or indexing is the state it has just

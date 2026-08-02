@@ -367,7 +367,8 @@ owes back is one of three (`04-technical-design.md` §5.3, and `graphus_storage:
 - **decision** — constraint validation. The verdict is written into the catalogue and nothing
   re-checks it, so it must be exactly what the deciding snapshot sees.
 - **conservative** — a pruning structure (the zone map). It excludes an id range *before* any re-check
-  runs and nothing repairs it, so it may never narrow on unproven state.
+  runs and nothing repairs it, so it may never narrow on unproven state — and the re-check that turns
+  its candidates into rows must run at the reader's snapshot, on a seam that owns one (`rmp` #958).
 
 Reading raw is **correct** for the first and **wrong** for the second. That single confusion produced
 three CRITICAL defects (`rmp` #771, #902, #904), and in each of them a docstring asserted the wrong

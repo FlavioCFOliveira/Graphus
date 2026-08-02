@@ -46,9 +46,17 @@
 //! ## Conservative — pruning structures (an excluded range disappears before any re-check runs)
 //!
 //! * `TxnCoordinator::rebuild_zone_column` — a zone map prunes whole id ranges, and nothing rebuilds
-//!   one afterwards, so it may never narrow on unproven state. It takes the same
-//!   `node_label_superset` gate as an index refill (`rmp` #904). Pinned by
-//!   `a_pruning_rebuild_gates_on_the_label_superset`.
+//!   one afterwards, so it may never narrow on unproven state. It is a superset on **both** axes: the
+//!   same `node_label_superset` label gate an index refill takes (`rmp` #904), and **every version** of
+//!   the property rather than the chain head (`rmp` #958) — the head may belong to an open writer, and
+//!   even when it is committed, a reader whose snapshot predates the overwrite still resolves the older
+//!   version. Pinned by `a_pruning_rebuild_gates_on_the_label_superset` and
+//!   `a_pruning_rebuild_summarizes_every_property_version`.
+//! * The zone map's *consumer* is `RecordStoreGraph::zone_scan_eq`, and it is deliberately **not**
+//!   listed under "live word" below: it performs no raw read at all. The pruning layer yields
+//!   candidates and the statement seam decides them through `read_source::index_seek_eq_recheck`, i.e.
+//!   `label_bitmap_at` + `is_visible`, exactly as every node equality seek does (`rmp` #958). Pinned by
+//!   `the_zone_map_consumer_decides_through_the_shared_recheck`.
 //!
 //! ## Live word — write-path enforcement and total-fallback memoization
 //!
@@ -64,9 +72,6 @@
 //!   `read_node_prop_one`, the authoritative path. A hole therefore costs one property decode, never a
 //!   row. That is what distinguishes it from an index refill, where a hole is a row no seek can
 //!   resurrect.
-//! * `TxnCoordinator::zone_scan_eq` reads the live word in its per-row re-check. It is a documented
-//!   current-state diagnostic surface with no planner or executor caller (`tests/zone_map_skipping.rs`
-//!   only); wiring it into a query path requires moving it to a seam that carries a snapshot first.
 //!
 //! ## Decision — nothing re-checks the answer
 //!
@@ -129,18 +134,11 @@ const SUPERSET_POLARITY_FNS: &[&str] = &[
 
 /// The functions that may read the **live** label word in `coordinator.rs`, each with the reason it is
 /// correct there. Anything else calling `node_labels` in that file fails the census.
-const LIVE_WORD_READERS: &[(&str, &str)] = &[
-    (
-        "zone_scan_eq",
-        "current-state diagnostic surface with no planner or executor caller; it holds no snapshot to \
-         resolve against and is documented as such",
-    ),
-    (
-        "rebuild_columns",
-        "memoization with a total fallback: a row the column omits falls through to \
+const LIVE_WORD_READERS: &[(&str, &str)] = &[(
+    "rebuild_columns",
+    "memoization with a total fallback: a row the column omits falls through to \
          read_node_prop_one, so a hole costs a decode and never a row",
-    ),
-];
+)];
 
 /// The body of the method named `name`, as `coordinator.rs` / `record_graph.rs` style it: a method
 /// declared at one `impl` level, so its closing brace is the first line that is exactly four spaces
@@ -251,10 +249,9 @@ fn every_index_refill_gates_on_the_label_superset() {
     }
 }
 
-/// A zone map PRUNES: `candidate_ranges_eq` removes a whole id range before `zone_scan_eq`'s per-row
-/// re-check ever runs, and nothing rebuilds a zone map afterwards. Its rebuild therefore takes the same
-/// superset gate as an index refill — the conservative obligation of
-/// `graphus_storage::scan_polarity`.
+/// A zone map PRUNES: `candidate_ranges_eq` removes a whole id range before the per-row re-check ever
+/// runs, and nothing rebuilds a zone map afterwards. Its rebuild therefore takes the same superset gate
+/// as an index refill — the conservative obligation of `graphus_storage::scan_polarity`.
 #[test]
 fn a_pruning_rebuild_gates_on_the_label_superset() {
     let body = method_body(COORDINATOR, "rebuild_zone_column");
@@ -269,6 +266,76 @@ fn a_pruning_rebuild_gates_on_the_label_superset() {
         0,
         "`rebuild_zone_column` must not narrow a zone on the strength of a live word an open writer \
          may roll back (`rmp` task #904)",
+    );
+}
+
+/// **THE `rmp` #958 REBUILD SHAPE, as a check.** The same rebuild is a superset on the VALUE axis too:
+/// it widens each zone with **every** version of the property, never with the chain head alone.
+///
+/// The head may belong to a transaction that has not committed, and even a committed head leaves an
+/// older reader resolving the version underneath it (`rmp` #50, newest-**visible**-wins). Either way a
+/// head-only summary narrows the zone below a value some live snapshot can still see, and the id range
+/// vanishes before any re-check can restore it.
+#[test]
+fn a_pruning_rebuild_summarizes_every_property_version() {
+    let body = method_body(COORDINATOR, "rebuild_zone_column");
+    assert!(
+        code_hits(&body, "superset_scan_node_property_values") >= 1,
+        "`rebuild_zone_column` must read the raw property chain — the superset — and say so at the \
+         call site (`rmp` tasks #905, #958)",
+    );
+    assert_eq!(
+        code_hits(&body, ".find(|(_, k, _)| *k == prop_key)"),
+        0,
+        "`rebuild_zone_column` must not summarise the chain HEAD: `find` stops at the newest version, \
+         which may be an uncommitted overwrite (a rollback restores the record but never the summary) \
+         or a committed one an existing reader still reads past. Widen the zone with every version \
+         (`filter`, not `find`) — `rmp` task #958",
+    );
+    assert!(
+        code_hits(&body, "abandon_column") >= 1,
+        "a rebuild whose scan faults must ABANDON the column (it then declines to a full scan), never \
+         install a summary over the ids it happened to read — `rmp` task #958",
+    );
+}
+
+/// **THE `rmp` #958 RE-CHECK SHAPE, as a check.** The zone map's consumer decides its candidates
+/// through the one lifted re-check body every node equality seek shares, so the label is resolved with
+/// `label_bitmap_at` and the version with `is_visible`, at the reader's snapshot.
+///
+/// The defect this replaces re-checked candidates against the raw live label word and `mvcc.in_use()`
+/// **and returned rows**, so a dirty read in either direction reached the caller unrepaired. Any future
+/// consumer that re-implements the re-check instead of calling the shared body fails here.
+#[test]
+fn the_zone_map_consumer_decides_through_the_shared_recheck() {
+    let body = method_body(RECORD_GRAPH, "zone_scan_eq");
+    assert!(
+        code_hits(&body, "candidate_ids_eq") == 1,
+        "`RecordStoreGraph::zone_scan_eq` must obtain CANDIDATES from the zone map \
+         (`ZoneMap::candidate_ids_eq`), never rows (`rmp` task #958)",
+    );
+    assert!(
+        code_hits(&body, "index_seek_eq_recheck") == 1,
+        "`RecordStoreGraph::zone_scan_eq` must decide those candidates through the shared \
+         `read_source::index_seek_eq_recheck` — `label_bitmap_at` + `is_visible` + the value residual \
+         + the SIREAD markers + the fail-closed read-fault handling — so the zone-routed answer and \
+         the scan it accelerates are the same set by construction (`rmp` task #958)",
+    );
+    for raw in [".node_labels(", "mvcc.in_use()"] {
+        assert_eq!(
+            code_hits(&body, raw),
+            0,
+            "`RecordStoreGraph::zone_scan_eq` must not re-check a candidate with `{raw}`: the label \
+             word is mutated in place and `in_use` is not a visibility predicate, so that read is a \
+             dirty read in both directions (`rmp` task #958)",
+        );
+    }
+    assert_eq!(
+        code_hits(COORDINATOR, "fn zone_scan_eq"),
+        0,
+        "the zone-map skip query must live on a seam that owns a snapshot. `TxnCoordinator` has \
+         none — `label_bitmap_at` demands a `(Snapshot, CommitRegistry)` pair — so a coordinator-level \
+         `zone_scan_eq` cannot be anything but a dirty read (`rmp` task #958)",
     );
 }
 
