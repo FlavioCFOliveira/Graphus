@@ -175,7 +175,10 @@ summary, under `plan` (EXPLAIN — the query was planned, not run) or `profile` 
 each operator carries its measured `rows` and `dbHits`). Exactly one of the two keys is ever present,
 and neither appears for an ordinary statement. The plan is a **plain JSON** document (not Jolt-typed —
 it is a diagnostic, not a result cell) in the Neo4j shape: `operatorType`, `args`, `identifiers`, and
-`children` for a non-leaf. See [cypher.md](cypher.md#query-prefixes--explain-and-profile).
+`children` for a non-leaf. A `PROFILE`'s `args` additionally carry the candidates each access path
+examined and rejected, and the serializability markers it emitted (`CandidatesExamined`,
+`CandidatesRejectedByVisibility`, `CandidatesRejectedByFilter`, `ReadMarkers`, `PredicateMarkers`), each
+present only when non-zero. See [cypher.md](cypher.md#query-prefixes--explain-and-profile).
 
 ### 4.1 Value encoding (Jolt typed JSON)
 

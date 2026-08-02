@@ -3971,6 +3971,13 @@ impl GraphAccess for ReadOnlyGraph<'_> {
         self.0.statistics()
     }
 
+    fn take_read_tally(&self) -> crate::read_source::ReadCounts {
+        // `rmp` #991: forwarded, not defaulted — the subquery's candidates are examined by the seam
+        // underneath, so inheriting the ZERO default would report a fabricated absence of work for
+        // every `EXISTS { ... }` sub-pipeline.
+        self.0.take_read_tally()
+    }
+
     // ---- writes: never reached (the read-only inner plan emits no write operator) -------------
     fn create_node(
         &mut self,

@@ -42,6 +42,7 @@
 //! `LiveSource(&*self.store.borrow())` + its own [`VisCtx`] + its own sink, so its observable behaviour
 //! stays **byte-identical** (the openCypher TCK and the Slice 3b-i equivalence test are the guards).
 
+use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -954,6 +955,195 @@ pub trait ReadSink {
     /// overwrites the first, which is usually the root cause). While set, the read result is
     /// untrustworthy and the caller must roll back.
     fn capture(&self, err: GraphusError);
+
+    /// Adds one access path's **candidate-examination** counts to this sink's [`ReadTally`]
+    /// (`rmp` task #991): `examined` candidate records were decoded and tested, of which
+    /// `rejected_by_visibility` were dropped by the MVCC visibility re-check and
+    /// `rejected_by_predicate` by the access path's own predicate re-check (label, value, range,
+    /// relationship type). The three are disjoint, so
+    /// `examined - rejected_by_visibility - rejected_by_predicate` is what survived.
+    ///
+    /// Default: a **no-op**. A sink that does not measure candidate examination reports nothing
+    /// rather than a fabricated number — the same rule the omitted `pageCache*`/`time` counters
+    /// follow (decision `D-query-prefixes`). Note the consequence for a seam that keeps the default
+    /// (in-tree, only [`MemGraph`](crate::graph_access::MemGraph), which is reachable from
+    /// `graphus-cypher`/`graphus-tck` tests and never in production): its plans carry **no** candidate
+    /// counter at all, and there the absence means "not measured" rather than "measured zero".
+    fn note_candidates(
+        &self,
+        _examined: u64,
+        _rejected_by_visibility: u64,
+        _rejected_by_predicate: u64,
+    ) {
+    }
+}
+
+// =================================================================================================
+// ReadTally / ReadCounts — the measured cost of the candidate + re-verification model (`rmp` #991)
+// =================================================================================================
+
+/// One access path's measured **candidate-examination** counts, drained off a [`ReadTally`]
+/// (`rmp` task #991).
+///
+/// # Why this exists
+///
+/// Every index access path in Graphus is a *candidate list plus a re-verification*: the index answers
+/// with a **superset** of the matching ids (it is a derived, MVCC-unaware structure), and the read body
+/// re-reads each candidate to test visibility and re-apply the predicate. `dbHits` charges what an
+/// operator **matched**, so a seek that examines a million candidates to return ten rows is
+/// indistinguishable from one that examines ten — and the blanket `mark_all_live_nodes` predicate
+/// footprint that every non-equality seek registers costs a pass over every live node without appearing
+/// anywhere at all. These counters make both visible.
+///
+/// # What each field is (all **measured**, none derived)
+///
+/// The three candidate counters are **disjoint**: a candidate is counted once in
+/// [`candidates_examined`](Self::candidates_examined) and then at most once as a rejection, so
+/// `candidates_examined - rejected_by_visibility - rejected_by_predicate` is the number of candidates
+/// that **survived the re-verification**.
+///
+/// That is a statement about *candidates*, and deliberately **not** about the operator's rows. Two
+/// mechanisms make the two differ, both measured and pinned by
+/// `tests/candidate_instrumentation.rs::surviving_candidates_are_not_rows_991`:
+///
+/// * **De-duplication.** A stale and a live index entry can name the same id, which is then examined
+///   twice, survives twice, and yields **one** row — every `index_seek_*_recheck` body de-duplicates
+///   before returning, precisely because that happens.
+/// * **One candidate, several rows.** A self-loop under [`ExpandDirection::Both`] is one surviving
+///   relationship candidate that [`expand_with_csr`] reports on both of its sides.
+///
+/// The two marker counters are counted at the point of emission — one per call the read body makes to
+/// [`ReadSink::note_read`] / [`ReadSink::note_predicate_read`] — never inferred from the candidate
+/// counts, which is why a blanket marker pass (zero candidates, one marker per live node) shows up
+/// here as exactly what it is.
+///
+/// # Where a storage **fault** is counted (`rmp` #991, documented rather than separated)
+///
+/// A candidate whose record cannot be read at all is neither invisible nor predicate-rejected, but it
+/// is aggregated into [`rejected_by_visibility`](Self::rejected_by_visibility) — and, for a property
+/// read that faults inside a value residual, into
+/// [`rejected_by_predicate`](Self::rejected_by_predicate). No fourth counter is spent on it because
+/// the case is unobservable in a delivered plan: every such site **fails closed**, capturing the error
+/// so the statement is rolled back and its plan never reaches a client. The aggregation is recorded
+/// here rather than left implicit so that a future reader does not mistake a fault for a visibility
+/// decision when debugging a captured-error path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReadCounts {
+    /// Candidate records decoded from the store and tested by an access path's re-verification.
+    pub candidates_examined: u64,
+    /// Of those, how many were dropped because the version is not visible to this snapshot.
+    pub rejected_by_visibility: u64,
+    /// Of those, how many were dropped by the access path's own predicate re-check — the label
+    /// bitmap, the current property value against the seek value or range bounds, or the
+    /// relationship type.
+    pub rejected_by_predicate: u64,
+    /// Per-record SIREAD markers emitted ([`ReadSink::note_read`] calls).
+    pub read_markers: u64,
+    /// Predicate SIREAD markers emitted ([`ReadSink::note_predicate_read`] calls).
+    pub predicate_markers: u64,
+}
+
+impl ReadCounts {
+    /// The all-zero counts — what a seam that measures nothing reports.
+    pub const ZERO: Self = Self {
+        candidates_examined: 0,
+        rejected_by_visibility: 0,
+        rejected_by_predicate: 0,
+        read_markers: 0,
+        predicate_markers: 0,
+    };
+
+    /// Whether nothing at all was measured (the common case for an operator that never touches the
+    /// storage seam).
+    #[must_use]
+    pub fn is_zero(&self) -> bool {
+        *self == Self::ZERO
+    }
+}
+
+/// The live accumulator behind [`ReadCounts`], owned by a seam that measures its own candidate
+/// examination (`rmp` task #991).
+///
+/// # Why `Cell` and not an atomic
+///
+/// The seams that own one ([`RecordStoreGraph`](crate::record_graph::RecordStoreGraph) and
+/// [`ReadOnlyGraph`](crate::read_only_graph::ReadOnlyGraph)) are already `!Sync` — both drive the store
+/// through `RefCell` — and each is used by exactly one thread at a time (the engine thread, or the one
+/// reader-pool thread the read was dispatched to). A `Cell` therefore needs no synchronisation at all,
+/// which matters because these counters are incremented on the **always-on** path: an unprofiled
+/// statement still tallies, it simply never drains.
+///
+/// The two halves accumulate differently, and only one is batched:
+///
+/// * **Candidates are batched.** A read body counts into plain `u64` locals and calls
+///   [`ReadSink::note_candidates`] **once** per access, so the per-candidate cost is a register
+///   increment and the per-access cost is three `Cell` read-modify-writes.
+/// * **Markers are per-event.** [`note_read_marker`](Self::note_read_marker) /
+///   [`note_predicate_marker`](Self::note_predicate_marker) do **one** `Cell` read-modify-write **per
+///   marker emitted**, because markers are emitted from many scattered sites rather than from a single
+///   loop. On the measured baseline that is 120 read-modify-writes for 40 candidates on an unselective
+///   range seek — three per candidate, not three per access.
+///
+/// Neither shape is atomic and neither allocates, which is why the measured effect stays inside the
+/// benchmark noise (`benches/read_seam.rs`, and `graphus-bench/RESULTS.md` §11.2 for the limits of
+/// that evidence) — but the marker path is genuinely per-event and is described as such.
+#[derive(Debug, Default)]
+pub struct ReadTally {
+    examined: Cell<u64>,
+    rejected_by_visibility: Cell<u64>,
+    rejected_by_predicate: Cell<u64>,
+    read_markers: Cell<u64>,
+    predicate_markers: Cell<u64>,
+}
+
+impl ReadTally {
+    /// A fresh, zeroed tally.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds one access path's candidate counts (see [`ReadSink::note_candidates`]).
+    #[inline]
+    pub fn note_candidates(
+        &self,
+        examined: u64,
+        rejected_by_visibility: u64,
+        rejected_by_predicate: u64,
+    ) {
+        self.examined.set(self.examined.get() + examined);
+        self.rejected_by_visibility
+            .set(self.rejected_by_visibility.get() + rejected_by_visibility);
+        self.rejected_by_predicate
+            .set(self.rejected_by_predicate.get() + rejected_by_predicate);
+    }
+
+    /// Counts one emitted per-record SIREAD marker.
+    #[inline]
+    pub fn note_read_marker(&self) {
+        self.read_markers.set(self.read_markers.get() + 1);
+    }
+
+    /// Counts one emitted predicate SIREAD marker.
+    #[inline]
+    pub fn note_predicate_marker(&self) {
+        self.predicate_markers.set(self.predicate_markers.get() + 1);
+    }
+
+    /// Takes everything measured since the previous drain and **resets** to zero.
+    ///
+    /// Draining is what makes the counts attributable: the profiler drains immediately after each
+    /// storage-seam call, so the counts land on the operator that made it and never leak into the next.
+    #[must_use]
+    pub fn take(&self) -> ReadCounts {
+        ReadCounts {
+            candidates_examined: self.examined.replace(0),
+            rejected_by_visibility: self.rejected_by_visibility.replace(0),
+            rejected_by_predicate: self.rejected_by_predicate.replace(0),
+            read_markers: self.read_markers.replace(0),
+            predicate_markers: self.predicate_markers.replace(0),
+        }
+    }
 }
 
 // =================================================================================================
@@ -1042,21 +1232,28 @@ pub fn scan_nodes<S: StoreReadSource, K: ReadSink>(src: &S, ctx: &VisCtx, sink: 
         }
     };
     let mut out = Vec::new();
+    // Candidate instrumentation (`rmp` #991), accumulated in locals and flushed once — see `ReadTally`.
+    let (mut examined, mut hidden) = (0u64, 0u64);
     for id in ids {
         match src.node(id) {
             Ok(rec) => {
+                examined += 1;
                 // A full scan examines every node, so SIREAD-mark each (`04 §5.4`).
                 sink.note_read(node_ssi_key(id));
                 if ctx.visible(rec.mvcc) {
                     out.push(NodeId(id));
+                } else {
+                    hidden += 1;
                 }
             }
             Err(e) => {
+                sink.note_candidates(examined, hidden, 0);
                 sink.capture(e);
                 return Vec::new();
             }
         }
     }
+    sink.note_candidates(examined, hidden, 0);
     out
 }
 
@@ -1094,6 +1291,10 @@ pub fn filter_label_candidates<S: StoreReadSource, K: ReadSink>(
     ids: Vec<u64>,
 ) -> Vec<NodeId> {
     let mut out = Vec::new();
+    // Candidate instrumentation (`rmp` #991): this is THE candidate re-verification of every node
+    // access path — the label re-check every index seek funnels its candidate list through — so its
+    // counts are what makes "examined a million to return ten" visible. Counted in locals, flushed once.
+    let (mut examined, mut hidden, mut filtered) = (0u64, 0u64, 0u64);
     for id in ids {
         // Skip nodes not visible before testing the label, honouring MVCC visibility.
         let rec = match src.node(id) {
@@ -1103,14 +1304,17 @@ pub fn filter_label_candidates<S: StoreReadSource, K: ReadSink>(
             // never a false alarm — and dropping the candidate could let a uniqueness / node-key check
             // miss an unreadable existing holder and commit a duplicate.
             Err(e) => {
+                sink.note_candidates(examined, hidden, filtered);
                 sink.capture(e);
                 return Vec::new();
             }
         };
+        examined += 1;
         let visible = ctx.visible(rec.mvcc);
         // SIREAD-mark every examined node, visible or not (the label predicate examined it).
         sink.note_read(node_ssi_key(id));
         if !visible {
+            hidden += 1;
             continue;
         }
         // Resolve the label word AS OF THIS SNAPSHOT (`rmp` #767) rather than reading whatever it
@@ -1119,14 +1323,16 @@ pub fn filter_label_candidates<S: StoreReadSource, K: ReadSink>(
         let bitmap = ctx.labels_at(src, id, rec.labels);
         match labels::has_label(bitmap, token_id) {
             Ok(true) => out.push(NodeId(id)),
-            Ok(false) => {}
+            Ok(false) => filtered += 1,
             Err(e) => {
                 // An overflow-form bitmap surfaces as a captured error, never a wrong row.
+                sink.note_candidates(examined, hidden, filtered);
                 sink.capture(GraphusError::from(e));
                 return Vec::new();
             }
         }
     }
+    sink.note_candidates(examined, hidden, filtered);
     out
 }
 
@@ -1144,19 +1350,25 @@ pub fn filter_any_label_candidates<S: StoreReadSource, K: ReadSink>(
     ids: Vec<u64>,
 ) -> Vec<NodeId> {
     let mut out = Vec::new();
+    // Candidate instrumentation (`rmp` #991) — see `filter_label_candidates`; counted in locals and
+    // flushed once, including on every fail-closed exit (the candidates WERE examined).
+    let (mut examined, mut hidden, mut filtered) = (0u64, 0u64, 0u64);
     for id in ids {
         let rec = match src.node(id) {
             Ok(rec) => rec,
             // FAIL CLOSED on a genuine read fault (`rmp` task #733), matching the `node_has_label` arm.
             Err(e) => {
+                sink.note_candidates(examined, hidden, filtered);
                 sink.capture(e);
                 return Vec::new();
             }
         };
+        examined += 1;
         let visible = ctx.visible(rec.mvcc);
         // SIREAD-mark every examined node exactly once, visible or not.
         sink.note_read(node_ssi_key(id));
         if !visible {
+            hidden += 1;
             continue;
         }
         // One snapshot-correct resolution (`rmp` #767) for the whole token loop below.
@@ -1170,6 +1382,7 @@ pub fn filter_any_label_candidates<S: StoreReadSource, K: ReadSink>(
                 }
                 Ok(false) => {}
                 Err(e) => {
+                    sink.note_candidates(examined, hidden, filtered);
                     sink.capture(GraphusError::from(e));
                     return Vec::new();
                 }
@@ -1177,8 +1390,11 @@ pub fn filter_any_label_candidates<S: StoreReadSource, K: ReadSink>(
         }
         if carries {
             out.push(NodeId(id));
+        } else {
+            filtered += 1;
         }
     }
+    sink.note_candidates(examined, hidden, filtered);
     out
 }
 
@@ -1216,6 +1432,8 @@ pub fn scan_label_property_morsel<S: StoreReadSource, K: ReadSink>(
 ) -> (usize, Vec<Value>) {
     let mut label_matches = 0usize;
     let mut values: Vec<Value> = Vec::new();
+    // Candidate instrumentation (`rmp` #991), identical in meaning to `filter_label_candidates`'s.
+    let (mut examined, mut hidden, mut filtered) = (0u64, 0u64, 0u64);
     for &id in ids {
         // Read the node record ONCE (visibility + label re-check). A read fault FAILS CLOSED
         // (`rmp` task #733), exactly as the sibling `node_has_label` arm below and
@@ -1224,22 +1442,29 @@ pub fn scan_label_property_morsel<S: StoreReadSource, K: ReadSink>(
         let rec = match src.node(id) {
             Ok(rec) => rec,
             Err(e) => {
+                sink.note_candidates(examined, hidden, filtered);
                 sink.capture(e);
                 return (label_matches, values);
             }
         };
+        examined += 1;
         // SIREAD-mark every examined candidate, visible or not (the predicate examined it) — the
         // identical per-candidate marker `filter_label_candidates` records.
         sink.note_read(node_ssi_key(id));
         if !ctx.visible(rec.mvcc) {
+            hidden += 1;
             continue;
         }
         // Snapshot-correct label membership (`rmp` #767), resolved from the record read above.
         match labels::has_label(ctx.labels_at(src, id, rec.labels), token_id) {
             Ok(true) => {}
-            Ok(false) => continue,
+            Ok(false) => {
+                filtered += 1;
+                continue;
+            }
             Err(e) => {
                 // An overflow-form bitmap surfaces as a captured error, never a wrong row.
+                sink.note_candidates(examined, hidden, filtered);
                 sink.capture(GraphusError::from(e));
                 return (label_matches, values);
             }
@@ -1252,6 +1477,7 @@ pub fn scan_label_property_morsel<S: StoreReadSource, K: ReadSink>(
             values.push(value);
         }
     }
+    sink.note_candidates(examined, hidden, filtered);
     (label_matches, values)
 }
 
@@ -1342,13 +1568,17 @@ pub fn scan_filter_eq<S: StoreReadSource, K: ReadSink>(
     ) else {
         let candidates = scan_nodes_by_label(src, ctx, sink, label);
         let examined = candidates.len();
-        let matched = candidates
+        let matched: Vec<NodeId> = candidates
             .into_iter()
             .filter(|id| {
                 node_property(src, ctx, sink, *id, property)
                     .is_some_and(|v| crate::equality::equals(&v, seek).is_true())
             })
             .collect();
+        // The value residual's own rejections (`rmp` #991). The candidates themselves were already
+        // counted (examined + visibility + label) by the `scan_nodes_by_label` above, so only the
+        // *additional* predicate rejections are added here — never the candidates a second time.
+        sink.note_candidates(0, 0, (examined - matched.len()) as u64);
         return ScanFilter { matched, examined };
     };
 
@@ -1379,25 +1609,36 @@ pub fn scan_filter_eq<S: StoreReadSource, K: ReadSink>(
     // a `PROFILE`'s `dbHits` (`rmp` #752) — a measured number, free to obtain (it is the scan's own length).
     let examined = ids.len();
     let mut out = Vec::new();
+    // Candidate instrumentation (`rmp` #991). `examined` above is the same quantity, already reported to
+    // the caller as this operator's `dbHits`; it is tallied here too so the fused scan+filter is
+    // comparable, operator for operator, with the index seek that replaces it.
+    let (mut seen, mut hidden, mut filtered) = (0u64, 0u64, 0u64);
     for id in ids {
         // Visibility first (MVCC): a tombstoned / not-yet-committed node never matches.
         let rec = match src.node(id) {
             Ok(rec) => rec,
             // `scan_node_ids` only yields slot-occupied ids; a transient decode fault is a real error.
             Err(e) => {
+                sink.note_candidates(seen, hidden, filtered);
                 sink.capture(e);
                 return ScanFilter::default();
             }
         };
+        seen += 1;
         if !ctx.visible(rec.mvcc) {
+            hidden += 1;
             continue;
         }
         // Carries the label AS OF THIS SNAPSHOT (`rmp` #767)?
         match labels::has_label(ctx.labels_at(src, id, rec.labels), label_token) {
             Ok(true) => {}
-            Ok(false) => continue,
+            Ok(false) => {
+                filtered += 1;
+                continue;
+            }
             Err(e) => {
                 // An overflow-form bitmap (#39) surfaces as a captured error, never a wrong row.
+                sink.note_candidates(seen, hidden, filtered);
                 sink.capture(GraphusError::from(e));
                 return ScanFilter::default();
             }
@@ -1411,8 +1652,11 @@ pub fn scan_filter_eq<S: StoreReadSource, K: ReadSink>(
             // modify/delete of *this* matching node must abort one of the two).
             sink.note_read(node_ssi_key(id));
             out.push(NodeId(id));
+        } else {
+            filtered += 1;
         }
     }
+    sink.note_candidates(seen, hidden, filtered);
     ScanFilter {
         matched: out,
         examined,
@@ -1494,16 +1738,24 @@ pub fn index_seek_eq_recheck<S: StoreReadSource, K: ReadSink>(
     let labelled = filter_label_candidates(src, ctx, sink, label_token, candidates);
 
     let mut out: Vec<(NodeId, Option<Value>)> = Vec::with_capacity(labelled.len());
+    // The value residual's own rejections (`rmp` #991): a candidate that survived the label re-check but
+    // whose current value is absent, or differs from `seek`. The candidates were already counted by
+    // `filter_label_candidates` — only the extra rejections are added, never the candidates twice.
+    let mut filtered = 0u64;
     for id in labelled {
         let Some(value) = node_property(src, ctx, sink, id, property) else {
+            filtered += 1;
             continue;
         };
         if crate::equality::equals(&value, seek).is_true() {
             // `carry.keep` DROPS the value under `Discard`, right here — the discarding path never
             // holds a second copy of the result set (`rmp` #879).
             out.push((id, carry.keep(value)));
+        } else {
+            filtered += 1;
         }
     }
+    sink.note_candidates(0, 0, filtered);
     // De-duplicate: a stale + a live index entry can name the same id twice. Keyed on the id alone,
     // so the carried value stays aligned with the id it was read from. The sort stays UNSTABLE, as
     // before: two entries sharing an id also share their value — both came from `node_property(id,
@@ -1562,15 +1814,21 @@ pub fn index_seek_range_recheck<S: StoreReadSource, K: ReadSink>(
     // fault), then the *current* value satisfies BOTH bounds under Cypher comparison semantics.
     let labelled = filter_label_candidates(src, ctx, sink, label_token, candidates);
     let mut out: Vec<(NodeId, Option<Value>)> = Vec::with_capacity(labelled.len());
+    // The range residual's own rejections (`rmp` #991) — see `index_seek_eq_recheck`.
+    let mut filtered = 0u64;
     for id in labelled {
         let Some(value) = node_property(src, ctx, sink, id, property) else {
+            filtered += 1;
             continue;
         };
         if crate::eval::satisfies_range(&value, lower, upper) {
             // The value the range residual just tested — carried under `rmp` #879, dropped otherwise.
             out.push((id, carry.keep(value)));
+        } else {
+            filtered += 1;
         }
     }
+    sink.note_candidates(0, 0, filtered);
     // De-duplicate: a stale + a live index entry can name the same id twice.
     out.sort_unstable_by_key(|(id, _)| *id);
     out.dedup_by_key(|(id, _)| *id);
@@ -1621,6 +1879,9 @@ pub fn index_seek_composite_recheck<S: StoreReadSource, K: ReadSink>(
     // identical set.
     let labelled = filter_label_candidates(src, ctx, sink, label_token, candidates);
     let mut out: Vec<(NodeId, Option<Vec<Value>>)> = Vec::with_capacity(labelled.len());
+    // The tuple residual's own rejections (`rmp` #991) — see `index_seek_eq_recheck`. One per rejected
+    // CANDIDATE, not per rejected key: the short-circuit means a candidate fails on exactly one key.
+    let mut filtered = 0u64;
     for id in labelled {
         // The element-wise tuple residual, still SHORT-CIRCUITING on the first key that fails: a
         // candidate rejected on key 1 must not read keys 2..k, or the read footprint would grow.
@@ -1639,8 +1900,11 @@ pub fn index_seek_composite_recheck<S: StoreReadSource, K: ReadSink>(
         }
         if all_match {
             out.push((id, carry.keep(tuple)));
+        } else {
+            filtered += 1;
         }
     }
+    sink.note_candidates(0, 0, filtered);
     // De-duplicate: a stale + a live index entry can name the same id twice.
     out.sort_unstable_by_key(|(id, _)| *id);
     out.dedup_by_key(|(id, _)| *id);
@@ -1788,19 +2052,35 @@ pub fn rel_index_seek_eq_recheck<S: StoreReadSource, K: ReadSink>(
     value: &Value,
     candidates: Vec<u64>,
 ) -> Vec<RelId> {
+    // Candidate instrumentation (`rmp` #991): `rel_candidate` discriminates a hidden version from a
+    // type/value mismatch, which the `Option` of `rel_data` cannot.
+    let (mut examined, mut hidden, mut filtered) = (0u64, 0u64, 0u64);
     let mut out: Vec<u64> = candidates
         .into_iter()
         .filter(|&id| {
             let r = RelId(id);
-            match rel_data(src, ctx, sink, r) {
-                Some(data) if data.rel_type == type_name => {
-                    rel_property(src, ctx, sink, r, property)
-                        .is_some_and(|v| crate::equality::equals(&v, value).is_true())
+            examined += 1;
+            match rel_candidate(src, ctx, sink, r) {
+                RelCandidate::Visible(data) if data.rel_type == type_name => {
+                    let keep = rel_property(src, ctx, sink, r, property)
+                        .is_some_and(|v| crate::equality::equals(&v, value).is_true());
+                    if !keep {
+                        filtered += 1;
+                    }
+                    keep
                 }
-                _ => false,
+                RelCandidate::Visible(_) => {
+                    filtered += 1;
+                    false
+                }
+                RelCandidate::Hidden | RelCandidate::Faulted => {
+                    hidden += 1;
+                    false
+                }
             }
         })
         .collect();
+    sink.note_candidates(examined, hidden, filtered);
     // De-duplicate: a stale + a live index entry can name the same id twice.
     out.sort_unstable();
     out.dedup();
@@ -1824,19 +2104,34 @@ pub fn rel_index_seek_range_recheck<S: StoreReadSource, K: ReadSink>(
     upper: Option<(&Value, bool)>,
     candidates: Vec<u64>,
 ) -> Vec<RelId> {
+    // Candidate instrumentation (`rmp` #991) — see `rel_index_seek_eq_recheck`.
+    let (mut examined, mut hidden, mut filtered) = (0u64, 0u64, 0u64);
     let mut out: Vec<u64> = candidates
         .into_iter()
         .filter(|&id| {
             let r = RelId(id);
-            match rel_data(src, ctx, sink, r) {
-                Some(data) if data.rel_type == type_name => {
-                    rel_property(src, ctx, sink, r, property)
-                        .is_some_and(|v| crate::eval::satisfies_range(&v, lower, upper))
+            examined += 1;
+            match rel_candidate(src, ctx, sink, r) {
+                RelCandidate::Visible(data) if data.rel_type == type_name => {
+                    let keep = rel_property(src, ctx, sink, r, property)
+                        .is_some_and(|v| crate::eval::satisfies_range(&v, lower, upper));
+                    if !keep {
+                        filtered += 1;
+                    }
+                    keep
                 }
-                _ => false,
+                RelCandidate::Visible(_) => {
+                    filtered += 1;
+                    false
+                }
+                RelCandidate::Hidden | RelCandidate::Faulted => {
+                    hidden += 1;
+                    false
+                }
             }
         })
         .collect();
+    sink.note_candidates(examined, hidden, filtered);
     out.sort_unstable();
     out.dedup();
     out.into_iter().map(RelId).collect()
@@ -1855,22 +2150,39 @@ pub fn rel_index_seek_composite_recheck<S: StoreReadSource, K: ReadSink>(
     values: &[Value],
     candidates: Vec<u64>,
 ) -> Vec<RelId> {
+    // Candidate instrumentation (`rmp` #991) — see `rel_index_seek_eq_recheck`.
+    let (mut examined, mut hidden, mut filtered) = (0u64, 0u64, 0u64);
     let mut out: Vec<u64> = candidates
         .into_iter()
         .filter(|&id| {
             let r = RelId(id);
-            match rel_data(src, ctx, sink, r) {
-                Some(data) if data.rel_type == type_name => properties
-                    .iter()
-                    .zip(values.iter())
-                    .all(|(property, value)| {
-                        rel_property(src, ctx, sink, r, property)
-                            .is_some_and(|v| crate::equality::equals(&v, value).is_true())
-                    }),
-                _ => false,
+            examined += 1;
+            match rel_candidate(src, ctx, sink, r) {
+                RelCandidate::Visible(data) if data.rel_type == type_name => {
+                    let keep = properties
+                        .iter()
+                        .zip(values.iter())
+                        .all(|(property, value)| {
+                            rel_property(src, ctx, sink, r, property)
+                                .is_some_and(|v| crate::equality::equals(&v, value).is_true())
+                        });
+                    if !keep {
+                        filtered += 1;
+                    }
+                    keep
+                }
+                RelCandidate::Visible(_) => {
+                    filtered += 1;
+                    false
+                }
+                RelCandidate::Hidden | RelCandidate::Faulted => {
+                    hidden += 1;
+                    false
+                }
             }
         })
         .collect();
+    sink.note_candidates(examined, hidden, filtered);
     out.sort_unstable();
     out.dedup();
     out.into_iter().map(RelId).collect()
@@ -1905,15 +2217,29 @@ pub fn rel_index_seek_spatial_recheck<S: StoreReadSource, K: ReadSink>(
     // The inline rel spatial seam marks every live relationship (the seek stands in for a typed scan) —
     // reproduce it here so the served footprint is identical.
     mark_all_live_rels(src, sink);
+    // Candidate instrumentation (`rmp` #991) — see `rel_index_seek_eq_recheck`.
+    let (mut examined, mut hidden, mut filtered) = (0u64, 0u64, 0u64);
     let mut out: Vec<u64> = candidates
         .into_iter()
         .filter(|&id| {
-            // `rel_data` SIREAD-marks + visibility-filters each candidate, mirroring the inline seam's
-            // per-candidate `self.rel_data(...)` type re-check; the residual `distance` filter above
-            // restores exactness.
-            matches!(rel_data(src, ctx, sink, RelId(id)), Some(data) if data.rel_type == type_name)
+            // `rel_candidate` SIREAD-marks + visibility-filters each candidate, mirroring the inline
+            // seam's per-candidate `self.rel_data(...)` type re-check; the residual `distance` filter
+            // above restores exactness.
+            examined += 1;
+            match rel_candidate(src, ctx, sink, RelId(id)) {
+                RelCandidate::Visible(data) if data.rel_type == type_name => true,
+                RelCandidate::Visible(_) => {
+                    filtered += 1;
+                    false
+                }
+                RelCandidate::Hidden | RelCandidate::Faulted => {
+                    hidden += 1;
+                    false
+                }
+            }
         })
         .collect();
+    sink.note_candidates(examined, hidden, filtered);
     out.sort_unstable();
     out.dedup();
     out.into_iter().map(RelId).collect()
@@ -1992,6 +2318,10 @@ pub fn expand_with_csr<S: StoreReadSource, K: ReadSink>(
     //   * "Win 1" (the fallback): walk the incidence chain once with `incident_rels_typed`, reading
     //     each link once and filtering type inline. Used when the CSR is off/stale or the expand is
     //     untyped. An empty `wanted_type_ids` (untyped) returns every incident edge here.
+    // Candidate instrumentation (`rmp` #991): on the CSR arm a candidate rejected by the type re-check is
+    // a predicate rejection recorded before the chain is even touched; on the chain arm the storage walk
+    // has already applied the type filter, so every returned link is a candidate this body examines.
+    let mut filtered = 0u64;
     let rels: Vec<(u64, RelRecord)> = match csr_candidates {
         Some(candidate_ids) => {
             // The CSR stores each incident rel-id of a `(node, type)` bucket exactly once (a self-loop
@@ -2003,6 +2333,7 @@ pub fn expand_with_csr<S: StoreReadSource, K: ReadSink>(
                 let rec = match src.rel(rid) {
                     Ok(rec) => rec,
                     Err(e) => {
+                        sink.note_candidates(filtered + matched.len() as u64, 0, filtered);
                         sink.capture(e);
                         return Vec::new();
                     }
@@ -2012,6 +2343,7 @@ pub fn expand_with_csr<S: StoreReadSource, K: ReadSink>(
                 // caller only supplies CSR candidates for a typed expand.) A stale CSR id can only fail
                 // this re-check (a superset id), never silently inject a wrong row.
                 if !rec.mvcc.in_use() || !wanted_type_ids.contains(&rec.type_id) {
+                    filtered += 1;
                     continue;
                 }
                 matched.push((rid, rec));
@@ -2027,7 +2359,9 @@ pub fn expand_with_csr<S: StoreReadSource, K: ReadSink>(
         },
     };
     let mut out = Vec::new();
+    let (mut examined, mut hidden) = (filtered, 0u64);
     for (rid, rec) in rels {
+        examined += 1;
         // SIREAD-mark each MATCHING incident relationship the traversal examined (`04 §5.4`). Edges of
         // a non-requested type were never examined (the storage walk filtered them), so they need no
         // per-rel SIREAD: the rel-type predicate marker above already covers any concurrent
@@ -2037,12 +2371,14 @@ pub fn expand_with_csr<S: StoreReadSource, K: ReadSink>(
         // reader could still traverse, or a later-committed edge). The incidence chain threads them
         // until GC.
         if !ctx.visible(rec.mvcc) {
+            hidden += 1;
             continue;
         }
         let touches_as_start = rec.start_node == node.0;
         let touches_as_end = rec.end_node == node.0;
         let want_out = matches!(direction, ExpandDirection::Outgoing | ExpandDirection::Both);
         let want_in = matches!(direction, ExpandDirection::Incoming | ExpandDirection::Both);
+        let before = out.len();
         if touches_as_start && want_out {
             out.push(Incident {
                 rel: RelId(rid),
@@ -2055,7 +2391,15 @@ pub fn expand_with_csr<S: StoreReadSource, K: ReadSink>(
                 neighbour: NodeId(rec.start_node),
             });
         }
+        if out.len() == before {
+            // A visible incident edge the traversal DIRECTION rejected (it only touches the anchor on
+            // the side this pattern does not want) — a predicate rejection like any other (`rmp` #991).
+            filtered += 1;
+        }
     }
+    // NOTE the surviving-candidate identity holds on the CANDIDATES, not on the rows: a self-loop under
+    // `ExpandDirection::Both` is one surviving candidate that emits **two** incidents.
+    sink.note_candidates(examined, hidden, filtered);
     out
 }
 
@@ -2281,14 +2625,19 @@ pub fn scan_rels_typed<S: StoreReadSource, K: ReadSink>(
         }
     };
     let mut out = Vec::new();
+    // Candidate instrumentation (`rmp` #991). A reclaimed (`!in_use`) slot and a non-matching type are
+    // both predicate rejections here: the record WAS decoded to decide either.
+    let (mut examined, mut hidden, mut filtered) = (0u64, 0u64, 0u64);
     for id in rel_ids {
         let rec = match src.rel(id) {
             Ok(rec) => rec,
             Err(e) => {
+                sink.note_candidates(examined, hidden, filtered);
                 sink.capture(e);
                 return None;
             }
         };
+        examined += 1;
         // Re-check slot occupancy on the RE-READ record, exactly as `expand_with_csr` re-checks its CSR
         // candidates. `scan_rel_ids` reported the slot occupied, but that was a separate read: this makes
         // the safety **local** instead of derived from three remote invariants. Without it, correctness
@@ -2296,11 +2645,13 @@ pub fn scan_rels_typed<S: StoreReadSource, K: ReadSink>(
         // making `creator_visible` false, and (3) the `rmp` #588 held-slots barrier keeping the slot out
         // of reuse for the duration — all true today, none of them stated here.
         if !rec.mvcc.in_use() {
+            filtered += 1;
             continue;
         }
         // An untyped scan wants every occupied slot, a typed one only the matching type. The type test
         // precedes the SIREAD so the marked set matches `expand`'s exactly (see the footprint section).
         if !wanted_type_ids.is_empty() && !wanted_type_ids.contains(&rec.type_id) {
+            filtered += 1;
             continue;
         }
         sink.note_read(rel_ssi_key(id));
@@ -2312,8 +2663,11 @@ pub fn scan_rels_typed<S: StoreReadSource, K: ReadSink>(
                 start: NodeId(rec.start_node),
                 end: NodeId(rec.end_node),
             });
+        } else {
+            hidden += 1;
         }
     }
+    sink.note_candidates(examined, hidden, filtered);
     Some(out)
 }
 
@@ -2325,6 +2679,43 @@ pub fn rel_data<S: StoreReadSource, K: ReadSink>(
     sink: &K,
     rel: RelId,
 ) -> Option<RelData> {
+    match rel_candidate(src, ctx, sink, rel) {
+        RelCandidate::Visible(data) => Some(data),
+        RelCandidate::Hidden | RelCandidate::Faulted => None,
+    }
+}
+
+/// Why one relationship candidate's re-read did or did not yield data — the discrimination the
+/// [`Option`] of [`rel_data`] collapses (`rmp` task #991).
+///
+/// The relationship index seek bodies need it to tell a candidate **rejected by MVCC visibility** from
+/// one rejected by the type/value predicate, which `Option` cannot express. Keeping it as one body that
+/// `rel_data` delegates to (rather than a second copy of the read) is what stops the two from drifting.
+pub(crate) enum RelCandidate {
+    /// The relationship exists and is visible to this snapshot.
+    Visible(RelData),
+    /// The record decoded, but the version is not visible to this snapshot.
+    Hidden,
+    /// The record could not be read at all; the fault has been captured, so the statement's result is
+    /// already untrustworthy and will be rolled back.
+    ///
+    /// Every call site aggregates this with [`Hidden`](Self::Hidden) into
+    /// [`ReadCounts::rejected_by_visibility`] rather than spending a fourth counter on it: a fault is
+    /// strictly neither a visibility nor a predicate decision, but the site **fails closed**, so the
+    /// plan carrying the count never reaches a client. The aggregation is stated here and on
+    /// [`ReadCounts`] so it is never mistaken for a visibility decision when reading a captured-error
+    /// path.
+    Faulted,
+}
+
+/// The single body behind [`rel_data`]: read the relationship record, SIREAD-mark it, and report
+/// **why** it did or did not yield data (see [`RelCandidate`]).
+pub(crate) fn rel_candidate<S: StoreReadSource, K: ReadSink>(
+    src: &S,
+    ctx: &VisCtx,
+    sink: &K,
+    rel: RelId,
+) -> RelCandidate {
     let rec = match src.rel(rel.0) {
         Ok(rec) => rec,
         // A storage `Err` is captured (not swallowed into `None`): every `RelId` reaching here is
@@ -2332,17 +2723,17 @@ pub fn rel_data<S: StoreReadSource, K: ReadSink>(
         // silently read as a missing relationship (`rmp` #359 defence-in-depth).
         Err(e) => {
             sink.capture(e);
-            return None;
+            return RelCandidate::Faulted;
         }
     };
     sink.note_read(rel_ssi_key(rel.0));
     if !ctx.visible(rec.mvcc) {
-        return None;
+        return RelCandidate::Hidden;
     }
     let rel_type = src
         .token_name(Namespace::RelType, rec.type_id)
         .unwrap_or_default();
-    Some(RelData {
+    RelCandidate::Visible(RelData {
         rel_type,
         start: NodeId(rec.start_node),
         end: NodeId(rec.end_node),
@@ -2615,6 +3006,9 @@ pub fn fulltext_scan_fallback<S: StoreReadSource, K: ReadSink>(
     }
 
     let mut out: Vec<NodeId> = Vec::new();
+    // The term residual's own rejections (`rmp` #991): the candidates were already counted by
+    // `filter_any_label_candidates`, so only the extra rejections are added here.
+    let mut filtered = 0u64;
     for node in labelled {
         let mut matched = false;
         'props: for name in &prop_names {
@@ -2632,8 +3026,11 @@ pub fn fulltext_scan_fallback<S: StoreReadSource, K: ReadSink>(
         }
         if matched {
             out.push(node);
+        } else {
+            filtered += 1;
         }
     }
+    sink.note_candidates(0, 0, filtered);
     out.sort_unstable();
     out.dedup();
     out
@@ -2746,13 +3143,19 @@ pub fn fulltext_rel_scan_fallback<S: StoreReadSource, K: ReadSink>(
     }
 
     let mut out: Vec<RelId> = Vec::new();
+    // Candidate instrumentation (`rmp` #991) — `rel_candidate` separates a hidden version from a
+    // type/term mismatch, which the `Option` of `rel_data` cannot.
+    let (mut examined, mut hidden, mut filtered) = (0u64, 0u64, 0u64);
     for id in all_ids {
         let rel = RelId(id);
-        // Visible + of a covered type? `rel_data` returns `None` for a not-visible relationship.
-        let Some(data) = rel_data(src, ctx, sink, rel) else {
+        examined += 1;
+        // Visible + of a covered type? A hidden version yields no data at all.
+        let RelCandidate::Visible(data) = rel_candidate(src, ctx, sink, rel) else {
+            hidden += 1;
             continue;
         };
         if !type_names.contains(&data.rel_type) {
+            filtered += 1;
             continue;
         }
         let mut matched = false;
@@ -2769,8 +3172,11 @@ pub fn fulltext_rel_scan_fallback<S: StoreReadSource, K: ReadSink>(
         }
         if matched {
             out.push(rel);
+        } else {
+            filtered += 1;
         }
     }
+    sink.note_candidates(examined, hidden, filtered);
     out.sort_unstable();
     out.dedup();
     out
@@ -2856,7 +3262,11 @@ pub fn incident_rels<S: StoreReadSource, K: ReadSink>(
             return Vec::new();
         }
     };
-    ids.into_iter()
+    // Candidate instrumentation (`rmp` #991): every incidence-chain link is a candidate this body reads
+    // and visibility-filters.
+    let (mut examined, mut hidden) = (0u64, 0u64);
+    let out: Vec<RelId> = ids
+        .into_iter()
         .filter(|&rid| {
             let mvcc = match src.rel(rid) {
                 Ok(rec) => rec.mvcc,
@@ -2865,11 +3275,18 @@ pub fn incident_rels<S: StoreReadSource, K: ReadSink>(
                     return false;
                 }
             };
+            examined += 1;
             sink.note_read(rel_ssi_key(rid));
-            ctx.visible(mvcc)
+            let visible = ctx.visible(mvcc);
+            if !visible {
+                hidden += 1;
+            }
+            visible
         })
         .map(RelId)
-        .collect()
+        .collect();
+    sink.note_candidates(examined, hidden, 0);
+    out
 }
 
 // --------------------------------- read-only property helpers ---------------------------------

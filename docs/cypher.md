@@ -423,6 +423,46 @@ not just the ones it matched, so a full-scan fallback cannot masquerade as cheap
 Graphus deliberately does **not** report `pageCacheHits`, `pageCacheMisses` or `time`: it does not
 measure them, and a fabricated counter is worse than an absent one. Drivers treat all three as optional.
 
+### The candidates an access path examined
+
+`dbHits` charges an operator for what it **matched**. Every index access path in Graphus is a *candidate
+list plus a re-verification* — the index is a derived, MVCC-unaware structure, so it answers with a
+**superset** of the matching ids and the engine re-reads each candidate to test visibility and re-apply
+the predicate — so `dbHits` alone cannot tell a seek that examined a million candidates to return ten
+rows from one that examined ten. A `PROFILE` therefore also reports, inside each operator's `args`:
+
+| Key | Meaning |
+| --- | ------- |
+| `CandidatesExamined` | Candidate records this operator decoded and re-verified. |
+| `CandidatesRejectedByVisibility` | Of those, how many the MVCC visibility re-check dropped. |
+| `CandidatesRejectedByFilter` | Of those, how many the operator's own predicate re-check dropped (label, value, range, relationship type, traversal direction). PostgreSQL calls the same thing *"Rows Removed by Filter"*. |
+| `ReadMarkers` / `PredicateMarkers` | Serializability (SIREAD) markers this operator emitted, counted where they are emitted. |
+
+The three candidate counters are disjoint: `examined - rejectedByVisibility - rejectedByFilter` is the
+number of candidates that **survived the re-verification**. That is not the same as the operator's row
+count — a node id named by both a stale and a live index entry is examined twice, survives twice and
+yields one row after de-duplication, and a self-loop matched undirected is one survivor reported on
+both of its sides.
+
+`ReadMarkers` is the one to watch. A **range** seek registers a conservative whole-store predicate
+footprint — one marker per live node, however few rows it returns — while an **equality** seek registers
+a precise one. Over a 40-node label, measured:
+
+```
+MATCH (n:Person {name: 'p7'})          NodeIndexSeek       rows=1   dbHits=1   examined=1   ReadMarkers=2
+MATCH (n:Person) WHERE n.age >= 38     NodeIndexRangeSeek  rows=2   dbHits=2   examined=2   ReadMarkers=44
+MATCH (n:Person) WHERE n.age >= 0      NodeIndexRangeSeek  rows=40  dbHits=40  examined=40  ReadMarkers=120
+MATCH (n:Person)                       TokenLookupScan     rows=40  dbHits=40  examined=40  ReadMarkers=80
+```
+
+Two rows costing a 44-marker pass over the whole store is a real cost that `rows` and `dbHits` could not
+show. These counters are emitted **only when non-zero**, the same rule the `stats` map follows. On the
+store-backed engine every server statement runs on, absence therefore means a *measured* zero. (The
+in-memory reference backend used by the engine's own test suites measures no candidates at all and
+emits none of these keys anywhere; that absence means "not measured". Nothing is fabricated either
+way.) Both differ from `pageCacheHits` / `time` above, which are never measured on any backend and so
+are never reported.
+
 `PROFILE` runs the statement **serially** (intra-query morsel parallelism is disabled for it) so that
 every storage access is attributable to an operator; a profiled query may therefore be slower than the
 same query run normally. An unprofiled statement pays nothing at all — no instrumentation is built.

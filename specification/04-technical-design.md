@@ -1142,6 +1142,33 @@ catalogue/statistics lookups — because the store did no record work for them. 
 count of calls through the one seam all store access passes through; nothing is estimated or
 synthesised.
 
+**The candidates an access path examined (rmp #991).** `dbHits` charges an operator for what it
+**matched**, which leaves the cost of Graphus's *candidate + re-verification* access model unmeasured.
+Every index access path answers from a derived, MVCC-unaware structure, so the index yields a
+**superset** of the matching ids and the read body re-reads each candidate to test visibility and
+re-apply the predicate. Two scalability brakes therefore had no signal at all: a seek examining a
+million candidates to return ten rows looked exactly as cheap as one examining ten, and the blanket
+`mark_all_live_nodes` predicate footprint every **non-equality** node seek registers unconditionally
+cost one SIREAD marker per live node whatever the seek returned. A `PROFILE` now reports, per
+operator, `CandidatesExamined`, `CandidatesRejectedByVisibility`, `CandidatesRejectedByFilter`,
+`ReadMarkers` and `PredicateMarkers` (wire shape frozen in `06-bolt-and-error-shapes.md` §3.1).
+
+The three candidate counters are **disjoint** — examined minus the two rejection reasons is the
+number of candidates that **survived the re-verification**, which is deliberately *not* a claim about
+the operator's rows: de-duplication of an id named by both a stale and a live index entry collapses
+two survivors into one row, and a self-loop under an undirected pattern reports one survivor on both
+of its sides (both measured and pinned in `candidate_instrumentation.rs`). The two marker counters are
+counted at the point of emission, never inferred. The
+measurement lives on the storage seam (`GraphAccess::take_read_tally`, implemented by
+`RecordStoreGraph` and the off-thread `ReadOnlyGraph`, forwarded by the RBAC and profiling
+decorators), the attribution in `ProfileRecorder`, and the rendering in `plan_description.rs`. Each
+counter is emitted only when non-zero, so absence means a *measured* zero — distinct from the
+permanently omitted `pageCache*`/`time`. PostgreSQL's `EXPLAIN ANALYZE` makes the same distinction
+with *"Rows Removed by Filter"* and is the direct precedent; the names are Graphus's own because the
+measured quantity is Graphus's own. Recorded baselines for the four access paths this sprint targets
+are pinned as executable assertions in
+`crates/graphus-cypher/tests/candidate_instrumentation.rs::the_recorded_baseline_for_the_four_access_paths_991`.
+
 **Cost on each path.** A `PROFILE`d statement runs **serially** — intra-query morsel parallelism is
 disabled for it (`crates/graphus-cypher/src/executor.rs`) — because the morsel workers read the store
 through a seam the profiling decorator does not sit on, so a parallel profiled run would silently
@@ -1149,7 +1176,19 @@ through a seam the profiling decorator does not sit on, so a parallel profiled r
 therefore be slower than the same query run normally (a diagnostic-only cost, exactly as Neo4j warns
 for `PROFILE`). An **unprofiled** statement pays nothing: no instrumentation is constructed (no
 recorder, no operator shim, no extra branch on the row path — confirmed by the executor row-path
-benchmark).
+benchmark). The one always-on half is the seam's own accumulation into its `ReadTally`, which has two
+shapes and only one of them is batched: **candidates** are counted into plain locals and flushed with
+three `Cell` read-modify-writes per access, while **markers** cost one `Cell` read-modify-write *each*,
+because they are emitted from many scattered sites rather than from one loop (120 of them for 40
+candidates on the measured unselective range seek). An unprofiled statement never drains the result.
+
+That half is measured over the real record store by `crates/graphus-cypher/benches/read_seam.rs`.
+Criterion detected **no change at the mean** on any of the four access paths (all `p > 0.05`); two of
+the four *medians* are distinguishable from zero in **opposite** directions (+3.1 % and −2.8 %), which
+is code-layout drift between binaries rather than a cost of the counters, since added per-candidate
+work cannot make a label scan faster. With 30 samples the run does **not** exclude a regression below
+roughly 12 % on the shortest path (`seek_eq_selective`, ~7.5 µs). `graphus-bench/RESULTS.md` §11.2
+carries the full numbers and the limits of that evidence.
 
 **Known limitation (measured).** A plain **auto-commit read** is dispatched to the off-thread reader
 pool, whose seam does not currently serve property-index seeks: it declines them and the executor

@@ -360,6 +360,17 @@ pub struct RecordStoreGraph<D: BlockDevice, S: LogSink> {
     /// both backends report byte-identical counters. Reset to zero per seam (each statement begins a
     /// fresh tally), and read after the cursor is drained, before commit.
     counters: RefCell<crate::counters::QueryCounters>,
+    /// The measured cost of this seam's **candidate + re-verification** work (`rmp` task #991):
+    /// candidates examined, candidates rejected by the MVCC visibility re-check, candidates rejected
+    /// by the access path's own predicate re-check, and SIREAD markers emitted.
+    ///
+    /// Accumulated **unconditionally** (an unprofiled statement tallies too, it simply never drains)
+    /// and drained by the profiling decorator through
+    /// [`take_read_tally`](GraphAccess::take_read_tally) immediately after each seam call, which is
+    /// what makes the counts attributable to the operator that made it. A `Cell` accumulator, not an
+    /// atomic: this seam is `!Sync` already (it drives the store through `RefCell`) and only ever runs
+    /// on one thread at a time; see [`ReadTally`](crate::read_source::ReadTally).
+    tally: read_source::ReadTally,
 }
 
 impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
@@ -411,6 +422,8 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             csr: None,
             // A fresh per-statement side-effect tally (`rmp` #510).
             counters: RefCell::new(crate::counters::QueryCounters::default()),
+            // A fresh per-statement candidate tally (`rmp` #991).
+            tally: read_source::ReadTally::new(),
         }
     }
 
@@ -465,6 +478,8 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             csr,
             // A fresh per-statement side-effect tally (`rmp` #510).
             counters: RefCell::new(crate::counters::QueryCounters::default()),
+            // A fresh per-statement candidate tally (`rmp` #991).
+            tally: read_source::ReadTally::new(),
         }
     }
 
@@ -476,6 +491,10 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     /// (sorted/deduped, byte-identically to inline recording) at statement-end (the M1 barrier),
     /// which lets the read run off-thread (`rmp` #336) without taking a lock on the shared tracker.
     fn note_read(&self, key: u64) {
+        // Counted at the point of emission (`rmp` #991), so a blanket `mark_all_live_nodes` pass shows
+        // up as exactly what it costs — one marker per live node — rather than being inferred from a
+        // candidate count it has nothing to do with.
+        self.tally.note_read_marker();
         self.read_buffer.record_read(key);
     }
 
@@ -503,7 +522,21 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     /// [`note_read`](Self::note_read) cannot: a predicate read sees the *set* of matching nodes
     /// (possibly empty), so a concurrent insert that makes a node match must abort one of the two.
     fn note_predicate_read(&self, predicate: PredicateRead) {
+        // Counted at the point of emission (`rmp` #991) — see `note_read`.
+        self.tally.note_predicate_marker();
         self.read_buffer.record_predicate_read(predicate);
+    }
+
+    /// Adds one access path's candidate-examination counts to this statement's [`ReadTally`]
+    /// (`rmp` task #991). See [`ReadSink::note_candidates`](crate::read_source::ReadSink::note_candidates).
+    fn note_candidates(
+        &self,
+        examined: u64,
+        rejected_by_visibility: u64,
+        rejected_by_predicate: u64,
+    ) {
+        self.tally
+            .note_candidates(examined, rejected_by_visibility, rejected_by_predicate);
     }
 
     /// Merges this statement's buffered SIREAD markers into the shared [`SsiTracker`] **now** (`rmp`
@@ -901,6 +934,8 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             csr: None,
             // A fresh per-statement side-effect tally (`rmp` #510).
             counters: RefCell::new(crate::counters::QueryCounters::default()),
+            // A fresh per-statement candidate tally (`rmp` #991).
+            tally: read_source::ReadTally::new(),
         }
     }
 
@@ -1404,6 +1439,10 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // Read-only store access (`rmp` #337 Slice 2): `node` / `node_has_label` are `&self`.
         let store = self.store.borrow();
         let mut out = Vec::new();
+        // Candidate instrumentation (`rmp` #991), byte-identical in meaning to the lifted
+        // `read_source::filter_label_candidates` twin: counted in locals, flushed once, and flushed on
+        // every fail-closed exit too (the candidates WERE examined).
+        let (mut examined, mut hidden, mut filtered) = (0u64, 0u64, 0u64);
         for id in ids {
             // Skip nodes not visible to this snapshot (tombstoned or not-yet-committed) before
             // testing the label, so the scan honours MVCC visibility (`04 §5.3`, `rmp` task #45).
@@ -1415,14 +1454,17 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                 // slot returns `Ok` with `in_use=false`), so capturing is never a false alarm.
                 Err(e) => {
                     drop(store);
+                    self.note_candidates(examined, hidden, filtered);
                     self.capture(e);
                     return Vec::new();
                 }
             };
+            examined += 1;
             let visible = self.visible(rec.mvcc);
             // SIREAD-mark every examined node, visible or not (the label predicate examined it).
             self.note_read(node_ssi_key(id));
             if !visible {
+                hidden += 1;
                 continue;
             }
             // Resolve the label word AS OF THIS SNAPSHOT (`rmp` #767) instead of reading whatever it
@@ -1431,16 +1473,19 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             let bitmap = self.label_bitmap_at(&store, id, rec.labels);
             match graphus_storage::labels::has_label(bitmap, token_id) {
                 Ok(true) => out.push(NodeId(id)),
-                Ok(false) => {}
+                Ok(false) => filtered += 1,
                 Err(e) => {
                     // An overflow-form bitmap (a #39-written node) surfaces as a captured error
                     // rather than a wrong (missing/extra) row.
                     drop(store);
+                    self.note_candidates(examined, hidden, filtered);
                     self.capture(GraphusError::from(e));
                     return Vec::new();
                 }
             }
         }
+        drop(store);
+        self.note_candidates(examined, hidden, filtered);
         out
     }
 
@@ -1524,6 +1569,8 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     fn filter_any_label_candidates(&self, token_ids: &[u32], ids: Vec<u64>) -> Vec<NodeId> {
         let store = self.store.borrow();
         let mut out = Vec::new();
+        // Candidate instrumentation (`rmp` #991) — see `filter_label_candidates`.
+        let (mut examined, mut hidden, mut filtered) = (0u64, 0u64, 0u64);
         for id in ids {
             let rec = match store.node(id) {
                 Ok(rec) => rec,
@@ -1531,14 +1578,17 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                 // `node_has_label` arm below and the single-label `filter_label_candidates`.
                 Err(e) => {
                     drop(store);
+                    self.note_candidates(examined, hidden, filtered);
                     self.capture(e);
                     return Vec::new();
                 }
             };
+            examined += 1;
             let visible = self.visible(rec.mvcc);
             // SIREAD-mark every examined node exactly once, visible or not.
             self.note_read(node_ssi_key(id));
             if !visible {
+                hidden += 1;
                 continue;
             }
             // One snapshot-correct resolution (`rmp` #767) for the whole token loop below.
@@ -1553,6 +1603,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                     Ok(false) => {}
                     Err(e) => {
                         drop(store);
+                        self.note_candidates(examined, hidden, filtered);
                         self.capture(GraphusError::from(e));
                         return Vec::new();
                     }
@@ -1560,8 +1611,12 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             }
             if carries {
                 out.push(NodeId(id));
+            } else {
+                filtered += 1;
             }
         }
+        drop(store);
+        self.note_candidates(examined, hidden, filtered);
         out
     }
 
@@ -1622,14 +1677,25 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         }
 
         let mut out: Vec<RelId> = Vec::new();
+        // Candidate instrumentation (`rmp` #991): `rel_candidate` separates a hidden version from a
+        // type/term mismatch, which the `Option` of `rel_data` cannot.
+        let (mut examined, mut hidden, mut filtered) = (0u64, 0u64, 0u64);
         for id in all_ids {
             let rel = RelId(id);
-            // Visible + of a covered type? `rel_data` returns `None` for a not-visible relationship
-            // (and SIREAD-marks the examined relationship).
-            let Some(data) = self.rel_data(rel) else {
+            examined += 1;
+            // Visible + of a covered type? A hidden version yields no data at all (and every examined
+            // relationship is SIREAD-marked either way).
+            let read_source::RelCandidate::Visible(data) = read_source::rel_candidate(
+                &LiveSource(&*self.store.borrow()),
+                &self.vis_ctx(),
+                self,
+                rel,
+            ) else {
+                hidden += 1;
                 continue;
             };
             if !type_names.contains(&data.rel_type) {
+                filtered += 1;
                 continue;
             }
             let mut matched = false;
@@ -1646,8 +1712,11 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             }
             if matched {
                 out.push(rel);
+            } else {
+                filtered += 1;
             }
         }
+        self.note_candidates(examined, hidden, filtered);
         out.sort_unstable();
         out.dedup();
         out
@@ -3572,6 +3641,9 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // from the property chain (fallback). Published to the cache at the end of the scan.
         let mut value_hits: u64 = 0;
         let mut fallback_reads: u64 = 0;
+        // Candidate instrumentation (`rmp` #991) — the columnar pass is a label-scan candidate
+        // re-verification like any other, so it reports the same three counts.
+        let (mut examined, mut hidden, mut filtered) = (0u64, 0u64, 0u64);
         for id in candidates {
             // Read the node record once (visibility + label re-check + the freshness witness). A
             // read fault FAILS CLOSED (`rmp` task #733), exactly as the sibling `node_has_label` arm
@@ -3581,14 +3653,17 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             let node_rec = match self.store.borrow().node(id) {
                 Ok(rec) => rec,
                 Err(e) => {
+                    self.note_candidates(examined, hidden, filtered);
                     self.capture(e);
                     return Some(ColumnarPass::default());
                 }
             };
+            examined += 1;
             // SIREAD-mark every examined candidate, visible or not (the predicate examined it) — the
             // identical per-candidate marker `filter_label_candidates` records.
             self.note_read(node_ssi_key(id));
             if !self.visible(node_rec.mvcc) {
+                hidden += 1;
                 continue;
             }
             // The node must carry the label AS OF THIS SNAPSHOT (`rmp` #767), the row label scan's
@@ -3596,9 +3671,13 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             let bitmap = self.label_bitmap_at(&self.store.borrow(), id, node_rec.labels);
             match graphus_storage::labels::has_label(bitmap, label_token) {
                 Ok(true) => {}
-                Ok(false) => continue,
+                Ok(false) => {
+                    filtered += 1;
+                    continue;
+                }
                 Err(e) => {
                     // An overflow-form bitmap (#39) surfaces as a captured error, never a wrong row.
+                    self.note_candidates(examined, hidden, filtered);
                     self.capture(GraphusError::from(e));
                     return Some(ColumnarPass::default());
                 }
@@ -3633,6 +3712,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                 out.push((node, value));
             }
         }
+        self.note_candidates(examined, hidden, filtered);
         // Publish the decode-accounting tallies (`rmp` #329/#330 measurement / observability): how many
         // values were served from the column (zero decode) vs read from the property chain (fallback).
         if let Some(columns) = &self.columns {
@@ -3734,17 +3814,23 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // two paths agree on membership and register identical SIREAD markers.
         let labelled = self.filter_label_candidates(label_token, all_ids);
         let mut scored: Vec<(u64, f32)> = Vec::new();
+        // The embedding residual's own rejections (`rmp` #991); the candidates themselves were counted
+        // by `filter_label_candidates` above.
+        let mut filtered = 0u64;
         for node in labelled {
             let Some(value) = self.node_property(node, property) else {
+                filtered += 1;
                 continue;
             };
             // The SAME shape validation the write path applies, so the scan's membership matches the
             // index's exactly: a malformed / wrong-dimension / non-finite embedding is not a member.
             let Some(embedding) = crate::index_set::extract_embedding(&value, dim) else {
+                filtered += 1;
                 continue;
             };
             scored.push((node.0, similarity_score(similarity, &embedding, query)));
         }
+        self.note_candidates(0, 0, filtered);
         // Descending score, ascending id tie-break — the same total order the procedure imposes, so a
         // tie resolves identically whichever path served it.
         scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
@@ -3772,25 +3858,38 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             }
         };
         let mut scored: Vec<(u64, f32)> = Vec::new();
+        // Candidate instrumentation (`rmp` #991) — see the full-text relationship fallback.
+        let (mut examined, mut hidden, mut filtered) = (0u64, 0u64, 0u64);
         for id in all_ids {
             let rel = RelId(id);
-            // Visible + of the covered type? `rel_data` returns `None` for a relationship this snapshot
-            // cannot see, and SIREAD-marks the one it examined — the same per-candidate re-check the
-            // full-text relationship fallback uses, so membership and markers match the index path.
-            let Some(data) = self.rel_data(rel) else {
+            examined += 1;
+            // Visible + of the covered type? A hidden version yields no data at all, and every examined
+            // relationship is SIREAD-marked — the same per-candidate re-check the full-text
+            // relationship fallback uses, so membership and markers match the index path.
+            let read_source::RelCandidate::Visible(data) = read_source::rel_candidate(
+                &LiveSource(&*self.store.borrow()),
+                &self.vis_ctx(),
+                self,
+                rel,
+            ) else {
+                hidden += 1;
                 continue;
             };
             if data.rel_type != rel_type {
+                filtered += 1;
                 continue;
             }
             let Some(value) = self.rel_property(rel, property) else {
+                filtered += 1;
                 continue;
             };
             let Some(embedding) = crate::index_set::extract_embedding(&value, dim) else {
+                filtered += 1;
                 continue;
             };
             scored.push((rel.0, similarity_score(similarity, &embedding, query)));
         }
+        self.note_candidates(examined, hidden, filtered);
         scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
         scored.truncate(k);
         scored
@@ -3816,6 +3915,15 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
 
     fn capture(&self, err: GraphusError) {
         self.capture(err);
+    }
+
+    fn note_candidates(
+        &self,
+        examined: u64,
+        rejected_by_visibility: u64,
+        rejected_by_predicate: u64,
+    ) {
+        self.note_candidates(examined, rejected_by_visibility, rejected_by_predicate);
     }
 }
 
@@ -5389,18 +5497,34 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             .borrow()
             .query_fulltext_rel(name, search, graphus_index::fulltext::MatchSemantics::Or)
             .unwrap_or_default();
-        // Re-check each candidate: visible + currently of a covered type (`rel_data` SIREAD-marks it).
+        // Re-check each candidate: visible + currently of a covered type (`rel_candidate` SIREAD-marks
+        // it, and — unlike the `Option` of `rel_data` — separates a hidden version from a type
+        // mismatch, which `rmp` #991 reports as two different rejection reasons).
+        let (mut examined, mut hidden, mut filtered) = (0u64, 0u64, 0u64);
         let mut out: Vec<RelId> = candidates
             .into_iter()
             .map(RelId)
             .filter(|&r| {
-                self.rel_data(r).is_some_and(|data| {
-                    type_tokens
-                        .iter()
-                        .any(|&tt| self.rel_type_token_matches(&data.rel_type, tt))
-                })
+                examined += 1;
+                let read_source::RelCandidate::Visible(data) = read_source::rel_candidate(
+                    &LiveSource(&*self.store.borrow()),
+                    &self.vis_ctx(),
+                    self,
+                    r,
+                ) else {
+                    hidden += 1;
+                    return false;
+                };
+                let keep = type_tokens
+                    .iter()
+                    .any(|&tt| self.rel_type_token_matches(&data.rel_type, tt));
+                if !keep {
+                    filtered += 1;
+                }
+                keep
             })
             .collect();
+        self.note_candidates(examined, hidden, filtered);
         out.sort_unstable();
         out.dedup();
         Some(out)
@@ -5505,6 +5629,9 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         }
 
         let mut out: Vec<NodeId> = Vec::new();
+        // The term residual's own rejections (`rmp` #991): the candidates were already counted by
+        // `filter_any_label_candidates`, so only the extra rejections are added here.
+        let mut filtered = 0u64;
         for node in labelled {
             // Build the node's document terms in the index's declared property order, exactly as
             // `reindex_fulltext_node` does: analyze each covered STRING property value (a non-string
@@ -5525,8 +5652,11 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             }
             if matched {
                 out.push(node);
+            } else {
+                filtered += 1;
             }
         }
+        self.note_candidates(0, 0, filtered);
         // Ascending + de-duplicated, like the fast path (`filter_label_candidates` already yields each
         // node at most once, but keep the contract explicit and order-stable).
         out.sort_unstable();
@@ -6173,5 +6303,10 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // `rmp` #510: the exact side-effect tally accumulated at the write chokepoints above. Cloned
         // out so the caller can read it after the cursor is drained, before commit.
         self.counters.borrow().clone()
+    }
+
+    fn take_read_tally(&self) -> read_source::ReadCounts {
+        // `rmp` #991: what the candidate re-verification above measured since the last drain.
+        self.tally.take()
     }
 }

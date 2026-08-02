@@ -135,3 +135,11 @@ harness = false
 [[bench]]
 name = "executor_row_path"
 harness = false
+
+# The storage read seam's per-candidate hot path (`rmp` #991): the number that must not move when the
+# candidate-examination instrumentation is added — an UNPROFILED statement never drains the seam's tally,
+# but the seam still keeps it, so this measures the always-on half of that instrumentation.
+# `cargo bench -p graphus-cypher --bench read_seam`.
+[[bench]]
+name = "read_seam"
+harness = false

@@ -1219,6 +1219,34 @@ pub trait GraphAccess {
     fn write_counters(&self) -> crate::counters::QueryCounters {
         crate::counters::QueryCounters::default()
     }
+
+    // ---- candidate instrumentation --------------------------------------------------------------
+
+    /// Drains this seam's [`ReadCounts`](crate::read_source::ReadCounts) — everything it measured
+    /// about the **candidate + re-verification** work of the calls made since the previous drain —
+    /// and resets the accumulator (`rmp` task #991).
+    ///
+    /// Graphus's index access paths are *candidate lists plus a re-verification*: a derived,
+    /// MVCC-unaware index answers with a superset, and the read body re-reads each candidate to test
+    /// visibility and re-apply the predicate. `dbHits` charges what an operator **matched**, so
+    /// without this a seek that examined a million candidates to return ten rows reads as cheaply as
+    /// one that examined ten, and the blanket predicate marker pass a non-equality seek registers —
+    /// one SIREAD per live node, whatever the seek returns — appears nowhere at all.
+    ///
+    /// The **profiling decorator** ([`ProfilingGraph`](crate::profile::ProfilingGraph)) drains this
+    /// immediately after each seam call, so the counts land on the operator that made it. Nothing
+    /// else drains it, which is why an unprofiled statement pays only the accumulation (a register
+    /// increment per candidate and a handful of `Cell` adds per access) and never the attribution.
+    ///
+    /// The **default** is [`ReadCounts::ZERO`](crate::read_source::ReadCounts::ZERO): a seam that does
+    /// not measure candidate examination reports **nothing** rather than a fabricated number — the
+    /// same rule that keeps `pageCacheHits` / `time` off the wire (decision `D-query-prefixes`). The
+    /// two store-backed seams (`RecordStoreGraph` and the off-thread `ReadOnlyGraph`) override it;
+    /// the [`AuthorizedGraph`](crate::authorized_graph::AuthorizedGraph) and `ProfilingGraph`
+    /// decorators forward it to the seam they wrap.
+    fn take_read_tally(&self) -> crate::read_source::ReadCounts {
+        crate::read_source::ReadCounts::ZERO
+    }
 }
 
 // =================================================================================================

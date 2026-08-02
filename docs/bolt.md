@@ -209,7 +209,11 @@ dialing. To use UDS you therefore speak Bolt directly over the socket. Two optio
   each operator's measured `rows` and `dbHits`. Exactly one of the two keys is ever sent (never both), and
   neither appears for an ordinary statement. Each plan node is a dictionary with `operatorType`, `args`,
   `identifiers` and — for a non-leaf — `children`, which is the shape the official drivers parse
-  (`summary().plan` / `summary().profile`). See [cypher.md](cypher.md#query-prefixes--explain-and-profile).
+  (`summary().plan` / `summary().profile`). A `PROFILE`'s `args` additionally carry the candidates each
+  access path examined and rejected, and the serializability markers it emitted
+  (`CandidatesExamined`, `CandidatesRejectedByVisibility`, `CandidatesRejectedByFilter`, `ReadMarkers`,
+  `PredicateMarkers`), each present only when non-zero. See
+  [cypher.md](cypher.md#query-prefixes--explain-and-profile).
 
 For the exact wire encoding, the authoritative reference is the `graphus-bolt` crate
 (`handshake.rs`, `framing.rs`, `message.rs`, `packstream.rs`) — and the Go UDS example,

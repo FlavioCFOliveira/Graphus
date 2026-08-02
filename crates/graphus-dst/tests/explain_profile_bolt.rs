@@ -92,6 +92,32 @@ fn total_db_hits(node: &Value) -> i64 {
     mine + kids
 }
 
+/// The first plan node of `operatorType == kind` in a rendered plan tree, searched depth-first.
+fn find_operator<'v>(node: &'v Value, kind: &str) -> Option<&'v Value> {
+    if let Some(Value::String(t)) = map_get(node, "operatorType")
+        && t == kind
+    {
+        return Some(node);
+    }
+    match map_get(node, "children") {
+        Some(Value::List(children)) => children.iter().find_map(|c| find_operator(c, kind)),
+        _ => None,
+    }
+}
+
+/// The integer `args` entry `key` of a plan node, or [`None`] when the key is absent — which, for the
+/// `rmp` #991 candidate counters on the store-backed seam this simulator runs, means a **measured
+/// zero** (they are emitted only when non-zero, the same rule the result-summary `stats` map follows).
+/// A seam that does not implement the tally at all emits none of them anywhere, and there absence
+/// would instead mean "not measured"; the deterministic engine is store-backed, so that case cannot
+/// arise here.
+fn plan_arg(node: &Value, key: &str) -> Option<i64> {
+    match map_get(node, "args").and_then(|args| map_get(args, key)) {
+        Some(Value::Integer(n)) => Some(*n),
+        _ => None,
+    }
+}
+
 fn records(responses: &[Response]) -> usize {
     responses
         .iter()
@@ -224,4 +250,132 @@ fn explain_over_the_simulated_wire_plans_without_executing() {
         last_plan(&plain).is_none(),
         "no prefix ⇒ no plan key; `explain` is still an ordinary alias"
     );
+}
+
+// =================================================================================================
+// The candidate + re-verification counters over the wire (`rmp` task #991)
+// =================================================================================================
+
+/// The **measured cost of the candidate model reaches the client**, deterministically, over the real
+/// Bolt wire: an index seek reports the candidates it examined and the SIREAD markers it emitted, as
+/// `args` entries of its own plan node.
+///
+/// The unit suite (`graphus-cypher/tests/candidate_instrumentation.rs`) pins the numbers against the
+/// engine; this pins that they survive the whole path — recorder → `PlanDescription` → PackStream map
+/// → decoded client value — with a seed that makes any failure exactly reproducible.
+///
+/// # Why this is not vacuous
+///
+/// Before `rmp` #991 no plan node carried any of these keys, so every `expect` below panics against the
+/// pre-change engine. The load-bearing assertion is the **contrast**: the range seek's whole-store
+/// blanket marker pass must dwarf the equality seek's precise footprint, over the same 200-node store.
+#[test]
+fn profile_over_the_simulated_wire_reports_the_candidate_counters_991() {
+    let seed = 0x0991_2026;
+    let eng = engine();
+    let seeded = session(
+        Rc::clone(&eng),
+        seed,
+        &[
+            "UNWIND range(0, 199) AS i CREATE (:Person {email: 'u' + toString(i) + '@x.io', age: i})",
+        ],
+    );
+    assert!(
+        seeded.iter().all(|r| !matches!(r, Response::Failure(_))),
+        "the seed statement succeeds"
+    );
+    declare_email_index(&eng);
+
+    let responses = session(
+        Rc::clone(&eng),
+        seed,
+        &["PROFILE MATCH (p:Person {email: 'u7@x.io'}) RETURN p.email AS email"],
+    );
+    let (key, plan) = last_plan(&responses).expect("a PROFILE reports a plan");
+    assert_eq!(key, "profile");
+    let seek = find_operator(&plan, "NodeIndexSeek").expect("the declared index is used");
+
+    let examined = plan_arg(seek, "CandidatesExamined")
+        .expect("the seek reports the candidates it examined (rmp #991)");
+    let markers = plan_arg(seek, "ReadMarkers")
+        .expect("the seek reports the SIREAD markers it emitted (rmp #991)");
+    assert!(examined >= 1, "the seek examined its candidate: {examined}");
+    assert!(markers >= 1, "…and marked what it read: {markers}");
+    assert!(
+        markers < 200,
+        "an EQUALITY seek must not mark every live node (rmp #316 removed that blanket): {markers}"
+    );
+
+    // The contrast: a RANGE seek over the same store carries the blanket `mark_all_live_nodes`
+    // footprint — one marker per live node — however few rows it returns.
+    let ranged = session(
+        eng,
+        seed,
+        &["PROFILE MATCH (p:Person) WHERE p.age >= 198 RETURN p.age AS age"],
+    );
+    let (_, range_plan) = last_plan(&ranged).expect("a PROFILE reports a plan");
+    let scan = find_operator(&range_plan, "NodeLabelScan")
+        .or_else(|| find_operator(&range_plan, "TokenLookupScan"))
+        .or_else(|| find_operator(&range_plan, "NodeIndexRangeSeek"))
+        .expect("the range predicate is served by some node access path");
+    let range_markers =
+        plan_arg(scan, "ReadMarkers").expect("the range access path reports its markers");
+    assert!(
+        range_markers >= 200,
+        "the range path marks every live node in the store: {range_markers}"
+    );
+    assert!(
+        range_markers > 10 * markers,
+        "the blanket footprint ({range_markers}) must be measurably heavier than the precise \
+         equality one ({markers}) — the whole point of counting markers"
+    );
+}
+
+/// An `EXPLAIN` executes nothing, so it measures nothing: no candidate counter appears anywhere in the
+/// plan it delivers. The wire-side twin of the "omitted counters stay omitted" unit test.
+#[test]
+fn explain_over_the_simulated_wire_reports_no_candidate_counters_991() {
+    let eng = engine();
+    declare_email_index(&eng);
+    let responses = session(
+        eng,
+        0x0991_2027,
+        &["EXPLAIN MATCH (p:Person {email: 'u7@x.io'}) RETURN p.email AS email"],
+    );
+    let (key, plan) = last_plan(&responses).expect("EXPLAIN reports a plan");
+    assert_eq!(key, "plan");
+
+    fn assert_clean(node: &Value) {
+        for measured in [
+            "CandidatesExamined",
+            "CandidatesRejectedByVisibility",
+            "CandidatesRejectedByFilter",
+            "ReadMarkers",
+            "PredicateMarkers",
+        ] {
+            assert!(
+                plan_arg(node, measured).is_none(),
+                "an EXPLAIN runs nothing, so it reports no {measured}"
+            );
+        }
+        // …and the counters Graphus does not measure at all are still absent (decision
+        // `D-query-prefixes`), exactly as they were before this task added new ones.
+        for unmeasured in [
+            "pageCacheHits",
+            "pageCacheMisses",
+            "pageCacheHitRatio",
+            "time",
+        ] {
+            assert!(
+                plan_arg(node, unmeasured).is_none(),
+                "{unmeasured} is never reported"
+            );
+        }
+        if let Some(Value::List(children)) = map_get(node, "children") {
+            for c in children {
+                assert_clean(c);
+            }
+        }
+    }
+    assert_clean(&plan);
 }

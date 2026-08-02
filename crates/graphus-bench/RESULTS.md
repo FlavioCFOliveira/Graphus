@@ -482,3 +482,120 @@ cargo bench -p graphus-bench --bench commit_path
 
 The bench creates a unique tempdir per driver (device file + `wal/` directory) and removes it on
 drop, so it leaves no scratch files behind. The numbers are storage-media-specific (§10.1).
+
+---
+
+## 11. The candidate + re-verification read model — measured baseline (`rmp` #991)
+
+Every index access path in Graphus is a **candidate list plus a re-verification**: the derived,
+MVCC-unaware index answers with a *superset* of the matching ids, and the read body re-reads each
+candidate to test visibility and re-apply the predicate. `PROFILE`'s `dbHits` charges what an operator
+**matched**, so it could not distinguish a seek that examined a million candidates to return ten rows
+from one that examined ten; and the blanket `mark_all_live_nodes` predicate footprint that every
+**non-equality** node seek registers — one SIREAD marker per live node, whatever the seek returns —
+appeared in no counter at all.
+
+`rmp` #991 added the five measured counters that close both gaps (`CandidatesExamined`,
+`CandidatesRejectedByVisibility`, `CandidatesRejectedByFilter`, `ReadMarkers`, `PredicateMarkers`;
+wire shape in `specification/06-bolt-and-error-shapes.md` §3.1) and recorded the baseline below. It is
+the "before" every later task in the multi-writer/MVCC-native sprint is measured against.
+
+### 11.1 Counter baseline — 40 `:Person` nodes in a `:KNOWS` ring, `name` and `age` indexed
+
+Real record store, coordinated path (`TxnCoordinator`), statements run inline. Pinned as executable
+assertions in
+`crates/graphus-cypher/tests/candidate_instrumentation.rs::the_recorded_baseline_for_the_four_access_paths_991`,
+so a change that moves any number fails there and names it.
+
+| access path | operator | rows | dbHits | examined | rejected (vis / filter) | **ReadMarkers** | PredicateMarkers |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| selective equality seek | `NodeIndexSeek` | 1 | 1 | 1 | 0 / 0 | **2** | 1 |
+| unselective range seek (`age >= 0`) | `NodeIndexRangeSeek` | 40 | 40 | 40 | 0 / 0 | **120** | 1 |
+| label scan | `TokenLookupScan` | 40 | 40 | 40 | 0 / 0 | **80** | 1 |
+| untyped traversal (one anchor) | `ExpandAll` | 1 | 1 | 2 | 0 / 1 | **2** | 1 |
+
+Two further measured points on the same fixture, which are the finding rather than the baseline:
+
+| query | rows | examined | **ReadMarkers** |
+| --- | ---: | ---: | ---: |
+| `MATCH (n:Person) WHERE n.age >= 38` | 2 | 2 | **44** |
+| `MATCH (n:Person) WHERE n.name STARTS WITH 'p1'` | 11 | 11 | **62** |
+
+**Reading it.**
+
+1. **A two-row range seek costs a 44-marker pass over the whole store.** 40 of those markers are the
+   blanket `mark_all_live_nodes` footprint, which is registered *unconditionally* by every non-equality
+   node seek and is independent of the seek's selectivity. Nothing in `rows` or `dbHits` showed it.
+2. **The label scan marks every node twice** (blanket pass, then the per-candidate marker of the
+   re-check that follows it) and the unselective range seek **three times** (blanket pass, candidate
+   re-check, then the freshness re-read of each survivor's property).
+3. **The equality seek is the deliberate contrast**: 2 markers, not 40. `rmp` #316 removed its blanket
+   marker precisely because it manufactured an rw-edge with every concurrent node writer (measured
+   `abort_rate ≈ 0.97` on fraud-oltp). That the two shapes now report *visibly* different footprints is
+   what makes `ReadMarkers` a diagnostic rather than a constant.
+
+### 11.2 Wall-clock: what the always-on half of the instrumentation costs
+
+The counters are accumulated **unconditionally** by the seam (an unprofiled statement simply never
+drains them), so the always-on half had to be measured, not assumed.
+`crates/graphus-cypher/benches/read_seam.rs` drives the four access paths over the real record store
+through a `TxnCoordinator`, with **no** query prefix. Same machine class as §1; Criterion 0.5, **30
+samples**, 3 s measurement, baseline captured on the pre-change tree and compared with
+`--baseline pre-991`. Both estimators are reported because they disagree, and the disagreement is the
+finding:
+
+| bench (1 000 `:Person` nodes, `:KNOWS` ring) | before | after | **mean** change | **median** change |
+| --- | ---: | ---: | ---: | ---: |
+| `seek_eq_selective` | 7.533 µs | 7.812 µs | +4.84 % `[−1.46 %, +11.90 %]` | **+3.09 % `[+1.39 %, +5.77 %]`** |
+| `seek_range_unselective` | 816.5 µs | 835.0 µs | +1.62 % `[−3.74 %, +9.54 %]` | −2.18 % `[−5.40 %, +2.63 %]` |
+| `label_scan` | 880.5 µs | 856.9 µs | −2.57 % `[−7.27 %, +3.55 %]` | **−2.81 % `[−4.28 %, −1.56 %]`** |
+| `expand_untyped` | 1.759 ms | 1.777 ms | +1.32 % `[−0.38 %, +2.96 %]` | +1.23 % `[−0.65 %, +2.76 %]` |
+
+Values are Criterion's own `change/estimates.json` for each benchmark; brackets are the 95 %
+confidence intervals.
+
+**What this does and does not establish.**
+
+1. **On the means, Criterion reports "No change in performance detected" for all four** (every
+   `p > 0.05`, every mean CI straddling zero). That is the headline, but it is not the whole picture.
+2. **Two of the four medians are statistically distinguishable from zero, in opposite directions:**
+   `seek_eq_selective` at **+3.09 %** with CI `[+1.39 %, +5.77 %]`, and `label_scan` at **−2.81 %**
+   with CI `[−4.28 %, −1.56 %]`. Neither interval contains zero. A change that genuinely added
+   per-candidate work could not make a full label scan **faster**, so a pair of ~3 % shifts in
+   opposite directions is the signature of **code-layout drift between the two binaries** (inlining,
+   alignment, i-cache placement), not of the counters themselves.
+3. **The experiment does not exclude a small regression on the shortest path.** With 30 samples the
+   upper bound of the mean CI for `seek_eq_selective` is **+11.9 %**, so a regression of up to roughly
+   12 % on the ~7.5 µs single-row seek is within what this run can rule out — and no more than that.
+   For the three longer-running benchmarks the intervals are tighter, but the same caveat applies in
+   proportion.
+
+So the defensible claim is: **no regression was detected at the mean on any of the four paths, and the
+per-candidate mechanism is a register increment on a local plus a handful of per-access `Cell`
+updates** (§11.2.1) — *not* that the instrumentation "costs nothing". Tightening the bound on
+`seek_eq_selective` needs more samples than this run took; until that is done, the ~12 % upper bound
+is the honest limit of the evidence.
+
+#### 11.2.1 The mechanism, as it actually is
+
+Two different accumulation shapes sit behind these numbers, and only one of them is batched:
+
+- **Candidates are batched.** Each read body counts into plain `u64` locals and calls
+  `ReadSink::note_candidates` **once** per access, which is three `Cell` read-modify-writes.
+- **Markers are not.** `note_read` / `note_predicate_read` do **one** `Cell` read-modify-write **per
+  marker emitted** (`record_graph.rs`, `read_only_graph.rs`), because markers are emitted from many
+  scattered sites rather than from one loop. By the §11.1 baseline that is 120 RMWs for 40 candidates
+  on the unselective range seek — three per candidate, not three per access.
+
+Neither shape is atomic and neither allocates, which is why the measured effect stays inside the noise
+above; but the marker path is genuinely per-event, and any future claim about this cost must say so.
+### 11.3 Reproducing
+
+```sh
+# The counter baseline (fails, naming the number, if any of it moves):
+cargo test -p graphus-cypher --test candidate_instrumentation
+
+# The always-on cost of the instrumentation, against a saved baseline:
+cargo bench -p graphus-cypher --bench read_seam -- --save-baseline <name>
+cargo bench -p graphus-cypher --bench read_seam -- --baseline <name>
+```

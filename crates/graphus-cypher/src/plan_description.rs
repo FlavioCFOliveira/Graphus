@@ -51,6 +51,19 @@
 //! | `EstimatedRows` | **root only** | The planner's cardinality estimate for the whole plan. Neo4j reports a per-operator estimate; Graphus's cardinality estimator produces a single estimate for the plan's result, and a per-operator number would have to be **invented** — so it is reported where it is real, and omitted where it is not. |
 //! | `planner` | root only | `"COST"` when graph statistics drove the cost-based optimiser, `"RULE"` when only the rule-based lowering ran ([`PhysicalPlan::cost_based`]). |
 //! | `runtime` | root only | `"VOLCANO"` — Graphus's iterator-model executor. |
+//! | `CandidatesExamined` | `PROFILE`, when non-zero | Candidate records the operator decoded and re-verified. An index access path is a candidate list **plus** a re-verification (the index is derived and MVCC-unaware, so it answers with a superset), and `DbHits` charges only what was *matched* — so without this a seek that examined a million candidates to return ten rows reads exactly like one that examined ten (`rmp` #991). |
+//! | `CandidatesRejectedByVisibility` | `PROFILE`, when non-zero | Of those, how many the MVCC visibility re-check dropped. |
+//! | `CandidatesRejectedByFilter` | `PROFILE`, when non-zero | Of those, how many the access path's own predicate re-check dropped (label bitmap, current value vs seek value or range bounds, relationship type, traversal direction). PostgreSQL reports the same distinction as *"Rows Removed by Filter"*. |
+//! | `ReadMarkers` / `PredicateMarkers` | `PROFILE`, when non-zero | SIREAD markers the operator emitted, counted at the point of emission. This is what exposes the blanket `mark_all_live_nodes` footprint every non-equality node seek registers: one marker per live node, whatever the seek returns. |
+//!
+//! The five `rmp` #991 counters are emitted **only when non-zero** — the rule the result-summary `stats`
+//! map already follows (`06-bolt-and-error-shapes.md` §3.1) — so an operator that touches no storage seam
+//! does not carry five zeros. On a seam that measures (`RecordStoreGraph` and the off-thread
+//! `ReadOnlyGraph`) their absence therefore means *"measured, and it was zero"*. On a seam that keeps the
+//! `ReadCounts::ZERO` default — in-tree only [`MemGraph`](crate::graph_access::MemGraph), a test-only
+//! backend — no candidate counter appears at all, and there absence means *"not measured"*. Both differ
+//! from the permanently-omitted `pageCache*` / `time` above, which are not measured on any seam and so are
+//! never reported under any circumstances.
 //!
 //! # Examples
 //!
@@ -78,6 +91,7 @@ use graphus_core::Value;
 
 use crate::physical::{PhysicalOp, PhysicalPlan};
 use crate::profile::{OpId, ProfileRecorder};
+use crate::read_source::ReadCounts;
 
 /// The Bolt / REST result-summary key an `EXPLAIN` plan is delivered under.
 pub const PLAN_KEY: &str = "plan";
@@ -281,6 +295,7 @@ fn render(
             // is what `cypher-shell` renders its table from.
             args.push(("Rows".to_owned(), Value::Integer(clamp(rows))));
             args.push(("DbHits".to_owned(), Value::Integer(clamp(hits))));
+            push_candidate_args(&mut args, rec.read_counts(id));
             (Some(rows), Some(hits))
         }
         None => (None, None),
@@ -300,6 +315,70 @@ fn render(
         children,
         rows,
         db_hits,
+    }
+}
+
+/// Appends the measured **candidate-examination** arguments of one operator (`rmp` task #991).
+///
+/// # What these are
+///
+/// Graphus's index access paths are *candidate lists plus a re-verification* (the index is derived and
+/// MVCC-unaware, so it answers with a superset that the read body re-reads and re-checks). `DbHits`
+/// charges what the operator **matched**, so on its own it cannot distinguish a seek that examined ten
+/// candidates from one that examined a million to return the same ten rows. These four do, and they are
+/// counted where the work happens, never inferred from one another:
+///
+/// * `CandidatesExamined` — candidate records decoded and tested by the re-verification.
+/// * `CandidatesRejectedByVisibility` — of those, dropped because the version is invisible to this
+///   snapshot.
+/// * `CandidatesRejectedByFilter` — of those, dropped by the access path's own predicate re-check (the
+///   label bitmap, the current property value against the seek value or range bounds, the relationship
+///   type or the traversal direction). PostgreSQL reports the same distinction as
+///   *"Rows Removed by Filter"* in `EXPLAIN ANALYZE`.
+/// * `ReadMarkers` / `PredicateMarkers` — SIREAD markers this operator emitted, counted at the point of
+///   emission. This is what exposes the blanket `mark_all_live_nodes` footprint every non-equality seek
+///   registers: one marker per live node, whatever the seek returns.
+///
+/// The three candidate counters are **disjoint**, so
+/// `CandidatesExamined - CandidatesRejectedByVisibility - CandidatesRejectedByFilter` is the number of
+/// candidates that **survived the re-verification** — a statement about candidates, not about the
+/// operator's rows. De-duplication (a stale and a live index entry naming one id) collapses two
+/// survivors into one row, and a self-loop matched undirected is one survivor reported on both of its
+/// sides; both are measured in
+/// `tests/candidate_instrumentation.rs::surviving_candidates_are_not_rows_991`.
+///
+/// # Absence means a measured zero — for a seam that measures
+///
+/// A counter is emitted only when it is **non-zero** — the rule the result-summary `stats` map already
+/// follows (`06-bolt-and-error-shapes.md` §3.1), and the reason a `Projection` does not carry five zeros.
+/// For the store-backed seams (`RecordStoreGraph` and the off-thread `ReadOnlyGraph`), absence therefore
+/// means "measured, and it was zero": an operator that touches no storage seam genuinely examines no
+/// candidate.
+///
+/// The qualification matters for a seam that does **not** implement
+/// [`GraphAccess::take_read_tally`](crate::graph_access::GraphAccess::take_read_tally) and keeps the
+/// `ZERO` default — in-tree that is only [`MemGraph`](crate::graph_access::MemGraph), reachable from
+/// `graphus-cypher`/`graphus-tck` tests and never in production. Its plans carry no candidate counter
+/// anywhere, and there the absence means "not measured". Nothing is fabricated either way, which is the
+/// property that matters; but the blanket reading "absent ⇒ measured zero" is only sound for a seam that
+/// measures.
+///
+/// Both are different again from the permanently-omitted `pageCacheHits` / `time`, which Graphus does not
+/// measure on **any** seam and so never reports (decision `D-query-prefixes`).
+fn push_candidate_args(args: &mut Vec<(String, Value)>, counts: ReadCounts) {
+    for (key, value) in [
+        ("CandidatesExamined", counts.candidates_examined),
+        (
+            "CandidatesRejectedByVisibility",
+            counts.rejected_by_visibility,
+        ),
+        ("CandidatesRejectedByFilter", counts.rejected_by_predicate),
+        ("ReadMarkers", counts.read_markers),
+        ("PredicateMarkers", counts.predicate_markers),
+    ] {
+        if value != 0 {
+            args.push((key.to_owned(), Value::Integer(clamp(value))));
+        }
     }
 }
 

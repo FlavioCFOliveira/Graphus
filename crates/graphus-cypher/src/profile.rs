@@ -34,12 +34,55 @@
 //! or disk-IO count — Graphus does not report `pageCacheHits` / `pageCacheMisses` / `time` at all rather
 //! than invent them (all three are optional on the wire; the official drivers default them to `0`).
 //!
+//! # What `dbHits` cannot show, and the counters that do (`rmp` task #991)
+//!
+//! `dbHits` charges an operator for what it **matched**. That is deliberate and unchanged — but it makes
+//! the cost of Graphus's *candidate + re-verification* access model invisible. Every index access path
+//! answers from a derived, MVCC-unaware structure, so the index yields a **superset** of the matching ids
+//! and the read body re-reads each candidate to test visibility and re-apply the predicate. Two
+//! scalability brakes therefore had no signal at all:
+//!
+//! 1. a seek that examines a million candidates to return ten rows looked exactly as cheap as one that
+//!    examines ten; and
+//! 2. the blanket `mark_all_live_nodes` predicate footprint, which every **non-equality** node seek
+//!    registers unconditionally, costs one SIREAD marker per live node whatever the seek returns — and
+//!    appeared nowhere.
+//!
+//! [`ReadCounts`] closes both. The seam ([`GraphAccess::take_read_tally`]) measures, this recorder
+//! attributes, and [`crate::plan_description`] renders — as `CandidatesExamined`,
+//! `CandidatesRejectedByVisibility`, `CandidatesRejectedByFilter`, `ReadMarkers` and `PredicateMarkers`
+//! inside each operator's `args`. The three candidate counters are **disjoint**, so
+//! `examined - rejected(visibility) - rejected(filter)` is what survived; the two marker counters are
+//! counted at the point of emission, never inferred from the candidates. Each is emitted only when
+//! non-zero, so absence means a *measured* zero — never an unmeasured quantity, which stays omitted
+//! (decision `D-query-prefixes`).
+//!
+//! PostgreSQL's `EXPLAIN ANALYZE` makes the same distinction with *"Rows Removed by Filter"*
+//! (`src/backend/commands/explain.c`; counters in `src/include/executor/instrument.h`) and is the direct
+//! precedent; the names here are Graphus's own because the measured quantity is Graphus's own.
+//!
 //! # Cost on the normal path: none
 //!
 //! Instrumentation is **entirely absent** unless the statement carries the `PROFILE` prefix. An
 //! unprofiled statement builds no [`ProfileRecorder`], wraps no operator, and calls the store through the
 //! bare seam exactly as before — there is no branch, no atomic and no allocation on the hot path, because
 //! the profiling operators and the counting decorator are simply never constructed.
+//!
+//! The one half that *is* always on is the seam's own accumulation into its
+//! [`ReadTally`](crate::read_source::ReadTally), and it has two shapes, only one of them batched:
+//! **candidates** are counted into plain locals and flushed with three `Cell` read-modify-writes per
+//! access, while **markers** cost one `Cell` read-modify-write **each**, because they are emitted from
+//! many scattered sites rather than from one loop (on the measured baseline, 120 of them for 40
+//! candidates on an unselective range seek). An unprofiled statement simply never drains the result.
+//!
+//! `benches/read_seam.rs` measures that half over the real record store —
+//! `cargo bench -p graphus-cypher --bench read_seam`. On the four access paths this instrumentation
+//! touches, Criterion detected **no change at the mean** on any of them (all `p > 0.05`); two of the
+//! four *medians* are distinguishable from zero in **opposite** directions (+3.1 % and −2.8 %), which is
+//! code-layout drift between binaries rather than a cost of the counters. With 30 samples the run does
+//! not exclude a regression below roughly 12 % on the shortest path (`seek_eq_selective`, ~7.5 µs).
+//! `graphus-bench/RESULTS.md` §11.2 carries the full numbers and the limits of that evidence; it is what
+//! to re-check whenever this module or `read_source` is touched.
 //!
 //! # Attribution model (why the numbers land on the right operator)
 //!
@@ -76,6 +119,7 @@ use crate::graph_access::{
     VectorQueryResult,
 };
 use crate::physical::{PhysicalOp, PhysicalPlan, TextSeekOp};
+use crate::read_source::ReadCounts;
 
 /// The id of one operator in a profiled plan: its index in the plan's **pre-order** numbering.
 ///
@@ -102,6 +146,11 @@ pub struct ProfileRecorder {
     rows: Vec<AtomicU64>,
     /// Storage-seam records obtained, per operator id (see the [module docs](self)).
     db_hits: Vec<AtomicU64>,
+    /// The seam's measured candidate-examination counts, per operator id (`rmp` task #991) — what the
+    /// "candidate + re-verification" access model actually cost, which `db_hits` cannot show because it
+    /// charges what an operator *matched*. Drained off the seam after every call it makes (see
+    /// [`ProfilingGraph::tally`]).
+    counts: Vec<Mutex<ReadCounts>>,
     /// The operator currently executing — the one storage accesses are attributed to. Starts at the root
     /// (`0`), so an access made outside any operator (result materialisation) lands on the root.
     current: AtomicUsize,
@@ -124,6 +173,7 @@ impl ProfileRecorder {
         Self {
             rows: (0..len).map(|_| AtomicU64::new(0)).collect(),
             db_hits: (0..len).map(|_| AtomicU64::new(0)).collect(),
+            counts: (0..len).map(|_| Mutex::new(ReadCounts::ZERO)).collect(),
             current: AtomicUsize::new(0),
             plan_ids,
             template_ids: Mutex::new(HashMap::new()),
@@ -218,6 +268,36 @@ impl ProfileRecorder {
             .get(id)
             .map_or(0, |c| c.load(Ordering::Relaxed))
     }
+
+    /// Adds `counts` — one storage-seam call's measured candidate examination, just drained off the
+    /// seam — to the **current** operator's tally (`rmp` task #991).
+    ///
+    /// An all-zero drain is discarded without touching the slot, so the overwhelming majority of seam
+    /// calls (scalar reads, writes, metadata) cost nothing here.
+    fn record_counts(&self, counts: ReadCounts) {
+        if counts.is_zero() {
+            return;
+        }
+        let id = self.current.load(Ordering::Relaxed);
+        let Some(slot) = self.counts.get(id) else {
+            return;
+        };
+        let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
+        slot.candidates_examined += counts.candidates_examined;
+        slot.rejected_by_visibility += counts.rejected_by_visibility;
+        slot.rejected_by_predicate += counts.rejected_by_predicate;
+        slot.read_markers += counts.read_markers;
+        slot.predicate_markers += counts.predicate_markers;
+    }
+
+    /// The measured candidate-examination counts of operator `id`
+    /// ([`ReadCounts::ZERO`] for an operator that never touched the storage seam).
+    #[must_use]
+    pub fn read_counts(&self, id: OpId) -> ReadCounts {
+        self.counts.get(id).map_or(ReadCounts::ZERO, |c| {
+            *c.lock().unwrap_or_else(PoisonError::into_inner)
+        })
+    }
 }
 
 /// Numbers `op`'s subtree in pre-order starting at `base`, mapping each operator's address to its id.
@@ -257,26 +337,47 @@ pub struct ProfilingGraph<'g> {
 
 impl<'g> ProfilingGraph<'g> {
     /// Wraps `inner`, tallying its accesses into `rec`.
+    ///
+    /// The seam's [`ReadTally`](crate::read_source::ReadTally) is drained and **discarded** here, so a
+    /// wrapper never inherits candidate counts produced while no wrapper was installed (`rmp` #991).
+    /// Work done outside every operator is not attributable to one, and an absent counter is honest
+    /// where a misattributed one is not — the same rule [`ProfileRecorder::id_of`] follows.
     pub fn new(inner: &'g mut dyn GraphAccess, rec: Arc<ProfileRecorder>) -> Self {
+        let _ = inner.take_read_tally();
         Self { inner, rec }
     }
 
+    /// Drains the seam's candidate-examination counts onto the **current** operator (`rmp` task #991).
+    ///
+    /// Called after **every** forwarded seam call — reads, writes and the uncounted metadata calls
+    /// alike — because a tally left undrained would be attributed to whichever operator drains next.
+    fn tally(&self) {
+        self.rec.record_counts(self.inner.take_read_tally());
+    }
+
     /// Counts one storage access that obtained `records` records (a lookup that found nothing still touched
-    /// the store, so it costs 1).
+    /// the store, so it costs 1), and drains that call's candidate counts.
     fn hit(&self, records: usize) {
         self.rec.record_db_hits(records.max(1) as u64);
+        self.tally();
     }
 
     /// Counts a scalar access (exactly one record consulted).
     fn hit1(&self) {
         self.rec.record_db_hits(1);
+        self.tally();
     }
 
     /// Counts an optional set-returning access: a decline (`None` — no such index) is not a storage access
     /// at all and costs nothing; a served seek costs one per candidate it returned.
+    ///
+    /// A decline still **drains**: a seam that declines after registering its SSI markers (the
+    /// relationship seeks do exactly that, `rmp` #683) really did emit them, and dropping the tally
+    /// would both hide that cost and misattribute it to the next operator to drain.
     fn hit_opt<T>(&self, r: &Option<Vec<T>>) {
-        if let Some(v) = r {
-            self.hit(v.len());
+        match r {
+            Some(v) => self.hit(v.len()),
+            None => self.tally(),
         }
     }
 
@@ -285,8 +386,9 @@ impl<'g> ProfilingGraph<'g> {
     /// never one per carried value — so the *seek's* own `dbHits` are unchanged by the feature and the
     /// saving shows up where it is real: in the consumer that no longer reads the store.
     fn hit_hits<V>(&self, r: &Option<SeekHits<V>>) {
-        if let Some(hits) = r {
-            self.hit(hits.len());
+        match r {
+            Some(hits) => self.hit(hits.len()),
+            None => self.tally(),
         }
     }
 }
@@ -334,6 +436,10 @@ impl GraphAccess for ProfilingGraph<'_> {
         let r = self.inner.count_store_nodes(label);
         if r.is_some() {
             self.hit1();
+        } else {
+            // A decline reads no record, but it may still have emitted markers — drain so they are not
+            // attributed to the next operator (`rmp` #991).
+            self.tally();
         }
         r
     }
@@ -343,50 +449,68 @@ impl GraphAccess for ProfilingGraph<'_> {
         let r = self.inner.count_store_rels(types);
         if r.is_some() {
             self.hit1();
+        } else {
+            self.tally();
         }
         r
     }
 
     fn node_exists(&self, node: NodeId) -> bool {
-        self.hit1();
-        self.inner.node_exists(node)
+        self.rec.record_db_hits(1);
+        let r = self.inner.node_exists(node);
+        self.tally();
+        r
     }
 
     fn rel_exists(&self, rel: RelId) -> bool {
-        self.hit1();
-        self.inner.rel_exists(rel)
+        self.rec.record_db_hits(1);
+        let r = self.inner.rel_exists(rel);
+        self.tally();
+        r
     }
 
     fn node_labels(&self, node: NodeId) -> Option<Vec<String>> {
-        self.hit1();
-        self.inner.node_labels(node)
+        self.rec.record_db_hits(1);
+        let r = self.inner.node_labels(node);
+        self.tally();
+        r
     }
 
     fn rel_data(&self, rel: RelId) -> Option<RelData> {
-        self.hit1();
-        self.inner.rel_data(rel)
+        self.rec.record_db_hits(1);
+        let r = self.inner.rel_data(rel);
+        self.tally();
+        r
     }
 
     fn rel_data_including_deleted(&self, rel: RelId) -> Option<RelData> {
-        self.hit1();
-        self.inner.rel_data_including_deleted(rel)
+        self.rec.record_db_hits(1);
+        let r = self.inner.rel_data_including_deleted(rel);
+        self.tally();
+        r
     }
 
     fn entity_deleted_by_txn(&self, entity: DeletedEntity) -> bool {
         // NOT a storage read: this consults the current transaction's own in-memory tombstone set (to
         // decide whether a property read on a self-deleted entity must raise). Counting it would inflate
         // every property access by 2x with work the store never did — a wrong number, so it is not counted.
-        self.inner.entity_deleted_by_txn(entity)
+        let r = self.inner.entity_deleted_by_txn(entity);
+        self.tally();
+        r
     }
 
     fn node_property(&self, node: NodeId, key: &str) -> Option<Value> {
-        self.hit1();
-        self.inner.node_property(node, key)
+        self.rec.record_db_hits(1);
+        let r = self.inner.node_property(node, key);
+        self.tally();
+        r
     }
 
     fn rel_property(&self, rel: RelId, key: &str) -> Option<Value> {
-        self.hit1();
-        self.inner.rel_property(rel, key)
+        self.rec.record_db_hits(1);
+        let r = self.inner.rel_property(rel, key);
+        self.tally();
+        r
     }
 
     fn node_properties(&self, node: NodeId) -> Option<Vec<(String, Value)>> {
@@ -538,8 +662,10 @@ impl GraphAccess for ProfilingGraph<'_> {
     }
 
     fn fulltext_score(&self, name: &str, node: NodeId, search: &str) -> Option<u64> {
-        self.hit1();
-        self.inner.fulltext_score(name, node, search)
+        self.rec.record_db_hits(1);
+        let r = self.inner.fulltext_score(name, node, search);
+        self.tally();
+        r
     }
 
     fn fulltext_query_rel(&self, name: &str, search: &str) -> Option<Vec<RelId>> {
@@ -549,8 +675,10 @@ impl GraphAccess for ProfilingGraph<'_> {
     }
 
     fn fulltext_score_rel(&self, name: &str, rel: RelId, search: &str) -> Option<u64> {
-        self.hit1();
-        self.inner.fulltext_score_rel(name, rel, search)
+        self.rec.record_db_hits(1);
+        let r = self.inner.fulltext_score_rel(name, rel, search);
+        self.tally();
+        r
     }
 
     fn vector_query_nodes(&self, name: &str, query: &[f32], k: usize) -> VectorQueryResult {
@@ -573,7 +701,9 @@ impl GraphAccess for ProfilingGraph<'_> {
 
     fn index_exists_by_name(&self, name: &str) -> Option<bool> {
         // A catalogue metadata lookup, not a record read — not counted (see `entity_deleted_by_txn`).
-        self.inner.index_exists_by_name(name)
+        let r = self.inner.index_exists_by_name(name);
+        self.tally();
+        r
     }
 
     fn fulltext_scan_fallback(
@@ -596,6 +726,8 @@ impl GraphAccess for ProfilingGraph<'_> {
             // `label_matches` counts every visible label-carrying node the columnar pass touched — the
             // records read — which is `>= rows.len()` (a node with no value contributes no row).
             self.hit(scan.label_matches.max(scan.rows.len()));
+        } else {
+            self.tally();
         }
         r
     }
@@ -607,32 +739,42 @@ impl GraphAccess for ProfilingGraph<'_> {
         let r = self.inner.project_snapshot(spec);
         if let Some(snap) = &r {
             self.hit(snap.node_count());
+        } else {
+            self.tally();
         }
         r
     }
 
     fn note_parallel_aggregate(&self) {
         self.inner.note_parallel_aggregate();
+        self.tally();
     }
 
     fn morsel_label_scan(&self, label: &str) -> Option<crate::morsel::MorselLabelScan> {
         // Unreachable while profiling (the morsel tier is disabled for a profiled statement), but
         // forwarded rather than declined so the decorator never changes which seam a caller reaches.
-        self.inner.morsel_label_scan(label)
+        let r = self.inner.morsel_label_scan(label);
+        self.tally();
+        r
     }
 
     fn frontier_morsel_source(&self) -> Option<crate::morsel::MorselFrontierSource> {
-        self.inner.frontier_morsel_source()
+        let r = self.inner.frontier_morsel_source();
+        self.tally();
+        r
     }
 
     fn merge_morsel_buffer(&self, buffer: graphus_txn::SsiReadBuffer) {
         self.inner.merge_morsel_buffer(buffer);
+        self.tally();
     }
 
     // ---- writes -----------------------------------------------------------------------------------
     fn create_node(&mut self, labels: &[String], properties: &[(String, Value)]) -> NodeId {
         self.rec.record_db_hits(1);
-        self.inner.create_node(labels, properties)
+        let r = self.inner.create_node(labels, properties);
+        self.tally();
+        r
     }
 
     fn create_rel(
@@ -643,57 +785,69 @@ impl GraphAccess for ProfilingGraph<'_> {
         properties: &[(String, Value)],
     ) -> RelId {
         self.rec.record_db_hits(1);
-        self.inner.create_rel(rel_type, start, end, properties)
+        let r = self.inner.create_rel(rel_type, start, end, properties);
+        self.tally();
+        r
     }
 
     fn set_node_property(&mut self, node: NodeId, key: &str, value: Value) {
         self.rec.record_db_hits(1);
         self.inner.set_node_property(node, key, value);
+        self.tally();
     }
 
     fn set_rel_property(&mut self, rel: RelId, key: &str, value: Value) {
         self.rec.record_db_hits(1);
         self.inner.set_rel_property(rel, key, value);
+        self.tally();
     }
 
     fn add_labels(&mut self, node: NodeId, labels: &[String]) {
         self.rec.record_db_hits(1);
         self.inner.add_labels(node, labels);
+        self.tally();
     }
 
     fn remove_labels(&mut self, node: NodeId, labels: &[String]) {
         self.rec.record_db_hits(1);
         self.inner.remove_labels(node, labels);
+        self.tally();
     }
 
     fn remove_node_property(&mut self, node: NodeId, key: &str) {
         self.rec.record_db_hits(1);
         self.inner.remove_node_property(node, key);
+        self.tally();
     }
 
     fn remove_rel_property(&mut self, rel: RelId, key: &str) {
         self.rec.record_db_hits(1);
         self.inner.remove_rel_property(rel, key);
+        self.tally();
     }
 
     fn replace_node_properties(&mut self, node: NodeId, properties: &[(String, Value)]) {
         self.rec.record_db_hits(1);
         self.inner.replace_node_properties(node, properties);
+        self.tally();
     }
 
     fn merge_node_properties(&mut self, node: NodeId, properties: &[(String, Value)]) {
         self.rec.record_db_hits(1);
         self.inner.merge_node_properties(node, properties);
+        self.tally();
     }
 
     fn replace_rel_properties(&mut self, rel: RelId, properties: &[(String, Value)]) {
         self.rec.record_db_hits(1);
         self.inner.replace_rel_properties(rel, properties);
+        self.tally();
     }
 
     fn merge_rel_properties(&mut self, rel: RelId, properties: &[(String, Value)]) {
         self.rec.record_db_hits(1);
         self.inner.merge_rel_properties(rel, properties);
+        self.tally();
     }
 
     fn incident_rels(&self, node: NodeId) -> Vec<RelId> {
@@ -705,11 +859,13 @@ impl GraphAccess for ProfilingGraph<'_> {
     fn delete_rel(&mut self, rel: RelId) {
         self.rec.record_db_hits(1);
         self.inner.delete_rel(rel);
+        self.tally();
     }
 
     fn delete_node(&mut self, node: NodeId) {
         self.rec.record_db_hits(1);
         self.inner.delete_node(node);
+        self.tally();
     }
 
     // ---- metadata (not storage reads: never counted) ----------------------------------------------
@@ -719,6 +875,13 @@ impl GraphAccess for ProfilingGraph<'_> {
 
     fn write_counters(&self) -> QueryCounters {
         self.inner.write_counters()
+    }
+
+    fn take_read_tally(&self) -> ReadCounts {
+        // Forwarded like every other seam method, so a caller above this decorator sees exactly what the
+        // wrapped seam measured. Nothing above it drains during a profiled statement — `tally()` is the
+        // only drain — so forwarding cannot steal counts from the attribution path (`rmp` #991).
+        self.inner.take_read_tally()
     }
 }
 

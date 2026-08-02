@@ -107,6 +107,15 @@ pub struct ReadOnlyGraph<D: BlockDevice, S: LogSink> {
     /// The memo carries values only — the equivalence predicate that authorised them was proven on the
     /// engine thread at capture time, because this thread can neither evaluate it nor keep it true.
     count_store: read_source::CountStoreCapture,
+    /// The measured cost of this reader's **candidate + re-verification** work (`rmp` task #991) —
+    /// candidates examined, candidates rejected by MVCC visibility, candidates rejected by the access
+    /// path's own predicate re-check, and SIREAD markers emitted.
+    ///
+    /// The off-thread twin of `RecordStoreGraph::tally`, and for the same reason a `Cell` accumulator
+    /// rather than an atomic: this reader is `!Sync` (it appends markers through `RefCell`) and is
+    /// owned by exactly one reader-pool thread for its whole life. Drained by the profiling decorator
+    /// through [`take_read_tally`](GraphAccess::take_read_tally) after each seam call.
+    tally: read_source::ReadTally,
 }
 
 impl<D: BlockDevice, S: LogSink> ReadOnlyGraph<D, S> {
@@ -146,6 +155,7 @@ impl<D: BlockDevice, S: LogSink> ReadOnlyGraph<D, S> {
             fulltext: read_source::FulltextReadSnapshot::default(),
             index_candidates: read_source::IndexCandidateCapture::default(),
             count_store: read_source::CountStoreCapture::default(),
+            tally: read_source::ReadTally::new(),
         }
     }
 
@@ -274,12 +284,15 @@ impl<D: BlockDevice, S: LogSink> ReadOnlyGraph<D, S> {
 /// neither). The coordinator merges the buffer on the engine thread at retirement.
 impl<D: BlockDevice, S: LogSink> ReadSink for ReadOnlyGraph<D, S> {
     fn note_read(&self, key: u64) {
+        // Counted at the point of emission (`rmp` #991), exactly as the live seam counts it.
+        self.tally.note_read_marker();
         if let Some(buf) = self.buffer.borrow_mut().as_mut() {
             buf.record_read(key);
         }
     }
 
     fn note_predicate_read(&self, predicate: PredicateRead) {
+        self.tally.note_predicate_marker();
         if let Some(buf) = self.buffer.borrow_mut().as_mut() {
             buf.record_predicate_read(predicate);
         }
@@ -287,6 +300,16 @@ impl<D: BlockDevice, S: LogSink> ReadSink for ReadOnlyGraph<D, S> {
 
     fn capture(&self, err: GraphusError) {
         self.capture_err(err);
+    }
+
+    fn note_candidates(
+        &self,
+        examined: u64,
+        rejected_by_visibility: u64,
+        rejected_by_predicate: u64,
+    ) {
+        self.tally
+            .note_candidates(examined, rejected_by_visibility, rejected_by_predicate);
     }
 }
 
@@ -847,6 +870,13 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         })
     }
 
+    fn take_read_tally(&self) -> read_source::ReadCounts {
+        // `rmp` #991: what this reader's candidate re-verification measured since the last drain. The
+        // off-thread twin of `RecordStoreGraph::take_read_tally`; a profiled statement drains through
+        // whichever of the two actually ran, so the counters do not depend on the dispatch route.
+        self.tally.take()
+    }
+
     fn merge_morsel_buffer(&self, buffer: graphus_txn::SsiReadBuffer) {
         // Convergence (`rmp` task #575-g.1): fold a morsel's accumulated SIREAD markers into THIS reader's
         // own buffer. A reader thread holds no shared `SsiTracker` (that lives only on the engine thread),
@@ -936,8 +966,8 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
 // (owned by that one reader, never shared). A compile-time assertion (no runtime body): it fails to
 // build the instant a non-`Send` field is introduced. The owned fields are all `Send + Sync`
 // (`StoreReadView` / `TokenSnapshot` from Slice 3a, `Snapshot` `Copy`, `CommitRegistry`/`TxnId` plain
-// data) except the two `RefCell<…>` interior-mutability cells, which are `Send` (their contents are) and
-// `!Sync` — exactly the bound we want. Asserted both for the concrete DST instantiation and generically
+// data) except the interior-mutability cells — the two `RefCell<…>` and the `rmp` #991 `ReadTally`'s
+// `Cell<u64>`s — which are `Send` (their contents are) and `!Sync`: exactly the bound we want. Asserted both for the concrete DST instantiation and generically
 // over the `D, S: Send + Sync` bound the view's own `Send + Sync` requires.
 const _: () = {
     fn assert_send<T: Send>() {}

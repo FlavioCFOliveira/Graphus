@@ -1367,6 +1367,14 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
         // inner and is counted there. So delegating verbatim yields the exact applied-side-effect tally.
         self.inner.write_counters()
     }
+
+    fn take_read_tally(&self) -> crate::read_source::ReadCounts {
+        // `rmp` #991: this decorator reads no record of its own — every candidate is examined by the
+        // inner seam — so it forwards the drain verbatim. Forwarding is load-bearing: inheriting the
+        // trait default would silently report ZERO for every RBAC-enforced statement, which is a
+        // fabricated number, not an absent one.
+        self.inner.take_read_tally()
+    }
 }
 
 impl<O: PrivilegeOracle> AuthorizedGraph<'_, O> {

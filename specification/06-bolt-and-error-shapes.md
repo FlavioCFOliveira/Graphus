@@ -475,6 +475,49 @@ it never reports a counter it did not count. All four are optional on the wire a
 drivers default them to `0`. The measured meaning of `dbHits` is defined in `04-technical-design.md`
 §7.8.
 
+A `PROFILE`'s `args` additionally carry the measured cost of the **candidate + re-verification**
+access model (`04-technical-design.md` §7.8, rmp #991). These are Graphus's own measured quantities,
+in `args` rather than at the top level, so the frozen driver-facing node shape above is unchanged:
+
+| `args` key | Counts |
+| --- | ------ |
+| `CandidatesExamined` | Candidate records the operator decoded and re-verified. |
+| `CandidatesRejectedByVisibility` | Of those, how many the MVCC visibility re-check dropped. |
+| `CandidatesRejectedByFilter` | Of those, how many the operator's own predicate re-check dropped (label bitmap, current value against the seek value or range bounds, relationship type, traversal direction). |
+| `ReadMarkers` | Per-record serializability (SIREAD) markers the operator emitted. |
+| `PredicateMarkers` | Predicate SIREAD markers the operator emitted. |
+
+The three candidate counters are **disjoint**, and
+`CandidatesExamined − CandidatesRejectedByVisibility − CandidatesRejectedByFilter` is the number of
+candidates that **survived the re-verification**. That is a statement about candidates, **not** about
+rows: what an operator then emits per surviving candidate is its own business, and two mechanisms in
+the current engine make the two differ.
+
+- **De-duplication.** A stale and a live index entry can name the same node id, so one id can be
+  examined twice, survive twice, and produce **one** row (the `index_seek_*_recheck` bodies
+  de-duplicate before returning). Measured: after `SET n.v = 2` on a node indexed at `v = 1`, the seek
+  `WHERE n.v >= 1 AND n.v <= 2` reports `CandidatesExamined = 2` with no rejections and `Rows = 1`.
+- **One candidate, several rows.** A self-loop traversed under an undirected pattern is one surviving
+  relationship candidate that the seam reports on both of its sides.
+
+Both are pinned by
+`crates/graphus-cypher/tests/candidate_instrumentation.rs::surviving_candidates_are_not_rows_991`.
+The two marker counters are counted at the point of emission and are never inferred from the candidate
+counts, which is what makes a blanket predicate footprint (one marker per live node, no candidates of
+its own) visible as exactly what it is.
+
+Each of the five follows the same **only non-zero counters appear** rule as `stats` above, so an
+operator that touches no storage seam carries none of them. On the store-backed seams — the two the
+server ever runs a statement on — their absence therefore means "measured, and it was zero".
+
+The qualification matters for a seam that does not implement the tally seam at all and keeps the
+all-zero default: in-tree that is only the in-memory reference backend used by the engine's own test
+suites, never a server path. Its plans carry none of these keys anywhere, and there absence means "not
+measured". Nothing is fabricated in either case, which is the property that matters; but the blanket
+reading "absent ⇒ measured zero" holds only for a seam that measures. Both are different again from
+the permanently omitted `pageCache*`/`time`, which Graphus does not measure on **any** seam and so
+never reports under any circumstances.
+
 ### 3.2 Failure shape (FAILURE)
 
 A Cypher error is delivered as a Bolt **`FAILURE`** message carrying two fields (`04` §8.1):
