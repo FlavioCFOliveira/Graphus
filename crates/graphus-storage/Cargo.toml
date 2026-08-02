@@ -23,6 +23,16 @@ dst = ["graphus-bufpool/dst"]
 # path is always cold-open. Recovery/startup harnesses can opt in to fail-fast enforcement.
 check-cold-assert = []
 
+# The buffer pool's write-back durability timers (`rmp` #974), forwarded to `graphus-bufpool`. Only
+# `benches/eviction_convoy.rs` needs them, and that bench declares it via `required-features`.
+#
+# This is a FEATURE rather than a dev-dependency on purpose. A dev-dependency with the feature
+# enabled would be unified into every `cargo test`/`cargo bench` resolve for the workspace, so the
+# whole certification gate would link a `graphus-bufpool` carrying two `Instant::now()` calls per
+# cache-miss read and four more per write-back — instrumenting exactly the hot paths the gate exists
+# to certify. Behind a feature, the default gate runs the production shape and the bench opts in.
+bufpool-probe = ["graphus-bufpool/bufpool-probe"]
+
 [dependencies]
 graphus-core = { path = "../graphus-core" }
 graphus-io = { path = "../graphus-io" }
@@ -66,3 +76,14 @@ loom = "0.7.2"
 # not warn when the flag is absent from a normal build.
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
+# The eviction write-back convoy harness (`rmp` #974): a real-file, real-WAL, real-doublewrite
+# measurement of concurrent read throughput with a working set that exceeds the buffer pool. Not a
+# Criterion bench (it drives its own threads and reports a table), so the default harness is off.
+# It reads the pool's write-back timers, hence `required-features` — which also keeps that
+# instrumentation out of the default test gate.
+#   cargo bench -p graphus-storage --bench eviction_convoy --features bufpool-probe
+[[bench]]
+name = "eviction_convoy"
+harness = false
+required-features = ["bufpool-probe"]

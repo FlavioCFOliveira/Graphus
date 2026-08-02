@@ -35,6 +35,10 @@ pub mod timezone;
 /// (`rmp` task #988). This is where "may the client retry this?" is decided — see the module docs.
 pub mod status;
 
+/// The frame-latch tripwire (`rmp` #974): a debug-build guard proving that no durability barrier is
+/// ever issued while a buffer-pool frame latch is held. Compiled out of release builds.
+pub mod latch;
+
 /// Identifier newtypes used across the storage, transaction, and query layers.
 pub mod ids {
     /// Physical page identifier within a store file.

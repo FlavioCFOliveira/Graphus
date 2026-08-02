@@ -672,7 +672,19 @@ impl<S: LogSink> WalManager<S> {
     }
 
     /// Hardens the log, treating a sync failure as unrecoverable (`§4.9`).
+    ///
+    /// # The frame-latch tripwire (`rmp` #974)
+    ///
+    /// This is the WAL's only durability barrier, and it is reached from the buffer pool's
+    /// write-back path via [`WalRule::ensure_durable`](graphus_bufpool::WalRule::ensure_durable).
+    /// It must **never** run while the caller holds a buffer-pool frame latch: this mutex is shared
+    /// with the store's commit path, so a harden under a latch chains
+    /// *frame latch → WAL mutex → `fdatasync`* and convoys every concurrent evictor and every
+    /// commit behind one latch. `rmp` #974 hoisted the pool's harden out of the latched region; the
+    /// assertion below is what keeps it hoisted — it is compiled out of release builds and is armed
+    /// throughout the (debug-profile) test suite.
     fn harden(&mut self) {
+        graphus_core::latch::assert_no_frame_latch_held("WalManager::harden");
         if let Err(e) = self.sink.sync() {
             panic!("WAL fdatasync failed; aborting to avoid silent data loss (fsyncgate): {e}");
         }

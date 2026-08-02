@@ -297,6 +297,20 @@ impl BlockDevice for FileBlockDevice {
         crate::full_sync_all(&self.file).map_err(|e| io_err("sync_all", &e))
     }
 
+    /// Offers a `&self` durability handle over a **duplicated descriptor** for the same file
+    /// (`rmp` #974), so the buffer pool can issue its home-write barrier without holding the
+    /// exclusive device guard that concurrent cache-miss reads need in shared mode.
+    ///
+    /// The duplicate refers to the same open file description's underlying file, so an
+    /// `fsync`/`fdatasync` through it flushes exactly the same dirty data as one through
+    /// [`sync_data`](BlockDevice::sync_data) — the kernel flushes the *file*, not a per-descriptor
+    /// view. A failure to duplicate is not an error: it yields `None` and the caller keeps the
+    /// historical guarded path (fail-safe, never fail-open).
+    fn sync_handle(&self) -> Option<std::sync::Arc<dyn crate::block::SyncHandle>> {
+        let dup = self.file.try_clone().ok()?;
+        Some(std::sync::Arc::new(FileSyncHandle { file: dup }))
+    }
+
     fn page_count(&self) -> u64 {
         self.page_count
     }
@@ -327,6 +341,26 @@ impl BlockDevice for FileBlockDevice {
             .map_err(|e| io_err("set_len", &e))?;
         self.page_count = new_count;
         Ok(())
+    }
+}
+
+/// The [`crate::block::SyncHandle`] a [`FileBlockDevice`] hands out (`rmp` #974): a duplicated
+/// descriptor for the same file, over which a durability barrier can be issued through `&self` and
+/// therefore **without** the caller's exclusive device guard.
+#[derive(Debug)]
+struct FileSyncHandle {
+    file: File,
+}
+
+impl crate::block::SyncHandle for FileSyncHandle {
+    fn sync_data(&self) -> Result<()> {
+        // Identical barrier to `FileBlockDevice::sync_data` — `F_FULLFSYNC` on macOS, `fdatasync`
+        // elsewhere (`crate::fullsync`) — issued on a duplicate descriptor for the same file.
+        crate::full_sync_data(&self.file).map_err(|e| io_err("sync_data", &e))
+    }
+
+    fn sync_all(&self) -> Result<()> {
+        crate::full_sync_all(&self.file).map_err(|e| io_err("sync_all", &e))
     }
 }
 

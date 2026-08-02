@@ -197,6 +197,26 @@ impl BlockDevice for StoreDevice {
         }
     }
 
+    /// Forwards the shared durability handle (`rmp` #974) for the **plaintext** device only.
+    ///
+    /// This forwarding is what makes the change reach production: the serving engine never hands
+    /// the buffer pool a bare [`FileBlockDevice`] — every store device goes through this wrapper —
+    /// so without it the pool would silently fall back to issuing its home-write barrier under the
+    /// exclusive device guard, which is the contention `rmp` #974 exists to remove.
+    ///
+    /// The **encrypted** variant deliberately returns `None`. Its `sync_data`/`sync_all` are not
+    /// pure barriers: they first call `persist_counter()`, which mutates and writes the nonce
+    /// counter (`graphus_crypto`), and that genuinely requires `&mut self`. Handing out a `&self`
+    /// handle would skip the counter persist and break the AEAD nonce-uniqueness invariant, so the
+    /// encrypted path correctly keeps the guarded `&mut` barrier. This is a durability/security
+    /// decision, not an oversight.
+    fn sync_handle(&self) -> Option<std::sync::Arc<dyn graphus_io::SyncHandle>> {
+        match self {
+            Self::Plain(d) => d.sync_handle(),
+            Self::Encrypted(_) => None,
+        }
+    }
+
     fn extend(&mut self, additional: u64) -> Result<()> {
         match self {
             Self::Plain(d) => d.extend(additional),

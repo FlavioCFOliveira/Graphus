@@ -31,5 +31,9 @@ pub mod page;
 mod pool;
 mod sync;
 
+/// Diagnostics counters for the eviction and write-back paths (`bufpool-probe` feature only).
+/// Compiled out of the production build.
+#[cfg(feature = "bufpool-probe")]
+pub use concurrent::probe;
 pub use concurrent::{ConcurrentBufferPool, PageStager, PinnedFrame};
 pub use pool::{BufferPool, FrameId, NoWal, WalRule};

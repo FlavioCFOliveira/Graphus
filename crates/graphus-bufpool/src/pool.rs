@@ -29,6 +29,51 @@ pub trait WalRule {
     fn tracks_lsn(&self) -> bool {
         true
     }
+
+    /// The log's **durable frontier**: the number of log bytes known to be on stable storage.
+    ///
+    /// This is the read-only counterpart of [`ensure_durable`](Self::ensure_durable) and must
+    /// **never** issue a durability barrier — it only reports what is already durable. The
+    /// relationship between the two is exact and is the contract the concurrent pool relies on:
+    ///
+    /// > `ensure_durable(up_to)` is a **no-op** if and only if `durable_len() > up_to.0`.
+    ///
+    /// (Strictly greater, mirroring `WalManager::ensure_durable`, which hardens when
+    /// `durable_len() <= up_to.0`.)
+    ///
+    /// # Progress requirement
+    ///
+    /// The equivalence has a direction that implementations must honour: after
+    /// `ensure_durable(up_to)` returns `Ok`, a subsequent `durable_len()` **must** report a value
+    /// `> up_to.0`. Reporting *less* than the truth is fine and expected — the pool's mirror lags the
+    /// log constantly, because the store commits without going through the pool — but the lag must
+    /// be **temporal**, resolving once the frontier is re-read. A rule that under-reports by a fixed
+    /// margin forever makes some pages permanently un-hardenable: the pool declines those victims,
+    /// re-sweeps, declines again, and eventually surfaces its retry-budget error. That is a clean,
+    /// bounded failure rather than corruption — WAL-before-data is never violated — but it is a
+    /// broken rule, not a supported configuration.
+    ///
+    /// # Why the pool needs it (`rmp` #974)
+    ///
+    /// The concurrent pool must never perform an `fdatasync` while holding a frame latch: the WAL
+    /// mutex is shared with the store's own commit path, so a harden under a latch chains
+    /// *frame latch → WAL mutex → fdatasync* and convoys every other evictor **and** every
+    /// concurrent commit behind it. The pool therefore **hoists** the harden: it asks this method
+    /// whether a page's `page_lsn` is already covered, and when it is not, it releases the latch,
+    /// hardens with no latch held, and retries. This method is consulted on the eviction path, so it
+    /// must be cheap — a field read, not I/O.
+    ///
+    /// # Why this is required rather than defaulted
+    ///
+    /// It has no default on purpose. A default would have to be either `0` ("nothing known
+    /// durable"), which is safe but makes an implementer's silence indistinguishable from a genuine
+    /// report of zero — the pool would then have to fall back on inferring the frontier from a
+    /// page's own `page_lsn`, and a single mis-stamped page could raise the pool-wide watermark and
+    /// disable WAL-before-data for every page below it — or `u64::MAX`, which is fail-open and would
+    /// silently disable the rule outright for any implementer who forgot. Requiring the method
+    /// forces the one decision that cannot be guessed, and lets the pool trust every value it gets
+    /// as an observation of the log.
+    fn durable_len(&mut self) -> u64;
 }
 
 /// A [`WalRule`] for standalone use (no WAL): every LSN is considered already durable.
@@ -42,6 +87,12 @@ impl WalRule for NoWal {
 
     fn tracks_lsn(&self) -> bool {
         false
+    }
+
+    /// Everything is already durable, so every LSN is covered — the exact counterpart of this
+    /// rule's no-op [`ensure_durable`](WalRule::ensure_durable).
+    fn durable_len(&mut self) -> u64 {
+        u64::MAX
     }
 }
 
@@ -361,6 +412,10 @@ mod tests {
             fn ensure_durable(&mut self, _up_to: Lsn) -> Result<()> {
                 Err(GraphusError::Storage("wal not durable".to_owned()))
             }
+            /// Nothing is ever durable — this rule refuses every harden.
+            fn durable_len(&mut self) -> u64 {
+                0
+            }
         }
         let mut p = BufferPool::with_wal(MemBlockDevice::new(0), FailWal, 2);
         let (f, _id) = p.new_page().unwrap();
@@ -381,6 +436,10 @@ mod tests {
         }
         fn tracks_lsn(&self) -> bool {
             false
+        }
+        /// A counting no-op rule: every harden succeeds immediately, so everything is durable.
+        fn durable_len(&mut self) -> u64 {
+            u64::MAX
         }
     }
 
@@ -428,6 +487,10 @@ mod tests {
             }
             fn tracks_lsn(&self) -> bool {
                 false
+            }
+            /// Refuses to harden, so nothing ever becomes durable.
+            fn durable_len(&mut self) -> u64 {
+                0
             }
         }
         for cap in 1..=4usize {

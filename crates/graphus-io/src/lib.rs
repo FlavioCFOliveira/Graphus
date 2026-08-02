@@ -72,7 +72,7 @@ pub mod net;
 #[cfg(all(target_os = "linux", feature = "io-uring", not(loom)))]
 mod uring;
 
-pub use block::{BlockDevice, PAGE_SIZE, Page, PageReadOutcome};
+pub use block::{BlockDevice, PAGE_SIZE, Page, PageReadOutcome, SyncHandle};
 pub use file::FileBlockDevice;
 pub use fullsync::{full_sync_all, full_sync_data};
 pub use mem::{FaultPlan, MemBlockDevice, TORN_SECTOR_SIZE, sector_torn_image};

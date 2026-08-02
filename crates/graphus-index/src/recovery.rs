@@ -112,6 +112,19 @@ impl<S: LogSink> WalRule for SharedWal<S> {
             )),
         }
     }
+
+    /// The manager's durable frontier, reported **without** hardening (`rmp` #974), so the buffer
+    /// pool can tell before it takes a frame latch whether an index page's `page_lsn` is already
+    /// covered — and hoist the `fdatasync` out from under the latch when it is not.
+    ///
+    /// A re-entrant borrow yields the conservative `0` ("nothing known durable") rather than an
+    /// error: this method must not fail, and under-reporting only makes the pool hoist and call
+    /// [`ensure_durable`](WalRule::ensure_durable), which surfaces the re-entrancy exactly as before.
+    fn durable_len(&mut self) -> u64 {
+        self.inner
+            .try_borrow()
+            .map_or(0, |manager| manager.durable_len())
+    }
 }
 
 /// Encodes an intra-page patch: a 2-byte little-endian `offset` followed by `bytes` (identical to

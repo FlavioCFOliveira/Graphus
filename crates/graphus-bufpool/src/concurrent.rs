@@ -53,8 +53,36 @@
 //! [`WalRule::ensure_durable`] takes `&mut self`, so the WAL stays behind its own `Mutex`. The
 //! device `RwLock` does **not** change the lock *ordering* below: a device guard (read or write) is
 //! still taken **innermost**, only while a frame write latch is held, never while a shard lock is
-//! held — so concurrent device reads add no new wait edge. Dedicated fsync threads (§3.6) remain a
-//! separate future option.
+//! held — so concurrent device reads add no new wait edge.
+//!
+//! ## Durability barriers are issued outside the locks (`rmp` #974)
+//!
+//! Every `fdatasync` on the write-back path used to run inside the locks above, and that — not the
+//! locks themselves — was the pool's dominant scalability limit once the working set exceeded the
+//! pool. Measured on a 16-core host with a working set 2× the pool: the **exclusive** device guard
+//! was occupied 87–92 % of wall time, 98 % of each hold was the barrier itself, and concurrent
+//! cache-miss reads (which need that same lock in *shared* mode) queued 27 µs at one reader rising
+//! to 323 µs at sixteen. Two changes remove the barriers from the locks:
+//!
+//! - **The WAL harden is hoisted out of the frame latch.** The chain used to be
+//!   *frame latch → WAL mutex → `fdatasync`*, and because that mutex is shared with the store's
+//!   commit path, one eviction's sync convoyed every other evictor **and** every concurrent commit.
+//!   [`ConcurrentBufferPool::select_victim`] now **declines** a dirty victim whose `page_lsn` the log
+//!   is not yet durable through ([`VictimChoice::NeedsWalHarden`]), releasing its latch so the
+//!   caller can harden holding nothing and re-sweep. The batch flush paths do the same with the
+//!   batch's maximum `page_lsn`, so they never hold N latches across a sync. The pool's *only*
+//!   hardening entry point is [`ConcurrentBufferPool::harden_wal`], which asserts (debug builds,
+//!   [`graphus_core::latch`]) that no frame latch is held, and the WAL's own `harden` asserts it
+//!   again at the barrier itself.
+//! - **The home-file barrier is issued off the device lock**, through the device's shared
+//!   [`graphus_io::SyncHandle`] (a duplicated descriptor). The exclusive guard now covers the
+//!   `pwrite` alone. This is a pure concurrency change: a barrier flushes the *file*, not a
+//!   per-descriptor view, and it is issued only after the write it must cover has returned.
+//!
+//! Neither change relaxes WAL-before-data. The home-write path still refuses to write a page whose
+//! redo record is not durable — it simply *verifies* that now
+//! ([`ConcurrentBufferPool::assert_wal_covers`], fail-closed) instead of syncing to make it true
+//! while holding a latch. Dedicated fsync threads (§3.6) remain a separate future option.
 //!
 //! ## Lock ordering — why this is deadlock-free
 //!
@@ -86,6 +114,24 @@
 //!   lock while another thread holds that shard lock *and* waits for that frame latch — the only
 //!   `shard → frame` edge uses `try_write` (non-blocking), so it cannot wait.
 //!
+//! The `rmp` #974 hoist **removes** wait edges and adds none. Two edges that used to exist are gone:
+//!
+//! - the *frame latch → WAL mutex* edge on the eviction write-back. `select_victim` consults the
+//!   WAL's durability **only through the lock-free `wal_durable` mirror** — it takes no WAL lock at
+//!   all, not even a `try_lock`. That is not fastidiousness: `self.wal` guards the rule *object*,
+//!   whereas the production rule keeps the real `WalManager` behind its own mutex, so a `try_lock`
+//!   here would succeed on the wrapper and then block inside `durable_len`, potentially behind a
+//!   commit's `fdatasync`, while this thread holds a frame latch and its caller holds a shard lock.
+//!   The sweep therefore keeps its non-blocking, loom-finite contract, and every blocking WAL
+//!   acquisition (`wal_covers_after_refresh`, `harden_wal`) happens on the hoist path, from a thread
+//!   holding nothing — a wait on a leaf;
+//! - the *frame latch → WAL mutex* edge in `guard_wal_before_data`, which read `tracks_lsn()`
+//!   through the mutex — under **every** dirty frame's latch in the batch paths. That value is now
+//!   cached at construction.
+//!
+//! The device edge is likewise weakened, never strengthened: the barrier that used to be issued
+//! under the exclusive device guard is now issued through a handle that takes no device lock at all.
+//!
 //! Latches are short-lived and the spec forbids holding them across `.await`; this pool is fully
 //! synchronous, so that rule is upheld by construction (there is no `.await` anywhere).
 
@@ -100,7 +146,7 @@ use graphus_io::{BlockDevice, PAGE_SIZE, Page};
 use crate::page;
 use crate::pool::{NoWal, WalRule};
 use crate::sync::{
-    Arc, AtomicUsize, Backoff, Mutex, MutexGuard, Ordering, RwLock, RwLockReadGuard,
+    Arc, AtomicU64, AtomicUsize, Backoff, Mutex, MutexGuard, Ordering, RwLock, RwLockReadGuard,
     RwLockWriteGuard,
 };
 
@@ -190,6 +236,30 @@ const MAX_FETCH_RETRIES: usize = 1_000_000;
 /// sooner. Irrelevant to loom (which resolves each retry in a handful of model yields, never
 /// approaching either bound).
 const PERSISTENT_ALL_PINNED_SWEEPS: usize = 100_000;
+
+/// Bound on the **WAL hoist-and-retry** rounds a home-write path will take before giving up
+/// (`rmp` #974).
+///
+/// A round is: discover under the frame latch that the log is not durable through a dirty page's
+/// `page_lsn`, release the latch, harden with nothing held, re-take the latch. One harden makes the
+/// *entire* appended log durable, so every page dirtied before it is covered — a second round is
+/// therefore only ever needed when a concurrent writer stamped a fresh LSN in the instant between
+/// the harden and the re-sweep.
+///
+/// The bound caps how many hardens **one call** will pay for. What happens past it differs by path,
+/// and the difference is deliberate:
+///
+/// * `fetch` / `new_page` stop hardening and fall back to the ordinary backed-off retry, so
+///   [`MAX_FETCH_RETRIES`] remains the single backstop. They must never surface an error here: a
+///   spurious `Err` out of `fetch` is swallowed by the read-view chain into a `Value::Null` — a
+///   *wrong answer* rather than a visible failure, the `rmp` #359/#339 read-integrity class;
+/// * the flush paths return a clean error, which their callers handle correctly — the checkpoint
+///   propagates it before advancing any floor, and the pages stay dirty and resident, so nothing is
+///   lost and a later flush captures them.
+///
+/// Neither path ever falls back to the one thing that must not happen: an `fdatasync` issued inside
+/// a latched region.
+const WAL_HOIST_ATTEMPTS: usize = 1024;
 
 /// The reservation state of a page, as recorded in a frame-table shard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -347,6 +417,39 @@ pub struct ConcurrentBufferPool<D: BlockDevice, W: WalRule = NoWal> {
     device: RwLock<D>,
     /// Serializes WAL-rule checks (`ensure_durable`).
     wal: Mutex<W>,
+    /// Whether the WAL rule tracks real LSNs, cached once at construction (`rmp` #974).
+    ///
+    /// [`WalRule::tracks_lsn`] is a *static* property of the rule, but reading it went through the
+    /// `wal` mutex — an acquisition on the write-back path, taken while holding a frame latch (and,
+    /// in the batch flush paths, while holding **every** dirty frame's latch). Caching it removes
+    /// that lock from the latched region entirely.
+    wal_tracks_lsn: bool,
+    /// The WAL's **durable frontier**, cached lock-free (`rmp` #974).
+    ///
+    /// A monotonically increasing (`fetch_max`) mirror of [`WalRule::durable_len`], refreshed
+    /// whenever this pool holds the WAL mutex anyway. It is the pool's cheap answer to *"is this
+    /// page's `page_lsn` already covered by durable log?"*, which is what lets the eviction path
+    /// decide — **before** it commits to a victim — whether a harden is needed, and hoist that
+    /// harden out from under the frame latch when it is.
+    ///
+    /// # Staleness is safe in exactly one direction
+    ///
+    /// The store hardens the same log directly on its commit path, without going through this pool,
+    /// so this value can lag the true frontier. That is **stale-low**: the pool then believes a page
+    /// is uncovered when it is really durable, hoists, and calls `ensure_durable`, which no-ops. The
+    /// cost is a wasted victim sweep; the durability decision is unaffected. It can never be
+    /// stale-**high** — every value published here was read from the rule under the WAL mutex, and a
+    /// log's durable length never decreases while the log is open — so the pool can never conclude a
+    /// page is covered when it is not, which is the only direction that would break WAL-before-data.
+    wal_durable: AtomicU64,
+    /// The device's **shared** durability handle (`rmp` #974), obtained once at construction.
+    ///
+    /// When present, the home-write barrier is issued through this handle with **no device guard
+    /// held at all**, instead of under the exclusive write guard that every concurrent cache-miss
+    /// read needs in shared mode. `None` for a device that cannot offer one (the in-memory DST
+    /// device, the encrypted device whose sync also persists a counter), in which case the
+    /// historical guarded path is used unchanged.
+    sync_handle: Option<std::sync::Arc<dyn graphus_io::SyncHandle>>,
     frames: Vec<FrameSlot>,
     table: Vec<Mutex<HashMap<PageId, Slot>>>,
     clock: AtomicUsize,
@@ -380,15 +483,25 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
     ///
     /// # Panics
     /// Panics if `capacity` is zero.
-    pub fn with_wal(device: D, wal: W, capacity: usize) -> Self {
+    pub fn with_wal(device: D, mut wal: W, capacity: usize) -> Self {
         assert!(capacity > 0, "buffer pool capacity must be > 0");
         let frames = (0..capacity).map(|_| FrameSlot::empty()).collect();
         let table = (0..SHARD_COUNT)
             .map(|_| Mutex::new(HashMap::default()))
             .collect();
+        // Cache the rule's static properties and seed the durable-frontier mirror once, here, where
+        // no latch is held and nothing is racing (`rmp` #974).
+        let wal_tracks_lsn = wal.tracks_lsn();
+        let wal_durable = AtomicU64::new(wal.durable_len());
+        // Take the device's shared durability handle once; it is reused for the pool's lifetime, so
+        // duplicating a descriptor never lands on a hot path.
+        let sync_handle = device.sync_handle();
         Self {
             device: RwLock::new(device),
             wal: Mutex::new(wal),
+            wal_tracks_lsn,
+            wal_durable,
+            sync_handle,
             frames,
             table,
             clock: AtomicUsize::new(0),
@@ -731,6 +844,10 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
         // `Contended` sweep each reset before retrying); only an uninterrupted run trips the shorter
         // [`PERSISTENT_ALL_PINNED_SWEEPS`] error, never the transient #359 `Contended` live-lock.
         let mut consecutive_all_pinned = 0usize;
+        // Hoist rounds taken on this call (`rmp` #974): a liveness backstop so a `WalRule` whose
+        // harden never advances its durability yields a clean, diagnostic error instead of spinning
+        // the retry budget.
+        let mut wal_hoists = 0usize;
         #[cfg(feature = "bufpool-probe")]
         let mut iter = 0u64;
         for _ in 0..MAX_FETCH_RETRIES {
@@ -806,6 +923,45 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
                                 shard.insert(page_id, Slot::Loading(victim.idx));
                                 victim
                                 // shard lock dropped here
+                            }
+                            VictimChoice::NeedsWalHarden(lsn) => {
+                                // The victim is dirty and its redo record is not durable yet. Its
+                                // latch was already released by the sweep; drop the shard lock so we
+                                // hold NOTHING, harden the log, and re-sweep (`rmp` #974). This is
+                                // the hoist: the `fdatasync` happens here, outside every latch,
+                                // instead of inside `write_back`.
+                                drop(shard);
+                                // Progress of a kind was made: an evictable victim exists, it is
+                                // simply not yet write-back-eligible. Never let this look like the
+                                // capacity wall.
+                                consecutive_all_pinned = 0;
+                                #[cfg(feature = "bufpool-probe")]
+                                {
+                                    iter += 1;
+                                }
+                                // Re-check against the refreshed frontier BEFORE paying for a
+                                // harden: a peer's `harden_wal` may already have covered this LSN
+                                // and merely not been visible in the mirror when the sweep ran, and
+                                // the store's own commit path advances the log without telling this
+                                // pool at all. The refresh takes the WAL lock — legal here, holding
+                                // nothing — and never syncs.
+                                if self.wal_covers_after_refresh(lsn) {
+                                    continue;
+                                }
+                                // A harden is genuinely needed. Bound how many we will pay for on
+                                // one call, but NEVER turn exhaustion into an error: a spurious
+                                // `Err` out of `fetch` is swallowed by the read-view chain into a
+                                // `Value::Null` — a wrong answer rather than a visible failure (the
+                                // `rmp` #359/#339 read-integrity class). Past the bound we simply
+                                // stop hardening and fall back to the ordinary backed-off retry, so
+                                // `MAX_FETCH_RETRIES` stays the single, well-understood backstop.
+                                if wal_hoists < WAL_HOIST_ATTEMPTS {
+                                    wal_hoists += 1;
+                                    self.harden_wal(lsn)?;
+                                } else {
+                                    backoff.spin();
+                                }
+                                continue;
                             }
                             VictimChoice::Contended => {
                                 // An unpinned frame exists but was momentarily latch-contended — the
@@ -932,10 +1088,31 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
         // remains the `Contended` backstop.
         let mut backoff = Backoff::new();
         let mut consecutive_all_pinned = 0usize;
+        // Hoist rounds taken on this call (`rmp` #974) — the liveness backstop, as in `fetch`.
+        let mut wal_hoists = 0usize;
         let mut victim = 'pick: {
             for _ in 0..MAX_FETCH_RETRIES {
                 match self.select_victim() {
                     VictimChoice::Found(v) => break 'pick v,
+                    VictimChoice::NeedsWalHarden(lsn) => {
+                        // The victim is dirty with an un-hardened `page_lsn`; its latch was already
+                        // released by the sweep. Harden with nothing held and re-sweep (`rmp` #974),
+                        // so the `fdatasync` never runs inside a latched region. Identical shape to
+                        // `fetch`'s arm: re-check first (a peer or the commit path may already have
+                        // covered it), bound the hardens, and degrade to backoff rather than to a
+                        // spurious error.
+                        consecutive_all_pinned = 0;
+                        if self.wal_covers_after_refresh(lsn) {
+                            continue;
+                        }
+                        if wal_hoists < WAL_HOIST_ATTEMPTS {
+                            wal_hoists += 1;
+                            self.harden_wal(lsn)?;
+                        } else {
+                            backoff.spin();
+                        }
+                        continue;
+                    }
                     VictimChoice::Contended => {
                         // Transient: an unpinned frame exists — reset the persistent signal and retry.
                         consecutive_all_pinned = 0;
@@ -1010,11 +1187,43 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
 
     /// Writes a frame back to the device if it is dirty (honouring the WAL rule first).
     ///
+    /// The WAL harden the rule may require is **hoisted out of the frame latch** (`rmp` #974): the
+    /// latch is taken, the page's `page_lsn` inspected, and if the log is not durable through it the
+    /// latch is *released*, the log hardened with nothing held, and the attempt retried. So this
+    /// method never issues an `fdatasync` inside a latched region.
+    ///
     /// # Errors
-    /// Propagates a WAL-rule or device-write failure.
+    /// Propagates a WAL-rule or device-write failure, or reports failure to converge within
+    /// [`WAL_HOIST_ATTEMPTS`] hoist-and-retry rounds (only reachable if a concurrent writer re-dirties
+    /// the frame with a fresh LSN on every single round).
     pub fn flush(&self, f: PinnedFrame) -> Result<()> {
-        let mut meta = unwrap_lock(self.frames[f.0].meta.write());
-        self.write_back(&mut meta, false)
+        for _ in 0..WAL_HOIST_ATTEMPTS {
+            let needs_harden = {
+                let latch = graphus_core::latch::FrameLatchScope::new();
+                let mut meta = unwrap_lock(self.frames[f.0].meta.write());
+                if !meta.dirty {
+                    return Ok(());
+                }
+                let lsn = page::page_lsn(&meta.data);
+                if self.wal_covers(lsn) {
+                    return self.write_back(&mut meta, false);
+                }
+                drop(meta);
+                drop(latch);
+                lsn
+            };
+            // No latch held: this is where the `fdatasync` is allowed to happen. Refresh first —
+            // the mirror may simply have been stale-low because the store's commit path advanced
+            // the log without going through this pool.
+            if !self.wal_covers_after_refresh(needs_harden) {
+                self.harden_wal(needs_harden)?;
+            }
+        }
+        Err(GraphusError::Storage(format!(
+            "flush of frame {} did not converge within {WAL_HOIST_ATTEMPTS} WAL hoist rounds: the \
+             frame was re-dirtied with a not-yet-durable page_lsn on every round",
+            f.0
+        )))
     }
 
     /// Writes a frame back that intentionally carries **no WAL-logged change** (its `page_lsn` is
@@ -1032,6 +1241,10 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
     /// # Errors
     /// Propagates a WAL-rule or device-write failure.
     pub fn flush_unlogged(&self, f: PinnedFrame) -> Result<()> {
+        // No hoist loop is needed: an unlogged page has nothing in the WAL that must precede it, so
+        // this path never hardens. The tripwire is still armed, so a future change that introduces a
+        // barrier here is caught rather than silently reopening the `rmp` #974 convoy.
+        let _latch = graphus_core::latch::FrameLatchScope::new();
         let mut meta = unwrap_lock(self.frames[f.0].meta.write());
         self.write_back(&mut meta, true)
     }
@@ -1051,93 +1264,7 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
     /// # Errors
     /// Propagates the first WAL-rule, device-write or sync failure.
     pub fn flush_all(&self) -> Result<()> {
-        // Coalesced checkpoint write-back (`rmp` #374). The old loop issued one `write_page`
-        // syscall per dirty frame, each under the exclusive device guard — a checkpoint after a
-        // sequential bulk load (dirty pages with *adjacent* page ids) paid N serialised `pwrite`s.
-        // Here we sort the dirty frames by page id, coalesce contiguous runs, and emit each run as
-        // one `write_pages` call (a single `pwrite` over the concatenated run on the file device).
-        //
-        // Latch protocol: we take each dirty frame's **write** latch and hold it for the whole
-        // batch — released only after the run it belongs to has been written and the frame marked
-        // clean. Holding the latch across the device write is exactly what `write_back` does per
-        // frame; doing it for a run prevents a concurrent writer from re-dirtying/mutating a page's
-        // bytes after we staged them but before they reach the device (no torn write), and prevents
-        // the evictor (`select_victim` uses `try_write`, never blocking) from stealing a frame
-        // mid-write-back. Latches are acquired in **frame-index order** (the `self.frames` scan
-        // order), the same order eviction would, so there is no lock-ordering cycle.
-        //
-        // The per-page durability contract of `write_back` is preserved exactly: for every dirty
-        // page we stamp its checksum and run `ensure_durable(page_lsn)` (the WAL-before-data rule)
-        // *before* its bytes are written home, and the single trailing `sync_all` barrier is issued
-        // once, after the whole batch — identical to before.
-        //
-        // The documented concurrency contract (storage audit F12) is unchanged: a frame re-dirtied
-        // after its latch is released here is captured by a later `flush_all`; a sharp checkpoint
-        // still requires the (single-writer) engine to quiesce writers, which it does by construction.
-
-        // Phase 1: collect the dirty frames with their latches held. We hold every dirty frame's
-        // write guard until the batch completes; clean frames are released immediately.
-        let mut guards: Vec<(usize, RwLockWriteGuard<'_, FrameMeta>)> = Vec::new();
-        for (idx, slot) in self.frames.iter().enumerate() {
-            let meta = unwrap_lock(slot.meta.write());
-            if meta.dirty {
-                guards.push((idx, meta));
-            }
-        }
-        if guards.is_empty() {
-            return self.write_device().sync_all();
-        }
-
-        // Phase 2: per-page WAL-before-data. Stamp each dirty page's checksum and ensure the WAL is
-        // durable through its `page_lsn` BEFORE any of its bytes are written back. This reproduces
-        // `write_back`'s ordering for every page in the batch. A `page_id` is required for a dirty
-        // frame (same invariant as `write_back`).
-        for (idx, meta) in &mut guards {
-            let page_id = meta.page_id.ok_or_else(|| {
-                GraphusError::Storage("a dirty frame must hold a page".to_owned())
-            })?;
-            page::write_checksum(&mut meta.data);
-            let lsn = page::page_lsn(&meta.data);
-            // WAL-before-data invariant, release-enforced (`rmp` #396): batch flushes only ever
-            // write logged pages home (no `allow_unlogged` path), so a `page_lsn == 0` under a real
-            // WAL is always a caller error that must fail closed, not a silent durability hole.
-            self.guard_wal_before_data(page_id, lsn, false)?;
-            self.ensure_durable(lsn)?;
-            let _ = idx;
-        }
-
-        // Phase 3: order the held frames by page id and coalesce contiguous runs. A gap in page
-        // ids (next.page_id != prev.page_id + 1) breaks the run, so only pages at adjacent file
-        // offsets are ever combined into one vectored/sequential device write.
-        guards.sort_by_key(|(_, meta)| meta.page_id.expect("dirty frame holds a page").0);
-        let mut device = self.write_device();
-        let mut run_start = 0usize; // index into `guards` where the current run begins
-        for i in 1..=guards.len() {
-            let break_run = i == guards.len() || {
-                let prev = guards[i - 1].1.page_id.expect("dirty frame holds a page").0;
-                let cur = guards[i].1.page_id.expect("dirty frame holds a page").0;
-                cur != prev + 1
-            };
-            if break_run {
-                let base = guards[run_start]
-                    .1
-                    .page_id
-                    .expect("dirty frame holds a page");
-                let run: Vec<&Page> = guards[run_start..i]
-                    .iter()
-                    .map(|(_, meta)| &*meta.data)
-                    .collect();
-                device.write_pages(base, &run)?;
-                run_start = i;
-            }
-        }
-
-        // Phase 4: the bytes are home — mark every flushed frame clean, then issue the single
-        // trailing durability barrier exactly once.
-        for (_, meta) in &mut guards {
-            meta.dirty = false;
-        }
-        device.sync_all()
+        self.flush_batch(None)
     }
 
     /// Writes back **only** the dirty frames whose home `PageId` is in `pages`, then syncs the
@@ -1148,11 +1275,11 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
     /// ([`crate::page`]; `graphus_storage::RecordStore::flush_protected`, `05 §3`).
     ///
     /// Every per-page durability guarantee of `flush_all` is preserved for the selected pages: the
-    /// checksum is stamped and the WAL-before-data rule (`ensure_durable(page_lsn)`) is enforced
-    /// *before* the page's bytes are written home, frames are flushed under their write latch (held
-    /// across the device write so no concurrent mutator or the evictor can tear the in-flight
-    /// image), and a single trailing `sync_all` barrier is issued after the batch. Frames not in
-    /// `pages` are left dirty and untouched, captured by a later flush.
+    /// checksum is stamped and the WAL-before-data rule is enforced *before* the page's bytes are
+    /// written home, frames are flushed under their write latch (held across the device write so no
+    /// concurrent mutator or the evictor can tear the in-flight image), and a single trailing
+    /// `sync_all` barrier is issued after the batch. Frames not in `pages` are left dirty and
+    /// untouched, captured by a later flush.
     ///
     /// The same F12 concurrency contract applies: a selected frame re-dirtied after its latch is
     /// released here is captured by a later flush; a sharp checkpoint still requires the
@@ -1161,89 +1288,171 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
     /// # Errors
     /// Propagates the first WAL-rule, device-write or sync failure.
     pub fn flush_pages(&self, pages: &[PageId]) -> Result<()> {
-        use rustc_hash::FxHashSet;
-        let wanted: FxHashSet<u64> = pages.iter().map(|p| p.0).collect();
+        let wanted: rustc_hash::FxHashSet<u64> = pages.iter().map(|p| p.0).collect();
+        self.flush_batch(Some(&wanted))
+    }
 
-        // Phase 1: collect the dirty frames whose page id is wanted, with their write latches held.
-        let mut guards: Vec<(usize, RwLockWriteGuard<'_, FrameMeta>)> = Vec::new();
-        for (idx, slot) in self.frames.iter().enumerate() {
-            let meta = unwrap_lock(slot.meta.write());
-            if meta.dirty && meta.page_id.is_some_and(|p| wanted.contains(&p.0)) {
-                guards.push((idx, meta));
+    /// The shared implementation behind [`flush_all`](Self::flush_all) (`want == None`, every dirty
+    /// frame) and [`flush_pages`](Self::flush_pages) (`want == Some`, the selected home page ids).
+    ///
+    /// The two differed only in which frames they latched; every durability step was duplicated
+    /// line-for-line, including the WAL-before-data ordering that `rmp` #974 had to restructure.
+    /// Unifying them means that ordering exists in exactly one place.
+    ///
+    /// # WAL-before-data, hoisted (`rmp` #974)
+    ///
+    /// The old shape held **every** dirty frame's write latch and then, still holding all of them,
+    /// ran `ensure_durable(page_lsn)` per page — N latches held across up to N `fdatasync`s, through
+    /// the mutex the store's commit path shares. The harden is now hoisted:
+    ///
+    /// 1. latch the batch's dirty frames (Phase 1);
+    /// 2. take the batch's **maximum** `page_lsn`. Because coverage is monotone in the LSN, the log
+    ///    being durable through that maximum covers every page in the batch;
+    /// 3. if it is not covered, **release every latch**, harden with nothing held, and retry from 1.
+    ///
+    /// Step 3 is what makes the barrier latch-free. It terminates: one harden makes the whole
+    /// appended log durable, and these paths run on the checkpointing writer, so a second round only
+    /// occurs if another thread dirtied a page in between. [`WAL_HOIST_ATTEMPTS`] bounds it, and
+    /// exhausting it returns a clean error with every page still dirty and resident — nothing is
+    /// lost, a later flush captures them.
+    ///
+    /// # Errors
+    /// Propagates the first WAL-rule, device-write or sync failure, or reports failure to converge
+    /// within [`WAL_HOIST_ATTEMPTS`] hoist rounds.
+    fn flush_batch(&self, want: Option<&rustc_hash::FxHashSet<u64>>) -> Result<()> {
+        for _ in 0..WAL_HOIST_ATTEMPTS {
+            // Phase 1: collect the batch's dirty frames with their write latches held. The tripwire
+            // is armed for exactly as long as those latches are (`FlushBatch` drops the guards
+            // first, then the scope), so any durability barrier reached from inside this region
+            // panics in a debug build instead of silently restoring the convoy.
+            //
+            // Latches are acquired in **frame-index order** (the `self.frames` scan order), the same
+            // order eviction would, so there is no lock-ordering cycle.
+            let mut batch = FlushBatch::collect(self, want);
+            if batch.guards.is_empty() {
+                drop(batch);
+                // Nothing to write home; still issue the trailing barrier the callers rely on. It
+                // goes through the shared handle, so it holds no device guard.
+                return self.barrier_sync_all();
             }
-        }
-        if guards.is_empty() {
-            return self.write_device().sync_all();
-        }
 
-        // Phase 2: per-page WAL-before-data — identical to `flush_all`.
-        for (idx, meta) in &mut guards {
-            let page_id = meta.page_id.ok_or_else(|| {
-                GraphusError::Storage("a dirty frame must hold a page".to_owned())
-            })?;
-            page::write_checksum(&mut meta.data);
-            let lsn = page::page_lsn(&meta.data);
-            // WAL-before-data invariant, release-enforced (`rmp` #396): as in `flush_all`, this
-            // targeted batch only writes logged pages home, so a `page_lsn == 0` under a real WAL is
-            // a caller error that must fail closed.
-            self.guard_wal_before_data(page_id, lsn, false)?;
-            self.ensure_durable(lsn)?;
-            let _ = idx;
-        }
+            // Phase 2: stamp each dirty page's checksum and enforce the page-level WAL invariants.
+            // Neither step syncs: `guard_wal_before_data` is the release-built `page_lsn == 0`
+            // check (`rmp` #396), reading the rule property cached at construction rather than
+            // taking the WAL mutex under these N latches.
+            let mut max_lsn = Lsn(0);
+            for (_, meta) in &mut batch.guards {
+                let page_id = meta.page_id.ok_or_else(|| {
+                    GraphusError::Storage("a dirty frame must hold a page".to_owned())
+                })?;
+                page::write_checksum(&mut meta.data);
+                let lsn = page::page_lsn(&meta.data);
+                // WAL-before-data invariant, release-enforced (`rmp` #396): batch flushes only ever
+                // write logged pages home (no `allow_unlogged` path), so a `page_lsn == 0` under a
+                // real WAL is always a caller error that must fail closed, not a silent durability
+                // hole.
+                self.guard_wal_before_data(page_id, lsn, false)?;
+                max_lsn = Lsn(max_lsn.0.max(lsn.0));
+            }
 
-        // Phase 3: order the held frames by page id and coalesce contiguous runs (as `flush_all`).
-        guards.sort_by_key(|(_, meta)| meta.page_id.expect("dirty frame holds a page").0);
+            // Phase 2a: THE HOIST. If the log is not durable through the batch's highest `page_lsn`,
+            // release every latch and harden outside the latched region, then retry. Coverage is
+            // monotone in the LSN, so one check over the maximum decides the whole batch.
+            if !self.wal_covers(max_lsn) {
+                drop(batch);
+                // Latches released: refresh the mirror (it may merely be stale-low after a commit
+                // this pool did not drive) and harden only if the log really is behind.
+                if !self.wal_covers_after_refresh(max_lsn) {
+                    self.harden_wal(max_lsn)?;
+                }
+                continue;
+            }
 
-        // Phase 3a: doublewrite protection (`rmp` #407, `05 §3`). When a stager is installed, stage
-        // the ENTIRE batch into the doublewrite area as one durable batch BEFORE any of its pages are
-        // written home — so every page written home below has an intact doublewrite copy and a torn
-        // home write is repairable on the next open. We stage all the selected pages here (the caller,
-        // `RecordStore::flush_protected`, bounds each `flush_pages` call to the doublewrite batch
-        // capacity). The staging takes the DWB lock AFTER the frame latches are already held (Phase 1),
-        // so the global lock order is uniformly **frame-latch → DWB**, matching the eviction path's
-        // `write_back` (frame latch held, then DWB) — no ABBA deadlock between a checkpoint and a
-        // concurrent reader-triggered eviction. The checksums were stamped in Phase 2, so the staged
-        // bytes equal the bytes about to land home.
-        if let Some(stager) = self.page_stager() {
-            let batch: Vec<(PageId, &[u8])> = guards
-                .iter()
-                .map(|(_, meta)| {
-                    (
-                        meta.page_id.expect("dirty frame holds a page"),
-                        &meta.data[..],
-                    )
-                })
-                .collect();
-            stager.stage_batch_and_sync(&batch)?;
-        }
+            // Phase 3: order the held frames by page id and coalesce contiguous runs. A gap in page
+            // ids (next.page_id != prev.page_id + 1) breaks the run, so only pages at adjacent file
+            // offsets are ever combined into one vectored/sequential device write (`rmp` #374).
+            batch
+                .guards
+                .sort_by_key(|(_, meta)| meta.page_id.expect("dirty frame holds a page").0);
 
-        let mut device = self.write_device();
-        let mut run_start = 0usize;
-        for i in 1..=guards.len() {
-            let break_run = i == guards.len() || {
-                let prev = guards[i - 1].1.page_id.expect("dirty frame holds a page").0;
-                let cur = guards[i].1.page_id.expect("dirty frame holds a page").0;
-                cur != prev + 1
-            };
-            if break_run {
-                let base = guards[run_start]
-                    .1
-                    .page_id
-                    .expect("dirty frame holds a page");
-                let run: Vec<&Page> = guards[run_start..i]
+            // Phase 3a: doublewrite protection (`rmp` #407, `05 §3`). When a stager is installed,
+            // stage the ENTIRE batch into the doublewrite area as one durable batch BEFORE any of
+            // its pages are written home — so every page written home below has an intact
+            // doublewrite copy and a torn home write is repairable on the next open. The caller
+            // (`RecordStore::flush_protected`) bounds each batch to the doublewrite batch capacity.
+            // The staging takes the DWB lock AFTER the frame latches are already held (Phase 1), so
+            // the global lock order is uniformly **frame-latch → DWB**, matching the eviction path's
+            // `write_back` — no ABBA deadlock between a checkpoint and a concurrent
+            // reader-triggered eviction. The checksums were stamped in Phase 2, so the staged bytes
+            // equal the bytes about to land home.
+            //
+            // Only the *targeted* path stages: `flush_all` is the unprotected whole-pool flush and
+            // has never staged (its callers own doublewrite protection themselves, if any).
+            if want.is_some()
+                && let Some(stager) = self.page_stager()
+            {
+                let staged: Vec<(PageId, &[u8])> = batch
+                    .guards
                     .iter()
-                    .map(|(_, meta)| &*meta.data)
+                    .map(|(_, meta)| {
+                        (
+                            meta.page_id.expect("dirty frame holds a page"),
+                            &meta.data[..],
+                        )
+                    })
                     .collect();
-                device.write_pages(base, &run)?;
-                run_start = i;
+                stager.stage_batch_and_sync(&staged)?;
             }
-        }
 
-        // Phase 4: the selected bytes are home — mark them clean, then the single barrier.
-        for (_, meta) in &mut guards {
-            meta.dirty = false;
+            {
+                let mut device = self.write_device();
+                let mut run_start = 0usize; // index into `guards` where the current run begins
+                for i in 1..=batch.guards.len() {
+                    let break_run = i == batch.guards.len() || {
+                        let prev = batch.guards[i - 1]
+                            .1
+                            .page_id
+                            .expect("dirty frame holds a page")
+                            .0;
+                        let cur = batch.guards[i]
+                            .1
+                            .page_id
+                            .expect("dirty frame holds a page")
+                            .0;
+                        cur != prev + 1
+                    };
+                    if break_run {
+                        let base = batch.guards[run_start]
+                            .1
+                            .page_id
+                            .expect("dirty frame holds a page");
+                        let run: Vec<&Page> = batch.guards[run_start..i]
+                            .iter()
+                            .map(|(_, meta)| &*meta.data)
+                            .collect();
+                        device.write_pages(base, &run)?;
+                        run_start = i;
+                    }
+                }
+                // The exclusive device guard is released HERE, before the barrier (`rmp` #974): it
+                // is needed for the `&mut` writes, never for the durability barrier, and holding it
+                // across the barrier is what blocked every concurrent cache-miss read.
+            }
+
+            // Phase 4: the bytes are home — mark every flushed frame clean, then release the latches
+            // and issue the single trailing durability barrier exactly once, holding no device
+            // guard. The barrier still happens-after the writes above (they returned before it was
+            // issued), so the ordering the callers rely on is unchanged.
+            for (_, meta) in &mut batch.guards {
+                meta.dirty = false;
+            }
+            drop(batch);
+            return self.barrier_sync_all();
         }
-        device.sync_all()
+        Err(GraphusError::Storage(format!(
+            "batch flush did not converge within {WAL_HOIST_ATTEMPTS} WAL hoist rounds: a \
+             concurrent writer re-dirtied the batch with a not-yet-durable page_lsn on every round"
+        )))
     }
 
     /// A snapshot count of currently dirty frames (diagnostics / tests).
@@ -1260,6 +1469,16 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
     /// every frame was genuinely pinned (capacity) vs because an unpinned frame was momentarily
     /// latch-contended (transient) — the measurement that pins down the precise mechanism. Compiled
     /// out of the production build.
+    /// A snapshot of the **write-back durability timers** (`rmp` #974, `bufpool-probe` feature only):
+    /// where an eviction write-back spends its time, and — the number this task turns on — how long
+    /// concurrent cache-miss reads spent *waiting* for the device read guard while another thread
+    /// was fsyncing under the exclusive write guard. Compiled out of the production build.
+    #[cfg(feature = "bufpool-probe")]
+    #[must_use]
+    pub fn write_back_probe(&self) -> probe::WriteBackProbe {
+        self.probe.snapshot_write_back()
+    }
+
     #[cfg(feature = "bufpool-probe")]
     #[must_use]
     pub fn probe_snapshot(&self) -> probe::ProbeSnapshot {
@@ -1347,6 +1566,13 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
             let Ok(guard) = slot.meta.try_write() else {
                 continue;
             };
+            // Arm the frame-latch tripwire the instant the latch is won, NOT later at the `Found`
+            // return: everything between here and the return runs with the latch held, so anything
+            // that region reaches must be visible to the tripwire (`rmp` #974). Arming it only on
+            // the accepted path would leave the WAL-coverage check below — the one place the sweep
+            // deliberately touches WAL state under a latch — unchecked, which is precisely the
+            // region the tripwire exists to police.
+            let latch = graphus_core::latch::FrameLatchScope::new();
             // Re-check the pin count now that we hold the latch (a pin may have raced in).
             if slot.pin_count.load(Ordering::Acquire) > 0 {
                 continue;
@@ -1354,7 +1580,44 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
             if slot.ref_bit.swap(0, Ordering::Relaxed) == 1 && guard.page_id.is_some() {
                 continue; // second chance for a referenced, occupied frame
             }
-            return VictimChoice::Found(Victim { idx, guard });
+            // WAL-BEFORE-DATA, HOISTED (`rmp` #974). This is the last point at which the harden can
+            // still be moved out of the latched region: from here the latch is held continuously
+            // through `load_into` → `evict_held` → `write_back`, so a harden discovered later would
+            // necessarily run *under* the latch — the convoy this task removed.
+            //
+            // If the victim is dirty and its `page_lsn` is not already covered by durable log, we
+            // therefore **decline this victim**: the guard is dropped (releasing the latch) and the
+            // caller hardens with nothing held, then re-sweeps. This mirrors PostgreSQL's
+            // `GetVictimBuffer`, which rejects a victim on `XLogNeedsFlush` rather than flush under
+            // the buffer lock.
+            //
+            // The check is exact for the write-back that follows: because the latch is held
+            // continuously from here to `write_back`, no writer can re-dirty this frame or advance
+            // its `page_lsn` in between, so a victim accepted here is still covered when its bytes
+            // are written home.
+            //
+            // It consults ONLY the lock-free mirror — never the WAL lock. That restriction is
+            // load-bearing, not stylistic: `self.wal` guards the rule *object*, while the production
+            // rule keeps the real `WalManager` behind its own mutex, so even a `try_lock` here would
+            // fall through into a blocking acquisition that can park behind a commit's `fdatasync` —
+            // while this thread holds a frame latch AND the caller holds a shard lock. That would
+            // re-create the convoy one lock deeper and add a `shard → WAL` wait edge the lock-order
+            // proof forbids. A stale-low mirror simply costs one decline-and-retry: the hoist path
+            // refreshes it with nothing held, and `ensure_durable` no-ops when the log is in fact
+            // already durable.
+            if self.wal_tracks_lsn && guard.dirty {
+                let lsn = page::page_lsn(&guard.data);
+                if !self.wal_covers(lsn) {
+                    drop(guard); // release the latch BEFORE the caller hardens
+                    drop(latch); // and disarm the tripwire with it
+                    return VictimChoice::NeedsWalHarden(lsn);
+                }
+            }
+            return VictimChoice::Found(Victim {
+                idx,
+                guard,
+                _latch: latch,
+            });
         }
         #[cfg(feature = "bufpool-probe")]
         self.probe.record_victim_miss(all_pinned);
@@ -1412,7 +1675,12 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
         // guard taken by `write_page`/`extend`/`sync_*` still fences these reads against a concurrent
         // device mutation, so a page can never be read while it is being relocated/grown.
         {
+            #[cfg(feature = "bufpool-probe")]
+            let wait_start = std::time::Instant::now();
             let device = self.read_device();
+            #[cfg(feature = "bufpool-probe")]
+            self.probe
+                .record_device_read_wait(wait_start.elapsed().as_nanos() as u64);
             if let Err(e) = device.read_page(page_id, &mut victim.guard.data) {
                 drop(device);
                 self.blank(&mut victim);
@@ -1456,6 +1724,18 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
         if !meta.dirty {
             return Ok(());
         }
+        #[cfg(feature = "bufpool-probe")]
+        let wb_start = std::time::Instant::now();
+        let r = self.write_back_dirty(meta, allow_unlogged);
+        #[cfg(feature = "bufpool-probe")]
+        self.probe
+            .record_write_back(wb_start.elapsed().as_nanos() as u64);
+        r
+    }
+
+    /// The dirty branch of [`write_back`](Self::write_back), split out so the whole home-write path
+    /// can be timed by the `bufpool-probe` seam with a single wrapper.
+    fn write_back_dirty(&self, meta: &mut FrameMeta, allow_unlogged: bool) -> Result<()> {
         let page_id = meta
             .page_id
             .ok_or_else(|| GraphusError::Storage("a dirty frame must hold a page".to_owned()))?;
@@ -1472,9 +1752,25 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
         // silent CRITICAL durability bug in release, so we fail closed with an error rather than a
         // `debug_assert` that compiles out.
         self.guard_wal_before_data(page_id, lsn, allow_unlogged)?;
-        // WAL rule: the log must be durable through this page's LSN before the data is written
-        // home (`specification` §3.2 page_lsn, §4.3 steal/no-force).
-        self.ensure_durable(lsn)?;
+        // WAL rule: the log must be durable through this page's LSN before the data is written home
+        // (`specification` §3.2 page_lsn, §4.3 steal/no-force).
+        //
+        // HOISTED (`rmp` #974). This used to be `ensure_durable(lsn)` — an `fdatasync` issued right
+        // here, under the caller's frame latch, through the mutex the store's commit path shares.
+        // The harden now happens *before* the latch is taken (`select_victim` hoists it for the
+        // eviction path; the flush paths hoist it in their own pre-pass), so all that remains here
+        // is the **verification**, which never syncs. It is fail-closed: an uncovered page is
+        // refused, never written home.
+        // The exemption is the **null LSN**, not the `allow_unlogged` flag. `allow_unlogged` exists
+        // so a freshly-allocated page with `page_lsn == 0` can be seeded with a valid checksum, and
+        // for that page there is by definition nothing in the log that must precede it. But
+        // `flush_unlogged` is a public API: gating on the flag would mean a caller passing a page
+        // that *does* carry a stamped LSN gets no ordering check at all — strictly weaker than the
+        // pre-`rmp` #974 code, which ran the rule unconditionally. Gating on `lsn == 0` keeps the
+        // exemption exactly as narrow as its justification.
+        if lsn.0 != 0 {
+            self.assert_wal_covers(page_id, lsn)?;
+        }
         // Doublewrite protection of the home write (`rmp` #407, `05 §3`). Before the page reaches its
         // home location, stage its EXACT image (checksum already stamped just above, so the staged
         // bytes equal the bytes about to land home) into the doublewrite area and fsync it. After
@@ -1511,11 +1807,43 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
             let data: &Page = &meta.data;
             {
                 let mut home_write = || -> Result<()> {
-                    let mut device = self.write_device();
-                    device.write_page(page_id, data)?;
+                    // The exclusive device guard is now held for the `pwrite` ALONE (`rmp` #974).
+                    // It used to span the `fdatasync` too, and that barrier — measured at 98 % of
+                    // the hold — is exactly what every concurrent cache-miss `read_page` queued
+                    // behind, since it needs a *shared* guard on this same lock.
+                    #[cfg(feature = "bufpool-probe")]
+                    let wait_start = std::time::Instant::now();
+                    {
+                        let mut device = self.write_device();
+                        #[cfg(feature = "bufpool-probe")]
+                        let hold_start = {
+                            let now = std::time::Instant::now();
+                            self.probe.record_device_write_wait(
+                                now.duration_since(wait_start).as_nanos() as u64,
+                            );
+                            now
+                        };
+                        let r = device.write_page(page_id, data);
+                        drop(device);
+                        #[cfg(feature = "bufpool-probe")]
+                        self.probe
+                            .record_device_write_guard(hold_start.elapsed().as_nanos() as u64);
+                        r?;
+                    }
                     // Make the evicted home page durable BEFORE the stager releases the DWB region:
-                    // only a durable home write may free the slot for reuse (`rmp` #411).
-                    device.sync_data()
+                    // only a durable home write may free the slot for reuse (`rmp` #411). The
+                    // barrier goes through the device's shared handle, so it holds NO device guard —
+                    // concurrent readers and other evictors' home writes proceed in parallel with
+                    // it. Ordering is preserved: our `write_page` above has already returned, so the
+                    // bytes are submitted before the barrier is issued, and a barrier is never
+                    // scoped to one page (a concurrent writer's bytes merely get flushed too).
+                    #[cfg(feature = "bufpool-probe")]
+                    let sync_start = std::time::Instant::now();
+                    let r = self.barrier_sync_data();
+                    #[cfg(feature = "bufpool-probe")]
+                    self.probe
+                        .record_home_sync(sync_start.elapsed().as_nanos() as u64);
+                    r
                 };
                 stager.stage_and_sync(page_id, &data[..], &mut home_write)?;
             }
@@ -1546,7 +1874,11 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
     /// Returns [`GraphusError::Storage`] if the page is logged (the WAL tracks LSNs) yet carries
     /// `page_lsn == 0` and `allow_unlogged` is not set.
     fn guard_wal_before_data(&self, page_id: PageId, lsn: Lsn, allow_unlogged: bool) -> Result<()> {
-        if allow_unlogged || lsn.0 != 0 || !unwrap_lock(self.wal.lock()).tracks_lsn() {
+        // `tracks_lsn` is read from the value cached at construction (`rmp` #974) rather than
+        // through the WAL mutex: it is a static property of the rule, and this check runs on the
+        // home-write path with a frame latch held — in the batch paths, with *every* dirty frame's
+        // latch held. Taking the WAL mutex there was a needless edge into the latched region.
+        if allow_unlogged || lsn.0 != 0 || !self.wal_tracks_lsn {
             return Ok(());
         }
         Err(GraphusError::Storage(format!(
@@ -1556,8 +1888,177 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
         )))
     }
 
-    fn ensure_durable(&self, up_to: Lsn) -> Result<()> {
-        unwrap_lock(self.wal.lock()).ensure_durable(up_to)
+    // --- WAL-before-data, hoisted out of the frame latch (`rmp` #974) -------------------------
+    //
+    // NOTE: the pool has exactly ONE entry point that can harden the log — [`harden_wal`] — and it
+    // asserts that no frame latch is held. There is deliberately no other `ensure_durable` wrapper:
+    // its absence is what makes "the pool never syncs the WAL under a latch" a property of the type,
+    // checkable by reading the call graph, rather than a convention.
+    //
+    // The rule is unchanged and absolute: a dirty page's `page_lsn` must be durable in the log
+    // *before* its bytes reach their home location. What changed is **where** the `fdatasync` that
+    // makes it so is issued. It used to run inside `write_back`, under the victim frame's write
+    // latch, chaining *frame latch → WAL mutex → fdatasync* — and because that mutex is the same one
+    // the store's commit path takes, one eviction's sync convoyed every other evictor and every
+    // concurrent commit. Now the decision and the sync are split:
+    //
+    //   * `wal_covers` answers "already durable?" **lock-free**, from the `wal_durable` mirror;
+    //   * `harden_wal` performs the sync, and is only ever called with **no frame latch held**;
+    //   * the home-write path only ever *verifies* coverage and refuses to write home without it.
+    //
+    // The verification is fail-closed: a page that reaches the home write uncovered is a caller
+    // protocol violation and returns an error rather than being written home, so the invariant
+    // cannot degrade into a silent durability hole.
+
+    /// Whether the log is known durable through `lsn`, answered **lock-free** from the cached
+    /// frontier.
+    ///
+    /// Mirrors `WalManager::ensure_durable`'s own predicate exactly: that method hardens when
+    /// `durable_len() <= up_to.0`, so "already durable" is the strict `durable_len() > lsn.0`.
+    /// A `false` here may be stale-low (see [`Self::wal_durable`]) — conservative, never unsafe.
+    #[inline]
+    fn wal_covers(&self, lsn: Lsn) -> bool {
+        !self.wal_tracks_lsn || self.wal_durable.load(Ordering::Acquire) > lsn.0
+    }
+
+    /// Publishes an observed durable frontier into the lock-free mirror, keeping it monotonic.
+    #[inline]
+    fn publish_wal_durable(&self, observed: u64) {
+        self.wal_durable.fetch_max(observed, Ordering::Release);
+    }
+
+    /// Refreshes the cached frontier from the rule and re-answers
+    /// [`wal_covers`](Self::wal_covers). **Never** issues a durability barrier.
+    ///
+    /// # Contract: no frame latch, no shard lock
+    ///
+    /// This acquires the WAL lock **blocking**, so it must be called holding neither. That is not a
+    /// theoretical restriction. `self.wal` is a `Mutex<W>` around the *rule object*, not around the
+    /// log: the production rule (`graphus_storage::SharedWal`) holds the real `WalManager` behind
+    /// its own `Arc<Mutex<…>>`, and `durable_len` takes *that* lock unconditionally. A `try_lock` on
+    /// the outer wrapper therefore proves nothing about whether this call blocks — it can still park
+    /// behind a commit that is holding the manager across an `fdatasync`. Calling it from inside the
+    /// victim sweep would have re-created exactly the convoy `rmp` #974 removed, one lock deeper,
+    /// and would have added a `shard → WAL` wait edge the lock-order proof does not permit.
+    ///
+    /// The sweep therefore consults only the lock-free mirror and declines the victim when it reads
+    /// stale-low; this refresh runs on the hoist path, where nothing is held.
+    fn wal_covers_after_refresh(&self, lsn: Lsn) -> bool {
+        if self.wal_covers(lsn) {
+            return true;
+        }
+        debug_assert_eq!(
+            graphus_core::latch::frame_latch_depth(),
+            0,
+            "wal_covers_after_refresh takes the WAL lock blocking and must never run with a frame \
+             latch held (`rmp` #974)"
+        );
+        let observed = unwrap_lock(self.wal.lock()).durable_len();
+        self.publish_wal_durable(observed);
+        observed > lsn.0
+    }
+
+    /// Hardens the log through `up_to` and republishes the cached frontier.
+    ///
+    /// # Contract
+    /// The caller MUST hold **no frame latch**. This is the method that can issue an `fdatasync`,
+    /// and hoisting it out of the latched region is the whole point of `rmp` #974; the WAL's own
+    /// `harden` asserts the property in debug builds via [`graphus_core::latch`].
+    ///
+    /// # Errors
+    /// Propagates a WAL-rule failure.
+    /// # Watermark publication
+    ///
+    /// On success the mirror is advanced to the frontier the rule reports through
+    /// [`WalRule::durable_len`] — and to *nothing else*. That value is an observation of the log,
+    /// taken under the WAL lock, so it can never overstate durability.
+    ///
+    /// In particular the mirror is **never** advanced to `up_to + 1`, even though a successful
+    /// `ensure_durable(up_to)` does imply the log is durable through `up_to`. `up_to` is a page's
+    /// `page_lsn` — data read out of a frame, not an observation of the log — and the mirror is
+    /// pool-wide and monotone. Folding page-derived data into it would mean one page carrying a
+    /// too-high `page_lsn` (a restored/PITR-truncated image, a mis-stamped write) permanently
+    /// certifying WAL-before-data for *every* page with a lower LSN. Keeping the mirror sourced
+    /// purely from the log confines any such page to being wrong about itself.
+    fn harden_wal(&self, up_to: Lsn) -> Result<()> {
+        debug_assert_eq!(
+            graphus_core::latch::frame_latch_depth(),
+            0,
+            "harden_wal must never run with a frame latch held (`rmp` #974)"
+        );
+        #[cfg(feature = "bufpool-probe")]
+        let start = std::time::Instant::now();
+        let mut wal = unwrap_lock(self.wal.lock());
+        let r = wal.ensure_durable(up_to);
+        // The rule's reported frontier is the only thing published (see the doc above). Reading it
+        // after a FAILED harden is still correct and useful: it reports what is durable now, which
+        // is simply less than the caller asked for.
+        let observed = wal.durable_len();
+        drop(wal);
+        #[cfg(feature = "bufpool-probe")]
+        self.probe
+            .record_wal_ensure(start.elapsed().as_nanos() as u64);
+        self.publish_wal_durable(observed);
+        r
+    }
+
+    /// Verifies WAL-before-data for a page about to be written home, **without** ever syncing.
+    ///
+    /// # Errors
+    /// Returns a storage error when the log is not durable through `lsn`. That is a caller protocol
+    /// violation — every home-write path hoists its harden first — and failing closed here keeps the
+    /// invariant intact instead of writing data ahead of its log.
+    fn assert_wal_covers(&self, page_id: PageId, lsn: Lsn) -> Result<()> {
+        if self.wal_covers(lsn) {
+            #[cfg(feature = "bufpool-probe")]
+            self.probe.record_wal_already_durable();
+            return Ok(());
+        }
+        Err(GraphusError::Storage(format!(
+            "WAL-before-data: page {} (page_lsn {}) reached the home write before the log was \
+             hardened through it (durable frontier {}). The home-write paths must hoist the harden \
+             out of the frame latch first (`rmp` #974); writing the page home here would put data \
+             ahead of its redo record",
+            page_id.0,
+            lsn.0,
+            self.wal_durable.load(Ordering::Acquire)
+        )))
+    }
+
+    // --- Device durability barriers, issued off the device lock (`rmp` #974) -------------------
+
+    /// Issues the home-file data barrier, preferring the device's shared [`graphus_io::SyncHandle`]
+    /// so **no device guard is held** for the duration.
+    ///
+    /// This is the measured lever of `rmp` #974: the barrier used to run under the pool's
+    /// **exclusive** device guard, which is the very lock every concurrent cache-miss `read_page`
+    /// needs in *shared* mode, and 98 % of each exclusive hold was the barrier itself. Issuing it
+    /// through a duplicated descriptor keeps the identical durability guarantee (the kernel flushes
+    /// the file, not a per-descriptor view) while letting concurrent readers — and other evictors'
+    /// home writes — run in parallel with it.
+    ///
+    /// Falls back to the guarded `&mut` path for a device that offers no handle, so behaviour is
+    /// unchanged there.
+    ///
+    /// # Errors
+    /// Propagates the barrier failure.
+    fn barrier_sync_data(&self) -> Result<()> {
+        match &self.sync_handle {
+            Some(h) => h.sync_data(),
+            None => self.write_device().sync_data(),
+        }
+    }
+
+    /// Issues the full (data + metadata) barrier, preferring the shared handle. See
+    /// [`barrier_sync_data`](Self::barrier_sync_data).
+    ///
+    /// # Errors
+    /// Propagates the barrier failure.
+    fn barrier_sync_all(&self) -> Result<()> {
+        match &self.sync_handle {
+            Some(h) => h.sync_all(),
+            None => self.write_device().sync_all(),
+        }
     }
 }
 
@@ -1566,6 +2067,52 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
 struct Victim<'a> {
     idx: usize,
     guard: RwLockWriteGuard<'a, FrameMeta>,
+    /// The frame-latch tripwire (`rmp` #974), armed for exactly as long as the latch is held.
+    ///
+    /// Declared **after** `guard` so Rust's field drop order (declaration order) releases the latch
+    /// first and disarms the tripwire second — the scope therefore covers the entire window in which
+    /// this thread holds the victim's latch, which is the whole of
+    /// `select_victim` → `load_into` → `evict_held` → `write_back`.
+    _latch: graphus_core::latch::FrameLatchScope,
+}
+
+/// The dirty frames of one batch flush, with their write latches held.
+///
+/// A named type rather than a bare `Vec` so the frame-latch tripwire (`rmp` #974) is armed for
+/// exactly as long as the latches are: the fields drop in declaration order, so the guards are
+/// released first and the scope disarmed second.
+struct FlushBatch<'a> {
+    guards: Vec<(usize, RwLockWriteGuard<'a, FrameMeta>)>,
+    _latch: graphus_core::latch::FrameLatchScope,
+}
+
+impl<'a> FlushBatch<'a> {
+    /// Latches every dirty frame the batch selects: all of them when `want` is `None`
+    /// ([`ConcurrentBufferPool::flush_all`]), otherwise those whose home page id is in `want`
+    /// ([`ConcurrentBufferPool::flush_pages`]). Clean and unselected frames are released
+    /// immediately.
+    fn collect<D: BlockDevice, W: WalRule>(
+        pool: &'a ConcurrentBufferPool<D, W>,
+        want: Option<&rustc_hash::FxHashSet<u64>>,
+    ) -> Self {
+        let latch = graphus_core::latch::FrameLatchScope::new();
+        let mut guards: Vec<(usize, RwLockWriteGuard<'a, FrameMeta>)> = Vec::new();
+        for (idx, slot) in pool.frames.iter().enumerate() {
+            let meta = unwrap_lock(slot.meta.write());
+            let selected = meta.dirty
+                && match want {
+                    None => true,
+                    Some(w) => meta.page_id.is_some_and(|p| w.contains(&p.0)),
+                };
+            if selected {
+                guards.push((idx, meta));
+            }
+        }
+        Self {
+            guards,
+            _latch: latch,
+        }
+    }
 }
 
 /// An RAII guard that owns one frame **pin** and releases it (via
@@ -1632,6 +2179,16 @@ enum VictimChoice<'a> {
     /// **Transient**: an unpinned frame is an evictable victim whose latch frees in microseconds, so
     /// the caller MUST retry (after dropping its shard lock and backing off), never error.
     Contended,
+    /// An evictable victim was found but it is **dirty with a `page_lsn` the log is not yet durable
+    /// through**, so writing it home would need a WAL harden — and the sweep already holds its latch
+    /// (`rmp` #974). The victim's latch has been **released**; the caller must drop its shard lock,
+    /// call [`ConcurrentBufferPool::harden_wal`] with nothing held, and re-sweep.
+    ///
+    /// This is the hoist: it converts "sync while latched" into "release, sync, retry", so the
+    /// `fdatasync` — and the WAL mutex the store's commit path shares — is never taken inside a
+    /// latched region. Always **transient**: one harden covers the whole appended log, so the very
+    /// next sweep finds the same (or any other) dirty victim already covered.
+    NeedsWalHarden(Lsn),
 }
 
 /// Acquires a latch/mutex guard, **recovering it even if a prior holder panicked** (storage audit
@@ -1648,12 +2205,12 @@ fn unwrap_lock<G>(r: std::result::Result<G, std::sync::PoisonError<G>>) -> G {
 /// wrong-bytes bug under an eviction storm, instead of guessing at it. The whole module is compiled
 /// out of the production build.
 #[cfg(feature = "bufpool-probe")]
-pub(crate) mod probe {
+pub mod probe {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// Per-pool diagnostics counters.
     #[derive(Default)]
-    pub(crate) struct Probe {
+    pub struct Probe {
         /// `select_victim` came up empty with **every** examined frame pinned (genuine capacity).
         all_pinned: AtomicU64,
         /// `select_victim` came up empty although ≥1 frame was unpinned (transient latch contention).
@@ -1663,9 +2220,95 @@ pub(crate) mod probe {
         /// `MAX_FETCH_RETRIES` ⇒ a near-wedge. The whole point of the `rmp` #359 fix is to keep this
         /// small even under an eviction storm.
         max_retry_iters: AtomicU64,
+
+        // ---- Write-back durability timers (`rmp` #974) ----
+        //
+        // The eviction write-back path performs up to three `fdatasync`s (WAL, doublewrite area,
+        // home file). These counters attribute where that time goes and, crucially, how much of it a
+        // *reader* pays for: `device_read_wait_nanos` is the time a cache-miss read spent blocked
+        // acquiring the device read guard, which is exactly the convoy a concurrent reader suffers
+        // when an unrelated thread is fsyncing under the exclusive device guard.
+        /// Number of dirty write-backs performed (the eviction/flush home-write path).
+        write_backs: AtomicU64,
+        /// Total nanoseconds spent in the dirty branch of `write_back` (whole home-write path).
+        write_back_nanos: AtomicU64,
+        /// Number of `ensure_durable` (WAL-before-data harden) calls made from a write-back.
+        wal_ensure_calls: AtomicU64,
+        /// Total nanoseconds spent inside `ensure_durable` — WAL mutex acquisition **plus** the
+        /// `fdatasync` it performs.
+        wal_ensure_nanos: AtomicU64,
+        /// Total nanoseconds a write-back **held** the exclusive device write guard. Every
+        /// nanosecond here blocks every concurrent cache-miss device read.
+        device_write_guard_nanos: AtomicU64,
+        /// Total nanoseconds a write-back spent **waiting** to acquire the exclusive device write
+        /// guard (queued behind another thread's home write).
+        device_write_wait_nanos: AtomicU64,
+        /// Total nanoseconds spent in the home-file `sync_data` itself, and how many were issued.
+        home_sync_nanos: AtomicU64,
+        home_syncs: AtomicU64,
+        /// Number of cache-miss device reads (`load_into`).
+        device_read_waits: AtomicU64,
+        /// Total nanoseconds cache-miss reads spent **waiting** to acquire the device read guard.
+        device_read_wait_nanos: AtomicU64,
+        /// Number of times a write-back completed with the WAL already durable through the page's
+        /// LSN, so no `fdatasync` was needed under the frame latch. Large relative to `write_backs`
+        /// ⇒ the pre-harden is doing its job.
+        wal_already_durable: AtomicU64,
     }
 
     impl Probe {
+        /// Adds `nanos` to `counter` and bumps `calls` by one, both relaxed (pure diagnostics).
+        #[inline]
+        fn add(counter: &AtomicU64, calls: &AtomicU64, nanos: u64) {
+            counter.fetch_add(nanos, Ordering::Relaxed);
+            calls.fetch_add(1, Ordering::Relaxed);
+        }
+
+        /// Records one dirty `write_back` taking `nanos`.
+        #[inline]
+        pub(crate) fn record_write_back(&self, nanos: u64) {
+            Self::add(&self.write_back_nanos, &self.write_backs, nanos);
+        }
+
+        /// Records one `ensure_durable` call from a write-back taking `nanos`.
+        #[inline]
+        pub(crate) fn record_wal_ensure(&self, nanos: u64) {
+            Self::add(&self.wal_ensure_nanos, &self.wal_ensure_calls, nanos);
+        }
+
+        /// Records one write-back that needed no harden (the WAL was already durable through the
+        /// page's LSN when the frame latch was taken).
+        #[inline]
+        pub(crate) fn record_wal_already_durable(&self) {
+            self.wal_already_durable.fetch_add(1, Ordering::Relaxed);
+        }
+
+        /// Records `nanos` spent holding the exclusive device write guard on a home write.
+        #[inline]
+        pub(crate) fn record_device_write_guard(&self, nanos: u64) {
+            self.device_write_guard_nanos
+                .fetch_add(nanos, Ordering::Relaxed);
+        }
+
+        /// Records `nanos` spent waiting to acquire the exclusive device write guard.
+        #[inline]
+        pub(crate) fn record_device_write_wait(&self, nanos: u64) {
+            self.device_write_wait_nanos
+                .fetch_add(nanos, Ordering::Relaxed);
+        }
+
+        /// Records one home-file `sync_data` taking `nanos`.
+        #[inline]
+        pub(crate) fn record_home_sync(&self, nanos: u64) {
+            Self::add(&self.home_sync_nanos, &self.home_syncs, nanos);
+        }
+
+        /// Records one cache-miss device read that waited `nanos` for the device read guard.
+        #[inline]
+        pub(crate) fn record_device_read_wait(&self, nanos: u64) {
+            Self::add(&self.device_read_wait_nanos, &self.device_read_waits, nanos);
+        }
+
         /// Records one empty `select_victim` sweep, classified by whether every frame was pinned.
         #[inline]
         pub(crate) fn record_victim_miss(&self, all_pinned: bool) {
@@ -1705,6 +2348,51 @@ pub(crate) mod probe {
         pub(crate) fn max_retry_iters(&self) -> u64 {
             self.max_retry_iters.load(Ordering::Relaxed)
         }
+
+        pub(crate) fn snapshot_write_back(&self) -> WriteBackProbe {
+            WriteBackProbe {
+                write_backs: self.write_backs.load(Ordering::Relaxed),
+                write_back_nanos: self.write_back_nanos.load(Ordering::Relaxed),
+                wal_ensure_calls: self.wal_ensure_calls.load(Ordering::Relaxed),
+                wal_ensure_nanos: self.wal_ensure_nanos.load(Ordering::Relaxed),
+                wal_already_durable: self.wal_already_durable.load(Ordering::Relaxed),
+                device_write_guard_nanos: self.device_write_guard_nanos.load(Ordering::Relaxed),
+                device_write_wait_nanos: self.device_write_wait_nanos.load(Ordering::Relaxed),
+                home_syncs: self.home_syncs.load(Ordering::Relaxed),
+                home_sync_nanos: self.home_sync_nanos.load(Ordering::Relaxed),
+                device_read_waits: self.device_read_waits.load(Ordering::Relaxed),
+                device_read_wait_nanos: self.device_read_wait_nanos.load(Ordering::Relaxed),
+            }
+        }
+    }
+
+    /// The write-back durability timers (`rmp` #974). All times are wall-clock nanoseconds summed
+    /// across every thread, so a figure may exceed the elapsed wall time of the run.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct WriteBackProbe {
+        /// Dirty write-backs performed.
+        pub write_backs: u64,
+        /// Total time in the dirty branch of `write_back`.
+        pub write_back_nanos: u64,
+        /// `ensure_durable` calls made **while a frame latch was held**.
+        pub wal_ensure_calls: u64,
+        /// Total time in `ensure_durable` (WAL mutex + `fdatasync`).
+        pub wal_ensure_nanos: u64,
+        /// Write-backs that found the WAL already durable through the page LSN (no harden needed).
+        pub wal_already_durable: u64,
+        /// Total time the **exclusive** device write guard was held on the home-write path.
+        pub device_write_guard_nanos: u64,
+        /// Total time write-backs spent queued waiting for the exclusive device write guard.
+        pub device_write_wait_nanos: u64,
+        /// Home-file `sync_data` calls issued by the write-back path.
+        pub home_syncs: u64,
+        /// Total time in the home-file `sync_data` itself.
+        pub home_sync_nanos: u64,
+        /// Cache-miss device reads performed.
+        pub device_read_waits: u64,
+        /// Total time cache-miss reads spent waiting for the device **read** guard — the convoy a
+        /// concurrent reader pays when another thread fsyncs under the exclusive device guard.
+        pub device_read_wait_nanos: u64,
     }
 
     /// A snapshot of the probe counters, returned by [`super::ConcurrentBufferPool::probe_snapshot`].
@@ -1748,6 +2436,11 @@ mod tests {
         fn ensure_durable(&mut self, up_to: Lsn) -> Result<()> {
             self.max_hardened = self.max_hardened.max(up_to.0);
             Ok(())
+        }
+        /// Everything asked for is hardened immediately, so the frontier is past every LSN handed
+        /// to this rule; reporting the recorded high-water + 1 mirrors that exactly.
+        fn durable_len(&mut self) -> u64 {
+            self.max_hardened.saturating_add(1)
         }
     }
 
@@ -2192,6 +2885,10 @@ mod tests {
             fn ensure_durable(&mut self, _up_to: Lsn) -> Result<()> {
                 Err(GraphusError::Storage("wal not durable".to_owned()))
             }
+            /// Nothing is ever durable — this rule refuses every harden.
+            fn durable_len(&mut self) -> u64 {
+                0
+            }
         }
         let p = ConcurrentBufferPool::with_wal(MemBlockDevice::new(0), FailWal, 2);
         let (f, _id) = p.new_page().unwrap();
@@ -2201,32 +2898,62 @@ mod tests {
         assert!(p.flush(f).is_err()); // the WAL rule refuses, so the write-back fails
     }
 
+    /// An eviction whose victim is **not yet covered** by the durable log must run the WAL rule
+    /// before the page reaches the device.
+    ///
+    /// The oracle is deliberately *not* "the rule is called on every write-back" any more. Since
+    /// `rmp` #974 the pool consults the rule's reported frontier first and hardens only when the
+    /// page is genuinely uncovered — which is exactly what `WalManager::ensure_durable` itself does
+    /// internally (it no-ops when `durable_len() > up_to`), so no durability is lost. A call-count
+    /// oracle would now be asserting an implementation detail the design intentionally removed: one
+    /// harden legitimately covers every page dirtied before it.
+    ///
+    /// The rule below therefore starts uncovered and becomes covered once hardened, so the test
+    /// still pins the property that matters — the harden happens, and it happens before the write.
     #[test]
     fn wal_rule_records_log_before_data() {
-        // A WAL rule + device that share an order log; assert ensure_durable always precedes the
-        // device write for the same write-back.
         #[derive(Clone)]
         struct OrderLog(StdArc<StdMutex<Vec<&'static str>>>);
-        struct RecordingWal(OrderLog);
+        /// Nothing is durable until the first harden; after it, everything is.
+        struct RecordingWal {
+            log: OrderLog,
+            durable: StdArc<std::sync::atomic::AtomicU64>,
+        }
         impl WalRule for RecordingWal {
             fn ensure_durable(&mut self, _up_to: Lsn) -> Result<()> {
-                self.0.0.lock().unwrap().push("wal");
+                self.log.0.lock().unwrap().push("wal");
+                self.durable
+                    .store(u64::MAX, std::sync::atomic::Ordering::Release);
                 Ok(())
+            }
+            fn durable_len(&mut self) -> u64 {
+                self.durable.load(std::sync::atomic::Ordering::Acquire)
             }
         }
         let log = OrderLog(StdArc::new(StdMutex::new(Vec::new())));
-        let p =
-            ConcurrentBufferPool::with_wal(MemBlockDevice::new(0), RecordingWal(log.clone()), 1);
+        let durable = StdArc::new(std::sync::atomic::AtomicU64::new(0));
+        let p = ConcurrentBufferPool::with_wal(
+            MemBlockDevice::new(0),
+            RecordingWal {
+                log: log.clone(),
+                durable: StdArc::clone(&durable),
+            },
+            1,
+        );
         let (fa, _a) = p.new_page().unwrap();
         p.with_page_mut(fa, |page| page[10] = 1);
         p.unpin(fa);
-        // Force a write-back via eviction.
+        // Force a write-back via eviction (capacity 1).
         let (fb, _b) = p.new_page().unwrap();
         p.unpin(fb);
-        // The recording of "wal" happened (write-back occurred); the device write is internal so
-        // we assert ordering by construction: write_back calls ensure_durable before write_page.
+        // The harden ran, and by construction it ran BEFORE the home write: `write_back` refuses to
+        // write a page home unless the log already covers its `page_lsn`, so the only way this
+        // eviction completed is that the hoist hardened first.
         let entries = log.0.lock().unwrap();
-        assert!(entries.contains(&"wal"), "WAL rule must run on write-back");
+        assert!(
+            entries.contains(&"wal"),
+            "an uncovered victim must be hardened before it is written home"
+        );
     }
 
     #[test]

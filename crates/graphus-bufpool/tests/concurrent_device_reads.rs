@@ -17,6 +17,13 @@
 //! failure. The device also records the **maximum number of threads ever concurrently inside
 //! `read_page`**, which this test asserts equals `READERS`: positive evidence the reads overlapped.
 
+// These are REAL-THREAD stress tests, not `loom` models: they spawn OS threads and share the
+// pool through `std::sync::Arc`, while `ConcurrentBufferPool::shared` returns the `crate::sync`
+// Arc — which becomes `loom::sync::Arc` under `--cfg loom`, so the two types stop matching and
+// the file cannot compile there. They are also meaningless under the model checker, which
+// drives its own scheduler. Gate the whole file off loom so `--cfg loom --tests` builds.
+#![cfg(not(loom))]
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::Duration;

@@ -104,20 +104,46 @@ impl BlockDevice for ModelDevice {
     }
 }
 
-/// A WAL rule that records, on every `ensure_durable`, that the log was made durable. The device
-/// write happens *inside* the pool right after this returns, so a successful `ensure_durable`
-/// preceding the home write is the log-before-data guarantee. We additionally assert ordering by
-/// counting: each write-back must bump `wal_calls` before the device's `write_page`. Because the
-/// pool calls `ensure_durable` then `write_page` under the same frame latch, observing
-/// `wal_calls >= writes` at all times is the invariant.
+/// A WAL rule that records, on every `ensure_durable`, that the log was made durable, and reports a
+/// frontier that starts uncovered and becomes fully covered once hardened.
+///
+/// # The oracle, restated for the `rmp` #974 hoist
+///
+/// The rule used to be a bare counter and the oracle was "`wal_calls >= writes` at all times",
+/// justified by the pool calling `ensure_durable` then `write_page` under one frame latch. That
+/// justification no longer holds: the harden is now hoisted *out* of the latched region and happens
+/// **before** the victim is accepted, and one harden legitimately covers many later write-backs. A
+/// strict per-write call-count oracle would therefore be asserting an implementation detail the
+/// design deliberately removed.
+///
+/// What survives — and is the property that actually matters — is the **ordering**: no page may
+/// reach the device until a harden has made the log durable through its `page_lsn`. That is what
+/// `WalCheckingDevice` asserts inside `write_page`, and it holds under the hoist for the same reason
+/// it held before: the pool refuses to write a page home while its LSN is uncovered.
+///
+/// Reporting `0` until the first harden, then `u64::MAX`, is what makes the model actually exercise
+/// the hoist: the first dirty victim is declined, the caller hardens with nothing held, and the
+/// re-sweep proceeds. A rule reporting `u64::MAX` from the start would never hoist at all and the
+/// scenario would silently stop testing the new path.
 struct OrderingWal {
     wal_calls: Arc<AtomicUsize>,
+    /// `0` until the first harden, then `u64::MAX` — "nothing durable" → "everything durable".
+    hardened: Arc<AtomicUsize>,
 }
 
 impl WalRule for OrderingWal {
     fn ensure_durable(&mut self, _up_to: Lsn) -> Result<()> {
         self.wal_calls.fetch_add(1, Ordering::SeqCst);
+        self.hardened.store(1, Ordering::SeqCst);
         Ok(())
+    }
+
+    fn durable_len(&mut self) -> u64 {
+        if self.hardened.load(Ordering::SeqCst) == 0 {
+            0
+        } else {
+            u64::MAX
+        }
     }
 }
 
@@ -301,6 +327,7 @@ fn loom_wal_rule_before_every_write_back() {
         };
         let wal = OrderingWal {
             wal_calls: wal_calls.clone(),
+            hardened: Arc::new(AtomicUsize::new(0)),
         };
         // 1 frame so the second allocation must evict (and thus write back) the first.
         let pool = ConcurrentBufferPool::with_wal(dev, wal, 1).shared();

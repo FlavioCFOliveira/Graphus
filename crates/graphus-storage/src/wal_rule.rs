@@ -122,6 +122,14 @@ impl<S: LogSink> WalRule for SharedWal<S> {
         self.with(|w| w.ensure_durable(up_to));
         Ok(())
     }
+
+    /// The manager's durable frontier, read under the shared lock and **without** hardening
+    /// (`rmp` #974). This is what lets the buffer pool decide, *before* it takes a frame latch,
+    /// whether a victim's `page_lsn` is already covered — and so hoist the `fdatasync` out from
+    /// under the latch when it is not.
+    fn durable_len(&mut self) -> u64 {
+        self.with(|w| w.durable_len())
+    }
 }
 
 #[cfg(test)]

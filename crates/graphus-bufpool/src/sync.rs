@@ -24,12 +24,12 @@
 //! quickly.
 
 #[cfg(loom)]
-pub(crate) use loom::sync::atomic::{AtomicUsize, Ordering};
+pub(crate) use loom::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 #[cfg(loom)]
 pub(crate) use loom::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 #[cfg(not(loom))]
-pub(crate) use std::sync::atomic::{AtomicUsize, Ordering};
+pub(crate) use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 #[cfg(not(loom))]
 pub(crate) use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 

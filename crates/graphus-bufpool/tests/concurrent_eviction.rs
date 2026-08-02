@@ -14,6 +14,13 @@
 //! `PAGES` (forcing constant eviction), read concurrently by `READERS` threads that each fetch every page
 //! many times and assert the bytes match the page id requested. A single mismatch fails the test.
 
+// These are REAL-THREAD stress tests, not `loom` models: they spawn OS threads and share the
+// pool through `std::sync::Arc`, while `ConcurrentBufferPool::shared` returns the `crate::sync`
+// Arc — which becomes `loom::sync::Arc` under `--cfg loom`, so the two types stop matching and
+// the file cannot compile there. They are also meaningless under the model checker, which
+// drives its own scheduler. Gate the whole file off loom so `--cfg loom --tests` builds.
+#![cfg(not(loom))]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 

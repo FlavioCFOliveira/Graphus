@@ -125,6 +125,12 @@ impl WalRule for TrackingNoopWal {
     fn ensure_durable(&mut self, _up_to: Lsn) -> Result<()> {
         Ok(())
     }
+
+    /// A no-op rule: every LSN is already durable, so the pool never hoists a harden and the model
+    /// explores only the latch protocol it is here to check.
+    fn durable_len(&mut self) -> u64 {
+        u64::MAX
+    }
 }
 
 /// The freeze-vs-reader model.

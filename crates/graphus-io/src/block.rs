@@ -33,6 +33,45 @@ pub enum PageReadOutcome {
     Torn,
 }
 
+/// A **shared** durability handle for a block device's backing store (`rmp` #974).
+///
+/// The [`BlockDevice`] sync methods take `&mut self`, so a caller that keeps its device behind a
+/// `RwLock` must hold the **exclusive** guard for the whole of an `fsync` — and on the buffer pool's
+/// eviction path that guard is exactly the lock every concurrent cache-miss page read needs in
+/// *shared* mode. Measurement (`rmp` #974) put the exclusive guard's occupancy at 87–92 % of wall
+/// time under a read workload whose working set exceeds the pool, with 98 % of each hold being the
+/// `fdatasync` itself; concurrent readers queued 27 µs (1 reader) to 323 µs (16 readers) per cache
+/// miss behind it.
+///
+/// A durability barrier does not actually need exclusive access to the device: on a Unix file it is
+/// `fsync(2)`/`fdatasync(2)` on a file descriptor, which is safe to call concurrently with reads and
+/// with writes through any descriptor for the same file. This trait is that narrow, `&self` surface.
+/// A device that can offer one returns it from [`BlockDevice::sync_handle`]; the buffer pool then
+/// issues its home-write barrier through the handle **without holding the device lock at all**, so
+/// concurrent cache-miss reads proceed in parallel with the barrier.
+///
+/// # Durability contract
+///
+/// The handle refers to the **same** backing store as the device it came from. A barrier issued
+/// through it makes durable every write already submitted through the device (the kernel flushes the
+/// file, not a per-descriptor view), so the ordering guarantee is exactly that of calling the
+/// device's own `sync_data`/`sync_all`: *after this returns, every write that completed before the
+/// call is on stable storage*. Writes submitted concurrently by other threads may also be flushed —
+/// harmless, since a barrier is never scoped to one page.
+pub trait SyncHandle: Send + Sync + std::fmt::Debug {
+    /// Flushes file data (and the minimum metadata needed to read it back) durably.
+    ///
+    /// # Errors
+    /// Returns a storage error if the underlying barrier fails.
+    fn sync_data(&self) -> Result<()>;
+
+    /// Flushes file data and all metadata durably.
+    ///
+    /// # Errors
+    /// Returns a storage error if the underlying barrier fails.
+    fn sync_all(&self) -> Result<()>;
+}
+
 /// A synchronous, page-addressable block device.
 ///
 /// This is the single I/O surface the buffer pool and write-ahead log build on. Two
@@ -104,6 +143,23 @@ pub trait BlockDevice {
 
     /// Flushes file data and all metadata durably.
     fn sync_all(&mut self) -> Result<()>;
+
+    /// A **shared** durability handle for this device's backing store, if it can offer one
+    /// (`rmp` #974).
+    ///
+    /// The default is `None`: a device that cannot issue a barrier through `&self` (the in-memory
+    /// DST device, whose "sync" is bookkeeping that models the durability boundary, and every
+    /// wrapper that has not opted in) keeps the historical behaviour — the caller falls back to the
+    /// `&mut self` methods under its exclusive device guard. Returning `Some` is therefore a pure
+    /// **concurrency** optimisation with no semantic change: see [`SyncHandle`] for the durability
+    /// contract a handle must honour.
+    ///
+    /// The buffer pool obtains the handle **once**, when the pool is constructed, and reuses it for
+    /// the lifetime of the pool, so an implementation may do real work here (duplicating a file
+    /// descriptor) without it appearing on any hot path.
+    fn sync_handle(&self) -> Option<std::sync::Arc<dyn SyncHandle>> {
+        None
+    }
 
     /// The number of pages the device currently holds.
     fn page_count(&self) -> u64;
