@@ -10,9 +10,9 @@ to the domain/component it constrains. On ratification, the chosen option is rec
 and its status set to `ratified`.
 
 > **Status: all 24 decisions of the original 2026-06-05 round are ratified.** The chosen option is
-> recorded on each `Decision` node (`status: ratified`, property `chosen`). Seven further decisions
+> recorded on each `Decision` node (`status: ratified`, property `chosen`). Twelve further decisions
 > were ratified after that round; they are recorded in the same index below, each carrying its own
-> ratification date. The register therefore holds **31 decisions** in total. The decision index in
+> ratification date. The register therefore holds **36 decisions** in total. The decision index in
 > the next section is the canonical enumeration; the options tables below it are kept for the
 > rationale and trade-offs, and are not a decision list.
 
@@ -70,6 +70,10 @@ Parse contract, to be preserved by any future edit:
 | `D-named-index-autoname` | ratified | 2026-07-08 | **Anonymous and legacy `CREATE INDEX ON :Label(property)` forms take a deterministic, stable auto-name of the form `index_<label>_<property>`** — a pure function of the label and property tokens — disambiguated by a deterministic token suffix and, if needed, a counter, until the name is free in every schema catalog; the resolved name is then persisted durably. Completes the already-ratified core requirement `FR-IX-15` under `D-v1-index-types` option (a); no ratified outcome changes. See the "Post-ratification note (2026-07-08)" below; design in `04-technical-design.md` §6.8. |
 | `D-query-prefixes` | ratified | 2026-07-14 | **`EXPLAIN` plans a statement without executing it; `PROFILE` executes it and annotates the plan with measured per-operator counters; exactly one of `plan` / `profile` is ever emitted.** `dbHits` is Graphus's own measured quantity, not a reproduction of Neo4j's DbHit accounting; unmeasured counters (per-operator time, page-cache counters) are omitted rather than fabricated — this supersedes the "timing" wording of `FR-QL-13`; a `PROFILE`d statement runs serially; the planner's cardinality estimate is reported on the root only. Completes the already-ratified core requirement `FR-QL-13`; no ratified outcome changes. See the "Post-ratification note (2026-07-14)" below; design in `04-technical-design.md` §7.8 and `06-bolt-and-error-shapes.md` §3.1. |
 | `D-async-commit` | ratified | 2026-07-23 | **Declined — Graphus does NOT adopt a deferred (asynchronous) WAL flush, whether time- or count-triggered.** Ack-after-fsync stays unconditional for every workload, and ingest acceleration goes through the `SuspendPersistence` campaign instead. Evaluated against measured evidence on 2026-07-23 and declined by the owner; refines `D-durability-mode`, whose "per-transaction synchronous available" facet is unchanged. Evidence and rationale in the "Ratified decision (2026-07-23)" section below. |
+| `D-version-representation` | ratified | 2026-08-02 | **Newest version in place, older versions reconstructed by walking one unified undo-delta chain per entity** (the Memgraph / InnoDB model), over append-only newest-first. This closes `04-technical-design.md` §12 item 2, which the specification itself declared to be blocking the record header and the undo area. Every mutation kind — create, delete, set property, add or remove label, add or remove incident edge — becomes a delta on that one chain; the chain is anchored by the record's `undo_ptr`, which today is provably dead. Design in `04-technical-design.md` §5.1 and §5.6; on-disk format in `05-storage-format.md` §12. |
+| `D-write-conflict-detection` | ratified | 2026-08-02 | **A write-write conflict is detected on the entity's own MVCC header and aborts the writer immediately, with no waiting** (the Memgraph `PrepareForWrite` model). The writer inspects the head of the entity's delta chain: if that head belongs to a transaction that is neither itself nor committed before its own start timestamp, it aborts at once with a retriable serialization failure. **The write-lock table and the wait-for-graph deadlock detector are retired**, and with them every lock wait and every lock-wait timeout. Design in `04-technical-design.md` §5.7. |
+| `D-multi-writer` | ratified | 2026-08-02 | **Graphus is multi-writer: N transactions write to the same database in parallel.** MVCC becomes the central and only concurrency-control mechanism, and the single-writer-thread engine model is retired. This supersedes the "keep the single-writer-thread engine model" facet of `D-read-parallelism` (rmp #146), whose read-side deferral was already discharged by the off-thread reader pool (rmp #336). Design in `04-technical-design.md` §5.7; the runtime shape that carries it is §9.1. |
+| `D-dst-writer-scheduler` | ratified | 2026-08-02 | **The DST simulator gains a deterministic writer scheduler, and it is a prerequisite of multi-writer certification.** Multi-writer correctness may not be signed off on non-deterministic evidence alone: the simulator must dispatch several concurrent writers against one database from a seeded schedule, so that any lost update, resurrection, or torn chain is reproducible from its seed. This extends the cooperative interleaver of `D-vopr` (`07-dst-simulator.md` §5) to the write path and narrows the named fidelity ceiling of `07-dst-simulator.md` §5.1. |
 
 <!-- END decision-index -->
 
@@ -299,6 +303,61 @@ scope and are propagated into `00-overview.md` and `01-needs-survey.md`:
 > retained in-memory undo chain pushes the other way. Second, the batched-ingest gain of ~1.16× is why
 > the campaign's value rests on sprint 81 (per-row cost and prepare-side parallelism) rather than on
 > the suspension itself.
+
+## Ratified decision (2026-08-02) — the MVCC-native engine
+
+> **Four decisions, ratified together on 2026-08-02, make MVCC the central and only
+> concurrency-control mechanism of Graphus.** They are recorded as one section because they are not
+> independent: the version representation determines how a conflict is detected, conflict detection
+> without waiting is what makes several writers safe, and a deterministic writer scheduler is what
+> makes several writers provable. Each refines an already-ratified decision rather than replacing it:
+> `D-concurrency-control` (MVCC + SSI) and `D-isolation-level` (Serializable by default) are
+> unchanged, and every one of the four inviolable requirements of `CLAUDE.md` stands as written.
+>
+> **Status: ratified (all four).**
+>
+> **Why now — the measured state of the engine.**
+>
+> The decisions were put to the owner after this sprint's audits established, empirically, that
+> Graphus today has **no version chain at all**, and that five separate ad-hoc mechanisms stand in
+> for the one the specification always described. Each fact below was read from the code in this
+> repository, at the cited line.
+>
+> | Finding | Evidence |
+> | --- | --- |
+> | `undo_ptr` is dead. The field is reserved in every node, relationship and property record and is **never written non-zero in production**, so no version chain exists. | `crates/graphus-storage/src/record.rs:74` (`MvccHeader::live` always sets `undo_ptr: 0`); `crates/graphus-storage/src/check.rs:1196-1199`, which states in the consistency checker's own documentation that "the per-value version chain is a documented follow-up, so today `undo_ptr` is always `0`". 8 bytes per record are reserved and unused. |
+> | The transaction manager was written against a **placeholder** store because the representation was an open spike. | `crates/graphus-txn/src/store.rs:6-8` and `:27-31`: "the real `graphus_storage` does not yet implement version-chain mechanics" and wiring it up "is a follow-up task, intentionally **out of scope** here". |
+> | Property updates are a tombstone plus a chain prepend, and the tombstone pass walks the whole chain. Measured cost is **O(M²)** in the number of properties set on one entity. | The chain walk is `RecordStore::tombstone_props_for_key`, `crates/graphus-storage/src/store.rs:5646-5666`. Measured: **15.1 µs/op at M = 1000** and **97.8 µs/op at M = 8000**. |
+> | Labels are a bitmap **mutated in place**, whose version history exists **only in memory** and is therefore not durable and not recoverable. | `crates/graphus-storage/src/label_history.rs:143` (`pub struct LabelHistory`), an in-process structure shared by `Arc` between the engine thread and the reader pool. |
+> | Chain heads and the label word are undone by an **ad-hoc compare-and-set**, one bespoke mechanism per field, because a whole-record pre-image undo would revert words a concurrently-committed writer legitimately owns. | `crates/graphus-storage/src/record.rs:114-123`; `crates/graphus-storage/src/store.rs:2507` (`write_chain_head`) and `:2541` (the label word). |
+> | Rollback is **physical ARIES undo**: it reverts bytes. This is the origin of the recurring defect family rmp #220 / #172 / #239 / #301 / #578 / #772 — every one of them a case of one transaction's byte-level undo damaging another's committed state. | `RecordStore::rollback`, `crates/graphus-storage/src/store.rs:3644`. |
+> | There is **no `command_id`**, so there is no statement-level isolation: a statement cannot be shown the state that preceded it within its own transaction. | `command_id` has **zero** occurrences across `crates/graphus-txn` and `crates/graphus-storage`. |
+>
+> **The four ratified decisions.**
+>
+> | Decision | Ratified choice | Grounding |
+> | --- | --- | --- |
+> | **`D-version-representation`** | **Newest version in place, one unified undo-delta chain per entity** (Memgraph / InnoDB), over append-only newest-first (PostgreSQL). One chain carries every mutation kind. | Memgraph's delta chain: `/data/refsrc/memgraph/src/storage/v2/delta.hpp:244-392` (the `Delta` record) and `delta_action.hpp:17-33` (the ten actions). The append-only contrast is PostgreSQL's heap, where an update writes a **new tuple** and links the old one to it — `/data/refsrc/postgres/src/include/access/htup_details.h:86-98` (`t_ctid` points at the replacement version) and `src/backend/access/heap/heapam.c:3808`. InnoDB's rollback segments are cited from official documentation only; **there is no InnoDB source tree in `/data/refsrc`**, so nothing about InnoDB here was read from code. |
+> | **`D-write-conflict-detection`** | **Detected on the MVCC header, abort immediately, never wait.** The lock table and the wait-for-graph deadlock detector are retired. | Memgraph `PrepareForWrite`: `/data/refsrc/memgraph/src/storage/v2/mvcc.hpp:112-137`. It reads the head delta's timestamp and returns `false` — a serialization error — rather than blocking. Its call sites are the whole write surface: `vertex_accessor.cpp:191,203,265,277,425,511,580,639` and `edge_accessor.cpp:194,261,315,360`. What is retired in Graphus is `crates/graphus-txn/src/lock.rs` (`LockTable`, `find_deadlock_victim`) and its driver `crates/graphus-txn/src/manager.rs:472-552`. |
+> | **`D-multi-writer`** | **N transactions write the same database in parallel.** | Enabled by the two decisions above: with no lock waits and no deadlock detector, the only interaction between two writers is a header check that either succeeds or aborts. Supersedes the single-writer facet of `D-read-parallelism`; the read-side half of that deferral was already discharged by the off-thread reader pool (rmp #336). |
+> | **`D-dst-writer-scheduler`** | **A deterministic writer scheduler in DST, as a prerequisite of multi-writer certification.** | `07-dst-simulator.md` §5 already dispatches overlapping transactions from one seeded `SimScheduler`; §5.1 names the fidelity ceiling that true-parallel writer races are structurally invisible to it. Multi-writer moves a class of defect from "owned by other suites" into the centre of the engine, so the scheduler must cover it. |
+>
+> **What this replaces, and where it is specified.**
+>
+> The five present-day mechanisms, their single replacement, and the task in which each one
+> disappears are tabulated in **`04-technical-design.md` §5.1**, which is the authoritative list. The
+> delta structure, its lifecycle, its ownership by the transaction, and the commit indirection point
+> are specified in the same section; the interaction with the record store and the indexes is
+> `04-technical-design.md` §5.6; latching and conflict detection are §5.7; the on-disk undo-area
+> format and the meaning of `undo_ptr` are `05-storage-format.md` §12.
+>
+> **Scope note — what these decisions do not touch.**
+>
+> They do not reopen `D-durability-mode` or `D-async-commit`: commit still acknowledges only after
+> `fdatasync`. They do not close `04-technical-design.md` §12 item 3 (torn-write protection): the
+> **doublewrite buffer stays**, with group staging (rmp #993/#994), and §4.5 is unchanged. They do not
+> alter the SSI algebra of §5.4 or the read polarities of §5.3. They resolve exactly one open spike,
+> `04-technical-design.md` §12 item 2.
 
 ## TCK target (pinned — closes `D-cypher-line` open question 1)
 

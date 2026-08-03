@@ -3,8 +3,10 @@
 This document records the outcome of the Phase 1 spike *"storage format and durability
 micro-decisions"* (`rmp` task, Phase 1). It resolves the format choices needed before the
 storage chain (`graphus-bufpool` → `graphus-wal` → `graphus-storage`) can be implemented, and
-**freezes the page header and the versioned-record header**. It provisionally resolves
-`04-technical-design.md` §12 items 2–5.
+**freezes the page header and the versioned-record header**. It provisionally resolved
+`04-technical-design.md` §12 items 2–5; **item 2 (the MVCC version representation) was ratified on
+2026-08-02 as `D-version-representation` and is no longer provisional** — see §5, and §12 for the
+on-disk undo area it unblocked.
 
 Per the project rules, choices that genuinely require a representative workload to settle are
 decided **provisionally** on the literature and **flagged for confirmation by benchmark** once
@@ -68,19 +70,28 @@ Measured on this host (`x86_64`, Rust 1.96, `--release`), hashing an 8 KiB page 
 - **Flag:** re-confirm CRC32C throughput on `aarch64` (ARM CRC extension); a 3-way-pipelined CRC32C
   implementation can be adopted later if (improbably) the checksum ever shows on a profile.
 
-## 5. MVCC version storage — **in-place latest + undo-delta chain** (provisional)
+## 5. MVCC version storage — **in-place latest + undo-delta chain** (ratified 2026-08-02)
 
 - **Decision: keep the latest visible version in the home record, with older versions reconstructed
   by applying logical undo deltas backward** (Memgraph / Neumann-et-al.-style), over append-only
-  newest-first.
+  newest-first. **Ratified on 2026-08-02 as `D-version-representation`**
+  (`02-decision-register.md`), which closes `04` §12 item 2. This section is no longer provisional.
 - Rationale: traversal-heavy graph reads overwhelmingly want the *latest* version; keeping it in the
   home record means the hot path reads the record directly with no chain walk and good cache
   locality. Older snapshots (only needed by concurrent long readers) are rebuilt by walking the undo
   deltas. GC prunes deltas older than the oldest active snapshot timestamp.
 - Trade-off: a reader on an old snapshot pays a chain walk proportional to concurrent long-running
   writers; acceptable for the target workload and bounded by GC.
-- **Measurement-gated (flag):** spike both representations on a traversal-heavy workload before
-  locking (`04` §12 item 2) when `graphus-txn` is implemented.
+- **Measured ground for the delta half of the choice** (not a preference): the present property path
+  tombstones the previous version by walking the entity's whole property chain and then prepends the
+  new one (`RecordStore::tombstone_props_for_key`,
+  `crates/graphus-storage/src/store.rs:5646-5666`), which is **O(M²)** in the number of assignments
+  to one entity — **15.1 µs/op at M = 1000** and **97.8 µs/op at M = 8000**. A constant-cost delta
+  prepend replaces that walk.
+- **One chain per entity carries every mutation kind** — creation, deletion, property assignment,
+  label change, and incidence-list change. The chain is anchored by the record's `undo_ptr` (§7) and
+  its on-disk format is frozen in §12. The delta actions, their lifecycle, their ownership by the
+  writing transaction, and the commit indirection point are specified in `04` §5.1.
 
 ---
 
@@ -112,10 +123,26 @@ this prefix and are finalized with `graphus-storage`.
 | 0 | 1 | `flags` | bit 0 `in_use`; bit 1 `dense` (node); remaining reserved. |
 | 1 | 8 | `created_ts` | commit timestamp / `TxnId` that created this version. |
 | 9 | 8 | `expired_ts` | commit timestamp that expired it; `0` = live (latest). |
-| 17 | 8 | `undo_ptr` | pointer into the undo area to the previous version's delta; `0` = none. |
+| 17 | 8 | `undo_ptr` | physical id, in `undo.store` (§12), of the **head of this entity's undo-delta chain**; `0` = none. |
 
 → **25-byte MVCC record header.** Node and relationship records additionally carry the **16-byte
 stable `ElementId`** (`D-element-id`) immediately after this prefix; property records do not.
+
+**`undo_ptr` — its meaning, and its present state.** `undo_ptr` is the **only** anchor of an entity's
+version history: it holds the physical id of the newest delta on that entity's chain, each delta
+carrying the id of the next-older one (§12). Reconstructing the version a given snapshot may see means
+starting from the in-place record image and applying deltas from `undo_ptr` backwards until the
+snapshot's visibility rule is satisfied (`04` §5.3). Without a non-zero `undo_ptr` there is no version
+chain at all.
+
+> **Flag — the field is reserved but dead in the engine as it stands.** `MvccHeader::live` writes
+> `undo_ptr: 0` unconditionally (`crates/graphus-storage/src/record.rs:74`) and the consistency
+> checker states so in its own documentation: "the per-value version chain is a documented follow-up,
+> so today `undo_ptr` is always `0`" (`crates/graphus-storage/src/check.rs:1196-1199`). Eight bytes per
+> record are therefore reserved and never used. Bringing the field to life — allocating the undo area
+> and writing real chain heads into it — is task **#966**. The frozen 25-byte header above does **not**
+> change: `undo_ptr` was always specified to mean this, and #966 makes the engine honour the
+> specification rather than the other way round.
 
 ---
 
@@ -124,8 +151,12 @@ stable `ElementId`** (`D-element-id`) immediately after this prefix; property re
 - Exact full record layouts (node/relationship/property type-specific fields) → **frozen in §9** by
   the `graphus-storage` task.
 - B+-tree slotted-page directory format → **frozen in §10** by the `graphus-index` task.
-- Page-size / fanout / torn-write / MVCC **measurements** → confirmed against LDBC SNB once
-  `graphus-bench` exists (this spike's choices are the working defaults until then).
+- Undo-area layout (the delta record and the commit-info slot) → **frozen in §12** by
+  `D-version-representation`; implemented by task #966.
+- Page-size / fanout / torn-write **measurements** → confirmed against LDBC SNB once `graphus-bench`
+  exists (this spike's choices are the working defaults until then). The **MVCC** representation is no
+  longer among them: it was ratified on 2026-08-02 (§5) on the measured evidence recorded there, and
+  `04` §12 item 2 is closed.
 - CRC32C re-confirmation on `aarch64`.
 
 Nothing here is silently fixed: each provisional choice is flagged for its confirming measurement.
@@ -224,3 +255,143 @@ Restore writes the verified pages onto a fresh device and **runs the consistency
 checker in `graphus-storage`): a backup that frames an internally-inconsistent image (even one that
 passes both integrity layers) is rejected rather than served. Online / incremental backup and
 point-in-time recovery are deferred to Phase 2; this is the offline path only.
+
+---
+
+## 12. Frozen layout — the undo area (`D-version-representation`, task #966)
+
+This section freezes the on-disk form of the undo-delta chain ratified as `D-version-representation`
+on 2026-08-02. The behavioural model — the seven delta actions, the delta lifecycle, the transaction's
+ownership of its deltas, and the commit indirection point — is `04-technical-design.md` §5.1; this
+section specifies only the bytes.
+
+> **This area does not exist in the engine yet.** It is the deliverable of task **#966**. Every field
+> below is a specification of what #966 must produce, not a description of present behaviour. What
+> exists today is the 8-byte `undo_ptr` reserved in every record and permanently written `0` (§7).
+
+### 12.1 Two new stores
+
+The undo area is **two additional fixed-record stores** in the same store directory, framed exactly
+like the three that already exist (§9): an array of fixed-size records inside each logical page's
+payload (bytes `24..8192`, after the §6 page header), record at store-slot `s` at byte offset
+`24 + (s mod records_per_page) × RECORD_SIZE`, all fields little-endian, **physical id `0` reserved as
+the null pointer**, ids allocated from `1` upward, freed ids reused through a per-store WAL-logged free
+list (§2.7 of `04-technical-design.md`).
+
+| Store | `RECORD_SIZE` | records/page | Holds |
+| --- | --- | --- | --- |
+| `undo.store` | **56** | 145 | one **delta** per record — the inverse of one change to one entity |
+| `commit.store` | **32** | 255 | one **commit-info slot** per writing transaction — the commit indirection point |
+
+Two stores rather than one because the §9 addressing rule requires a single record size per store. The
+56-byte delta is not a coincidence: Memgraph holds its own `Delta` to the same budget
+(`static_assert(sizeof(Delta) <= 56, ...)`, `/data/refsrc/memgraph/src/storage/v2/delta.hpp:408`).
+
+### 12.2 Delta record (`undo.store`, 56 bytes)
+
+| Offset | Size | Field | Notes |
+| --- | --- | --- | --- |
+| 0 | 1 | `flags` | bit 0 `in_use`; remaining reserved, must be zero. |
+| 1 | 1 | `action` | one of the seven actions of §12.3. |
+| 2 | 1 | `type_tag` | `SetProperty` only: the old value's type tag, encoded exactly as `props.store`'s `type_tag` (§9), including its inline-vs-overflow bit. Zero for every other action. |
+| 3 | 1 | `direction` | the two incidence actions only: `1` = the entity is the relationship's **start** node, `2` = its **end** node. Zero for every other action. |
+| 4 | 4 | `command_id` | the statement counter within the writing transaction (`04` §5.1.4). |
+| 8 | 8 | `commit_info` | physical id in `commit.store` of the writing transaction's slot (§12.4). Never `0` on a live delta. |
+| 16 | 8 | `next` | physical id in `undo.store` of the next-older delta on this entity's chain; `0` = end of chain. |
+| 24 | 4 | `token` | `SetProperty`: the property-key token. `AddLabel`/`RemoveLabel`: the label token. The two incidence actions: the relationship-type token. Zero otherwise. |
+| 28 | 4 | — | reserved, must be zero. |
+| 32 | 8 | `value_inline` | `SetProperty` only: the **old** value if it fits, else the `strings.store` block id, encoded exactly as `props.store`'s `value_inline` (§9). Zero for every other action. |
+| 40 | 8 | `peer` | the two incidence actions only: physical id of the relationship's other endpoint node. Zero otherwise. |
+| 48 | 8 | `edge` | the two incidence actions only: physical id of the relationship record. Zero otherwise. |
+
+A delta is **immutable once linked**: after the publication order of `04` §5.1.2 step 3, no field of it
+is ever rewritten. Only its slot is reused, and only after GC has reclaimed it.
+
+### 12.3 The `action` byte
+
+The encoding is fixed, so that a stored delta is decodable by any build that reads this format
+version. **A delta names the action that UNDOES the change** (`04` §5.1.1); the "Written when" column
+is therefore the inverse of the action's name, and that is deliberate.
+
+| Value | Action | Written when the transaction… | Fields it uses beyond the common ones |
+| --- | --- | --- | --- |
+| 1 | `DeleteObject` | creates a node or relationship | none |
+| 2 | `RecreateObject` | deletes a node or relationship | none |
+| 3 | `SetProperty` | sets, changes, or removes a property | `token`, `type_tag`, `value_inline` |
+| 4 | `AddLabel` | removes a label from a node | `token` |
+| 5 | `RemoveLabel` | adds a label to a node | `token` |
+| 6 | `AddIncidentEdge` | removes an incident relationship from a node | `token`, `direction`, `peer`, `edge` |
+| 7 | `RemoveIncidentEdge` | adds an incident relationship to a node | `token`, `direction`, `peer`, `edge` |
+
+Value `0` is reserved and is not a valid action, so a zeroed slot never decodes as a delta.
+
+Correspondence with the reference implementation: Memgraph's enumeration
+(`/data/refsrc/memgraph/src/storage/v2/delta_action.hpp:17-33`) carries the same set with two
+differences. It splits each incidence action by direction into four actions
+(`ADD_IN_EDGE`/`ADD_OUT_EDGE`/`REMOVE_IN_EDGE`/`REMOVE_OUT_EDGE`) where Graphus uses two actions plus
+the `direction` byte, and it carries one further action, `DELETE_DESERIALIZED_OBJECT`, which exists
+only for its disk-backed storage mode and has no Graphus counterpart.
+
+### 12.4 Commit-info slot (`commit.store`, 32 bytes)
+
+| Offset | Size | Field | Notes |
+| --- | --- | --- | --- |
+| 0 | 1 | `flags` | bit 0 `in_use`; remaining reserved, must be zero. |
+| 1 | 7 | — | reserved, must be zero. |
+| 8 | 8 | `commit_ts` | **the commit indirection point.** Carries the writer's `TxnId` in the in-flight `VersionStamp` encoding while the transaction is open, and its commit timestamp once it has committed. Written exactly once, by a single store, at commit. |
+| 16 | 8 | `txn_id` | the owning transaction's id, retained after commit for recovery and diagnostics. |
+| 24 | 8 | `delta_count` | `0` while the transaction is open; set at commit to the number of deltas the transaction created, then decremented by GC as each one is reclaimed. |
+
+**Why one slot and not one timestamp per delta.** A transaction that touched *k* entities commits with
+**one** write, and all *k* of its deltas become committed at the same instant because each resolves its
+status through this slot. This is what removes the freeze sweep — the in-place rewrite of every
+committed writer's stamps across `[freeze_low, high_water)`
+(`crates/graphus-storage/src/store.rs:617-625`), a frontier that needs its own release-active audit and
+whose mis-advance was a silent-data-loss defect (rmp #522). Memgraph publishes the same way, in one
+line: `transaction_.commit_info->timestamp.store(*commit_timestamp_, std::memory_order_release)`
+(`/data/refsrc/memgraph/src/storage/v2/inmemory/storage.cpp:1299`).
+
+**Write ordering at commit, which is normative.** `delta_count` is written **before** `commit_ts`, and
+`commit_ts` is the **last** write. Until `commit_ts` is published no other transaction treats this one
+as committed, so the earlier write is not observable as a partial commit; publishing `commit_ts` last
+is what makes a reader see either the whole transaction or none of it.
+
+**Reclamation.** GC decrements `delta_count` as it reclaims each of the transaction's deltas and frees
+the slot when the count reaches zero. The invariant is that **a slot outlives its last delta**: no
+delta may ever refer to a freed or reused slot, because a delta's committed-ness is only knowable
+through it. An **aborting** transaction never uses the count: it applies and frees its own deltas
+itself (§12.5), and frees its slot with them.
+
+### 12.5 Durability, recovery, and rollback
+
+- **The undo area is ordinary storage.** Both stores are ordinary logical pages carrying the §6 page
+  header, with their own CRC32C, torn-write protection (§3) and page LSN. Every mutation is WAL-logged
+  as an intra-page `(u16 offset, bytes)` patch and redone by the same three-phase ARIES machinery as a
+  record-store page (`04-technical-design.md` §4.8). There is no separate undo-area recovery path and
+  no rebuild on open.
+- **Redo stays physical; undo becomes logical.** Crash recovery still replays physical page images, so
+  the undo area is reconstructed byte-exactly. What changes is transaction rollback: instead of
+  reverting bytes (`RecordStore::rollback`, `crates/graphus-storage/src/store.rs:3644`), a rolling-back
+  transaction walks **its own** deltas and applies them, restoring exactly the state it found. This is
+  task **#970**, and it is what ends the defect family rmp #220 / #172 / #239 / #301 / #578 / #772, all
+  of which are cases of one transaction's byte-level undo damaging another's committed state.
+- **A loser transaction after a crash is undone the same way.** A slot whose `commit_ts` is still an
+  in-flight stamp when recovery reaches the ARIES undo phase belongs to a transaction that did not
+  commit; its deltas are applied, in chain order, exactly as a live rollback would apply them.
+- **Consistency checking.** The checker's existing `undo_ptr` range guard
+  (`MvccHeaderFault::UndoPtrOutOfRange`, `crates/graphus-storage/src/check.rs:1224-1229`) was written
+  for this moment and needs no change in kind: it must now range-check against `undo.store`'s
+  high-water mark, and gains the chain obligations that only apply once chains exist — a chain must
+  terminate, every `commit_info` must address a live slot, and a **committed** slot's `delta_count` must
+  equal the number of unreclaimed deltas that name it (an open transaction's slot carries `0`).
+
+### 12.6 Format version
+
+Adding these two stores and bringing `undo_ptr` to life is an **incompatible on-disk layout change**:
+a store written by a build that has an undo area cannot be read correctly by one that does not.
+`graphus_core::constants::FORMAT_VERSION` (`crates/graphus-core/src/lib.rs:622`, documented as "bumped
+on any incompatible layout change") is therefore raised from **1 to 2** by task **#966**. A store
+carrying format version 1 has no undo area and every `undo_ptr` in it reads `0`, which is a valid,
+chain-free image; opening it under a version-2 build is an upgrade, and opening a version-2 store under
+an older build must be refused rather than misread. The backup artifact's own `format_version`
+(§11) is independent and is not affected by this bump.

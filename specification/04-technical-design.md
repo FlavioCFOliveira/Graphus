@@ -84,7 +84,7 @@ A single Cargo workspace, Edition 2024, 64-bit-only targets (`D-target-matrix`).
 | `graphus-bufpool` | lib | Frame table, page latches, pin counts, eviction (CLOCK/2Q), prefetch, write-back coordination with WAL (WAL rule). |
 | `graphus-storage` | lib | Page formats; node/relationship/property/label record codecs; index-free adjacency chains; token/dictionary store; free-space management; element-ID→physical-ID map. |
 | `graphus-index` | lib | B+-tree, token-lookup index, composite & relationship-property indexes; constraint checks; index recovery. |
-| `graphus-txn` | lib | Transaction lifecycle, MVCC version chains, visibility, SSI conflict tracker, timestamp oracle, version GC, deadlock/latch policy. |
+| `graphus-txn` | lib | Transaction lifecycle, MVCC version chains and their undo deltas, visibility, SSI conflict tracker, timestamp oracle, version GC, write-conflict detection (§5.7), latch policy. |
 | `graphus-cypher` | lib | Full Cypher compile/execute pipeline; plan cache; runtime operators; error-phase split; result cursors. |
 | `graphus-bolt` | lib | PackStream v1, chunked framing, handshake, Bolt server-state machine; transport-agnostic over UDS and TCP. |
 | `graphus-rest` | lib | HTTP transactional API (axum/hyper), Jolt-style typed JSON + CBOR negotiation, NDJSON streaming, RFC 9457 errors. |
@@ -198,9 +198,10 @@ Records are **fixed-size** within each store (cache- and arithmetic-friendly). V
 (strings, large lists) lives in `strings.store` and is referenced by id. Every record carries an
 MVCC header so versioning is intrinsic to the store, not bolted on.
 
-All layouts below are the **logical fields**; exact field packing (and whether the MVCC header is
-inline vs side-tabled) is finalized after the §12 version-storage spike. Sizes are the design
-target.
+All layouts below are the **logical fields**; sizes are the design target, and the frozen byte-exact
+layouts are in `05-storage-format.md` §9. The §12 version-storage spike that once gated this section
+is **resolved** (`D-version-representation`, 2026-08-02): the MVCC header is **inline** in every
+record, and `version_ptr` is the head of that entity's unified undo-delta chain (§5.1).
 
 **Common MVCC record header (in every node/rel/property record):**
 
@@ -252,8 +253,10 @@ which endpoint the current node is) to enumerate incident edges in O(degree) wit
 | `value_inline` | 8 | the value if it fits (i64, f64, bool, short string, small temporal); else `strings.store` block id |
 | `next_prop` | 8 | next property in this entity's chain (0 = end) |
 
-Property chains are singly linked per entity; a property update under MVCC creates a new version of
-the *entity* (or a property-version record) rather than mutating in place (§5.6).
+Property chains are singly linked per entity. Under `D-version-representation` a property assignment
+**updates the property record in place** and records the previous value in a `SetProperty` delta on
+the entity's undo chain (§5.1.1); it does not tombstone the old version and prepend a new one, which
+is the present O(M²) behaviour that task #967 removes (§5.1.5).
 
 **Temporal values.** All v1 temporal types (`DATE`, `LOCAL TIME`, `ZONED TIME`, `LOCAL DATETIME`,
 `ZONED DATETIME`, `DURATION`) are encoded with **nanosecond** resolution. Zoned types carry both an
@@ -524,21 +527,186 @@ state. This is mandated by `D-durability-mode` and NFR-1.
 opt-in. The reference is Cahill/Fekete SSI and the PostgreSQL SSI implementation (Sources: Cahill
 2009 / Ports & Grittner VLDB 2012; Postgres README-SSI).
 
-### 5.1 Version representation — recommendation: **version chains with logical undo deltas**
+### 5.1 Version representation — ratified: **newest version in place, one unified undo-delta chain**
 
-Each record's MVCC header (§2.3) holds `xmin`, `xmax`, and a `version_ptr` to the prior version.
-Newest version lives in the main store ("newest-to-oldest" chain); older versions are reachable via
-`version_ptr` into the undo/version area.
+**Ratified on 2026-08-02 as `D-version-representation`** (`02-decision-register.md`, "Ratified
+decision (2026-08-02) — the MVCC-native engine"). This **closes §12 item 2**, the spike that the
+specification itself declared to be blocking the record header and the undo area.
 
-**Recommendation:** store the **newest version in place** and keep older versions as **logical undo
-deltas** in the WAL-backed undo area (an MVCC scheme close to in-place + undo, à la Memgraph's
-delta chains; Source: Memgraph storage). Rationale: traversals (the hot path) overwhelmingly read
-the *latest* committed version, which is then a single record fetch with no chain walk; only
-concurrent readers on older snapshots pay to walk deltas. The alternative — append-only new versions
-with the chain newest-first in the main store (Postgres-style) — simplifies GC ordering but bloats
-the hot store and hurts adjacency locality. **The final pick (in-place+delta vs append-only) is a
-spike in §12**, measured on a traversal-heavy workload, because it interacts directly with
-index-free-adjacency cache behavior.
+**The choice.** The **newest version of an entity lives in place**, in its home record in the record
+store. Every older version is reconstructed by walking a **single undo-delta chain per entity**,
+newest to oldest, applying each delta in turn to a copy of the in-place image. The chain is anchored
+by the record's `undo_ptr` (§2.3, `05-storage-format.md` §7), which is the head of that chain.
+"Unified" is the operative word: **one chain per entity carries every mutation kind** — creation,
+deletion, property assignment, label change, and incidence-list change alike — instead of the five
+separate mechanisms that stand in for it today.
+
+The alternative that was weighed and rejected is **append-only newest-first**, in which an update
+writes a whole new version record and links it to the old one, as PostgreSQL's heap does (Source, read
+2026-08-02: `/data/refsrc/postgres/src/include/access/htup_details.h:86-98`, where `t_ctid` points at
+the replacement version; the new tuple is stamped in `src/backend/access/heap/heapam.c:3808`). It
+simplifies garbage-collection ordering, but it bloats the hot store and breaks adjacency locality,
+which is precisely the property index-free adjacency exists to protect: a traversal reads the *latest*
+committed version of nearly every record it touches, and under in-place-latest that is one record
+fetch with no chain walk at all. Only a reader on an older snapshot pays to walk deltas.
+
+The model adopted is Memgraph's (Source, read 2026-08-02:
+`/data/refsrc/memgraph/src/storage/v2/delta.hpp:244-392`, the `Delta` record;
+`delta_action.hpp:17-33`, its action enumeration) and, in its broad shape, InnoDB's rollback
+segments. **The InnoDB parallel is cited from MySQL's official documentation only — no InnoDB source
+tree was read, because none is present in `/data/refsrc`.** Every statement below that describes a
+concrete field, call site, or control flow is grounded in the Memgraph source or in this repository's
+own code, at the line cited.
+
+**The measured grounding.** The decision was not taken on preference. Property assignment today is a
+tombstone pass over the whole property chain followed by a prepend
+(`RecordStore::tombstone_props_for_key`, `crates/graphus-storage/src/store.rs:5646-5666`), which is
+**O(M²)** in the number of properties set on one entity — measured at **15.1 µs/op at M = 1000** and
+**97.8 µs/op at M = 8000**. A delta chain replaces that walk with a constant-cost prepend.
+
+#### 5.1.1 The delta
+
+A **delta** is one immutable, fixed-size record describing **how to undo one change to one entity**.
+It is not a description of the change; it is the inverse of it. This inversion is the single most
+important convention in this section, and it is the one a reader is most likely to get backwards:
+**creating an entity writes a `DeleteObject` delta**, because deleting the entity is what undoes the
+creation. Memgraph names its actions the same way and for the same reason — creating an edge calls
+`CreateAndLinkDelta(..., Delta::RemoveOutEdgeTag(), ...)` on the source vertex
+(`/data/refsrc/memgraph/src/storage/v2/inmemory/storage.cpp:892` and `:895` for the target vertex),
+and the first delta of any newly created object is a `DELETE_OBJECT`
+(`/data/refsrc/memgraph/src/storage/v2/mvcc.hpp:236-249`).
+
+Graphus defines **seven delta actions**, one for each mutation the engine can perform on an entity:
+
+| Action | Written when the transaction… | Payload it carries | Applying it restores |
+| --- | --- | --- | --- |
+| `DeleteObject` | **creates** a node or relationship | nothing | the entity's non-existence |
+| `RecreateObject` | **deletes** a node or relationship | nothing | the entity's existence |
+| `SetProperty` | sets, changes, or removes a property | the property key token and the **old** value (`NULL` when the property did not exist before) | the previous value of that one property, or its previous absence |
+| `AddLabel` | **removes** a label from a node | the label token | that label's membership |
+| `RemoveLabel` | **adds** a label to a node | the label token | that label's absence |
+| `AddIncidentEdge` | **removes** an incident relationship from a node | the relationship type token, the other endpoint's physical id, the relationship's physical id, and the direction | that one incidence entry |
+| `RemoveIncidentEdge` | **adds** an incident relationship to a node | the same four fields as `AddIncidentEdge` | the absence of that incidence entry |
+
+Two properties of this set matter downstream. First, **a delta is per-entity and per-change, never
+per-record-image**: an entity with a thousand properties that changes one of them writes one small
+delta, not a copy of the entity. Second, **the incidence actions name a single incidence entry**, not
+a chain-head pointer, so undoing an edge insertion is the removal of one entry rather than the
+restoration of a pointer word that a concurrent writer may meanwhile own — which is exactly the
+failure mode that forced the present ad-hoc compare-and-set undo
+(`crates/graphus-storage/src/record.rs:114-123`).
+
+The delta record's on-disk layout, its size, and the store that holds it are frozen in
+`05-storage-format.md` §12.
+
+#### 5.1.2 Delta lifecycle and ownership
+
+**The transaction owns its deltas; the entity only borrows the head of the chain.** A delta is
+allocated from the writing transaction's own delta arena, and Memgraph makes the same split — the
+transaction holds `delta_container deltas`
+(`/data/refsrc/memgraph/src/storage/v2/transaction.hpp:234`) while the object holds only a pointer to
+the chain head. The lifecycle has five steps:
+
+1. **Conflict check.** Before any delta is created, the writer checks the entity's MVCC header for a
+   write-write conflict and aborts immediately if there is one (§5.7).
+2. **Allocation.** The delta is allocated in the undo area under the writing transaction's ownership,
+   carrying the action, its payload, the transaction's `command_id` (below), and a reference to the
+   transaction's shared commit-info slot (below) — **not** a timestamp of its own.
+3. **Linking.** The delta is prepended to the entity's chain and the entity's `undo_ptr` is advanced
+   to it. The link order is fixed and non-negotiable, because garbage collection and concurrent
+   readers walk the chain while it is being modified: set the new delta's `next` to the current head
+   **first**, and publish the new head **last**, so the chain is a valid list at every instant
+   (Memgraph's `CreateAndLinkDelta` documents and enforces exactly this order —
+   `/data/refsrc/memgraph/src/storage/v2/mvcc.hpp:314-359`).
+4. **In-place mutation.** Only then does the writer change the home record, so the newest value is in
+   place and its predecessor is recoverable from the delta just linked.
+5. **Resolution.** On commit, the transaction publishes its commit timestamp once (below) and its
+   deltas become the historical versions other snapshots read. On abort, the transaction walks **its
+   own** deltas and applies each one, which restores exactly the state it found — a *logical* undo, in
+   contrast with today's physical byte-level ARIES undo (`RecordStore::rollback`,
+   `crates/graphus-storage/src/store.rs:3644`). Memgraph's abort is the same walk
+   (`/data/refsrc/memgraph/src/storage/v2/inmemory/storage.cpp:1489-1560`).
+
+A delta becomes reclaimable once no live snapshot can reach it, which is the same watermark rule the
+version GC already uses (§5.5).
+
+#### 5.1.3 The commit indirection point
+
+**A delta does not carry a commit timestamp. It carries a reference to a commit-info slot shared by
+every delta of its transaction, and that slot is published by a single atomic store at commit.** This
+one indirection is the load-bearing part of the whole design, and it is worth stating why in full.
+
+Without it, committing a transaction that touched *k* records means writing *k* timestamps, and every
+one of those writes must be made durable and must be found again after a crash. Graphus pays that cost
+today: a committed writer's records keep an in-flight stamp until a **freeze sweep** rewrites each one
+in place, scanning `[freeze_low, high_water)` across all three stores
+(`crates/graphus-storage/src/store.rs:617-625`). The frontier is a correctness-critical invariant of
+its own, it has needed its own release-active audit (`store.rs:442-455`), and moving it past a live
+writer caused a silent-data-loss defect (rmp #522). With the indirection, commit is **one atomic store
+into one slot**, and every delta of that transaction becomes committed at the same instant, because
+every one of them reads its timestamp through the slot. Memgraph does exactly this, in one line:
+`transaction_.commit_info->timestamp.store(*commit_timestamp_, std::memory_order_release)`
+(`/data/refsrc/memgraph/src/storage/v2/inmemory/storage.cpp:1299`), against the `CommitInfo` structure
+at `delta.hpp:40-49`; every reader resolves a delta's status by loading through it
+(`mvcc.hpp:57`, `:114`).
+
+The contrast with the append-only alternative is instructive and is a second, independent reason for
+the representation choice. PostgreSQL has no such shared slot: it stamps each tuple with a transaction
+id and then consults the commit log per tuple, caching the answer in per-tuple **hint bits**
+(`/data/refsrc/postgres/src/include/access/htup_details.h:204`, `HEAP_XMIN_COMMITTED`, set by
+`SetHintBits`, `src/backend/access/heap/heapam_visibility.c:198-199`). Hint bits are that design's
+answer to the same problem the freeze sweep answers here. The shared commit slot removes the problem
+instead of answering it.
+
+**Consequences to hold.** The slot is per-transaction, so it must outlive the transaction object and
+be reclaimed only when the last delta referring to it is reclaimed. It is read on every visibility
+decision, so it is a read-mostly, heavily-shared cache line and must be sized and padded accordingly
+(§10.2). And because publication is a single release store, a reader either sees the whole transaction
+as committed or none of it — which is atomicity (the **A** of ACID) expressed directly in the data
+structure rather than reconstructed by a sweep.
+
+#### 5.1.4 Statement-level isolation: `command_id`
+
+Each delta records the **`command_id`** of the statement that produced it: a counter incremented once
+per statement within the transaction. It exists so that a statement can be shown the state that
+preceded it, even for changes its own transaction made — the "read-your-own-writes but not
+your-own-current-statement's-writes" rule that Cypher's `MERGE` and multi-clause updates depend on.
+Memgraph's read path takes both a snapshot **and** a view (`OLD` or `NEW`) and compares `command_id`
+to decide whether to undo a delta belonging to the reader's own transaction
+(`/data/refsrc/memgraph/src/storage/v2/mvcc.hpp:72-94`).
+
+**Graphus has no `command_id` today**: the identifier has **zero occurrences** across
+`crates/graphus-txn` and `crates/graphus-storage`, so no statement-level isolation exists. It is
+introduced with the delta record and is the subject of task **#972**.
+
+#### 5.1.5 What the unified chain replaces
+
+**Five** mechanisms currently stand in for the version chain, and they exist only because there is no
+chain to carry the change. The table below lists each of the five (rows 1–5) with its replacement and
+the task that retires it, preceded by row 0 — the missing foundation all five depend on, which is the
+undo area itself. This table is the authoritative list; the decision register
+(`02-decision-register.md`) summarises it and does not restate it.
+
+| # | Mechanism today | Where it lives now | Replaced by | Retired in |
+| --- | --- | --- | --- | --- |
+| 0 | **No undo area at all.** `undo_ptr` is reserved in every record and always written `0`, so there is no chain to anchor. | `crates/graphus-storage/src/record.rs:74`; admitted in `crates/graphus-storage/src/check.rs:1196-1199` | The undo area and the delta record; `undo_ptr` becomes the live chain head | **#966** |
+| 1 | **Property tombstone plus chain prepend.** Setting a property walks the entity's whole property chain to tombstone the previous version, then prepends a new one — **O(M²)** over M assignments (15.1 µs/op at M = 1000; 97.8 µs/op at M = 8000). | `RecordStore::tombstone_props_for_key`, `crates/graphus-storage/src/store.rs:5646-5666` | One `SetProperty` delta carrying the old value; the home property record is updated in place | **#967** |
+| 2 | **Label bitmap mutated in place, with the version history held only in memory.** The history is an in-process structure shared by `Arc`; nothing about it is durable, so labels are not versioned on disk. | `crates/graphus-storage/src/label_history.rs:143` | `AddLabel` / `RemoveLabel` deltas on the same durable chain as every other change | **#968** |
+| 3 | **Ad-hoc compare-and-set undo for chain heads and the label word.** A bespoke undo per field, needed because a whole-record pre-image undo would revert words a concurrently-committed writer legitimately owns. | `crates/graphus-storage/src/record.rs:114-123`; `store.rs:2507` (`write_chain_head`), `:2541` (label word) | `AddIncidentEdge` / `RemoveIncidentEdge` deltas naming one incidence entry, so no shared pointer word is ever rewritten by an undo | **#969** |
+| 4 | **Physical ARIES rollback.** Undo reverts bytes. This is the origin of the recurring defect family rmp #220 / #172 / #239 / #301 / #578 / #772, each one a case of one transaction's byte-level undo damaging another's committed state. | `RecordStore::rollback`, `crates/graphus-storage/src/store.rs:3644` | Logical rollback: the transaction walks its own deltas and applies them | **#970** |
+| 5 | **Write-lock table plus wait-for-graph deadlock detector.** The only true blocking in the engine, with the cycle detection and lock-wait timeout that blocking requires. | `crates/graphus-txn/src/lock.rs`; driven from `crates/graphus-txn/src/manager.rs:472-552` | Conflict detection on the entity's MVCC header, aborting immediately without waiting (§5.7) | **#971** |
+
+Two further tasks complete the model rather than replacing a mechanism: **#972** introduces
+`command_id` and statement-level isolation, and the deterministic writer scheduler required by
+`D-dst-writer-scheduler` extends `07-dst-simulator.md` §5 so that multi-writer behaviour is certified
+from a seed rather than from a race.
+
+**Status of this section.** Everything above is the **specified target**, not present behaviour. As of
+this writing the engine has no undo area, no delta, no `command_id`, and no chain: the transaction
+manager is written against a placeholder store precisely because the representation was open, and says
+so — "the real `graphus_storage` does not yet implement version-chain mechanics", and wiring it up "is
+a follow-up task, intentionally **out of scope** here" (`crates/graphus-txn/src/store.rs:6-8`,
+`:27-31`). Each row of the table above names the task that closes the gap it describes.
 
 ### 5.2 Timestamps and snapshots
 
@@ -660,25 +828,115 @@ back; this is surfaced as an observability metric (NFR-10) so a stuck reader pin
 
 ### 5.6 Interaction with the record store and indexes
 
-- **Writes** create new versions linked via `version_ptr`; the MVCC header carries `xmin/xmax`. The
-  store is therefore MVCC-native (§2.3), not an MVCC layer on top of a single-version store.
-- **Index entries are MVCC-aware (§6.3):** an index points at a record; visibility is resolved by
-  reading the record's MVCC header, and index entries for dead versions are GC'd alongside.
-- **Constraint checks** (uniqueness/existence) run at **commit time** against the committed snapshot
-  to be serializable-correct (§6.5).
+Under `D-version-representation` the store is **MVCC-native** (§2.3): versioning is a property of the
+record itself, not a layer above a single-version store. Six consequences follow, and they are the
+contract between §5 and the rest of the engine.
 
-### 5.7 Latch vs lock granularity; deadlock handling
+- **A write mutates the home record in place and leaves a delta behind.** The writer allocates the
+  delta, links it at the head of the entity's chain, advances `undo_ptr`, and only then changes the
+  record body (§5.1.2, steps 2–4). The MVCC header keeps its meaning unchanged from §5.2: `xmin` is
+  the creating transaction, `xmax` the expiring one, and `undo_ptr` is now the live head of the undo
+  chain rather than a permanently-zero reserved word.
+- **A read of the latest committed version costs one record fetch.** This is the whole point of
+  in-place-latest, and it is what protects index-free adjacency: a traversal that reads the current
+  version of every record it visits walks no chains at all. A reader on an older snapshot walks the
+  chain from `undo_ptr` backwards, applying deltas until it reaches the version its snapshot may see
+  (§5.3).
+- **Every delta is WAL-logged and recovered by the same ARIES machinery** as the record it belongs to
+  (§4.8). The undo area is an ordinary region of ordinary logical pages (`05-storage-format.md` §12),
+  not a side structure with its own recovery rules, so a crash mid-chain is recovered by redo exactly
+  as a crash mid-record is. This is what makes labels durably versioned for the first time: today
+  their history is in memory only (`crates/graphus-storage/src/label_history.rs:143`) and is lost on
+  restart.
+- **Indexes are unchanged and stay unversioned (§6.3).** An index entry points at a record; visibility
+  is resolved by reading that record's MVCC header and, where the entry's key was itself changed by an
+  in-flight transaction, by resolving the delta chain. The three read polarities of §5.3 are
+  unaffected: what changes is *how* an older version is reconstructed, not *which* answer each
+  polarity owes. In particular, a **superset** read still returns every version any snapshot could
+  need — under the delta model that is the in-place image plus its reachable chain, rather than the
+  in-place image plus a retained in-memory bitmap.
+- **Constraint checks keep their timing and their polarity.** Uniqueness and existence validation runs
+  at commit time against the committed snapshot (§6.5), and it remains a **decision**-polarity read
+  (§5.3): it must see exactly the graph a `MATCH` in the same transaction would see, which under the
+  delta model means resolving the chain at the validating snapshot rather than reading the raw
+  in-place image.
+- **Garbage collection reclaims deltas, not just records.** The watermark rule of §5.5 is unchanged —
+  the oldest active begin timestamp — but the reclaimable unit becomes the delta below that watermark
+  as well as the dead record. Two obligations follow: a delta may not be reclaimed while any live
+  snapshot can still reach it through a chain, and the transaction's commit-info slot (§5.1.3) may not
+  be reclaimed while any delta still refers to it.
 
-- **Latches** (physical, short) protect page bytes and in-memory structures (§3.3); they are ordered
-  to be deadlock-free by construction.
-- **MVCC has no read locks** (SSI uses non-blocking SIREAD markers). The only true blocking is
-  **write-write**: two transactions writing the same record — the second either waits for or, under
-  SI/SSI "first-updater-wins", is aborted on conflict. Because write-write conflicts can cycle, a
-  **wait-for graph deadlock detector** runs over write-lock waits; on a cycle it aborts the
-  youngest (or lowest-progress) transaction with a retriable error. A configurable lock-wait timeout
-  is the backstop.
-- This split — deadlock-free latches + a bounded-scope write-lock deadlock detector + non-blocking
-  reads — is what lets readers never block writers (NFR-4).
+**What disappears from this interface.** The freeze sweep does. Today a committed writer's records
+carry in-flight stamps until a sweep rewrites each one in place across
+`[freeze_low, high_water)` (`crates/graphus-storage/src/store.rs:617-625`); with the commit
+indirection point (§5.1.3) a transaction's commit timestamp is published once, so there is nothing
+left to rewrite and no frontier to maintain.
+
+### 5.7 Latches, conflict detection, and multi-writer execution
+
+**Ratified on 2026-08-02 as `D-write-conflict-detection` and `D-multi-writer`**
+(`02-decision-register.md`). Graphus has exactly **one** blocking primitive — the latch — and **no
+logical lock of any kind**. There is no lock table, no lock wait, no lock-wait timeout, and no
+deadlock detector, because a transaction never waits for another transaction.
+
+**Latches (physical, short) are the only blocking.** They protect page bytes and in-memory structures
+(§3.3), are held for the duration of a memory operation rather than a transaction, and are ordered to
+be deadlock-free by construction (§3.3, lock ordering). What makes a chain safe to walk while it is
+being extended is the publication order of §5.1.2 step 3, not a transaction-scoped lock: the new delta
+is written in full first, its `next` is set to the current head, and the record's `undo_ptr` is
+published **last**, under the latch of the record's own page. A concurrent reader, or the GC, therefore
+observes either the old chain or the new one, never a partially-linked one.
+
+**Write-write conflicts are detected on the entity's own MVCC state, and abort immediately.** Before
+writing, a transaction reads the head of the entity's delta chain and decides in constant time:
+
+| State of the chain head | Verdict |
+| --- | --- |
+| The chain is empty | proceed |
+| The head belongs to **this** transaction | proceed |
+| The head belongs to a transaction that **committed before this transaction's start timestamp** | proceed |
+| Anything else — the head belongs to another transaction that is in flight, or that committed after this transaction started | **abort now**, with a retriable serialization failure |
+
+The writer never waits for the outcome of the conflicting transaction, so no wait-for edge is ever
+created, so no cycle can form, so **there is nothing for a deadlock detector to detect**. This is
+Memgraph's `PrepareForWrite` (Source, read 2026-08-02:
+`/data/refsrc/memgraph/src/storage/v2/mvcc.hpp:112-137`), which returns `false` — a serialization
+error — instead of blocking, and which gates the entire write surface: every mutating accessor calls
+it first (`vertex_accessor.cpp:191,203,265,277,425,511,580,639`;
+`edge_accessor.cpp:194,261,315,360`).
+
+**Two properties of this rule matter for the inviolable ACID requirement.** First, it is
+*first-writer-wins*, not first-updater-wins-after-a-wait: the transaction that reached the entity
+first keeps it, and the second is told to retry. Second, aborting on conflict is **more** conservative
+than waiting, never less: a transaction that would have been permitted to proceed after a wait is
+merely asked to retry, whereas no transaction that must abort is ever allowed to commit. The
+serialization failure is retriable and is surfaced through the existing retriable-error contract, so
+the client-visible behaviour of a conflicting write is unchanged in kind.
+
+**SSI is unaffected.** Read tracking, rw-antidependency edges, pivot detection and the abort policy of
+§5.4 are untouched: SIREAD markers never blocked anything and still do not. Conflict detection covers
+**write-write**; SSI covers **read-write**. They are complementary, and both are required for
+serializability.
+
+**Multi-writer.** Because two writers interact only through a constant-time header check that either
+succeeds or aborts, **N transactions write to the same database in parallel** (`D-multi-writer`), and
+the single-writer engine thread is retired. This supersedes the writer-side facet of
+`D-read-parallelism` — "keep the single-writer-thread engine model"; that decision's read-side
+deferral had already been discharged by the off-thread reader pool (rmp #336). Readers still never
+block writers and writers still never block readers (NFR-4); what changes is that writers no longer
+block one another either — they either proceed or abort.
+
+**Certification.** Multi-writer correctness is certified from a **deterministic writer schedule**, not
+from an unreproducible race: `D-dst-writer-scheduler` requires the DST simulator to dispatch several
+concurrent writers against one database from a seeded schedule, extending the cooperative interleaver
+of `07-dst-simulator.md` §5 to the write path and narrowing the fidelity ceiling named in §5.1 of that
+document. This is a prerequisite of the multi-writer sign-off, not a follow-up to it.
+
+**What is retired, and when.** The write-lock table and the wait-for-graph deadlock detector exist
+today in `crates/graphus-txn/src/lock.rs` (`LockTable`, `find_deadlock_victim`), driven from
+`crates/graphus-txn/src/manager.rs:472-552`. They are removed in task **#971**, which is where the
+header check specified above becomes the engine's only conflict mechanism. Until then, this section
+describes the specified target and the code implements first-updater-wins with deadlock detection.
 
 ---
 
@@ -1574,9 +1832,22 @@ escalations already in `02-decision-register.md`.
    IDs; decide on lexicographic sortability of the textual form, monotonicity within a millisecond,
    and ecosystem expectations. *Resolve before the record header is frozen (§2.2/§2.3).* Also resolve
    the **TCK integer-`id()` reuse vs never-reused ElementId** reconciliation (`02` Q3).
-2. **MVCC version storage: in-place + logical undo deltas vs append-only newest-first**
-   (§5.1). Spike both on a traversal-heavy workload; decide on hot-path cache behavior + GC cost.
-   *Blocks finalizing the record header and the undo area.*
+2. **MVCC version storage: in-place + logical undo deltas vs append-only newest-first** (§5.1).
+   **Resolved (2026-08-02) — `D-version-representation`: newest version in place, with older versions
+   reconstructed by walking one unified undo-delta chain per entity.** Append-only newest-first
+   (PostgreSQL's heap: `/data/refsrc/postgres/src/include/access/htup_details.h:86-98`) is rejected
+   because it bloats the hot store and breaks the adjacency locality that index-free adjacency exists
+   to protect, while in-place-latest makes the overwhelmingly common read — the latest committed
+   version — a single record fetch with no chain walk. The measured ground for the delta half of the
+   choice is the present property path, a tombstone walk plus prepend that is **O(M²)** in the number
+   of assignments to one entity (`RecordStore::tombstone_props_for_key`,
+   `crates/graphus-storage/src/store.rs:5646-5666`; **15.1 µs/op at M = 1000**, **97.8 µs/op at
+   M = 8000**), which a constant-cost delta prepend replaces. The model is Memgraph's
+   (`/data/refsrc/memgraph/src/storage/v2/delta.hpp:244-392`, `delta_action.hpp:17-33`); the InnoDB
+   parallel is cited from official documentation only, as no InnoDB source tree is present in
+   `/data/refsrc`. *This unblocks the record header and the undo area, which were explicitly blocked
+   on it:* the delta actions, lifecycle, ownership and commit indirection point are specified in §5.1,
+   and the on-disk undo-area format in `05-storage-format.md` §12.
 3. **Torn-write protection: doublewrite buffer (recommended) vs full-page-writes** (§4.5). Measure
    write-amplification and commit-latency impact per target before locking.
 4. **Logical page size** (default 8 KiB) and **B+-tree fanout** (§3.1, §6.1) — measure against LDBC

@@ -521,6 +521,11 @@ case.
 
 #### 7.2.6 Single-writer engine thread: a fairness requirement, not a correctness one
 
+> **Forward reference (2026-08-02).** `D-multi-writer` (`02-decision-register.md`) retires the
+> single-writer engine thread; when it lands, the fairness requirement below is superseded by ordinary
+> multi-writer MVCC concurrency and this section must be revisited. Everything below remains an
+> accurate description of the engine as audited on 2026-07-01, and of Mode B's obligations until then.
+
 The audit confirmed the single-writer-engine-thread model is real (`graphus-server/src/engine/mod.rs`,
 a `std::sync::mpsc` `EngineCommand` queue: one OS thread executes one statement/commit at a time
 for a given database). This changes **nothing** about Mode B's correctness — SSI already handles
