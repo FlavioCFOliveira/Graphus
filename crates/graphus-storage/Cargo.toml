@@ -47,6 +47,9 @@ graphus-bufpool = { path = "../graphus-bufpool" }
 # on (`rmp` #721). A LEAF crate (graphus-core only), which is what lets it be `loom` model-checked in
 # isolation — see its Cargo.toml. Acyclic: it never depends on storage.
 graphus-pagemap = { path = "../graphus-pagemap" }
+# The group-staging barrier for the doublewrite (`rmp` #994). A LEAF crate so its leader/follower
+# protocol can be `loom`-model-checked in isolation — see its Cargo.toml.
+graphus-groupsync = { path = "../graphus-groupsync" }
 graphus-wal = { path = "../graphus-wal" }
 # The consistency checker (src/check.rs) verifies store/index agreement, so it needs the index
 # types. This edge is acyclic: graphus-index depends on core/io/bufpool/wal, never on storage.

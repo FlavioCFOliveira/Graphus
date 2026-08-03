@@ -215,6 +215,8 @@ impl Rig {
             // inside the DWB device mutex), so both arms come from ONE binary under identical
             // instrumentation instead of from two separately patched builds.
             stager.set_barrier_under_lock(env_usize("CONVOY_DWB_BARRIER_UNDER_LOCK", 0) != 0);
+            // `CONVOY_DWB_GROUP=0` reproduces the pre-`rmp` #994 shape: one barrier per evicted page.
+            stager.set_group_staging(env_usize("CONVOY_DWB_GROUP", 1) != 0);
             pool.set_page_stager(Arc::clone(&stager) as Arc<dyn graphus_bufpool::PageStager>);
             Some(stager)
         } else {
@@ -238,6 +240,9 @@ struct ArmResult {
     elapsed: Duration,
     probe: graphus_bufpool::probe::WriteBackProbe,
     dwb: graphus_storage::dwb::probe::DwbProbeSnapshot,
+    /// Barriers actually issued and evictors that rode on someone else's (`rmp` #994).
+    barriers_issued: u64,
+    piggybacked: u64,
 }
 
 /// Runs one arm: `readers` reader threads and `writers` writer threads over a working set of
@@ -349,6 +354,7 @@ fn run_arm(
         .as_ref()
         .map(|s| s.probe_snapshot())
         .unwrap_or_default();
+    let counters_before = rig.stager.as_ref().map_or((0, 0), |s| s.barrier_counters());
     let start = Instant::now();
 
     std::thread::sleep(Duration::from_secs(secs));
@@ -359,6 +365,7 @@ fn run_arm(
         .as_ref()
         .map(|s| s.probe_snapshot().since(&dwb_before))
         .unwrap_or_default();
+    let counters_after = rig.stager.as_ref().map_or((0, 0), |s| s.barrier_counters());
     stop.store(true, Ordering::Relaxed);
     for h in handles {
         h.join().expect("join worker");
@@ -388,6 +395,8 @@ fn run_arm(
         elapsed,
         probe,
         dwb,
+        barriers_issued: counters_after.0 - counters_before.0,
+        piggybacked: counters_after.1 - counters_before.1,
     };
     // Free the arm's files: a long sweep would otherwise leave one store + WAL + DWB per arm behind.
     drop(rig.pool);
@@ -500,6 +509,16 @@ fn main() {
             r.dwb.lock_wait_nanos as f64 / 1e6 / secs_f,
             dwb_mean(r.dwb.lock_hold_nanos, r.dwb.stages),
             dwb_mean(r.dwb.barrier_nanos, r.dwb.barriers),
+        );
+        println!(
+            "        # group staging: barriers={} piggybacked={} ratio={:.2} evictions/barrier",
+            r.barriers_issued,
+            r.piggybacked,
+            if r.barriers_issued > 0 {
+                (r.barriers_issued + r.piggybacked) as f64 / r.barriers_issued as f64
+            } else {
+                0.0
+            },
         );
         println!(
             "        # mean ms: write_back={:.3} wal_ensure={:.3} home_sync={:.3} \

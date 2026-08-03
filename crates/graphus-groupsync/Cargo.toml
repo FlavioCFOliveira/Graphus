@@ -1,0 +1,35 @@
+[package]
+name = "graphus-groupsync"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Group-staging barrier for Graphus: one durability barrier amortised over many concurrent writers."
+
+[dependencies]
+graphus-core = { path = "../graphus-core" }
+
+# `loom` model-checks the leader/follower protocol and its generation counter (`rmp` #994). It is
+# needed by the *library* (via `src/sync.rs`) only when compiled with `--cfg loom`, so it is gated on
+# that cfg and never enters a production build.
+#
+# This is a LEAF crate — it depends on `graphus-core` alone, deliberately, for exactly the reason
+# `graphus-pagemap` is one. `--cfg loom` is a global RUSTFLAG, so it also flips `graphus-bufpool`'s
+# own loom seam; a barrier living inside `graphus-storage` (which depends on bufpool) could therefore
+# not be model-checked at all, because storage's `std::sync::Arc` would stop matching bufpool's
+# `loom::sync::Arc` signatures — verified by trying it. Keeping the protocol in a crate with no
+# bufpool edge is what makes the model check possible:
+#
+#   RUSTFLAGS="--cfg loom" cargo test -p graphus-groupsync --release
+[target.'cfg(loom)'.dependencies]
+loom = "0.7.2"
+
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7.2"
+
+# `loom` is a known custom cfg the crate sets via RUSTFLAGS; register it so `unexpected_cfgs` does not
+# warn on the `#[cfg(loom)]` arms in `src/sync.rs`.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

@@ -987,6 +987,11 @@ pub struct DwbPageStager<D: BlockDevice> {
     /// `None` for a device that cannot offer one, in which case the barrier stays inside the mutex
     /// (correct, just not concurrent) — see the type docs.
     sync_handle: Option<std::sync::Arc<dyn graphus_io::SyncHandle>>,
+    /// Group staging (`rmp` #994): amortises ONE durability barrier over every evictor whose staging
+    /// writes completed before it started, instead of one barrier per evicted page. Only used on the
+    /// shared-handle path; when the barrier must stay inside the device mutex there is nothing to
+    /// amortise, because the mutex already serialises the evictors.
+    barrier: std::sync::Arc<graphus_groupsync::StagingBarrier>,
     /// Staging timers (`rmp` #993, `dwb-probe` feature only). Compiled out of the production build.
     #[cfg(feature = "dwb-probe")]
     probe: std::sync::Arc<probe::DwbProbe>,
@@ -998,6 +1003,10 @@ pub struct DwbPageStager<D: BlockDevice> {
     /// there is no runtime switch on a durability path.
     #[cfg(feature = "dwb-probe")]
     barrier_under_lock: std::sync::atomic::AtomicBool,
+    /// **Measurement-only** A/B switch (`dwb-probe` feature only): when cleared, every evictor issues
+    /// its own barrier, reproducing the pre-`rmp` #994 shape (one barrier per evicted page).
+    #[cfg(feature = "dwb-probe")]
+    group_staging: std::sync::atomic::AtomicBool,
 }
 
 impl<D: BlockDevice> DwbPageStager<D> {
@@ -1016,10 +1025,36 @@ impl<D: BlockDevice> DwbPageStager<D> {
             dwb,
             free_slots: std::sync::Arc::new(std::sync::Mutex::new(FreeSlots::new())),
             sync_handle,
+            barrier: std::sync::Arc::new(graphus_groupsync::StagingBarrier::new()),
             #[cfg(feature = "dwb-probe")]
             probe: std::sync::Arc::new(probe::DwbProbe::default()),
             #[cfg(feature = "dwb-probe")]
             barrier_under_lock: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "dwb-probe")]
+            group_staging: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+
+    /// **Measurement only** (`dwb-probe` feature): enables/disables group staging, so one binary can
+    /// measure the pre- and post-`rmp` #994 shapes under identical instrumentation.
+    #[cfg(feature = "dwb-probe")]
+    pub fn set_group_staging(&self, on: bool) {
+        self.group_staging
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether barriers are amortised across evictors. Always `true` without the `dwb-probe`
+    /// feature — the production path has no switch.
+    #[inline]
+    fn group_staging_enabled(&self) -> bool {
+        #[cfg(feature = "dwb-probe")]
+        {
+            self.group_staging
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }
+        #[cfg(not(feature = "dwb-probe"))]
+        {
+            true
         }
     }
 
@@ -1059,20 +1094,45 @@ impl<D: BlockDevice> DwbPageStager<D> {
     /// Returns `true` when the barrier was issued through the handle (lock-free). `false` means the
     /// device offers no handle and the caller must fall back to
     /// [`Dwb::sync_device`](Dwb::sync_device) under the mutex.
-    fn barrier_off_lock(&self) -> Option<Result<()>> {
+    fn barrier_off_lock(&self, ticket: Option<u64>) -> Option<Result<()>> {
+        // `None` means the staging path already made the copy durable under the device mutex, so
+        // there is nothing to wait for. It is NOT "no barrier needed" by default: every path that
+        // defers the barrier hands back a real ticket.
+        let ticket = ticket?;
         if self.barrier_inside_lock() {
             return None; // measurement arm: the barrier already ran inside the mutex.
         }
         let handle = self.sync_handle.as_ref()?;
-        // The tripwire: this barrier is the one `rmp` #993 moved out of the mutex, and this assertion
-        // is what keeps it out. Compiled out in release.
-        graphus_core::latch::assert_no_dwb_lock_held("DwbPageStager staging barrier");
-        #[cfg(feature = "dwb-probe")]
-        let start = std::time::Instant::now();
-        let r = handle.sync_data();
-        #[cfg(feature = "dwb-probe")]
-        self.probe.record_barrier(start.elapsed().as_nanos() as u64);
-        Some(r)
+        // GROUP STAGING (`rmp` #994). We do not sync unconditionally: we ask the shared barrier to
+        // make OUR ticket durable. If a leader's barrier already covered the writes this ticket
+        // stands for, we return without issuing one of our own; otherwise we lead a round. Either
+        // way this returns `Ok` only once `durable >= ticket` — a caller can never conclude without
+        // its own bytes on stable storage.
+        let sync = || -> Result<()> {
+            // The tripwire: this barrier is the one `rmp` #993 moved out of the device mutex, and
+            // this assertion is what keeps it out. Compiled out in release.
+            graphus_core::latch::assert_no_dwb_lock_held("DwbPageStager staging barrier");
+            #[cfg(feature = "dwb-probe")]
+            let start = std::time::Instant::now();
+            let r = handle.sync_data();
+            #[cfg(feature = "dwb-probe")]
+            self.probe.record_barrier(start.elapsed().as_nanos() as u64);
+            r
+        };
+        if !self.group_staging_enabled() {
+            // Measurement arm: no amortisation, one barrier per evicted page (pre-`rmp` #994).
+            return Some(sync());
+        }
+        // `wait_durable` reports whether we led a round; the counters it keeps are the
+        // amortisation diagnostics. We discard the flag here — correctness never depends on it.
+        Some(self.barrier.wait_durable(ticket, &sync).map(|_led| ()))
+    }
+
+    /// Barriers issued and evictors satisfied without issuing one (`rmp` #994 diagnostics). The
+    /// ratio between them is the amortisation the group-staging protocol achieves.
+    #[must_use]
+    pub fn barrier_counters(&self) -> (u64, u64) {
+        self.barrier.counters()
     }
 
     /// Claims a free eviction-ring slot, **blocking** until one is free, and returns its index. The
@@ -1170,14 +1230,23 @@ impl<D: BlockDevice + Send> graphus_bufpool::PageStager for DwbPageStager<D> {
                 now
             };
             let r = if self.sync_handle.is_some() && !self.barrier_inside_lock() {
+                // Write, then take the ticket — in that order, still holding the device mutex.
+                // The ticket asserts "my writes have completed", so taking it before them would
+                // let a leader's barrier claim bytes that had not reached the page cache yet
+                // (`rmp` #994, and the reason the follower recheck exists at all).
                 dwb.stage_eviction_slot_no_sync(slot, page_id, page)
+                    .map(|()| Some(self.barrier.ticket()))
             } else {
                 // No shared handle (in-memory DST device, encrypted device): the barrier needs
                 // `&mut`, so it stays inside the mutex. The scope is deliberately NOT armed around it
                 // — this path cannot satisfy the invariant the tripwire checks, and asserting over it
                 // would be a false alarm rather than a finding.
                 drop(_dwb_scope);
-                dwb.stage_eviction_slot(slot, page_id, page)
+                // Fallback path: the barrier already ran inside the mutex, so there is no ticket
+                // to wait on. `None` rather than a `0` sentinel — `wait_durable(0, ..)` would be
+                // satisfied by `durable >= 0` unconditionally, so a sentinel would turn a future
+                // branch mix-up into a silently skipped barrier.
+                dwb.stage_eviction_slot(slot, page_id, page).map(|()| None)
             };
             drop(dwb);
             #[cfg(feature = "dwb-probe")]
@@ -1186,15 +1255,18 @@ impl<D: BlockDevice + Send> graphus_bufpool::PageStager for DwbPageStager<D> {
             r
             // DWB device mutex released above.
         };
-        if let Err(e) = stage_result {
-            self.free_slot(slot);
-            return Err(e);
-        }
+        let ticket = match stage_result {
+            Ok(t) => t,
+            Err(e) => {
+                self.free_slot(slot);
+                return Err(e);
+            }
+        };
         // 2b. BARRIER, with the DWB mutex released. Until this returns the staged copy is NOT durable,
         //     so it MUST precede the home write below — that ordering is the whole point of the
         //     doublewrite buffer. Our `pwrite`s have already returned, so this barrier covers them;
         //     a peer staging into a disjoint slot may have its bytes flushed too, which is harmless.
-        if let Some(Err(e)) = self.barrier_off_lock() {
+        if let Some(Err(e)) = self.barrier_off_lock(ticket) {
             // No durable copy ⇒ no home write. Free the slot (nothing is in flight for it) and
             // propagate: the pool leaves the frame dirty and the page stays resident.
             self.free_slot(slot);
@@ -1244,7 +1316,7 @@ impl<D: BlockDevice + Send> graphus_bufpool::PageStager for DwbPageStager<D> {
         // frame's latch while it runs — so a barrier inside this mutex blocks concurrent evictors
         // (which need the same mutex to stage) for its whole duration, on top of the latches the
         // checkpoint already holds.
-        {
+        let ticket = {
             let _dwb_scope = graphus_core::latch::DwbLockScope::new();
             let mut dwb = self
                 .dwb
@@ -1252,14 +1324,16 @@ impl<D: BlockDevice + Send> graphus_bufpool::PageStager for DwbPageStager<D> {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if self.sync_handle.is_some() && !self.barrier_inside_lock() {
                 dwb.stage_batch_no_sync(&pages)?;
+                // Ticket taken after the writes, under the mutex — same rule as the eviction path.
+                Some(self.barrier.ticket())
             } else {
                 drop(_dwb_scope);
                 return dwb.stage_batch(&pages);
             }
-        }
+        };
         // The batch is NOT durable until this returns, and every caller writes these pages home only
         // afterwards.
-        match self.barrier_off_lock() {
+        match self.barrier_off_lock(ticket) {
             Some(r) => r,
             None => Ok(()),
         }
