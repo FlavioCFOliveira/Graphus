@@ -99,7 +99,7 @@ fn gc_freed_slot_is_not_reused_while_an_inflight_reader_may_walk_through_it() {
             // slot is SHADOW-HELD (the reader with ticket 100 < 101 is still in flight) ...
             gc_pass_with_barrier(&mut s, graphus_core::TxnId(4), Some(BARRIER));
             assert_eq!(
-                s.held_slots_len(),
+                s.held_slots_len_of(graphus_storage::StoreKind::Rel),
                 1,
                 "the freed slot must be shadow-held from reuse"
             );
@@ -140,7 +140,7 @@ fn gc_freed_slot_is_not_reused_while_an_inflight_reader_may_walk_through_it() {
     // (100). A lost `+ 1` in the wiring would make barrier == 100 and free it here, under the reader.
     s.release_held(READER_TICKET);
     assert_eq!(
-        s.held_slots_len(),
+        s.held_slots_len_of(graphus_storage::StoreKind::Rel),
         1,
         "#588 boundary: the newest in-flight reader (oldest open) must keep its held slot protected"
     );
@@ -151,7 +151,8 @@ fn gc_freed_slot_is_not_reused_while_an_inflight_reader_may_walk_through_it() {
     assert_eq!(
         s.held_slots_len(),
         0,
-        "the slot must be released once no predating reader remains"
+        "every held slot — record and undo-area alike — must be released once no predating reader \
+         remains"
     );
     let txn = graphus_core::TxnId(6);
     s.begin(txn);

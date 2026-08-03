@@ -51,12 +51,14 @@ use crate::paging;
 use crate::read_view::{self, MetaSnapshot, StoreMetaSnapshot, StorePages, StoreReadView};
 use crate::record::{
     CHAIN_FLAG_END_FIRST, CHAIN_FLAG_START_FIRST, ChainSide, MVCC_HEADER_SIZE, MVCC_OFF_CREATED_TS,
-    MVCC_OFF_EXPIRED_TS, MvccHeader, NODE_OFF_FIRST_PROP, NODE_OFF_FIRST_REL, NODE_OFF_LABELS,
-    NODE_RECORD_SIZE, NodeRecord, PROP_RECORD_SIZE, PropRecord, REL_OFF_CHAIN_FLAGS,
-    REL_OFF_END_PREV, REL_OFF_FIRST_PROP, REL_OFF_START_PREV, REL_RECORD_SIZE, RelRecord,
+    MVCC_OFF_EXPIRED_TS, MVCC_OFF_UNDO_PTR, MvccHeader, NODE_OFF_FIRST_PROP, NODE_OFF_FIRST_REL,
+    NODE_OFF_LABELS, NODE_RECORD_SIZE, NodeRecord, PROP_RECORD_SIZE, PropRecord,
+    REL_OFF_CHAIN_FLAGS, REL_OFF_END_PREV, REL_OFF_FIRST_PROP, REL_OFF_START_PREV, REL_RECORD_SIZE,
+    RelRecord,
 };
 use crate::scan_polarity::{DecidedProperties, SupersetProperties};
 use crate::tokens::{Namespace, TokenSnapshot, TokenStore};
+use crate::undo::{self, CommitSlot, UndoAction, UndoDelta};
 use crate::valenc;
 use crate::wal_rule::SharedWal;
 
@@ -74,6 +76,31 @@ pub const META_PAGE: PageId = PageId(0);
 /// here so a full chunk written at `HEADER_SIZE` never runs past the page.
 const META_CHUNK_CAP: usize = paging::PAGE_PAYLOAD - 12;
 
+/// Bit set in the **head** metadata page's `chunk_len` field by every build that writes the undo
+/// area, i.e. by on-disk format version 2 and up (`05 §12.6`, `rmp` #966).
+///
+/// # Why a flag bit in a length field
+///
+/// `05 §12.6` requires that "opening a version-2 store under an older build must be **refused**
+/// rather than misread". An older build cannot be taught a new version check after the fact — it is
+/// already shipped — so the refusal has to come from a validation it *already* performs. It performs
+/// exactly one on this frame: [`read_meta`](RecordStore::read_meta) rejects a chunk whose length runs
+/// past the page. Setting bit 31 of `chunk_len` makes the length astronomically larger than a page,
+/// so a pre-#966 build fails its own guard deterministically ("metadata chunk runs past the page")
+/// instead of parsing a catalog whose trailing undo-area block it would silently drop — which would
+/// orphan the two undo stores and strand every `undo_ptr` in the record stores.
+///
+/// A real chunk length is at most [`META_CHUNK_CAP`] (a few kilobytes), so the bit can never collide
+/// with a genuine value. This build masks it off and treats its presence as informational; the
+/// authoritative version is the one in the catalog payload ([`Meta`]).
+///
+/// **Ratified on 2026-08-03**, deliberately and with the trade-off stated: an old build failing
+/// immediately on a version-2 store is worth more than one reading it wrongly and then writing over
+/// it, and the error message it produces — "metadata chunk runs past the page", which does not name
+/// the version — is the accepted price. This is a design decision, not an accident of the encoding:
+/// removing the bit re-opens the silent-misread path (`05 §12.6`).
+const META_FORMAT_V2_FLAG: u32 = 0x8000_0000;
+
 /// Reserved system transaction id for standalone catalog writes (`04 §2.6`): a token/catalog
 /// change that must be durable on its own (e.g. at `create`) uses this transaction.
 const SYSTEM_TXN: TxnId = TxnId(u64::MAX);
@@ -83,11 +110,18 @@ const PAGE_TYPE_RECORD: u8 = 1;
 /// Page-type byte for the metadata page.
 const PAGE_TYPE_META: u8 = 5;
 
-/// The number of fixed-record stores backed by the catalog (`nodes`, `rels`, `props`, and the
-/// `strings.store` overflow heap, `04 §2.1`). Indexed by [`StoreKind`] `as usize`.
-pub const STORE_COUNT: usize = 4;
+/// The number of fixed-record stores backed by the catalog (`nodes`, `rels`, `props`, the
+/// `strings.store` overflow heap, `04 §2.1`, and the undo area's `undo.store` / `commit.store` pair,
+/// `05 §12.1`). Indexed by [`StoreKind`] `as usize`.
+pub const STORE_COUNT: usize = 6;
 
-/// Which of the fixed-record stores a record id belongs to (`04 §2.1`).
+/// Which of the fixed-record stores a record id belongs to (`04 §2.1`, `05 §12.1`).
+///
+/// The first four are the **MVCC record stores plus their overflow heap**; the last two are the
+/// **undo area** (`rmp` #966). The split matters: only the first three carry the 25-byte MVCC header
+/// of `05 §7`, so the freeze sweep, the tombstone reclamation and the version-visibility rules apply
+/// to them and to nothing else. The undo area's records are pure storage — framed, checksummed,
+/// WAL-logged and recovered exactly like any other page, but never version-stamped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreKind {
     /// The node store (`nodes.store`).
@@ -99,16 +133,30 @@ pub enum StoreKind {
     /// The `strings.store` variable-length overflow heap (`04 §2.1`, `rmp` task #43): its
     /// fixed-size "records" are the [`HeapBlock`]s of a value's block chain.
     Strings = 3,
+    /// The `undo.store` delta store (`05 §12.1`, `rmp` #966): one 56-byte
+    /// [`UndoDelta`](crate::undo::UndoDelta) per record — the inverse of one change to one entity.
+    Undo = 4,
+    /// The `commit.store` commit-info store (`05 §12.1`, `rmp` #966): one 32-byte
+    /// [`CommitSlot`](crate::undo::CommitSlot) per writing transaction — the commit indirection
+    /// point every one of that transaction's deltas resolves its status through.
+    Commit = 5,
 }
 
-/// The four [`StoreKind`]s indexed by their discriminant (`kind as usize`), so a subtype byte can be
+/// The six [`StoreKind`]s indexed by their discriminant (`kind as usize`), so a subtype byte can be
 /// mapped back to its kind without a fallible `match` (`rmp` #398 orphan-page attribution).
-const ALL_STORE_KINDS: [StoreKind; STORE_COUNT] = [
+pub(crate) const ALL_STORE_KINDS: [StoreKind; STORE_COUNT] = [
     StoreKind::Node,
     StoreKind::Rel,
     StoreKind::Prop,
     StoreKind::Strings,
+    StoreKind::Undo,
+    StoreKind::Commit,
 ];
+
+/// The three stores whose records carry the frozen MVCC header of `05 §7` and are therefore subject
+/// to version stamping, the freeze sweep and tombstone reclamation. The `strings.store` heap blocks
+/// carry a header but are never visibility-checked; the undo area's records carry none at all.
+const MVCC_STORE_KINDS: [StoreKind; 3] = [StoreKind::Node, StoreKind::Rel, StoreKind::Prop];
 
 impl StoreKind {
     /// The fixed record size of this store in bytes.
@@ -119,7 +167,17 @@ impl StoreKind {
             StoreKind::Rel => REL_RECORD_SIZE,
             StoreKind::Prop => PROP_RECORD_SIZE,
             StoreKind::Strings => crate::heap::STRINGS_RECORD_SIZE,
+            StoreKind::Undo => crate::undo::UNDO_RECORD_SIZE,
+            StoreKind::Commit => crate::undo::COMMIT_RECORD_SIZE,
         }
+    }
+
+    /// Whether records of this store carry the frozen 25-byte MVCC header (`05 §7`) — i.e. whether
+    /// they can be version-stamped, frozen, tombstoned and anchored to an undo chain. False for the
+    /// undo area's own two stores, whose records are pure storage.
+    #[must_use]
+    pub fn is_versioned(self) -> bool {
+        matches!(self, StoreKind::Node | StoreKind::Rel | StoreKind::Prop)
     }
 }
 
@@ -215,6 +273,20 @@ impl StorePages for [FixedStore; STORE_COUNT] {
 /// `StoreKind::Prop` ids alongside nodes/rels is all it takes. The `strings.store` overflow heap
 /// blocks owned by a property are *not* tracked: they are never visibility-checked and are freed with
 /// their owning property at GC.
+/// One delta a still-open transaction has linked onto an entity's undo chain (`rmp` #966).
+///
+/// Recorded in link order so a rollback can decide, per delta, whether its slot is free again. See
+/// [`ActiveTxn::undo_links`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UndoLink {
+    /// The store the entity lives in (always a [`StoreKind::is_versioned`] one).
+    kind: StoreKind,
+    /// Physical id of the entity whose chain the delta was prepended onto.
+    entity: u64,
+    /// Physical id of the delta in `undo.store`.
+    delta: u64,
+}
+
 #[derive(Debug, Default, Clone)]
 struct ActiveTxn {
     created: Vec<(StoreKind, u64)>,
@@ -254,6 +326,23 @@ struct ActiveTxn {
     /// `popped_ids`, so bounded by the free list size at begin). A popped prop with no recorded owner
     /// is conservatively **not** re-pushed (a safe leak, never a double-free).
     popped_prop_owners: Vec<(u64, StoreKind, u64)>,
+    /// **`rmp` #966.** The `commit.store` physical id of this transaction's **commit-info slot** —
+    /// its commit indirection point (`04 §5.1.3`). Allocated lazily, on the first delta the
+    /// transaction writes, so a read-only or delta-free transaction allocates nothing. Every delta
+    /// this transaction creates names this slot, and the commit publishes it with a single store.
+    commit_slot: Option<u64>,
+    /// **`rmp` #966.** Every delta this transaction linked onto an entity's undo chain, in link
+    /// order.
+    ///
+    /// A delta's creation is undone by the compare-and-set undo of the entity's `undo_ptr`
+    /// ([`write_chain_head`](RecordStore::write_chain_head)), which fires **only if this
+    /// transaction's delta is still the head** — so after the undo a delta is either unreachable
+    /// (its slot is free again) or still threaded as a corpse, because another transaction prepended
+    /// on top of it. [`reclaim_aborted_undo`](RecordStore::reclaim_aborted_undo) decides which by
+    /// re-walking each touched entity's chain, exactly as
+    /// [`reclaim_aborted_pops`](RecordStore::reclaim_aborted_pops) re-walks an incidence chain for
+    /// the same question about a reused relationship slot.
+    undo_links: Vec<UndoLink>,
     /// This transaction's own pending **schema-catalog DDL**, as a per-entry undo log (`rmp` #734) —
     /// the `Statistics` twin of [`freed_ids`](Self#structfield.freed_ids) / [`popped_ids`](Self#structfield.popped_ids).
     ///
@@ -426,8 +515,16 @@ struct SchemaUndo {
 /// What one [`RecordStore::gc`] pass did (observability, NFR-10; `rmp` task #59).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GcPassReport {
-    /// Physical record versions reclaimed (slots freed, `04 §5.5`).
+    /// Physical record versions reclaimed (slots freed, `04 §5.5`). Counts **record** slots only —
+    /// nodes, relationships, property versions and heap blocks. Undo deltas are reported separately
+    /// by [`undo_deltas_reclaimed`](Self#structfield.undo_deltas_reclaimed) so this number keeps its
+    /// pre-`rmp`-#966 meaning.
     pub reclaimed: usize,
+    /// **`rmp` #966.** Undo-delta slots reclaimed by the Phase F version-chain sweep: deltas no live
+    /// snapshot can reach any more (`05 §12`). Separate from
+    /// [`reclaimed`](Self#structfield.reclaimed) because a delta is not a record version — a caller
+    /// tracking live-record cardinality must not see chain maintenance in that figure.
+    pub undo_deltas_reclaimed: usize,
     /// MVCC header words (`xmin`/`xmax`) frozen from a committed writer's in-flight `TxnId` to its
     /// `Committed(ts)` stamp (`rmp` task #59), making those versions self-describing.
     pub frozen: usize,
@@ -689,6 +786,39 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// engine via [`set_reuse_barrier`](Self::set_reuse_barrier) around [`gc`](Self::gc)), in which case
     /// a freed id is immediately reusable — the inline/DST path and the no-open-reader fast path.
     reuse_barrier: Option<u64>,
+    /// **`rmp` #966.** The on-disk format version the durable catalog carried when this store was
+    /// opened (`05 §12.6`); [`graphus_core::constants::FORMAT_VERSION`] for a store this build
+    /// created. Surfaced by [`opened_format_version`](Self::opened_format_version) so a caller can
+    /// see that an upgrade happened; the store itself always writes the current version.
+    opened_format_version: u32,
+    /// **`rmp` #966 — the undo-delta slab.** A half-open run `[next, end)` of freshly-allocated
+    /// `undo.store` physical ids, all inside **one** store page, from which
+    /// [`alloc_undo_id`](Self::alloc_undo_id) hands out deltas by a bare counter increment.
+    ///
+    /// This is the store-record form of Memgraph's `delta_container`, whose whole purpose is that a
+    /// transaction does not pay an allocation per delta
+    /// (`/data/refsrc/memgraph/src/storage/v2/delta_container.hpp:57-60`). Here the cost avoided is
+    /// [`alloc_id`](Self::alloc_id)'s per-id free-list probe and `ensure_store_page` growth check; the
+    /// locality gained matters more: a transaction's deltas land contiguously in one page, so its
+    /// chain writes dirty one page and its WAL patches all name that page.
+    ///
+    /// Purely in-memory and never persisted: it is refilled from the allocator on demand and dropped
+    /// on rollback. An open slab's unconsumed tail is therefore *leaked* across a close/crash — at
+    /// most one page's worth of 56-byte slots (8 KiB) for the life of a store, and invisible to the
+    /// consistency checker, which does not require an allocated id to be either in use or free.
+    undo_slab: Option<(u64, u64)>,
+    /// **`rmp` #966.** Entities whose undo chain has grown since the last GC pass and may therefore
+    /// have become reclaimable: `(kind as u8, physical id)`. The GC chain sweep iterates exactly this
+    /// set instead of scanning the record stores, mirroring the `rmp` #522 pending-tombstone design.
+    /// Reseeded by a full scan on the first pass after [`open`](Self::open)
+    /// (`gc_full_scan_pending`), which is what makes a crash-recovered store's chains reclaimable
+    /// without any of this in-memory state surviving.
+    pending_undo_chains: std::collections::BTreeSet<(u8, u64)>,
+    /// **`rmp` #966.** Set when a rollback left one of its deltas threaded on an entity's chain as a
+    /// corpse (only possible when another transaction prepended onto the *same* entity in between),
+    /// which also strands that transaction's commit slot. The next full GC pass resolves it with a
+    /// reference sweep over `undo.store`; until then the slot is a bounded leak, never a hazard.
+    undo_orphan_slots_possible: bool,
     /// Exact, persisted live-record cardinalities for the planner's cardinality estimator
     /// (`rmp` task #79): per-label node counts and per-relationship-type counts. Part of the durable
     /// catalog ([`Meta`]) — mutated incrementally on the committed transitions that change a record's
@@ -844,6 +974,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // `rmp` #588: reader-safe slot-reuse overlay (in-memory; empty unless off-thread readers hold a slot).
             held_slots: std::array::from_fn(|_| HashMap::new()),
             reuse_barrier: None,
+            opened_format_version: graphus_core::constants::FORMAT_VERSION,
+            // `rmp` #966 undo-area state: all in-memory, all rebuilt from scratch every open. The
+            // chain sweep's pending set is reseeded by the first pass's full scan
+            // (`gc_full_scan_pending`), so a crash-recovered store reclaims its chains normally.
+            undo_slab: None,
+            pending_undo_chains: std::collections::BTreeSet::new(),
+            undo_orphan_slots_possible: false,
             statistics: Statistics::new(),
             checkpoint_interval_bytes: DEFAULT_CHECKPOINT_INTERVAL_BYTES,
             wal_segment_sizing_adaptive: true,
@@ -894,11 +1031,18 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // floors WAL reclamation so no commit record an unfrozen version needs is dropped.
             unfrozen_commit_lsn.insert(committed_txn, lsn);
         }
+        // `Meta::decode` has already decided the format-version question (`05 §12.6`): a version-1
+        // image arrives here with two EMPTY undo-area stores — which is exactly the state of a store
+        // that has no version chains, so the upgrade is a no-op rather than a conversion — and an
+        // image newer than this build understands never arrives at all, because `decode` refuses it.
+        let store_format_version = meta.format_version;
         let mut stores = [
             FixedStore::from_meta(StoreKind::Node, &meta.stores[0])?,
             FixedStore::from_meta(StoreKind::Rel, &meta.stores[1])?,
             FixedStore::from_meta(StoreKind::Prop, &meta.stores[2])?,
             FixedStore::from_meta(StoreKind::Strings, &meta.stores[3])?,
+            FixedStore::from_meta(StoreKind::Undo, &meta.stores[4])?,
+            FixedStore::from_meta(StoreKind::Commit, &meta.stores[5])?,
         ];
         // Re-attribute every record page the device holds back to its owning store (`rmp` #239). The
         // durable catalog persists a store's `device_pages`/`high_water` only at a *commit*; a page
@@ -963,6 +1107,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // `rmp` #588: reader-safe slot-reuse overlay (in-memory; empty unless off-thread readers hold a slot).
             held_slots: std::array::from_fn(|_| HashMap::new()),
             reuse_barrier: None,
+            opened_format_version: store_format_version,
+            // `rmp` #966 undo-area state: all in-memory, all rebuilt from scratch every open. The
+            // chain sweep's pending set is reseeded by the first pass's full scan
+            // (`gc_full_scan_pending`), so a crash-recovered store reclaims its chains normally.
+            undo_slab: None,
+            pending_undo_chains: std::collections::BTreeSet::new(),
+            undo_orphan_slots_possible: false,
             statistics: meta.statistics,
             checkpoint_interval_bytes: DEFAULT_CHECKPOINT_INTERVAL_BYTES,
             wal_segment_sizing_adaptive: true,
@@ -1011,14 +1162,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
 
     fn snapshot_meta(&self, committing: TxnId) -> Meta {
         Meta {
+            // Every catalog this build writes is a format-version-2 image, so a store opened at
+            // version 1 is UPGRADED by its first checkpoint (`05 §12.6`). The upgrade adds the two
+            // (empty) undo-area stores and loses nothing: a version-1 store has no chains, which is
+            // precisely what an empty undo area describes.
+            format_version: graphus_core::constants::FORMAT_VERSION,
             element_id_next: self.element_ids.peek(),
             commit_ts_hw: self.commit_ts_hw,
-            stores: [
-                self.stores[0].to_meta(),
-                self.stores[1].to_meta(),
-                self.stores[2].to_meta(),
-                self.stores[3].to_meta(),
-            ],
+            stores: std::array::from_fn(|i| self.stores[i].to_meta()),
             tokens: self.tokens.clone(),
             // Clones the whole `Statistics` (counts *and* the `rmp` task #81 property-histogram map):
             // the histogram blobs ride the same checkpoint-at-commit path as the counts with no
@@ -1075,11 +1226,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // the chunk bytes escape the borrow (they are appended to `payload`), so they are copied
             // out inside the closure (`rmp` #337, Slice 1 closure-API conversion).
             let chunk_and_next: Result<(Vec<u8>, u64)> = pool.with_page(f, |p| {
-                let chunk_len = u32::from_le_bytes(
+                // Mask off the format-version flag (`META_FORMAT_V2_FLAG`) an undo-area build sets on
+                // the head page: it is a tripwire for OLDER builds, not a length.
+                let chunk_len = (u32::from_le_bytes(
                     p[HEADER_SIZE..HEADER_SIZE + 4]
                         .try_into()
                         .expect("4-byte slice"),
-                ) as usize;
+                ) & !META_FORMAT_V2_FLAG) as usize;
                 let next = u64::from_le_bytes(
                     p[HEADER_SIZE + 4..HEADER_SIZE + 12]
                         .try_into()
@@ -1170,6 +1323,33 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     fn orphan_page_records_well_formed(page: &[u8], kind: StoreKind) -> bool {
         let record_size = kind.record_size();
         let rpp = paging::records_per_page(record_size);
+        // The undo area's records carry NO MVCC header (`05 §12`), so the header-shaped validation
+        // below would read their `action` / `commit_info` / `next` bytes as version stamps and reject a
+        // perfectly good page — bricking `open` on nothing worse than an aborted transaction having
+        // grown `undo.store` (`rmp` #966). Their own strict codecs are the right — and sharper —
+        // cross-validation: they reject an unknown action byte, a non-zero reserved field, and a
+        // payload field set on an action that does not own it, none of which survive being read at the
+        // wrong stride.
+        if !kind.is_versioned() {
+            for slot in 0..rpp {
+                let off = HEADER_SIZE + slot * record_size;
+                if off + record_size > page.len() {
+                    break;
+                }
+                let bytes = &page[off..off + record_size];
+                if undo::is_zeroed(bytes) {
+                    continue; // never-written slot: carries no invariant
+                }
+                let decodes = match kind {
+                    StoreKind::Undo => UndoDelta::decode(bytes).is_ok(),
+                    _ => CommitSlot::decode(bytes).is_ok(),
+                };
+                if !decodes {
+                    return false;
+                }
+            }
+            return true;
+        }
         for slot in 0..rpp {
             let off = HEADER_SIZE + slot * record_size;
             // Defensive bound (the arithmetic above never overruns for a valid `rpp`, but a future
@@ -1442,7 +1622,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             let chunk = &payload[lo..hi];
             let next = if i + 1 < total { pages[i + 1].0 } else { 0 };
             let mut framed = Vec::with_capacity(12 + chunk.len());
-            framed.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
+            // The head page carries the format-version tripwire; continuation pages do not, because a
+            // pre-#966 build never reaches one — it fails on the head (`META_FORMAT_V2_FLAG`).
+            let framed_len = if i == 0 {
+                chunk.len() as u32 | META_FORMAT_V2_FLAG
+            } else {
+                chunk.len() as u32
+            };
+            framed.extend_from_slice(&framed_len.to_le_bytes());
             framed.extend_from_slice(&next.to_le_bytes());
             framed.extend_from_slice(chunk);
             self.write_region(pages[i], HEADER_SIZE, &framed, txn)?;
@@ -1619,6 +1806,44 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// # Errors
     /// Returns a storage error if the store's physical-id space is exhausted (`rmp` #452, see
     /// [`PhysicalAllocator::alloc_fresh`]) or if mapping the fresh id's page fails (e.g. ENOSPC).
+    /// Pops the next **reusable** freed physical id of `kind`, or `None` when the free list is empty
+    /// or holds only ids still shadow-held for an in-flight off-thread reader (`rmp` #588).
+    ///
+    /// Held ids are stashed and re-listed so they stay free for later reuse once released; if only
+    /// held ids remain this returns `None` and the caller grows a fresh id rather than reusing one.
+    /// On the common path (`held_slots` empty) this is the pre-#588 single pop.
+    fn pop_free_id(&mut self, kind: StoreKind) -> Option<u64> {
+        if self.held_slots[kind as usize].is_empty() {
+            return self.store_mut(kind).free.pop();
+        }
+        let mut stash: Vec<u64> = Vec::new();
+        let picked = loop {
+            match self.store_mut(kind).free.pop() {
+                Some(id) if self.held_slots[kind as usize].contains_key(&id) => stash.push(id),
+                other => break other,
+            }
+        };
+        for id in stash {
+            self.store_mut(kind).free.push(id);
+        }
+        picked
+    }
+
+    /// Records that `txn` **popped** (reused) freed physical id `id` of `kind`, so a live rollback can
+    /// return it to the free list if the transaction aborts without the slot becoming a
+    /// live-referenced corpse (`rmp` #581). Mirrors the `SYSTEM_TXN` guard of
+    /// [`note_created`](Self::note_created) / [`free_push`](Self::free_push): the system transaction
+    /// never pops-then-aborts and is never rolled back.
+    fn note_popped_id(&mut self, txn: TxnId, kind: StoreKind, id: u64) {
+        if txn != SYSTEM_TXN {
+            self.active
+                .entry(txn)
+                .or_default()
+                .popped_ids
+                .push((kind, id));
+        }
+    }
+
     fn alloc_id(&mut self, kind: StoreKind, txn: TxnId) -> Result<u64> {
         // A freed id is reused first: its store page already exists (the record once lived there), so
         // no growth — and no fallibility — is needed. `rmp` #588: SKIP any freed id still shadow-held
@@ -1652,33 +1877,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                  history — some path returned them without calling LabelHistory::forget_node"
             );
         }
-        let reused = if self.held_slots[kind as usize].is_empty() {
-            self.store_mut(kind).free.pop()
-        } else {
-            let mut stash: Vec<u64> = Vec::new();
-            let picked = loop {
-                match self.store_mut(kind).free.pop() {
-                    Some(id) if self.held_slots[kind as usize].contains_key(&id) => stash.push(id),
-                    other => break other,
-                }
-            };
-            for id in stash {
-                self.store_mut(kind).free.push(id);
-            }
-            picked
-        };
-        if let Some(id) = reused {
-            // Record the pop so a live rollback can return this reused id to the free list if the
-            // transaction aborts without the slot becoming a live-referenced corpse (`rmp` #581).
-            // Mirrors the `SYSTEM_TXN` guard of `note_created`/`free_push`: the system transaction
-            // never pops-then-aborts and is never rolled back.
-            if txn != SYSTEM_TXN {
-                self.active
-                    .entry(txn)
-                    .or_default()
-                    .popped_ids
-                    .push((kind, id));
-            }
+        if let Some(id) = self.pop_free_id(kind) {
+            self.note_popped_id(txn, kind, id);
             return Ok(id);
         }
         // Fresh id: `alloc_fresh` first (it fails closed at the `u64::MAX` ceiling, `rmp` #452, so we
@@ -1913,12 +2113,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 device_pages: s.device_pages.reader(),
             }
         };
-        MetaSnapshot::new([
-            snap(StoreKind::Node),
-            snap(StoreKind::Rel),
-            snap(StoreKind::Prop),
-            snap(StoreKind::Strings),
-        ])
+        // Every store, including the undo area's two: the off-thread read path resolves a record's
+        // location through this snapshot, and a reader that walks a version chain (`rmp` #966 and the
+        // tasks built on it) must be able to locate a delta exactly as it locates a record.
+        MetaSnapshot::new(ALL_STORE_KINDS.map(snap))
     }
 
     /// Builds an owned, `Send + Sync` [`StoreReadView`] over this store's committed state (`rmp` task
@@ -2097,6 +2295,22 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             return Ok(None);
         }
 
+        // THE COMMIT INDIRECTION POINT (`04 §5.1.3`, `rmp` #966). Publish `txn`'s commit timestamp
+        // into its commit slot — one write that commits every delta it created — before the catalog
+        // checkpoint and the `COMMIT` record, so it is covered by this transaction's own WAL frames
+        // and by the same `fdatasync`. A transaction that created no delta owns no slot and this is a
+        // no-op. It is fallible, so it sits INSIDE the fallible section: a failure here leaves `txn` a
+        // fully-formed open writer whose slot still carries its in-flight stamp, i.e. uncommitted,
+        // which is exactly what a subsequent rollback expects to find (`rmp` #955).
+        debug_assert!(
+            wrote_durable
+                || self
+                    .active
+                    .get(&txn)
+                    .is_none_or(|a| a.commit_slot.is_none()),
+            "a transaction that owns a commit slot has written a record, so it must be WAL-active"
+        );
+        self.publish_commit_slot(txn, commit_ts)?;
         self.checkpoint_meta(txn, false)?;
         // PREPARE: append the `COMMIT` record with NO `fdatasync` (the group-commit deferral, `rmp`
         // #528). The caller hardens the whole batch with a single `harden_wal`.
@@ -2538,6 +2752,777 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         Ok(())
     }
 
+    // ------------------- the undo area (`rmp` #966, `05 §12`, `04 §5.1`) -------------------
+    //
+    // `undo_ptr` is a chain head with exactly the shape of `first_rel` / `first_prop`: writers
+    // PREPEND to it and never rewrite an already-linked delta. It therefore inherits the whole
+    // chain-safety discipline established above, and for the same reasons:
+    //
+    //   * the head is published with `write_chain_head`, whose undo is a compare-and-set — an abort
+    //     never clobbers a head a later writer legitimately owns;
+    //   * a delta's first (and only) write uses a **header-only creation undo** that reverts just the
+    //     `flags` byte, so an aborted delta becomes a *corpse* whose `next` is intact and a survivor
+    //     that prepended on top still threads through it to its successor (`rmp` #220);
+    //   * the publication ORDER is fixed and normative (`04 §5.1.2` step 3): the delta is written in
+    //     full, with `next` already pointing at the current head, and the head is published LAST. A
+    //     concurrent reader, or the GC, therefore observes either the old chain or the new one, never
+    //     a partially-linked one.
+
+    /// Reads the `undo.store` delta at physical id `id`.
+    ///
+    /// Returns `Ok(None)` for a slot that is entirely zero — never written — which is not a delta at
+    /// all (`05 §12.3`: action `0` is reserved). Any other malformed slot is an error, never a
+    /// plausible-looking delta. A *reclaimed* slot decodes normally with its `in_use` bit clear: like
+    /// every other store here, freeing a slot clears the flag and leaves the body until the slot is
+    /// reused, so the whole record need not be rewritten to free it.
+    ///
+    /// # Errors
+    /// Returns a storage error if `id` is out of range, its page is unreadable, or the slot is
+    /// occupied but does not decode.
+    fn read_delta(&self, id: u64) -> Result<Option<UndoDelta>> {
+        let buf = self.read_undo_slot_bytes(StoreKind::Undo, id, undo::UNDO_RECORD_SIZE)?;
+        if undo::is_zeroed(&buf) {
+            return Ok(None);
+        }
+        UndoDelta::decode(&buf)
+            .map(Some)
+            .map_err(|e| GraphusError::Storage(format!("undo delta {id}: {e}")))
+    }
+
+    /// Reads the `commit.store` slot at physical id `id`. `Ok(None)` for a zeroed slot, exactly as
+    /// [`read_delta`](Self::read_delta).
+    ///
+    /// # Errors
+    /// Returns a storage error if `id` is out of range, its page is unreadable, or the slot is
+    /// occupied but does not decode.
+    fn read_commit_slot(&self, id: u64) -> Result<Option<CommitSlot>> {
+        let buf = self.read_undo_slot_bytes(StoreKind::Commit, id, undo::COMMIT_RECORD_SIZE)?;
+        if undo::is_zeroed(&buf) {
+            return Ok(None);
+        }
+        CommitSlot::decode(&buf)
+            .map(Some)
+            .map_err(|e| GraphusError::Storage(format!("commit slot {id}: {e}")))
+    }
+
+    /// Copies the `len` raw bytes of undo-area record `id` out from its resident page under one read
+    /// latch. Bounds-checked against the store's high-water mark first, so a dangling chain pointer
+    /// is reported as such rather than silently reading a neighbouring slot.
+    fn read_undo_slot_bytes(&self, kind: StoreKind, id: u64, len: usize) -> Result<Vec<u8>> {
+        if id == NULL_ID || id >= self.store(kind).alloc.high_water() {
+            return Err(GraphusError::Storage(format!(
+                "{kind:?} store id {id} is outside 1..{}",
+                self.store(kind).alloc.high_water()
+            )));
+        }
+        let (rel_page, off) = paging::record_location(id, kind.record_size());
+        let dev = self.device_page(kind, rel_page)?;
+        let f = self.pool.fetch(dev)?;
+        let bytes = self.pool.with_page(f, |p| p[off..off + len].to_vec());
+        self.pool.unpin(f);
+        Ok(bytes)
+    }
+
+    /// Returns a physical id for a fresh `undo.store` delta: a reclaimed id when one is available,
+    /// otherwise the next id of this store's **slab**.
+    ///
+    /// The slab is the store-record form of Memgraph's `delta_container`
+    /// (`/data/refsrc/memgraph/src/storage/v2/delta_container.hpp:57-60`): rather than allocating per
+    /// delta, one page's worth of contiguous ids is claimed at a time and handed out by a counter
+    /// increment. Reuse is still preferred over growth, so the store does not grow while reclaimed
+    /// slots are available. See [`undo_slab`](Self#structfield.undo_slab).
+    ///
+    /// # Errors
+    /// Returns a storage error if the slab cannot be refilled (id-space exhaustion, or a failure
+    /// mapping the slab's page).
+    fn alloc_undo_id(&mut self, txn: TxnId) -> Result<u64> {
+        if let Some(id) = self.pop_free_id(StoreKind::Undo) {
+            self.note_popped_id(txn, StoreKind::Undo, id);
+            return Ok(id);
+        }
+        let (next, end) = match self.undo_slab {
+            Some((next, end)) if next < end => (next, end),
+            _ => self.refill_undo_slab(txn)?,
+        };
+        self.undo_slab = Some((next + 1, end));
+        Ok(next)
+    }
+
+    /// Claims the rest of the current `undo.store` page as a fresh slab and returns its `[next, end)`
+    /// range. The slab never crosses a page boundary, so a transaction's deltas cluster in one page:
+    /// one dirty page and one WAL-patch target for the whole chain-writing burst.
+    fn refill_undo_slab(&mut self, txn: TxnId) -> Result<(u64, u64)> {
+        let rpp = paging::records_per_page(undo::UNDO_RECORD_SIZE) as u64;
+        let first = self.store(StoreKind::Undo).alloc.high_water().max(1);
+        let rel_page = first / rpp;
+        // Fail closed rather than compute a wrapped range: a wrapped `end <= first` would make the
+        // slab permanently empty and every refill a no-op, i.e. a livelock on a path that is supposed
+        // to report exhaustion. `alloc_fresh` fails closed at the same ceiling for the same reason
+        // (`rmp` #452).
+        let end = rel_page
+            .checked_add(1)
+            .and_then(|p| p.checked_mul(rpp))
+            .filter(|&end| end > first)
+            .ok_or_else(|| {
+                GraphusError::Storage(
+                    "undo.store physical-id space is exhausted; no delta slab can be claimed"
+                        .to_owned(),
+                )
+            })?;
+        // Bump the allocator over the whole run BEFORE mapping the page, then un-bump on a mapping
+        // failure — the same fail-closed discipline `alloc_id` uses, and for the same reason: the
+        // catalog invariant `high_water <= addressable capacity` must hold the instant it can be
+        // observed. No id in the run has been written, so re-handing them out later is safe.
+        for _ in first..end {
+            self.store_mut(StoreKind::Undo).alloc.alloc_fresh()?;
+        }
+        if let Err(e) = self.ensure_store_page(StoreKind::Undo, rel_page, txn) {
+            self.store_mut(StoreKind::Undo).alloc = PhysicalAllocator::restore(first);
+            return Err(e);
+        }
+        self.undo_slab = Some((first, end));
+        Ok((first, end))
+    }
+
+    /// The `commit.store` slot of `txn`, allocating and writing it on first use (`04 §5.1.3`).
+    ///
+    /// The slot opens carrying `txn`'s **in-flight** version stamp, which is what makes an
+    /// unpublished slot self-describing: a delta that resolves through it reads "still in flight",
+    /// and after a crash a slot still carrying an in-flight stamp names a loser transaction
+    /// (`05 §12.5`).
+    ///
+    /// # Errors
+    /// Returns a storage error if the slot cannot be allocated or written.
+    fn commit_slot_for(&mut self, txn: TxnId) -> Result<u64> {
+        if let Some(id) = self.active.get(&txn).and_then(|a| a.commit_slot) {
+            return Ok(id);
+        }
+        let id = self.alloc_id(StoreKind::Commit, txn)?;
+        let mut buf = [0u8; undo::COMMIT_RECORD_SIZE];
+        CommitSlot::open(txn.0, VersionStamp::in_flight(txn)).encode(&mut buf);
+        // Header-only creation undo, as for a relationship/property record (`rmp` #220): an abort
+        // clears the slot's `in_use` bit and leaves `txn_id` and the in-flight stamp in place, so a
+        // delta that survived the abort as a corpse can still be attributed to the transaction that
+        // failed to commit.
+        self.write_undo_area_create(StoreKind::Commit, id, &buf, undo::COMMIT_OFF_FLAGS, txn)?;
+        self.active.entry(txn).or_default().commit_slot = Some(id);
+        Ok(id)
+    }
+
+    /// Prepends `delta` to entity `(kind, entity)`'s undo chain under `txn` and publishes it as the
+    /// new chain head, returning the delta's physical id (`04 §5.1.2` steps 2–3).
+    ///
+    /// `delta`'s `commit_info` and `next` are filled in here — a caller supplies only the action and
+    /// its payload, because the transaction owns the slot and the chain owns the link.
+    ///
+    /// # Errors
+    /// Returns a storage error if the entity's header cannot be read, the delta cannot be allocated
+    /// or written, or the chain head cannot be published.
+    fn link_delta(
+        &mut self,
+        kind: StoreKind,
+        entity: u64,
+        mut delta: UndoDelta,
+        txn: TxnId,
+    ) -> Result<u64> {
+        debug_assert!(
+            kind.is_versioned(),
+            "only a record carrying the `05 §7` MVCC header can anchor an undo chain"
+        );
+        let slot = self.commit_slot_for(txn)?;
+        let head = self.read_mvcc(kind, entity)?.undo_ptr;
+        let id = self.alloc_undo_id(txn)?;
+        delta.flags = undo::FLAG_IN_USE;
+        delta.commit_info = slot;
+        delta.next = head;
+        let mut buf = [0u8; undo::UNDO_RECORD_SIZE];
+        delta.encode(&mut buf);
+        // STEP 3, and its order is not negotiable: the delta is written IN FULL — `next` already
+        // naming the current head — and only then is the head republished. Reversed, a reader or the
+        // GC could observe an `undo_ptr` pointing at a slot that is not yet a valid delta.
+        self.write_undo_area_create(StoreKind::Undo, id, &buf, undo::UNDO_OFF_FLAGS, txn)?;
+        self.write_chain_head(kind, entity, MVCC_OFF_UNDO_PTR, id, head, txn)?;
+        self.active
+            .entry(txn)
+            .or_default()
+            .undo_links
+            .push(UndoLink {
+                kind,
+                entity,
+                delta: id,
+            });
+        // The chain just grew, so it becomes a candidate for the GC chain sweep (`rmp` #522's
+        // pending-set design, applied to chains): the sweep iterates this set instead of scanning.
+        self.pending_undo_chains.insert((kind as u8, entity));
+        Ok(id)
+    }
+
+    /// First write of a freshly-allocated undo-area record, with the **header-only creation undo**
+    /// (`rmp` #220): redo installs the whole record, undo reverts only the `flags` byte at
+    /// `flags_off`. An aborted delta therefore keeps its `next`, and an aborted commit slot keeps its
+    /// `txn_id` — both of which a survivor still has to be able to read.
+    fn write_undo_area_create(
+        &mut self,
+        kind: StoreKind,
+        id: u64,
+        buf: &[u8],
+        flags_off: usize,
+        txn: TxnId,
+    ) -> Result<()> {
+        let (rel_page, off) = paging::record_location(id, kind.record_size());
+        let dev = self.ensure_store_page(kind, rel_page, txn)?;
+        let end = off + buf.len();
+        let f = self.pool.fetch(dev)?;
+        // Capture the one-byte flags pre-image under a read latch, strictly before the whole-record
+        // post-image overwrite under the write latch (frame pinned across both, `rmp` #337).
+        let undo_img = self
+            .pool
+            .with_page(f, |p| {
+                paging::encode_patch(off + flags_off, &p[off + flags_off..off + flags_off + 1])
+            })
+            .into_vec();
+        let redo = paging::encode_patch(off, buf);
+        let lsn = self
+            .wal
+            .with(|w| w.log_update_borrowed(txn, dev, &redo, undo_img));
+        self.pool.with_page_mut_lsn(f, lsn, |p| {
+            p[off..end].copy_from_slice(buf);
+        });
+        self.pool.unpin(f);
+        Ok(())
+    }
+
+    /// Patches one 8-byte word of commit slot `id` under `txn`, with a plain pre-image undo.
+    ///
+    /// A plain undo is correct here — and only here among the undo area's writes — because a commit
+    /// slot is **private to one transaction**: no other writer ever touches it, so its pre-image can
+    /// never go stale the way a shared chain head's can.
+    fn patch_commit_slot_word(
+        &mut self,
+        id: u64,
+        field_off: usize,
+        word: u64,
+        txn: TxnId,
+    ) -> Result<()> {
+        let (rel_page, off) = paging::record_location(id, undo::COMMIT_RECORD_SIZE);
+        let dev = self.device_page(StoreKind::Commit, rel_page)?;
+        self.write_region(dev, off + field_off, &word.to_le_bytes(), txn)
+    }
+
+    /// **The commit indirection point** (`04 §5.1.3`, `05 §12.4`): publishes `txn`'s commit into its
+    /// commit slot, which commits **every one of its deltas at the same instant**.
+    ///
+    /// The write order is normative: `delta_count` first, `commit_ts` **last**. Until `commit_ts` is
+    /// published no reader treats this transaction as committed, so the earlier write is never
+    /// observable as a partial commit; publishing `commit_ts` last is what makes a reader see either
+    /// the whole transaction or none of it — atomicity expressed in the data structure rather than
+    /// reconstructed by a sweep.
+    ///
+    /// A no-op for a transaction that created no delta (it has no slot).
+    ///
+    /// # Errors
+    /// Returns a storage error if either word cannot be written.
+    fn publish_commit_slot(&mut self, txn: TxnId, commit_ts: Timestamp) -> Result<()> {
+        let Some(active) = self.active.get(&txn) else {
+            return Ok(());
+        };
+        let Some(slot) = active.commit_slot else {
+            return Ok(());
+        };
+        let count = active.undo_links.len() as u64;
+        self.patch_commit_slot_word(slot, undo::COMMIT_OFF_DELTA_COUNT, count, txn)?;
+        self.patch_commit_slot_word(
+            slot,
+            undo::COMMIT_OFF_COMMIT_TS,
+            VersionStamp::committed(commit_ts),
+            txn,
+        )?;
+        Ok(())
+    }
+
+    /// Walks entity `(kind, entity)`'s undo chain newest-first, returning `(delta id, delta)` pairs.
+    ///
+    /// The walk threads through **corpse** deltas (an aborted transaction's, whose `in_use` bit its
+    /// creation undo cleared) exactly as the incidence walk threads through a dead-link relationship
+    /// corpse: their action is never applied, but their `next` is still the way to the older versions
+    /// below them.
+    ///
+    /// # Errors
+    /// Returns a storage error if a link dangles (points at a zeroed or out-of-range slot) or the
+    /// chain fails to terminate within the store's id space — both of which are corruption, not
+    /// states a healthy store can reach.
+    fn undo_chain(&self, kind: StoreKind, entity: u64) -> Result<Vec<(u64, UndoDelta)>> {
+        let mut out = Vec::new();
+        let mut cur = self.read_mvcc(kind, entity)?.undo_ptr;
+        // One step per allocated delta is the exact ceiling: a well-formed chain visits each delta at
+        // most once, so exceeding it proves a cycle without needing a visited set on the hot path.
+        let guard = self.store(StoreKind::Undo).alloc.high_water();
+        let mut steps = 0u64;
+        while cur != NULL_ID {
+            steps += 1;
+            if steps > guard {
+                return Err(GraphusError::Storage(format!(
+                    "undo chain of {kind:?} {entity} is malformed (cycle?)"
+                )));
+            }
+            let Some(delta) = self.read_delta(cur)? else {
+                return Err(GraphusError::Storage(format!(
+                    "undo chain of {kind:?} {entity} reaches empty delta slot {cur}"
+                )));
+            };
+            out.push((cur, delta));
+            cur = delta.next;
+        }
+        Ok(out)
+    }
+
+    /// Detaches entity `(kind, entity)`'s **whole** undo chain under `txn` and reclaims every delta on
+    /// it, returning how many deltas were freed.
+    ///
+    /// Detaching before freeing is what keeps the chain valid at every instant: the head is set to
+    /// `0` first — with the same compare-and-set undo its publication used — so nothing can reach a
+    /// delta whose slot is about to be listed as free.
+    ///
+    /// # Errors
+    /// Returns a storage error if the chain is malformed or a write fails.
+    fn free_undo_chain(&mut self, kind: StoreKind, entity: u64, txn: TxnId) -> Result<usize> {
+        let chain = self.undo_chain(kind, entity)?;
+        if chain.is_empty() {
+            return Ok(0);
+        }
+        let head = chain[0].0;
+        self.write_chain_head(kind, entity, MVCC_OFF_UNDO_PTR, NULL_ID, head, txn)?;
+        for &(id, delta) in &chain {
+            self.free_delta(id, delta, txn)?;
+        }
+        // The candidate entry is deliberately LEFT in `pending_undo_chains`. Dropping it here would be
+        // wrong if this transaction later rolls back — the WAL undo restores the chain, but nothing
+        // would restore the candidate, so the chain would go unswept until the next post-open full
+        // scan. The next pass reads an empty chain and drops the entry then, which is self-healing
+        // under both outcomes and costs one header read.
+        Ok(chain.len())
+    }
+
+    /// Reclaims one unreachable delta: clears its `in_use` bit, releases its hold on its commit slot,
+    /// and returns its id to the free list.
+    ///
+    /// Only the flag byte is written, not the whole record — the same discipline every other store
+    /// uses when it frees a slot (the body survives until the slot is reused), and one 1-byte WAL
+    /// patch instead of 56.
+    fn free_delta(&mut self, id: u64, delta: UndoDelta, txn: TxnId) -> Result<()> {
+        let (rel_page, off) = paging::record_location(id, undo::UNDO_RECORD_SIZE);
+        let dev = self.device_page(StoreKind::Undo, rel_page)?;
+        self.write_region(dev, off + undo::UNDO_OFF_FLAGS, &[0u8], txn)?;
+        self.release_commit_slot(delta.commit_info, txn)?;
+        self.free_push(StoreKind::Undo, id, txn);
+        Ok(())
+    }
+
+    /// Decrements commit slot `slot`'s `delta_count` for one reclaimed delta and frees the slot when
+    /// the count reaches zero (`05 §12.4`).
+    ///
+    /// The invariant this maintains is that **a slot outlives its last delta**: no delta may ever
+    /// refer to a freed or reused slot, because a delta's committed-ness is only knowable through it.
+    /// An **aborted** transaction's slot never carries a count (it never committed), so it is left
+    /// alone here and reclaimed by the orphan sweep once nothing names it.
+    fn release_commit_slot(&mut self, slot: u64, txn: TxnId) -> Result<()> {
+        let Some(rec) = self.read_commit_slot(slot)? else {
+            return Ok(());
+        };
+        if !rec.in_use() {
+            // A corpse slot: its transaction aborted, so there is no count to decrement. Whether it is
+            // still named by another corpse delta is a question only a reference sweep can answer.
+            self.undo_orphan_slots_possible = true;
+            return Ok(());
+        }
+        let remaining = rec.delta_count.saturating_sub(1);
+        self.patch_commit_slot_word(slot, undo::COMMIT_OFF_DELTA_COUNT, remaining, txn)?;
+        if remaining == 0 {
+            let (rel_page, off) = paging::record_location(slot, undo::COMMIT_RECORD_SIZE);
+            let dev = self.device_page(StoreKind::Commit, rel_page)?;
+            self.write_region(dev, off + undo::COMMIT_OFF_FLAGS, &[0u8], txn)?;
+            self.free_push(StoreKind::Commit, slot, txn);
+        }
+        Ok(())
+    }
+
+    /// Writes the `DeleteObject` delta that records the creation of node / relationship `id` under
+    /// `txn`, and returns the `undo_ptr` the caller must put into the **new record it is about to
+    /// write** (`05 §12.3`).
+    ///
+    /// **The action is the inverse of the event**, which is the convention of this whole subsystem: a
+    /// creation is undone by a deletion, so a creation writes `DeleteObject`.
+    ///
+    /// # Why a creation publishes its chain head differently
+    ///
+    /// Every other mutation publishes the head with a separate compare-and-set chain-head write
+    /// ([`link_delta`](Self::link_delta)), because the entity already exists and a concurrent writer
+    /// may own its head. A **creation** has neither problem: there is no prior head to displace, and
+    /// nothing can observe — let alone prepend to — a record that does not exist yet. So the head
+    /// rides along in the record's own first write, and the publication order of `04 §5.1.2` step 3 is
+    /// still honoured exactly: the delta is written in full **before** the record that names it.
+    ///
+    /// That is worth one WAL record and one page fetch per created entity, which on the hottest write
+    /// path in the engine is not a rounding error — **measured over 1000 `create_node`s: 398 WAL bytes
+    /// per node with a separate chain-head write, 311 with the head inline** (the pre-`rmp`-#966
+    /// baseline, with no chain at all, is 192). The budget is pinned by
+    /// `tests/undo_chain.rs::the_wal_cost_of_a_created_entity_stays_within_its_budget`.
+    ///
+    /// The abort story is unchanged and needs no compare-and-set: a creation's undo reverts the new
+    /// record's MVCC header — `undo_ptr` included — so an aborted creation leaves the head at `0`,
+    /// which is exactly what the compare-and-set undo would have restored.
+    ///
+    /// Returns `0` (no chain) for the reserved [`SYSTEM_TXN`], which writes only the catalog, is never
+    /// rolled back and has no [`VersionStamp`] form (its id does not fit the stamp's 63-bit payload),
+    /// so it can neither own a commit slot nor need one.
+    ///
+    /// # Errors
+    /// Returns a storage error if the delta cannot be allocated or written.
+    fn creation_chain_head(&mut self, kind: StoreKind, id: u64, txn: TxnId) -> Result<u64> {
+        if txn == SYSTEM_TXN {
+            return Ok(NULL_ID);
+        }
+        let slot = self.commit_slot_for(txn)?;
+        let delta_id = self.alloc_undo_id(txn)?;
+        let mut buf = [0u8; undo::UNDO_RECORD_SIZE];
+        UndoDelta::new(UndoAction::DeleteObject, slot, 0, NULL_ID).encode(&mut buf);
+        self.write_undo_area_create(StoreKind::Undo, delta_id, &buf, undo::UNDO_OFF_FLAGS, txn)?;
+        self.active
+            .entry(txn)
+            .or_default()
+            .undo_links
+            .push(UndoLink {
+                kind,
+                entity: id,
+                delta: delta_id,
+            });
+        self.pending_undo_chains.insert((kind as u8, id));
+        Ok(delta_id)
+    }
+
+    /// Links the `RecreateObject` delta that records the MVCC deletion of node / relationship `id`
+    /// under `txn` (`05 §12.3`) — the inverse of the event, exactly as a creation's `DeleteObject` is
+    /// ([`creation_chain_head`](Self::creation_chain_head)).
+    ///
+    /// Unlike a creation, this goes through the full [`link_delta`](Self::link_delta) publication: the
+    /// entity already exists, already has a chain head to displace, and a concurrently-interleaved
+    /// transaction may legitimately own that head — so the head must be published by the
+    /// compare-and-set chain-head write, not carried in a record body.
+    ///
+    /// # Errors
+    /// Returns a storage error if the delta cannot be allocated, written, or linked.
+    fn note_entity_deleted(&mut self, kind: StoreKind, id: u64, txn: TxnId) -> Result<()> {
+        if txn == SYSTEM_TXN {
+            return Ok(());
+        }
+        self.link_delta(
+            kind,
+            id,
+            UndoDelta::new(UndoAction::RecreateObject, 0, 0, 0),
+            txn,
+        )?;
+        Ok(())
+    }
+
+    /// Reclaims the undo-area slots of a transaction that has just **aborted**, given the deltas it
+    /// linked and the commit slot it owned (`rmp` #966).
+    ///
+    /// Called from [`rollback`](Self::rollback) *after* the WAL undo has run, so every one of this
+    /// transaction's chain-head publications has already been compare-and-set-undone and every one of
+    /// its deltas has already had its `in_use` bit cleared. What is left to decide is purely a space
+    /// question, and it is decided **by re-walking each touched entity's chain** rather than by
+    /// assuming the undo fired: a delta a concurrent transaction prepended on top of is still
+    /// threaded, as a corpse, and its slot must NOT be handed out again — the delta twin of
+    /// [`reclaim_aborted_pops`](Self::reclaim_aborted_pops).
+    ///
+    /// Infallible and best-effort by construction: it performs no page write (rollback's post-undo
+    /// section must stay infallible, `rmp` #955) and any read error simply leaves the slot leaked,
+    /// which is safe. A leaked slot is reclaimed later by the GC chain sweep or its orphan pass.
+    fn reclaim_aborted_undo(&mut self, links: &[UndoLink], commit_slot: Option<u64>) {
+        if links.is_empty() {
+            // No delta ⇒ nothing can name the slot, so an allocated-but-unused slot is free again.
+            if let Some(slot) = commit_slot {
+                self.free_orphan_slot(StoreKind::Commit, slot);
+            }
+            return;
+        }
+        // One walk per touched entity, not per delta: a transaction that linked several deltas onto
+        // the same entity (create-then-delete in one transaction) must not walk it twice.
+        let mut entities: Vec<(StoreKind, u64)> =
+            links.iter().map(|l| (l.kind, l.entity)).collect();
+        entities.sort_unstable_by_key(|&(kind, id)| (kind as u8, id));
+        entities.dedup();
+        let mut still_threaded = std::collections::BTreeSet::new();
+        for (kind, entity) in entities {
+            match self.undo_chain(kind, entity) {
+                Ok(chain) => {
+                    if chain.is_empty() {
+                        continue;
+                    }
+                    // The entity still has a chain, so at least one delta on it survived this abort —
+                    // it belongs to another writer, or it is one of ours that a later prepend pinned.
+                    self.pending_undo_chains.insert((kind as u8, entity));
+                    still_threaded.extend(chain.iter().map(|&(id, _)| id));
+                }
+                // Cannot prove the chain no longer reaches our deltas ⇒ free none of this entity's
+                // (a safe leak, never a double-free).
+                Err(_) => still_threaded.extend(
+                    links
+                        .iter()
+                        .filter(|l| l.kind == kind && l.entity == entity)
+                        .map(|l| l.delta),
+                ),
+            }
+        }
+        let mut any_threaded = false;
+        for link in links {
+            if still_threaded.contains(&link.delta) {
+                any_threaded = true;
+            } else {
+                self.free_orphan_slot(StoreKind::Undo, link.delta);
+            }
+        }
+        match commit_slot {
+            // A threaded corpse delta still names this slot, so the slot must outlive it (`05 §12.4`).
+            // It carries no delta count (it never committed), so only a reference sweep can free it.
+            Some(_) if any_threaded => self.undo_orphan_slots_possible = true,
+            Some(slot) => self.free_orphan_slot(StoreKind::Commit, slot),
+            None => {}
+        }
+    }
+
+    /// Returns a provably-unreferenced undo-area id to its store's free list **without** a page write
+    /// and without the per-transaction bookkeeping [`free_push`](Self::free_push) records.
+    ///
+    /// Both omissions are deliberate. The slot's `in_use` bit has already been cleared — by the WAL
+    /// undo on the rollback path, or by an explicit write on the GC path — so no write is owed; and
+    /// the transaction this id belonged to has already ended, so there is no rollback left to withdraw
+    /// the push. The `rmp` #588 reuse hold still applies: an off-thread reader mid-walk may hold a
+    /// pointer into the slot.
+    fn free_orphan_slot(&mut self, kind: StoreKind, id: u64) {
+        if self.store(kind).free.ids().contains(&id) {
+            return;
+        }
+        self.store_mut(kind).free.push(id);
+        if let Some(barrier) = self.reuse_barrier {
+            self.held_slots[kind as usize].insert(id, barrier);
+        }
+    }
+
+    /// GC phase F (`rmp` #966): reclaims every undo chain no live snapshot can still reach, and
+    /// returns how many deltas were freed.
+    ///
+    /// **The rule.** A chain is reclaimed *whole*, from the entity's `undo_ptr` down, and only when
+    /// **every** delta on it is dead — either an aborted transaction's corpse, or committed at or
+    /// before `watermark` (the oldest active snapshot, `04 §5.5`). Whole-chain reclamation is what
+    /// keeps a delta immutable once linked (`05 §12.2`): nothing is ever spliced out of the middle of
+    /// a chain, so no delta's `next` is ever rewritten. The per-delta test is needed as well as the
+    /// head's, because statement-granularity interleaving can leave a *newer* committed delta above an
+    /// *older* still-in-flight one.
+    ///
+    /// The candidate set is the entities whose chains grew since the last pass
+    /// ([`pending_undo_chains`](Self#structfield.pending_undo_chains)), reseeded by a full scan on the
+    /// first pass after `open` — the same incremental shape the `rmp` #522 tombstone sweep uses, and
+    /// what makes a crash-recovered store (which has none of this in-memory state) reclaim normally.
+    ///
+    /// # Errors
+    /// Returns a storage error if a chain is malformed or a write fails.
+    fn gc_reclaim_undo_chains(&mut self, txn: TxnId, watermark: Timestamp) -> Result<usize> {
+        // The chain-head census, collected only on the pass that scans the record stores anyway. It is
+        // what lets the orphan sweep below free a delta a CRASH stranded (see
+        // [`gc_sweep_undo_orphans`](Self::gc_sweep_undo_orphans)).
+        let chain_heads = if self.gc_full_scan_pending {
+            Some(self.seed_pending_undo_chains()?)
+        } else {
+            None
+        };
+        let candidates: Vec<(u8, u64)> = self.pending_undo_chains.iter().copied().collect();
+        let mut freed = 0usize;
+        for (kind_byte, entity) in candidates {
+            let kind = ALL_STORE_KINDS[kind_byte as usize];
+            let chain = self.undo_chain(kind, entity)?;
+            if chain.is_empty() {
+                self.pending_undo_chains.remove(&(kind_byte, entity));
+                continue;
+            }
+            let mut all_dead = true;
+            for &(_, delta) in &chain {
+                if !self.delta_is_dead(delta, watermark)? {
+                    all_dead = false;
+                    break;
+                }
+            }
+            if all_dead {
+                freed += self.free_undo_chain(kind, entity, txn)?;
+            }
+        }
+        // The reference sweep runs when something may have been stranded: a rollback that left a
+        // threaded corpse, or the first pass after `open` (which is where a crash-stranded delta is
+        // collected — and the only pass that holds the chain-head census it needs).
+        if self.undo_orphan_slots_possible || chain_heads.is_some() {
+            freed += self.gc_sweep_undo_orphans(txn, chain_heads.as_ref())?;
+        }
+        Ok(freed)
+    }
+
+    /// Whether `delta` can no longer be needed by any live snapshot: its transaction aborted (the
+    /// delta is a corpse, or its slot is), or it committed at or before the GC `watermark`.
+    ///
+    /// Every one of those questions is answered **through the commit slot** — the indirection point
+    /// (`04 §5.1.3`). That is the whole economy of the design: one word per transaction decides the
+    /// fate of all of its deltas, instead of a stamp per record that a freeze sweep has to rewrite.
+    fn delta_is_dead(&self, delta: UndoDelta, watermark: Timestamp) -> Result<bool> {
+        if !delta.in_use() {
+            return Ok(true);
+        }
+        let Some(slot) = self.read_commit_slot(delta.commit_info)? else {
+            // The slot is gone, so nothing can resolve this delta's status any more. That must never
+            // happen (`05 §12.4`: a slot outlives its last delta) and the checker reports it; treat the
+            // delta as live here so GC never compounds the damage by freeing more.
+            return Ok(false);
+        };
+        if !slot.in_use() {
+            return Ok(true); // aborted transaction
+        }
+        Ok(match VersionStamp::from_raw(slot.commit_ts) {
+            VersionStamp::Committed(ts) => ts <= watermark,
+            // Still open — or a writer whose commit the registry has since resolved but whose slot is
+            // this build's durable record of it. Either way, not reclaimable yet.
+            VersionStamp::InFlight(_) | VersionStamp::None => false,
+        })
+    }
+
+    /// Rebuilds [`pending_undo_chains`](Self#structfield.pending_undo_chains) by scanning the three
+    /// versioned stores for a non-zero `undo_ptr`.
+    ///
+    /// Runs only on the first GC pass after `open` (the `gc_full_scan_pending` gate every other
+    /// full-store sweep shares), which is exactly what a crash-recovered store needs: the pending set
+    /// is in-memory only, so without this a recovered store would never reclaim the chains ARIES redo
+    /// rebuilt for it.
+    /// Also returns the set of **chain heads** it saw — every non-zero `undo_ptr` in the store. That
+    /// set is the half of the delta-reference census the undo store cannot supply on its own, and it
+    /// is what lets [`gc_sweep_undo_orphans`](Self::gc_sweep_undo_orphans) free a delta a **crash**
+    /// stranded (see that method).
+    fn seed_pending_undo_chains(&mut self) -> Result<std::collections::BTreeSet<u64>> {
+        let mut heads = std::collections::BTreeSet::new();
+        for kind in MVCC_STORE_KINDS {
+            let hw = self.store(kind).alloc.high_water();
+            for id in 1..hw {
+                let head = self.read_mvcc(kind, id)?.undo_ptr;
+                if head != NULL_ID {
+                    self.pending_undo_chains.insert((kind as u8, id));
+                    heads.insert(head);
+                }
+            }
+        }
+        Ok(heads)
+    }
+
+    /// The undo area's **reference sweep**: frees every delta and every commit slot that nothing names
+    /// any more (`rmp` #966). Returns how many deltas it freed.
+    ///
+    /// It is the reclaimer of last resort, for the two lifetimes the precise paths cannot cover:
+    ///
+    /// * **A delta a crash stranded.** A creation writes its delta and then the record that names it.
+    ///   A crash between the two leaves a delta the ARIES undo turns into a corpse but that no chain
+    ///   ever reached, and — unlike a live rollback, where
+    ///   [`reclaim_aborted_undo`](Self::reclaim_aborted_undo) knows exactly which deltas the aborting
+    ///   transaction linked — nothing in memory survives a crash to say so. Only a census can.
+    /// * **An aborted transaction's slot that a threaded corpse delta still named** when its rollback
+    ///   ran. Such a slot never carries a `delta_count` (it never committed), so the count rule of
+    ///   `05 §12.4` cannot free it either.
+    ///
+    /// **The census.** A delta is reachable exactly when it is some record's `undo_ptr` or some live
+    /// delta's `next`; a slot is reachable exactly when some live delta names it as `commit_info`. The
+    /// undo-store scan supplies the `next` and `commit_info` halves; `chain_heads` supplies the
+    /// `undo_ptr` half, and is `Some` only on a pass that has just scanned the record stores for it
+    /// ([`seed_pending_undo_chains`](Self::seed_pending_undo_chains)). Without it the delta phase is
+    /// skipped rather than guessed — a skipped reclamation is a bounded leak, a wrong one is corruption.
+    ///
+    /// Two conservative rules, both in the safe direction:
+    ///
+    /// * a **freed** delta's body is not rewritten when it is freed (only its flag is cleared), so its
+    ///   stale `next` must not be counted as a reference — free-listed deltas are excluded from the
+    ///   census;
+    /// * a slot owned by a **still-open** transaction is never freed, because that transaction may be
+    ///   between allocating its slot and linking its first delta, at which instant nothing names it.
+    ///
+    /// If the GC pass that ran this sweep later **rolls back**, its frees are undone by the WAL while
+    /// the in-memory gate stays cleared, so the next sweep is deferred to the following post-open full
+    /// pass. That is a bounded space leak and never a correctness problem: an orphan is unreachable by
+    /// construction, so nothing resolves through it either way.
+    fn gc_sweep_undo_orphans(
+        &mut self,
+        txn: TxnId,
+        chain_heads: Option<&std::collections::BTreeSet<u64>>,
+    ) -> Result<usize> {
+        let undo_hw = self.store(StoreKind::Undo).alloc.high_water();
+        let mut freed_deltas = 0usize;
+        if let Some(heads) = chain_heads {
+            // Phase 1 — unreachable deltas. `next` links come from deltas that are themselves still
+            // allocated; a free-listed delta's stale body is not a reference.
+            let mut reachable = heads.clone();
+            let mut corpses: Vec<u64> = Vec::new();
+            for id in 1..undo_hw {
+                if self.store(StoreKind::Undo).free.ids().contains(&id) {
+                    continue;
+                }
+                let Some(delta) = self.read_delta(id)? else {
+                    continue;
+                };
+                if delta.next != NULL_ID {
+                    reachable.insert(delta.next);
+                }
+                if !delta.in_use() {
+                    corpses.push(id);
+                }
+            }
+            for id in corpses {
+                if !reachable.contains(&id) {
+                    self.free_orphan_slot(StoreKind::Undo, id);
+                    freed_deltas += 1;
+                }
+            }
+        }
+
+        // Phase 2 — unreachable commit slots, over what phase 1 left standing.
+        let mut referenced = std::collections::BTreeSet::new();
+        for id in 1..undo_hw {
+            if self.store(StoreKind::Undo).free.ids().contains(&id) {
+                continue;
+            }
+            if let Some(delta) = self.read_delta(id)? {
+                referenced.insert(delta.commit_info);
+            }
+        }
+        let open: std::collections::BTreeSet<u64> =
+            self.active.values().filter_map(|a| a.commit_slot).collect();
+        let commit_hw = self.store(StoreKind::Commit).alloc.high_water();
+        for id in 1..commit_hw {
+            if referenced.contains(&id)
+                || open.contains(&id)
+                || self.store(StoreKind::Commit).free.ids().contains(&id)
+            {
+                continue;
+            }
+            let Some(slot) = self.read_commit_slot(id)? else {
+                continue;
+            };
+            if slot.in_use() {
+                // A committed slot with no surviving delta: the `delta_count` rule owns it and has
+                // already freed it, so reaching here means the count and the references disagree. The
+                // checker reports that; do not act on it.
+                continue;
+            }
+            let (rel_page, off) = paging::record_location(id, undo::COMMIT_RECORD_SIZE);
+            let dev = self.device_page(StoreKind::Commit, rel_page)?;
+            self.write_region(dev, off, &[0u8; undo::COMMIT_RECORD_SIZE], txn)?;
+            self.free_push(StoreKind::Commit, id, txn);
+        }
+        self.undo_orphan_slots_possible = false;
+        Ok(freed_deltas)
+    }
+
     /// Writes node `id`'s 8-byte `labels` bitmap word to `new_labels`, logging a **compare-and-set
     /// logical undo** (`rmp` #772): redo installs `new_labels`; undo resets the word to `old_labels`
     /// *only if it still equals `new_labels`* (this txn's own write is still the one on the page).
@@ -2914,6 +3899,16 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.held_slots.iter().map(HashMap::len).sum()
     }
 
+    /// **`rmp` #588** (observability / tests): the number of physical slots of **one** store currently
+    /// shadow-held from reuse. Sharper than [`held_slots_len`](Self::held_slots_len) for a caller that
+    /// cares about a specific store, since a GC pass also holds the undo-area slots it frees
+    /// (`rmp` #966) — conservatively, because an off-thread reader walking a version chain has exactly
+    /// the same mid-walk hazard as one walking an incidence chain.
+    #[must_use]
+    pub fn held_slots_len_of(&self, kind: StoreKind) -> usize {
+        self.held_slots[kind as usize].len()
+    }
+
     /// Records that property `pid` was prepended onto `(owner_kind, owner_id)` — but only if `pid` was
     /// a **popped** (reused) id of `txn` (`rmp` #581). A prop carries no owner back-pointer, so the
     /// rollback needs this to walk the owner's chain and decide whether an aborted pop became a live
@@ -3052,6 +4047,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         freeze_only: bool,
     ) -> Result<GcPassReport> {
         let mut reclaimed = 0usize;
+        let mut undo_deltas_reclaimed = 0usize;
 
         // `rmp` #522: snapshot the freeze frontier BEFORE the freeze sweep advances it, so a rollback of
         // this GC pass (whose WAL undo restores the stamps it froze) can restore the frontier and not
@@ -3131,6 +4127,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 self.pending_prop_corpses = false;
                 self.prune_settled_tombstones(StoreKind::Prop)?;
             }
+
+            // ---- Phase F: reclaim undo chains no live snapshot can reach (`rmp` #966). ----
+            // Runs LAST among the reclamation sweeps, so a node/relationship reclaimed above has
+            // already had its own chain freed with it and is not walked again here. Candidate-set
+            // driven exactly as Phases A–D are, with the same first-post-open full-scan seeding.
+            self.bump_drain_progress();
+            undo_deltas_reclaimed = self.gc_reclaim_undo_chains(txn, watermark)?;
         }
 
         // ---- Phase E: freeze committed-but-unfrozen MVCC stamps (`rmp` task #59), frontier-based. ----
@@ -3188,6 +4191,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             });
             Ok(GcPassReport {
                 reclaimed,
+                undo_deltas_reclaimed,
                 frozen,
                 prune_scheduled,
                 freeze_scanned,
@@ -3205,6 +4209,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // Not scheduling `pending_gc_prune` mirrors exactly what a rolled-back GC pass does.
             Ok(GcPassReport {
                 reclaimed,
+                undo_deltas_reclaimed,
                 frozen,
                 prune_scheduled: 0,
                 freeze_scanned,
@@ -3549,7 +4554,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 match kind {
                     StoreKind::Rel => self.reclaim_rel(txn, id)?,
                     StoreKind::Node => self.reclaim_node(txn, id)?,
-                    StoreKind::Prop | StoreKind::Strings => {}
+                    // Only nodes and relationships are entity tombstones. Property versions are
+                    // reclaimed by the Phase D chain sweep; heap blocks and the undo area's records
+                    // carry no visibility of their own and are freed with whatever owns them.
+                    StoreKind::Prop | StoreKind::Strings | StoreKind::Undo | StoreKind::Commit => {}
                 }
                 self.pending_tombstones[kind as usize].remove(&id);
                 reclaimed += 1;
@@ -3799,8 +4807,15 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             popped_prop_owners: aborted_prop_owners,
             schema_undo: aborted_schema_undo,
             counts: aborted_counts,
+            commit_slot: aborted_commit_slot,
+            undo_links: aborted_undo_links,
             ..
         } = self.active.remove(&txn).unwrap_or_default();
+        // The in-memory delta slab is dropped, never carried across a rollback (`rmp` #966): the
+        // catalog reload below resets this store's allocator to the durable image, so a slab cursor
+        // captured before it could hand out an id the allocator no longer considers taken. Dropping it
+        // costs at most one page of undo slots, and only on a transaction that actually aborted.
+        self.undo_slab = None;
         // Any catalog-only change this txn made has been discarded by the `reload_catalog` above (`rmp`
         // #529): clear the dirty flag so the NEXT transaction's read-only fast path is not forced onto
         // the durable path by this aborted transaction's un-persisted mutation. (A token this txn
@@ -3948,6 +4963,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // GC splice, never double-freed. Runs AFTER the free-list restore above so a re-push cannot be
         // undone by it, and after the WAL undo (which reverted each pop's slot to `!in_use`).
         self.reclaim_aborted_pops(&aborted_popped_ids, &aborted_prop_owners);
+        // `rmp` #966: the same question, asked of this transaction's undo-area slots. Runs AFTER the
+        // free-list restore above (like `reclaim_aborted_pops`) so its pushes are not undone by it.
+        self.reclaim_aborted_undo(&aborted_undo_links, aborted_commit_slot);
         // `rmp` #522: a rolled-back creation may leave a dead-link corpse — a relationship threaded in an
         // incidence chain by a concurrently-committed prepend (#220) or a property threaded in a property
         // chain (#172). Register them so the NEXT GC pass runs the corpse splice / property sweep it
@@ -4024,6 +5042,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                     }
                     _ => false,
                 },
+                // The undo area's own slots are never *popped* by a data transaction: a delta id comes
+                // from `alloc_undo_id` (which records its pops the same way) and a commit slot from
+                // `alloc_id`, and both are reclaimed by `reclaim_aborted_undo`, which asks the sharper
+                // question — whether the slot is still threaded on a chain. Re-pushing here would risk
+                // a double free, so decline (a safe leak, exactly as for an unknown-owner property).
+                StoreKind::Undo | StoreKind::Commit => false,
                 StoreKind::Prop => match self.read_prop(id) {
                     Ok(p) if !p.mvcc.in_use() => {
                         match prop_owners.iter().find(|&&(pid, _, _)| pid == id) {
@@ -4281,7 +5305,15 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         let eid = self.element_ids.alloc()?;
         // Stamp `xmin` with the writer's in-flight `TxnId` (`04 §5.2`); `commit` settles it to the
         // commit timestamp. Until then the version is visible only to its own transaction.
-        let rec = NodeRecord::new(eid, VersionStamp::in_flight(txn));
+        let mut rec = NodeRecord::new(eid, VersionStamp::in_flight(txn));
+        // The version chain's first link (`04 §5.1.1`, `05 §12.3`): creating an entity writes a
+        // `DeleteObject` delta, because deleting it is what undoes the creation. The delta is written
+        // FIRST and its id rides into the record's own first write as `undo_ptr` — see
+        // [`creation_chain_head`](Self::creation_chain_head) for why a creation may publish its head
+        // that way and every other mutation may not. Memgraph likewise makes the first delta of any
+        // newly created object a `DELETE_OBJECT`
+        // (`/data/refsrc/memgraph/src/storage/v2/mvcc.hpp:236-249`).
+        rec.mvcc.undo_ptr = self.creation_chain_head(StoreKind::Node, id, txn)?;
         self.write_node(id, &rec, txn)?;
         self.note_created(txn, StoreKind::Node, id);
         // Maintain the grand-total live-node count (`rmp` task #82): once per node, labelled or not —
@@ -4363,6 +5395,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // node, alongside the per-label decrements and independent of how many labels it carried.
         // Reclamation at GC ([`reclaim_node`]) must NOT decrement again.
         self.count_bump(txn, CountKey::TotalNodes, false);
+        // Link the `RecreateObject` delta BEFORE the in-place mutation that follows (`04 §5.1.2`,
+        // steps 3 then 4): the previous state must be recoverable from a linked delta before the
+        // record stops describing it.
+        self.note_entity_deleted(StoreKind::Node, id, txn)?;
         // `rmp` #301: compare-and-set undo for the tombstone stamp, so a non-LIFO abort never clobbers
         // a header word a concurrently-interleaved transaction has since re-stamped.
         self.patch_header_word_cas(
@@ -4387,6 +5423,18 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // would reject the tombstoned node we are reclaiming).
         let first_prop = self.read_node(id)?.first_prop;
         let _freed = self.free_property_chain(txn, id, first_prop)?;
+        // Free this node's whole undo chain BEFORE the header (and with it `undo_ptr`) is cleared
+        // (`rmp` #966). ORDER IS LOAD-BEARING, and getting it wrong is silent: `MvccHeader::default()`
+        // below zeroes `undo_ptr`, so a `free_undo_chain` placed after the write reads an EMPTY chain,
+        // frees nothing, and leaks every delta the node ever accumulated — with no error and no
+        // failing invariant, because an unreachable delta is indistinguishable from a reclaimed one
+        // except by counting. It was placed after the write in the first cut of #966 and cost 25
+        // leaked delta slots per churn tick, growing `undo.store` without bound while every other
+        // store plateaued (`crates/graphus-iot-gen/tests/churn_plateau.rs` is the gate that caught it).
+        //
+        // The GC precondition for reclaiming a record — no live snapshot can see it — is strictly
+        // stronger than the one for reclaiming its chain, so the chain is unconditionally dead here.
+        self.free_undo_chain(StoreKind::Node, id, txn)?;
         let mut dead = self.read_node(id)?;
         dead.first_prop = NULL_ID;
         dead.mvcc = MvccHeader::default(); // clears in_use
@@ -4714,6 +5762,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.note_created(txn, StoreKind::Rel, id);
         // Stamp `xmin` with the writer's in-flight `TxnId` (`04 §5.2`); settled at commit.
         let mut rel = RelRecord::new(eid, VersionStamp::in_flight(txn), type_id, start, end);
+        // The creation's `DeleteObject` delta, written before the record that names it, exactly as for
+        // a node ([`creation_chain_head`](Self::creation_chain_head)). Both branches below write the
+        // record through `write_rel_create`, whose header-only creation undo reverts `undo_ptr` along
+        // with the rest of the MVCC header on abort — so an aborted creation leaves no chain head.
+        rel.mvcc.undo_ptr = self.creation_chain_head(StoreKind::Rel, id, txn)?;
 
         if start == end {
             // Self-loop: thread into the single chain twice. New head order:
@@ -4944,6 +5997,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         if !Self::is_live_version(rel.mvcc) {
             return Err(GraphusError::Storage(format!("rel {id} is not in use")));
         }
+        // Link the `RecreateObject` delta BEFORE the in-place mutation (`04 §5.1.2`, steps 3 then 4).
+        self.note_entity_deleted(StoreKind::Rel, id, txn)?;
         // `rmp` #301: compare-and-set undo for the tombstone stamp (non-LIFO-safe, see
         // [`patch_header_word_cas`](Self::patch_header_word_cas)).
         self.patch_header_word_cas(
@@ -5003,6 +6058,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             self.unlink_side(id, ChainSide::End, rel.end_node, txn)?;
         }
 
+        // Free this relationship's undo chain BEFORE the header (and with it `undo_ptr`) is cleared:
+        // once the header is zeroed the chain is unreachable and its deltas would leak (`rmp` #966).
+        // As for a node, the record's own reclamation precondition already implies the chain's.
+        self.free_undo_chain(StoreKind::Rel, id, txn)?;
         let mut dead = self.read_rel(id)?;
         dead.first_prop = NULL_ID; // the chain is freed; drop the now-dangling head pointer
         dead.mvcc = MvccHeader::default();
@@ -5410,7 +6469,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         Ok(match owner_kind {
             StoreKind::Node => self.read_node(owner_id)?.first_prop,
             StoreKind::Rel => self.read_rel(owner_id)?.first_prop,
-            StoreKind::Prop | StoreKind::Strings => {
+            StoreKind::Prop | StoreKind::Strings | StoreKind::Undo | StoreKind::Commit => {
                 return Err(GraphusError::Storage(format!(
                     "{owner_kind:?} is not a property-chain owner"
                 )));
@@ -5438,9 +6497,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 rel.first_prop = first_prop;
                 self.write_rel(owner_id, &rel, txn)
             }
-            StoreKind::Prop | StoreKind::Strings => Err(GraphusError::Storage(format!(
-                "{owner_kind:?} is not a property-chain owner"
-            ))),
+            StoreKind::Prop | StoreKind::Strings | StoreKind::Undo | StoreKind::Commit => Err(
+                GraphusError::Storage(format!("{owner_kind:?} is not a property-chain owner")),
+            ),
         }
     }
 
@@ -7651,10 +8710,74 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.tokens.len(Namespace::Label)
     }
 
+    /// The **version chain** of entity `(kind, id)`, newest delta first (`05 §12`, `04 §5.1`;
+    /// `rmp` #966): `(delta id, delta)` pairs from the record's `undo_ptr` down to the end of the
+    /// chain, an empty vector when the entity has no chain.
+    ///
+    /// This is the read side of the undo area. Reconstructing the version a given snapshot may see
+    /// means starting from the in-place record image and applying these deltas in order until the
+    /// snapshot's visibility rule is satisfied (`04 §5.3`); resolving each delta's commit status means
+    /// reading its [`commit_slot`](Self::commit_slot).
+    ///
+    /// The walk threads through **corpse** deltas (an aborted transaction's, whose `in_use` bit is
+    /// clear): they are returned, because a caller reconstructing a version has to skip them
+    /// explicitly rather than have the chain silently end at one.
+    ///
+    /// # Errors
+    /// Returns a storage error if the entity cannot be read, a link dangles, or the chain fails to
+    /// terminate — all of which are corruption the consistency checker also reports.
+    pub fn version_chain(&self, kind: StoreKind, id: u64) -> Result<Vec<(u64, UndoDelta)>> {
+        self.undo_chain(kind, id)
+    }
+
+    /// Observability for the undo area (`rmp` #966): `(deltas, commit slots)` currently on their
+    /// store's free list — i.e. reclaimed and available for reuse.
+    ///
+    /// Surfaced because the two numbers are the direct evidence that chain reclamation and abort
+    /// reclamation actually happen: a store whose chains are built but never reclaimed reports
+    /// `(0, 0)` for ever while `undo.store` grows without bound.
+    #[must_use]
+    pub fn undo_area_free_counts(&self) -> (usize, usize) {
+        (
+            self.store(StoreKind::Undo).free.len(),
+            self.store(StoreKind::Commit).free.len(),
+        )
+    }
+
+    /// The commit-info slot at `commit.store` id `slot` — the indirection point through which every
+    /// delta of one transaction resolves its commit status (`04 §5.1.3`). `None` for a zeroed slot.
+    ///
+    /// # Errors
+    /// Returns a storage error if `slot` is out of range or occupied but undecodable.
+    pub fn commit_slot(&self, slot: u64) -> Result<Option<CommitSlot>> {
+        self.read_commit_slot(slot)
+    }
+
     /// Reads the `strings.store` overflow-heap block at physical id `id` (`rmp` task #43). Used by
     /// the consistency checker to scan and validate overflow chains.
     pub(crate) fn checker_block(&mut self, id: u64) -> Result<HeapBlock> {
         self.read_block(id)
+    }
+
+    /// The `undo.store` delta at `id`, or `None` for a zeroed (never-written / reclaimed) slot
+    /// (`rmp` #966). An occupied-but-undecodable slot is an error, which the checker reports.
+    pub(crate) fn checker_delta(&self, id: u64) -> Result<Option<UndoDelta>> {
+        self.read_delta(id)
+    }
+
+    /// The `commit.store` slot at `id`, or `None` for a zeroed slot (`rmp` #966).
+    pub(crate) fn checker_commit_slot(&self, id: u64) -> Result<Option<CommitSlot>> {
+        self.read_commit_slot(id)
+    }
+
+    /// The on-disk format version this store was **opened** at (`05 §12.6`).
+    ///
+    /// [`graphus_core::constants::FORMAT_VERSION`] for a store this build created, and `1` for one
+    /// created before the undo area existed — which this build upgrades in place at its first
+    /// catalog checkpoint, since a version-1 image is exactly a version-2 image with no chains.
+    #[must_use]
+    pub fn opened_format_version(&self) -> u32 {
+        self.opened_format_version
     }
 
     /// The number of currently **dirty** buffer-pool frames (#426). The offline consistency checker
@@ -9016,6 +10139,91 @@ mod tests {
     }
 
     /// Runs a GC pass over `s` at the current snapshot as its own transaction, returning the report.
+    /// **The undo area's orphan-page cross-validation must use its own codec, not the MVCC header
+    /// shape** (`rmp` #966).
+    ///
+    /// `reconstruct_orphan_store_pages` attributes an orphan record page to a store by its subtype
+    /// byte and then cross-validates the page's records against that claimed kind (`rmp` #398),
+    /// because CRC32C cannot catch an in-range but WRONG subtype and reading a store at the wrong
+    /// stride would corrupt every record it serves. That cross-validation reads a 25-byte MVCC header
+    /// out of each slot — and the undo area's records have no MVCC header (`05 §12`): a delta's bytes
+    /// 1..25 are its `action`, `type_tag`, `direction`, `command_id` and `commit_info`.
+    ///
+    /// This test asserts BOTH directions of the fix, which is what makes it non-vacuous:
+    ///
+    /// 1. a page of well-formed, in-use deltas is ACCEPTED for `StoreKind::Undo` — and the assertion
+    ///    below shows it would have been REJECTED by the MVCC-header reading, so the fix is
+    ///    load-bearing rather than cosmetic;
+    /// 2. a page of deltas is still REJECTED when the subtype claims a *versioned* store, so the
+    ///    mis-attribution defence the check exists for is not weakened.
+    #[test]
+    fn an_undo_page_is_cross_validated_by_its_own_codec_not_the_mvcc_header() {
+        use crate::undo::{UndoAction, UndoDelta};
+
+        // A page of live deltas, exactly as `write_undo_area_create` lays them out.
+        let mut page = vec![0u8; PAGE_SIZE];
+        let rpp = paging::records_per_page(undo::UNDO_RECORD_SIZE);
+        for slot in 0..rpp {
+            let off = HEADER_SIZE + slot * undo::UNDO_RECORD_SIZE;
+            let next = if slot == 0 { 0 } else { slot as u64 };
+            UndoDelta::new(UndoAction::DeleteObject, 1, 0, next)
+                .encode(&mut page[off..off + undo::UNDO_RECORD_SIZE]);
+        }
+
+        // (1) Accepted as what it is.
+        assert!(
+            Store::orphan_page_records_well_formed(&page, StoreKind::Undo),
+            "a page of well-formed deltas must be accepted for `StoreKind::Undo`"
+        );
+
+        // …and the MVCC-header reading the check used to apply would have REJECTED it. This is the
+        // proof that the codec branch is load-bearing: without it, `open` fails closed on a perfectly
+        // good undo page with "mis-attributed page — possible corruption".
+        let mut header_check_would_reject = false;
+        for slot in 0..rpp {
+            let off = HEADER_SIZE + slot * undo::UNDO_RECORD_SIZE;
+            let mvcc = MvccHeader::read(&page[off..off + MVCC_HEADER_SIZE]);
+            if !mvcc.in_use() {
+                continue;
+            }
+            if VersionStamp::from_raw(mvcc.created_ts) == VersionStamp::None {
+                header_check_would_reject = true;
+            }
+            if let (VersionStamp::Committed(c), VersionStamp::Committed(e)) = (
+                VersionStamp::from_raw(mvcc.created_ts),
+                VersionStamp::from_raw(mvcc.expired_ts),
+            ) && c.0 > e.0
+            {
+                header_check_would_reject = true;
+            }
+        }
+        assert!(
+            header_check_would_reject,
+            "NON-VACUITY: the MVCC-header reading must actually reject this page, or the codec \
+             branch this test exists to justify would be a no-op"
+        );
+
+        // (2) The mis-attribution defence is intact: the same bytes claimed as a versioned store are
+        //     still rejected, so a flipped subtype byte cannot smuggle an undo page into the node
+        //     store.
+        assert!(
+            !Store::orphan_page_records_well_formed(&page, StoreKind::Node),
+            "delta bytes read at the node stride must still be rejected — that is the check's whole \
+             purpose (`rmp` #398)"
+        );
+
+        // A zeroed page carries no invariant for either kind (a never-written slot).
+        let blank = vec![0u8; PAGE_SIZE];
+        assert!(Store::orphan_page_records_well_formed(
+            &blank,
+            StoreKind::Undo
+        ));
+        assert!(Store::orphan_page_records_well_formed(
+            &blank,
+            StoreKind::Commit
+        ));
+    }
+
     fn gc_pass(s: &mut Store, txn: u64) -> GcPassReport {
         let wm = s.snapshot_ts();
         s.begin(TxnId(txn));

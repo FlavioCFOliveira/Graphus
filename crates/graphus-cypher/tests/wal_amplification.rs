@@ -1211,6 +1211,10 @@ enum PageOwner {
     Rel,
     Prop,
     Strings,
+    /// `undo.store` — one MVCC version-delta per record (`rmp` #966, `05 §12`).
+    Undo,
+    /// `commit.store` — one commit-info slot per writing transaction (`rmp` #966, `05 §12`).
+    Commit,
     /// The meta page + its catalog continuation chain.
     Catalog,
 }
@@ -1222,6 +1226,8 @@ impl PageOwner {
             Self::Rel => "rel store",
             Self::Prop => "prop store",
             Self::Strings => "strings heap",
+            Self::Undo => "undo deltas",
+            Self::Commit => "commit slots",
             Self::Catalog => "catalog",
         }
     }
@@ -1237,12 +1243,27 @@ where
         let mut map: BTreeMap<u64, PageOwner> = BTreeMap::new();
         let view = s.read_view();
         let meta = view.meta();
-        for (kind, owner) in [
+        // Attributing EVERY store explicitly is load-bearing: the fallback below labels anything no
+        // record store owns as "catalog", so a store missing from this list has its records silently
+        // charged to the catalog term. That is precisely what happened when `rmp` #966 added the undo
+        // area and this list still named four stores — every version-delta and commit-slot record was
+        // reported as catalog, which both overstated the catalog and hid the undo area's own cost
+        // inside it. The length assertion makes the omission impossible to repeat.
+        let attribution = [
             (StoreKind::Node, PageOwner::Node),
             (StoreKind::Rel, PageOwner::Rel),
             (StoreKind::Prop, PageOwner::Prop),
             (StoreKind::Strings, PageOwner::Strings),
-        ] {
+            (StoreKind::Undo, PageOwner::Undo),
+            (StoreKind::Commit, PageOwner::Commit),
+        ];
+        assert_eq!(
+            attribution.len(),
+            graphus_storage::STORE_COUNT,
+            "every fixed-record store must be attributed to a `PageOwner`; an unattributed store's \
+             pages fall through to the catalog fallback and are reported as catalog bytes"
+        );
+        for (kind, owner) in attribution {
             for rel_page in 0..meta.mapped_page_count(kind) {
                 let dev = meta.device_page(kind, rel_page).expect("mapped store page");
                 map.insert(dev.0, owner);
@@ -1602,11 +1623,22 @@ fn a_single_reading_commit_writes_small_delta_records_not_page_images() {
     // 6. A reading's OWN records dominate: the node/relationship/property/string-heap writes it makes
     //    are the bulk of the commit, and the catalog re-image is a single record. This is the term
     //    batching CANNOT remove, and the reason batching pays far less than the commit-count ratio.
+    //
+    //    `PageOwner::Undo` BELONGS IN THIS SUM (`rmp` #966). A reading creates a node and an
+    //    `:EMITTED` relationship, and creating an entity writes one `DeleteObject` version delta —
+    //    so a reading writes exactly two delta records, per READING, in the same way and for the same
+    //    reason it writes its own node and relationship records. MEASURED: 237 B/commit at every store
+    //    size, and invariant under batching (asserted in
+    //    `a_batched_commit_writes_strictly_fewer_wal_bytes_per_reading`, which is what proves it is a
+    //    per-reading and not a per-commit term). `PageOwner::Commit` is deliberately NOT here: the
+    //    commit-info slot is allocated once per TRANSACTION and published once at commit, so it
+    //    amortises with the catalog image and belongs with the per-commit terms.
     let data_bytes: f64 = [
         PageOwner::Node,
         PageOwner::Rel,
         PageOwner::Prop,
         PageOwner::Strings,
+        PageOwner::Undo,
     ]
     .iter()
     .filter_map(|o| p.by_owner.get(o))
@@ -1614,8 +1646,8 @@ fn a_single_reading_commit_writes_small_delta_records_not_page_images() {
     .sum();
     assert!(
         data_bytes > 0.5 * p.bytes_per_commit,
-        "the reading's own node/rel/property/string records are {data_bytes:.0} B of a {:.0} B \
-         commit — the report describes them as the bulk of it",
+        "the reading's own node/rel/property/string/version-delta records are {data_bytes:.0} B of a \
+         {:.0} B commit — the report describes them as the bulk of it",
         p.bytes_per_commit
     );
 
@@ -1862,11 +1894,18 @@ fn a_batched_commit_writes_strictly_fewer_wal_bytes_per_reading() {
     //     commits alone or with 24 others. This is the irreducible floor of the example's residual: a
     //     32-byte reading is stored as several MVCC-versioned, chained, byte-addressed records, and
     //     every one of them is logged with a redo AND an undo image.
+    //     `Undo` is in this list (`rmp` #966): a reading creates a node and a relationship, and each
+    //     creation writes one `DeleteObject` version delta, so its deltas are a per-READING cost like
+    //     its records. This assertion is what PROVES that classification rather than assuming it — if
+    //     the delta term ever started amortising with batching it would be a per-commit term, and the
+    //     decomposition in `a_single_reading_commit_writes_small_delta_records_not_page_images` (which
+    //     counts it as a reading's own record) would be wrong.
     for owner in [
         PageOwner::Node,
         PageOwner::Rel,
         PageOwner::Prop,
         PageOwner::Strings,
+        PageOwner::Undo,
     ] {
         let a = per_reading(&single, owner);
         let b = per_reading(&batched, owner);
@@ -1891,32 +1930,55 @@ fn a_batched_commit_writes_strictly_fewer_wal_bytes_per_reading() {
          for a {BATCH}x drop in commits ({cat_single:.0} B -> {cat_batched:.0} B per reading)"
     );
 
-    // (c) THE SAVING IS FULLY ACCOUNTED FOR — to the byte — by exactly TWO per-commit terms: the
-    //     catalog re-image and the `Commit` record itself. Nothing else amortises. This is the
-    //     complete mechanism, and if any other term ever started amortising (or stopped), this fails
-    //     and the example's explanation would have to be re-measured rather than reused.
+    // (c) THE SAVING IS FULLY ACCOUNTED FOR — to the byte — by exactly THREE per-commit terms: the
+    //     catalog re-image, the **commit-info slot**, and the `Commit` record itself. Nothing else
+    //     amortises. This is the complete mechanism, and if any other term ever started amortising
+    //     (or stopped), this fails and the example's explanation would have to be re-measured rather
+    //     than reused.
+    //
+    //     THE COMMIT-SLOT TERM IS NEW (`rmp` #966) and it is a genuine third term, not a re-pin to
+    //     make an old number fit. A writing transaction allocates ONE commit-info slot — the commit
+    //     indirection point through which every one of its version deltas resolves its commit status
+    //     (`05-storage-format.md` §12.4) — and publishes it with two writes at commit (`delta_count`,
+    //     then `commit_ts`). That is three records per TRANSACTION regardless of how many readings the
+    //     transaction carries, so it amortises exactly like the catalog image, for exactly the same
+    //     reason. MEASURED: ~248 B/commit, and it is the 238 B/reading this accounting was previously
+    //     unable to explain.
     let commit_rec_single =
         single.commit_record_bytes_per_commit * single.commits as f64 / single.readings as f64;
     let commit_rec_batched =
         batched.commit_record_bytes_per_commit * batched.commits as f64 / batched.readings as f64;
+    let slot_single = per_reading(&single, PageOwner::Commit);
+    let slot_batched = per_reading(&batched, PageOwner::Commit);
     let total_saved = single.bytes_per_reading - batched.bytes_per_reading;
     let catalog_saved = cat_single - cat_batched;
     let commit_saved = commit_rec_single - commit_rec_batched;
+    let slot_saved = slot_single - slot_batched;
     eprintln!(
         "  => the {total_saved:.0} B/reading batching saved = {catalog_saved:.0} B catalog image \
-         + {commit_saved:.0} B commit record; the reading's OWN records ({:.0} B) did not move",
+         + {slot_saved:.0} B commit-info slot + {commit_saved:.0} B commit record; the reading's OWN \
+         records ({:.0} B, version deltas included) did not move",
         per_reading(&batched, PageOwner::Node)
             + per_reading(&batched, PageOwner::Rel)
             + per_reading(&batched, PageOwner::Prop)
-            + per_reading(&batched, PageOwner::Strings),
+            + per_reading(&batched, PageOwner::Strings)
+            + per_reading(&batched, PageOwner::Undo),
+    );
+    // The commit slot must really amortise — otherwise it is not a per-commit term and putting it in
+    // this sum would be curve-fitting rather than mechanism.
+    assert!(
+        slot_saved > 0.9 * slot_single,
+        "the commit-info slot is claimed to be a per-TRANSACTION term, so batching {BATCH} readings \
+         per commit must amortise essentially all of it: {slot_single:.0} B -> {slot_batched:.0} B \
+         per reading"
     );
     assert!(
-        (total_saved - (catalog_saved + commit_saved)).abs() < 0.01 * total_saved,
-        "batching saved {total_saved:.0} B per reading, but its two per-commit terms — the catalog \
-         image ({catalog_saved:.0} B) and the commit record ({commit_saved:.0} B) — account for only \
-         {:.0} B of it. The remainder is unexplained, and an unexplained term must not be shipped as \
-         an explanation",
-        catalog_saved + commit_saved,
+        (total_saved - (catalog_saved + slot_saved + commit_saved)).abs() < 0.01 * total_saved,
+        "batching saved {total_saved:.0} B per reading, but its three per-commit terms — the catalog \
+         image ({catalog_saved:.0} B), the commit-info slot ({slot_saved:.0} B) and the commit record \
+         ({commit_saved:.0} B) — account for only {:.0} B of it. The remainder is unexplained, and an \
+         unexplained term must not be shipped as an explanation",
+        catalog_saved + slot_saved + commit_saved,
     );
 }
 
@@ -1971,15 +2033,29 @@ where
     coord.with_store_mut(|s| {
         let view = s.read_view();
         let meta = view.meta();
-        [
+        // EVERY record store, the undo area included (`rmp` #966). The 16 B-per-store-page law below
+        // is a ratio whose DENOMINATOR is this count, so omitting a store the catalog DOES image
+        // inflates the measured slope and turns the law into a false alarm — which is exactly what
+        // happened when #966 added `undo.store` and `commit.store` and this list still named four:
+        // the slope read 20.5 B/page and the law looked broken when only the instrument was.
+        //
+        // The assertion below makes the list structurally impossible to leave stale: it must name
+        // every store the catalog images, and `STORE_COUNT` is that number.
+        let kinds = [
             StoreKind::Node,
             StoreKind::Rel,
             StoreKind::Prop,
             StoreKind::Strings,
-        ]
-        .iter()
-        .map(|k| meta.mapped_page_count(*k))
-        .sum()
+            StoreKind::Undo,
+            StoreKind::Commit,
+        ];
+        assert_eq!(
+            kinds.len(),
+            graphus_storage::STORE_COUNT,
+            "this measurement enumerates the stores the durable catalog images; a new store must be \
+             added here (and to `page_owners`) or the per-store-page law it measures becomes a lie"
+        );
+        kinds.iter().map(|k| meta.mapped_page_count(*k)).sum()
     })
 }
 
@@ -2457,12 +2533,38 @@ fn a_retention_purge_inflates_every_later_commit_through_the_catalog_free_list()
         after.bytes_per_commit,
     );
 
-    // The page map is held CONSTANT (page maps only ever grow, and the purge frees slots rather than
-    // pages), so the catalog's growth cannot be the page-map term — it is the free list.
-    assert_eq!(
-        pages_before, pages_after,
-        "the store's page count must not change across the purge, or the page-map term would be \
-         confounded with the free-list term"
+    // The page-map term is SUBTRACTED OUT rather than held at zero, so what remains is the free-list
+    // term and only the free-list term.
+    //
+    // WHY THIS CHANGED (`rmp` #966). This used to assert `pages_before == pages_after`: the purge
+    // frees record *slots*, not pages, and the measured window's readings reused them, so no store
+    // grew. That is no longer true, and the reason is a real property of the engine rather than noise:
+    // every write transaction allocates one commit-info slot in `commit.store` and every created
+    // entity one delta in `undo.store`, so ANY window of commits grows the undo area — and page maps
+    // never shrink. Holding the page count at zero growth is therefore no longer a precondition this
+    // measurement can establish, and asserting it would only be asserting that the undo area does not
+    // exist.
+    //
+    // Subtracting `16 B x Δpages` (the page-map law this file measures and pins in
+    // `the_per_commit_catalog_image_grows_with_the_store`) is strictly sharper than the old equality:
+    // it isolates the free-list term explicitly instead of relying on a confound happening to be zero,
+    // and it keeps working for any future store that also grows during the window.
+    assert!(
+        pages_after >= pages_before,
+        "page maps only ever grow: {pages_before} -> {pages_after}"
+    );
+    let page_map_term = 16.0 * (pages_after - pages_before) as f64;
+    let free_list_term = delta - page_map_term;
+    eprintln!(
+        "  of the {delta:+.0} B, {page_map_term:.0} B is the page-map term ({} new pages x 16 B) and \
+         {free_list_term:.0} B is the FREE LIST",
+        pages_after - pages_before
+    );
+    assert!(
+        free_list_term > 0.9 * delta,
+        "the purge's inflation of every later commit must be the FREE LIST, not the page map: of \
+         {delta:+.0} B only {free_list_term:.0} B is attributable to freed ids ({page_map_term:.0} B \
+         is page-map growth across the window)"
     );
     assert!(
         gc_report.reclaimed > 0,

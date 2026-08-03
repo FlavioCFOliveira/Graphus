@@ -64,7 +64,8 @@ use graphus_wal::LogSink;
 use crate::heap::{BLOCK_PAYLOAD, HeapBlock};
 use crate::idalloc::NULL_ID;
 use crate::record::{ChainSide, MvccHeader, NodeRecord, PropRecord, RelRecord};
-use crate::store::{RecordStore, STORE_COUNT, StoreKind};
+use crate::store::{ALL_STORE_KINDS, RecordStore, STORE_COUNT, StoreKind};
+use crate::undo::{CommitSlot, UndoDelta};
 use crate::valenc::OVERFLOW_BIT as PROP_OVERFLOW_BIT;
 
 /// One structural inconsistency found by [`check_store`]. Each variant names the offending ids /
@@ -159,6 +160,82 @@ pub enum Violation {
         /// Which heap-chain rule was broken.
         detail: HeapChainFault,
     },
+    /// An entity's **undo-delta chain** is malformed (`05 §12`, `04 §5.1`; `rmp` #966). Without a
+    /// well-formed chain an older snapshot cannot be reconstructed at all, so every fault here is a
+    /// direct threat to MVCC visibility.
+    UndoChain {
+        /// `StoreKind` of the entity that anchors the chain (`Node`, `Rel`, or `Prop`).
+        kind: StoreKind,
+        /// Physical id of the entity whose `undo_ptr` roots the chain.
+        entity: u64,
+        /// Physical id of the delta implicated (`0` when the fault is the entity's `undo_ptr` head).
+        delta: u64,
+        /// Which chain rule was broken.
+        detail: UndoChainFault,
+    },
+    /// An **undo-area slot** is internally inconsistent, independently of any chain that reaches it
+    /// (`05 §12.2`, `§12.4`; `rmp` #966).
+    UndoSlot {
+        /// Which undo-area store the slot belongs to (`Undo` or `Commit`).
+        kind: StoreKind,
+        /// Physical id of the offending slot.
+        id: u64,
+        /// Which slot rule was broken.
+        detail: UndoSlotFault,
+    },
+}
+
+/// The precise version-chain rule broken by a [`Violation::UndoChain`] (`rmp` #966).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UndoChainFault {
+    /// `undo_ptr`, or a delta's `next`, names an id outside `1..high_water` of `undo.store` — a
+    /// dangling chain pointer.
+    DeltaOutOfRange,
+    /// A chain link reaches a slot that holds no delta at all (an all-zero, never-written or
+    /// reclaimed slot). The version below this point is unreachable, so an older snapshot cannot be
+    /// reconstructed.
+    DeltaEmpty,
+    /// The chain revisits a delta: it is cyclic and would never terminate.
+    Cycle,
+    /// A delta the chain still reaches is on `undo.store`'s free list, so its slot may be handed out
+    /// and overwritten while the chain still needs it.
+    FreedDeltaReachable,
+    /// A delta's `commit_info` names an id outside `1..high_water` of `commit.store`.
+    CommitInfoOutOfRange {
+        /// The offending `commit_info` value.
+        commit_info: u64,
+    },
+    /// A delta's `commit_info` names a slot that holds no commit-info record, so the delta's
+    /// committed-ness is unknowable — the one thing `05 §12.4` promises can never happen ("a slot
+    /// outlives its last delta").
+    CommitInfoDangling {
+        /// The `commit.store` id the delta names.
+        commit_info: u64,
+    },
+}
+
+/// The precise undo-area slot rule broken by a [`Violation::UndoSlot`] (`rmp` #966).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UndoSlotFault {
+    /// The slot is occupied but does not decode as a delta / commit-info record: a reserved field is
+    /// set, the action byte is unknown, or a payload field is set on an action that does not own it
+    /// (`05 §12.2`, `§12.3`).
+    Undecodable {
+        /// The decoder's own message, naming the invariant that failed.
+        reason: String,
+    },
+    /// A **committed** transaction's slot records a `delta_count` that does not equal the number of
+    /// unreclaimed deltas naming it (`05 §12.4`). Either GC has lost count — and the slot will be
+    /// freed while deltas still resolve through it — or a delta has been lost.
+    DeltaCountMismatch {
+        /// The count the slot records.
+        recorded: u64,
+        /// The number of unreclaimed deltas that actually name it.
+        actual: u64,
+    },
+    /// A commit slot is on `commit.store`'s free list yet a surviving delta still names it, so a
+    /// reuse of the slot would silently re-attribute that delta to another transaction.
+    FreedButReferenced,
 }
 
 /// The precise adjacency rule broken by a [`Violation::Adjacency`].
@@ -466,6 +543,7 @@ pub fn check_store<D: BlockDevice, S: LogSink>(
     check_adjacency(store, &cat, &scan, &mut report)?;
     check_heap_chains(&cat, &scan, &mut report);
     check_mvcc_headers(&cat, &scan, &mut report);
+    check_undo_chains(&cat, &scan, &mut report);
     check_free_lists(&cat, &scan, &mut report);
     check_label_bitmaps(&cat, &scan, &mut report);
 
@@ -535,18 +613,8 @@ struct Catalog {
 impl Catalog {
     fn snapshot<D: BlockDevice, S: LogSink>(store: &RecordStore<D, S>) -> Self {
         Self {
-            high_water: [
-                store.checker_high_water(StoreKind::Node),
-                store.checker_high_water(StoreKind::Rel),
-                store.checker_high_water(StoreKind::Prop),
-                store.checker_high_water(StoreKind::Strings),
-            ],
-            free: [
-                store.checker_free_ids(StoreKind::Node),
-                store.checker_free_ids(StoreKind::Rel),
-                store.checker_free_ids(StoreKind::Prop),
-                store.checker_free_ids(StoreKind::Strings),
-            ],
+            high_water: ALL_STORE_KINDS.map(|k| store.checker_high_water(k)),
+            free: ALL_STORE_KINDS.map(|k| store.checker_free_ids(k)),
             pages: store.mapped_pages(),
             label_token_count: store.checker_label_token_count(),
         }
@@ -587,6 +655,23 @@ struct Scan {
     corpse_props: BTreeMap<u64, PropRecord>,
     /// Live `strings.store` overflow-heap block ids -> their block (`rmp` task #43).
     live_blocks: BTreeMap<u64, HeapBlock>,
+    /// Every occupied `undo.store` slot -> its delta (`rmp` #966, `05 §12.2`), **including corpses**
+    /// (an aborted transaction's delta, `in_use` clear but body intact): a chain walk threads through
+    /// a corpse exactly as the incidence walk threads through a dead-link relationship, so the chain
+    /// pass needs both. A zeroed slot is not recorded at all — it is not a delta (`05 §12.3`).
+    deltas: BTreeMap<u64, UndoDelta>,
+    /// The subset of [`deltas`](Scan::deltas) whose `in_use` bit is set and which is not on the free
+    /// list — the deltas that count towards a commit slot's `delta_count` (`05 §12.4`).
+    live_deltas: BTreeSet<u64>,
+    /// Every occupied `commit.store` slot -> its record (`rmp` #966, `05 §12.4`), corpses included.
+    commit_slots: BTreeMap<u64, CommitSlot>,
+    /// The subset of [`commit_slots`](Scan::commit_slots) that is in use and not on the free list.
+    live_commit_slots: BTreeSet<u64>,
+    /// `(kind, entity id, undo_ptr)` of every **non-live** node / relationship / property slot that
+    /// still anchors a version chain (`rmp` #966). Empty in a healthy store; when it is not, the
+    /// chain it names has been leaked, and [`check_undo_chains`] validates it exactly as it does a
+    /// live record's.
+    orphan_chain_heads: Vec<(StoreKind, u64, u64)>,
     /// Freed ids per store (from the catalog), as a set for O(log n) membership.
     freed: [BTreeSet<u64>; STORE_COUNT],
     /// Per-store ids that are on the free list yet whose on-disk record still reads `in_use` — a
@@ -601,6 +686,11 @@ impl Scan {
             StoreKind::Rel => self.live_rels.contains_key(&id),
             StoreKind::Prop => self.live_props.contains_key(&id),
             StoreKind::Strings => self.live_blocks.contains_key(&id),
+            // The undo area's records are not versioned entities, so "live" for them is a property of
+            // the slot's own `in_use` bit rather than of a live-record snapshot (`rmp` #966). The
+            // version-chain pass reads them directly; nothing routes a chain question through here.
+            StoreKind::Undo => self.live_deltas.contains(&id),
+            StoreKind::Commit => self.live_commit_slots.contains(&id),
         }
     }
 }
@@ -613,12 +703,8 @@ fn scan_records<D: BlockDevice, S: LogSink>(
     cat: &Catalog,
     _report: &mut ConsistencyReport,
 ) -> Result<Scan> {
-    let freed: [BTreeSet<u64>; STORE_COUNT] = [
-        cat.free(StoreKind::Node).iter().copied().collect(),
-        cat.free(StoreKind::Rel).iter().copied().collect(),
-        cat.free(StoreKind::Prop).iter().copied().collect(),
-        cat.free(StoreKind::Strings).iter().copied().collect(),
-    ];
+    let freed: [BTreeSet<u64>; STORE_COUNT] =
+        ALL_STORE_KINDS.map(|k| cat.free(k).iter().copied().collect());
 
     // A per-record read can fail if the record's page is corrupt (checksum). That page is already
     // reported by `check_checksums_and_page_ids`; here we simply skip the unreadable record so the
@@ -627,6 +713,19 @@ fn scan_records<D: BlockDevice, S: LogSink>(
     // free list (still `in_use`) is caught (`FreeListFault::StillInUse`).
     let mut freed_but_in_use: [BTreeSet<u64>; STORE_COUNT] = Default::default();
 
+    // Chain heads anchored on a slot that is NOT a live record — a freed slot, or a corpse
+    // (`rmp` #966). A healthy store has none: an aborted creation's chain-head publication is
+    // compare-and-set-undone back to `0`, and a reclaimed record has its chain freed before its id is
+    // listed. One that survives is a LEAKED chain, and the version-chain pass reports every fault on
+    // it exactly as it would on a live record's — which is the point of collecting them here rather
+    // than dropping the slot on the floor.
+    let mut orphan_chain_heads: Vec<(StoreKind, u64, u64)> = Vec::new();
+    let mut note_orphan_head = |kind: StoreKind, id: u64, mvcc: MvccHeader| {
+        if mvcc.undo_ptr != NULL_ID {
+            orphan_chain_heads.push((kind, id, mvcc.undo_ptr));
+        }
+    };
+
     let mut live_nodes = BTreeMap::new();
     for id in 1..cat.high_water(StoreKind::Node) {
         let Ok(rec) = store.node(id) else { continue };
@@ -634,8 +733,14 @@ fn scan_records<D: BlockDevice, S: LogSink>(
             if rec.mvcc.in_use() {
                 freed_but_in_use[StoreKind::Node as usize].insert(id);
             }
+            note_orphan_head(StoreKind::Node, id, rec.mvcc);
         } else if rec.mvcc.in_use() {
             live_nodes.insert(id, rec);
+        } else {
+            // `!in_use` and not on the free list: a node slot no live record occupies. It anchors no
+            // adjacency or property walk (unlike a relationship / property corpse), so it is not
+            // collected as a record — but a chain still hanging off it must not go unseen.
+            note_orphan_head(StoreKind::Node, id, rec.mvcc);
         }
     }
 
@@ -647,6 +752,7 @@ fn scan_records<D: BlockDevice, S: LogSink>(
             if rec.mvcc.in_use() {
                 freed_but_in_use[StoreKind::Rel as usize].insert(id);
             }
+            note_orphan_head(StoreKind::Rel, id, rec.mvcc);
         } else if rec.mvcc.in_use() {
             live_rels.insert(id, rec);
         } else {
@@ -665,6 +771,7 @@ fn scan_records<D: BlockDevice, S: LogSink>(
             if rec.mvcc.in_use() {
                 freed_but_in_use[StoreKind::Prop as usize].insert(id);
             }
+            note_orphan_head(StoreKind::Prop, id, rec.mvcc);
         } else if rec.mvcc.in_use() {
             live_props.insert(id, rec);
         } else {
@@ -690,6 +797,57 @@ fn scan_records<D: BlockDevice, S: LogSink>(
         }
     }
 
+    // The undo area (`rmp` #966): two ordinary fixed-record stores, scanned the same way. Their
+    // records carry no MVCC header, so "occupied" is the slot's own `in_use` flag and "empty" is an
+    // all-zero slot; an occupied-but-undecodable slot is corruption and is reported here rather than
+    // silently skipped, because every later chain question depends on being able to decode it.
+    let mut deltas = BTreeMap::new();
+    let mut live_deltas = BTreeSet::new();
+    for id in 1..cat.high_water(StoreKind::Undo) {
+        match store.checker_delta(id) {
+            Ok(None) => {}
+            Ok(Some(delta)) => {
+                if delta.in_use() && !freed[StoreKind::Undo as usize].contains(&id) {
+                    live_deltas.insert(id);
+                }
+                if freed[StoreKind::Undo as usize].contains(&id) && delta.in_use() {
+                    freed_but_in_use[StoreKind::Undo as usize].insert(id);
+                }
+                deltas.insert(id, delta);
+            }
+            Err(e) => _report.push(Violation::UndoSlot {
+                kind: StoreKind::Undo,
+                id,
+                detail: UndoSlotFault::Undecodable {
+                    reason: e.to_string(),
+                },
+            }),
+        }
+    }
+    let mut commit_slots = BTreeMap::new();
+    let mut live_commit_slots = BTreeSet::new();
+    for id in 1..cat.high_water(StoreKind::Commit) {
+        match store.checker_commit_slot(id) {
+            Ok(None) => {}
+            Ok(Some(slot)) => {
+                if slot.in_use() && !freed[StoreKind::Commit as usize].contains(&id) {
+                    live_commit_slots.insert(id);
+                }
+                if freed[StoreKind::Commit as usize].contains(&id) && slot.in_use() {
+                    freed_but_in_use[StoreKind::Commit as usize].insert(id);
+                }
+                commit_slots.insert(id, slot);
+            }
+            Err(e) => _report.push(Violation::UndoSlot {
+                kind: StoreKind::Commit,
+                id,
+                detail: UndoSlotFault::Undecodable {
+                    reason: e.to_string(),
+                },
+            }),
+        }
+    }
+
     Ok(Scan {
         corpse_rels,
         live_nodes,
@@ -697,6 +855,11 @@ fn scan_records<D: BlockDevice, S: LogSink>(
         live_props,
         corpse_props,
         live_blocks,
+        deltas,
+        live_deltas,
+        commit_slots,
+        live_commit_slots,
+        orphan_chain_heads,
         freed,
         freed_but_in_use,
     })
@@ -1075,12 +1238,7 @@ fn check_free_lists(cat: &Catalog, scan: &Scan, report: &mut ConsistencyReport) 
         }
     }
 
-    for kind in [
-        StoreKind::Node,
-        StoreKind::Rel,
-        StoreKind::Prop,
-        StoreKind::Strings,
-    ] {
+    for kind in ALL_STORE_KINDS {
         let hw = cat.high_water(kind);
         let mut seen: BTreeSet<u64> = BTreeSet::new();
         for &id in cat.free(kind) {
@@ -1118,6 +1276,11 @@ fn check_free_lists(cat: &Catalog, scan: &Scan, report: &mut ConsistencyReport) 
                 // Nodes are not chained, so a freed node id cannot be live-referenced via a chain;
                 // a relationship endpoint pointing at a freed node is caught by `check_referential`.
                 StoreKind::Node => false,
+                // A freed delta that a chain still reaches, and a freed commit slot a surviving delta
+                // still names, are both reported by the version-chain pass
+                // ([`UndoChainFault::FreedDeltaReachable`] / [`CommitSlotFault::FreedButReferenced`]),
+                // which is the pass that owns the chain walk and the reference census.
+                StoreKind::Undo | StoreKind::Commit => false,
             };
             if referenced {
                 report.push(Violation::FreeList {
@@ -1193,10 +1356,11 @@ fn check_label_bitmaps(cat: &Catalog, scan: &Scan, report: &mut ConsistencyRepor
 ///   disjoint number spaces (`VersionStamp`'s in-flight bit) and are deliberately not compared, so a
 ///   lazily-unfrozen committed version (whose `xmin` is still its writer's `TxnId`) is never a false
 ///   positive.
-/// * **`undo_ptr` is in range** ([`MvccHeaderFault::UndoPtrOutOfRange`]): the older-version
-///   back-pointer is `0` (none) or a physical id in `1..high_water` of the record's own store. The
-///   per-value version chain is a documented follow-up, so today `undo_ptr` is always `0`; this guard
-///   catches a dangling pointer now and the future unbounded-loop hazard the moment chains activate.
+/// * **`undo_ptr` is in range** ([`MvccHeaderFault::UndoPtrOutOfRange`]): the version-chain head is
+///   `0` (no chain) or a physical id in `1..high_water` of **`undo.store`** — not of the record's own
+///   store. That retarget is the point of `rmp` #966: before the undo area existed `undo_ptr` was
+///   always `0`, so any bound accepted it; now it addresses a different store and only that store's
+///   high-water bounds it. The chain *below* the head is validated by [`check_undo_chains`].
 fn check_mvcc_headers(cat: &Catalog, scan: &Scan, report: &mut ConsistencyReport) {
     let mut check = |kind: StoreKind, id: u64, mvcc: MvccHeader| {
         if VersionStamp::from_raw(mvcc.created_ts) == VersionStamp::None {
@@ -1221,7 +1385,7 @@ fn check_mvcc_headers(cat: &Catalog, scan: &Scan, report: &mut ConsistencyReport
                 });
             }
         }
-        if mvcc.undo_ptr != NULL_ID && mvcc.undo_ptr >= cat.high_water(kind) {
+        if mvcc.undo_ptr != NULL_ID && mvcc.undo_ptr >= cat.high_water(StoreKind::Undo) {
             report.push(Violation::MvccHeader {
                 kind,
                 id,
@@ -1239,6 +1403,127 @@ fn check_mvcc_headers(cat: &Catalog, scan: &Scan, report: &mut ConsistencyReport
     }
     for (&id, rec) in &scan.live_props {
         check(StoreKind::Prop, id, rec.mvcc);
+    }
+}
+
+/// 8. **Version-chain well-formedness** (`05 §12`, `04 §5.1`; `rmp` #966).
+///
+/// The undo chain is the *only* anchor of an entity's version history, so a fault in it is a fault in
+/// MVCC visibility itself: a broken link makes an older snapshot unreconstructible, and a reused
+/// delta slot makes it reconstruct **wrongly**. This pass proves, purely from the scan snapshot:
+///
+/// * every chain **terminates**, visiting no delta twice ([`UndoChainFault::Cycle`]) — the guard the
+///   `undo_ptr` header check was written for and could not enforce while chains did not exist;
+/// * no link **dangles**: each id is in `1..high_water` of `undo.store`
+///   ([`UndoChainFault::DeltaOutOfRange`]) and names an occupied slot
+///   ([`UndoChainFault::DeltaEmpty`]);
+/// * no reachable delta is on the **free list** ([`UndoChainFault::FreedDeltaReachable`]), which
+///   would let a later allocation overwrite a version some snapshot still needs;
+/// * every delta's `commit_info` addresses a **live** commit slot
+///   ([`UndoChainFault::CommitInfoDangling`]) — `05 §12.4`'s "a slot outlives its last delta", which
+///   is what makes a delta's committed-ness knowable at all;
+/// * a **committed** slot's `delta_count` equals the number of unreclaimed deltas naming it
+///   ([`UndoSlotFault::DeltaCountMismatch`]). Only committed slots are checked: `05 §12.4` gives an
+///   open transaction's slot the value `0` by definition, and an aborted transaction's slot never
+///   publishes a count.
+///
+/// Chains hanging off **corpse** records are walked too, not just off live ones: a corpse still
+/// anchors whatever survived it, and a leaked chain is exactly what this pass exists to catch.
+fn check_undo_chains(cat: &Catalog, scan: &Scan, report: &mut ConsistencyReport) {
+    let undo_hw = cat.high_water(StoreKind::Undo);
+    let commit_hw = cat.high_water(StoreKind::Commit);
+    let freed_deltas = &scan.freed[StoreKind::Undo as usize];
+
+    let mut heads: Vec<(StoreKind, u64, u64)> = Vec::new();
+    for (&id, rec) in &scan.live_nodes {
+        heads.push((StoreKind::Node, id, rec.mvcc.undo_ptr));
+    }
+    for (&id, rec) in scan.live_rels.iter().chain(scan.corpse_rels.iter()) {
+        heads.push((StoreKind::Rel, id, rec.mvcc.undo_ptr));
+    }
+    for (&id, rec) in scan.live_props.iter().chain(scan.corpse_props.iter()) {
+        heads.push((StoreKind::Prop, id, rec.mvcc.undo_ptr));
+    }
+    heads.extend(scan.orphan_chain_heads.iter().copied());
+
+    for (kind, entity, head) in heads {
+        let mut cur = head;
+        let mut seen: BTreeSet<u64> = BTreeSet::new();
+        while cur != NULL_ID {
+            let fault = |detail| Violation::UndoChain {
+                kind,
+                entity,
+                delta: cur,
+                detail,
+            };
+            if cur >= undo_hw {
+                report.push(fault(UndoChainFault::DeltaOutOfRange));
+                break;
+            }
+            if !seen.insert(cur) {
+                report.push(fault(UndoChainFault::Cycle));
+                break;
+            }
+            let Some(delta) = scan.deltas.get(&cur) else {
+                report.push(fault(UndoChainFault::DeltaEmpty));
+                break;
+            };
+            if freed_deltas.contains(&cur) {
+                report.push(fault(UndoChainFault::FreedDeltaReachable));
+            }
+            if delta.commit_info == NULL_ID || delta.commit_info >= commit_hw {
+                report.push(fault(UndoChainFault::CommitInfoOutOfRange {
+                    commit_info: delta.commit_info,
+                }));
+            } else if !scan.commit_slots.contains_key(&delta.commit_info) {
+                report.push(fault(UndoChainFault::CommitInfoDangling {
+                    commit_info: delta.commit_info,
+                }));
+            }
+            cur = delta.next;
+        }
+    }
+
+    // The reference census, over EVERY delta rather than only the reachable ones: `delta_count`
+    // counts unreclaimed deltas (`05 §12.4`), and a delta stops being unreclaimed when GC frees its
+    // slot, not when it stops being reachable.
+    let mut references: BTreeMap<u64, u64> = BTreeMap::new();
+    for id in &scan.live_deltas {
+        let Some(delta) = scan.deltas.get(id) else {
+            continue;
+        };
+        *references.entry(delta.commit_info).or_default() += 1;
+    }
+    for (&id, slot) in &scan.commit_slots {
+        let actual = references.get(&id).copied().unwrap_or(0);
+        if scan.freed[StoreKind::Commit as usize].contains(&id) && actual > 0 {
+            report.push(Violation::UndoSlot {
+                kind: StoreKind::Commit,
+                id,
+                detail: UndoSlotFault::FreedButReferenced,
+            });
+            continue;
+        }
+        // Only a COMMITTED slot's count is normative. An open transaction's slot carries `0` by
+        // definition, and an aborted transaction's (a corpse) never publishes one.
+        if !slot.in_use()
+            || !matches!(
+                VersionStamp::from_raw(slot.commit_ts),
+                VersionStamp::Committed(_)
+            )
+        {
+            continue;
+        }
+        if slot.delta_count != actual {
+            report.push(Violation::UndoSlot {
+                kind: StoreKind::Commit,
+                id,
+                detail: UndoSlotFault::DeltaCountMismatch {
+                    recorded: slot.delta_count,
+                    actual,
+                },
+            });
+        }
     }
 }
 
@@ -1361,6 +1646,10 @@ fn scan_high_water(scan: &Scan, kind: StoreKind) -> u64 {
         StoreKind::Rel => scan.live_rels.keys().next_back().copied(),
         StoreKind::Prop => scan.live_props.keys().next_back().copied(),
         StoreKind::Strings => scan.live_blocks.keys().next_back().copied(),
+        // Index entries never name an undo-area record, so this is unreachable for them; answer with
+        // the same conservative "one past the largest known id" the other stores get.
+        StoreKind::Undo => scan.live_deltas.iter().next_back().copied(),
+        StoreKind::Commit => scan.live_commit_slots.iter().next_back().copied(),
     }
     .unwrap_or(0);
     let freed_max = scan.freed[kind as usize]

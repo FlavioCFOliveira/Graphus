@@ -619,7 +619,16 @@ pub mod error {
 /// Global on-disk format and engine constants.
 pub mod constants {
     /// On-disk format version, bumped on any incompatible layout change.
-    pub const FORMAT_VERSION: u32 = 1;
+    ///
+    /// | Version | Introduced by | Change |
+    /// | --- | --- | --- |
+    /// | 1 | — | Three record stores plus the `strings.store` overflow heap; `undo_ptr` reserved in every record header and permanently `0`. |
+    /// | 2 | `rmp` #966 | The **undo area** (`05-storage-format.md` §12): the `undo.store` delta store and the `commit.store` commit-info store, and `undo_ptr` as the live head of an entity's version chain. |
+    ///
+    /// The version is persisted in the durable catalog (`graphus_storage::Meta`), which is where a
+    /// store's version is read from and where the compatibility decision is taken: a store older
+    /// than this constant is **upgraded** on open, and one newer than it is **refused**.
+    pub const FORMAT_VERSION: u32 = 2;
 
     /// Logical database page size in bytes, decoupled from the OS page size
     /// (`04-technical-design.md` §3.1; the default is subject to spike §12 item 4).

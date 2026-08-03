@@ -35,9 +35,9 @@ use graphus_storage::record::{
 use graphus_storage::store::StoreKind;
 use graphus_storage::{
     AgreementFault, ConsistencyReport, IndexAgreement, IndexEntry, Namespace, RecordStore,
-    Violation, check::AdjacencyFault, check::FreeListFault, check::HeapChainFault,
-    check::LabelBitmapFault, check::MvccHeaderFault, check::PropertyFault, recovery,
-    verify_on_open,
+    UndoChainFault, UndoSlotFault, Violation, check::AdjacencyFault, check::FreeListFault,
+    check::HeapChainFault, check::LabelBitmapFault, check::MvccHeaderFault, check::PropertyFault,
+    recovery, verify_on_open,
 };
 use graphus_wal::{LogSink, MemLogSink, WalManager};
 
@@ -215,6 +215,32 @@ impl DiskImage {
         panic!("record with element_id {element_id} not found in the image");
     }
 
+    /// Locates the device page holding store-relative page `0` of `kind`, by the **store-kind
+    /// subtype byte** every record page carries in its header (`rmp` #239: type byte at
+    /// `OFF_PAGE_TYPE`, kind byte immediately after). Used for the undo area (`rmp` #966), whose
+    /// records carry no element id and so cannot be found by [`locate`](Self::locate).
+    fn locate_store_page(&self, kind: StoreKind) -> u64 {
+        for (pid, bytes) in &self.pages {
+            if page::page_type(bytes) == 1 && bytes[page::OFF_PAGE_TYPE + 1] == kind as u8 {
+                return *pid;
+            }
+        }
+        panic!("no {kind:?} store page in the image");
+    }
+
+    /// Overwrites the 8-byte little-endian word at `(page_id, off)` and refreshes the page checksum,
+    /// so the *only* thing the checker can flag is the semantic damage.
+    fn write_u64_at(&mut self, page_id: u64, off: usize, word: u64) {
+        self.page_mut(page_id)[off..off + 8].copy_from_slice(&word.to_le_bytes());
+        self.refresh_checksum(page_id);
+    }
+
+    /// Reads the 8-byte little-endian word at `(page_id, off)`.
+    fn read_u64_at(&self, page_id: u64, off: usize) -> u64 {
+        let bytes = &self.pages.iter().find(|(i, _)| *i == page_id).unwrap().1;
+        u64::from_le_bytes(bytes[off..off + 8].try_into().expect("8-byte slice"))
+    }
+
     /// Reads record `id`'s bytes for `kind` at the located slot.
     fn read_rel_at(&self, page_id: u64, off: usize) -> RelRecord {
         let bytes = &self.pages.iter().find(|(i, _)| *i == page_id).unwrap().1;
@@ -367,6 +393,11 @@ fn decode_element_id(kind: StoreKind, bytes: &[u8]) -> u128 {
         // Property and heap-block records have no element id; never located by element id.
         StoreKind::Prop => PropRecord::decode(bytes).mvcc.created_ts as u128,
         StoreKind::Strings => u128::from(graphus_storage::HeapBlock::decode(bytes).mvcc.created_ts),
+        // The undo area's records carry no MVCC header and no element id at all; they are located by
+        // physical id, never by identity (`05 §12`).
+        StoreKind::Undo | StoreKind::Commit => {
+            panic!("{kind:?} records are not located by element id")
+        }
     }
 }
 
@@ -1520,4 +1551,233 @@ fn label_bitmap_unknown_token_is_flagged() {
         "a label bitmap referencing an unknown token id must be flagged: {:?}",
         r.violations
     );
+}
+
+// ============================================================================================
+// Version-chain corruption is flagged (`rmp` #966, `05 §12`).
+//
+// The undo area's records carry no element id, so they are located by the store-kind subtype byte
+// every record page stamps in its header. Field offsets below are the FROZEN layout of `05 §12.2`
+// / `§12.4` written out literally, which makes these tests a second, independent statement of that
+// layout: a silent change to it breaks them.
+// ============================================================================================
+
+/// Byte offsets inside a 56-byte delta record (`05 §12.2`).
+const DELTA_SIZE: usize = 56;
+const DELTA_OFF_COMMIT_INFO: usize = 8;
+const DELTA_OFF_NEXT: usize = 16;
+/// Byte offsets inside a 32-byte commit-info slot (`05 §12.4`).
+const SLOT_SIZE: usize = 32;
+const SLOT_OFF_DELTA_COUNT: usize = 24;
+
+/// Builds a small store with live version chains, ready to be corrupted.
+fn store_with_chains() -> (Store, u64, u128) {
+    let mut s = fresh(64);
+    let txn = TxnId(1);
+    s.begin(txn);
+    let t = s.intern_token(Namespace::RelType, "T").unwrap();
+    let (a, eid_a) = s.create_node(txn).unwrap();
+    let (b, _) = s.create_node(txn).unwrap();
+    s.create_rel(txn, t, a, b).unwrap();
+    s.commit(txn).unwrap();
+    (s, a, eid_a.0)
+}
+
+/// A chain link that reaches an **empty** delta slot is flagged: the version below it is
+/// unreachable, so an older snapshot cannot be reconstructed.
+#[test]
+fn undo_chain_reaching_an_empty_delta_slot_is_flagged() {
+    let (mut s, a, eid_a) = store_with_chains();
+    let mut img = DiskImage::capture(&mut s);
+    assert!(report(&mut img.open()).is_consistent(), "healthy first");
+
+    // Repoint node `a`'s chain head at a slot that is in range (the delta slab claims a whole page of
+    // ids up front) but was never written.
+    let (page_id, off) = img.locate(StoreKind::Node, eid_a);
+    let mut node = img.read_node_at(page_id, off);
+    let empty_slot = 100;
+    assert_ne!(node.mvcc.undo_ptr, empty_slot);
+    node.mvcc.undo_ptr = empty_slot;
+    img.write_node_at(page_id, off, &node);
+
+    let mut store = img.open();
+    let r = report(&mut store);
+    assert!(
+        r.violations.iter().any(|v| matches!(
+            v,
+            Violation::UndoChain {
+                entity,
+                detail: UndoChainFault::DeltaEmpty,
+                ..
+            } if *entity == a
+        )),
+        "a chain link into an empty slot must be flagged: {:?}",
+        r.violations
+    );
+    assert!(
+        verify_on_open(&mut store, &[]).is_err(),
+        "and must refuse to serve"
+    );
+}
+
+/// A **cyclic** chain is flagged rather than walked for ever — the unbounded-loop hazard the
+/// `undo_ptr` header guard was written for and could not enforce while chains did not exist.
+#[test]
+fn a_cyclic_undo_chain_is_flagged() {
+    let (mut s, _a, _eid) = store_with_chains();
+    let mut img = DiskImage::capture(&mut s);
+    assert!(report(&mut img.open()).is_consistent(), "healthy first");
+
+    // Point the first delta's `next` back at itself.
+    let undo_page = img.locate_store_page(StoreKind::Undo);
+    let slot1 = page::HEADER_SIZE + DELTA_SIZE; // physical id 1 (id 0 is the reserved null)
+    assert_eq!(img.read_u64_at(undo_page, slot1 + DELTA_OFF_NEXT), 0);
+    img.write_u64_at(undo_page, slot1 + DELTA_OFF_NEXT, 1);
+
+    let mut store = img.open();
+    let r = report(&mut store);
+    assert!(
+        r.violations.iter().any(|v| matches!(
+            v,
+            Violation::UndoChain {
+                detail: UndoChainFault::Cycle,
+                ..
+            }
+        )),
+        "a self-referential chain must be flagged as a cycle: {:?}",
+        r.violations
+    );
+    assert!(verify_on_open(&mut store, &[]).is_err());
+}
+
+/// A delta whose `commit_info` points outside `commit.store` is flagged.
+#[test]
+fn a_delta_naming_an_out_of_range_commit_slot_is_flagged() {
+    let (mut s, _a, _eid) = store_with_chains();
+    let mut img = DiskImage::capture(&mut s);
+    assert!(report(&mut img.open()).is_consistent(), "healthy first");
+
+    let undo_page = img.locate_store_page(StoreKind::Undo);
+    let slot1 = page::HEADER_SIZE + DELTA_SIZE;
+    assert_ne!(
+        img.read_u64_at(undo_page, slot1 + DELTA_OFF_COMMIT_INFO),
+        0,
+        "a live delta always names a slot"
+    );
+    img.write_u64_at(undo_page, slot1 + DELTA_OFF_COMMIT_INFO, 50);
+
+    let mut store = img.open();
+    let r = report(&mut store);
+    assert!(
+        r.violations.iter().any(|v| matches!(
+            v,
+            Violation::UndoChain {
+                detail: UndoChainFault::CommitInfoOutOfRange { commit_info: 50 },
+                ..
+            }
+        )),
+        "an out-of-range `commit_info` must be flagged: {:?}",
+        r.violations
+    );
+    assert!(verify_on_open(&mut store, &[]).is_err());
+}
+
+/// A commit slot that has been **erased while deltas still name it** is flagged: their
+/// committed-ness becomes unknowable, and `05 §12.4` promises that can never happen ("a slot
+/// outlives its last delta"). This is the exact damage a premature slot reclamation would do.
+#[test]
+fn a_delta_whose_commit_slot_is_gone_is_flagged() {
+    let (mut s, _a, _eid) = store_with_chains();
+    let mut img = DiskImage::capture(&mut s);
+    assert!(report(&mut img.open()).is_consistent(), "healthy first");
+
+    let commit_page = img.locate_store_page(StoreKind::Commit);
+    let slot1 = page::HEADER_SIZE + SLOT_SIZE; // the one transaction's slot, physical id 1
+    assert_ne!(
+        img.read_u64_at(commit_page, slot1 + SLOT_OFF_DELTA_COUNT),
+        0,
+        "the slot is really occupied before it is erased"
+    );
+    img.page_mut(commit_page)[slot1..slot1 + SLOT_SIZE].fill(0);
+    img.refresh_checksum(commit_page);
+
+    let mut store = img.open();
+    let r = report(&mut store);
+    assert!(
+        r.violations.iter().any(|v| matches!(
+            v,
+            Violation::UndoChain {
+                detail: UndoChainFault::CommitInfoDangling { commit_info: 1 },
+                ..
+            }
+        )),
+        "a delta whose slot no longer exists must be flagged: {:?}",
+        r.violations
+    );
+    assert!(verify_on_open(&mut store, &[]).is_err());
+}
+
+/// A committed slot whose `delta_count` disagrees with the number of unreclaimed deltas naming it is
+/// flagged (`05 §12.4`): the count is what decides when the slot may be freed, so a wrong one frees
+/// it while deltas still resolve through it.
+#[test]
+fn a_commit_slot_with_a_wrong_delta_count_is_flagged() {
+    let (mut s, _a, _eid) = store_with_chains();
+    let mut img = DiskImage::capture(&mut s);
+    assert!(report(&mut img.open()).is_consistent(), "healthy first");
+
+    let commit_page = img.locate_store_page(StoreKind::Commit);
+    let slot1 = page::HEADER_SIZE + SLOT_SIZE; // physical id 1
+    let real = img.read_u64_at(commit_page, slot1 + SLOT_OFF_DELTA_COUNT);
+    assert_eq!(real, 3, "one transaction created two nodes and one edge");
+    img.write_u64_at(commit_page, slot1 + SLOT_OFF_DELTA_COUNT, 7);
+
+    let mut store = img.open();
+    let r = report(&mut store);
+    assert!(
+        r.violations.iter().any(|v| matches!(
+            v,
+            Violation::UndoSlot {
+                detail: UndoSlotFault::DeltaCountMismatch {
+                    recorded: 7,
+                    actual: 3
+                },
+                ..
+            }
+        )),
+        "a mis-counted commit slot must be flagged: {:?}",
+        r.violations
+    );
+    assert!(verify_on_open(&mut store, &[]).is_err());
+}
+
+/// A delta slot that is occupied but does not decode — here, a reserved word forged non-zero — is
+/// flagged rather than accepted as a plausible delta (`05 §12.2`: reserved fields must be zero).
+#[test]
+fn an_undecodable_delta_slot_is_flagged() {
+    let (mut s, _a, _eid) = store_with_chains();
+    let mut img = DiskImage::capture(&mut s);
+    assert!(report(&mut img.open()).is_consistent(), "healthy first");
+
+    let undo_page = img.locate_store_page(StoreKind::Undo);
+    let slot1 = page::HEADER_SIZE + DELTA_SIZE;
+    // Offset 28 is the delta's reserved word (`05 §12.2`), which must be zero.
+    img.page_mut(undo_page)[slot1 + 28] = 0xFF;
+    img.refresh_checksum(undo_page);
+
+    let mut store = img.open();
+    let r = report(&mut store);
+    assert!(
+        r.violations.iter().any(|v| matches!(
+            v,
+            Violation::UndoSlot {
+                kind: StoreKind::Undo,
+                detail: UndoSlotFault::Undecodable { .. },
+                ..
+            }
+        )),
+        "an undecodable delta must be flagged: {:?}",
+        r.violations
+    );
+    assert!(verify_on_open(&mut store, &[]).is_err());
 }

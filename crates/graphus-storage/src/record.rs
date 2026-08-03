@@ -39,6 +39,11 @@ pub const MVCC_OFF_CREATED_TS: usize = OFF_CREATED_TS;
 /// Byte offset of the `expired_ts` (`xmax`) word within any record's MVCC header (`05 §7`). Exposed
 /// so the store can stamp an MVCC tombstone (`xmax`) or settle it at commit with an 8-byte patch.
 pub const MVCC_OFF_EXPIRED_TS: usize = OFF_EXPIRED_TS;
+/// Byte offset of the `undo_ptr` word within any record's MVCC header (`05 §7`) — the head of this
+/// entity's undo-delta chain (`05 §12`, `rmp` #966). Exposed so the store can publish a new chain
+/// head with the same compare-and-set chain-head write `first_rel` / `first_prop` use: `undo_ptr` is
+/// a prepend-only chain head and shares their undo hazard exactly.
+pub const MVCC_OFF_UNDO_PTR: usize = OFF_UNDO_PTR;
 
 /// The frozen MVCC record header shared by every node, relationship and property record
 /// (`05 §7`).
@@ -47,10 +52,14 @@ pub const MVCC_OFF_EXPIRED_TS: usize = OFF_EXPIRED_TS;
 /// once committed, or the writer's [`TxnId`](graphus_core::TxnId) while uncommitted (the
 /// [`VersionStamp`](graphus_core::VersionStamp) convention); `expired_ts` is `0` while the version
 /// is live, or carries the deleting transaction's stamp once tombstoned; `undo_ptr` is the physical
-/// id of the older version (`0` = none, reserved for the per-value version chain, a follow-up). The
+/// id of the head of this entity's undo-delta chain (`0` = none; `05 §12`, `rmp` #966). The
 /// store is **MVCC-native** (`rmp` task #45): it stamps `xmin` in-flight on create, settles it to
 /// the commit timestamp at commit, MVCC-tombstones `xmax` on delete, and reclaims tombstones by GC;
 /// `graphus-txn`'s visibility rule reads these words directly.
+///
+/// `undo_ptr` is **live** since `rmp` #966: it holds the physical id, in `undo.store` (`05 §12`), of
+/// the newest delta on this entity's version chain, or `0` when the entity has no chain. Every
+/// mutation the store makes to a versioned record prepends a delta and republishes this word.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MvccHeader {
     /// Flag bits ([`FLAG_IN_USE`], [`FLAG_DENSE`], rest reserved).
@@ -59,7 +68,8 @@ pub struct MvccHeader {
     pub created_ts: u64,
     /// Expiring transaction's commit timestamp; `0` = live (latest visible version).
     pub expired_ts: u64,
-    /// Physical id of the older version (undo chain head); `0` = none.
+    /// Physical id in `undo.store` of the head of this entity's undo-delta chain; `0` = none
+    /// (`05 §7`, `05 §12`, `rmp` #966).
     pub undo_ptr: u64,
 }
 

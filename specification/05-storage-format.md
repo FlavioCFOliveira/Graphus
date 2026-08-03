@@ -128,21 +128,27 @@ this prefix and are finalized with `graphus-storage`.
 → **25-byte MVCC record header.** Node and relationship records additionally carry the **16-byte
 stable `ElementId`** (`D-element-id`) immediately after this prefix; property records do not.
 
-**`undo_ptr` — its meaning, and its present state.** `undo_ptr` is the **only** anchor of an entity's
+**`undo_ptr` — its meaning.** `undo_ptr` is the **only** anchor of an entity's
 version history: it holds the physical id of the newest delta on that entity's chain, each delta
 carrying the id of the next-older one (§12). Reconstructing the version a given snapshot may see means
 starting from the in-place record image and applying deltas from `undo_ptr` backwards until the
 snapshot's visibility rule is satisfied (`04` §5.3). Without a non-zero `undo_ptr` there is no version
 chain at all.
 
-> **Flag — the field is reserved but dead in the engine as it stands.** `MvccHeader::live` writes
-> `undo_ptr: 0` unconditionally (`crates/graphus-storage/src/record.rs:74`) and the consistency
-> checker states so in its own documentation: "the per-value version chain is a documented follow-up,
-> so today `undo_ptr` is always `0`" (`crates/graphus-storage/src/check.rs:1196-1199`). Eight bytes per
-> record are therefore reserved and never used. Bringing the field to life — allocating the undo area
-> and writing real chain heads into it — is task **#966**. The frozen 25-byte header above does **not**
-> change: `undo_ptr` was always specified to mean this, and #966 makes the engine honour the
+> **The field is live since task #966.** Creating or deleting a node or relationship links a delta and
+> publishes it as that entity's chain head (`RecordStore::link_delta`, driven from `create_node` /
+> `create_rel` / `delete_node` / `delete_rel` in `crates/graphus-storage/src/store.rs`), so `undo_ptr`
+> is no longer the permanently-zero reserved word it was. The head is published with the same
+> compare-and-set chain-head write `first_rel` / `first_prop` use, and the consistency checker now
+> range-checks it against **`undo.store`**'s high-water and walks the chain below it
+> (`Violation::UndoChain`, `crates/graphus-storage/src/check.rs`). The frozen 25-byte header above did
+> **not** change: `undo_ptr` was always specified to mean this, and #966 made the engine honour the
 > specification rather than the other way round.
+>
+> **Still to come.** #966 delivered the area and the entity-lifecycle actions (`DeleteObject` /
+> `RecreateObject`). Property assignment (**#967**), label change (**#968**) and incidence change
+> (**#969**) still use the mechanisms `04` §5.1.5 lists; they move onto this chain in their own tasks,
+> and the record format does not change again when they do.
 
 ---
 
@@ -265,9 +271,12 @@ on 2026-08-02. The behavioural model — the seven delta actions, the delta life
 ownership of its deltas, and the commit indirection point — is `04-technical-design.md` §5.1; this
 section specifies only the bytes.
 
-> **This area does not exist in the engine yet.** It is the deliverable of task **#966**. Every field
-> below is a specification of what #966 must produce, not a description of present behaviour. What
-> exists today is the 8-byte `undo_ptr` reserved in every record and permanently written `0` (§7).
+> **This area exists in the engine as of task #966.** The codec is
+> `crates/graphus-storage/src/undo.rs`; the two stores are `StoreKind::Undo` and `StoreKind::Commit`
+> in `crates/graphus-storage/src/store.rs`, framed and recovered exactly like the four that precede
+> them. All seven actions of §12.3 are encodable and decodable; the write path emits the two
+> entity-lifecycle ones (`DeleteObject` on create, `RecreateObject` on delete), and tasks #967 / #968 /
+> #969 add the property, label and incidence actions without changing a byte of the format below.
 
 ### 12.1 Two new stores
 
@@ -389,9 +398,39 @@ itself (§12.5), and frees its slot with them.
 
 Adding these two stores and bringing `undo_ptr` to life is an **incompatible on-disk layout change**:
 a store written by a build that has an undo area cannot be read correctly by one that does not.
-`graphus_core::constants::FORMAT_VERSION` (`crates/graphus-core/src/lib.rs:622`, documented as "bumped
+`graphus_core::constants::FORMAT_VERSION` (`crates/graphus-core/src/lib.rs`, documented as "bumped
 on any incompatible layout change") is therefore raised from **1 to 2** by task **#966**. A store
 carrying format version 1 has no undo area and every `undo_ptr` in it reads `0`, which is a valid,
 chain-free image; opening it under a version-2 build is an upgrade, and opening a version-2 store under
 an older build must be refused rather than misread. The backup artifact's own `format_version`
 (§11) is independent and is not affected by this bump.
+
+**How the version is carried, and how each direction of the rule is enforced.** Before #966 the
+constant was never persisted, so a store carried no version at all. #966 gives it two carriers, one
+for each direction:
+
+- **This build reading an older or a newer store.** The version lives in the durable catalog
+  (`graphus_storage::Meta`), in a trailing block introduced by the magic `GRPHUNDO` and followed by the
+  two undo-area store entries. The block is appended after every pre-existing block, by the same
+  append-only rule every other catalog extension follows, so a version-1 image is exactly this image
+  without the block: `Meta::decode` reports it as version 1 with two empty undo-area stores — a valid,
+  chain-free image — and the first checkpoint rewrites the catalog at version 2. A version *newer* than
+  the reading build is refused outright, never partially interpreted.
+- **An older build reading this store.** A shipped build cannot be taught a new version check, so the
+  refusal has to come from a validation it already performs, and it performs exactly one on the
+  metadata frame: it rejects a catalog chunk whose length runs past the page. A version-2 build
+  therefore sets bit 31 of the **head** metadata page's `chunk_len`, which makes a pre-#966 build fail
+  that guard deterministically instead of parsing a catalog whose trailing undo-area block it would
+  silently drop — which would orphan both undo stores and strand every `undo_ptr` in the record stores.
+  A real chunk length is at most one page, so the bit can never collide with a genuine value; a
+  version-2 build masks it off. The error an older build reports is *"metadata chunk runs past the
+  page"*: a refusal, and a deterministic one, though it does not name the version.
+
+  > **Ratified on 2026-08-03.** This tripwire is a deliberate design decision, not an accident of the
+  > encoding, and it was put to the owner precisely because it carries a flag bit in a length field and
+  > yields an error message that does not name the version. The trade-off was accepted as stated: **an
+  > old build failing immediately on a version-2 store is worth more than one reading it wrongly and
+  > then writing over it**, and the confusing message is the accepted price. Do not "clean this up" as
+  > an unintentional hack — removing the bit re-opens the silent-misread path this section exists to
+  > close. It is pinned by
+  > `crates/graphus-storage/tests/undo_chain.rs::the_head_metadata_page_carries_the_format_tripwire`.

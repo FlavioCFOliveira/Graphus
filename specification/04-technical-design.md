@@ -689,7 +689,7 @@ undo area itself. This table is the authoritative list; the decision register
 
 | # | Mechanism today | Where it lives now | Replaced by | Retired in |
 | --- | --- | --- | --- | --- |
-| 0 | **No undo area at all.** `undo_ptr` is reserved in every record and always written `0`, so there is no chain to anchor. | `crates/graphus-storage/src/record.rs:74`; admitted in `crates/graphus-storage/src/check.rs:1196-1199` | The undo area and the delta record; `undo_ptr` becomes the live chain head | **#966** |
+| 0 | ~~**No undo area at all.** `undo_ptr` is reserved in every record and always written `0`, so there is no chain to anchor.~~ **CLOSED.** | was `crates/graphus-storage/src/record.rs`; now `crates/graphus-storage/src/undo.rs` + `StoreKind::Undo` / `StoreKind::Commit` | The undo area and the delta record; `undo_ptr` is the live chain head | **#966 — done** |
 | 1 | **Property tombstone plus chain prepend.** Setting a property walks the entity's whole property chain to tombstone the previous version, then prepends a new one — **O(M²)** over M assignments (15.1 µs/op at M = 1000; 97.8 µs/op at M = 8000). | `RecordStore::tombstone_props_for_key`, `crates/graphus-storage/src/store.rs:5646-5666` | One `SetProperty` delta carrying the old value; the home property record is updated in place | **#967** |
 | 2 | **Label bitmap mutated in place, with the version history held only in memory.** The history is an in-process structure shared by `Arc`; nothing about it is durable, so labels are not versioned on disk. | `crates/graphus-storage/src/label_history.rs:143` | `AddLabel` / `RemoveLabel` deltas on the same durable chain as every other change | **#968** |
 | 3 | **Ad-hoc compare-and-set undo for chain heads and the label word.** A bespoke undo per field, needed because a whole-record pre-image undo would revert words a concurrently-committed writer legitimately owns. | `crates/graphus-storage/src/record.rs:114-123`; `store.rs:2507` (`write_chain_head`), `:2541` (label word) | `AddIncidentEdge` / `RemoveIncidentEdge` deltas naming one incidence entry, so no shared pointer word is ever rewritten by an undo | **#969** |
@@ -701,12 +701,19 @@ Two further tasks complete the model rather than replacing a mechanism: **#972**
 `D-dst-writer-scheduler` extends `07-dst-simulator.md` §5 so that multi-writer behaviour is certified
 from a seed rather than from a race.
 
-**Status of this section.** Everything above is the **specified target**, not present behaviour. As of
-this writing the engine has no undo area, no delta, no `command_id`, and no chain: the transaction
-manager is written against a placeholder store precisely because the representation was open, and says
-so — "the real `graphus_storage` does not yet implement version-chain mechanics", and wiring it up "is
-a follow-up task, intentionally **out of scope** here" (`crates/graphus-txn/src/store.rs:6-8`,
-`:27-31`). Each row of the table above names the task that closes the gap it describes.
+**Status of this section.** Row 0 is **closed**: task #966 built the undo area, the delta record, the
+commit-info slot and the chain, and brought `undo_ptr` to life. The engine writes a `DeleteObject`
+delta when it creates a node or relationship and a `RecreateObject` delta when it deletes one, publishes
+each transaction's commit with a single store into its slot, reclaims chains by watermark at GC, and
+validates every chain in the consistency checker. `command_id` is carried in every delta and is always
+`0` until **#972** introduces statement-level isolation.
+
+Rows 1–5 are still the **specified target**, not present behaviour: property assignment, label change
+and incidence change still use the mechanisms listed, rollback is still physical, and the write-lock
+table is still in place. Each row names the task that closes it. The transaction manager likewise still
+runs against a placeholder store — "the real `graphus_storage` does not yet implement version-chain
+mechanics", and wiring it up "is a follow-up task, intentionally **out of scope** here"
+(`crates/graphus-txn/src/store.rs`).
 
 ### 5.2 Timestamps and snapshots
 

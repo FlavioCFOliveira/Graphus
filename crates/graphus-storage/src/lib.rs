@@ -87,6 +87,7 @@ pub mod recovery;
 pub mod scan_polarity;
 pub mod store;
 pub mod tokens;
+pub mod undo;
 pub mod valenc;
 pub mod wal_rule;
 
@@ -96,7 +97,8 @@ pub use backup::{
 };
 pub use check::{
     AdjacencyFault, AgreementFault, ConsistencyReport, FreeListFault, HeapChainFault,
-    IndexAgreement, IndexEntry, LabelBitmapFault, PropertyFault, Violation, verify_on_open,
+    IndexAgreement, IndexEntry, LabelBitmapFault, PropertyFault, UndoChainFault, UndoSlotFault,
+    Violation, verify_on_open,
 };
 pub use dwb::{DWB_EVICT_RING_SLOTS, DWB_MAX_BATCH, Dwb, DwbPageStager, dwb_device_pages};
 /// The page-header codec (checksum / `page_id` / `page_lsn` / type accessors) the storage layer
@@ -135,9 +137,15 @@ pub use record::{
 pub use scan_polarity::{DecidedProperties, SupersetProperties};
 pub use store::{
     DEFAULT_CHECKPOINT_INTERVAL_BYTES, DirectionalRelCounts, FreezeFrontierViolation, GcPassReport,
-    META_PAGE, RecordStore, StoreKind,
+    META_PAGE, RecordStore, STORE_COUNT, StoreKind,
 };
 pub use tokens::{Namespace, TokenSnapshot, TokenStore};
+/// The undo area (`05-storage-format.md` §12, `rmp` #966): the delta record that carries the inverse
+/// of one change to one entity, and the per-transaction commit-info slot every delta resolves its
+/// commit status through.
+pub use undo::{
+    COMMIT_RECORD_SIZE, CommitSlot, IncidentDirection, UNDO_RECORD_SIZE, UndoAction, UndoDelta,
+};
 pub use valenc::{
     OVERFLOW_BIT as PROP_OVERFLOW_BIT, TAG_DATE, TAG_DURATION, TAG_LIST, TAG_LOCAL_DATE_TIME,
     TAG_LOCAL_TIME, TAG_STRING, TAG_ZONED_DATE_TIME, TAG_ZONED_TIME, ValueDecodeError,

@@ -19,6 +19,23 @@ use crate::idalloc::FreeList;
 use crate::store::STORE_COUNT;
 use crate::tokens::TokenStore;
 
+/// The number of fixed-record stores a **format version 1** catalog describes: the node,
+/// relationship and property stores plus the `strings.store` overflow heap (`04 §2.1`).
+///
+/// The catalog's first four store entries keep their historic position and byte layout for ever, so
+/// a version-1 image and the version-1 prefix of a version-2 image are byte-identical up to the
+/// statistics block. The undo area's two stores (`05 §12.1`) live in the trailing block instead —
+/// the same append-only rule every other catalog extension follows.
+const LEGACY_STORE_COUNT: usize = 4;
+
+/// The on-disk format version of a catalog image that carries **no** undo-area block: everything
+/// this project wrote before `rmp` #966 (`05 §12.6`).
+const LEGACY_FORMAT_VERSION: u32 = 1;
+
+/// Magic word introducing the trailing undo-area block (`rmp` #966). Chosen so a truncated or
+/// garbage tail cannot be mistaken for the block: `b"GRPHUNDO"` read little-endian.
+const UNDO_AREA_MAGIC: u64 = u64::from_le_bytes(*b"GRPHUNDO");
+
 /// The durable catalog stored in the metadata page.
 ///
 /// Holds, for each of the three record stores, the physical-id high-water mark, the free list,
@@ -26,6 +43,15 @@ use crate::tokens::TokenStore;
 /// next `ElementId` to allocate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Meta {
+    /// The on-disk format version this catalog image was written by
+    /// ([`FORMAT_VERSION`](graphus_core::constants::FORMAT_VERSION), `05 §12.6`).
+    ///
+    /// A **version-1** image (everything written before `rmp` #966) has no undo-area block at all;
+    /// [`decode`](Self::decode) reports it as `1` with two empty undo-area stores, which is exactly
+    /// the state a store with no version chains is in, so opening one is a lossless **upgrade**
+    /// rather than a conversion. An image whose version is *newer* than this build's is **refused**
+    /// by `decode`, never partially interpreted.
+    pub format_version: u32,
     /// Next `ElementId` to allocate (never-reused monotonic counter, `04 §2.2`).
     pub element_id_next: u128,
     /// The largest MVCC commit timestamp issued so far (`04 §5.2`). Persisted so the timestamp
@@ -33,7 +59,8 @@ pub struct Meta {
     /// committer's timestamp must never alias or regress past a durable committed version.
     pub commit_ts_hw: u64,
     /// Per-store state, indexed by [`StoreKind`](crate::store::StoreKind) `as usize` (the node, rel
-    /// and prop stores plus the `strings.store` overflow heap, `04 §2.1`).
+    /// and prop stores plus the `strings.store` overflow heap, `04 §2.1`, and — from format version
+    /// 2 — the `undo.store` / `commit.store` pair of the undo area, `05 §12.1`).
     pub stores: [StoreMeta; STORE_COUNT],
     /// The token dictionaries (`04 §2.6`).
     pub tokens: TokenStore,
@@ -3669,6 +3696,7 @@ impl Meta {
     #[must_use]
     pub fn new(element_id_seed: u128) -> Self {
         Self {
+            format_version: graphus_core::constants::FORMAT_VERSION,
             element_id_next: element_id_seed,
             commit_ts_hw: 0,
             stores: Default::default(),
@@ -3691,15 +3719,11 @@ impl Meta {
         let mut out = Vec::new();
         out.extend_from_slice(&self.element_id_next.to_le_bytes());
         out.extend_from_slice(&self.commit_ts_hw.to_le_bytes());
-        for s in &self.stores {
-            out.extend_from_slice(&s.high_water.to_le_bytes());
-            let fl = s.free_list.encode();
-            out.extend_from_slice(&(fl.len() as u32).to_le_bytes());
-            out.extend_from_slice(&fl);
-            out.extend_from_slice(&(s.device_pages.len() as u32).to_le_bytes());
-            for &p in &s.device_pages {
-                out.extend_from_slice(&p.to_le_bytes());
-            }
+        // The FOUR version-1 stores keep their historic position and layout, so a version-1 image and
+        // the version-1 prefix of a version-2 image are byte-identical up to the statistics block.
+        // The undo area's two stores are appended in the trailing block below.
+        for s in &self.stores[..LEGACY_STORE_COUNT] {
+            Self::encode_store(&mut out, s);
         }
         let tok = self.tokens.encode();
         out.extend_from_slice(&(tok.len() as u32).to_le_bytes());
@@ -3709,7 +3733,33 @@ impl Meta {
         let stats = self.statistics.encode();
         out.extend_from_slice(&(stats.len() as u32).to_le_bytes());
         out.extend_from_slice(&stats);
+        // ---- The undo-area block (`rmp` #966, `05 §12.6`): format version 2 and up. ----
+        //
+        // Appended after every prior block by this catalog's established append-only rule, so a
+        // version-1 image simply ENDS where this block would start and `decode` reports version 1
+        // with two empty undo-area stores. The block leads with a magic word rather than a bare
+        // version number so the decoder can tell "no block" from "a block it must parse" without
+        // relying on the payload length alone — a bare trailing `u32` would be indistinguishable
+        // from a truncated or garbage tail.
+        out.extend_from_slice(&UNDO_AREA_MAGIC.to_le_bytes());
+        out.extend_from_slice(&self.format_version.to_le_bytes());
+        for s in &self.stores[LEGACY_STORE_COUNT..] {
+            Self::encode_store(&mut out, s);
+        }
         Ok(out)
+    }
+
+    /// Encodes one store's durable catalog entry: high-water, length-prefixed free list, then the
+    /// length-prefixed device-page map. Byte-identical to the inline encoding it replaces.
+    fn encode_store(out: &mut Vec<u8>, s: &StoreMeta) {
+        out.extend_from_slice(&s.high_water.to_le_bytes());
+        let fl = s.free_list.encode();
+        out.extend_from_slice(&(fl.len() as u32).to_le_bytes());
+        out.extend_from_slice(&fl);
+        out.extend_from_slice(&(s.device_pages.len() as u32).to_le_bytes());
+        for &p in &s.device_pages {
+            out.extend_from_slice(&p.to_le_bytes());
+        }
     }
 
     /// Rebuilds a catalog from a metadata payload produced by [`encode`](Self::encode).
@@ -3721,18 +3771,83 @@ impl Meta {
         let element_id_next = read_u128(bytes, &mut cur)?;
         let commit_ts_hw = read_u64(bytes, &mut cur)?;
         let mut stores: [StoreMeta; STORE_COUNT] = Default::default();
-        for (idx, s) in stores.iter_mut().enumerate() {
-            s.high_water = read_u64(bytes, &mut cur)?;
-            let fl_len = read_u32(bytes, &mut cur)? as usize;
-            let fl_end = take(bytes, &mut cur, fl_len)?;
-            s.free_list = FreeList::decode(&bytes[cur - fl_len..fl_end])?;
-            let n_pages = read_u32(bytes, &mut cur)? as usize;
+        for (idx, s) in stores.iter_mut().enumerate().take(LEGACY_STORE_COUNT) {
+            *s = Self::decode_store(bytes, &mut cur, idx)?;
+        }
+        let tok_len = read_u32(bytes, &mut cur)? as usize;
+        let tok_end = take(bytes, &mut cur, tok_len)?;
+        let tokens = TokenStore::decode(&bytes[cur - tok_len..tok_end])?;
+        // Statistics follow the tokens (`rmp` task #79).
+        let stats_len = read_u32(bytes, &mut cur)? as usize;
+        let stats_end = take(bytes, &mut cur, stats_len)?;
+        let statistics = Statistics::decode(&bytes[cur - stats_len..stats_end])?;
+        // ---- The trailing undo-area block (`rmp` #966, `05 §12.6`). ----
+        //
+        // Absent ⇒ a **version-1** image: no undo area, every `undo_ptr` in the store is `0`, and the
+        // two undo-area stores stay at their `Default` (empty, high-water 0) value. That is a valid,
+        // chain-free image, so opening it is an upgrade and not a conversion — the first checkpoint
+        // this build takes rewrites the catalog with the block present.
+        //
+        // Present ⇒ read the version and REFUSE anything this build does not understand, rather than
+        // interpreting a layout it has never seen (`05 §12.6`: "opening a version-2 store under an
+        // older build must be refused rather than misread" — the same rule, applied forwards).
+        let format_version = if cur >= bytes.len() {
+            LEGACY_FORMAT_VERSION
+        } else {
+            let magic = read_u64(bytes, &mut cur)?;
+            if magic != UNDO_AREA_MAGIC {
+                return Err(GraphusError::Storage(format!(
+                    "metadata undo-area block has a bad magic ({magic:#018x}, expected \
+                     {UNDO_AREA_MAGIC:#018x})"
+                )));
+            }
+            let version = read_u32(bytes, &mut cur)?;
+            if version <= LEGACY_FORMAT_VERSION || version > graphus_core::constants::FORMAT_VERSION
+            {
+                return Err(GraphusError::Storage(format!(
+                    "store on-disk format version {version} is not readable by this build (which \
+                     supports up to version {}); a store written by a newer build must be opened by \
+                     that build",
+                    graphus_core::constants::FORMAT_VERSION
+                )));
+            }
+            for (idx, s) in stores.iter_mut().enumerate().skip(LEGACY_STORE_COUNT) {
+                *s = Self::decode_store(bytes, &mut cur, idx)?;
+            }
+            version
+        };
+        Ok(Self {
+            format_version,
+            element_id_next,
+            commit_ts_hw,
+            stores,
+            tokens,
+            statistics,
+        })
+    }
+
+    /// Decodes one store's durable catalog entry (`idx` is its [`StoreKind`](crate::store::StoreKind)
+    /// discriminant, used both for the record-size bound below and for the error message).
+    ///
+    /// # Errors
+    /// Returns a storage error if the entry is truncated, its free list is malformed, or its
+    /// high-water mark exceeds the capacity its device-page map addresses.
+    fn decode_store(bytes: &[u8], cur: &mut usize, idx: usize) -> Result<StoreMeta> {
+        let mut s = StoreMeta {
+            high_water: read_u64(bytes, cur)?,
+            ..StoreMeta::default()
+        };
+        {
+            let fl_len = read_u32(bytes, cur)? as usize;
+            let fl_end = take(bytes, cur, fl_len)?;
+            s.free_list = FreeList::decode(&bytes[*cur - fl_len..fl_end])?;
+            let n_pages = read_u32(bytes, cur)? as usize;
             // Cap by the bytes remaining: each device-page entry is an 8-byte `read_u64`, so the real
             // count cannot exceed `bytes.len()`. Without the cap a forged `n_pages = 0xFFFF_FFFF`
             // forces a multi-GiB allocation (OOM) before the per-element reads validate the input.
             s.device_pages = Vec::with_capacity(n_pages.min(bytes.len()));
             for _ in 0..n_pages {
-                s.device_pages.push(read_u64(bytes, &mut cur)?);
+                s.device_pages.push(read_u64(bytes, cur)?);
             }
             // Fail closed on an out-of-range high-water mark (`rmp` #452). `high_water` is one past the
             // largest physical id ever allocated; real ids start at `1` (id `0` is the reserved null), so
@@ -3762,7 +3877,10 @@ impl Meta {
                 1 => crate::record::REL_RECORD_SIZE,
                 2 => crate::record::PROP_RECORD_SIZE,
                 // The fourth catalog store is the `strings.store` overflow heap (`04 §2.1`).
-                _ => crate::heap::STRINGS_RECORD_SIZE,
+                3 => crate::heap::STRINGS_RECORD_SIZE,
+                // The undo area's two stores (`05 §12.1`), present from format version 2.
+                4 => crate::undo::UNDO_RECORD_SIZE,
+                _ => crate::undo::COMMIT_RECORD_SIZE,
             };
             // `records_per_page` is a non-zero, page-bounded constant for every real store, so the only
             // overflow risk is the `n_pages * rpp` product; `saturating_mul` keeps the ceiling sound (a
@@ -3782,20 +3900,7 @@ impl Meta {
                 )));
             }
         }
-        let tok_len = read_u32(bytes, &mut cur)? as usize;
-        let tok_end = take(bytes, &mut cur, tok_len)?;
-        let tokens = TokenStore::decode(&bytes[cur - tok_len..tok_end])?;
-        // Statistics follow the tokens (`rmp` task #79).
-        let stats_len = read_u32(bytes, &mut cur)? as usize;
-        let stats_end = take(bytes, &mut cur, stats_len)?;
-        let statistics = Statistics::decode(&bytes[cur - stats_len..stats_end])?;
-        Ok(Self {
-            element_id_next,
-            commit_ts_hw,
-            stores,
-            tokens,
-            statistics,
-        })
+        Ok(s)
     }
 }
 
