@@ -68,6 +68,7 @@ Whenever you author, exercise, or validate test scenarios — especially those i
 2. **All project documentation (including CLAUDE.md and other operational documents) MUST be written in English** — flawless English, free of spelling, grammar, and syntax errors. Use clear, simple, unambiguous technical language intended for human readers.
 3. **Documentation MUST be accurate and faithful to the code.**
 4. **The workflow MUST always follow these steps:** Specify → Implement → Test → Document.
+5. **Open-source inspired.** For every component of the project you MUST look for inspiration in the open-source projects that implement that same component in an exemplary manner. Whenever possible, rely on **more than one** reference project, so that the strengths and the weaknesses of each approach can be compared. Whenever it is necessary, the reference project's **source code** MUST be used as the ultimate source of truth. The mandatory protocol is defined in "Open-source inspiration policy".
 
 ## Decision framework
 
@@ -94,6 +95,18 @@ Whenever you find pre-existing bugs, you MUST fix them on the spot and then cont
 **EVERY action you take MUST be held to production-grade standards** — development, bug fixes, evaluations, analyses, audits, and anything else. There is no category of work that is exempt.
 
 Throughout the entire work cycle (analysis → planning → development → testing), the goal MUST be that the produced result is **production-grade**. Apply not only your maximum knowledge but also your maximum diligence to ensure that you only ever work toward code that is ready to be used in production.
+
+### Exemplary components
+
+Every component of the project MUST be a piece that performs, in an **exemplary** manner, the purpose it was built for.
+
+Every piece MUST have its responsibility defined clearly and explicitly, so that the boundaries of what it does — and of what it is accountable for — are unambiguous.
+
+To **design, implement, and evaluate** each component, you MUST search for the open-source projects that implement each of those features in an exemplary manner, and take those implementations as a source of inspiration for this project. You may use several open-source projects for the same feature or component. The protocol to follow is defined in "Open-source inspiration policy".
+
+### Sound architecture
+
+The general architecture of the project — and the specific architecture of each of its components — MUST be based on the best practices that best suit the project's purpose. You MUST also seek inspiration in other open-source projects, in order to guarantee that the intended results are reached in an assertive and deliberate way.
 
 ## Subagent team
 
@@ -154,6 +167,8 @@ This rule governs the execution of **tasks** (the units of work tracked in `rmp`
 
 **Evaluations and audits may be run in parallel, but ONLY when the user has explicitly authorized it, and ONLY when they are not roadmap tasks.** This covers investigative work such as running several auditor subagents at once inside the single open task, or an ad-hoc evaluation that is not tracked in `rmp`. It NEVER authorizes running two `rmp` tasks concurrently: the "exactly one task in progress" invariant holds without exception, including for tasks whose subject is an audit or an evaluation.
 
+**Even when parallel execution has been authorized, you MUST NEVER run more than 2 (two) evaluations or audits at the same time.** Plan every evaluation and audit that is needed, but execute them in waves of at most two: as soon as one finishes, start the next one, always keeping the limit of two running in parallel.
+
 ## Knowledge Graph
 
 **The Knowledge Graph MUST be managed with the help of the `knowledge-authority` skill.** That skill is the empirical source of truth about this project's own contents: use it to bootstrap, query, refresh, and synchronize the graph, and to update it after every commit.
@@ -168,7 +183,7 @@ You may create whatever nodes and edges make the most sense for the project and 
 
 ## Never guess
 
-All interactions in the project MUST be based EXCLUSIVELY on the knowledge you already have, and you must never try to guess the intended answers. When the information you have is insufficient, you must look for answers on the internet in official or authoritative sources, papers, books, or specialist authors, in order to determine the best result.
+All interactions in the project MUST be based EXCLUSIVELY on **verified knowledge**, and you must never try to guess the intended answers. When the information you have is insufficient, you must look for answers in official or authoritative sources — specifications, RFCs, papers, books, or specialist authors — in order to determine the best result.
 
 Use the **Knowledge Graph** (KG) as the primary source of information — both as a means of consultation and as a means of storing the relationships you discover.
 
@@ -192,9 +207,130 @@ Reference projects are consulted for **understanding**, never for copy-and-paste
 
 Whatever you learn from a reference project MUST be recorded in the **Knowledge Graph**, so that the insight — and the decision it supports — is preserved and can be consulted again without re-reading external sources.
 
+The way reference projects MUST be selected, studied, and turned into decisions for Graphus is defined in the next section.
+
+## Open-source inspiration policy
+
+### Principle
+
+Before designing or implementing any component, **identify clearly and objectively what that component is meant to do**. Only then — and always as a function of that objective, the macro objective first — study how the most successful or most authoritative open-source projects solved the same problem, and use that knowledge to take better-informed decisions for **this** project.
+
+Reference projects are treated as **good practice to be analysed**, never as a solution to be adopted automatically. What is extracted from them is **understanding** (the structure, the algorithm, the reason behind the decision, the trade-offs accepted), never code to transcribe.
+
+### Protocol
+
+Follow this sequence for each component:
+
+1. **Define the component's macro objective.** Which problem it solves, which role it plays in the project, which guarantees it must offer, and under which constraints (correctness, safety, performance, durability, concurrency). Written down explicitly and without ambiguity.
+2. **Define the micro objectives.** The concrete features and behaviors: inputs and outputs, invariants, edge cases, quality and performance requirements, and acceptance criteria (see "Planning").
+3. **Record the objectives and the decisions in the Knowledge Graph** (see "Knowledge Graph"), so that they remain consultable and traceable.
+4. **Identify the reference projects.** Select the open-source projects that solve the same class of problem with recognized success. Selection criteria: maturity and real-world adoption, active maintenance, demonstrable engineering quality, documented design, and production use — **not** popularity on its own. The identification MUST be verified, never presumed (see "Never guess").
+5. **Study the approach in the primary sources.** The source code at a concrete version or tag, the official documentation, design documents, ADRs, papers, and issue/PR discussions — rather than secondary sources. The goal is to understand **why** the decision was taken, and not merely what it was. To study a repository, apply the "Token-economy policy" (a local clone instead of many remote queries).
+6. **Analyse the favorable AND the unfavorable aspects.** For each approach, enumerate explicitly:
+   - what serves this component's objective, and why;
+   - what does **not** serve it, and which problems it would bring here;
+   - which trade-offs the approach accepts;
+   - which premises and context the reference project had (scale, language, concurrency model, durability requirements, runtime environment), and **whether those premises hold in this project**;
+   - what the reference project **abandoned** over time, and for what reason — negative evidence is frequently the most valuable.
+7. **Decide for this project.** The decision follows from the objectives defined in steps 1 and 2 and from the "Decision framework" (correct → safe → fast). The decision is expected to be an **adaptation or a synthesis**: it may combine ideas from several references, or reject all of them, as long as it is justified.
+8. **Document the decision.** Record the decision taken, the alternatives considered, the sources consulted, and the reasoning, in a form that can be audited and revisited.
+9. **Validate empirically.** When the approach has a measurable impact, measure it in this project instead of trusting the reference's claims (see "Measure to decide").
+
+### Direct copying is forbidden
+
+- **Copying code directly from open-source projects into this project is FORBIDDEN**: whole files, blocks of code, or line-by-line transcription or translation into another language.
+- The implementation MUST be **original**, idiomatic for the language and for this project's conventions, and designed for the objectives defined in the protocol above.
+- **Copying a decision without understanding it is equally forbidden.** Adopting an approach merely because a reference project uses it is a form of guessing (see "Never guess"). If you cannot explain why it is appropriate for this component, do not adopt it.
+- **Licences and legal obligations.** Inspiration does not remove the obligation to respect the licence of the originating project. Never incorporate third-party code without checking its licence and **without the user's explicit authorization**. If you conclude that reusing code or adopting a dependency is the best route, **ask the user first** (see "Core rules", rule 1), presenting the options and identifying the licence of each one.
+- **Attribution.** Record in the Knowledge Graph and in the documentation which source inspired each decision — for traceability and credit, never as a way of legitimizing a copy.
+
+### Safeguards
+
+- **"That is how project X does it" is never, on its own, a justification.** The justification is always this component's objective. Popularity is not suitability.
+- **A different context invalidates the conclusions.** Compare the premises before comparing the solutions: an approach that is excellent in its own context may be inadequate here.
+- **Approaches evolve.** Study a concrete version, and check whether the approach is still in force in the reference project.
+- If a reference approach conflicts with this project's specification or objectives, **ask the user** how to proceed (see "Core rules", rule 1), presenting the possible options.
+
 ## Measure to decide
 
 Whenever it is necessary to evaluate performance, completeness (whether something is complete), or correctness (whether something is right), you MUST ALWAYS gather evidence from the project to determine the needs. You MUST ALWAYS decide empirically.
+
+## Token-economy policy
+
+### Principle
+
+**Before performing any operation, always consider its cost in tokens and choose the cheapest alternative that produces the same result.** When two or more ways of obtaining the same information (or the same effect) are available, the cheapest one is mandatory.
+
+**Choosing the cheap route MUST NOT AFFECT THE RESULT OF THE OPERATION IN ANY WAY.** The saving applies **exclusively to the means** used to reach the result, **never to the result itself**. The result obtained through the cheap route MUST be **identical** to the one the expensive route would have produced — not "close enough", not "approximate", not "probably the same": **identical**.
+
+**Mandatory condition (equivalence test).** You may only choose the cheaper alternative when you are certain that the result is equivalent. Before choosing, verify:
+
+- Does it return exactly the same information, with the same accuracy and the same level of detail?
+- Does it cover exactly the same scope (the same files, the same cases, the same data)?
+- Does it produce exactly the same effect on the project?
+
+If the answer to any of these questions is "no" or "I don't know", the cheap alternative is **excluded** and you use the route that guarantees the result. **Whenever the equivalence is in doubt, always choose the more reliable route, even if it is more expensive.** Economy is only the tie-breaker between options that are proven to be equivalent — never a criterion for deciding the result itself.
+
+**To save tokens, NEVER reduce:** the scope of the task, the depth of the analysis, the number of files or cases examined when all of them are relevant, the tests to run, the evidence to gather, the verification against authoritative sources, the validation of the acceptance criteria, or the quality of the deliverable. Saving tokens is **not** doing less: it is doing the same thing by a shorter route.
+
+**Limit of this principle (precedence):** token economy **NEVER** justifies compromising correctness, safety, completeness, or the gathering of evidence. If the cheaper route produces a different, incomplete, or uncertain result, then it is **not** the same operation — in that case "Never guess", "Measure to decide", and the "Decision framework" prevail. Saving tokens must never lead you to guess or to assume.
+
+### Concrete examples
+
+**Preference for the local CLI (general rule)**
+
+- **If an operation can be performed locally through a CLI, it MUST be performed through the CLI and by no other means.** The local CLI is systematically the cheapest option, so, where an equivalent command exists, no other way of obtaining the same result is acceptable.
+- This applies to every more expensive alternative: web queries, browser tooling, navigating graphical interfaces, or any remote service that returns what a local command already returns.
+- Examples:
+  - `git log`, `git show`, `git diff`, `git blame` locally, instead of consulting the repository's web interface;
+  - `gh issue view`, `gh pr view`, `gh api` (the GitHub CLI), instead of opening the corresponding web pages;
+  - `rmp` for everything concerning tasks, sprints, and the Knowledge Graph (see "Task planning and execution" and "Knowledge Graph"), which is moreover the single source of truth;
+  - `--help`, `man`, or the command's own documentation, instead of searching for that same documentation online;
+  - filtering and aggregating data locally (for example with `grep`, `jq`, `sort`, `wc`) instead of pulling the full result set into the context.
+- Reserve the more expensive routes (web, browser, remote services) for the cases where **no** local command can produce the same result.
+- This preference is equally subject to the equivalence test above: if the CLI does not return the same information, with the same scope and accuracy, use the route that guarantees the result.
+
+**Obtaining external information**
+
+- If a repository can be cloned (preferably `git clone --depth 1`) and its files consulted locally, **avoid** using `WebFetch` to obtain the same content — above all when several files from the same repository are needed.
+- To consult the documentation of a dependency, prefer the documentation already available locally (the project's own files, the dependency's source code, `cargo doc`, the command's `--help`) over an internet search.
+- When a web search really is necessary, run **one targeted, specific search** instead of several generic searches followed by reading irrelevant pages.
+
+**Consulting this project**
+
+- Consult the **Knowledge Graph first** (see "Knowledge Graph"). Reading the graph is cheaper than reading files or walking the code in search of the same answer. That is exactly what the graph exists for.
+- Use targeted searches (`grep` / `glob` with precise patterns) instead of reading whole files in search of a single reference.
+- When reading a large file, read only the range of lines you need instead of the complete file.
+- For wide searches (sweeping many files or directories), **delegate to a subagent** that returns only the conclusion, instead of pulling the content of every file into the main context.
+
+**Do not repeat work already done**
+
+- Do not re-read files you have already read in this session, and do not re-confirm an edit that was applied successfully.
+- Do not re-derive facts already established in the conversation, and do not reopen decisions the user has already taken.
+- Do not launch the same search twice (for example, delegating a search to a subagent and also running it yourself). Delegate **or** execute, never both.
+
+**Commands and output**
+
+- Limit command output to what is needed: use `git log --oneline`, `git diff --stat` before the full diff, `git status --short`, `--name-only`, the `-q` / `--quiet` flags, or otherwise restrict the result (for example with `head`).
+- Avoid dumping large files into the context or into the answer. Reference `path:line` instead of reproducing the content.
+- Prefer reading text (or a page's accessibility tree) over capturing images or screenshots, which are substantially more expensive, whenever the text is sufficient.
+
+**Tests and validation**
+
+- While iterating, run the specific test or crate that is at stake; reserve the full suite for the task's final validation.
+- Do not run the full suite repeatedly to check changes that only affect one isolated component.
+
+**Model, effort, and parallelism**
+
+- Adapt the model and the effort level to the real difficulty of each operation (see "Task execution"): simple, mechanical operations do not justify the most expensive model or the highest effort level.
+- Group into a single message the tool calls that are independent of one another, instead of issuing them one at a time.
+- Respect the limit of 2 evaluations or audits in parallel (see "Task execution"): excessive parallelism multiplies the cost without accelerating the result.
+
+### Safeguard
+
+Every example above is subject to the equivalence test. They are shortcuts on the **route**, not cuts in the **result**.
+
+If, during execution, you find that the cheap route you chose is not producing the same result — it returned insufficient information, left part of the scope out, or raised doubt — **abandon it immediately and redo the operation by the complete route**. The cost already spent is never a justification for accepting an inferior result.
 
 ## Regression prevention
 
