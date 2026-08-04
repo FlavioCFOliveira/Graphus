@@ -671,6 +671,15 @@ pub struct DegreeOutcome {
     pub committed: i64,
     /// The hub's persisted out-edge count after all commits (must equal `committed`, never 0).
     pub fanout: Option<i64>,
+    /// How many of the `k` writers had their **statement** refused before ever reaching `COMMIT`
+    /// (`rmp` #969). Recorded rather than swallowed: an edge insertion on a shared hub must never be
+    /// refused, so this is the number that proves the guarantee is real instead of merely unobserved.
+    ///
+    /// It was genuinely unobserved before. The sweep used to write the statement as
+    /// `if let Ok(mut r) = eng.run(...)`, which discards a refusal; a writer whose statement failed
+    /// then committed an **empty** transaction and still counted in `committed`, so `fanout ==
+    /// committed` could hold while edges silently went missing.
+    pub statements_refused: i64,
 }
 
 /// **A reader must never fail a legitimate read because a writer grew the store under it**
@@ -717,18 +726,38 @@ pub fn supernode_degree_sweep(degrees: &[i64]) -> Vec<DegreeOutcome> {
         let mut eng = engine();
         let _ = write(&mut eng, "CREATE (:Hub {id: 1})", vec![]);
         let mut tickets = Vec::new();
+        let mut statements_refused = 0i64;
         for i in 0..k {
             let Ok(t) = eng.begin(AccessMode::Write) else {
                 continue;
             };
-            if let Ok(mut r) = eng.run(
+            // The refusal is COUNTED, never discarded (`rmp` #969): a swallowed statement error let a
+            // writer commit an empty transaction and still be counted as a committer, so the
+            // `fanout == committed` invariant could hold over edges that were never created.
+            match eng.run(
                 t,
                 "MATCH (h:Hub {id: 1}) CREATE (h)-[:LINK]->(:Leaf {id: $l})",
                 vec![("l".into(), Value::Integer(100 + i))],
                 false,
                 None,
             ) {
-                while let Ok(Some(_)) = r.rows.next() {}
+                Ok(mut r) => {
+                    let mut drained_ok = true;
+                    loop {
+                        match r.rows.next() {
+                            Ok(Some(_)) => {}
+                            Ok(None) => break,
+                            Err(_) => {
+                                drained_ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !drained_ok {
+                        statements_refused += 1;
+                    }
+                }
+                Err(_) => statements_refused += 1,
             }
             tickets.push(t);
         }
@@ -745,6 +774,7 @@ pub fn supernode_degree_sweep(degrees: &[i64]) -> Vec<DegreeOutcome> {
             k,
             committed,
             fanout,
+            statements_refused,
         });
     }
     out
@@ -2729,11 +2759,26 @@ mod tests {
             "two concurrent writers must keep both edges"
         );
 
-        // With K>=3 concurrently-open writers, SSI aborts the dangerous pivots; every edge that
-        // COMMITS must survive — fan-out equals the committed count (NOT 0). Driven through the reusable
-        // degree-sweep parameter (rmp #462) so the guarantee holds at every K, not just one.
+        // At every K, every edge that COMMITS must survive — fan-out equals the committed count (NOT
+        // 0). Driven through the reusable degree-sweep parameter (rmp #462) so the guarantee holds at
+        // every K, not just one.
+        //
+        // Since `rmp` #969 the sweep also pins the stronger statement the anchor choice buys
+        // (`D-incidence-anchor`): **ALL K writers commit and ALL K edges land**. Versioning adjacency
+        // on the endpoint node's undo chain instead would refuse every writer after the first, and
+        // `statements_refused` is what makes the difference observable instead of hidden behind a
+        // swallowed statement error.
         for o in supernode_degree_sweep(&[2, 3, 4, 6, 8, 12, 16, 24]) {
-            assert!(o.committed >= 1, "at least one writer commits at K={}", o.k);
+            assert_eq!(
+                o.statements_refused, 0,
+                "rmp #969: an edge insertion on a shared hub must never be refused (K={})",
+                o.k
+            );
+            assert_eq!(
+                o.committed, o.k,
+                "rmp #969: every one of the K concurrent edge writers commits (K={})",
+                o.k
+            );
             assert_eq!(
                 o.fanout,
                 Some(o.committed),

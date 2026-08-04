@@ -65,7 +65,7 @@ use crate::heap::{BLOCK_PAYLOAD, HeapBlock};
 use crate::idalloc::NULL_ID;
 use crate::record::{ChainSide, MvccHeader, NodeRecord, PropRecord, RelRecord};
 use crate::store::{ALL_STORE_KINDS, RecordStore, STORE_COUNT, StoreKind};
-use crate::undo::{CommitSlot, UndoAction, UndoDelta};
+use crate::undo::{CommitSlot, IncidentDirection, UndoAction, UndoDelta};
 use crate::valenc::OVERFLOW_BIT as PROP_OVERFLOW_BIT;
 
 /// One structural inconsistency found by [`check_store`]. Each variant names the offending ids /
@@ -212,8 +212,8 @@ pub enum UndoChainFault {
         /// The `commit.store` id the delta names.
         commit_info: u64,
     },
-    /// Walking a chain from its head, a delta's commit timestamp is **greater** than the one above
-    /// it — the ordering the read path's `Stop` rule depends on, broken (`rmp` #967).
+    /// Walking a chain from its head, a **sequential** delta's commit timestamp is **greater** than
+    /// the one above it — the ordering the read path's `Stop` rule depends on, broken (`rmp` #967).
     ///
     /// The reconstruction ends the walk at the first delta the reading snapshot already reflects, on
     /// the argument that everything below committed no later. If that fails, a snapshot between the
@@ -221,11 +221,62 @@ pub enum UndoChainFault {
     /// other symptom. The invariant is bought by the entity-granularity write-conflict check
     /// (`D-property-write-conflict`), which stops two transactions interleaving deltas on one chain;
     /// this fault is what proves the check is still doing its job.
+    ///
+    /// **Incidence deltas are excluded, by design** (`rmp` #969). They are *non-sequential*: two
+    /// transactions inserting edges on one node may interleave their deltas, so an incidence delta
+    /// can legitimately sit out of commit order. The read path never stops at one
+    /// ([`scan_polarity::is_non_sequential`](crate::scan_polarity)), so the invariant the `Stop` rule
+    /// actually needs — and the one checked here — is that the timestamps descend along the chain's
+    /// **sequential subsequence**. Including incidence deltas here would report a healthy chain as
+    /// corrupt; excluding the check entirely would stop proving the conflict check works.
     CommitTimestampsNotDescending {
         /// The commit timestamp of the delta nearer the head.
         above: u64,
         /// The commit timestamp of this delta, which is greater.
         below: u64,
+    },
+    /// An incidence delta names a relationship-type token the token store does not have (`rmp` #969).
+    ///
+    /// The incidence twin of [`UnknownPropertyToken`](Self::UnknownPropertyToken), and it catches the
+    /// same class of corruption: a payload field that decodes cleanly but points nowhere.
+    UnknownRelTypeToken {
+        /// The relationship-type token id the delta names.
+        token: u32,
+    },
+    /// An incidence delta's `edge` or `peer` is the null physical id (`rmp` #969).
+    ///
+    /// Physical ids start at `1`, so a zero here is a payload field that was never written or was
+    /// zeroed under it — the incidence twin of a `SetProperty` delta with no key.
+    ///
+    /// **Deliberately not an out-of-range check.** An id *above* a store's allocator high-water is a
+    /// legitimate transient state after redo-only crash recovery: the high-water is restored from the
+    /// last durable catalog, while redo has already re-created records beyond it (the monotonic
+    /// high-water floor of `rmp` #220 / #172). Flagging that would report a healthy recovered store as
+    /// corrupt — measured, on `graphus-dst`'s `undo_chain_recovery` sweep, as a delta naming node `5`
+    /// with the node high-water restored at `5`. What catches a genuinely wrong target is
+    /// [`IncidenceContradictsEdge`](Self::IncidenceContradictsEdge), which needs no range assumption.
+    IncidenceTargetNull {
+        /// The relationship physical id the delta names.
+        edge: u64,
+        /// The peer-endpoint node physical id the delta names.
+        peer: u64,
+    },
+    /// An incidence delta contradicts the relationship it names (`rmp` #969): the edge is live, but
+    /// its endpoint on the delta's `direction` side is not the node whose chain carries the delta, or
+    /// its other endpoint is not the delta's `peer`, or its type is not the delta's `token`.
+    ///
+    /// This is the failure mode versioning adjacency introduces, and nothing else would catch it: a
+    /// delta with a plausible-looking but wrong payload decodes, walks, and reads back — it only goes
+    /// wrong when a rollback applies it. Checked **only against a live relationship record**, because
+    /// a version legitimately outlives the record it describes: once GC has reclaimed the edge, the
+    /// delta may still name a slot that is free or has been handed to a different relationship.
+    IncidenceContradictsEdge {
+        /// The relationship physical id the delta names.
+        edge: u64,
+        /// What the delta claims: `(token, direction, peer)`.
+        claimed: (u32, u8, u64),
+        /// What the relationship record says, in the same shape.
+        actual: (u32, u8, u64),
     },
     /// A [`SetProperty`](crate::undo::UndoAction::SetProperty) delta names a property-key token that
     /// does not exist in the token store (`04 §2.6`) — a dangling key reference, so the value it
@@ -703,6 +754,10 @@ struct Catalog {
     /// `0..prop_key_token_count` (`04 §2.6`). Used to flag a `SetProperty` delta that names a
     /// non-existent key (`rmp` #967).
     prop_key_token_count: usize,
+    /// Number of interned `RelType`-namespace tokens; valid relationship-type token ids are
+    /// `0..rel_type_token_count` (`04 §2.6`). Used to flag an incidence delta that names a
+    /// non-existent type (`rmp` #969).
+    rel_type_token_count: usize,
 }
 
 impl Catalog {
@@ -713,6 +768,7 @@ impl Catalog {
             pages: store.mapped_pages(),
             label_token_count: store.checker_label_token_count(),
             prop_key_token_count: store.checker_prop_key_token_count(),
+            rel_type_token_count: store.checker_rel_type_token_count(),
         }
     }
 
@@ -1579,6 +1635,7 @@ fn check_undo_chains(cat: &Catalog, scan: &Scan, report: &mut ConsistencyReport)
     heads.extend(scan.orphan_chain_heads.iter().copied());
 
     let prop_key_tokens = cat.prop_key_token_count as u32;
+    let rel_type_tokens = cat.rel_type_token_count as u32;
     for (kind, entity, head) in heads {
         let mut cur = head;
         let mut seen: BTreeSet<u64> = BTreeSet::new();
@@ -1621,6 +1678,41 @@ fn check_undo_chains(cat: &Catalog, scan: &Scan, report: &mut ConsistencyReport)
                 report.push(fault(UndoChainFault::UnknownPropertyToken {
                     token: delta.token,
                 }));
+            }
+            // The incidence payload (`rmp` #969). Three checks, in widening order of what they can
+            // prove: the type token exists; the two physical ids are addressable; and — when the
+            // relationship is still live — the delta agrees with it on all three of type, side and
+            // peer. The last is the one that matters, because a wrong-but-plausible incidence payload
+            // is invisible until a rollback applies it.
+            if delta.action.is_incidence() {
+                if delta.token >= rel_type_tokens {
+                    report.push(fault(UndoChainFault::UnknownRelTypeToken {
+                        token: delta.token,
+                    }));
+                }
+                if delta.edge == NULL_ID || delta.peer == NULL_ID {
+                    report.push(fault(UndoChainFault::IncidenceTargetNull {
+                        edge: delta.edge,
+                        peer: delta.peer,
+                    }));
+                } else if let Some(rel) = scan.live_rels.get(&delta.edge) {
+                    // The delta anchors on the relationship itself (`D-incidence-anchor`), so what it
+                    // has to agree with is that record: the peer is the endpoint at the OTHER end
+                    // from the one `direction` names, and the type is the relationship's own.
+                    let claimed_start = delta.direction == IncidentDirection::Start.as_byte();
+                    let actual_peer = if claimed_start {
+                        rel.end_node
+                    } else {
+                        rel.start_node
+                    };
+                    if actual_peer != delta.peer || rel.type_id != delta.token {
+                        report.push(fault(UndoChainFault::IncidenceContradictsEdge {
+                            edge: delta.edge,
+                            claimed: (delta.token, delta.direction, delta.peer),
+                            actual: (rel.type_id, delta.direction, actual_peer),
+                        }));
+                    }
+                }
             }
             // The ordering the read path's `Stop` rule rests on. Only live deltas whose slot records
             // a real commit timestamp participate: a corpse never happened, and an open transaction

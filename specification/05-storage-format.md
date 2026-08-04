@@ -329,14 +329,14 @@ Two stores rather than one because the §9 addressing rule requires a single rec
 | 0 | 1 | `flags` | bit 0 `in_use`; remaining reserved, must be zero. |
 | 1 | 1 | `action` | one of the seven actions of §12.3. |
 | 2 | 1 | `type_tag` | `SetProperty` only: the old value's type tag, encoded exactly as `props.store`'s `type_tag` (§9), including its inline-vs-overflow bit. Zero for every other action. |
-| 3 | 1 | `direction` | the two incidence actions only: `1` = the entity is the relationship's **start** node, `2` = its **end** node. Zero for every other action. |
+| 3 | 1 | `direction` | the two incidence actions only: `1` = the **start** end of the relationship, `2` = its **end** end. Zero for every other action. |
 | 4 | 4 | `command_id` | the statement counter within the writing transaction (`04` §5.1.4). |
 | 8 | 8 | `commit_info` | physical id in `commit.store` of the writing transaction's slot (§12.4). Never `0` on a live delta. |
 | 16 | 8 | `next` | physical id in `undo.store` of the next-older delta on this entity's chain; `0` = end of chain. |
 | 24 | 4 | `token` | `SetProperty`: the property-key token. `AddLabel`/`RemoveLabel`: the label token. The two incidence actions: the relationship-type token. Zero otherwise. |
 | 28 | 4 | — | reserved, must be zero. |
 | 32 | 8 | `value_inline` | `SetProperty` only: the **old** value if it fits, else the `strings.store` block id, encoded exactly as `props.store`'s `value_inline` (§9). Zero for every other action. |
-| 40 | 8 | `peer` | the two incidence actions only: physical id of the relationship's other endpoint node. Zero otherwise. |
+| 40 | 8 | `peer` | the two incidence actions only: physical id of the endpoint node at the **other** end from the one `direction` names. Zero otherwise. |
 | 48 | 8 | `edge` | the two incidence actions only: physical id of the relationship record. Zero otherwise. |
 
 A delta is **immutable once linked**: after the publication order of `04` §5.1.2 step 3, no field of it
@@ -384,10 +384,15 @@ is therefore the inverse of the action's name, and that is deliberate.
 | 3 | `SetProperty` | sets, changes, or removes a property | `token`, `type_tag`, `value_inline` |
 | 4 | `AddLabel` | removes a label from a node | `token` |
 | 5 | `RemoveLabel` | adds a label to a node | `token` |
-| 6 | `AddIncidentEdge` | removes an incident relationship from a node | `token`, `direction`, `peer`, `edge` |
-| 7 | `RemoveIncidentEdge` | adds an incident relationship to a node | `token`, `direction`, `peer`, `edge` |
+| 6 | `AddIncidentEdge` | removes one of a relationship's incidence entries | `token`, `direction`, `peer`, `edge` |
+| 7 | `RemoveIncidentEdge` | adds one of a relationship's incidence entries | `token`, `direction`, `peer`, `edge` |
 
 Value `0` is reserved and is not a valid action, so a zeroed slot never decodes as a delta.
+
+**The two incidence actions anchor on the RELATIONSHIP** (`D-incidence-anchor`, ratified 2026-08-04;
+`04 §5.1.1`), so the entity whose chain carries them is the relationship itself and `direction` says
+which of that relationship's two ends the entry is on. `edge` therefore names the owning entity and is
+redundant with it by construction — which is what the consistency checker cross-validates.
 
 Correspondence with the reference implementation: Memgraph's enumeration
 (`/data/refsrc/memgraph/src/storage/v2/delta_action.hpp:17-33`) carries the same set with two

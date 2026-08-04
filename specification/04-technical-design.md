@@ -596,6 +596,49 @@ restoration of a pointer word that a concurrent writer may meanwhile own — whi
 failure mode that forced the present ad-hoc compare-and-set undo
 (`crates/graphus-storage/src/record.rs:114-123`).
 
+**A third property is specific to the incidence actions: they anchor on the RELATIONSHIP, not on the
+endpoint node** (`D-incidence-anchor`, ratified 2026-08-04; task **#969**). The node is where the
+incidence chain *head* lives, so the node looks like the natural anchor, and the first draft of #969
+used it. It is the wrong one, and the reason is measured rather than argued.
+
+With the node anchor, a node's chain grows by one delta per edge inserted on it, and **every property
+or label read of that node walks its chain**: one visible-property read on a hub cost **220 ns at
+degree 0 and 488 µs at degree 4000**. The growth does not end at the next collection either — §5.5's
+chain reclamation frees a chain only when *every* delta on it is dead, so a hub under sustained
+insertion never prunes. That is a direct regression of the acceptance criterion task #967 established
+(a visible-property read touches one property record, whatever the entity's history).
+
+The relationship carries the same information and none of the cost. It is a **fresh slot private to
+its creator**, so three things follow at once: incidence deltas never interleave with another
+transaction's, the commit ordering the read path's `Stop` rule depends on (§5.3) is undisturbed, and
+**an edge insertion never conflicts with anything** — the supernode write concurrency `rmp` #220 built
+is preserved exactly, with no relaxation of §5.1.2 step 1 needed anywhere.
+
+The price is accepted deliberately: **every** edge pays two deltas, including in a bulk load. The
+endpoint-anchored draft could skip them when the endpoint was created by the same transaction — such a
+node is invisible to every other snapshot — and the relationship-anchored one cannot, because the
+relationship always was created by the writing transaction. Measured at **898 B/edge** of WAL for an
+edge between two committed endpoints.
+
+Memgraph anchors on the vertex and must, and the difference is representational rather than a matter
+of taste. Its `in_edges` / `out_edges` are a plain container **inside the vertex** with no per-element
+version (`/data/refsrc/memgraph/src/storage/v2/vertex.hpp:41-44`), so a vertex's adjacency can only be
+reconstructed from that vertex's delta chain. It pays for that twice over: the chain is walked on
+every expansion, and edge creation had to be given an explicit escape from the write-conflict rule
+(`PrepareForNonSequentialWrite`, `mvcc.hpp:150`; the permitted set is exactly the two edge-creation
+actions, `delta.hpp:394-396`) to keep edge-heavy imports viable. Graphus reconstructs adjacency from
+nothing — every relationship carries its own MVCC header and the incidence walk filters per element
+(§2.4) — so it needs neither the walk nor the escape.
+
+The same difference decides where `AddIncidentEdge` is written, and the honest answer is **nowhere,
+yet**. Memgraph's `DeleteEdge` erases the edge from both containers in place, so it must write the
+restoring delta. Graphus's deletion is a tombstone: the relationship keeps its slot and its links so
+an older snapshot can still traverse to it (§5.3), and the adjacency is not mutated at all — the
+version that covers the deletion is the relationship's own `RecreateObject`. Physically unlinking on
+delete instead would sever an off-thread reader mid-traversal, which is the `rmp` #811 defect class.
+`AddIncidentEdge` is therefore the frozen inverse of `RemoveIncidentEdge`, written by the logical
+rollback of **#970** and by nothing before it.
+
 The delta record's on-disk layout, its size, and the store that holds it are frozen in
 `05-storage-format.md` §12.
 
@@ -721,7 +764,7 @@ undo area itself. This table is the authoritative list; the decision register
 | 0 | ~~**No undo area at all.** `undo_ptr` is reserved in every record and always written `0`, so there is no chain to anchor.~~ **CLOSED.** | was `crates/graphus-storage/src/record.rs`; now `crates/graphus-storage/src/undo.rs` + `StoreKind::Undo` / `StoreKind::Commit` | The undo area and the delta record; `undo_ptr` is the live chain head | **#966 — done** |
 | 1 | **Property tombstone plus chain prepend.** Setting a property walks the entity's whole property chain to tombstone the previous version, then prepends a new one — **O(M²)** over M assignments (15.1 µs/op at M = 1000; 97.8 µs/op at M = 8000). | `RecordStore::tombstone_props_for_key`, `crates/graphus-storage/src/store.rs:6710-6753` | One `SetProperty` delta carrying the old value; the home property record is updated in place, and a **removal** is an empty cell in place rather than a tombstone (below) | **#967** |
 | 2 | **Label bitmap mutated in place, with the version history held only in memory.** The history is an in-process structure shared by `Arc`; nothing about it is durable, so labels are not versioned on disk. | `crates/graphus-storage/src/label_history.rs:143` | `AddLabel` / `RemoveLabel` deltas on the same durable chain as every other change | **#968** |
-| 3 | **Ad-hoc compare-and-set undo for chain heads and the label word.** A bespoke undo per field, needed because a whole-record pre-image undo would revert words a concurrently-committed writer legitimately owns. | `crates/graphus-storage/src/record.rs:114-123`; `store.rs:2507` (`write_chain_head`), `:2541` (label word) | `AddIncidentEdge` / `RemoveIncidentEdge` deltas naming one incidence entry, so no shared pointer word is ever rewritten by an undo | **#969** |
+| 3 | **Ad-hoc compare-and-set undo for chain heads and the label word.** A bespoke undo per field, needed because a whole-record pre-image undo would revert words a concurrently-committed writer legitimately owns. | `crates/graphus-storage/src/record.rs:114-123`; `store.rs:2507` (`write_chain_head`), `:2541` (label word) | `AddIncidentEdge` / `RemoveIncidentEdge` deltas naming one incidence entry, so no shared pointer word is ever rewritten by an undo | **#969** (the deltas) + **#970** (the compensations they replace) |
 | 4 | **Physical ARIES rollback.** Undo reverts bytes. This is the origin of the recurring defect family rmp #220 / #172 / #239 / #301 / #578 / #772, each one a case of one transaction's byte-level undo damaging another's committed state. | `RecordStore::rollback`, `crates/graphus-storage/src/store.rs:3644` | Logical rollback: the transaction walks its own deltas and applies them | **#970** |
 | 5 | **Write-lock table plus wait-for-graph deadlock detector.** The only true blocking in the engine, with the cycle detection and lock-wait timeout that blocking requires. | `crates/graphus-txn/src/lock.rs`; driven from `crates/graphus-txn/src/manager.rs:472-552` | Conflict detection on the entity's MVCC header, aborting immediately without waiting (§5.7) | **#971** |
 

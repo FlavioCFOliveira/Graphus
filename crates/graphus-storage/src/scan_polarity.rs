@@ -198,6 +198,11 @@ pub enum DeltaVerdict {
     /// on one entity, so a chain cannot hold an older-committed delta above a newer-committed one.
     /// The consistency checker re-verifies the ordering independently
     /// ([`UndoChainFault::CommitTimestampsNotDescending`](crate::check::UndoChainFault)).
+    ///
+    /// The claim survives `rmp` #969 intact, and that is a property of where the incidence deltas
+    /// live: they anchor on the **relationship**, a fresh slot private to its creator
+    /// (`D-incidence-anchor`), so they never interleave with another transaction's deltas and never
+    /// put a chain out of commit order.
     Stop,
 }
 

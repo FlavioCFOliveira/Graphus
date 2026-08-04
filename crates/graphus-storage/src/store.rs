@@ -25,7 +25,7 @@
 //! and traversal dedupes it by relationship id (`04 §2.4`). [`RecordStore::incident_rels`] walks
 //! a node's chain in O(degree) with no index probe.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use std::sync::Arc;
 
@@ -58,7 +58,7 @@ use crate::record::{
 };
 use crate::scan_polarity::{DecidedProperties, SupersetProperties};
 use crate::tokens::{Namespace, TokenSnapshot, TokenStore};
-use crate::undo::{self, CommitSlot, UndoAction, UndoDelta};
+use crate::undo::{self, CommitSlot, IncidentDirection, UndoAction, UndoDelta};
 use crate::valenc;
 use crate::wal_rule::SharedWal;
 
@@ -293,10 +293,36 @@ struct UndoLink {
     delta: u64,
 }
 
+/// One end of a relationship insertion, as the incidence delta names it (`rmp` #969, `05 §12.2`).
+/// A self-loop supplies both sides with the same `peer` — its one node genuinely is both ends of that
+/// relationship, and each end is a distinct incidence entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IncidenceSide {
+    /// Which end of the relationship this entry is.
+    direction: IncidentDirection,
+    /// Physical id of the endpoint node at the **other** end.
+    peer: u64,
+}
+
 #[derive(Debug, Default, Clone)]
 struct ActiveTxn {
     created: Vec<(StoreKind, u64)>,
     expired: Vec<(StoreKind, u64)>,
+    /// Relationship ids this transaction captured as the **pre-image of a node's `first_rel`** while
+    /// prepending an edge (`rmp` #969). Its rollback will write one of these back into `first_rel`, so
+    /// GC must not reclaim any of them in the meantime — the abort would otherwise restore a head
+    /// naming a slot on the free list, which the next allocation hands to an unrelated relationship.
+    ///
+    /// This is the **exact** question, and it is worth saying why the obvious approximation is not
+    /// good enough. Asking instead "does either endpoint carry an uncommitted incidence delta?"
+    /// answers a strictly larger question: on a hub under sustained insertion there is *always* such a
+    /// delta, so every tombstoned relationship incident to it becomes unreclaimable and the space
+    /// leak is unbounded (measured: eight consecutive GC passes reclaiming zero). Naming the captured
+    /// ids costs one `u64` per prepend, is O(1) to test, and has no false positives.
+    ///
+    /// Cleared with the transaction, on either outcome: once it commits, the pre-image is never
+    /// written back; once it aborts, the write-back has already happened.
+    captured_rel_heads: BTreeSet<u64>,
     /// Physical ids this transaction pushed onto a store's free list (`rmp` #578). Only the
     /// GC/reclaim paths free ids, and they route every push through
     /// [`free_push`](RecordStore::free_push), which records it here. On a **live** rollback these
@@ -2999,6 +3025,18 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         old_head: u64,
         txn: TxnId,
     ) -> Result<()> {
+        // Name the relationship this transaction is capturing as a pre-image, so GC does not reclaim
+        // it out from under the undo that will write it back (`rmp` #969, see
+        // [`rel_head_captured_by_open_writer`](Self::rel_head_captured_by_open_writer)). Recorded here
+        // — the single door every `first_rel` publication passes through — rather than in `create_rel`,
+        // so a future prepend path inherits it instead of having to remember.
+        if kind == StoreKind::Node && field_off == NODE_OFF_FIRST_REL && old_head != NULL_ID {
+            self.active
+                .entry(txn)
+                .or_default()
+                .captured_rel_heads
+                .insert(old_head);
+        }
         let (rel_page, off) = paging::record_location(id, kind.record_size());
         let dev = self.device_page(kind, rel_page)?;
         let abs = off + field_off;
@@ -3463,8 +3501,43 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// door through which a delta reaches a chain, so guarding it covers every delta writer by
     /// construction rather than by each one remembering to ask.
     ///
+    /// # The non-sequential relaxation (`rmp` #969)
+    ///
+    /// `incoming_is_non_sequential` says the delta about to be prepended is an **incidence** delta —
+    /// the versioned form of "this transaction threaded an edge into this node's incidence chain".
+    /// Such a delta may be prepended **even onto a head another open transaction holds**, provided
+    /// that head is itself an incidence delta. Without that relaxation, versioning adjacency on the
+    /// node's chain would make every concurrent edge insertion on a shared node a serialization
+    /// failure — destroying exactly the supernode write concurrency `rmp` #220 built and `rmp` #975 /
+    /// #977 exist to widen.
+    ///
+    /// This is Memgraph's `PrepareForNonSequentialWrite`
+    /// (`/data/refsrc/memgraph/src/storage/v2/mvcc.hpp:150`, read 2026-08-04), and its own rationale
+    /// is worth quoting because it is *negative* evidence — Memgraph had the strict rule and carved
+    /// this exception out of it: non-sequential deltas "relax the usual rules of MVCC by allowing
+    /// certain operations (i.e., edge creations) to be prepended to a delta chain in a
+    /// non-sequential manner, even in cases where normally this would be a write conflict. Doing so
+    /// hugely improves performance in edge-write heavy imports" (`delta.hpp:180-185`).
+    ///
     /// # Errors
     /// As [`ensure_no_conflicting_writer`](Self::ensure_no_conflicting_writer).
+    ///
+    /// # Only the head needs checking, and why that survives `rmp` #969
+    ///
+    /// A delta is prepended only onto a head no *other* open transaction holds, so "the head is
+    /// committed or mine" implies "nothing below is held by anyone else", by induction down the
+    /// chain. That is why one read answers the question.
+    ///
+    /// An earlier draft of `rmp` #969 broke the induction and this note records it, because the
+    /// failure was silent and the repair is easy to undo by accident. It anchored the incidence
+    /// deltas on the **endpoint node** and let them interleave across transactions; a transaction's
+    /// own incidence delta could then sit on another's uncommitted delta, and a head-only check waved
+    /// the next sequential write through onto it. The chain `[Seq(T1)] → [Inc(T1)] → [Inc(T2)] →
+    /// [Seq(T2)]` became reachable, its commit timestamps ascended, and the reproduced consequences
+    /// were a lost update, a committed write destroyed by a concurrent abort, and a dirty read of a
+    /// label belonging to a still-open transaction. `D-incidence-anchor` removes the possibility at
+    /// the root: incidence deltas anchor on the **relationship**, a fresh slot private to its
+    /// creator, so no two transactions ever share an incidence chain.
     fn ensure_chain_head_unheld(
         &self,
         kind: StoreKind,
@@ -3595,6 +3668,91 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             self.link_delta(StoreKind::Node, id, delta, txn)?;
         }
         Ok(())
+    }
+
+    /// Links the [`UndoAction::RemoveIncidentEdge`] delta for **one end** of a relationship
+    /// insertion (`rmp` #969, `05 §12.3`, `04 §5.1.1`).
+    ///
+    /// The delta is the INVERSE of the event, exactly as a creation's `DeleteObject` is: the
+    /// transaction *added* an incidence entry, so what undoes it is *removing* that entry. It names
+    /// **one entry** — the relationship type token, which end it is, the peer endpoint and the edge —
+    /// and never a chain-head pointer word. That is the whole point of the action (`04 §5.1.5` row 3):
+    /// a shared pointer word stops being the unit of undo, so an abort can no longer revert a word a
+    /// concurrently-committed writer legitimately owns.
+    ///
+    /// # It anchors on the RELATIONSHIP, not on the endpoint node
+    ///
+    /// (`D-incidence-anchor`, ratified 2026-08-04.) The node is where the incidence *chain head*
+    /// lives, so the node looks like the natural anchor — and it is what an earlier draft of this task
+    /// used. It is the wrong one, for a reason that only shows up under measurement: a node's chain
+    /// would then grow by one delta per edge inserted on it, and every property or label read of that
+    /// node walks its chain. Measured on that draft, a single visible-property read on a hub cost
+    /// **220 ns at degree 0 and 488 µs at degree 4000**, and the growth is not merely "until the next
+    /// GC pass" — [`gc_reclaim_undo_chains`](Self::gc_reclaim_undo_chains) frees a chain only when
+    /// **every** delta on it is dead, so a hub under sustained insertion never prunes. That regresses
+    /// the acceptance criterion `rmp` #967 was built to establish.
+    ///
+    /// The relationship carries the same information and none of the cost: it is a **fresh, private
+    /// slot** whose chain no other transaction can reach, so the deltas never interleave, the ordering
+    /// the read path's `Stop` rule depends on is undisturbed, and node chains stay exactly as long as
+    /// the property and label history that belongs on them.
+    ///
+    /// # Errors
+    /// Returns a storage error if the delta cannot be allocated, written or linked.
+    fn link_incidence_delta(
+        &mut self,
+        edge: u64,
+        type_id: u32,
+        side: IncidenceSide,
+        txn: TxnId,
+    ) -> Result<()> {
+        if txn == SYSTEM_TXN {
+            return Ok(());
+        }
+        let mut delta = UndoDelta::new(UndoAction::RemoveIncidentEdge, 0, 0, 0);
+        delta.token = type_id;
+        delta.direction = side.direction.as_byte();
+        delta.peer = side.peer;
+        delta.edge = edge;
+        self.link_delta(StoreKind::Rel, edge, delta, txn)?;
+        Ok(())
+    }
+
+    /// Links **both** of a relationship insertion's incidence deltas, one per end (`rmp` #969).
+    ///
+    /// Called after the relationship record exists, because the deltas prepend onto **its** chain and
+    /// `link_delta` reads that chain's head from the record. A self-loop is genuinely both ends of the
+    /// same relationship, so it gets two deltas naming the same peer and differing only in direction —
+    /// which is exactly how it is threaded into the one incidence chain twice (`04 §2.4`).
+    ///
+    /// # Errors
+    /// Returns a storage error if either delta cannot be allocated, written or linked.
+    fn link_incidence_deltas(
+        &mut self,
+        edge: u64,
+        type_id: u32,
+        start: u64,
+        end: u64,
+        txn: TxnId,
+    ) -> Result<()> {
+        self.link_incidence_delta(
+            edge,
+            type_id,
+            IncidenceSide {
+                direction: IncidentDirection::Start,
+                peer: end,
+            },
+            txn,
+        )?;
+        self.link_incidence_delta(
+            edge,
+            type_id,
+            IncidenceSide {
+                direction: IncidentDirection::End,
+                peer: start,
+            },
+            txn,
+        )
     }
 
     fn link_set_property(
@@ -3787,14 +3945,18 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// threaded, as a corpse, and its slot must NOT be handed out again — the delta twin of
     /// [`reclaim_aborted_pops`](Self::reclaim_aborted_pops).
     ///
-    /// **Since `rmp` #968 that threaded state has no reachable live route**, and the re-walk is kept
-    /// as defence in depth rather than as a path taken. `link_delta` now refuses to prepend onto a
-    /// chain head an *open* transaction holds, so an aborting transaction's delta is always still the
-    /// head at its own rollback and its compare-and-set undo always fires. The re-walk stays because
-    /// it is cheap, because it is the fail-safe direction (leaking a slot is safe, handing out a
-    /// threaded one is not), and because it must remain correct for the sprint-96 writers still to
-    /// come; the cost of the assumption being wrong is a corpse double-free, so it is not an
-    /// assumption worth making.
+    /// **The re-walk is a path genuinely taken again since `rmp` #969**, and this note used to say the
+    /// opposite. Between #968 and #969 it really was unreachable: `link_delta` refused to prepend onto
+    /// a chain head an *open* transaction held, so an aborting transaction's delta was always still
+    /// the head at its own rollback and its compare-and-set undo always fired.
+    ///
+    /// Incidence deltas are **non-sequential** (`D-incidence-non-sequential`): a second transaction
+    /// may prepend an edge insertion on top of a first one that is still open. If the *lower* writer
+    /// aborts, its delta is no longer the head, its compare-and-set undo correctly no-ops, and the
+    /// delta stays threaded below the survivor as a corpse — precisely the state this re-walk exists
+    /// to recognise. Handing that slot out again would splice a live chain onto a reused record. The
+    /// re-walk is what makes the sprint-96 concurrency safe rather than a fail-safe kept "just in
+    /// case", and its cost is bounded by the aborting transaction's own links.
     ///
     /// Infallible and best-effort by construction: it performs no page write (rollback's post-undo
     /// section must stay infallible, `rmp` #955) and any read error simply leaves the slot leaked,
@@ -5010,6 +5172,46 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             if self.is_txn_active(w))
     }
 
+    /// Whether some **open** transaction captured relationship `id` as the pre-image of a node's
+    /// `first_rel` and will write it back if it aborts (`rmp` #969).
+    ///
+    /// # The defect this closes
+    ///
+    /// A writer `W` that prepends onto node `N` captures `N`'s current `first_rel` as the undo image
+    /// of its chain-head write. If GC then reclaims **that very relationship** — legitimate on its own
+    /// terms: it is tombstoned and committed at or below the watermark — `W`'s abort restores
+    /// `first_rel` to a slot that is now on the free list. A live node's incidence chain then heads
+    /// into a freed slot, which the next allocation hands to an unrelated relationship, and the
+    /// traversal walks a foreign record's pointers: a silently wrong traversal, and committed edges
+    /// lost from the walk. Reproduced end to end by
+    /// `tests/incidence_undo_chain_969.rs::gc_must_not_reclaim_the_chain_head_an_open_writer_will_restore`,
+    /// whose pre-fix failure is the checker reporting `Adjacency(DeadRel)` together with
+    /// `FreeList(ReferencedByLiveChain)`.
+    ///
+    /// The hazard is **pre-existing** and independent of how the head is written: the compare-and-set
+    /// undo (`rmp` #220) fires here too, because the head *is* still this writer's pushed id — what
+    /// went stale is the value the undo restores, not the word it tests. It is fixed here rather than
+    /// deferred because a pre-existing defect is fixed where it is found.
+    ///
+    /// # Why the exact question, and not the easy one
+    ///
+    /// The first version of this gate asked "does either endpoint carry an uncommitted incidence
+    /// delta?" — a strictly larger question, and one that starves reclamation: on a hub under
+    /// sustained edge insertion there is always such a delta, so every tombstoned relationship
+    /// incident to it becomes permanently unreclaimable (measured: eight consecutive GC passes
+    /// reclaiming zero, against a baseline of 2000). Naming the captured pre-images instead
+    /// ([`ActiveTxn::captured_rel_heads`]) is O(1) per candidate, has no false positives, and costs
+    /// one `u64` per prepend.
+    ///
+    /// This gate becomes unnecessary once `rmp` #970 makes rollback logical: an abort will then
+    /// unlink the edge from the chain's **current** state instead of restoring a captured pointer
+    /// word, so there is no stale image left to invalidate.
+    fn rel_head_captured_by_open_writer(&self, id: u64) -> bool {
+        self.active
+            .iter()
+            .any(|(txn, a)| a.captured_rel_heads.contains(&id) && self.is_txn_active(*txn))
+    }
+
     /// Reclaims the reclaimable MVCC tombstones of `kind` (`Rel` or `Node`) under `txn` (`rmp` #522).
     /// Iterates only the tracked [`pending_tombstones[kind]`](Self::pending_tombstones) set — with a
     /// full-store fallback on the first post-open pass (`gc_full_scan_pending`), which also seeds the set
@@ -5045,7 +5247,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 continue;
             }
             let reclaimable = Self::is_reclaimable(mvcc, watermark, &self.commit_registry)
-                && (kind != StoreKind::Node || !self.has_live_incident_rels(id)?);
+                && (kind != StoreKind::Node || !self.has_live_incident_rels(id)?)
+                && (kind != StoreKind::Rel || !self.rel_head_captured_by_open_writer(id));
             if reclaimable {
                 match kind {
                     StoreKind::Rel => self.reclaim_rel(txn, id)?,
@@ -6256,6 +6459,18 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 "start node {start} not in use"
             )));
         }
+        // BOTH endpoints are validated before anything is allocated, so a refused edge costs no
+        // physical id, no `ElementId` and no undo slot. A self-loop's single node is read once and
+        // used for both sides — it really is both ends of that relationship.
+        let end_node = if start == end {
+            start_node
+        } else {
+            let n = self.read_node(end)?;
+            if !Self::is_live_version(n.mvcc) {
+                return Err(GraphusError::Storage(format!("end node {end} not in use")));
+            }
+            n
+        };
         let id = self.alloc_id(StoreKind::Rel, txn)?;
         let eid = self.element_ids.alloc()?;
         self.note_created(txn, StoreKind::Rel, id);
@@ -6291,6 +6506,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 old_head,
                 txn,
             )?;
+            self.link_incidence_deltas(id, type_id, start, end, txn)?;
             // Maintain the per-relationship-type live count (`rmp` task #79) and the grand-total
             // live-relationship count (`rmp` task #82): the self-loop is now a live version. Both
             // endpoints are the (validated) live start node, so the increment is unconditional here.
@@ -6309,11 +6525,6 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 true,
             )?;
             return Ok((id, eid));
-        }
-
-        let end_node = self.read_node(end)?;
-        if !Self::is_live_version(end_node.mvcc) {
-            return Err(GraphusError::Storage(format!("end node {end} not in use")));
         }
 
         // Push at the head of the START node's chain.
@@ -6346,6 +6557,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             txn,
         )?;
         self.write_chain_head(StoreKind::Node, end, NODE_OFF_FIRST_REL, id, end_head, txn)?;
+        self.link_incidence_deltas(id, type_id, start, end, txn)?;
         // Maintain the per-relationship-type live count (`rmp` task #79) and the grand-total
         // live-relationship count (`rmp` task #82): the relationship is now a written, live version
         // and both endpoints are validated. The self-loop branch above returns early, so the grand
@@ -7087,6 +7299,28 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
 
     /// Unlinks one chain side of relationship `id` (whose current image is `rel`) from `node`'s
     /// incidence chain: bridges its neighbours and, if it was the head, repoints `first_rel`.
+    ///
+    /// # Headship is re-derived from the node, never trusted from the record
+    ///
+    /// A relationship's own `prev` and first-in-chain marker **can be stale**, and one path leaves
+    /// them stale by design: when a later writer prepends on top of `id`,
+    /// [`relink_old_head`](Self::relink_old_head) sets `id`'s `prev` to the new record and clears its
+    /// marker with an *undo == redo* write (`rmp` #239), so an abort of that prepend does **not**
+    /// restore them. `id` is then the node's head again — `first_rel` names it — while its own
+    /// pointers still say it is not.
+    ///
+    /// Trusting the record there took the neighbour branch, so `first_rel` was left naming `id` while
+    /// the slot was freed; the corpse splice then re-discovered `id` from that still-pointing head
+    /// and freed it a **second** time. Two entries for one slot in a free list that does not
+    /// deduplicate ([`FreeList::push`](crate::idalloc::FreeList::push)) hands the same physical id to
+    /// two records, whose chains then self-cycle — the `rmp` #578 failure shape. Reproduced, before
+    /// this fix, by nothing more exotic than *abort a prepend, then run GC*
+    /// (`tests/incidence_undo_chain_969.rs::reclaiming_a_relationship_an_aborted_prepend_left_stale_frees_its_slot_once`),
+    /// which surfaced it as `FreeList { detail: Duplicate }`.
+    ///
+    /// The node's `first_rel` is the authoritative statement of headship, so it is what decides. This
+    /// is the same re-derive-from-the-live-walk discipline `gc_splice_corpses` already applies for the
+    /// same reason (see its module comment, hazard 1).
     fn unlink_side_with(
         &mut self,
         id: u64,
@@ -7096,7 +7330,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         txn: TxnId,
     ) -> Result<()> {
         let (prev, next) = rel.chain_pointers(side);
-        if prev == NULL_ID {
+        // `prev != id` excludes a self-loop's NON-head link, whose `prev` names the record itself:
+        // both of its sides face `node`, so `first_rel == id` alone cannot tell them apart, and only
+        // the side the relink actually touched (the one whose `prev` was `NULL`) is the stale head.
+        let is_head = prev == NULL_ID || (prev != id && self.read_node(node)?.first_rel == id);
+        if is_head {
             let mut n = self.read_node(node)?;
             n.first_rel = next;
             self.write_node(node, &n, txn)?;
@@ -7104,7 +7342,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             self.repoint_neighbour(prev, node, id, next, NeighbourPtr::Next, txn)?;
         }
         if next != NULL_ID {
-            self.repoint_neighbour(next, node, id, prev, NeighbourPtr::Prev, txn)?;
+            // A new head's `prev` is `NULL`, not the stale pointer this record happened to carry.
+            let restored_prev = if is_head { NULL_ID } else { prev };
+            self.repoint_neighbour(next, node, id, restored_prev, NeighbourPtr::Prev, txn)?;
         }
         Ok(())
     }
@@ -9451,6 +9691,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// bitmap references only token ids that exist in the token store (`rmp` task #42).
     pub(crate) fn checker_label_token_count(&self) -> usize {
         self.tokens.len(Namespace::Label)
+    }
+
+    /// The number of interned `RelType`-namespace tokens (`04 §2.6`): relationship-type token ids are
+    /// dense in `0..rel_type_token_count`. The consistency checker uses this to flag an incidence
+    /// delta that names a type the token store does not have (`rmp` #969).
+    pub(crate) fn checker_rel_type_token_count(&self) -> usize {
+        self.tokens.len(Namespace::RelType)
     }
 
     /// The **version chain** of entity `(kind, id)`, newest delta first (`05 §12`, `04 §5.1`;

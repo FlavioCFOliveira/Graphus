@@ -245,9 +245,21 @@ fn run_undo_chain_crash(seed: u64) -> UndoRecoveryReport {
                         delta.commit_info
                     )
                 });
+            // A **live** delta must resolve through a live slot. A **corpse** delta legitimately
+            // resolves through a corpse slot: that pairing is precisely how the area records "this
+            // transaction did not commit" (`05 §12.4`).
+            //
+            // Stated as the invariant rather than as "the slot is live" because that is what
+            // `05 §12.4` actually promises, and because the stricter form was only ever true by
+            // accident of which states happened to be reachable. A draft of `rmp` #969 made the
+            // corpse-below-a-survivor state reachable by letting incidence deltas interleave across
+            // transactions on one node's chain; `D-incidence-anchor` removed that by anchoring them
+            // on the relationship instead. The assertion is kept in its true form so a future change
+            // that makes the state reachable again is not reported as corruption.
             assert!(
-                slot.in_use(),
-                "seed {seed}: a committed survivor's delta must resolve through a live slot"
+                slot.in_use() || !delta.in_use(),
+                "seed {seed}: a LIVE delta of a committed survivor must resolve through a live \
+                 slot (a corpse delta may resolve through a corpse slot)"
             );
         }
         // The oldest delta of any surviving entity is its creation's inverse.

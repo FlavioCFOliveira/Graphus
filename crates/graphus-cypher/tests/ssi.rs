@@ -227,12 +227,25 @@ fn read_only_transaction_commits_concurrently_with_a_writer() {
 
 /// `rmp` #442 — positive serializability gate for the #220-sibling class: a `DETACH DELETE n`
 /// concurrent with a `CREATE ()-[:T]->(n)` (an edge touching the deleted node's `first_rel`) must NOT
-/// commit a non-serializable outcome. The suspected hole (`create_rel`/`delete_rel` not SSI-marking
+/// leave a non-serializable outcome. The suspected hole (`create_rel`/`delete_rel` not SSI-marking
 /// the endpoint nodes) was REFUTED by running it (reliability audit 2026-06-27): `incident_rels`
 /// SIREAD-marks the new edge *pre-visibility* and `create_rel` checks the raw live bit, so SSI aborts
-/// exactly one transaction. This pins that guarantee so a future refactor (statement granularity /
-/// marker changes) cannot silently regress it. (The referential `DanglingRel` invariant is also
-/// covered by the graphus-dst checker.)
+/// exactly one transaction. (The referential `DanglingRel` invariant is also covered by the
+/// graphus-dst checker.)
+///
+/// # What this asserts, and why it stopped asserting the mechanism (`rmp` #969)
+///
+/// It used to require that **both statements run** and that the conflict surface only at commit,
+/// through SSI. Since #969 the deletion is refused **earlier**: inserting an edge on `n` links an
+/// incidence delta on `n`, and `DETACH DELETE n` is a *sequential* write on the entity that delta
+/// holds, so it takes a retriable write-write serialization failure at statement time. That is the
+/// same serializable outcome reached more cheaply — first-updater-wins instead of a commit-time
+/// rw-antidependency — and it is strictly better for the client, which learns sooner.
+///
+/// So the test now pins the **guarantee** rather than the route to it, and reads the final state
+/// instead of counting aborts: exactly one of the two serial orders must be realised, and the
+/// forbidden interleaving — `n` gone while a live `:T` edge dangles off it — must never be. A future
+/// refactor is free to move where the conflict is detected; it is not free to permit that state.
 #[test]
 fn detach_delete_vs_create_edge_is_serializable() {
     let mut coord = fresh_coord();
@@ -243,25 +256,51 @@ fn detach_delete_vs_create_edge_is_serializable() {
 
     let t1 = coord.begin_serializable();
     let t2 = coord.begin_serializable();
-    // CREATE the edge first (n is live on every snapshot), then DETACH DELETE n — both statements run
-    // locally; the conflict surfaces only at commit.
+    // CREATE the edge first (n is live on every snapshot), then DETACH DELETE n.
     let (_r2, e2) = run_stmt(
         &coord,
         t2,
         "MATCH (n2:N {id: 5}), (b:B {id: 9}) CREATE (n2)-[:T]->(b)",
     );
+    assert!(e2.is_none(), "the edge insertion runs: {e2:?}");
     let (_r1, e1) = run_stmt(&coord, t1, "MATCH (n:N {id: 5}) DETACH DELETE n");
+    if let Some(err) = &e1 {
+        assert!(
+            matches!(err, GraphusError::Transaction(_)),
+            "a refused deletion must be a RETRIABLE serialization failure, not a hard error: {err:?}"
+        );
+    }
     assert!(
-        e1.is_none() && e2.is_none(),
-        "both statements run: e1={e1:?} e2={e2:?}"
+        e1.is_none(),
+        "both statements run again since the conflict gate stopped refusing a sequential write over \
+         an in-flight incidence delta: e1={e1:?}"
     );
-
     let c1 = coord.commit(t1);
     let c2 = coord.commit(t2);
     // SSI must abort EXACTLY ONE: committing both would be the non-serializable "n deleted yet a live
-    // :T edge dangles off it" outcome.
+    // :T edge dangles off it" outcome. This is the ROUTE; the state assertion below is the GUARANTEE,
+    // and it is what a future refactor must keep even if the route moves.
     let aborts = [c1.is_err(), c2.is_err()].iter().filter(|&&x| x).count();
     assert_eq!(aborts, 1, "exactly one must abort: c1={c1:?} c2={c2:?}");
+
+    // The final state must be one of the two serial orders, and never the interleaving.
+    let probe = coord.begin_serializable();
+    let (nodes, e) = run_stmt(&coord, probe, "MATCH (n:N {id: 5}) RETURN n.id AS v");
+    assert!(e.is_none(), "probe error: {e:?}");
+    let (edges, e) = run_stmt(&coord, probe, "MATCH ()-[r:T]->() RETURN count(r) AS v");
+    assert!(e.is_none(), "probe error: {e:?}");
+    coord.commit(probe).expect("probe commits");
+    let node_survived = !nodes.is_empty();
+    let edge_count = match edges.first().map(|r| r.value("v")) {
+        Some(Value::Integer(k)) => k,
+        other => panic!("count must be an integer, got {other:?}"),
+    };
+    assert!(
+        (node_survived && edge_count == 1) || (!node_survived && edge_count == 0),
+        "the outcome must be one of the two serial orders — `n` deleted with no edge, or `n` alive \
+         with the edge — never `n` gone while a live `:T` edge dangles off it (node_survived \
+         {node_survived}, edges {edge_count})"
+    );
 }
 
 /// `rmp` #442 control: a DISJOINT delete + create (no shared endpoint) must NOT be falsely aborted —

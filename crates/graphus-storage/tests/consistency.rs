@@ -1747,7 +1747,11 @@ fn a_commit_slot_with_a_wrong_delta_count_is_flagged() {
     let commit_page = img.locate_store_page(StoreKind::Commit);
     let slot1 = page::HEADER_SIZE + SLOT_SIZE; // physical id 1
     let real = img.read_u64_at(commit_page, slot1 + SLOT_OFF_DELTA_COUNT);
-    assert_eq!(real, 3, "one transaction created two nodes and one edge");
+    assert_eq!(
+        real, 5,
+        "one transaction created two nodes (one `DeleteObject` each) and one edge (its own \
+         `DeleteObject` plus one incidence delta per end, `rmp` #969)"
+    );
     img.write_u64_at(commit_page, slot1 + SLOT_OFF_DELTA_COUNT, 7);
 
     let mut store = img.open();
@@ -1758,7 +1762,7 @@ fn a_commit_slot_with_a_wrong_delta_count_is_flagged() {
             Violation::UndoSlot {
                 detail: UndoSlotFault::DeltaCountMismatch {
                     recorded: 7,
-                    actual: 3
+                    actual: 5
                 },
                 ..
             }
@@ -1795,6 +1799,161 @@ fn an_undecodable_delta_slot_is_flagged() {
             }
         )),
         "an undecodable delta must be flagged: {:?}",
+        r.violations
+    );
+    assert!(verify_on_open(&mut store, &[]).is_err());
+}
+
+// ===========================================================================================
+// The incidence-delta rules (`rmp` #969) — adjacency versioned on the undo chain
+// ===========================================================================================
+
+/// Offset of a delta's `action` byte within its record (`05 §12.2`).
+const DELTA_OFF_ACTION: usize = 1;
+/// Offset of a delta's `direction` byte.
+const DELTA_OFF_DIRECTION: usize = 3;
+/// Offset of a delta's `token` word (u32).
+const DELTA_OFF_TOKEN: usize = 24;
+/// Offset of a delta's `peer` word.
+const DELTA_OFF_PEER: usize = 40;
+/// The frozen `RemoveIncidentEdge` action byte.
+const ACTION_REMOVE_INCIDENT_EDGE: u8 = 7;
+
+/// A store whose relationship endpoints were **committed before** the edge, so the creator gate does
+/// not apply and both endpoints carry an incidence delta (`rmp` #969).
+fn store_with_incidence_deltas() -> Store {
+    let mut s = fresh(64);
+    let setup = TxnId(1);
+    s.begin(setup);
+    let (a, _) = s.create_node(setup).unwrap();
+    let (b, _) = s.create_node(setup).unwrap();
+    s.commit(setup).unwrap();
+
+    let txn = TxnId(2);
+    s.begin(txn);
+    let t = s.intern_token(Namespace::RelType, "T").unwrap();
+    s.create_rel(txn, t, a, b).unwrap();
+    s.commit(txn).unwrap();
+    s
+}
+
+/// The byte offset, within the `undo.store` page, of the first `RemoveIncidentEdge` delta.
+///
+/// Found by scanning for the action byte rather than computed from an allocation order, so the
+/// helper does not silently target the wrong slot when the write path's delta order changes.
+fn locate_incidence_delta(img: &DiskImage, undo_page: u64) -> usize {
+    let bytes = &img.pages.iter().find(|(i, _)| *i == undo_page).unwrap().1;
+    let mut off = page::HEADER_SIZE;
+    while off + DELTA_SIZE <= PAGE_SIZE {
+        if bytes[off + DELTA_OFF_ACTION] == ACTION_REMOVE_INCIDENT_EDGE {
+            return off;
+        }
+        off += DELTA_SIZE;
+    }
+    panic!("no incidence delta in the undo store; the fixture wrote none");
+}
+
+/// An incidence delta naming a relationship type the token store does not have is flagged — the
+/// incidence twin of `UnknownPropertyToken`.
+#[test]
+fn an_incidence_delta_with_an_unknown_rel_type_token_is_flagged() {
+    let mut s = store_with_incidence_deltas();
+    let mut img = DiskImage::capture(&mut s);
+    assert!(report(&mut img.open()).is_consistent(), "healthy first");
+
+    let undo_page = img.locate_store_page(StoreKind::Undo);
+    let slot = locate_incidence_delta(&img, undo_page);
+    // One `RelType` token is interned, so id 4_000 names nothing.
+    img.page_mut(undo_page)[slot + DELTA_OFF_TOKEN..slot + DELTA_OFF_TOKEN + 4]
+        .copy_from_slice(&4_000u32.to_le_bytes());
+    img.refresh_checksum(undo_page);
+
+    let mut store = img.open();
+    let r = report(&mut store);
+    assert!(
+        r.violations.iter().any(|v| matches!(
+            v,
+            Violation::UndoChain {
+                detail: UndoChainFault::UnknownRelTypeToken { token: 4_000 },
+                ..
+            }
+        )),
+        "an incidence delta naming an unknown relationship type must be flagged: {:?}",
+        r.violations
+    );
+    assert!(verify_on_open(&mut store, &[]).is_err());
+}
+
+/// An incidence delta whose `peer` was zeroed under it is flagged: physical ids start at `1`, so a
+/// null target is a payload field that is simply not there.
+///
+/// The check is a **null** check and not a range check on purpose — see
+/// [`UndoChainFault::IncidenceTargetNull`]: an id above a store's high-water is a legitimate
+/// transient state after redo-only crash recovery, and flagging it reported healthy recovered stores
+/// as corrupt in `graphus-dst`'s `undo_chain_recovery` sweep.
+#[test]
+fn an_incidence_delta_with_a_null_target_is_flagged() {
+    let mut s = store_with_incidence_deltas();
+    let mut img = DiskImage::capture(&mut s);
+    assert!(report(&mut img.open()).is_consistent(), "healthy first");
+
+    let undo_page = img.locate_store_page(StoreKind::Undo);
+    let slot = locate_incidence_delta(&img, undo_page);
+    assert_ne!(
+        img.read_u64_at(undo_page, slot + DELTA_OFF_PEER),
+        0,
+        "a live incidence delta always names a peer"
+    );
+    img.write_u64_at(undo_page, slot + DELTA_OFF_PEER, 0);
+
+    let mut store = img.open();
+    let r = report(&mut store);
+    assert!(
+        r.violations.iter().any(|v| matches!(
+            v,
+            Violation::UndoChain {
+                detail: UndoChainFault::IncidenceTargetNull { peer: 0, .. },
+                ..
+            }
+        )),
+        "an incidence delta with no peer must be flagged: {:?}",
+        r.violations
+    );
+    assert!(verify_on_open(&mut store, &[]).is_err());
+}
+
+/// **The rule that matters**: an incidence delta whose payload is addressable and well-formed but
+/// *contradicts the relationship it names* — here the side is flipped — is flagged.
+///
+/// Nothing else catches this. The delta decodes, the chain walks, every read still returns the right
+/// answer; it only goes wrong when a rollback applies the delta and unlinks the edge from the wrong
+/// end. That is precisely the failure mode versioning adjacency introduces.
+#[test]
+fn an_incidence_delta_contradicting_its_relationship_is_flagged() {
+    let mut s = store_with_incidence_deltas();
+    let mut img = DiskImage::capture(&mut s);
+    assert!(report(&mut img.open()).is_consistent(), "healthy first");
+
+    let undo_page = img.locate_store_page(StoreKind::Undo);
+    let slot = locate_incidence_delta(&img, undo_page);
+    // Flip the side the delta claims: 1 = start, 2 = end (`05 §12.2`).
+    let was =
+        img.pages.iter().find(|(i, _)| *i == undo_page).unwrap().1[slot + DELTA_OFF_DIRECTION];
+    let flipped = if was == 1 { 2 } else { 1 };
+    img.page_mut(undo_page)[slot + DELTA_OFF_DIRECTION] = flipped;
+    img.refresh_checksum(undo_page);
+
+    let mut store = img.open();
+    let r = report(&mut store);
+    assert!(
+        r.violations.iter().any(|v| matches!(
+            v,
+            Violation::UndoChain {
+                detail: UndoChainFault::IncidenceContradictsEdge { .. },
+                ..
+            }
+        )),
+        "an incidence delta that disagrees with its relationship must be flagged: {:?}",
         r.violations
     );
     assert!(verify_on_open(&mut store, &[]).is_err());

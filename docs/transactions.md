@@ -119,6 +119,28 @@ Writers are always serializable among themselves, whether or not any reader is r
 concurrent write–write conflict is always resolved (one side commits, the other gets a
 retriable serialization failure), and no committed write is ever lost.
 
+### What counts as a write–write conflict, node by node
+
+Two open transactions conflict when they write the **same node or relationship** — the granularity is
+the entity, not the individual property. Writing two different properties of one node from two open
+transactions is a conflict; writing two different nodes is not.
+
+**Inserting relationships is the deliberate exception.** Any number of open transactions may insert
+relationships on the *same* node concurrently, and all of them commit. Edge insertions commute — each
+adds a distinct entry to the node's adjacency and none reads another's — so serialising them would
+cost throughput on exactly the hot spots that need it most (a "supernode" with a large fan-out) and
+buy nothing. Concurrent edge insertion is a supported, first-class workload at any degree.
+
+The exception runs both ways: an edge insertion is never refused, and it never causes another
+transaction to be refused either. Changing a node — setting a property, adding a label, deleting it —
+while a different transaction inserts an edge on it is allowed in either order. Nothing about an edge
+insertion touches the version history of its endpoints.
+
+Deleting a relationship is a write to the relationship, not to its endpoints, so it does not conflict
+with edge insertions on those endpoints. A `DETACH DELETE` concurrent with an edge insertion on the
+same node is still resolved: not as a write–write conflict, but by serializability checking at commit
+time, which aborts one of the two rather than leaving an edge dangling off a deleted node.
+
 ## Retrying a serialization failure
 
 A statement or transaction under **Serializable** isolation (a write, or anything inside an

@@ -149,8 +149,9 @@ fn every_entity_gets_its_own_chain() {
     assert!(slot.in_use());
     assert_eq!(slot.txn_id, 1);
     assert_eq!(
-        slot.delta_count, 3,
-        "three deltas resolve through this slot"
+        slot.delta_count, 5,
+        "five deltas resolve through this slot: one `DeleteObject` per created entity (two nodes \
+         and the relationship) plus one incidence delta per end of the relationship (`rmp` #969)"
     );
     assert!(
         matches!(
@@ -250,7 +251,10 @@ fn the_checker_accepts_a_chain_before_and_after_gc() {
     // The commit slot goes with the last delta that named it (`05 §12.4`: a slot outlives its last
     // delta, and not one pass longer).
     let (free_deltas, free_slots) = s.undo_area_free_counts();
-    assert_eq!(free_deltas, 3, "all three deltas are back on the free list");
+    assert_eq!(
+        free_deltas, 5,
+        "all five deltas are back on the free list (`rmp` #969 adds one per relationship end)"
+    );
     assert_eq!(
         free_slots, 1,
         "the transaction's commit slot is reclaimed once its last delta is (`05 §12.4`)"
