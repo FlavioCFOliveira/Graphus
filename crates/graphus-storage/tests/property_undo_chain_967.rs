@@ -91,28 +91,31 @@ fn current_value(s: &Store, node: u64, key: u32) -> Option<Value> {
 /// `true` for a corpse, so `free_undo_chain` **does** reach `free_delta` with one; without the
 /// `in_use()` gate those blocks go on the free list while a live property still reads through them.
 ///
-/// # Reaching a THREADED corpse takes three transactions
-///
-/// A first attempt at this test aborted the overwrite on its own — and proved nothing. A lone
-/// abort's chain-head compare-and-set undo puts `undo_ptr` back where it was, so the delta is
-/// *unlinked*, `reclaim_aborted_undo` frees its slot without a page write, and `free_delta` never
-/// sees it. (The mutation check confirmed it: removing the `in_use()` gate left that version of the
-/// test green.)
+/// # This test changed subject in `rmp` #968, and the reason is the point
 ///
 /// A corpse only stays **threaded** when another transaction prepended on top of it before it
-/// aborted, so its compare-and-set undo no-ops. Under `D-property-write-conflict` no second
-/// *property* writer can do that — but a `DELETE` can: `delete_node` links its `RecreateObject`
-/// delta through the same chain and is not gated by the property-path check. So the history is:
-/// T2 overwrites, T3 deletes on top, T2 aborts (its undo no-ops — T3 owns the head), T3 aborts (its
-/// undo restores the head to T2's now-corpse delta). The node is live again, its cell owns the
-/// original chain, and a corpse delta names that same chain.
+/// aborted, so its compare-and-set undo no-ops. When this test was written, `D-property-write-conflict`
+/// stopped a second *property* writer from doing that — but a `DELETE` could: `delete_node` linked its
+/// `RecreateObject` delta through the same chain and was **not** gated, because the check sat on the
+/// three property entry points instead of on the chain itself. So the original history was: T2
+/// overwrites, T3 deletes on top, T2 aborts (its undo no-ops — T3 owns the head), T3 aborts.
 ///
-/// # Making a latent double-free observable
+/// `rmp` #968 moved the check into [`link_delta`], the single door every delta passes through, because
+/// that gap was about to become a wrong read: a label delta lands on the same chain and — unlike a
+/// deletion — a label change does not make the entity invisible, so the ascending commit timestamps
+/// the interleaving produces would be read, not skipped. The very interleaving this test used to
+/// perform is therefore now **refused**, and that refusal is what this test asserts.
 ///
-/// The blocks still hold the right bytes until something reuses them, so the test does the reuse:
-/// after GC it allocates fresh overflow values until the free list is consumed, and only then
-/// re-reads. That is what turns "the blocks are on the free list" into "the property reads back the
-/// wrong value".
+/// **What that costs, stated plainly.** With no transaction able to prepend onto an open
+/// transaction's chain head, an aborting transaction's delta is always still the head at its own
+/// rollback, so its compare-and-set undo always fires and the delta is *unlinked*. The threaded-corpse
+/// state has no reachable live route left, and `free_delta`'s `in_use()` gate is retained as defence
+/// in depth rather than as a reachable path — see `reclaim_aborted_deltas`. This test can no longer
+/// exercise that gate, and pretending otherwise by keeping a sequence that now returns an error would
+/// be worse than saying so: what it asserts instead is the **stronger** invariant that replaced it,
+/// which fails loudly if the guard is ever removed. The lone-abort accounting below is kept because it
+/// is still true and still worth pinning; the note that it alone "proves nothing" about the `in_use()`
+/// gate remains accurate, and is exactly why the refusal assertion carries the test.
 #[test]
 fn the_corpse_delta_of_an_aborted_overwrite_never_frees_the_restored_chain() {
     let mut s = fresh();
@@ -141,53 +144,58 @@ fn the_corpse_delta_of_an_aborted_overwrite_never_frees_the_restored_chain() {
         "both chains are allocated while the overwrite is in flight",
     );
 
-    // T3 deletes the node, prepending its own delta ON TOP of T2's. This is what makes T2's abort
-    // leave a THREADED corpse instead of simply unlinking its delta.
+    // THE INVARIANT (`rmp` #968): T3 tries to delete the node, which links a `RecreateObject` delta
+    // onto the very chain T2 still holds. That is the prepend that used to thread T2's corpse, and it
+    // must now be REFUSED — a retriable serialization failure, not a silent interleave. If this ever
+    // starts succeeding again, the chain can carry ascending commit timestamps and the read path's
+    // early stop becomes a wrong read.
     let t3 = TxnId(3);
     s.begin(t3);
-    s.delete_node(t3, n).expect("T3 deletes the node");
+    let refused = s.delete_node(t3, n);
+    let err = refused.expect_err(
+        "a second transaction must not prepend onto a chain an OPEN transaction holds: without this \
+         the deletion path interleaves its delta with T2's and the chain's commit timestamps can \
+         ascend, which is exactly what `DeltaVerdict::Stop` assumes cannot happen",
+    );
+    assert!(
+        matches!(err, GraphusError::Transaction(_)),
+        "the refusal must be a RETRIABLE serialization failure, so a coordinator retries the \
+         transaction instead of surfacing corruption: got {err:?}",
+    );
+    assert!(
+        format!("{err}").contains("write-write conflict"),
+        "and it must name the conflict so an operator can act on it: {err}",
+    );
+    s.rollback(t3).expect("abort the refused delete");
 
-    // T2 aborts: its chain-head compare-and-set undo no-ops (T3 owns the head), so its delta stays on
-    // the chain as a corpse — still naming the FIRST chain, which the same rollback has just restored
-    // into the live cell.
+    // NON-VACUITY of the refusal: it must be the *holder* that caused it, not some unrelated error
+    // path. The same delete succeeds the moment T2 is no longer open.
     s.rollback(t2).expect("abort the overwrite");
-    // T3 aborts: its undo restores the head to T2's corpse, and the node is live again.
-    s.rollback(t3).expect("abort the delete");
-
     assert_eq!(
         s.heap_block_usage().expect("heap usage"),
         4,
-        "the aborts release the blocks the aborted value allocated, and only those",
+        "the abort releases the blocks the aborted value allocated, and only those",
     );
     assert_eq!(
         current_value(&s, n, key),
         Some(first.clone()),
-        "the aborts restore the first value",
+        "the abort restores the first value",
     );
-    // NON-VACUITY: the corpse must actually be on the chain, or the gate under test is never reached.
-    let chain = s
-        .superset_scan_node_properties(n)
-        .expect("superset read")
-        .history()
-        .iter()
-        .filter(|d| !d.delta.in_use())
-        .count();
-    assert!(
-        chain >= 1,
-        "the history must contain a THREADED corpse delta, else `free_delta` never sees one and \
-         this test cannot observe the gate it exists to protect",
-    );
+    let t5 = TxnId(5);
+    s.begin(t5);
+    s.delete_node(t5, n)
+        .expect("with no open holder the very same deletion is allowed");
+    s.rollback(t5).expect("put the node back");
 
-    // GC past the watermark. The whole chain is dead — the corpse plus the committed creation
-    // deltas — so `free_undo_chain` reaches `free_delta` with the corpse.
+    // GC past the watermark, which is where a wrongly-freed overflow chain would surface.
     let watermark = s.snapshot_ts();
     gc_at(&mut s, 4, watermark);
 
     assert_eq!(
         s.heap_block_usage().expect("heap usage"),
         4,
-        "GC must NOT free the chain a corpse delta names: the rollback already gave it back to the \
-         live cell, so freeing it is a double-free (the `in_use()` gate in `free_delta`)",
+        "GC must NOT free the chain the rollback gave back to the live cell — freeing it is a \
+         double-free (the `in_use()` gate in `free_delta`)",
     );
     assert_eq!(
         current_value(&s, n, key),

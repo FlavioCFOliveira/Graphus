@@ -3184,6 +3184,15 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         );
         let slot = self.commit_slot_for(txn)?;
         let head = self.read_mvcc(kind, entity)?.undo_ptr;
+        // STEP 1 (`04 §5.1.2`), and it belongs HERE rather than in each caller. The read path's
+        // early stop (`DeltaVerdict::Stop`) is the claim that commit timestamps never ascend down a
+        // chain, and the only thing that makes that true is refusing to interleave two open
+        // transactions' deltas on one chain. `link_delta` is the single door a delta passes through,
+        // so guarding the door covers every writer — the property path, the deletion path
+        // (`note_entity_deleted`), and everything sprint 96 adds after it — instead of relying on
+        // each new writer to remember. Costs nothing on a fresh chain and reuses the `head` already
+        // read above.
+        self.ensure_chain_head_unheld(kind, entity, head, txn)?;
         let id = self.alloc_undo_id(txn)?;
         delta.flags = undo::FLAG_IN_USE;
         delta.commit_info = slot;
@@ -3455,6 +3464,26 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// head belongs to another open transaction, and a storage error if the chain head dangles.
     fn ensure_no_conflicting_writer(&self, kind: StoreKind, entity: u64, txn: TxnId) -> Result<()> {
         let head = self.read_mvcc(kind, entity)?.undo_ptr;
+        self.ensure_chain_head_unheld(kind, entity, head, txn)
+    }
+
+    /// [`ensure_no_conflicting_writer`](Self::ensure_no_conflicting_writer) for a caller that has
+    /// **already read** the chain head, so the check costs no redundant header read (`rmp` #968).
+    ///
+    /// This is the form [`link_delta`](Self::link_delta) uses, and using it there is what turns the
+    /// check from a property-path convention into a **structural** guarantee: `link_delta` is the one
+    /// door through which a delta reaches a chain, so guarding it covers every delta writer by
+    /// construction rather than by each one remembering to ask.
+    ///
+    /// # Errors
+    /// As [`ensure_no_conflicting_writer`](Self::ensure_no_conflicting_writer).
+    fn ensure_chain_head_unheld(
+        &self,
+        kind: StoreKind,
+        entity: u64,
+        head: u64,
+        txn: TxnId,
+    ) -> Result<()> {
         if head == NULL_ID {
             return Ok(());
         }
@@ -3695,9 +3724,18 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// transaction's chain-head publications has already been compare-and-set-undone and every one of
     /// its deltas has already had its `in_use` bit cleared. What is left to decide is purely a space
     /// question, and it is decided **by re-walking each touched entity's chain** rather than by
-    /// assuming the undo fired: a delta a concurrent transaction prepended on top of is still
+    /// assuming the undo fired: a delta another transaction prepended on top of would still be
     /// threaded, as a corpse, and its slot must NOT be handed out again — the delta twin of
     /// [`reclaim_aborted_pops`](Self::reclaim_aborted_pops).
+    ///
+    /// **Since `rmp` #968 that threaded state has no reachable live route**, and the re-walk is kept
+    /// as defence in depth rather than as a path taken. `link_delta` now refuses to prepend onto a
+    /// chain head an *open* transaction holds, so an aborting transaction's delta is always still the
+    /// head at its own rollback and its compare-and-set undo always fires. The re-walk stays because
+    /// it is cheap, because it is the fail-safe direction (leaking a slot is safe, handing out a
+    /// threaded one is not), and because it must remain correct for the sprint-96 writers still to
+    /// come; the cost of the assumption being wrong is a corpse double-free, so it is not an
+    /// assumption worth making.
     ///
     /// Infallible and best-effort by construction: it performs no page write (rollback's post-undo
     /// section must stay infallible, `rmp` #955) and any read error simply leaves the slot leaked,
