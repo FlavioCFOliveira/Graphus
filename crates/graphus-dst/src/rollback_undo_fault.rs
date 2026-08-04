@@ -224,7 +224,11 @@ fn observe<D: graphus_io::BlockDevice, S: LogSink>(
         is_active: store.is_txn_active(txn),
         is_uncommitted_data_writer: reported == Some(txn),
         reported_uncommitted_writer: reported,
-        holds_inflight_label_versions: store.label_history().has_inflight_versions_of(txn),
+        holds_inflight_label_versions: store
+            .live_label_delta_census()
+            .expect("census the undo area")
+            .1
+            > 0,
         label_change_is_visible: resolve_labels(store, node) == written_labels,
     }
 }

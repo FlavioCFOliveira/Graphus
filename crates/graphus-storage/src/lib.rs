@@ -76,7 +76,6 @@ pub mod dwb;
 pub mod heap;
 pub mod idalloc;
 pub mod incremental;
-pub mod label_history;
 pub mod labels;
 pub mod meta;
 pub mod paging;
@@ -118,7 +117,6 @@ pub use incremental::{
     Plain, RestoreOutcome, RestoreTarget, begin_chain, capture_increment,
     restore_chain_file_atomic, restore_to, verify_chain,
 };
-pub use label_history::LabelHistory;
 pub use labels::{LabelError, MAX_INLINE_LABEL_ID, OVERFLOW_BIT};
 pub use meta::{
     CompositeIndexEntry, ConstraintEntry, ConstraintKind, ConstraintTypeDescriptor, FulltextEntity,

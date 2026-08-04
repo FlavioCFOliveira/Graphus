@@ -179,7 +179,11 @@ pub fn run_label_snapshot_visibility_crash(steal: bool) -> (bool, bool) {
         crash_no_force(store)
     };
     let live = store.node(n).expect("read node n").labels;
-    let history_empty = !store.label_history().any();
+    let history_empty = store
+        .live_label_delta_census()
+        .expect("census the undo area")
+        .0
+        == 0;
     store.flush().expect("flush after recovery");
     (has_bit(live), history_empty)
 }
@@ -358,20 +362,31 @@ mod tests {
         );
     }
 
-    /// The in-memory-only design claim: after a crash the history is empty and the recovered word is
-    /// authoritative on its own.
+    /// **`rmp` #968 acceptance criterion 4, and the assertion that INVERTED.**
+    ///
+    /// It used to read "after a crash the history is EMPTY and the recovered word is authoritative on
+    /// its own" — the in-memory-only design's central claim, which rested on no reader surviving a
+    /// restart. That claim was true but it was an argument for why the versions could be *lost*, not a
+    /// durability guarantee: the labels were simply not versioned on disk.
+    ///
+    /// Since #968 a label version is an undo delta, so it is WAL-logged and recovered like every other
+    /// record. The recovered store therefore carries the versions, and that is the criterion: a node
+    /// with label changes survives a restart **with** the versions an active reader could ask for.
+    /// Asserting the inverse of the old claim is what makes the difference between the two designs
+    /// observable rather than merely described.
     #[test]
-    fn crash_recovery_needs_no_label_history() {
+    fn label_versions_survive_a_crash() {
         for steal in [false, true] {
-            let (label_present, history_empty) = run_label_snapshot_visibility_crash(steal);
+            let (label_present, no_label_versions) = run_label_snapshot_visibility_crash(steal);
             assert!(
                 !label_present,
                 "steal={steal}: the COMMITTED label removal did not survive recovery"
             );
             assert!(
-                history_empty,
-                "steal={steal}: a recovered store must start with an EMPTY label history — the \
-                 in-memory-only design rests on no reader surviving a restart"
+                !no_label_versions,
+                "steal={steal}: the recovered store must still carry the node's label versions — \
+                 they are undo deltas now, so losing them across recovery would mean an older reader \
+                 could not be served after a restart (`rmp` #968 AC4)"
             );
         }
     }
@@ -426,11 +441,11 @@ mod tests {
         store.remove_label(t1, n, LABEL_BIT).expect("relabel");
         store.commit(t1).expect("relabel commits");
         assert!(
-            store.label_history().any(),
+            store.live_label_delta_census().expect("census").0 > 0,
             "precondition: relabelling an already-committed node must retain a version"
         );
         assert!(
-            !store.label_history().has_inflight_versions_of(t1),
+            store.live_label_delta_census().expect("census").1 == 0,
             "rmp #767: commit must SETTLE the version — an in-flight stamp outliving its registry \
              entry is the Finding 1 defect"
         );
@@ -441,13 +456,13 @@ mod tests {
 
         // The auditor's assertion, on the real store.
         assert_eq!(
-            store.label_history().tracked_nodes(),
+            store.live_label_delta_census().expect("census").0,
             0,
             "rmp #767 Finding 4: the label history must drain — an unsettled version is unprunable \
              at ANY watermark and leaks for the life of the process"
         );
         assert!(
-            !store.label_history().any(),
+            store.live_label_delta_census().expect("census").0 == 0,
             "rmp #767 Finding 4: the hot-path gate must disarm; a permanently armed gate puts a lock \
              + map lookup on every label re-check in the store"
         );

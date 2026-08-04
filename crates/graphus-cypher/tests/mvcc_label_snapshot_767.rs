@@ -642,26 +642,26 @@ mod gc_interaction {
         );
     }
 
-    /// The history must not leak: once no reader can need them, a GC pass at a full watermark
-    /// collapses every retained version and disarms the hot-path gate. A version whose stamp was
-    /// never settled would be unprunable and pin the gate for the life of the process.
+    /// The label versions must not leak: once no reader can need them, a GC pass at a full watermark
+    /// reclaims every one. `rmp` #968 moved them from the in-process history onto the node's undo
+    /// chain, so what this now pins is that the chain sweep reaches label deltas exactly as it reaches
+    /// property ones — a delta the sweep skipped would grow `undo.store` without bound.
     #[test]
     fn a_full_watermark_gc_pass_drains_the_label_history() {
         let mut store = run_commit("CREATE (:Person {v: 1})", fresh_store(), 1);
         store = run_commit("MATCH (n:Person) SET n:Admin", store, 2);
         assert!(
-            store.label_history().any(),
+            store.live_label_delta_census().expect("census").0 > 0,
             "precondition: the relabel of an already-committed node must retain a version"
         );
 
         let wm = store.snapshot_ts();
         gc_at(&mut store, 3, wm);
         assert_eq!(
-            store.label_history().tracked_nodes(),
+            store.live_label_delta_census().expect("census").0,
             0,
-            "rmp #767: a GC pass at a full watermark must drain the label history — an unsettled \
-             version is unprunable and leaks for the life of the process, keeping the hot-path gate \
-             armed on every label re-check in the store"
+            "rmp #767/#968: a GC pass at a full watermark must reclaim every label delta — one the \
+             chain sweep skips leaks for the life of the store and grows `undo.store` without bound"
         );
     }
 }

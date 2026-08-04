@@ -69,7 +69,6 @@ use graphus_wal::LogSink;
 
 use crate::heap::{HeapBlock, STRINGS_RECORD_SIZE};
 use crate::idalloc::NULL_ID;
-use crate::label_history::LabelHistory;
 use crate::paging;
 use crate::record::{
     MVCC_HEADER_SIZE, MvccHeader, NODE_RECORD_SIZE, NodeRecord, PROP_RECORD_SIZE, PropRecord,
@@ -618,6 +617,43 @@ pub fn label_bitmap_at<D: BlockDevice, S: LogSink, P: StorePages>(
         Some(e) => Err(e),
         None => Ok(bitmap),
     }
+}
+
+/// The union of every label bitmap node `id` could present to **any** snapshot — the live word
+/// widened by every label an [`UndoAction::AddLabel`] delta on its chain could restore (`rmp` #968).
+///
+/// The candidate-membership superset an index refill must gate on (`rmp` #904). It replaces
+/// the retired `LabelHistory::candidate_superset`, and the widening rule is the same one stated in
+/// direction: `AddLabel` is the delta written when a label is **removed**, so it names exactly a label
+/// some older snapshot still sees. `RemoveLabel` names one an older snapshot does *not* see, and the
+/// live word already carries it, so it widens nothing.
+///
+/// Deliberately snapshot-free and deliberately generous: it walks the **whole** chain, corpses
+/// included, without consulting commit status. A refill has no snapshot to resolve against, and the
+/// only safe error direction is a false positive — every consumer of these trees re-checks membership
+/// against its own snapshot through [`label_bitmap_at`], and a seek's re-check can drop a candidate
+/// but can never resurrect one.
+///
+/// # Errors
+/// As [`undo_chain`].
+pub fn node_label_superset_bitmap<D: BlockDevice, S: LogSink, P: StorePages>(
+    pool: &Pool<D, S>,
+    pages: &P,
+    id: u64,
+    live: u64,
+    head: u64,
+) -> Result<u64> {
+    if head == NULL_ID {
+        return Ok(live);
+    }
+    let mut superset = live;
+    walk_undo_chain(pool, pages, StoreKind::Node, id, head, |_id, delta| {
+        if delta.action == UndoAction::AddLabel {
+            superset |= 1u64 << delta.token;
+        }
+        Ok(true)
+    })?;
+    Ok(superset)
 }
 
 /// Reassembles the byte payload of the overflow heap chain whose head block is `head` (the body of
@@ -1285,13 +1321,6 @@ pub fn incident_rels_typed<D: BlockDevice, S: LogSink, P: StorePages>(
 pub struct StoreReadView<D: BlockDevice, S: LogSink> {
     pool: Arc<Pool<D, S>>,
     meta: MetaSnapshot,
-    /// The store's **live** node label-bitmap version history (`rmp` task #767), shared by [`Arc`].
-    ///
-    /// Live, not captured: the page cache above is itself live (`rmp` #721), so a label change
-    /// committed after this view was dispatched is already present in the word a reader decodes, and
-    /// only a live history carries the older version needed to resolve it away. See
-    /// [`LabelHistory`](crate::label_history::LabelHistory).
-    label_history: Arc<LabelHistory>,
 }
 
 impl<D: BlockDevice, S: LogSink> Clone for StoreReadView<D, S> {
@@ -1299,7 +1328,6 @@ impl<D: BlockDevice, S: LogSink> Clone for StoreReadView<D, S> {
         Self {
             pool: Arc::clone(&self.pool),
             meta: self.meta.clone(),
-            label_history: Arc::clone(&self.label_history),
         }
     }
 }
@@ -1316,25 +1344,11 @@ impl<D: BlockDevice, S: LogSink> StoreReadView<D, S> {
     /// Builds a read view from an [`Arc`]-shared page cache and a captured [`MetaSnapshot`]. Used by
     /// [`RecordStore::read_view`](crate::store::RecordStore::read_view).
     #[must_use]
-    pub fn new(
-        pool: Arc<Pool<D, S>>,
-        meta: MetaSnapshot,
-        label_history: Arc<LabelHistory>,
-    ) -> Self {
-        Self {
-            pool,
-            meta,
-            label_history,
-        }
+    pub fn new(pool: Arc<Pool<D, S>>, meta: MetaSnapshot) -> Self {
+        Self { pool, meta }
     }
 
     /// The shared node label-bitmap version history (`rmp` task #767) this view resolves labels
-    /// through.
-    #[must_use]
-    pub fn label_history(&self) -> &Arc<LabelHistory> {
-        &self.label_history
-    }
-
     /// The location metadata snapshot this view reads through.
     #[must_use]
     pub fn meta(&self) -> &MetaSnapshot {
