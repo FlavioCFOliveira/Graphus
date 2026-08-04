@@ -301,10 +301,10 @@ fn csr_eliminates_nonmatching_chain_reads() {
             &self,
             id: u64,
             live: u64,
+            head: u64,
             snapshot: graphus_txn::Snapshot,
-            registry: &graphus_txn::CommitRegistry,
-        ) -> u64 {
-            self.inner.label_bitmap_at(id, live, snapshot, registry)
+        ) -> Result<u64, graphus_core::error::GraphusError> {
+            self.inner.label_bitmap_at(id, live, head, snapshot)
         }
         fn superset_scan_node_properties(
             &self,

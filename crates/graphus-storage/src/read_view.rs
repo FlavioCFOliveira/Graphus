@@ -64,7 +64,7 @@ use graphus_core::error::{GraphusError, Result};
 use graphus_core::{PageId, Value};
 use graphus_io::BlockDevice;
 use graphus_pagemap::PageMap;
-use graphus_txn::{CommitRegistry, Snapshot};
+use graphus_txn::Snapshot;
 use graphus_wal::LogSink;
 
 use crate::heap::{HeapBlock, STRINGS_RECORD_SIZE};
@@ -79,7 +79,7 @@ use crate::scan_polarity::{
     DecidedProperties, DecisionFold, DeltaVerdict, PropertyDelta, SupersetProperties, delta_verdict,
 };
 use crate::store::{STORE_COUNT, StoreKind};
-use crate::undo::{self, CommitSlot, UndoDelta};
+use crate::undo::{self, CommitSlot, UndoAction, UndoDelta};
 use crate::wal_rule::SharedWal;
 use crate::{labels, valenc};
 
@@ -550,6 +550,73 @@ fn decide_properties<D: BlockDevice, S: LogSink, P: StorePages>(
     match failure {
         Some(e) => Err(e),
         None => Ok(DecidedProperties::from_fold(fold, snapshot)),
+    }
+}
+
+/// The label bitmap node `id` presents to `snapshot`, reconstructed from the entity's undo chain
+/// (`rmp` #968).
+///
+/// `live` is the word currently in the record and `head` its `undo_ptr`; both are taken from the
+/// caller because every caller on the hot path has just decoded the record for its own MVCC
+/// visibility check, so this costs **zero** extra record reads for the overwhelmingly common node
+/// whose labels no open transaction has touched: `head == NULL_ID` returns `live` without reading
+/// anything. That short-circuit is the whole reason the seam takes `head` instead of re-reading the
+/// node, and it is what keeps a pure label scan at its pre-versioning cost.
+///
+/// The walk is the label twin of [`decide_properties`] and shares its two rules exactly, because it
+/// walks the **same** chain: [`delta_verdict`] decides per delta, and the walk stops at the first
+/// delta the snapshot already reflects. A delta records the *inverse* of the event
+/// (`RemoveLabel` undoes an add, `AddLabel` undoes a removal), so applying one is a single bit flip
+/// — idempotent and order-independent, which is why a per-bit delta is sufficient where a per-word
+/// one would clobber bits another transaction owns. Deltas of any other action on the chain
+/// (`SetProperty`, `RecreateObject`, …) are stepped over, exactly as
+/// [`DecisionFold::apply`](crate::scan_polarity::DecisionFold) steps over these.
+///
+/// # Errors
+/// As [`undo_chain`], plus a storage error if a live delta's commit slot cannot be resolved. A read
+/// fault is **never** answered with the live word: that would be a silent dirty read of whatever an
+/// uncommitted writer happened to leave in the record (the fail-closed-on-read-fault contract,
+/// `rmp` #733).
+pub fn label_bitmap_at<D: BlockDevice, S: LogSink, P: StorePages>(
+    pool: &Pool<D, S>,
+    pages: &P,
+    id: u64,
+    live: u64,
+    head: u64,
+    snapshot: Snapshot,
+) -> Result<u64> {
+    if head == NULL_ID {
+        return Ok(live);
+    }
+    let mut bitmap = live;
+    let mut failure = None;
+    walk_undo_chain(pool, pages, StoreKind::Node, id, head, |delta_id, delta| {
+        let slot = if delta.in_use() {
+            read_commit_slot(pool, pages, delta.commit_info)?
+        } else {
+            None
+        };
+        match delta_verdict(&delta, slot, snapshot, delta_id) {
+            Ok(DeltaVerdict::Skip) => Ok(true),
+            Ok(DeltaVerdict::Apply) => {
+                match delta.action {
+                    UndoAction::AddLabel => bitmap |= 1u64 << delta.token,
+                    UndoAction::RemoveLabel => bitmap &= !(1u64 << delta.token),
+                    // Not a label event: this chain carries every kind of version for the entity.
+                    _ => {}
+                }
+                Ok(true)
+            }
+            Ok(DeltaVerdict::Stop) => Ok(false),
+            Err(e) => {
+                failure = Some(e);
+                Ok(false)
+            }
+        }
+    })?;
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(bitmap),
     }
 }
 
@@ -1342,19 +1409,21 @@ impl<D: BlockDevice, S: LogSink> StoreReadView<D, S> {
     /// The label bitmap node `id` presents to `snapshot` (`rmp` task #767), given the `live` word
     /// already decoded from its record.
     ///
-    /// Takes `live` rather than re-reading the record because every caller on the hot path has just
-    /// decoded it for the MVCC visibility check. Resolves through the store's live
-    /// [`LabelHistory`](crate::label_history::LabelHistory), so an uncommitted or
-    /// after-the-snapshot label change is undone instead of leaking into the read.
-    #[must_use]
+    /// Takes `live` and the record's `undo_ptr` as `head` rather than re-reading the record, because
+    /// every caller on the hot path has just decoded both for the MVCC visibility check. Resolves
+    /// through the node's own undo chain (`rmp` #968), so an uncommitted or after-the-snapshot label
+    /// change is undone instead of leaking into the read — and an untouched node costs no read at all.
+    ///
+    /// # Errors
+    /// Returns a storage error if the node's undo chain cannot be walked (`rmp` #968).
     pub fn label_bitmap_at(
         &self,
         id: u64,
         live: u64,
+        head: u64,
         snapshot: Snapshot,
-        registry: &CommitRegistry,
-    ) -> u64 {
-        self.label_history.resolve(id, live, snapshot, registry)
+    ) -> Result<u64> {
+        label_bitmap_at(&self.pool, &self.meta, id, live, head, snapshot)
     }
 
     /// Whether node `id` carries the label with `label_token_id`. See [`node_has_label`].

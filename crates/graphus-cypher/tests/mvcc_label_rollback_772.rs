@@ -102,38 +102,54 @@ fn si_label_rollback_preserves_concurrent_committed_property() {
     let (_r, err) = run_stmt(&coord, w1, &compile("MATCH (n:Person) REMOVE n:Person"));
     assert!(err.is_none(), "W1 REMOVE errored: {err:?}");
 
-    // W2: a DIFFERENT transaction sets a property on the same node and COMMITS. Under
-    // `IsolationLevel::Snapshot` the write-lock layer *detects* the write-write conflict with W1 and
-    // flags it on the statement (`has_error`), but SI does NOT enforce it: the mutation still lands
-    // and the commit succeeds (the documented weaker opt-in — this exact reachability is what the
-    // `rmp` #772 repro relies on; whether SI *should* enforce first-updater-wins is a separate
-    // isolation-semantics question reported alongside this fix). The soft flag is deliberately not
-    // asserted on here; the checkpoint read below proves the write committed and is visible.
+    // W2: a DIFFERENT transaction tries to set a property on the same node.
+    //
+    // `rmp` #968 ANSWERED THE QUESTION THIS COMMENT USED TO LEAVE OPEN. It said the write-lock layer
+    // only *flagged* the write-write conflict under `IsolationLevel::Snapshot` while the mutation
+    // still landed, and that whether SI should enforce first-updater-wins was "a separate
+    // isolation-semantics question". It is no longer separate and no longer optional: a label change
+    // now links a delta onto the node's undo chain, so W1 holds the node, and the STORAGE layer
+    // refuses W2 at every isolation level (`D-write-conflict-detection`). The `rmp` #772 anomaly is
+    // consequently unreachable rather than survived — the stronger of the two outcomes.
     let w2 = coord.begin_at(IsolationLevel::Snapshot, 0);
-    let _ = run_stmt(
+    let (_r, err) = run_stmt(
         &coord,
         w2,
         &compile("MATCH (n) SET n.email = 'committed@x.io'"),
     );
-    coord
-        .commit(w2)
-        .expect("W2 commits under SI despite the soft write-lock flag");
+    let err = err.expect("W2's write must be refused while W1 holds the node's undo chain");
+    assert!(
+        err.to_string().contains("conflict"),
+        "the refusal must name the write-write conflict, so a driver retries rather than failing \
+         the transaction outright: {err}",
+    );
+    coord.rollback(w2).expect("W2 abandons the refused attempt");
 
-    // Non-vacuity checkpoint: W2's committed effect is visible BEFORE W1 rolls back.
+    // Non-vacuity: the refusal really did stop the write — the property still holds the seeded value.
     assert_eq!(
         read_scalar(&mut coord, "MATCH (n) RETURN n.email AS e", "e"),
-        Value::String("committed@x.io".to_owned()),
-        "precondition: W2's committed property must be visible before the rollback"
+        Value::String("original@x.io".to_owned()),
+        "the refused write must not have landed"
     );
 
-    // W1 rolls back. Its undo must touch ONLY the labels word, never W2's committed `first_prop`.
+    // W1 rolls back. Its undo must touch ONLY the labels word.
     coord.rollback(w1).expect("W1 rollback");
+
+    // And with no holder, the very same write now succeeds and commits.
+    let w3 = coord.begin_at(IsolationLevel::Snapshot, 0);
+    let (_r, err) = run_stmt(
+        &coord,
+        w3,
+        &compile("MATCH (n) SET n.email = 'committed@x.io'"),
+    );
+    assert!(err.is_none(), "W3 SET errored: {err:?}");
+    coord.commit(w3).expect("W3 commits");
 
     // The committed property survives (was `Null` pre-fix — the orphaned-version anomaly).
     assert_eq!(
         read_scalar(&mut coord, "MATCH (n) RETURN n.email AS e", "e"),
         Value::String("committed@x.io".to_owned()),
-        "W1's rollback destroyed W2's committed property (rmp #772)"
+        "the committed property must survive W1's label rollback (rmp #772)"
     );
     // W1's OWN change is cleanly undone: the label it removed is back.
     assert_eq!(

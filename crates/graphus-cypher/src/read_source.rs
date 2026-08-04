@@ -170,21 +170,26 @@ pub trait StoreReadSource {
     /// The label bitmap node `id` presents to `snapshot`, given the `live` word already decoded from
     /// its record (`rmp` task #767).
     ///
-    /// The label word is mutated IN PLACE with no version chain, so reading it directly returns
-    /// whatever it holds at that instant — including an uncommitted writer's change (a dirty read) or
-    /// one committed after the reader's snapshot began (a non-repeatable read). This resolves it
-    /// through the store's live label version history instead, the label analogue of the
-    /// newest-visible-wins fold the property chain already gets.
+    /// The label word is mutated IN PLACE, so reading it directly returns whatever it holds at that
+    /// instant — including an uncommitted writer's change (a dirty read) or one committed after the
+    /// reader's snapshot began (a non-repeatable read). This resolves it through the node's own undo
+    /// chain (`rmp` #968), the same early-stopping walk the property chain already gets, rather than
+    /// through the in-process history `rmp` #767 used.
     ///
-    /// Takes `live` rather than re-reading the record: every hot-path caller has just decoded it for
-    /// the MVCC visibility check one line earlier.
+    /// Takes `live` and the record's `undo_ptr` as `head` rather than re-reading the record: every
+    /// hot-path caller has just decoded both for the MVCC visibility check one line earlier, and a
+    /// node no open transaction has relabelled (`head == 0`) is answered with no read at all.
+    ///
+    /// # Errors
+    /// Returns a storage error if the chain cannot be walked. It is never answered with `live`, which
+    /// would turn a read fault into a silent dirty read.
     fn label_bitmap_at(
         &self,
         id: u64,
         live: u64,
+        head: u64,
         snapshot: Snapshot,
-        registry: &CommitRegistry,
-    ) -> u64;
+    ) -> Result<u64, GraphusError>;
 
     /// The **superset**-polarity read of `node_id`'s property chain, head to tail (newest first).
     ///
@@ -292,10 +297,10 @@ impl<D: BlockDevice, S: LogSink> StoreReadSource for LiveSource<'_, D, S> {
         &self,
         id: u64,
         live: u64,
+        head: u64,
         snapshot: Snapshot,
-        registry: &CommitRegistry,
-    ) -> u64 {
-        self.0.label_bitmap_at(id, live, snapshot, registry)
+    ) -> Result<u64, GraphusError> {
+        self.0.label_bitmap_at(id, live, head, snapshot)
     }
     fn superset_scan_node_properties(
         &self,
@@ -381,10 +386,10 @@ impl<D: BlockDevice, S: LogSink> StoreReadSource for ReadViewSource<'_, D, S> {
         &self,
         id: u64,
         live: u64,
+        head: u64,
         snapshot: Snapshot,
-        registry: &CommitRegistry,
-    ) -> u64 {
-        self.view.label_bitmap_at(id, live, snapshot, registry)
+    ) -> Result<u64, GraphusError> {
+        self.view.label_bitmap_at(id, live, head, snapshot)
     }
     fn superset_scan_node_properties(
         &self,
@@ -1243,11 +1248,20 @@ impl VisCtx<'_> {
     /// word already decoded from `id`'s record.
     ///
     /// The label counterpart of [`visible`](Self::visible): where `visible` filters a *record*
-    /// version, this resolves the *label word*, which is mutated in place and so has its versions in
-    /// the store's side history rather than in the record.
+    /// version, this resolves the *label word*, which is mutated in place and so has its versions on
+    /// the node's undo chain rather than in the record (`rmp` #968).
+    ///
+    /// # Errors
+    /// Returns a storage error if the node's undo chain cannot be walked (`rmp` #968).
     #[inline]
-    pub fn labels_at<S: StoreReadSource>(&self, src: &S, id: u64, live: u64) -> u64 {
-        src.label_bitmap_at(id, live, self.snapshot, self.registry)
+    pub fn labels_at<S: StoreReadSource>(
+        &self,
+        src: &S,
+        id: u64,
+        live: u64,
+        head: u64,
+    ) -> Result<u64, GraphusError> {
+        src.label_bitmap_at(id, live, head, self.snapshot)
     }
 
     /// Whether the version carrying `mvcc` was **deleted by this very transaction** — its creator is
@@ -1378,7 +1392,16 @@ pub fn filter_label_candidates<S: StoreReadSource, K: ReadSink>(
         // Resolve the label word AS OF THIS SNAPSHOT (`rmp` #767) rather than reading whatever it
         // holds now. `rec` is already in hand, so this also drops the second `read_node` the old
         // `node_has_label(id, ..)` call performed per candidate.
-        let bitmap = ctx.labels_at(src, id, rec.labels);
+        let bitmap = match ctx.labels_at(src, id, rec.labels, rec.mvcc.undo_ptr) {
+            Ok(b) => b,
+            Err(e) => {
+                // A chain read fault is captured and the scan yields nothing, never a
+                // wrong (missing/extra) row (`rmp` #733 fail-closed-on-read-fault).
+                sink.note_candidates(examined, hidden, filtered);
+                sink.capture(e);
+                return Vec::new();
+            }
+        };
         match labels::has_label(bitmap, token_id) {
             Ok(true) => out.push(NodeId(id)),
             Ok(false) => filtered += 1,
@@ -1430,7 +1453,16 @@ pub fn filter_any_label_candidates<S: StoreReadSource, K: ReadSink>(
             continue;
         }
         // One snapshot-correct resolution (`rmp` #767) for the whole token loop below.
-        let bitmap = ctx.labels_at(src, id, rec.labels);
+        let bitmap = match ctx.labels_at(src, id, rec.labels, rec.mvcc.undo_ptr) {
+            Ok(b) => b,
+            Err(e) => {
+                // A chain read fault is captured and the scan yields nothing, never a
+                // wrong (missing/extra) row (`rmp` #733 fail-closed-on-read-fault).
+                sink.note_candidates(examined, hidden, filtered);
+                sink.capture(e);
+                return Vec::new();
+            }
+        };
         let mut carries = false;
         for &token_id in token_ids {
             match labels::has_label(bitmap, token_id) {
@@ -1514,7 +1546,17 @@ pub fn scan_label_property_morsel<S: StoreReadSource, K: ReadSink>(
             continue;
         }
         // Snapshot-correct label membership (`rmp` #767), resolved from the record read above.
-        match labels::has_label(ctx.labels_at(src, id, rec.labels), token_id) {
+        let bitmap = match ctx.labels_at(src, id, rec.labels, rec.mvcc.undo_ptr) {
+            Ok(b) => b,
+            Err(e) => {
+                // A chain read fault is captured and the scan yields nothing, never a
+                // wrong (missing/extra) row (`rmp` #733 fail-closed-on-read-fault).
+                sink.note_candidates(examined, hidden, filtered);
+                sink.capture(e);
+                return (label_matches, values);
+            }
+        };
+        match labels::has_label(bitmap, token_id) {
             Ok(true) => {}
             Ok(false) => {
                 filtered += 1;
@@ -1688,7 +1730,17 @@ pub fn scan_filter_eq<S: StoreReadSource, K: ReadSink>(
             continue;
         }
         // Carries the label AS OF THIS SNAPSHOT (`rmp` #767)?
-        match labels::has_label(ctx.labels_at(src, id, rec.labels), label_token) {
+        let bitmap = match ctx.labels_at(src, id, rec.labels, rec.mvcc.undo_ptr) {
+            Ok(b) => b,
+            Err(e) => {
+                // A chain read fault is captured and the scan yields nothing, never a
+                // wrong (missing/extra) row (`rmp` #733 fail-closed-on-read-fault).
+                sink.note_candidates(examined as u64, hidden, filtered);
+                sink.capture(e);
+                return ScanFilter::default();
+            }
+        };
+        match labels::has_label(bitmap, label_token) {
             Ok(true) => {}
             Ok(false) => {
                 filtered += 1;
@@ -2544,14 +2596,21 @@ pub fn node_labels<S: StoreReadSource, K: ReadSink>(
         return None;
     }
     // Resolve the label word AS OF THIS SNAPSHOT (`rmp` #767), not whatever it holds now.
-    let live = match src.node(node.0) {
-        Ok(rec) => rec.labels,
+    let (live, head) = match src.node(node.0) {
+        Ok(rec) => (rec.labels, rec.mvcc.undo_ptr),
         Err(e) => {
             sink.capture(e);
             return Some(Vec::new());
         }
     };
-    let ids = match labels::token_ids(ctx.labels_at(src, node.0, live)) {
+    let resolved = match ctx.labels_at(src, node.0, live, head) {
+        Ok(b) => b,
+        Err(e) => {
+            sink.capture(e);
+            return Some(Vec::new());
+        }
+    };
+    let ids = match labels::token_ids(resolved) {
         Ok(ids) => ids,
         Err(e) => {
             sink.capture(GraphusError::from(e));

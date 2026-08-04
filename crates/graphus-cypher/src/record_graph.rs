@@ -999,12 +999,23 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     /// The label bitmap node `id` presents to this query's snapshot (`rmp` task #767), given the
     /// `live` word already decoded from its record.
     ///
-    /// The label counterpart of [`visible`](Self::visible). The label word is mutated IN PLACE with no
-    /// version chain, so its older versions live in the store's side history rather than in the
-    /// record; reading the word directly would surface an uncommitted writer's change (a dirty read)
-    /// or one committed after this snapshot began (a non-repeatable read).
-    fn label_bitmap_at(&self, store: &RecordStore<D, S>, id: u64, live: u64) -> u64 {
-        store.label_bitmap_at(id, live, self.snapshot, &self.registry)
+    /// The label counterpart of [`visible`](Self::visible). The label word is mutated IN PLACE, so its
+    /// older versions live on the node's undo chain rather than in the record (`rmp` #968); reading
+    /// the word directly would surface an uncommitted writer's change (a dirty read) or one committed
+    /// after this snapshot began (a non-repeatable read). `head` is the record's `undo_ptr`, which the
+    /// caller has already decoded, so a node no open transaction has relabelled costs no read.
+    ///
+    /// # Errors
+    /// Returns a storage error if the chain cannot be walked; never the live word, which would turn a
+    /// read fault into a dirty read.
+    fn label_bitmap_at(
+        &self,
+        store: &RecordStore<D, S>,
+        id: u64,
+        live: u64,
+        head: u64,
+    ) -> Result<u64, GraphusError> {
+        store.label_bitmap_at(id, live, head, self.snapshot)
     }
 
     /// This statement's visibility context (snapshot + registry + txn) for the shared lifted read body
@@ -1470,7 +1481,16 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             // Resolve the label word AS OF THIS SNAPSHOT (`rmp` #767) instead of reading whatever it
             // holds now — the inline twin of `read_source::filter_label_candidates`. `rec` is already
             // in hand, so this also drops the second `read_node` `node_has_label` performed.
-            let bitmap = self.label_bitmap_at(&store, id, rec.labels);
+            let bitmap = match self.label_bitmap_at(&store, id, rec.labels, rec.mvcc.undo_ptr) {
+                Ok(b) => b,
+                Err(e) => {
+                    // A chain read fault is captured, never answered with the live word.
+                    drop(store);
+                    self.note_candidates(examined, hidden, filtered);
+                    self.capture(e);
+                    return Vec::new();
+                }
+            };
             match graphus_storage::labels::has_label(bitmap, token_id) {
                 Ok(true) => out.push(NodeId(id)),
                 Ok(false) => filtered += 1,
@@ -1592,7 +1612,15 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                 continue;
             }
             // One snapshot-correct resolution (`rmp` #767) for the whole token loop below.
-            let bitmap = self.label_bitmap_at(&store, id, rec.labels);
+            let bitmap = match self.label_bitmap_at(&store, id, rec.labels, rec.mvcc.undo_ptr) {
+                Ok(b) => b,
+                Err(e) => {
+                    drop(store);
+                    self.note_candidates(examined, hidden, filtered);
+                    self.capture(e);
+                    return Vec::new();
+                }
+            };
             let mut carries = false;
             for &token_id in token_ids {
                 match graphus_storage::labels::has_label(bitmap, token_id) {
@@ -3754,7 +3782,19 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             }
             // The node must carry the label AS OF THIS SNAPSHOT (`rmp` #767), the row label scan's
             // membership test — resolved from the record already decoded above, not re-read live.
-            let bitmap = self.label_bitmap_at(&self.store.borrow(), id, node_rec.labels);
+            let bitmap = match self.label_bitmap_at(
+                &self.store.borrow(),
+                id,
+                node_rec.labels,
+                node_rec.mvcc.undo_ptr,
+            ) {
+                Ok(b) => b,
+                Err(e) => {
+                    self.note_candidates(examined, hidden, filtered);
+                    self.capture(e);
+                    return Some(ColumnarPass::default());
+                }
+            };
             match graphus_storage::labels::has_label(bitmap, label_token) {
                 Ok(true) => {}
                 Ok(false) => {

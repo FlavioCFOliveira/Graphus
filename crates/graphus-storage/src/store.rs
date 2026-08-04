@@ -2588,8 +2588,23 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                     .is_none_or(|a| a.commit_slot.is_none()),
             "a transaction that owns a commit slot has written a record, so it must be WAL-active"
         );
-        self.publish_commit_slot(txn, commit_ts)?;
         self.checkpoint_meta(txn, false)?;
+        // PUBLISH THE COMMIT SLOT LAST among the fallible steps (`rmp` #968), and immediately before
+        // the WAL `COMMIT` record — which it must still precede, so recovery replays it as part of the
+        // committed transaction.
+        //
+        // Order matters because the slot is a SECOND visibility oracle. A record header's in-flight
+        // stamp is resolved through the commit registry, which is published only once every fallible
+        // step has succeeded; a delta's status is resolved through this slot. Published before
+        // `checkpoint_meta`, a failure in `checkpoint_meta` left the two disagreeing: the registry
+        // still said "in flight" while the slot already said `Committed(commit_ts)`, so any reader
+        // resolving through the chain saw an uncommitted transaction's change as committed — while
+        // the comment above promised exactly the opposite ("a failure here leaves `txn` a
+        // fully-formed open writer whose slot still carries its in-flight stamp"). The window existed
+        // from `rmp` #967, when deltas first carried a value; #968 made it observable, because a
+        // label change — unlike a property overwrite by the same failing writer — is read by
+        // `label_bitmap_at` on a node every snapshot can see.
+        self.publish_commit_slot(txn, commit_ts)?;
         // PREPARE: append the `COMMIT` record with NO `fdatasync` (the group-commit deferral, `rmp`
         // #528). The caller hardens the whole batch with a single `harden_wal`.
         let commit_lsn = self.wal.with(|w| w.commit_at_no_sync(txn, commit_ts))?;
@@ -3538,6 +3553,77 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///
     /// # Errors
     /// Returns a storage error if the delta cannot be allocated, written, or linked.
+    /// Links one delta per label bit `txn` is changing on node `id`, carrying the membership the node
+    /// held **before** the change (`rmp` #968, `05 §12.3`).
+    ///
+    /// A delta records the **inverse** of the event, exactly as `DeleteObject` records a creation:
+    /// adding a label writes [`UndoAction::RemoveLabel`], removing one writes
+    /// [`UndoAction::AddLabel`]. This is Memgraph's shape — `ADD_LABEL` and `REMOVE_LABEL` are delta
+    /// actions like any other (`/data/refsrc/memgraph/src/storage/v2/delta.hpp`) — and it is what
+    /// retires `LabelHistory`: the previous membership stops living in an in-process map that a
+    /// restart loses and becomes a durable version on the same chain as everything else.
+    ///
+    /// One delta **per changed bit**, not one per word, because a delta's payload is a single `token`
+    /// (`05 §12.2` froze the record at 56 bytes with no room for a bitmap) and because per-bit is the
+    /// granularity a reader needs anyway: replaying a bit flip is idempotent and order-independent
+    /// within one transaction, whereas replaying a whole word would clobber bits a *different*
+    /// transaction legitimately owns. The label word is a 63-bit token-id bitmap ([`crate::labels`]),
+    /// so a changed bit *is* the label token id and needs no lookup.
+    ///
+    /// # The creator gate is kept, and why that is still sound
+    ///
+    /// A node whose `xmin` is `txn`'s own in-flight stamp is invisible to every other snapshot, so no
+    /// reader can ask what its labels were before, and `txn` reads its own latest write. Its rollback
+    /// is covered by the node's own creation undo, which removes the node outright — the labels of a
+    /// node that never existed need no version. Skipping it is not an optimisation detail: `CREATE
+    /// (:L)` goes through this path, so without the gate a bulk load of N labelled nodes would link N
+    /// deltas that nothing can ever read (measured at ~2.9x on a pure label scan when the equivalent
+    /// gate was absent from `LabelHistory` — see [`track_label_history`](Self::track_label_history)).
+    ///
+    /// # Errors
+    /// Returns a storage error if a delta cannot be allocated, written, or linked, and
+    /// [`GraphusError::Transaction`] — retriable — if another open transaction holds the node's chain
+    /// ([`link_delta`](Self::link_delta) performs that check for every delta writer).
+    fn link_label_deltas(
+        &mut self,
+        id: u64,
+        txn: TxnId,
+        old_labels: u64,
+        new_labels: u64,
+        creator: u64,
+    ) -> Result<()> {
+        if txn == SYSTEM_TXN {
+            debug_assert!(
+                false,
+                "SYSTEM_TXN changed node {id}'s labels; the undo chain cannot version it"
+            );
+            return Ok(());
+        }
+        if VersionStamp::from_raw(creator) == VersionStamp::InFlight(txn) {
+            return Ok(()); // the creator gate — see the doc above
+        }
+        let mut changed = old_labels ^ new_labels;
+        while changed != 0 {
+            let bit = changed.trailing_zeros();
+            changed &= changed - 1;
+            debug_assert!(
+                bit <= crate::labels::MAX_INLINE_LABEL_ID,
+                "bit {bit} is the overflow flag, not a label token; an overflowed label set (`rmp` \
+                 #39) cannot be versioned one token at a time and must be rejected before here"
+            );
+            // The INVERSE of the event: what the reader must apply to undo it.
+            let action = if new_labels & (1u64 << bit) != 0 {
+                UndoAction::RemoveLabel // the label was added, so undoing removes it
+            } else {
+                UndoAction::AddLabel // the label was removed, so undoing restores it
+            };
+            let mut delta = UndoDelta::new(action, 0, 0, 0);
+            delta.token = bit;
+            self.link_delta(StoreKind::Node, id, delta, txn)?;
+        }
+        Ok(())
+    }
+
     fn link_set_property(
         &mut self,
         kind: StoreKind,
@@ -4074,6 +4160,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // word is written under the latch, a reader that decodes this word under the page READ latch
         // is guaranteed to also observe the filter bit, so it can never skip the authoritative
         // history and trust an uncommitted word. Reorder these two and you open a dirty read.
+        //
+        // `rmp` #968: the durable version is the undo delta, and it is linked FIRST for the same
+        // happens-before reason the filter arming had to be — a reader that observes the new word
+        // under the page read latch must already be able to observe the delta that undoes it. The
+        // delta link also carries the write-conflict check (`link_delta`), so a label change on a node
+        // another open transaction holds is refused here rather than interleaved onto its chain.
+        self.link_label_deltas(id, txn, old_labels, new_labels, creator)?;
         self.track_label_history(id, txn, old_labels, new_labels, creator);
         let (rel_page, off) = paging::record_location(id, StoreKind::Node.record_size());
         let dev = self.device_page(StoreKind::Node, rel_page)?;
@@ -6259,15 +6352,19 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// [`node_label_superset`](Self::node_label_superset); the snapshot-correct narrowing then happens
     /// at seek time in `graphus_cypher::read_source::filter_label_candidates`, which routes back
     /// through this method.
-    #[must_use]
+    ///
+    /// # Errors
+    /// Returns a storage error if the node's undo chain cannot be walked (`rmp` #968). A read fault is
+    /// never answered with the live word, which would be a dirty read of an uncommitted writer's
+    /// in-place change.
     pub fn label_bitmap_at(
         &self,
         id: u64,
         live: u64,
+        head: u64,
         snapshot: Snapshot,
-        registry: &CommitRegistry,
-    ) -> u64 {
-        self.label_history.resolve(id, live, snapshot, registry)
+    ) -> Result<u64> {
+        read_view::label_bitmap_at(&self.pool, &self.stores, id, live, head, snapshot)
     }
 
     // --------------------------- relationship CRUD --------------------------

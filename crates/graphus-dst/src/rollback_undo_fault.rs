@@ -251,11 +251,14 @@ fn resolve_labels<D: graphus_io::BlockDevice, S: LogSink>(
     node: u64,
 ) -> u64 {
     let live = live_bitmap(store, node);
+    let head = store.node(node).expect("read node").mvcc.undo_ptr;
     let snapshot = Snapshot {
         owner: TxnId(u64::MAX),
         ts: store.snapshot_ts(),
     };
-    store.label_bitmap_at(node, live, snapshot, store.commit_registry())
+    store
+        .label_bitmap_at(node, live, head, snapshot)
+        .expect("resolve labels from the node's undo chain")
 }
 
 /// Seeds a committed `(:Person)` node and returns `(node id, its committed label bitmap, the bitmap a

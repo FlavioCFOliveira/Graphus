@@ -110,16 +110,38 @@ fn drive_scenario() -> (Store, u64, u64) {
         .remove_label(w1, n, LABEL_BIT)
         .expect("W1 remove_label");
 
-    // W2: a DIFFERENT transaction overwrites the property and COMMITS on top of W1's open record.
+    // W2: a DIFFERENT transaction tries to overwrite the property while W1 still holds the node.
+    //
+    // `rmp` #968 CHANGED THIS STEP, and the change is the finding. A label change now links a delta
+    // onto the node's undo chain, so W1 *holds* the node, and `link_delta`'s write-conflict check
+    // refuses W2 outright. The interleaving this scenario was written to reproduce (`rmp` #772 — a
+    // label rollback clobbering a concurrently-committed `first_prop`) is therefore no longer
+    // something the undo has to survive: it is something the write path forbids, which is the
+    // stronger guarantee `D-write-conflict-detection` promised. Asserting the refusal here is what
+    // keeps the scenario non-vacuous; without it the sequence below would merely be two transactions
+    // that never overlapped.
     let w2 = next_txn(&mut next);
     store.begin(w2);
-    let p1 = store
+    let refused = store
         .set_node_property_value(w2, n, PROP_KEY, &Value::String("committed@x.io".to_owned()))
-        .expect("W2 set property");
-    store.commit(w2).expect("W2 commits");
+        .expect_err("W2 must be refused while W1 holds the node's undo chain");
+    assert!(
+        format!("{refused}").contains("write-write conflict"),
+        "the refusal must name the write-write conflict so it is retriable rather than fatal: \
+         {refused}",
+    );
+    store.rollback(w2).expect("W2 abandons the refused attempt");
 
-    // W1 rolls back. Its undo must touch ONLY the labels word, never W2's committed `first_prop`.
+    // W1 rolls back. Its undo must touch ONLY the labels word — the property it must not disturb is
+    // written next, by a W2 that is now free to proceed.
     store.rollback(w1).expect("W1 rollback");
+
+    let w3 = next_txn(&mut next);
+    store.begin(w3);
+    let p1 = store
+        .set_node_property_value(w3, n, PROP_KEY, &Value::String("committed@x.io".to_owned()))
+        .expect("with no holder the same write is allowed");
+    store.commit(w3).expect("W3 commits");
 
     (store, n, p1)
 }

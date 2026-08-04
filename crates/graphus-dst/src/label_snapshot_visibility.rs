@@ -93,12 +93,16 @@ impl LabelSnapshotReport {
 
 /// Resolves node `n`'s label bitmap as seen by `(owner, ts)`.
 fn sees_label(store: &Store, n: u64, owner: TxnId, ts: u64) -> bool {
-    let live = store.node(n).expect("read node n").labels;
+    let rec = store.node(n).expect("read node n");
     let snapshot = Snapshot {
         owner,
         ts: Timestamp(ts),
     };
-    has_bit(store.label_bitmap_at(n, live, snapshot, store.commit_registry()))
+    has_bit(
+        store
+            .label_bitmap_at(n, rec.labels, rec.mvcc.undo_ptr, snapshot)
+            .expect("resolve n's labels from its undo chain"),
+    )
 }
 
 /// Drives the interleaving and returns `(store, node_id, report)`.
@@ -256,18 +260,43 @@ pub fn run_reclaimed_id_reuse() -> (bool, u64, u64) {
         .remove_label(t_relabel, n, person)
         .expect("in-flight relabel");
 
-    // A DIFFERENT transaction deletes `n` and commits (the storage layer imposes no guard here).
+    // A DIFFERENT transaction tries to delete `n`. When this scenario was written the storage layer
+    // imposed no guard here, and that was the whole exposure: the delete could commit *under* an
+    // in-flight relabeller, the slot could then be reclaimed and reused, and the version the
+    // relabeller had retained — keyed on the node **id** in the in-process `LabelHistory` — would be
+    // inherited by whatever new node popped that id.
+    //
+    // `rmp` #968 closes both halves at once. The relabeller now holds the node's undo chain, so the
+    // delete is REFUSED; and the retained version no longer lives in an id-keyed side map but on the
+    // record's own chain, which is reclaimed with the record, so a reused slot starts at
+    // `undo_ptr == 0` and has nothing to inherit. The scenario keeps testing id reuse — it is still
+    // the thing that must not leak — and additionally pins the refusal that now makes the dangerous
+    // ordering unreachable.
     let t_del = next_txn(&mut next);
     store.begin(t_del);
-    store.delete_node(t_del, n).expect("delete node");
-    store.commit(t_del).expect("delete commits");
+    let refused = store
+        .delete_node(t_del, n)
+        .expect_err("the delete must be refused while an in-flight relabeller holds the node");
+    assert!(
+        format!("{refused}").contains("write-write conflict"),
+        "the refusal must be the retriable serialization failure, not a fatal error: {refused}",
+    );
+    store.rollback(t_del).expect("abandon the refused delete");
+
+    // The relabeller commits, releasing the node...
+    store.commit(t_relabel).expect("relabeller commits");
+
+    // ...and only then can the delete succeed. The id becomes reclaimable exactly as before.
+    let t_del2 = next_txn(&mut next);
+    store.begin(t_del2);
+    store
+        .delete_node(t_del2, n)
+        .expect("with no holder the same delete is allowed");
+    store.commit(t_del2).expect("delete commits");
 
     // A GC pass at the full watermark reclaims `n`'s slot.
     let wm = store.snapshot_ts();
     gc_at(&mut store, next_txn(&mut next), wm);
-
-    // The relabeller finally commits.
-    store.commit(t_relabel).expect("relabeller commits");
 
     // A brand-new, unrelated node pops the freed id.
     let t_new = next_txn(&mut next);
@@ -276,12 +305,14 @@ pub fn run_reclaimed_id_reuse() -> (bool, u64, u64) {
     store.add_label(t_new, m, company).expect("new label");
     store.commit(t_new).expect("new node commits");
 
-    let live = store.node(m).expect("read new node").labels;
+    let rec = store.node(m).expect("read new node");
     let snapshot = Snapshot {
         owner: TxnId(9_999),
         ts: store.snapshot_ts(),
     };
-    let resolved = store.label_bitmap_at(m, live, snapshot, store.commit_registry());
+    let resolved = store
+        .label_bitmap_at(m, rec.labels, rec.mvcc.undo_ptr, snapshot)
+        .expect("resolve m's labels from its undo chain");
     (m == n, resolved, 1u64 << company)
 }
 
