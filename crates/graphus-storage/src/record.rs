@@ -375,6 +375,21 @@ const PROP_OFF_TYPE_TAG: usize = 29; // u8
 const PROP_OFF_VALUE_INLINE: usize = 30; // u64
 const PROP_OFF_NEXT_PROP: usize = 38; // u64
 
+/// The contiguous byte range of a property record that a **value-level write owns**: `created_ts`,
+/// `expired_ts`, `undo_ptr`, `key`, `type_tag`, `value_inline` (`rmp` #967).
+///
+/// It starts at byte 1, not 0, and stops at byte 38, not 46 — both boundaries are load-bearing:
+///
+/// * **`flags` (byte 0) is excluded** because the in-use bit is the *slot's* state, owned by the
+///   creation undo and the corpse discipline, never by a value write.
+/// * **`next_prop` (bytes 38..46) is excluded** because it is a *shared chain word*: the GC splice
+///   and a concurrent prepend legitimately own it, so including it in a value write's pre-image undo
+///   would let an out-of-LIFO abort sever a chain — the `rmp` #172 / #220 / #239 defect family.
+///
+/// See [`RecordStore::write_prop_cell`](crate::RecordStore) for why the region is written as one
+/// patch rather than field by field.
+pub(crate) const PROP_CELL_REGION: std::ops::Range<usize> = OFF_CREATED_TS..PROP_OFF_NEXT_PROP;
+
 /// A property record (`04 §2.3`): one entry of an entity's singly-linked property chain.
 ///
 /// `type_tag` discriminates the value class and the inline-vs-overflow bit (`04 §2.3`);
@@ -535,6 +550,69 @@ mod tests {
         let mut buf = [0u8; PROP_RECORD_SIZE];
         p.encode(&mut buf);
         assert_eq!(PropRecord::decode(&buf), p);
+    }
+
+    /// The in-place property write's byte region, pinned exactly (`rmp` #967). Its two boundaries
+    /// are correctness, not tidiness: including byte 0 would put the slot's `in_use` bit in a value
+    /// write's pre-image undo, and including `next_prop` would put a shared chain word there.
+    #[test]
+    fn the_property_cell_region_covers_the_value_fields_and_nothing_else() {
+        assert_eq!(PROP_CELL_REGION, 1..38);
+        assert!(
+            !PROP_CELL_REGION.contains(&OFF_FLAGS),
+            "the `flags` byte is the SLOT's state and must never ride a value write",
+        );
+        for off in [PROP_OFF_NEXT_PROP, PROP_OFF_NEXT_PROP + 7] {
+            assert!(
+                !PROP_CELL_REGION.contains(&off),
+                "`next_prop` is a SHARED chain word: including it reintroduces `rmp` #172/#220/#239",
+            );
+        }
+        // Every field the value write does own is inside it.
+        for off in [
+            OFF_CREATED_TS,
+            OFF_EXPIRED_TS,
+            OFF_UNDO_PTR,
+            PROP_OFF_KEY,
+            PROP_OFF_TYPE_TAG,
+            PROP_OFF_VALUE_INLINE,
+            PROP_OFF_VALUE_INLINE + 7,
+        ] {
+            assert!(
+                PROP_CELL_REGION.contains(&off),
+                "offset {off} must be owned"
+            );
+        }
+    }
+
+    /// A patch over [`PROP_CELL_REGION`] must be able to change every value field and must leave
+    /// `flags` and `next_prop` byte-identical — asserted over the real codec rather than over the
+    /// offsets alone.
+    #[test]
+    fn a_cell_region_patch_preserves_flags_and_next_prop() {
+        let mut before = PropRecord::new(7, 3, 0x10, 0xAAAA);
+        before.next_prop = 0x1234_5678_9ABC_DEF0;
+        before.mvcc.flags = FLAG_IN_USE | FLAG_DENSE;
+        let mut page = [0u8; PROP_RECORD_SIZE];
+        before.encode(&mut page);
+
+        let mut after = before;
+        after.mvcc.created_ts = 99;
+        after.key = 42;
+        after.type_tag = 0;
+        after.value_inline = 0;
+        let mut patch_src = [0u8; PROP_RECORD_SIZE];
+        after.encode(&mut patch_src);
+        // Exactly what `write_prop_cell` writes.
+        page[PROP_CELL_REGION].copy_from_slice(&patch_src[PROP_CELL_REGION]);
+
+        let got = PropRecord::decode(&page);
+        assert_eq!(got.mvcc.created_ts, 99);
+        assert_eq!(got.key, 42);
+        assert_eq!(got.type_tag, 0);
+        assert_eq!(got.value_inline, 0);
+        assert_eq!(got.mvcc.flags, before.mvcc.flags, "flags untouched");
+        assert_eq!(got.next_prop, before.next_prop, "next_prop untouched");
     }
 
     #[test]

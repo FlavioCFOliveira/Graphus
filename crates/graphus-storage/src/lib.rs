@@ -81,6 +81,7 @@ pub mod labels;
 pub mod meta;
 pub mod paging;
 pub mod propenc;
+pub mod read_probe;
 pub mod read_view;
 pub mod record;
 pub mod recovery;
@@ -98,7 +99,7 @@ pub use backup::{
 pub use check::{
     AdjacencyFault, AgreementFault, ConsistencyReport, FreeListFault, HeapChainFault,
     IndexAgreement, IndexEntry, LabelBitmapFault, PropertyFault, UndoChainFault, UndoSlotFault,
-    Violation, verify_on_open,
+    Violation, verify_on_open, verify_warm,
 };
 pub use dwb::{DWB_EVICT_RING_SLOTS, DWB_MAX_BATCH, Dwb, DwbPageStager, dwb_device_pages};
 /// The page-header codec (checksum / `page_id` / `page_lsn` / type accessors) the storage layer
@@ -133,8 +134,12 @@ pub use record::{
     PropRecord, REL_RECORD_SIZE, RelRecord,
 };
 /// The read-polarity taxonomy (`rmp` task #905): which of superset / decision / conservative a
-/// storage read is required to answer, and the two types that keep the first two apart.
-pub use scan_polarity::{DecidedProperties, SupersetProperties};
+/// storage read is required to answer, and the two types that keep the first two apart — plus the
+/// candidate type both deal in since the property path moved onto the undo chain (`rmp` #967).
+pub use scan_polarity::{
+    CandidateSource, DecidedProperties, DeltaVerdict, PropertyCandidate, PropertyDelta,
+    SupersetProperties,
+};
 pub use store::{
     DEFAULT_CHECKPOINT_INTERVAL_BYTES, DirectionalRelCounts, FreezeFrontierViolation, GcPassReport,
     META_PAGE, RecordStore, STORE_COUNT, StoreKind,

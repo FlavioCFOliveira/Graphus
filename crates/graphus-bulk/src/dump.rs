@@ -24,7 +24,8 @@ use std::io::Write;
 
 use graphus_core::{Result, Value};
 use graphus_io::BlockDevice;
-use graphus_storage::{Namespace, RecordStore};
+use graphus_storage::undo::TYPE_TAG_ABSENT;
+use graphus_storage::{Namespace, RecordStore, SupersetProperties};
 use graphus_wal::LogSink;
 
 /// The inferred CSV column type token for a property key (the `:type` suffix the importer reads).
@@ -104,25 +105,46 @@ fn render_value(value: &Value) -> String {
     }
 }
 
-/// PERF (C17): collapses a property chain to the newest value per key **and** resolves token ids to
-/// key names in a single pass, returning a name-keyed map ready for column lookup. This replaces the
-/// previous "build a token-keyed `BTreeMap`, then re-key into a name-keyed `BTreeMap`" double build.
+/// An entity's **current** property image, name-keyed and ready for column lookup: the value each key
+/// holds now, decoded, with token ids resolved to key names in a single pass.
 ///
-/// Newest-wins is preserved: token interning is 1:1 (a name has exactly one token), so deduping by
-/// token before resolving and deduping by name while resolving yield identical results.
-fn newest_by_name<D: BlockDevice, S: LogSink>(
+/// # Polarity — CURRENT IMAGE (`rmp` #967)
+///
+/// This used to fold "first occurrence per key wins" over the decoded superset
+/// (`RecordStore::superset_scan_{node,rel}_property_values`), which *was* the physical image while
+/// every version of a key was a cell carrying its own MVCC stamps. Since #967 an overwrite is written
+/// **in place** and the superseded value descends onto the entity's undo chain, so that read yields
+/// the candidate SUPERSET: the live cells — with the EMPTY cell a removal leaves behind skipped —
+/// followed by every retained historical value. First-occurrence-wins over it therefore resolved a
+/// **removed** key to its pre-removal value, and the dump emitted a property the store no longer
+/// holds, in a column the importer would re-create on the way back in. An overwrite was never
+/// affected (the live cell holds the newest value and comes first), which is exactly why the defect
+/// hid: only a removal exposes it.
+///
+/// The dumper owes the **current image**, and `cells_ignoring_history()` is that read. It is the right
+/// polarity here rather than the decision read because the dumper is an offline surface holding no
+/// reader snapshot: it opens the store after recovery, so no writer is in flight and the current image
+/// *is* the committed image. One value per key, one CSV cell per (row, column).
+///
+/// An empty cell (`TYPE_TAG_ABSENT`) is a key the entity no longer holds and is skipped. A healthy
+/// post-#967 store holds at most one cell per key; the first is kept deterministically if an older
+/// build ever wrote two.
+fn current_by_name<D: BlockDevice, S: LogSink>(
     store: &RecordStore<D, S>,
-    props: Vec<(u64, u32, Value)>,
+    props: &SupersetProperties,
 ) -> Result<BTreeMap<String, Value>> {
-    // First-occurrence-per-token wins (chain is newest-to-oldest); resolve each surviving token to
-    // its name once.
     let mut seen: BTreeMap<u32, ()> = BTreeMap::new();
     let mut out: BTreeMap<String, Value> = BTreeMap::new();
-    for (_pid, key_token, value) in props {
-        if seen.insert(key_token, ()).is_none() {
-            let name = key_name(store, Namespace::PropKey, key_token)?;
-            out.insert(name, value);
+    for &(_pid, cell) in props.cells_ignoring_history() {
+        if cell.type_tag == TYPE_TAG_ABSENT {
+            continue; // the key was removed: the cell was emptied in place (`rmp` #967).
         }
+        if seen.insert(cell.key, ()).is_some() {
+            continue;
+        }
+        let value = store.decode_property_value(cell.type_tag, cell.value_inline)?;
+        let name = key_name(store, Namespace::PropKey, cell.key)?;
+        out.insert(name, value);
     }
     Ok(out)
 }
@@ -157,7 +179,7 @@ pub fn dump_nodes<D: BlockDevice, S: LogSink, W: Write>(
         for t in label_tokens {
             labels.push(key_name(store, Namespace::Label, t)?);
         }
-        let by_name = newest_by_name(store, store.superset_scan_node_property_values(id)?)?;
+        let by_name = current_by_name(store, &store.superset_scan_node_properties(id)?)?;
         for (key, value) in &by_name {
             key_types
                 .entry(key.clone())
@@ -212,7 +234,7 @@ pub fn dump_relationships<D: BlockDevice, S: LogSink, W: Write>(
     for &id in &rel_ids {
         let rec = store.rel(id)?;
         let type_name = key_name(store, Namespace::RelType, rec.type_id)?;
-        let by_name = newest_by_name(store, store.superset_scan_rel_property_values(id)?)?;
+        let by_name = current_by_name(store, &store.superset_scan_rel_properties(id)?)?;
         for (key, value) in &by_name {
             key_types
                 .entry(key.clone())

@@ -75,8 +75,11 @@ use crate::record::{
     MVCC_HEADER_SIZE, MvccHeader, NODE_RECORD_SIZE, NodeRecord, PROP_RECORD_SIZE, PropRecord,
     REL_RECORD_SIZE, RelRecord,
 };
-use crate::scan_polarity::SupersetProperties;
+use crate::scan_polarity::{
+    DecidedProperties, DecisionFold, DeltaVerdict, PropertyDelta, SupersetProperties, delta_verdict,
+};
 use crate::store::{STORE_COUNT, StoreKind};
+use crate::undo::{self, CommitSlot, UndoDelta};
 use crate::wal_rule::SharedWal;
 use crate::{labels, valenc};
 
@@ -253,6 +256,10 @@ pub fn read_prop<D: BlockDevice, S: LogSink, P: StorePages>(
     pages: &P,
     id: u64,
 ) -> Result<PropRecord> {
+    // `rmp` #967 AC 2: the sole `PropRecord` decode in the workspace, so counting here counts every
+    // `props.store` record read on every read path — the inline one and the off-thread reader pool
+    // alike. Compiles to nothing unless the `read-probe` feature is on (see `crate::read_probe`).
+    crate::read_probe::note_prop_read();
     let (rel_page, off) = paging::record_location(id, PROP_RECORD_SIZE);
     let dev = pages.device_page(StoreKind::Prop, rel_page)?;
     pool.with_page_fetched(dev, |p| PropRecord::decode(&p[off..off + PROP_RECORD_SIZE]))
@@ -288,6 +295,262 @@ pub fn read_mvcc<D: BlockDevice, S: LogSink, P: StorePages>(
     let (rel_page, off) = paging::record_location(id, kind.record_size());
     let dev = pages.device_page(kind, rel_page)?;
     pool.with_page_fetched(dev, |p| MvccHeader::read(&p[off..off + MVCC_HEADER_SIZE]))
+}
+
+// ------------------------- the undo area, from either read path -------------------------
+//
+// `rmp` #967. Once a property's old values live on the undo chain, **reading a property means
+// reading the undo area** — so the undo area's decoders must live here, in the single decode impl,
+// exactly as `read_prop` does. Routing only the inline `&RecordStore` path through them and leaving
+// the reader pool to answer from something else is the #755/#768/#769/#770 defect family verbatim:
+// the pool quietly served a different mechanism from the inline path, and the divergence was
+// invisible until it produced wrong rows.
+
+/// The upper bound on an undo-area id for `kind`, for the range check below.
+///
+/// **Live**, not the snapshotted `high_water`, for the `rmp` #721 reason: a reader walking a chain
+/// follows pointers out of live record content, so a writer that prepended a delta after this
+/// reader's capture can legitimately put a delta id above the captured high-water on a chain the
+/// reader must still traverse. Bounding by the captured mark would fail that legitimate walk with
+/// "id is outside 1..N" — and a record that cannot be LOCATED is never filtered, because visibility
+/// is decided above this layer. The live slot capacity is `>= high_water` always, grows with the
+/// writer, and still catches a genuinely dangling pointer.
+fn undo_id_bound<P: StorePages>(pages: &P, kind: StoreKind) -> u64 {
+    slot_capacity(pages, kind).max(pages.high_water(kind))
+}
+
+/// Copies the `len` raw bytes of undo-area record `id` out from its resident page under one read
+/// latch, bounds-checked first so a dangling chain pointer is reported rather than silently reading
+/// a neighbouring slot.
+fn read_undo_slot_bytes<D: BlockDevice, S: LogSink, P: StorePages>(
+    pool: &Pool<D, S>,
+    pages: &P,
+    kind: StoreKind,
+    id: u64,
+    len: usize,
+) -> Result<Vec<u8>> {
+    let bound = undo_id_bound(pages, kind);
+    if id == NULL_ID || id >= bound {
+        return Err(GraphusError::Storage(format!(
+            "{kind:?} store id {id} is outside 1..{bound}"
+        )));
+    }
+    let (rel_page, off) = paging::record_location(id, kind.record_size());
+    let dev = pages.device_page(kind, rel_page)?;
+    pool.with_page_fetched(dev, |p| p[off..off + len].to_vec())
+}
+
+/// Decodes the `undo.store` delta at `id` (the body of `RecordStore::read_delta`).
+///
+/// Returns `Ok(None)` for a slot that is entirely zero — never written — which is not a delta at all
+/// (`05 §12.3`: action `0` is reserved). Any other malformed slot is an error, never a
+/// plausible-looking delta. A *reclaimed* slot decodes normally with its `in_use` bit clear.
+///
+/// # Errors
+/// Returns a storage error if `id` is out of range, its page is unreadable, or the slot is occupied
+/// but does not decode.
+pub fn read_delta<D: BlockDevice, S: LogSink, P: StorePages>(
+    pool: &Pool<D, S>,
+    pages: &P,
+    id: u64,
+) -> Result<Option<UndoDelta>> {
+    // `rmp` #967 AC 2: the sole `UndoDelta` decode in the workspace, so this count is every delta
+    // read on every read path — inline and off-thread alike. It exists so the record-read proof
+    // cannot be satisfied by relocating the walk from `props.store` into `undo.store`. Compiles to
+    // nothing unless the `read-probe` feature is on (see `crate::read_probe`).
+    crate::read_probe::note_undo_read();
+    let buf = read_undo_slot_bytes(pool, pages, StoreKind::Undo, id, undo::UNDO_RECORD_SIZE)?;
+    if undo::is_zeroed(&buf) {
+        return Ok(None);
+    }
+    UndoDelta::decode(&buf)
+        .map(Some)
+        .map_err(|e| GraphusError::Storage(format!("undo delta {id}: {e}")))
+}
+
+/// Decodes the `commit.store` slot at `id` (the body of `RecordStore::read_commit_slot`).
+/// `Ok(None)` for a zeroed slot, exactly as [`read_delta`].
+///
+/// # Errors
+/// Returns a storage error if `id` is out of range, its page is unreadable, or the slot is occupied
+/// but does not decode.
+pub fn read_commit_slot<D: BlockDevice, S: LogSink, P: StorePages>(
+    pool: &Pool<D, S>,
+    pages: &P,
+    id: u64,
+) -> Result<Option<CommitSlot>> {
+    // Counted separately from the delta reads so that relocating the visibility walk into the commit
+    // indirection shows up as growth here rather than passing as an O(1) property read.
+    crate::read_probe::note_commit_slot_read();
+    let buf = read_undo_slot_bytes(pool, pages, StoreKind::Commit, id, undo::COMMIT_RECORD_SIZE)?;
+    if undo::is_zeroed(&buf) {
+        return Ok(None);
+    }
+    CommitSlot::decode(&buf)
+        .map(Some)
+        .map_err(|e| GraphusError::Storage(format!("commit slot {id}: {e}")))
+}
+
+/// Walks entity `(kind, entity)`'s undo chain newest-first, returning `(delta id, delta)` pairs (the
+/// body of `RecordStore::undo_chain`).
+///
+/// The walk threads through **corpse** deltas (an aborted transaction's, whose `in_use` bit its
+/// creation undo cleared) exactly as the incidence walk threads through a dead-link relationship
+/// corpse: their action is never applied, but their `next` is still the way to the older versions
+/// below them.
+///
+/// # Errors
+/// Returns a storage error if a link dangles (points at a zeroed or out-of-range slot) or the chain
+/// fails to terminate within the store's live slot capacity — both of which are corruption, not
+/// states a healthy store can reach.
+pub fn undo_chain<D: BlockDevice, S: LogSink, P: StorePages>(
+    pool: &Pool<D, S>,
+    pages: &P,
+    kind: StoreKind,
+    entity: u64,
+) -> Result<Vec<(u64, UndoDelta)>> {
+    let head = read_mvcc(pool, pages, kind, entity)?.undo_ptr;
+    let mut out = Vec::new();
+    walk_undo_chain(pool, pages, kind, entity, head, |id, delta| {
+        out.push((id, delta));
+        Ok(true)
+    })?;
+    Ok(out)
+}
+
+/// The one chain walk: follows `head` newest-first, invoking `visit(id, delta)` for each link and
+/// stopping early when it returns `Ok(false)`.
+///
+/// The cycle guard is the store's **live** slot capacity (`rmp` #721 — see [`undo_id_bound`]): a
+/// well-formed chain visits each delta at most once, so exceeding the number of addressable slots
+/// proves a cycle without a visited set on the hot path.
+fn walk_undo_chain<D, S, P, F>(
+    pool: &Pool<D, S>,
+    pages: &P,
+    kind: StoreKind,
+    entity: u64,
+    head: u64,
+    mut visit: F,
+) -> Result<()>
+where
+    D: BlockDevice,
+    S: LogSink,
+    P: StorePages,
+    F: FnMut(u64, UndoDelta) -> Result<bool>,
+{
+    let guard = undo_id_bound(pages, StoreKind::Undo);
+    let mut cur = head;
+    let mut steps = 0u64;
+    while cur != NULL_ID {
+        steps += 1;
+        if steps > guard {
+            return Err(GraphusError::Storage(format!(
+                "undo chain of {kind:?} {entity} is malformed (cycle?)"
+            )));
+        }
+        let Some(delta) = read_delta(pool, pages, cur)? else {
+            return Err(GraphusError::Storage(format!(
+                "undo chain of {kind:?} {entity} reaches empty delta slot {cur}"
+            )));
+        };
+        let next = delta.next;
+        if !visit(cur, delta)? {
+            return Ok(());
+        }
+        cur = next;
+    }
+    Ok(())
+}
+
+/// Collects entity `(kind, entity)`'s **whole** undo chain with each live delta's commit slot already
+/// resolved — the superset-polarity half of a property read (`rmp` #967).
+///
+/// A **corpse** delta's slot is deliberately not read: the corpse is skipped before its commit
+/// information is ever needed, so reading it would be one wasted record read per corpse on a path
+/// whose record-read count is an acceptance criterion.
+///
+/// # Errors
+/// As [`undo_chain`], plus a storage error if a **live** delta's `commit_info` names a slot that
+/// holds no record — the one thing `05 §12.4` promises can never happen, so it is failed closed
+/// here rather than dropped.
+fn collect_undo_history<D: BlockDevice, S: LogSink, P: StorePages>(
+    pool: &Pool<D, S>,
+    pages: &P,
+    kind: StoreKind,
+    entity: u64,
+    head: u64,
+) -> Result<Vec<PropertyDelta>> {
+    let mut out = Vec::new();
+    let mut fault = None;
+    walk_undo_chain(pool, pages, kind, entity, head, |id, delta| {
+        let slot = if delta.in_use() {
+            let resolved = read_commit_slot(pool, pages, delta.commit_info)?;
+            if resolved.is_none() {
+                fault = Some((id, delta.commit_info));
+            }
+            resolved
+        } else {
+            None
+        };
+        out.push(PropertyDelta { id, delta, slot });
+        Ok(true)
+    })?;
+    if let Some((id, commit_info)) = fault {
+        return Err(GraphusError::Storage(format!(
+            "undo delta {id} names commit slot {commit_info} which holds no record; a slot must \
+             outlive its last delta (`05 §12.4`), so this version cannot be resolved"
+        )));
+    }
+    Ok(out)
+}
+
+/// Reconstructs entity `(kind, entity)`'s properties as of `snapshot`, **stopping the chain walk at
+/// the first delta the snapshot already reflects** (`rmp` #967, `04 §5.6`).
+///
+/// This is why it is a separate walk from `collect_undo_history` + [`SupersetProperties::decide`]
+/// rather than a fold over it, and the difference is the whole acceptance criterion: the superset
+/// walk must read the entity's *entire* chain (a population path needs every historical value), while
+/// a reader that sees the live value must read exactly **one** delta and **one** commit slot no
+/// matter how many times the key has been overwritten. Both apply the identical
+/// [`delta_verdict`] + [`DecisionFold`] logic, so they cannot disagree about the answer — only about
+/// how many records they touch to reach it.
+///
+/// # Errors
+/// As [`undo_chain`], plus a storage error if a live delta's commit slot cannot be resolved.
+fn decide_properties<D: BlockDevice, S: LogSink, P: StorePages>(
+    pool: &Pool<D, S>,
+    pages: &P,
+    kind: StoreKind,
+    entity: u64,
+    head: u64,
+    cells: &[(u64, PropRecord)],
+    snapshot: Snapshot,
+) -> Result<DecidedProperties> {
+    let mut fold = DecisionFold::seed(cells);
+    let mut failure = None;
+    walk_undo_chain(pool, pages, kind, entity, head, |id, delta| {
+        let slot = if delta.in_use() {
+            read_commit_slot(pool, pages, delta.commit_info)?
+        } else {
+            None
+        };
+        match delta_verdict(&delta, slot, snapshot, id) {
+            Ok(DeltaVerdict::Skip) => Ok(true),
+            Ok(DeltaVerdict::Apply) => {
+                fold.apply(&delta, id);
+                Ok(true)
+            }
+            Ok(DeltaVerdict::Stop) => Ok(false),
+            Err(e) => {
+                failure = Some(e);
+                Ok(false)
+            }
+        }
+    })?;
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(DecidedProperties::from_fold(fold, snapshot)),
+    }
 }
 
 /// Reassembles the byte payload of the overflow heap chain whose head block is `head` (the body of
@@ -562,6 +825,43 @@ pub fn scan_in_use_mvcc_from<D: BlockDevice, S: LogSink, P: StorePages>(
     Ok(out)
 }
 
+/// Counts the in-use `props.store` cells that carry an MVCC **tombstone** (`expired_ts != 0`), the
+/// shape a **pre-`rmp`-#967** build left behind for a removed or overwritten property (`rmp` #967
+/// audit).
+///
+/// This build never writes one — [`RecordStore::write_prop_cell`](crate::RecordStore) refuses a
+/// non-zero `expired_ts`, and `D-property-removal` empties the cell in place instead — so on a store
+/// this build created the answer is always `(0, None)` and the scan exists solely to decide whether a
+/// **legacy** image may be opened at all. The predicate is deliberately identical to the consistency
+/// checker's [`MvccHeaderFault::PropertyCellTombstoned`](crate::check::MvccHeaderFault), so the two
+/// tiers cannot disagree about what a tombstoned cell is.
+///
+/// Returns `(count, first)`: how many offending cells the store holds, and the lowest offending
+/// `(physical_id, expired_ts)` for the operator-facing diagnostic. It is a full pass over
+/// `props.store` rather than a stop-at-first scan because the count is what tells an operator whether
+/// they are looking at one stale cell or a whole graph's worth of removals, and because the answer
+/// `(0, None)` — the case that decides an open succeeds — costs the full pass either way.
+///
+/// # Errors
+/// Returns a storage error if a `props.store` page cannot be read.
+pub fn scan_property_tombstones<D: BlockDevice, S: LogSink, P: StorePages>(
+    pool: &Pool<D, S>,
+    pages: &P,
+) -> Result<(usize, Option<(u64, u64)>)> {
+    let mut count = 0usize;
+    let mut first: Option<(u64, u64)> = None;
+    for_each_record_slot(pool, pages, StoreKind::Prop, 1, |id, rec| {
+        let mvcc = MvccHeader::read(&rec[..MVCC_HEADER_SIZE]);
+        if mvcc.in_use() && mvcc.expired_ts != 0 {
+            count += 1;
+            // The walk is ascending by id, so the first hit is the lowest.
+            first.get_or_insert((id, mvcc.expired_ts));
+        }
+        Ok(())
+    })?;
+    Ok((count, first))
+}
+
 /// Like [`scan_in_use_mvcc_from`] but visits only the **bounded window** `from..min(from+max_ids,
 /// high_water)` (`rmp` #809): the release-active freeze-frontier audit sweeps one such window per GC
 /// pass so its cost is `O(max_ids)` — a constant tax on the GC path, independent of store size — while
@@ -626,46 +926,88 @@ pub fn node_has_label<D: BlockDevice, S: LogSink, P: StorePages>(
     labels::has_label(node.labels, label_token_id).map_err(GraphusError::from)
 }
 
-/// Collects every **slot-occupied** (`in_use`) property `(physical_id, record)` in `node_id`'s chain,
-/// head to tail (the body of `RecordStore::superset_scan_node_properties`) — MVCC tombstones
-/// included, see that method's doc. The cycle guard uses the `Prop` high-water from `pages`.
+/// The **superset**-polarity read of `node_id`'s properties (the body of
+/// `RecordStore::superset_scan_node_properties`): every slot-occupied cell in its `first_prop` chain
+/// **and** its whole undo-delta history, which after `rmp` #967 is where every older value lives.
 ///
 /// # Errors
-/// Returns a storage error if a chain page is missing or the chain does not terminate.
+/// Returns a storage error if a chain page is missing, a chain does not terminate, or a live delta's
+/// commit slot cannot be resolved.
 pub fn superset_scan_node_properties<D: BlockDevice, S: LogSink, P: StorePages>(
     pool: &Pool<D, S>,
     pages: &P,
     node_id: u64,
 ) -> Result<SupersetProperties> {
     let node = read_node(pool, pages, node_id)?;
-    Ok(SupersetProperties::from_chain(collect_prop_chain(
-        pool,
-        pages,
-        node.first_prop,
-        "node",
-        node_id,
-    )?))
+    let cells = collect_prop_chain(pool, pages, node.first_prop, "node", node_id)?;
+    let history = collect_undo_history(pool, pages, StoreKind::Node, node_id, node.mvcc.undo_ptr)?;
+    Ok(SupersetProperties::from_chain(cells, history))
 }
 
-/// Collects every **slot-occupied** (`in_use`) property `(physical_id, record)` in `rel_id`'s chain,
-/// head to tail (the body of `RecordStore::superset_scan_rel_properties`) — MVCC tombstones
-/// included.
+/// The **superset**-polarity read of `rel_id`'s properties — the relationship twin of
+/// [`superset_scan_node_properties`], with the same two halves.
 ///
 /// # Errors
-/// Returns a storage error if a chain page is missing or the chain does not terminate.
+/// As [`superset_scan_node_properties`].
 pub fn superset_scan_rel_properties<D: BlockDevice, S: LogSink, P: StorePages>(
     pool: &Pool<D, S>,
     pages: &P,
     rel_id: u64,
 ) -> Result<SupersetProperties> {
     let rel = read_rel(pool, pages, rel_id)?;
-    Ok(SupersetProperties::from_chain(collect_prop_chain(
+    let cells = collect_prop_chain(pool, pages, rel.first_prop, "rel", rel_id)?;
+    let history = collect_undo_history(pool, pages, StoreKind::Rel, rel_id, rel.mvcc.undo_ptr)?;
+    Ok(SupersetProperties::from_chain(cells, history))
+}
+
+/// The **decision**-polarity read of `node_id`'s properties (the body of
+/// `RecordStore::decision_scan_node_properties`): exactly what `snapshot` sees, reconstructed by the
+/// early-stopping chain walk.
+///
+/// # Errors
+/// Returns a storage error if a chain page is missing, a chain does not terminate, or a live delta's
+/// commit slot cannot be resolved.
+pub fn decision_scan_node_properties<D: BlockDevice, S: LogSink, P: StorePages>(
+    pool: &Pool<D, S>,
+    pages: &P,
+    node_id: u64,
+    snapshot: Snapshot,
+) -> Result<DecidedProperties> {
+    let node = read_node(pool, pages, node_id)?;
+    let cells = collect_prop_chain(pool, pages, node.first_prop, "node", node_id)?;
+    decide_properties(
         pool,
         pages,
-        rel.first_prop,
-        "rel",
+        StoreKind::Node,
+        node_id,
+        node.mvcc.undo_ptr,
+        &cells,
+        snapshot,
+    )
+}
+
+/// The **decision**-polarity read of `rel_id`'s properties — the relationship twin of
+/// [`decision_scan_node_properties`].
+///
+/// # Errors
+/// As [`decision_scan_node_properties`].
+pub fn decision_scan_rel_properties<D: BlockDevice, S: LogSink, P: StorePages>(
+    pool: &Pool<D, S>,
+    pages: &P,
+    rel_id: u64,
+    snapshot: Snapshot,
+) -> Result<DecidedProperties> {
+    let rel = read_rel(pool, pages, rel_id)?;
+    let cells = collect_prop_chain(pool, pages, rel.first_prop, "rel", rel_id)?;
+    decide_properties(
+        pool,
+        pages,
+        StoreKind::Rel,
         rel_id,
-    )?))
+        rel.mvcc.undo_ptr,
+        &cells,
+        snapshot,
+    )
 }
 
 /// The shared property-chain walk behind [`superset_scan_node_properties`] /
@@ -715,10 +1057,11 @@ pub fn superset_scan_rel_property_values<D: BlockDevice, S: LogSink, P: StorePag
     rel_id: u64,
 ) -> Result<Vec<(u64, u32, Value)>> {
     let chain = superset_scan_rel_properties(pool, pages, rel_id)?;
-    let mut out = Vec::with_capacity(chain.len());
-    for (pid, prop) in chain.into_every_version() {
-        let value = decode_property_value(pool, pages, prop.type_tag, prop.value_inline)?;
-        out.push((pid, prop.key, value));
+    let candidates: Vec<_> = chain.candidates().collect();
+    let mut out = Vec::with_capacity(candidates.len());
+    for c in candidates {
+        let value = decode_property_value(pool, pages, c.type_tag, c.value_inline)?;
+        out.push((c.source.id(), c.key, value));
     }
     Ok(out)
 }
@@ -1038,6 +1381,62 @@ impl<D: BlockDevice, S: LogSink> StoreReadView<D, S> {
     /// Returns a storage error if a chain page is missing or the chain does not terminate.
     pub fn superset_scan_rel_properties(&self, rel_id: u64) -> Result<SupersetProperties> {
         superset_scan_rel_properties(&self.pool, &self.meta, rel_id)
+    }
+
+    /// The **decision**-polarity read of `node_id`'s properties. See
+    /// [`decision_scan_node_properties`].
+    ///
+    /// This is the reader pool's half of the `rmp` #967 parity contract: the off-thread path
+    /// reconstructs an older property version through **the same** undo-chain walk the inline
+    /// `RecordStore` path uses. A reader pool that answered from a different mechanism is the
+    /// #755/#768/#769/#770 defect family, and the reason both sides delegate to one body here.
+    ///
+    /// # Errors
+    /// Returns a storage error if a chain page is missing, a chain does not terminate, or a live
+    /// delta's commit slot cannot be resolved.
+    pub fn decision_scan_node_properties(
+        &self,
+        node_id: u64,
+        snapshot: Snapshot,
+    ) -> Result<DecidedProperties> {
+        decision_scan_node_properties(&self.pool, &self.meta, node_id, snapshot)
+    }
+
+    /// The **decision**-polarity read of `rel_id`'s properties. See
+    /// [`decision_scan_rel_properties`].
+    ///
+    /// # Errors
+    /// As [`StoreReadView::decision_scan_node_properties`].
+    pub fn decision_scan_rel_properties(
+        &self,
+        rel_id: u64,
+        snapshot: Snapshot,
+    ) -> Result<DecidedProperties> {
+        decision_scan_rel_properties(&self.pool, &self.meta, rel_id, snapshot)
+    }
+
+    /// Decodes the `undo.store` delta at `id`. See [`read_delta`].
+    ///
+    /// # Errors
+    /// Returns a storage error if `id` is out of range or the slot is occupied but does not decode.
+    pub fn read_delta(&self, id: u64) -> Result<Option<UndoDelta>> {
+        read_delta(&self.pool, &self.meta, id)
+    }
+
+    /// Decodes the `commit.store` slot at `id`. See [`read_commit_slot`].
+    ///
+    /// # Errors
+    /// Returns a storage error if `id` is out of range or the slot is occupied but does not decode.
+    pub fn read_commit_slot(&self, id: u64) -> Result<Option<CommitSlot>> {
+        read_commit_slot(&self.pool, &self.meta, id)
+    }
+
+    /// Walks entity `(kind, entity)`'s undo chain newest-first. See [`undo_chain`].
+    ///
+    /// # Errors
+    /// Returns a storage error if a link dangles or the chain does not terminate.
+    pub fn undo_chain(&self, kind: StoreKind, entity: u64) -> Result<Vec<(u64, UndoDelta)>> {
+        undo_chain(&self.pool, &self.meta, kind, entity)
     }
 
     /// The **superset**-polarity decoded read of relationship `rel_id`'s properties as

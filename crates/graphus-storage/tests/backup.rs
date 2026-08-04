@@ -140,12 +140,11 @@ fn snapshot<D: graphus_io::BlockDevice>(store: &mut RecordStore<D, MemLogSink>) 
         let mut props: Vec<PropView> = store
             .superset_scan_node_properties(nphys)
             .expect("node properties")
-            .into_every_version()
-            .into_iter()
-            .map(|(_, p)| PropView {
-                key: p.key,
-                type_tag: p.type_tag,
-                value_inline: p.value_inline,
+            .candidates()
+            .map(|c| PropView {
+                key: c.key,
+                type_tag: c.type_tag,
+                value_inline: c.value_inline,
             })
             .collect();
         props.sort();

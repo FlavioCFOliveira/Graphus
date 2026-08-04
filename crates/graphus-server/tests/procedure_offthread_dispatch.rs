@@ -78,7 +78,7 @@ fn run_auto(
         return (false, Vec::new());
     };
     let mut rows = Vec::new();
-    match handle.run_blocking(ticket, stmt.to_owned(), vec![], true, None) {
+    match handle.run_blocking(ticket, stmt.to_owned(), vec![], true, None, None) {
         Ok(mut reply) => loop {
             match reply.rows.next() {
                 Ok(Some(cells)) => rows.push(cells),
@@ -100,7 +100,7 @@ fn run_explicit(
         return (false, Vec::new());
     };
     let mut rows = Vec::new();
-    let ok = match handle.run_blocking(ticket, stmt.to_owned(), vec![], false, None) {
+    let ok = match handle.run_blocking(ticket, stmt.to_owned(), vec![], false, None, None) {
         Ok(mut reply) => loop {
             match reply.rows.next() {
                 Ok(Some(cells)) => rows.push(cells),

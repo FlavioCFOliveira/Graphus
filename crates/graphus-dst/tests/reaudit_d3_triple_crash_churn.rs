@@ -67,9 +67,11 @@ fn observe(store: &Store, node: u64) -> Result<Observed, CheckFailure> {
             context: "superset_scan_node_properties".into(),
             message: e.to_string(),
         })?
-        .into_every_version()
-        .into_iter()
-        .map(|(_, p)| (p.key, p.type_tag, p.value_inline))
+        // `rmp` #967: the node's property state is now the live cells PLUS the retained values on its
+        // undo chain, so the fingerprint takes the candidate SUPERSET — reading only the cells would
+        // let two recoveries that disagree about the undo area still compare equal.
+        .candidates()
+        .map(|c| (c.key, c.type_tag, c.value_inline))
         .collect();
     props.sort_unstable();
     Ok(Observed { incident, props })

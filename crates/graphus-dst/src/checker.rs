@@ -204,8 +204,14 @@ pub fn verify<D: BlockDevice, S: LogSink>(
         let mut store_props: Vec<PropTriple> = store
             .superset_scan_node_properties(node)
             .map_err(|e| store_err("superset_scan_node_properties()", node, &e))?
-            .into_every_version()
-            .into_iter()
+            .cells_ignoring_history()
+            .iter()
+            // `rmp` #967: the LIVE CELLS are the store's current property set — which is exactly what
+            // the model tracks. The undo history deliberately is NOT compared: it holds the values
+            // older snapshots can still reconstruct, and the model has no notion of those. An EMPTY
+            // cell (`type_tag == 0`) is a key the store no longer holds, so it is skipped rather than
+            // compared as a zero-tagged value the model could never produce.
+            .filter(|(_, p)| p.type_tag != 0)
             .map(|(_, p)| PropTriple {
                 key: p.key,
                 type_tag: p.type_tag,

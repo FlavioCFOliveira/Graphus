@@ -85,13 +85,20 @@ Measured on this host (`x86_64`, Rust 1.96, `--release`), hashing an 8 KiB page 
 - **Measured ground for the delta half of the choice** (not a preference): the present property path
   tombstones the previous version by walking the entity's whole property chain and then prepends the
   new one (`RecordStore::tombstone_props_for_key`,
-  `crates/graphus-storage/src/store.rs:5646-5666`), which is **O(M²)** in the number of assignments
+  `crates/graphus-storage/src/store.rs:6710-6753`), which is **O(M²)** in the number of assignments
   to one entity — **15.1 µs/op at M = 1000** and **97.8 µs/op at M = 8000**. A constant-cost delta
   prepend replaces that walk.
 - **One chain per entity carries every mutation kind** — creation, deletion, property assignment,
   label change, and incidence-list change. The chain is anchored by the record's `undo_ptr` (§7) and
   its on-disk format is frozen in §12. The delta actions, their lifecycle, their ownership by the
   writing transaction, and the commit indirection point are specified in `04` §5.1.
+- **Refined on 2026-08-03 for the property path** (task #967), without any byte changing:
+  `D-property-write-conflict` (the entity-granularity conflict check arrives with #967),
+  `D-property-removal` (a removal is an **empty cell in place**, not an `expired_ts` tombstone, and
+  exactly one owner names any `strings.store` overflow chain), and `D-property-visibility` (the undo
+  chain is the **sole** visibility oracle for a property's value, so the cell's `created_ts` is
+  informative only). See §7 for how the record header reads on a property cell, §12.2 for the
+  `type_tag == 0` clarification, and `04` §§5.1.2, 5.1.5, 5.6.
 
 ---
 
@@ -149,6 +156,25 @@ chain at all.
 > `RecreateObject`). Property assignment (**#967**), label change (**#968**) and incidence change
 > (**#969**) still use the mechanisms `04` §5.1.5 lists; they move onto this chain in their own tasks,
 > and the record format does not change again when they do.
+
+**How this header reads on a property record, from task #967 onward** (`D-property-visibility` and
+`D-property-removal`, ratified 2026-08-03; `04` §5.6). The 25-byte prefix above is shared by node,
+relationship and property records and **its bytes do not change**, but two of its fields carry less
+meaning on a property cell than on an entity record, and the difference is normative:
+
+- **`created_ts` is informative, not authoritative.** A reader never decides which value of a
+  property it may see by comparing the cell's `created_ts`. It resolves visibility from the in-place
+  image plus the **entity's** undo chain, which is the sole oracle for a property's value (`04`
+  §5.6). The stamp remains useful for diagnostics and for the consistency checker.
+- **`expired_ts` is never written by a property operation.** A property removal is an **empty cell in
+  place** (`type_tag = 0, value_inline = 0`, §12.2) that keeps its `in_use` bit and its position in
+  the `first_prop` chain — not a tombstone (`04` §5.1.5, row 1 in detail). `expired_ts` therefore
+  stays `0` on property cells, and expiry remains meaningful only for node and relationship records.
+- **`in_use` keeps its full structural meaning** on a property cell: slot occupancy and corpse
+  threading are unchanged.
+
+Entity records are unaffected: on a node or relationship, all three fields keep exactly the meaning
+the table states.
 
 ---
 
@@ -316,6 +342,35 @@ Two stores rather than one because the §9 addressing rule requires a single rec
 A delta is **immutable once linked**: after the publication order of `04` §5.1.2 step 3, no field of it
 is ever rewritten. Only its slot is reused, and only after GC has reclaimed it.
 
+**Clarification (2026-08-03): what `type_tag == 0` means on a `SetProperty` delta.** The table above
+states that `type_tag` is zero for every action other than `SetProperty`, but it did not state what a
+zero means **on** a `SetProperty` delta. It means **the property did not exist before**, and applying
+the delta restores its absence. This is the encoding of the "`NULL` when the property did not exist
+before" payload that `04` §5.1.1 already specifies in prose. Memgraph writes the same thing for the
+same case: initialising a property that was absent links a `SetProperty` delta whose old value is a
+default-constructed `PropertyValue`
+(`/data/refsrc/memgraph/src/storage/v2/vertex_accessor.cpp:522`).
+
+**No byte of the frozen layout changes.** This paragraph is prose filling a gap in the table's
+description, not an amendment to the format: no field moves, no field changes width, and no value
+that was previously legal becomes illegal or vice versa. A reader must be able to tell the two apart,
+because §12 is frozen — so it is said explicitly here.
+
+**Why the zero is unambiguous.** The property type-tag space **starts at 1**, so no encoder can ever
+emit `0` for a property that exists:
+
+- the inline tags are `TAG_BOOL = 1`, `TAG_INT = 2`, `TAG_FLOAT = 3`
+  (`crates/graphus-storage/src/propenc.rs`);
+- the overflow classes are `4..=13`, always OR-ed with `OVERFLOW_BIT = 0x80`
+  (`crates/graphus-storage/src/valenc.rs`), so every overflow tag is `≥ 0x84`.
+
+The zero is therefore free to carry "absent", and it does. Two adjacent cases must not be confused
+with it: `Integer(0)` and `Boolean(false)` are distinguished by their **tag** (`2` and `1`
+respectively), never by the value word, so a zero `value_inline` alongside a non-zero `type_tag` is an
+ordinary stored zero and not an absence. Note also that `valenc.rs`'s `TAG_LIST_EMPTY = 0` is **not**
+a counter-example: it is a private `elem_tag` written **inside** a serialized empty list's body to
+record that the list has no element class, and it never appears in a `type_tag` field.
+
 ### 12.3 The `action` byte
 
 The encoding is fixed, so that a stored delta is decodable by any build that reads this format
@@ -384,6 +439,9 @@ itself (§12.5), and frees its slot with them.
   transaction walks **its own** deltas and applies them, restoring exactly the state it found. This is
   task **#970**, and it is what ends the defect family rmp #220 / #172 / #239 / #301 / #578 / #772, all
   of which are cases of one transaction's byte-level undo damaging another's committed state.
+  **#970 is a rollback change only.** Because the undo chain is already the sole visibility oracle for
+  a property's value by the time #970 lands (`D-property-visibility`, ratified 2026-08-03; `04` §5.6),
+  replacing physical undo with logical undo needs **no second rewrite of the read path**.
 - **A loser transaction after a crash is undone the same way.** A slot whose `commit_ts` is still an
   in-flight stamp when recovery reaches the ARIES undo phase belongs to a transaction that did not
   commit; its deltas are applied, in chain order, exactly as a live rollback would apply them.

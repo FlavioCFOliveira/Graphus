@@ -618,17 +618,35 @@ pub mod error {
 
 /// Global on-disk format and engine constants.
 pub mod constants {
-    /// On-disk format version, bumped on any incompatible layout change.
+    /// On-disk format version, bumped on any **incompatible** change to the durable image —
+    /// incompatible in **layout** or in **meaning**.
     ///
     /// | Version | Introduced by | Change |
     /// | --- | --- | --- |
     /// | 1 | — | Three record stores plus the `strings.store` overflow heap; `undo_ptr` reserved in every record header and permanently `0`. |
-    /// | 2 | `rmp` #966 | The **undo area** (`05-storage-format.md` §12): the `undo.store` delta store and the `commit.store` commit-info store, and `undo_ptr` as the live head of an entity's version chain. |
+    /// | 2 | `rmp` #966 | The **undo area** (`05-storage-format.md` §12): the `undo.store` delta store and the `commit.store` commit-info store, and `undo_ptr` as the live head of an entity's version chain. A **layout** change. |
+    /// | 3 | `rmp` #967 | A property cell's MVCC header no longer carries its visibility (`D-property-visibility`): the newest value lives in the cell and every older one on the owning entity's undo chain, so `expired_ts` is never stamped on a property cell again. A **meaning** change at identical layout — see below. |
+    ///
+    /// # Why a meaning change bumps the version too
+    ///
+    /// Version 3 adds no field and moves no byte: a version-2 and a version-3 catalog differ only in
+    /// this number. What changed is how a `props.store` cell is *read*. Before #967 a committed
+    /// `REMOVE n.p` was one cell left in use with `expired_ts` stamped and its value intact, and
+    /// visibility came from that header; from #967 the undo chain is the sole oracle and the header is
+    /// not consulted. A version-2 image read by a version-3 build therefore reports every committed
+    /// property removal as a live property — a wrong answer that looks like data, which is worse than
+    /// a failed startup. That is exactly the class of incompatibility this constant exists to express,
+    /// so it is expressed here rather than left to be discovered at query time. The machinery is
+    /// #966's and is merely used: the append-only catalog block that carries the number, and the
+    /// bit-31 tripwire on the head metadata page that makes a pre-#966 build refuse rather than
+    /// misread.
     ///
     /// The version is persisted in the durable catalog (`graphus_storage::Meta`), which is where a
     /// store's version is read from and where the compatibility decision is taken: a store older
-    /// than this constant is **upgraded** on open, and one newer than it is **refused**.
-    pub const FORMAT_VERSION: u32 = 2;
+    /// than this constant is **upgraded** on open — unless the upgrade would change what its data
+    /// means, in which case it is **refused** with a migration route
+    /// (`RecordStore::refuse_legacy_property_tombstones`) — and one newer than it is always refused.
+    pub const FORMAT_VERSION: u32 = 3;
 
     /// Logical database page size in bytes, decoupled from the OS page size
     /// (`04-technical-design.md` §3.1; the default is subject to spike §12 item 4).

@@ -658,6 +658,7 @@ pub(super) fn handle_run<
         pending_row: None,
         pending_error: None,
         seam_error: None,
+        serialization_failure: false,
         started_nanos: started,
         query: query.to_owned(),
         deadline,
@@ -1229,6 +1230,18 @@ pub(super) struct InFlightInline {
     /// invariant), surfaced as the terminal item at finalization — rows precede it, byte-identically
     /// to the single-visit ordering.
     seam_error: Option<GraphusError>,
+    /// Whether this statement's terminal item was a **retriable serialization failure**
+    /// ([`GraphusError::Transaction`]) captured by the write seam (`rmp` #967).
+    ///
+    /// A write-write conflict is refused in two places that agree on the victim — the coordinator's
+    /// first-updater-wins [`LockTable`](graphus_txn::LockTable) and, since `rmp` #967, the store's
+    /// `ensure_no_conflicting_writer` (`D-property-write-conflict`) — and both document the same
+    /// contract: the error is captured "so the caller rolls this transaction back". For an
+    /// auto-commit statement the caller is [`finish_autocommit`], which already does. For an
+    /// EXPLICIT transaction there was no caller at all, so the refused writer stayed open and
+    /// committable; [`finalize_inflight`] now closes that half. See the comment there for the
+    /// committed-data-loss this prevents.
+    serialization_failure: bool,
     /// `clock.now_nanos()` at statement start, for an accurate latency/slow-query log at finish.
     started_nanos: u64,
     /// The query string, kept for the slow-query log at finish.
@@ -1336,6 +1349,11 @@ fn settle_seam_error(inflight: &mut InFlightInline, produced_ok: bool) -> Option
     match inflight.seam_error.take() {
         None => Some(true),
         Some(error) => {
+            // `rmp` #967: remember that this statement died of a RETRIABLE serialization failure, so
+            // `finalize_inflight` can roll an explicit transaction back. Recorded here — the single
+            // point where a seam error becomes the terminal item — so both delivery routes (accepted
+            // now, or parked in `pending_error` and re-offered on a later tick) are covered.
+            inflight.serialization_failure = matches!(error, GraphusError::Transaction(_));
             if inflight.offer_terminal_error(error) {
                 Some(false)
             } else {
@@ -1646,6 +1664,44 @@ fn finalize_inflight<D: BlockDevice, S: LogSink>(
             commit_batch,
         )
     } else {
+        // An EXPLICIT transaction whose statement died of a retriable serialization failure is rolled
+        // back HERE, at statement end (`rmp` #967). Committed-data-loss, measured on
+        // `graphus-dst`'s `isolation::tests::write_write_conflict_is_detected`:
+        //
+        // T1 and T2 both run `MATCH (c:Counter) SET c.v = c.v + 1`. T1 wins the entity — the
+        // coordinator's first-updater-wins `LockTable` grants it the write lock, and (since #967) the
+        // store's `ensure_no_conflicting_writer` names it the holder of the undo chain — so T2's write
+        // is REFUSED with a retriable `GraphusError::Transaction`. But T2's SSI footprint was already
+        // announced (`note_write` records the write marker BEFORE it acquires the lock, and the
+        // predicate pre-image is announced before the store call), so the tracker still believes T2
+        // wrote the node. That phantom write gives T1 an outbound rw-edge, makes T1 a Case-A pivot,
+        // and SSI aborts T1 — the writer that actually succeeded — while T2, whose write never
+        // happened, went on to COMMIT as if it had. Net: neither increment survives and the committed
+        // value silently stays at the pre-image.
+        //
+        // Rolling T2 back at statement end retires its phantom footprint (`TxnCoordinator::abort` →
+        // `SsiTracker::forget` + `LockTable::release_all`), so T1 is no longer a pivot and commits its
+        // increment, and T2's later `COMMIT` correctly fails instead of silently succeeding over a
+        // write the engine refused. That is exactly the contract both refusal sites already document —
+        // `RecordGraph::note_write`: "captures a retriable serialization error **so the caller rolls
+        // this transaction back**" — which had a caller for auto-commit statements
+        // (`finish_autocommit`'s `!produced_ok` arm) and none at all for explicit ones.
+        //
+        // Deliberately narrow: ONLY a retriable `GraphusError::Transaction` from the write seam. Those
+        // are exactly two sites — `RecordGraph::note_write`'s first-updater-wins refusal and
+        // `RecordStore::ensure_no_conflicting_writer` — and no other error the seam can capture carries
+        // that variant (an authorization denial is `Security`, a constraint violation is its own kind,
+        // everything else from the store is `Storage`). Every other statement failure keeps the existing
+        // behaviour: the error is the terminal item and the transaction stays open for the client to
+        // roll back itself.
+        //
+        // Routed through `rollback_tx` rather than a bare `coordinator.rollback`, so this abort keeps
+        // the guarantees a client `ROLLBACK` has: the `catch_recovery` boundary that stops an fsyncgate
+        // panic unwinding the single engine thread (`rmp` #386/#955) and the `degrade_on_incomplete_undo`
+        // flag when the undo does not complete (`rmp` #955).
+        if !produced_ok && inflight.serialization_failure {
+            let _ = super::rollback_tx(coordinator, open, inflight.ticket, metrics, db, degraded);
+        }
         None
     };
 

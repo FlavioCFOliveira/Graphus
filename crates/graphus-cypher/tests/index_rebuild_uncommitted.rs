@@ -2124,3 +2124,91 @@ fn vector_conflict_backoff_drains_at_full_quiescence() {
          throttle is gone (`rmp` #802).",
     );
 }
+
+// =================================================================================================
+// `rmp` #967 — the superset moved, and a refill that reads the CURRENT image loses the older tuple
+// =================================================================================================
+
+/// **THE `rmp` #967 POPULATION SHAPE, as a check.** After the property path moved onto the unified
+/// undo chain, an overwrite is written **in place** and the superseded value descends onto the node's
+/// undo chain. So the live `props.store` cells stopped being a superset: they are the *current* image,
+/// holding only the newest value of each key. A refill that reads them indexes only that value, and
+/// every value an older snapshot — or a rollback — still resolves is indexed nowhere. A seek's
+/// re-check can remove a candidate but never resurrect one, so that row is lost to every future
+/// reader (`rmp` #766 / #765), and for a NODE KEY tree it is worse: the write path's duplicate check
+/// finds no candidate and admits a committed duplicate (`rmp` #683).
+///
+/// The rollback is the shape this pins, and deliberately so. The "older reader" route is **not**
+/// observable here: a reader whose snapshot predates a rebuild declines the rebuilt tree and falls
+/// back to the exact scan (the `rmp` #765 freshness marker), so it answers correctly whatever the
+/// refill did — a test written that way passes with the refill reading the current image and proves
+/// nothing. Verified, not assumed: that variant was written first and passed under the probe below.
+/// A writer's ROLLBACK, by contrast, restores the cell in place *after* the rebuild, so the committed
+/// tuple's only chance of being in the tree was the refill reading it off the undo chain, and the
+/// reader that seeks it is FRESH and does not decline.
+///
+/// This test fails if `stamped_candidates` is switched to the current image, which is how the choice
+/// was verified rather than assumed.
+#[test]
+fn composite_rebuild_keeps_a_rolled_back_tuple_findable() {
+    let mut coord = fresh_coord();
+    run_write(&mut coord, "CREATE (:Person {a: 1, b: 1})");
+    run_write(&mut coord, "CREATE (:Person {a: 9, b: 9})"); // a second row, so a scan is not trivial
+    coord
+        .begin_online_node_composite_index_named(
+            None,
+            "Person",
+            &["a".to_owned(), "b".to_owned()],
+            false,
+        )
+        .expect("declare composite index (a,b)");
+    while coord.advance_index_builds(usize::MAX) {}
+
+    const FIND_OLD_TUPLE: &str = "MATCH (n:Person) WHERE n.a = 1 AND n.b = 1 RETURN n.a AS a";
+
+    // NON-VACUITY: the "seek" arm below must actually be routed to the composite index. Asserting the
+    // catalog is non-empty is not enough — the planner has to CHOOSE the composite seek, or this test
+    // compares the scan against itself and stays green through any refill defect at all.
+    let seek_plan = format!("{:?}", compile(FIND_OLD_TUPLE, &coord.catalog()));
+    assert!(
+        seek_plan.contains("NodeCompositeIndexSeek"),
+        "vacuous: the planner did not route to the composite index, so the `seek` arm below is an \
+         ordinary scan. Plan was: {seek_plan}",
+    );
+
+    // An OPEN writer overwrites `a` IN PLACE. The live cell now reads `a = 2`; the committed value `1`
+    // survives only as a `SetProperty` delta on the node's undo chain.
+    let writer = coord.begin_serializable();
+    let _ = run_plan(
+        &coord,
+        writer,
+        &compile(
+            "MATCH (n:Person) WHERE n.a = 1 SET n.a = 2",
+            &IndexCatalog::empty(),
+        ),
+    );
+
+    // An unrelated index DDL wipes every tree and refills them from the store, with no snapshot.
+    coord
+        .create_node_property_index("Person", "unrelated")
+        .expect("unrelated create index drives the rebuild");
+
+    // The writer ROLLS BACK: the cell is restored to `a = 1` in place. The tree is not rebuilt, so the
+    // committed tuple is in it only if the refill read the node's undo chain.
+    coord.rollback(writer).expect("writer rolls back");
+
+    // A FRESH reader — its snapshot post-dates the rebuild, so it does not decline the tree.
+    let reader = coord.begin_serializable();
+    let (seek, scan) = seek_vs_scan(&coord, reader, FIND_OLD_TUPLE);
+    assert_eq!(
+        scan, 1,
+        "ground truth broken: after the rollback the committed tuple (1,1) must be visible",
+    );
+    assert_eq!(
+        seek, scan,
+        "the refill read the CURRENT image, so it indexed only the writer's uncommitted tuple (2,1) \
+         and the committed tuple (1,1) is indexed nowhere; the rollback restored the record but \
+         nothing restores the index entry: composite index seek returned {seek}, the \
+         snapshot-correct scan returned {scan} (`rmp` #967)",
+    );
+}

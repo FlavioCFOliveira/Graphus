@@ -7,7 +7,11 @@ use std::collections::BTreeMap;
 use graphus_bulk::{BulkImporter, DEFAULT_BATCH_SIZE, dump_nodes, dump_relationships};
 use graphus_core::Value;
 use graphus_io::MemBlockDevice;
-use graphus_storage::check::verify_on_open;
+// The importer's stores are verified WARM: nothing flushes them between `finish()` and the check,
+// so their buffer pools hold dirty resident pages by construction (write-back is deferred to a
+// checkpoint). `verify_warm` is the structural entry point for exactly that; `verify_on_open` is the
+// COLD-open startup hook and asserts the opposite precondition under `--features check-cold-assert`.
+use graphus_storage::check::verify_warm;
 use graphus_storage::{Namespace, RecordStore};
 use graphus_wal::{MemLogSink, WalManager};
 
@@ -158,7 +162,7 @@ fn imports_typed_nodes_and_relationships() {
     assert_eq!(stats.properties, 9);
 
     // The store is internally consistent (the inviolable ACID gate).
-    verify_on_open(&mut store, &[]).expect("store consistent after import");
+    verify_warm(&mut store, &[]).expect("store consistent after import");
 
     // Alice's node carries the typed properties.
     let shapes = node_shapes(&mut store);
@@ -308,7 +312,7 @@ fn measures_initial_load_throughput() {
 
     assert_eq!(stats.nodes, N as u64, "all nodes ingested");
     assert_eq!(stats.relationships, (N - 1) as u64, "all rels ingested");
-    verify_on_open(&mut store, &[]).expect("store consistent after bulk load");
+    verify_warm(&mut store, &[]).expect("store consistent after bulk load");
 
     // The store really holds them.
     assert_eq!(store.scan_node_ids().expect("scan").len(), N);
@@ -360,7 +364,7 @@ fn dump_import_round_trips_to_an_identical_graph() {
     imp1.import_relationships(rels.as_bytes())
         .expect("import rels");
     let (mut original, _stats) = imp1.finish();
-    verify_on_open(&mut original, &[]).expect("original consistent");
+    verify_warm(&mut original, &[]).expect("original consistent");
     let before = graph_snapshot(&mut original);
 
     // Dump it to CSV.
@@ -376,7 +380,7 @@ fn dump_import_round_trips_to_an_identical_graph() {
     imp2.import_relationships(rel_csv.as_slice())
         .expect("re-import rels");
     let (mut restored, _stats) = imp2.finish();
-    verify_on_open(&mut restored, &[]).expect("restored consistent");
+    verify_warm(&mut restored, &[]).expect("restored consistent");
     let after = graph_snapshot(&mut restored);
 
     // The two graphs are identical: same node shapes (labels + props) and same relationship shapes
@@ -426,7 +430,7 @@ fn persist_id_stores_the_external_id_as_a_named_string_property() {
     imp.import_relationships(rels.as_bytes())
         .expect("import rels");
     let (mut store, stats) = imp.finish();
-    verify_on_open(&mut store, &[]).expect("consistent");
+    verify_warm(&mut store, &[]).expect("consistent");
 
     // Two nodes, each carrying `name` + the persisted `personId` → 4 property writes total.
     assert_eq!(stats.nodes, 2);

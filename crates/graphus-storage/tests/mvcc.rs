@@ -260,9 +260,16 @@ fn gc_freezes_committed_headers_and_prunes_the_transaction_table() {
         report.reclaimed, 0,
         "watermark 1 protects the t2 tombstones"
     );
-    // Frozen words: a.xmin, b.xmin, r.xmin, r.xmax, p1.xmin, p1.xmax, p2.xmin.
+    // Frozen words: a.xmin, b.xmin, r.xmin, r.xmax, cell.xmin.
+    //
+    // Five, not the pre-`rmp` #967 seven. The overwrite no longer produces a second property record
+    // with its own `xmin` plus an `xmax` on the first: it rewrites ONE cell in place, and a property
+    // operation never stamps `xmax` at all (`D-property-removal`). The subject of this test — that
+    // the freeze sweep settles EVERY committed stamp across every record kind, and that the prune is
+    // scheduled for exactly the writers it froze — is unchanged, and the property half of it is
+    // asserted below on the surviving cell.
     assert_eq!(
-        report.frozen, 7,
+        report.frozen, 5,
         "every committed stamp across all record kinds froze"
     );
     assert_eq!(report.prune_scheduled, 2, "t1 and t2 scheduled for pruning");
@@ -286,18 +293,21 @@ fn gc_freezes_committed_headers_and_prunes_the_transaction_table() {
         VersionStamp::from_raw(rel.mvcc.expired_ts),
         VersionStamp::Committed(Timestamp(2))
     );
-    let old_prop = s.property(p1).unwrap();
+    // The property cell: ONE record, rewritten in place, so `p1 == p2` and its `xmin` carries the
+    // overwriting transaction. Its `xmax` is `0` and stays `0` for ever — the retired tombstone.
     assert_eq!(
-        VersionStamp::from_raw(old_prop.mvcc.created_ts),
-        VersionStamp::Committed(Timestamp(1))
+        p1, p2,
+        "the overwrite reuses the cell rather than allocating"
+    );
+    let cell = s.property(p1).unwrap();
+    assert_eq!(
+        VersionStamp::from_raw(cell.mvcc.created_ts),
+        VersionStamp::Committed(Timestamp(2)),
+        "the cell's creator stamp froze to the overwriting transaction's commit ts"
     );
     assert_eq!(
-        VersionStamp::from_raw(old_prop.mvcc.expired_ts),
-        VersionStamp::Committed(Timestamp(2))
-    );
-    assert_eq!(
-        VersionStamp::from_raw(s.property(p2).unwrap().mvcc.created_ts),
-        VersionStamp::Committed(Timestamp(2))
+        cell.mvcc.expired_ts, 0,
+        "a property operation never stamps `xmax` after `rmp` #967"
     );
 
     // (ii) The table shrank to exactly the writers not yet frozen: only the GC transaction itself.
@@ -317,8 +327,13 @@ fn gc_freezes_committed_headers_and_prunes_the_transaction_table() {
     let report = s.gc(t4, latest).unwrap();
     s.commit(t4).unwrap();
     assert_eq!(
-        report.reclaimed, 2,
-        "the rel tombstone and the old property version"
+        report.reclaimed, 1,
+        "the rel tombstone; the old property value is no longer a RECORD to reclaim — it is a delta \
+         on node a's undo chain, counted by `undo_deltas_reclaimed`"
+    );
+    assert!(
+        report.undo_deltas_reclaimed > 0,
+        "and that chain IS reclaimed by the same pass: {report:?}"
     );
     assert_eq!(report.prune_scheduled, 1, "the previous GC writer (t3)");
     assert_eq!(s.commit_registry().len(), 1, "only t4 remains");

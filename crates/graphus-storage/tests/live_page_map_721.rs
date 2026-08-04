@@ -32,7 +32,7 @@
 
 use graphus_core::{TxnId, Value};
 use graphus_io::MemBlockDevice;
-use graphus_storage::{Namespace, RecordStore};
+use graphus_storage::{Namespace, RecordStore, StoreKind};
 use graphus_wal::{MemLogSink, WalManager};
 
 fn fresh(cap: usize) -> RecordStore<MemBlockDevice, MemLogSink> {
@@ -100,20 +100,29 @@ fn reader_view_follows_rel_chain_onto_a_page_allocated_after_its_snapshot() {
     );
 }
 
-/// The property-chain face of #721: `SET n.hot = ...` writes a new property version and re-points
-/// `node.first_prop` at it. A reader holding a pre-growth view follows that live pointer onto a
-/// **newly allocated** prop-store page.
+/// The property-chain face of #721: a writer that adds properties re-points `node.first_prop` at a
+/// record on a **newly allocated** prop-store page, which a reader holding a pre-growth view must
+/// still be able to locate.
 ///
 /// Pre-fix this fails with `Storage("Prop store page N not allocated")`.
+///
+/// # Re-armed for `rmp` #967
+///
+/// This test used to churn ONE key 600 times, relying on the pre-#967 write path allocating a fresh
+/// `props.store` record per `SET`. After #967 that loop rewrites a single cell in place and allocates
+/// **nothing**, so the store never grows and the #721 hazard is never exercised — the test would
+/// still pass, while proving nothing. It now writes 600 **distinct** keys, which genuinely grows the
+/// store, and asserts the growth crossed a device-page boundary before the reader walks. Without
+/// that assertion the re-arming would itself be unverified.
 #[test]
 fn reader_view_follows_prop_chain_onto_a_page_allocated_after_its_snapshot() {
     let mut s = fresh(512);
 
     let txn = TxnId(1);
     s.begin(txn);
-    let key = s.intern_token(Namespace::PropKey, "hot").unwrap();
+    let key0 = s.intern_token(Namespace::PropKey, "k0").unwrap();
     let (node, _) = s.create_node(txn).unwrap();
-    s.set_node_property_value(txn, node, key, &Value::Integer(0))
+    s.set_node_property_value(txn, node, key0, &Value::Integer(0))
         .unwrap();
     s.commit(txn).unwrap();
 
@@ -123,24 +132,39 @@ fn reader_view_follows_prop_chain_onto_a_page_allocated_after_its_snapshot() {
         .superset_scan_node_properties(node)
         .expect("baseline chain");
     assert_eq!(before.len(), 1, "one live property to start with");
+    // The page map is shared LIVE (that is the #721 fix), so this handle tracks the writer's growth.
+    let pages_before = view.meta().store(StoreKind::Prop).device_pages.len();
 
-    // (2) The writer churns the property. Per-value MVCC makes every `SET` a tombstone + a fresh
-    // version, so the prop store grows monotonically and `node.first_prop` chases the newest record.
+    // (2) The writer adds 600 DISTINCT keys, so the prop store grows monotonically and
+    // `node.first_prop` chases the newest record onto pages the reader never saw.
     for i in 1..600i64 {
         let txn = TxnId(100 + i as u64);
         s.begin(txn);
+        let key = s
+            .intern_token(Namespace::PropKey, &format!("k{i}"))
+            .unwrap();
         s.set_node_property_value(txn, node, key, &Value::Integer(i))
             .unwrap();
         s.commit(txn).unwrap();
     }
 
-    // (3) The pre-growth reader walks the property chain. It must not fail.
+    // NON-VACUITY: the hazard only exists if the store actually grew onto new device pages.
+    let pages_after = view.meta().store(StoreKind::Prop).device_pages.len();
+    assert!(
+        pages_after > pages_before,
+        "the prop store must have crossed a device-page boundary for this test to exercise \
+         anything: {pages_before} -> {pages_after} pages",
+    );
+
+    // (3) The pre-growth reader walks the property chain. It must not fail, and it must reach every
+    // record the writer added.
     let walked = view
         .superset_scan_node_properties(node)
         .expect("a concurrent writer growing the prop store must never fail a reader's chain walk");
-    assert!(
-        !walked.is_empty(),
-        "the chain walk must still reach the property records"
+    assert_eq!(
+        walked.len(),
+        600,
+        "the walk must reach every cell, including those on post-snapshot pages",
     );
 }
 
@@ -166,7 +190,7 @@ fn reader_view_follows_overflow_chain_onto_a_page_allocated_after_its_snapshot()
 
     let view = s.read_view();
     let before = view.superset_scan_node_properties(node).unwrap();
-    let (_, p0) = before.every_version()[0];
+    let (_, p0) = before.cells_ignoring_history()[0];
     view.decode_property_value(p0.type_tag, p0.value_inline)
         .expect("baseline overflow decode");
 
@@ -184,8 +208,17 @@ fn reader_view_follows_overflow_chain_onto_a_page_allocated_after_its_snapshot()
     let walked = view
         .superset_scan_node_properties(node)
         .expect("prop chain walk");
-    for (pid, prop) in walked.every_version() {
-        view.decode_property_value(prop.type_tag, prop.value_inline)
-            .unwrap_or_else(|e| panic!("overflow decode of prop {pid} failed: {e}"));
+    // Every CANDIDATE, not merely every cell: after `rmp` #967 the historical values live on the
+    // undo chain, and their `strings.store` chains are exactly the ones that sit on pages allocated
+    // after the reader's snapshot. Decoding only the cell would walk one chain and miss the hazard.
+    let candidates: Vec<_> = walked.candidates().collect();
+    assert!(
+        candidates.len() > 1,
+        "the churn must leave historical values on the undo chain: found {} candidates",
+        candidates.len(),
+    );
+    for c in candidates {
+        view.decode_property_value(c.type_tag, c.value_inline)
+            .unwrap_or_else(|e| panic!("overflow decode of {:?} failed: {e}", c.source));
     }
 }

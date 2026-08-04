@@ -85,6 +85,20 @@ impl StoreReadSource for Counting<'_> {
     ) -> Result<SupersetProperties, graphus_core::error::GraphusError> {
         self.inner.superset_scan_rel_properties(id)
     }
+    fn decision_scan_node_properties(
+        &self,
+        id: u64,
+        snapshot: graphus_txn::Snapshot,
+    ) -> Result<graphus_storage::DecidedProperties, graphus_core::error::GraphusError> {
+        self.inner.decision_scan_node_properties(id, snapshot)
+    }
+    fn decision_scan_rel_properties(
+        &self,
+        id: u64,
+        snapshot: graphus_txn::Snapshot,
+    ) -> Result<graphus_storage::DecidedProperties, graphus_core::error::GraphusError> {
+        self.inner.decision_scan_rel_properties(id, snapshot)
+    }
     fn incident_rels(&self, id: u64) -> Result<Vec<u64>, graphus_core::error::GraphusError> {
         self.inner.incident_rels(id)
     }

@@ -101,6 +101,7 @@ fn seed(handle: &EngineHandle) {
             vec![],
             true,
             None,
+            None,
         )
         .expect("seed runs");
     while let Ok(Some(_)) = reply.rows.next() {}
@@ -116,6 +117,7 @@ fn probe_count(handle: &EngineHandle) -> Option<i64> {
             "MATCH (n:N) RETURN count(n) AS c".to_owned(),
             vec![],
             true,
+            None,
             None,
         )
         .ok()?;
@@ -198,6 +200,7 @@ fn engine_survives_panic_during_resumed_batch() {
             ),
             vec![],
             false,
+            None,
             None,
         )
         .expect("the RUN reply arrives before the first row (sent up front)");

@@ -418,20 +418,140 @@ fn active_writer_holds_newest_covered(
             .iter()
             .find(|(_, prop)| prop.key == key)
             .and_then(|(_, prop)| {
-                // BOTH MVCC stamps, because both halves of an uncommitted change hide behind a different
-                // one. `created_ts` catches `SET n.p = …`: the writer PREPENDS a new version, so its
-                // dirty value is the chain head. `expired_ts` catches `REMOVE n.p`: the writer
-                // TOMBSTONES in place WITHOUT prepending (`remove_node_property_value`), so the head is
-                // still the committed record and only its expiry stamp names the writer.
+                // BOTH MVCC stamps, because before `rmp` #967 each half of an uncommitted change hid
+                // behind a different one. `created_ts` caught `SET n.p = …` (the writer PREPENDED a new
+                // version, so its dirty value was the chain head); `expired_ts` caught `REMOVE n.p` (the
+                // writer TOMBSTONED in place WITHOUT prepending, so the head was still the committed
+                // record and only its expiry stamp named the writer). Checking `created_ts` alone left
+                // the removal half of this window open — MEASURED: the build baked the doomed value, and
+                // once the removal committed the index kept matching a term the entity no longer has.
                 //
-                // Checking `created_ts` alone left the removal half of this window open — MEASURED: the
-                // build baked the doomed value, and once the removal committed the index kept matching a
-                // term the entity no longer has. Same unrepairable wrong row, since the consumer
-                // re-checks visibility + label but never terms.
+                // After `rmp` #967 BOTH halves restamp `created_ts` of the SAME cell: a `SET` rewrites it
+                // in place and a `REMOVE` empties it in place (`D-property-removal`), and a property
+                // operation never writes `expired_ts` again. So `created_ts` alone would now suffice and
+                // `expired_ts` is always `0` here; the second probe is kept because it costs one compare
+                // against a word that is now invariantly zero and it fails closed against any older store
+                // image (or any future path) that still carries an expiry stamp on a property cell.
                 held_by_active(prop.mvcc.created_ts)
                     .or_else(|| held_by_active(prop.mvcc.expired_ts))
             })
     })
+}
+
+/// One candidate value of one property together with the **validity interval** the composite build
+/// needs, reconstructed from the entity's undo chain (`rmp` #967).
+///
+/// The stamps are raw [`VersionStamp`] words in exactly the encoding
+/// [`visible_instant_range`] resolves, so a `StampedCandidate` is a drop-in for the pre-#967
+/// `PropRecord` + `MvccHeader` pair the composite sweep used to read.
+struct StampedCandidate {
+    key: u32,
+    type_tag: u8,
+    value_inline: u64,
+    /// Stamp of the transaction that INSTALLED this value.
+    xmin: u64,
+    /// Stamp of the transaction that REPLACED it; `0` = still current.
+    xmax: u64,
+}
+
+/// The **superset** of one entity's property values with each value's validity interval —
+/// the composite-index build's read after the property path moved onto the undo chain (`rmp` #967).
+///
+/// # Why the intervals have to be reconstructed rather than dropped
+///
+/// [`SupersetProperties::candidates`] is the plain superset: every value the entity holds or has
+/// held, with no stamps. That is exactly right for a structure that indexes each value
+/// independently (text, spatial), but a **composite** index indexes *tuples*, and a tuple is only
+/// observable if its members were current **at one common instant**. Handing the sweep a stampless
+/// candidate set would leave only two options, both bad: collapse to one value per key, which drops
+/// every tuple an older snapshot needs (the `rmp` #766 / #683 loss — a missing NODE KEY candidate
+/// makes the write path's duplicate check find nothing and ADMIT a committed duplicate), or emit the
+/// Cartesian product of the per-key candidate sets, which is `O(V^k)` where the interval
+/// construction is `O(V)` (see [`composite_candidate_tuples`], whose whole `rmp` #774 rework exists
+/// to keep that term linear).
+///
+/// So this rebuilds the intervals from the chain, which loses nothing: an entity holds exactly one
+/// value per key at any instant, so the observable tuples are still precisely the per-instant ones.
+///
+/// # The reconstruction rule
+///
+/// A `SetProperty` delta carries the value the key held **before** the write that pushed it, so on a
+/// chain read newest-first (`d1`, `d2`, … with commit stamps `S1 >= S2 >= …`, the ordering the
+/// entity-granularity conflict check `D-property-write-conflict` guarantees and the consistency
+/// checker re-verifies):
+///
+/// * the **live cell**'s value was installed by `d1`'s writer and is current, so `(xmin, xmax) =
+///   (cell.created_ts, 0)` — every write restamps the cell's `created_ts` in place, so that word is
+///   the installing writer's stamp even though the value itself is written in place;
+/// * `d_i`'s value was installed by `d_{i+1}`'s writer and ended when `d_i`'s writer committed, so
+///   `(xmin, xmax) = (S_{i+1}, S_i)`;
+/// * the **oldest** retained delta for a key has no `S_{i+1}` on the chain — the write that
+///   installed its value has already been reclaimed — so `xmin` falls back to `entity_created_ts`,
+///   a stamp that is always a lower bound for any value the entity ever held. That widens the
+///   interval, which is the safe direction: the sweep fills instants newest-first, so a wider older
+///   interval can only paint instants no newer version claimed. Extra tuples are false positives a
+///   seek's re-check drops; a missing one is unrecoverable.
+///
+/// Corpse deltas and deltas whose commit slot is a corpse are skipped entirely (their transaction
+/// aborted, so neither their value nor their stamp ever bounded anything) — the same rule
+/// [`SupersetProperties::candidates`] applies, kept identical here on purpose.
+fn stamped_candidates(chain: &SupersetProperties, entity_created_ts: u64) -> Vec<StampedCandidate> {
+    let cells = chain.cells_ignoring_history();
+    let mut out: Vec<StampedCandidate> = Vec::with_capacity(cells.len() + chain.history_len());
+    let mut seen_keys: Vec<u32> = Vec::with_capacity(cells.len());
+    for &(_pid, cell) in cells {
+        if seen_keys.contains(&cell.key) {
+            // A healthy post-#967 store holds ONE cell per key (the checker reports a second as a
+            // fault); resolving to the chain head keeps an older store image readable rather than
+            // doubling the key.
+            continue;
+        }
+        seen_keys.push(cell.key);
+        if cell.type_tag == TYPE_TAG_ABSENT {
+            continue; // the key is currently absent — no value, but its history may still hold some
+        }
+        out.push(StampedCandidate {
+            key: cell.key,
+            type_tag: cell.type_tag,
+            value_inline: cell.value_inline,
+            xmin: cell.mvcc.created_ts,
+            xmax: 0,
+        });
+    }
+    // `pending[i] = (key, index into out)`: a delta-sourced value whose `xmin` is still the
+    // `entity_created_ts` fallback and will be corrected by the next older write of the same key.
+    let mut pending: Vec<(u32, usize)> = Vec::new();
+    for entry in chain.history() {
+        if !entry.delta.in_use() {
+            continue; // a corpse: its transaction aborted, so this write never happened
+        }
+        let Some(slot) = entry.slot.filter(|s| s.in_use()) else {
+            continue; // an unresolvable or aborted writer — same treatment as a corpse delta
+        };
+        if entry.delta.action != UndoAction::SetProperty {
+            continue; // changes no property (it still participates in the chain's ordering)
+        }
+        let key = entry.delta.token;
+        // This delta's writer INSTALLED the value recorded above it for `key`.
+        if let Some(pos) = pending.iter().position(|(k, _)| *k == key) {
+            let (_, idx) = pending.remove(pos);
+            out[idx].xmin = slot.commit_ts;
+        }
+        if entry.delta.type_tag == TYPE_TAG_ABSENT {
+            // "the key was absent before this write": no candidate value, but the bound it just set
+            // on the value above it is real.
+            continue;
+        }
+        out.push(StampedCandidate {
+            key,
+            type_tag: entry.delta.type_tag,
+            value_inline: entry.delta.value_inline,
+            xmin: entity_created_ts,
+            xmax: slot.commit_ts,
+        });
+        pending.push((key, out.len() - 1));
+    }
+    out
 }
 
 /// Equivalence guard for the `rmp` #774 merge-sweep: `composite_candidate_tuples` must produce the SAME
@@ -746,11 +866,13 @@ use graphus_index::histogram::PropertyHistogram;
 use graphus_index::keycodec::encode_equality_canonical;
 use graphus_index::{Similarity, VectorIndexError};
 use graphus_io::BlockDevice;
+use graphus_storage::undo::{TYPE_TAG_ABSENT, UndoAction};
 use graphus_storage::{
     CompositeIndexEntry, ConstraintEntry, ConstraintKind, ConstraintTypeDescriptor,
     DecidedProperties, FulltextEntity, FulltextIndexEntry, GcPassReport, IndexState, Namespace,
     PropRecord, RecordStore, RelCompositeIndexEntry, SpatialEntity, SpatialIndexEntry,
-    StoreReadView, TextIndexEntry, TokenSnapshot, VectorEntity, VectorIndexEntry, VectorSimilarity,
+    StoreReadView, SupersetProperties, TextIndexEntry, TokenSnapshot, VectorEntity,
+    VectorIndexEntry, VectorSimilarity,
 };
 use graphus_txn::{
     CommitRegistry, IsolationLevel, LockTable, PredicateRead, Snapshot, SsiReadBuffer, SsiTracker,
@@ -2786,13 +2908,21 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         id: u64,
         registered: &[(u32, Vec<u32>)],
     ) {
-        // The node's label tokens + EVERY version of its properties (with MVCC stamps), read in one
-        // store-borrow scope. Read-only: `node_label_superset` / `node_properties` are `&self`
-        // (`rmp` #337 Slice 2). `superset_scan_node_properties` is used rather than
-        // `superset_scan_node_property_values` because the latter strips the stamps, and the
-        // per-view tuple construction below needs them (`rmp` task #766). The membership gate is
-        // the LIVE-OR-RETAINED label superset, never the raw live word (`rmp` task #904) — see
-        // `RecordStore::node_label_superset`.
+        // The node's label tokens + EVERY candidate value of its properties (with the validity
+        // interval each one is observable over), read in one store-borrow scope. Read-only:
+        // `node_label_superset` / `superset_scan_node_properties` are `&self` (`rmp` #337 Slice 2).
+        //
+        // POLARITY — SUPERSET (`rmp` #766, #967). `superset_scan_node_properties` +
+        // [`stamped_candidates`] rather than `cells_ignoring_history`: after `rmp` #967 an overwrite
+        // is written IN PLACE and the old value descends onto the node's undo chain, so the live
+        // cells are the CURRENT image and reading only them would silently drop every tuple an older
+        // snapshot still needs — and for a NODE KEY that means the write path's duplicate check finds
+        // nothing and ADMITS a committed duplicate (`rmp` #683 / #765). It is also not
+        // `SupersetProperties::candidates`, which strips the stamps the per-view tuple construction
+        // needs; see [`stamped_candidates`] for why a composite build cannot drop them.
+        //
+        // The membership gate is the LIVE-OR-RETAINED label superset, never the raw live word
+        // (`rmp` task #904) — see `RecordStore::node_label_superset`.
         let (label_tokens, props, registry): (Vec<u32>, Vec<(u32, PropVersion)>, CommitRegistry) = {
             let store = store.borrow();
             let labels = match store.node_label_superset(id) {
@@ -2805,8 +2935,17 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     return;
                 }
             };
+            // The node's own creation stamp is the `xmin` floor for a value whose installing write
+            // has already been reclaimed off the undo chain (see [`stamped_candidates`]).
+            let created_ts = match store.node(id) {
+                Ok(rec) => rec.mvcc.created_ts,
+                Err(_) => {
+                    Self::note_rebuild_gap(index);
+                    return;
+                }
+            };
             let chain = match store.superset_scan_node_properties(id) {
-                Ok(chain) => chain.into_every_version(),
+                Ok(chain) => stamped_candidates(&chain, created_ts),
                 Err(_) => {
                     // `rmp` task #733: record the gap instead of hiding it — an entity missing from
                     // the index is a candidate a seek can never resurrect, so the build that drove
@@ -2816,13 +2955,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 }
             };
             let mut props: Vec<(u32, PropVersion)> = Vec::with_capacity(chain.len());
-            for (_pid, prop) in chain {
-                match store.decode_property_value(prop.type_tag, prop.value_inline) {
+            for cand in chain {
+                match store.decode_property_value(cand.type_tag, cand.value_inline) {
                     Ok(value) => props.push((
-                        prop.key,
+                        cand.key,
                         PropVersion {
-                            xmin: prop.mvcc.created_ts,
-                            xmax: prop.mvcc.expired_ts,
+                            xmin: cand.xmin,
+                            xmax: cand.xmax,
                             value,
                         },
                     )),
@@ -3081,13 +3220,26 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         {
             return;
         }
-        // EVERY version of the relationship's properties, with MVCC stamps (`rmp` task #766):
-        // `rel_properties` rather than `superset_scan_rel_property_values`, which strips the stamps
+        // POLARITY — SUPERSET (`rmp` #766, #967), the relationship twin of
+        // `index_one_node_composite`: EVERY candidate value of the relationship's properties with the
+        // validity interval each is observable over. `superset_scan_rel_properties` +
+        // [`stamped_candidates`] rather than the live cells (which after `rmp` #967 are only the
+        // CURRENT image, so a REL KEY would lose the candidate that catches a committed duplicate —
+        // `rmp` #683) and rather than `superset_scan_rel_property_values`, which strips the stamps
         // the per-view tuple construction needs.
         let (props, registry): (Vec<(u32, PropVersion)>, CommitRegistry) = {
             let store = store.borrow();
+            // The relationship's own creation stamp is the `xmin` floor for a value whose installing
+            // write has already been reclaimed off the undo chain (see [`stamped_candidates`]).
+            let created_ts = match store.rel(id) {
+                Ok(rec) => rec.mvcc.created_ts,
+                Err(_) => {
+                    Self::note_rebuild_gap(index);
+                    return;
+                }
+            };
             let chain = match store.superset_scan_rel_properties(id) {
-                Ok(chain) => chain.into_every_version(),
+                Ok(chain) => stamped_candidates(&chain, created_ts),
                 Err(_) => {
                     // a non-storable / read fault: skip this relationship's properties.
                     // `rmp` task #733: record the gap instead of hiding it — an entity missing from
@@ -3098,13 +3250,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 }
             };
             let mut out: Vec<(u32, PropVersion)> = Vec::with_capacity(chain.len());
-            for (_pid, prop) in chain {
-                match store.decode_property_value(prop.type_tag, prop.value_inline) {
+            for cand in chain {
+                match store.decode_property_value(cand.type_tag, cand.value_inline) {
                     Ok(value) => out.push((
-                        prop.key,
+                        cand.key,
                         PropVersion {
-                            xmin: prop.mvcc.created_ts,
-                            xmax: prop.mvcc.expired_ts,
+                            xmin: cand.xmin,
+                            xmax: cand.xmax,
                             value,
                         },
                     )),
@@ -3171,16 +3323,21 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ) {
         // Read the node's label-membership SUPERSET (`rmp` task #904 — the live word unioned with every
         // bitmap `LabelHistory` retains, never the raw live word; see
-        // `RecordStore::node_label_superset`), the covered full-text keys, its STAMPED property chain
-        // (newest-first) and the commit registry in one shared borrow scope (`node_label_superset` /
-        // `node_properties` are `&self`, `rmp` #337 Slice 2). The chain carries MVCC stamps
-        // (`node_properties`, not `superset_scan_node_property_values`) because the #778 gate below
-        // must resolve the newest version's writer.
+        // `RecordStore::node_label_superset`), the covered full-text keys and its live property CELLS
+        // in one shared borrow scope (`node_label_superset` / `superset_scan_node_properties` are
+        // `&self`, `rmp` #337 Slice 2).
         //
-        // Widening only the LABEL component is sound here even though this consumer re-checks no term:
-        // `RecordStoreGraph::fulltext_query` re-checks a hit's visibility and current label
-        // (`filter_any_label_candidates`), so a document indexed under a label the node does not carry
-        // at the reader's snapshot is dropped whole.
+        // POLARITY — CURRENT IMAGE, deliberately (`cells_ignoring_history`, `rmp` #778 option (b),
+        // #967). A full-text document is indexed WHOLE, and `fulltext_query` re-checks a hit's
+        // visibility and current label but NEVER its terms, so a term unioned in from an older version
+        // is a wrong row the consumer cannot drop — the opposite of the text / spatial grids, which
+        // index each value independently and therefore DO take the union (`rmp` #773 / #779). This
+        // build has never been a superset for that reason; what makes it safe is the in-flight-writer
+        // gate below, which refuses to bake at all while the newest version of a covered key is
+        // uncommitted. `cells_ignoring_history` is the read that expresses exactly that image: after
+        // `rmp` #967 the live cells ARE the current value of every key (an overwrite rewrites the cell
+        // in place, a removal empties it), and it keeps the EMPTY cells the gate below needs — which
+        // `SupersetProperties::candidates` drops, taking the removal half of the gate's window with it.
         let (label_tokens, covered, chain) = {
             let store = store.borrow();
             let label_tokens = match store.node_label_superset(id) {
@@ -3197,7 +3354,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 .borrow()
                 .fulltext_covered_keys_for_labels(&label_tokens);
             let chain = match store.superset_scan_node_properties(id) {
-                Ok(chain) => chain.into_every_version(),
+                Ok(chain) => chain.cells_ignoring_history().to_vec(),
                 Err(_) => {
                     Self::note_rebuild_gap(index);
                     return;
@@ -3230,12 +3387,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             //    non-string the loop walked on and indexed an OLDER string version of that same key:
             //    `SET n.title = 42` over a committed `'alpha'` left the index still matching `'alpha'`.
             //    A key is settled by its newest version whatever that version's type.
-            // 2. A COMMITTED REMOVAL IS NOT PART OF THE STATE. `node_properties` returns every `in_use`
-            //    record, and a tombstone keeps its slot until GC reclaims it — which has no automatic
-            //    trigger (`rmp` #305) — so a removed property's value stayed indexable indefinitely:
-            //    `REMOVE n.title` committed, then any rebuild re-baked `'alpha'`. A non-zero `expired_ts`
-            //    means this version was removed; the still-in-flight case is already parked by the
-            //    conflict gate above, so reaching here with one set means the remover committed.
+            // 2. A COMMITTED REMOVAL IS NOT PART OF THE STATE. A removed property's value must not stay
+            //    indexable: `REMOVE n.title` committed, then any rebuild re-baked `'alpha'`. Before
+            //    `rmp` #967 the removal was an in-place TOMBSTONE, so a non-zero `expired_ts` was the
+            //    signal; after #967 (`D-property-removal`) it is the cell rewritten in place to the
+            //    EMPTY form, so the signal is `type_tag == TYPE_TAG_ABSENT` and `expired_ts` is never
+            //    written by a property operation again. The still-in-flight case is already parked by
+            //    the conflict gate above, so reaching here with an empty cell means the remover
+            //    committed.
             // 3. FAIL-CLOSED NARROWING. Skipping before the decode means a corrupt SHADOWED or REMOVED
             //    version no longer raises a `rebuild_gap` (`rmp` task #733). Deliberate: only the newest
             //    live version reaches the index, so neither can make the index an inexact image of the
@@ -3246,7 +3405,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     continue;
                 }
                 seen.push(prop.key);
-                if prop.mvcc.expired_ts != 0 {
+                if prop.type_tag == TYPE_TAG_ABSENT || prop.mvcc.expired_ts != 0 {
                     continue;
                 }
                 match store.decode_property_value(prop.type_tag, prop.value_inline) {
@@ -3274,10 +3433,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         index: &Rc<RefCell<IndexSet>>,
         id: u64,
     ) {
-        // The relationship's type, covered full-text keys, STAMPED property chain and the commit
-        // registry in one shared borrow scope — the relationship twin of `index_one_node_fulltext`
-        // (`rmp` task #778). `rel_properties` (not `superset_scan_rel_property_values`) so the #778
-        // gate can resolve the newest version's writer.
+        // The relationship's type, covered full-text keys and live property CELLS in one shared borrow
+        // scope — the relationship twin of `index_one_node_fulltext` (`rmp` tasks #778, #967), with the
+        // same polarity and the same reason: a full-text document is indexed whole and its consumer
+        // never re-checks terms, so this build bakes the CURRENT image (`cells_ignoring_history`) and
+        // refuses to bake at all while an in-flight writer holds the newest version of a covered key.
+        // Read that method's comment for the full argument, including why the EMPTY cells the gate
+        // needs make `SupersetProperties::candidates` the wrong read here.
         let (type_token, covered, chain) = {
             let store = store.borrow();
             let type_token = match store.rel(id) {
@@ -3294,7 +3456,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 .borrow()
                 .fulltext_rel_covered_keys_for_type(type_token);
             let chain = match store.superset_scan_rel_properties(id) {
-                Ok(chain) => chain.into_every_version(),
+                Ok(chain) => chain.cells_ignoring_history().to_vec(),
                 Err(_) => {
                     Self::note_rebuild_gap(index);
                     return;
@@ -3326,12 +3488,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             //    non-string the loop walked on and indexed an OLDER string version of that same key:
             //    `SET n.title = 42` over a committed `'alpha'` left the index still matching `'alpha'`.
             //    A key is settled by its newest version whatever that version's type.
-            // 2. A COMMITTED REMOVAL IS NOT PART OF THE STATE. `node_properties` returns every `in_use`
-            //    record, and a tombstone keeps its slot until GC reclaims it — which has no automatic
-            //    trigger (`rmp` #305) — so a removed property's value stayed indexable indefinitely:
-            //    `REMOVE n.title` committed, then any rebuild re-baked `'alpha'`. A non-zero `expired_ts`
-            //    means this version was removed; the still-in-flight case is already parked by the
-            //    conflict gate above, so reaching here with one set means the remover committed.
+            // 2. A COMMITTED REMOVAL IS NOT PART OF THE STATE. A removed property's value must not stay
+            //    indexable: `REMOVE n.title` committed, then any rebuild re-baked `'alpha'`. Before
+            //    `rmp` #967 the removal was an in-place TOMBSTONE, so a non-zero `expired_ts` was the
+            //    signal; after #967 (`D-property-removal`) it is the cell rewritten in place to the
+            //    EMPTY form, so the signal is `type_tag == TYPE_TAG_ABSENT` and `expired_ts` is never
+            //    written by a property operation again. The still-in-flight case is already parked by
+            //    the conflict gate above, so reaching here with an empty cell means the remover
+            //    committed.
             // 3. FAIL-CLOSED NARROWING. Skipping before the decode means a corrupt SHADOWED or REMOVED
             //    version no longer raises a `rebuild_gap` (`rmp` task #733). Deliberate: only the newest
             //    live version reaches the index, so neither can make the index an inexact image of the
@@ -3342,7 +3506,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     continue;
                 }
                 seen.push(prop.key);
-                if prop.mvcc.expired_ts != 0 {
+                if prop.type_tag == TYPE_TAG_ABSENT || prop.mvcc.expired_ts != 0 {
                     continue;
                 }
                 match store.decode_property_value(prop.type_tag, prop.value_inline) {
@@ -3637,9 +3801,18 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // TxnOutcome::InFlight`, which is DEAD — always false, since the registry gains an entry only
         // when a transaction *resolves*. That exact confusion is `rmp` #522 and it silently no-opped the
         // pre-#778 full-text gate; re-making it here would no-op this one.
+        //
+        // POLARITY — CURRENT IMAGE for the GATE (`cells_ignoring_history`, `rmp` #967). The question
+        // this read answers is structural: "does a still-open transaction hold the newest version of a
+        // covered key?". After #967 that writer's mark is the CELL's own `created_ts`, restamped in
+        // place by a `SET` and by a `REMOVE` alike, so the gate reads the cells' MVCC headers — one of
+        // the uses `SupersetProperties::cells_ignoring_history` names as legitimate. It is NOT
+        // `candidates`, which drops the EMPTY cell a `REMOVE` leaves behind and would therefore reopen
+        // the removal half of this window; and it is not a snapshot read, because a build has no
+        // snapshot. The VALUES this build bakes are read separately below.
         let conflicted_keys: Vec<u32> = {
             let chain = match store.borrow().superset_scan_node_properties(id) {
-                Ok(chain) => chain.into_every_version(),
+                Ok(chain) => chain.cells_ignoring_history().to_vec(),
                 Err(_) => {
                     Self::note_rebuild_gap(index);
                     return;
@@ -3666,13 +3839,23 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             keys
         };
 
-        // The node's current property values, keyed by prop-key (newest-wins per key), keeping only the
-        // values a registered vector index covers for one of this node's labels. The value type is NOT
-        // pre-filtered here (unlike text/spatial): `insert_vector_value` validates the embedding shape.
+        // The node's current property values, keyed by prop-key, keeping only the values a registered
+        // vector index covers for one of this node's labels. The value type is NOT pre-filtered here
+        // (unlike text/spatial): `insert_vector_value` validates the embedding shape.
+        //
+        // POLARITY — CURRENT IMAGE (`cells_ignoring_history`, `rmp` #967). An HNSW graph holds ONE
+        // embedding per entity, so unlike the text / spatial grids it cannot union versions, and
+        // `rmp` #780 already settled that an entity whose newest covered version is uncommitted is left
+        // out entirely rather than indexed at an older one. After #967 the live cells ARE that current
+        // image; reading `superset_scan_node_property_values` (which now yields the CANDIDATE superset —
+        // cells first, then history) and keeping the first occurrence per key would re-bake a removed
+        // embedding, because `candidates` drops the EMPTY cell a `REMOVE` leaves and the key's first
+        // surviving candidate is then a historical value.
         let mut values: Vec<(u32, Value)> = Vec::new();
         {
-            let chain = match store.borrow_mut().superset_scan_node_property_values(id) {
-                Ok(chain) => chain,
+            let store = store.borrow();
+            let cells = match store.superset_scan_node_properties(id) {
+                Ok(chain) => chain.cells_ignoring_history().to_vec(),
                 Err(_) => {
                     // `rmp` task #733: record the gap instead of hiding it — an entity missing from
                     // the index is a candidate a seek can never resurrect, so the build that drove
@@ -3681,23 +3864,35 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     return;
                 }
             };
-            for (_pid, key, value) in chain {
-                if values.iter().any(|(k, _)| *k == key) {
-                    continue; // newest-wins: keep only the first occurrence of each key.
+            for (_pid, cell) in cells {
+                if cell.type_tag == TYPE_TAG_ABSENT {
+                    continue; // `REMOVE n.p` emptied the cell in place: the key is absent (`rmp` #967)
+                }
+                if values.iter().any(|(k, _)| *k == cell.key) {
+                    continue; // one cell per key in a healthy store; keep the head deterministically
                 }
                 // `rmp` #780: an active writer holds this key's newest version. Indexing ANY version
                 // here would be wrong — the newest is uncommitted, and an older one is not what a
                 // newest-wins graph means — so leave the entity out entirely. The blocker recorded
                 // above makes readers decline this index to the exact scan, which sees the committed
                 // value, so the omission is never observable as a missing row.
-                if conflicted_keys.contains(&key) {
+                if conflicted_keys.contains(&cell.key) {
                     continue;
                 }
-                let used = registered.iter().any(|&(reg_label, prop_key)| {
-                    prop_key == key && label_tokens.contains(&reg_label)
-                });
-                if used {
-                    values.push((key, value));
+                if !registered.iter().any(|&(reg_label, prop_key)| {
+                    prop_key == cell.key && label_tokens.contains(&reg_label)
+                }) {
+                    continue;
+                }
+                // Decoded per COVERED key rather than over the whole chain, which narrows the `rmp` #733
+                // fail-closed surface exactly as `decided_value_for_key` does: an unreadable overflow
+                // chain belonging to a property no vector index covers can no longer block the build.
+                match store.decode_property_value(cell.type_tag, cell.value_inline) {
+                    Ok(value) => values.push((cell.key, value)),
+                    Err(_) => {
+                        Self::note_rebuild_gap(index);
+                        return;
+                    }
                 }
             }
         }
@@ -3741,10 +3936,12 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             }
         };
         // `rmp` task #780 — the relationship twin of the node gate in
-        // [`index_one_node_vector`](Self::index_one_node_vector); see there for the full rationale.
+        // [`index_one_node_vector`](Self::index_one_node_vector); see there for the full rationale,
+        // including why the gate reads the live CELLS' MVCC headers (`cells_ignoring_history`,
+        // `rmp` #967) rather than the candidate superset.
         let conflicted_keys: Vec<u32> = {
             let chain = match store.borrow().superset_scan_rel_properties(id) {
-                Ok(chain) => chain.into_every_version(),
+                Ok(chain) => chain.cells_ignoring_history().to_vec(),
                 Err(_) => {
                     Self::note_rebuild_gap(index);
                     return;
@@ -3769,10 +3966,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             keys
         };
 
+        // POLARITY — CURRENT IMAGE (`cells_ignoring_history`, `rmp` #967): the relationship twin of the
+        // node vector build; see there for why an HNSW graph must read the current image and why the
+        // candidate superset would re-bake a removed embedding.
         let mut values: Vec<(u32, Value)> = Vec::new();
         {
-            let chain = match store.borrow().superset_scan_rel_property_values(id) {
-                Ok(chain) => chain,
+            let store = store.borrow();
+            let cells = match store.superset_scan_rel_properties(id) {
+                Ok(chain) => chain.cells_ignoring_history().to_vec(),
                 Err(_) => {
                     // `rmp` task #733: record the gap instead of hiding it — an entity missing from
                     // the index is a candidate a seek can never resurrect, so the build that drove
@@ -3781,19 +3982,29 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     return;
                 }
             };
-            for (_pid, key, value) in chain {
-                if values.iter().any(|(k, _)| *k == key) {
-                    continue; // newest-wins: keep only the first occurrence of each key.
+            for (_pid, cell) in cells {
+                if cell.type_tag == TYPE_TAG_ABSENT {
+                    continue; // `REMOVE r.p` emptied the cell in place: the key is absent (`rmp` #967)
+                }
+                if values.iter().any(|(k, _)| *k == cell.key) {
+                    continue; // one cell per key in a healthy store; keep the head deterministically
                 }
                 // `rmp` #780: see the node twin — leave a conflicted entity out entirely.
-                if conflicted_keys.contains(&key) {
+                if conflicted_keys.contains(&cell.key) {
                     continue;
                 }
-                let used = registered
+                if !registered
                     .iter()
-                    .any(|&(reg_type, prop_key)| prop_key == key && reg_type == type_token);
-                if used {
-                    values.push((key, value));
+                    .any(|&(reg_type, prop_key)| prop_key == cell.key && reg_type == type_token)
+                {
+                    continue;
+                }
+                match store.decode_property_value(cell.type_tag, cell.value_inline) {
+                    Ok(value) => values.push((cell.key, value)),
+                    Err(_) => {
+                        Self::note_rebuild_gap(index);
+                        return;
+                    }
                 }
             }
         }
@@ -4847,16 +5058,27 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// Re-captures **every declared** columnar column from the current store (`rmp` #329): the
     /// derived analogue of [`rebuild_index`](Self::rebuild_index) for the columnar cache. Each
     /// declared `(label_token, prop_key)` column is rebuilt by scanning the in-use nodes, capturing,
-    /// for every node that currently carries the label and holds an index-stable value of the key, the
-    /// tuple `(node_id, value, prop_pid, node_first_prop)` — the value plus the two staleness witnesses
-    /// the read-time re-check needs.
+    /// for every node that currently carries the label and holds an index-stable value of the key, a
+    /// [`ColumnRow`](crate::column_cache::ColumnRow) — the value plus the staleness witness the
+    /// read-time re-check needs.
     ///
     /// Reads directly off the store with **no MVCC snapshot** (like `rebuild_index`): the cache is a
     /// candidate-class accelerator whose every entry is re-validated at read time, so capturing each
-    /// node's *current newest in-use* value is sufficient — a value that some future reader cannot see
-    /// is harmless (the read-time visibility re-check drops it, falling back to the row read). Store
-    /// read faults on a single node skip that node best-effort (it degrades to the row path for that
-    /// node, never a wrong row). The store and the cache are borrowed in separate scopes.
+    /// node's *current* value is sufficient — a value that some future reader cannot see is harmless
+    /// (the read-time re-check drops it, falling back to the row read). Store read faults on a single
+    /// node skip that node best-effort (it degrades to the row path for that node, never a wrong row).
+    /// The store and the cache are borrowed in separate scopes.
+    ///
+    /// # Polarity — CURRENT IMAGE, and why it may not be the candidate superset (`rmp` #967)
+    ///
+    /// This is one entry per node, keyed by node id, whose witness names a **`props.store` cell**. So
+    /// it must read the live cells (`cells_ignoring_history`), not
+    /// [`SupersetProperties::candidates`]: a candidate may come from the **undo store**, whose
+    /// physical ids live in a different id space, so caching one would make the read-time witness
+    /// probe read `props.store` at an undo-store id. It would also re-bake a **removed** value,
+    /// because `candidates` drops the empty cell a `REMOVE` leaves behind and the key's first
+    /// surviving candidate is then historical. Serving an older snapshot is not this structure's job —
+    /// that reader's witness check fails and it falls back to the authoritative chain read.
     fn rebuild_columns(
         store: &Rc<RefCell<RecordStore<D, S>>>,
         columns: &Rc<RefCell<crate::column_cache::ColumnCache>>,
@@ -4876,12 +5098,15 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         };
 
         // Accumulate each declared column's rows in node-id order (the scan order).
-        let mut per_column: Vec<Vec<(u64, Value, u64, u64)>> =
+        let mut per_column: Vec<Vec<crate::column_cache::ColumnRow>> =
             declared.iter().map(|_| Vec::new()).collect();
 
         for id in node_ids {
-            // Read the node's labels, first_prop chain head, and newest-in-use property values once.
-            let (label_tokens, first_prop, props): (Vec<u32>, u64, Vec<(u64, u32, Value)>) = {
+            // Read the node's labels, first_prop chain head and live property CELLS once. The cells
+            // are kept UNDECODED here: only the declared keys are decoded below, which narrows the
+            // fault surface (an unreadable overflow chain of an undeclared property no longer costs
+            // this node its whole row) and skips the overflow walks for keys no column caches.
+            let (label_tokens, first_prop, cells): (Vec<u32>, u64, Vec<(u64, PropRecord)>) = {
                 // Read-only store access (`rmp` #337 Slice 2): the column rebuild scan only reads.
                 let store = store.borrow();
                 let node = match store.node(id) {
@@ -4897,26 +5122,45 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     Ok(l) => l,
                     Err(_) => continue,
                 };
-                let chain = match store.superset_scan_node_property_values(id) {
-                    Ok(chain) => chain,
+                let cells = match store.superset_scan_node_properties(id) {
+                    Ok(chain) => chain.cells_ignoring_history().to_vec(),
                     Err(_) => continue,
                 };
-                (labels, node.first_prop, chain)
+                (labels, node.first_prop, cells)
             };
 
-            // For each declared column the node matches, capture its newest in-use value of the key.
+            // For each declared column the node matches, capture its current value of the key.
             for (ci, &(label_token, prop_key)) in declared.iter().enumerate() {
                 if !label_tokens.contains(&label_token) {
                     continue;
                 }
-                // `superset_scan_node_property_values` decodes the chain newest-first, so the FIRST
-                // occurrence of the key is the newest in-use version — its pid is the staleness witness.
-                if let Some((pid, _key, value)) = props.iter().find(|(_, key, _)| *key == prop_key)
+                // A healthy post-#967 store holds ONE cell per key, so the first match is the node's
+                // current value; an EMPTY cell means the key was removed in place and the node
+                // contributes no row (`D-property-removal`).
+                let Some(&(pid, cell)) = cells
+                    .iter()
+                    .find(|(_, c)| c.key == prop_key && c.type_tag != TYPE_TAG_ABSENT)
+                else {
+                    continue;
+                };
+                let value = match store
+                    .borrow()
+                    .decode_property_value(cell.type_tag, cell.value_inline)
                 {
-                    // A null value is never stored as a property (Cypher), so any present record holds a
-                    // non-null value; capture it with the witnesses (pid + the node's chain head).
-                    per_column[ci].push((id, value.clone(), *pid, first_prop));
-                }
+                    Ok(v) => v,
+                    Err(_) => continue, // undecodable: this node degrades to the row path
+                };
+                per_column[ci].push(crate::column_cache::ColumnRow {
+                    node_id: id,
+                    value,
+                    witness: crate::column_cache::ColumnWitness {
+                        prop_pid: pid,
+                        node_first_prop: first_prop,
+                        type_tag: cell.type_tag,
+                        value_inline: cell.value_inline,
+                        created_ts: cell.mvcc.created_ts,
+                    },
+                });
             }
         }
 
@@ -11746,10 +11990,21 @@ mod max_transaction_age_tests {
             Some(pinned),
             "the long reader must still pin the watermark while it is open"
         );
-        let reclaimed_pinned = coord.gc().expect("gc pass while pinned").reclaimed;
+        // What the churn leaves behind moved with `rmp` #967. Before it, each overwrite PREPENDED a
+        // new property record and tombstoned the old one, so the garbage was dead `props.store`
+        // versions and `GcPassReport::reclaimed` counted all of it. After it, the overwrite is written
+        // IN PLACE and the superseded value descends onto the node's undo chain, so the garbage is
+        // `undo.store` deltas — which `rmp` #966 reports in a SEPARATE field, deliberately, so that
+        // `reclaimed` keeps its "live-record versions" meaning. The semantic this test protects is
+        // unchanged ("reaping an over-age reader unblocks the reclamation its snapshot was pinning"),
+        // so it is asserted on the total reclamation work, which is where that garbage now is.
+        let pass_pinned = coord.gc().expect("gc pass while pinned");
+        let reclaimed_pinned = pass_pinned.reclaimed + pass_pinned.undo_deltas_reclaimed;
         assert_eq!(
             reclaimed_pinned, 0,
-            "while the reader pins the watermark, no dead version is reclaimable"
+            "while the reader pins the watermark, nothing the churn left behind is reclaimable \
+             (records {}, undo deltas {})",
+            pass_pinned.reclaimed, pass_pinned.undo_deltas_reclaimed
         );
 
         // Now: time has advanced one nanosecond past the cap for the reader (begin = MS), but a younger
@@ -11776,11 +12031,15 @@ mod max_transaction_age_tests {
             Some(pinned),
             "reaping the over-age reader must release its hold on the watermark"
         );
-        let reclaimed_after = coord.gc().expect("gc pass after reap").reclaimed;
+        let pass_after = coord.gc().expect("gc pass after reap");
+        let reclaimed_after = pass_after.reclaimed + pass_after.undo_deltas_reclaimed;
         assert!(
             reclaimed_after > reclaimed_pinned && reclaimed_after > 0,
             "the advanced watermark must unblock reclamation of the pinned garbage: \
-             reclaimed {reclaimed_pinned} (pinned) -> {reclaimed_after} (after reap)"
+             reclaimed {reclaimed_pinned} (pinned) -> {reclaimed_after} (after reap; records {}, \
+             undo deltas {})",
+            pass_after.reclaimed,
+            pass_after.undo_deltas_reclaimed
         );
 
         // The reaped reader's next use surfaces a clean retriable error — it is no longer active.

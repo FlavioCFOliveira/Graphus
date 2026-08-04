@@ -290,12 +290,18 @@ fn mid_abort_reopen_recovers_every_committed_batch() {
         .token_id(Namespace::PropKey, "nodes")
         .expect("nodes prop key recovered");
     let mut sentinel_nodes: Option<i64> = None;
+    // The sentinel's CURRENT value of `nodes`, which after `rmp` #967 is its live cell: an overwrite
+    // rewrites the cell in place and the superseded value descends onto the node's undo chain, so
+    // reading the candidate superset here would also surface every earlier cumulative count.
     for (_pid, prop) in recovered
         .superset_scan_node_properties(sentinel_id)
         .expect("walk sentinel property chain")
-        .into_every_version()
+        .cells_ignoring_history()
     {
-        if prop.key == s_nodes && prop.mvcc.in_use() && prop.mvcc.expired_ts == 0 {
+        if prop.key == s_nodes
+            && prop.mvcc.in_use()
+            && prop.type_tag != graphus_storage::undo::TYPE_TAG_ABSENT
+        {
             let v = recovered
                 .decode_property_value(prop.type_tag, prop.value_inline)
                 .expect("decode sentinel nodes value");

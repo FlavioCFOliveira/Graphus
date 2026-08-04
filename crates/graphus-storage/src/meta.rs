@@ -30,7 +30,27 @@ const LEGACY_STORE_COUNT: usize = 4;
 
 /// The on-disk format version of a catalog image that carries **no** undo-area block: everything
 /// this project wrote before `rmp` #966 (`05 §12.6`).
-const LEGACY_FORMAT_VERSION: u32 = 1;
+pub(crate) const LEGACY_FORMAT_VERSION: u32 = 1;
+
+/// The first on-disk format version in which a `props.store` cell's MVCC header no longer carries
+/// the property's visibility (`rmp` #967, `D-property-visibility`).
+///
+/// Every **earlier** version — 1 and 2 alike — recorded a removed or overwritten property as a cell
+/// left in use with `expired_ts` stamped and its value intact, which this build reads as a live
+/// value. So the legacy-image gate
+/// (`RecordStore::refuse_legacy_property_tombstones`) keys on `format_version <` this constant, not
+/// on the legacy version alone: version 2 differs from version 3 only in this number, and carries
+/// exactly the same hazard.
+///
+/// Named separately from [`FORMAT_VERSION`](graphus_core::constants::FORMAT_VERSION) on purpose. A
+/// future bump for an unrelated layout change must NOT make the gate start scanning version-3 stores,
+/// which are already written under the new property model.
+pub(crate) const PROPERTY_UNDO_CHAIN_FORMAT_VERSION: u32 = 3;
+
+const _: () = assert!(
+    PROPERTY_UNDO_CHAIN_FORMAT_VERSION <= graphus_core::constants::FORMAT_VERSION,
+    "the property-model version must be one this build can actually write",
+);
 
 /// Magic word introducing the trailing undo-area block (`rmp` #966). Chosen so a truncated or
 /// garbage tail cannot be mistaken for the block: `b"GRPHUNDO"` read little-endian.
@@ -3735,6 +3755,11 @@ impl Meta {
         out.extend_from_slice(&stats);
         // ---- The undo-area block (`rmp` #966, `05 §12.6`): format version 2 and up. ----
         //
+        // Its LAYOUT has not changed since #966; version 3 (`rmp` #967) reuses it byte for byte and
+        // only writes a different number into the version field, because what #967 changed is what a
+        // property cell MEANS, not where anything sits. That is why the block needs no versioned
+        // parsing here: every version from 2 up decodes identically.
+        //
         // Appended after every prior block by this catalog's established append-only rule, so a
         // version-1 image simply ENDS where this block would start and `decode` reports version 1
         // with two empty undo-area stores. The block leads with a magic word rather than a bare
@@ -3789,8 +3814,9 @@ impl Meta {
         // this build takes rewrites the catalog with the block present.
         //
         // Present ⇒ read the version and REFUSE anything this build does not understand, rather than
-        // interpreting a layout it has never seen (`05 §12.6`: "opening a version-2 store under an
-        // older build must be refused rather than misread" — the same rule, applied forwards).
+        // interpreting a layout it has never seen (`05 §12.6`: "opening a store of a newer version
+        // under an older build must be refused rather than misread" — the same rule, applied
+        // forwards).
         let format_version = if cur >= bytes.len() {
             LEGACY_FORMAT_VERSION
         } else {

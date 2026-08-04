@@ -26,20 +26,37 @@
 //! lifecycle, asserting both directions with teeth:
 //!
 //!  1. **The pin holds.** With the reader open, `gc_watermark()` is the reader's snapshot (not
-//!     `snapshot_ts()`), and `coordinator.gc()` reclaims nothing the reader can still observe — the
-//!     version's slot is retained.
+//!     `snapshot_ts()`), `coordinator.gc()` reclaims nothing the reader can still observe, and the
+//!     reader's snapshot still resolves the superseded value.
 //!  2. **Rollback releases the pin (mirror).** After `coordinator.rollback(reader)` the reader leaves
 //!     the active set, `oldest_active_snapshot()` advances, and a second `coordinator.gc()` reclaims
-//!     the now-unpinned version, freeing its slot.
+//!     the now-unpinned version — after which that same snapshot can no longer reconstruct it, and
+//!     resolves the value committed *after* it instead.
 //!
 //! A regression that made GC ignore the live reader (part 1) OR fail to advance after the rollback
 //! (part 2) fires the corresponding assertion.
+//!
+//! ## What `rmp` #967 moved, and what it did not
+//!
+//! **What the pin protects moved; that it must protect it did not.** Before #967 an overwrite
+//! tombstoned the old `props.store` record (stamping its `xmax`) and prepended a new one, so the
+//! pinned version was a physically distinct prop record and the teeth were "its slot is retained /
+//! freed". After #967 (`D-property-removal` / `D-property-visibility`) the new value is written **in
+//! place** into the same cell — which an overwrite never frees and never tombstones, so its
+//! `in_use()` bit can no longer distinguish a pinned version from a reclaimed one — and the
+//! superseded value descends onto the entity's **undo chain** as a `SetProperty` delta. So the
+//! reclamation is asserted on the TOTAL work
+//! ([`reclaimed`](graphus_storage::GcPassReport::reclaimed) +
+//! [`undo_deltas_reclaimed`](graphus_storage::GcPassReport::undo_deltas_reclaimed), which `rmp` #966
+//! keeps separate so `reclaimed` retains its "live record versions" meaning), and the retained-slot
+//! and freed-slot checks are replaced by the strictly stronger observable consequence: whether the
+//! reader's own snapshot can still resolve the superseded value through the production read path.
 
-use graphus_core::{Timestamp, Value};
+use graphus_core::{Timestamp, TxnId, Value};
 use graphus_cypher::TxnCoordinator;
 use graphus_io::MemBlockDevice;
 use graphus_storage::{Namespace, RecordStore};
-use graphus_txn::IsolationLevel;
+use graphus_txn::{IsolationLevel, Snapshot};
 use graphus_wal::{MemLogSink, WalManager};
 
 type Coord = TxnCoordinator<MemBlockDevice, MemLogSink>;
@@ -56,23 +73,47 @@ fn new_coord() -> Coord {
     TxnCoordinator::new(store)
 }
 
+/// Resolves the value a reader at `snapshot` observes for node `node`'s property `key`, exactly as
+/// the production read path does (`graphus_cypher::record_graph::read_node_prop_one`). `None` means
+/// the reader observes no value for that key at its snapshot.
+///
+/// This goes through [`RecordStore::decision_scan_node_properties`] — the store's decision-polarity
+/// walk over the cell **and** the entity's undo chain — because `rmp` #967's `D-property-visibility`
+/// makes that chain the sole oracle for a property's visible version; the cell's own `created_ts` is
+/// informative only. A helper that reconstructed the value some other way would stop testing what the
+/// production reader does, which is the whole point of asserting on it here.
+fn resolves(coord: &Coord, node: u64, key: u32, snapshot: Snapshot) -> Option<i64> {
+    coord.with_store_mut(|s| {
+        let decided = s
+            .decision_scan_node_properties(node, snapshot)
+            .expect("reconstruct the node's properties at the reader's snapshot");
+        let prop = decided.visible_version(key)?;
+        let value = s
+            .decode_property_value(prop.type_tag, prop.value_inline)
+            .expect("decode the visible value");
+        match value {
+            Value::Integer(i) => Some(i),
+            other => panic!("expected an integer property, got {other:?}"),
+        }
+    })
+}
+
 #[test]
 fn reader_pins_reclaim_floor_until_it_rolls_back() {
     let mut coord = new_coord();
 
     // --- t1: create node A with A.p = V1, commit at ts 1 (the committed base the reader observes). ---
     let t1 = coord.begin(IsolationLevel::Serializable);
-    let (key, node_a, p1) = coord.with_store_mut(|s| {
+    let (key, node_a) = coord.with_store_mut(|s| {
         let key = s
             .intern_token(Namespace::PropKey, "p")
             .expect("intern prop key");
         let (a, _) = s.create_node(t1).expect("create node a");
-        // Inline integer value → V1 lives entirely in one prop slot (`p1`), so its reclamation is a
-        // single observable slot free.
-        let p1 = s
-            .set_node_property_value(t1, a, key, &Value::Integer(V1))
+        // Inline integer value → the value lives entirely in one prop cell, so once it is superseded
+        // the version the reader pins is exactly one `SetProperty` delta on a's undo chain.
+        s.set_node_property_value(t1, a, key, &Value::Integer(V1))
             .expect("set a.p = V1");
-        (key, a, p1)
+        (key, a)
     });
     let ts1 = coord.commit(t1).expect("commit t1");
     assert_eq!(ts1, Timestamp(1), "the only commit so far is at ts 1");
@@ -86,9 +127,20 @@ fn reader_pins_reclaim_floor_until_it_rolls_back() {
         Some(Timestamp(1)),
         "the open reader pins the GC low-water at its snapshot (ts 1)"
     );
+    // The reader's own begin snapshot, the one every resolution below is evaluated at.
+    let reader_snapshot = Snapshot {
+        owner: reader,
+        ts: ts1,
+    };
+    assert_eq!(
+        resolves(&coord, node_a, key, reader_snapshot),
+        Some(V1),
+        "the reader observes V1 at its snapshot before the overwrite"
+    );
 
-    // --- t2: overwrite A.p = V2 and commit at ts 2 — V1 becomes a tombstone (its xmax committed at 2,
-    //     i.e. AFTER the reader's snapshot, so the reader must still see V1). ---
+    // --- t2: overwrite A.p = V2 and commit at ts 2. The cell now holds V2 in place and V1 descends
+    //     onto A's undo chain as a delta written by t2, which committed AFTER the reader's snapshot —
+    //     so the reader must still be able to reconstruct V1. ---
     let t2 = coord.begin(IsolationLevel::Serializable);
     coord.with_store_mut(|s| {
         s.set_node_property_value(t2, node_a, key, &Value::Integer(V2))
@@ -104,15 +156,26 @@ fn reader_pins_reclaim_floor_until_it_rolls_back() {
         Timestamp(1),
         "while the reader is open, gc_watermark() is its snapshot (1), never snapshot_ts (2)"
     );
-    // V1's xmax committed at 2, and `2 <= 1` is false, so the reader-safe GC reclaims nothing.
+    // The delta carrying V1 was written by t2, which committed at 2, and `2 <= 1` is false, so the
+    // reader-safe GC reclaims nothing. Asserted on the TOTAL work (see the module note): since #967 an
+    // overwrite creates no prop record and tombstones none, `reclaimed` alone is 0 here whatever GC
+    // does — trivially true, and its part-2 mirror impossible. The sum can fail in both directions.
     let live = coord.gc().expect("gc while the reader is live");
     assert_eq!(
-        live.reclaimed, 0,
-        "a live reader pins the floor at 1; the V1 version (xmax 2) MUST NOT be reclaimed"
+        live.reclaimed + live.undo_deltas_reclaimed,
+        0,
+        "a live reader pins the floor at 1; the version it still observes MUST NOT be reclaimed \
+         (records = {}, undo deltas = {})",
+        live.reclaimed,
+        live.undo_deltas_reclaimed
     );
-    assert!(
-        coord.with_store_mut(|s| s.property(p1).expect("read V1's slot").mvcc.in_use()),
-        "V1's physical slot must still be in use while the reader can observe it (no lost version)"
+    // The observable consequence, and the semantic the retained-slot check stood for: the pinned
+    // reader can still reconstruct V1 through the production read path. This replaces the pre-#967
+    // `property(p1).mvcc.in_use()` assertion, which an in-place overwrite made unable to fail.
+    assert_eq!(
+        resolves(&coord, node_a, key, reader_snapshot),
+        Some(V1),
+        "while it pins the floor, the reader must still resolve V1 (ACID: no lost version)"
     );
 
     // === Part 2 — ROLLBACK RELEASES THE PIN (mirror). ===
@@ -128,13 +191,42 @@ fn reader_pins_reclaim_floor_until_it_rolls_back() {
     // A subsequent GC now runs at the advanced watermark and reclaims exactly what the reader pinned.
     let after = coord.gc().expect("gc after the reader departs");
     assert!(
-        after.reclaimed >= 1,
-        "once the reader is gone the floor advances past the V1 tombstone, which is now reclaimed \
-         (got reclaimed={})",
-        after.reclaimed
+        after.reclaimed + after.undo_deltas_reclaimed >= 1,
+        "once the reader is gone the floor advances past the superseded V1 version, which is now \
+         reclaimed (records = {}, undo deltas = {})",
+        after.reclaimed,
+        after.undo_deltas_reclaimed
     );
-    assert!(
-        !coord.with_store_mut(|s| s.property(p1).expect("read V1's slot").mvcc.in_use()),
-        "after the reader departs and GC runs, V1's physical slot must be reclaimed (freed for reuse)"
+    // The mirror of part 1's observable consequence, and what makes the pin non-vacuous: the very same
+    // snapshot that resolved V1 while it was pinned can no longer reconstruct it, because the delta
+    // holding it is gone. This replaces the pre-#967 `!property(p1).mvcc.in_use()` assertion, which an
+    // in-place overwrite made unable to fail — the cell holds V2 and stays in use regardless.
+    let unpinned = resolves(&coord, node_a, key, reader_snapshot);
+    assert_ne!(
+        unpinned,
+        Some(V1),
+        "after the reader departs and GC runs, its snapshot can no longer reconstruct V1 — exactly \
+         the loss the pin was preventing"
+    );
+    // The shape of that loss, pinned for the same reason as in `gc_watermark_teeth.rs`: post-#967 the
+    // superseded value lives only on the undo chain, so reclaiming the chain leaves the in-place cell
+    // standing and the departed reader's snapshot now resolves V2 — a value committed at 2, after that
+    // snapshot. Reclaiming it while the reader was live would therefore have been a wrong-row read,
+    // not merely a missing value: strictly worse, and exactly what part 1 proves the pin prevents.
+    assert_eq!(
+        unpinned,
+        Some(V2),
+        "with the pinned version reclaimed, the ts-1 snapshot resolves V2 — committed after it"
+    );
+    // ...and the reclamation was targeted, not a wholesale wipe: the live value survives it. (A GC
+    // regression that emptied the cell outright would fail here while the assertions above passed.)
+    let current = Snapshot {
+        owner: TxnId(9_999),
+        ts: coord.with_store_mut(|s| s.snapshot_ts()),
+    };
+    assert_eq!(
+        resolves(&coord, node_a, key, current),
+        Some(V2),
+        "GC reclaimed only what the departed reader had pinned: the live value V2 survives"
     );
 }

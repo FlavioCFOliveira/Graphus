@@ -197,9 +197,20 @@ pub fn run_reader_vs_store_growth(seed: u64) -> ReaderGrowthReport {
         // A purchase edge on the hub: prepends to the hub's incidence chain (rel + node growth).
         let (buyer, _) = s.create_node(txn).unwrap();
         s.create_rel(txn, rel_type, hub, buyer).unwrap();
-        // A hot-counter bump on the hub: per-value MVCC tombstones the old version and PREPENDS a
-        // fresh one, re-pointing `hub.first_prop` (prop growth).
+        // A hot-counter bump on the hub. `rmp` #967 RE-ARM: this used to be the prop-store growth
+        // driver, because per-value MVCC allocated a fresh record per `SET` and re-pointed
+        // `hub.first_prop` at it. It no longer does — the same key is now rewritten IN PLACE and
+        // allocates nothing — so on its own this loop would leave the prop store one page wide and
+        // the `Prop store page N not allocated` hazard would never be exercised. The counter bump
+        // stays (it is what the isolation oracle below reads), and a DISTINCT key per iteration is
+        // added beside it to restore the growth. `pages_grown_after_snapshot` below is the
+        // non-vacuity control that the store really did grow.
         s.set_node_property_value(txn, hub, hot, &Value::Integer(i as i64 + 1))
+            .unwrap();
+        let fresh_key = s
+            .intern_token(Namespace::PropKey, &format!("k{i}"))
+            .unwrap();
+        s.set_node_property_value(txn, hub, fresh_key, &Value::Integer(i as i64))
             .unwrap();
         // Occasionally churn the overflow value too, so the `strings` store grows as well.
         if rng.below(4) == 0 {
@@ -273,33 +284,40 @@ pub fn run_reader_vs_store_growth(seed: u64) -> ReaderGrowthReport {
     }
 
     // -- the property chain + the overflow heap (the `Prop`/`Strings` faces) ----------------------
+    // ORACLE 1 (location): EVERY candidate the superset read reports must decode — including its
+    // overflow chain, which walks the `strings` store's page map. After `rmp` #967 the candidates are
+    // the live cells PLUS the entity's undo history, and it is the history that names the overflow
+    // chains allocated after the reader's snapshot — so decoding only the cells would walk one chain
+    // and miss the hazard this scenario exists to catch.
     match view.superset_scan_node_properties(hub) {
         Err(e) => read_failures.push(format!("superset_scan_node_properties(hub): {e}")),
         Ok(props) => {
+            for c in props.candidates() {
+                if let Err(e) = view.decode_property_value(c.type_tag, c.value_inline) {
+                    read_failures.push(format!("decode_property_value({:?}): {e}", c.source));
+                }
+            }
+        }
+    }
+    // ORACLE 2 (isolation), through the DECISION-polarity read — the production rule, rather than a
+    // hand-rolled `is_visible` fold over cell stamps, which `D-property-visibility` retired.
+    match view.decision_scan_node_properties(hub, reader_snapshot) {
+        Err(e) => read_failures.push(format!("decision_scan_node_properties(hub): {e}")),
+        Ok(decided) => {
             let mut visible_hot: Option<Value> = None;
             let mut visible_tag = 0u32;
-            for (pid, prop) in props.every_version() {
-                // ORACLE 1 (location): every located property must decode — including its overflow
-                // chain, which walks the `strings` store's page map.
-                let value = match view.decode_property_value(prop.type_tag, prop.value_inline) {
+            for c in decided.visible_versions() {
+                let value = match view.decode_property_value(c.type_tag, c.value_inline) {
                     Ok(v) => v,
                     Err(e) => {
-                        read_failures.push(format!("decode_property_value(prop {pid}): {e}"));
+                        read_failures.push(format!("decode_property_value({:?}): {e}", c.source));
                         continue;
                     }
                 };
-                if !is_visible(
-                    reader_snapshot,
-                    prop.mvcc.created_ts,
-                    prop.mvcc.expired_ts,
-                    &registry,
-                ) {
-                    continue;
-                }
-                // ORACLE 2 (isolation): the only `hot` the reader may see is the pre-snapshot 0.
-                if prop.key == hot {
+                // The only `hot` the reader may see is the pre-snapshot 0.
+                if c.key == hot {
                     visible_hot = Some(value);
-                } else if prop.key == tag {
+                } else if c.key == tag {
                     visible_tag += 1;
                 }
             }

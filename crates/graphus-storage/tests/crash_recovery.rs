@@ -725,7 +725,7 @@ fn multi_field_record_write_recovers_and_aborts_byte_identically() {
         let mut v: Vec<(u32, u64)> = s
             .superset_scan_node_properties(node)
             .unwrap()
-            .every_version()
+            .cells_ignoring_history()
             .iter()
             .map(|(_, p)| (p.key, p.value_inline))
             .collect();
@@ -746,7 +746,7 @@ fn multi_field_record_write_recovers_and_aborts_byte_identically() {
     let mut after: Vec<(u32, u64)> = rec
         .superset_scan_node_properties(node)
         .unwrap()
-        .every_version()
+        .cells_ignoring_history()
         .iter()
         .map(|(_, p)| (p.key, p.value_inline))
         .collect();
@@ -777,7 +777,7 @@ fn multi_field_record_write_recovers_and_aborts_byte_identically() {
     let kept_props: Vec<(u32, u64)> = rec2
         .superset_scan_node_properties(kept)
         .unwrap()
-        .every_version()
+        .cells_ignoring_history()
         .iter()
         .map(|(_, p)| (p.key, p.value_inline))
         .collect();

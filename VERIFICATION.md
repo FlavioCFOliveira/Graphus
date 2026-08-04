@@ -24,6 +24,7 @@ how CI should schedule it.
 | 9 | Examples suite — E2E, both modes | `examples/run-all.sh` via `scripts/examples-gate.sh` | every push | ~2–4 min |
 | 10 | Read-polarity census (superset / decision / conservative) | `graphus-cypher/tests/read_polarity_census.rs`, `graphus-storage/tests/scan_polarity_barrier.rs` | every push | < 1 s |
 | 11 | Official Neo4j driver interop (real driver over Bolt) | `graphus-server/tests/neo4j_driver_interop.rs` (feature `neo4j-interop`) | every push | ~1–3 min |
+| 12 | Property visible-read record count (`rmp` #967 AC2) | `graphus-storage/tests/prop_visible_read_record_count.rs` (feature `read-probe`) | every push | < 1 s |
 
 > **What "every push" means today.** It is the *intended* cadence, and it is what `scripts/verify.sh`
 > runs — but nothing invokes that script automatically: `.github/workflows/` holds only the on-demand
@@ -448,11 +449,55 @@ change.
 
 ---
 
+## 12. Property visible-read record count — the `rmp` #967 headline claim, measured
+
+`rmp` #967 moved a property overwrite to "newest version written in place, old value on the entity's
+undo chain". Its headline acceptance criterion is that **reading the visible property no longer walks
+the version chain** when the reader sees the live version — the whole point of the redesign, and the
+reason the pre-#967 read cost grew with the number of overwrites.
+
+That claim is proved by a **record-read count**, not a timing. The count is a property of the
+algorithm; a timing is a property of the host, because after the writes the whole chain is resident in
+the buffer pool and a big enough cache walks thousands of records fast enough to pass any threshold
+loose enough not to be flaky. The suite measures the reads at two chain lengths (M = 1000 and
+M = 8000) and asserts the whole `(prop, undo, commit)` triple is **identical** — comparing the triple
+rather than its total is what stops the walk from being merely *relocated* into the undo chain or the
+commit indirection.
+
+```sh
+cargo test -p graphus-storage --features read-probe --test prop_visible_read_record_count
+```
+
+**Expected:** `test result: ok. 3 passed`
+(`visible_read_record_count_is_identical_at_m1000_and_m8000` — the criterion;
+`a_visible_read_costs_exactly_one_record_in_each_store` — the exact constant `1/1/1`;
+`distinct_keys_still_cost_one_record_read_each` — the direction in which growth is still correct).
+
+**`--features read-probe` is mandatory, and this is why it is a gate.** The instrumentation is a cargo
+feature that is **off by default**: it sits on the hottest read in the engine, and defaulting it on (or
+carrying it as a dev-dependency, which cargo would unify into every workspace test and bench resolve)
+would perturb the very benchmark #967 exists to measure. The test file is therefore
+`#![cfg(feature = "read-probe")]`, so a plain `cargo test -p graphus-storage` **compiles it away** and
+asserts nothing.
+
+That is the exact shape of `rmp` #960 (gate 11): a suite behind an opt-in feature that no automated
+gate ever enabled, so the defect it existed to catch sat on `main` while every gate that did run
+stayed green. `04-technical-design.md` §11.6 was ratified by #967 itself to stop that recurring — and a
+headline acceptance criterion asserted by nothing any gate executes is that same defect, one release
+later. `scripts/verify.sh` runs it as step 4.
+
+**When gate 12 fails**, the property read has started walking the chain again — most likely because a
+read path was moved off `decision_scan_*` onto a fold over the cells' own MVCC stamps, or because a
+new indirection was introduced between the cell and its value. Check which of the three counters grew:
+`prop` means the `props.store` chain, `undo` the delta chain, `commit` the slot indirection.
+
+---
+
 ## Quick start
 
 ```sh
-# Fast gates only (build/clippy/fmt, anomaly, read-polarity census, proptest, regression gate,
-# LDBC, examples, official-driver interop) — every push:
+# Fast gates only (build/clippy/fmt, anomaly, read-polarity census, visible-read record count,
+# proptest, regression gate, LDBC, examples, official-driver interop) — every push:
 scripts/verify.sh
 
 # Add the slow gates as needed:

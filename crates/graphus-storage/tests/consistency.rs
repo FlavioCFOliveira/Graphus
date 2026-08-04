@@ -424,9 +424,16 @@ fn simple_graph_passes() {
     s.create_rel(txn, t, a, b).unwrap();
     s.create_rel(txn, t, a, b).unwrap(); // parallel
     s.create_rel(txn, t, c, c).unwrap(); // self-loop
+    // Two DISTINCT keys. `rmp` #967 made "two live cells for one key" a fault
+    // (`PropertyFault::DuplicateLiveKey`): after the property path moved onto the undo chain there is
+    // exactly one cell per key — it is rewritten in place, never duplicated — so a second one is
+    // unreadable (first-cell-wins) and unreclaimable. The subject of this test is a HEALTHY graph
+    // passing the checker, so it must not build that state; the two-cells-per-owner coverage it
+    // wanted is unchanged.
     let key = s.intern_token(Namespace::PropKey, "name").unwrap();
+    let key2 = s.intern_token(Namespace::PropKey, "nick").unwrap();
     s.add_node_property(txn, a, key, 4, 0xABCD).unwrap();
-    s.add_node_property(txn, a, key, 4, 0x1234).unwrap();
+    s.add_node_property(txn, a, key2, 4, 0x1234).unwrap();
     s.commit(txn).unwrap();
 
     let r = report(&mut s);
@@ -446,7 +453,16 @@ fn random_histories_stay_consistent() {
         let txn = TxnId(1);
         s.begin(txn);
         let rt = s.intern_token(Namespace::RelType, "E").unwrap();
-        let pk = s.intern_token(Namespace::PropKey, "p").unwrap();
+        // A pool of DISTINCT keys, one per property write, so the generator never builds two live
+        // cells for one key — a state `rmp` #967 made a checker fault (see `simple_graph_passes`).
+        // The write mix, the node/rel churn and the crash-recovery re-check are otherwise unchanged.
+        let pks: Vec<u32> = (0..64)
+            .map(|i| {
+                s.intern_token(Namespace::PropKey, &format!("p{i}"))
+                    .unwrap()
+            })
+            .collect();
+        let mut next_pk = 0usize;
 
         let mut rng = SimRng::new(seed);
         let mut nodes: Vec<u64> = Vec::new();
@@ -464,6 +480,8 @@ fn random_histories_stay_consistent() {
                 alive_rels.push(rid);
             } else if choice < 85 {
                 let a = nodes[(rng.next_u64() as usize) % nodes.len()];
+                let pk = pks[next_pk % pks.len()];
+                next_pk += 1;
                 s.add_node_property(txn, a, pk, 2, rng.next_u64()).unwrap();
             } else if !alive_rels.is_empty() {
                 let i = (rng.next_u64() as usize) % alive_rels.len();

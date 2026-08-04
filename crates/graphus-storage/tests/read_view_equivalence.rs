@@ -301,9 +301,9 @@ fn store_read_view_is_byte_identical_to_record_store() {
         assert_results_eq(
             &format!("superset_scan_node_properties({id})"),
             s.superset_scan_node_properties(id)
-                .map(|c| c.into_every_version()),
+                .map(|c| c.candidates().collect::<Vec<_>>()),
             view.superset_scan_node_properties(id)
-                .map(|c| c.into_every_version()),
+                .map(|c| c.candidates().collect::<Vec<_>>()),
         );
         assert_results_eq(
             &format!("incident_rels({id})"),
@@ -324,9 +324,9 @@ fn store_read_view_is_byte_identical_to_record_store() {
         assert_results_eq(
             &format!("superset_scan_rel_properties({id})"),
             s.superset_scan_rel_properties(id)
-                .map(|c| c.into_every_version()),
+                .map(|c| c.candidates().collect::<Vec<_>>()),
             view.superset_scan_rel_properties(id)
-                .map(|c| c.into_every_version()),
+                .map(|c| c.candidates().collect::<Vec<_>>()),
         );
         assert_results_eq(
             &format!("superset_scan_rel_property_values({id})"),
@@ -416,10 +416,10 @@ fn view_node_property_values(
     node_id: u64,
 ) -> Result<Vec<(u64, u32, Value)>, GraphusError> {
     let chain = view.superset_scan_node_properties(node_id)?;
-    let mut out = Vec::with_capacity(chain.len());
-    for (pid, prop) in chain.into_every_version() {
-        let value = view.decode_property_value(prop.type_tag, prop.value_inline)?;
-        out.push((pid, prop.key, value));
+    let mut out = Vec::new();
+    for c in chain.candidates() {
+        let value = view.decode_property_value(c.type_tag, c.value_inline)?;
+        out.push((c.source.id(), c.key, value));
     }
     Ok(out)
 }

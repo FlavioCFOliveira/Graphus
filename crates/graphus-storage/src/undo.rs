@@ -51,6 +51,31 @@ pub const COMMIT_RECORD_SIZE: usize = 32;
 /// everywhere in the store.
 pub const FLAG_IN_USE: u8 = crate::record::FLAG_IN_USE;
 
+/// The `type_tag` value that means **"no value here"** (`05 §12.2`; ratified decision
+/// `D-property-removal`, `02-decision-register.md`).
+///
+/// It has one meaning and two readings, which are the same statement seen from the two ends of a
+/// property's history:
+///
+/// * on a [`UndoAction::SetProperty`] delta — *the key was **absent** before the write this delta
+///   undoes*, so undoing it removes the key rather than restoring a value;
+/// * in a `props.store` cell — *this cell is **empty***: it keeps its `in_use` bit and its place in
+///   the owner's `first_prop` chain (so the chain stays walkable and a later `SET` of the same key
+///   reuses it with no allocation), but it holds no value and the key reads as absent.
+///
+/// **Nothing else can produce this tag**, which is what makes it usable as a sentinel rather than as
+/// a value that merely happens to be unused today: the inline codec's tags start at `1`
+/// ([`crate::propenc::TAG_BOOL`]) and the overflow codec's class tags start at `4`
+/// ([`crate::valenc::TAG_STRING`]), always OR-ed with [`crate::valenc::OVERFLOW_BIT`]. The test
+/// `no_encoder_can_emit_the_absent_type_tag` below pins that over both codecs' full tag sets.
+///
+/// One near-collision is worth naming, because a reader grepping for a zero tag will find it:
+/// `valenc`'s private `TAG_LIST_EMPTY = 0` is an **element** tag *inside* an overflow payload's
+/// bytes (it says "this list's elements have no type because the list is empty"). It is never a
+/// record's or a delta's `type_tag`, and it is unreachable from here — a `List` value's record tag
+/// is always `TAG_LIST | OVERFLOW_BIT`.
+pub const TYPE_TAG_ABSENT: u8 = 0;
+
 // --- delta field offsets (`05 §12.2`) ---
 const D_OFF_FLAGS: usize = 0; // u8
 const D_OFF_ACTION: usize = 1; // u8
@@ -625,6 +650,76 @@ mod tests {
         assert_eq!(decoded.commit_info, 7);
         delta.flags = 0;
         assert_eq!(decoded, delta);
+    }
+
+    /// [`TYPE_TAG_ABSENT`] is only a sentinel if **no encoder can emit it**. Both value codecs are
+    /// swept over their complete tag surface: the inline codec through its public API (every
+    /// inline-representable `Value` class), and the overflow codec through every class tag it
+    /// defines, each OR-ed with the overflow bit exactly as the property write path stores it.
+    ///
+    /// If a future codec claims tag `0`, an empty cell and a removal delta would both become
+    /// indistinguishable from a real value and every removal would silently read back as that
+    /// value. This test is the gate.
+    #[test]
+    fn no_encoder_can_emit_the_absent_type_tag() {
+        use graphus_core::Value;
+
+        // The inline codec: every class it accepts, plus the boundary values of each.
+        for v in [
+            Value::Boolean(false),
+            Value::Boolean(true),
+            Value::Integer(0),
+            Value::Integer(i64::MIN),
+            Value::Integer(i64::MAX),
+            Value::Float(0.0),
+            Value::Float(f64::MIN),
+            Value::Float(f64::MAX),
+        ] {
+            let (tag, _) = crate::propenc::encode_inline(&v).expect("inline-encodable");
+            assert_ne!(
+                tag, TYPE_TAG_ABSENT,
+                "the inline codec emitted the absent sentinel for {v:?}"
+            );
+        }
+
+        // The overflow codec: every class tag it defines, stored as the record/delta `type_tag`.
+        for class_tag in [
+            crate::valenc::TAG_STRING,
+            crate::valenc::TAG_LIST,
+            crate::valenc::TAG_DATE,
+            crate::valenc::TAG_LOCAL_TIME,
+            crate::valenc::TAG_ZONED_TIME,
+            crate::valenc::TAG_LOCAL_DATE_TIME,
+            crate::valenc::TAG_ZONED_DATE_TIME,
+            crate::valenc::TAG_DURATION,
+            crate::valenc::TAG_POINT,
+            crate::valenc::TAG_DATE_WIDE,
+        ] {
+            assert_ne!(class_tag, TYPE_TAG_ABSENT, "class tag {class_tag} is zero");
+            assert_ne!(
+                class_tag | crate::valenc::OVERFLOW_BIT,
+                TYPE_TAG_ABSENT,
+                "stored overflow tag for class {class_tag} is the absent sentinel"
+            );
+        }
+    }
+
+    /// The "was absent" / "is empty" delta — `SetProperty` with a zero `type_tag` and a zero
+    /// `value_inline` — must survive the strict decoder. It carries a real `token`, so it is not a
+    /// zeroed slot, and its zero payload is exactly what says "there was no value here".
+    #[test]
+    fn an_absent_value_set_property_delta_round_trips() {
+        let mut d = UndoDelta::new(UndoAction::SetProperty, 3, 0, 0);
+        d.token = 77;
+        d.type_tag = TYPE_TAG_ABSENT;
+        d.value_inline = 0;
+        let mut buf = [0u8; UNDO_RECORD_SIZE];
+        d.encode(&mut buf);
+        assert!(!is_zeroed(&buf), "a real delta is never a zeroed slot");
+        let got = UndoDelta::decode(&buf).expect("the absent-value delta decodes");
+        assert_eq!(got, d);
+        assert_eq!(got.type_tag, TYPE_TAG_ABSENT);
+        assert_eq!(got.value_inline, 0);
     }
 
     #[test]

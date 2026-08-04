@@ -126,18 +126,99 @@ fn assert_columnar_equals_row(setup: &[&str], label: &str, property: &str, query
         run_write(&mut acc, stmt);
         run_write(&mut row, stmt);
     }
-    // Guard: the accelerated coordinator must actually have captured the column (else this would
+    // Guard 1: the accelerated coordinator must actually have captured the column (else this would
     // vacuously compare the row path against itself).
     assert!(
         acc.columnar_column_len(label, property).is_some(),
         "the columnar column must be declared/captured for `{label}.{property}`"
     );
 
+    // Guard 2 (`rmp` #967): the accelerator must actually be CONSULTED by the read below. "Captured"
+    // and "consulted" are different claims, and only the second one makes the equality meaningful: a
+    // query that never reaches the columnar path compares the row path against itself and would stay
+    // green through any cache defect whatsoever, including one that serves a pre-overwrite value.
+    //
+    // Required only of a query that actually reads the cached PROPERTY. A `count(*)`-only aggregate
+    // folds cardinality and never asks for a value, so it legitimately never reaches the column; the
+    // guard would be wrong there rather than revealing anything. Both shapes appear in the callers
+    // below, so the condition is on the query text rather than on a per-caller flag.
+    let reads_the_property = query.contains(&format!(".{property}"));
+    let hits_before = acc.columnar_scan_hits();
     let via_columnar = read_scalar(&mut acc, query, col);
+    assert!(
+        !reads_the_property || acc.columnar_scan_hits() > hits_before,
+        "`{query}`: the columnar path was never consulted (scan_hits did not increase), so this \
+         equivalence would hold vacuously — the accelerated coordinator ran the row path too"
+    );
+
     let via_row = read_scalar(&mut row, query, col);
     assert_eq!(
         via_columnar, via_row,
         "`{query}` (col `{col}`): columnar result {via_columnar:?} must equal row result {via_row:?}"
+    );
+}
+
+/// **THE `rmp` #967 COLUMNAR SHAPE, as a focused regression test.** An **in-place** overwrite must make
+/// the cached entry decline, and the accelerator must be *consulted* while it does.
+///
+/// Before #967 an overwrite prepended a new `PropRecord` (so the `first_prop` witness moved) and a
+/// removal tombstoned in place (so the visibility witness caught it). After #967 the overwrite rewrites
+/// the CELL in place and the removal empties it in place: neither moves `first_prop` and neither stamps
+/// `xmax`, so **both** pre-#967 witnesses survive and the cache would serve the pre-overwrite value.
+/// The witness therefore carries the cell's `(type_tag, value_inline, created_ts)` and requires
+/// byte-equality on re-read.
+///
+/// A committed-overwrite variant is already covered by
+/// [`overwrite_after_declare_falls_back_and_equals_row_path`]; this one isolates the case where the
+/// **byte-equality** half of the witness is the *only* thing that can detect the write. The column is
+/// captured **while the writing transaction is open and has already written once**, so the cell's
+/// `created_ts` is that writer's in-flight stamp — and it stays that same stamp across its second
+/// write. Reading as that writer, every other witness matches: `first_prop` never moved, the slot
+/// still holds the key, and the cell is visible (a transaction sees its own writes). Only the value
+/// bytes differ.
+#[test]
+fn an_in_place_overwrite_makes_the_cached_entry_decline() {
+    const N: i64 = 40;
+    let mut acc = fresh_coord();
+    for _ in 0..N {
+        run_write(&mut acc, "CREATE (:P {v: 1})");
+    }
+
+    // W opens and writes once. Its cells now read `v = 100`, stamped `InFlight(W)`.
+    let w = acc.begin_serializable();
+    let first = compile("MATCH (n:P) SET n.v = 100");
+    let _ = run_plan(&acc, w, &first);
+
+    // Capture the column NOW, mid-W: it records value 100 with `created_ts = InFlight(W)`.
+    acc.declare_columnar_cache("P", "v").expect("declare");
+    assert_eq!(acc.columnar_column_len("P", "v"), Some(N as usize));
+
+    // W's SECOND write of the same key. The cell becomes 200 in place; `created_ts` is unchanged
+    // (still `InFlight(W)`), `first_prop` is unchanged, and the cell stays visible to W.
+    let second = compile("MATCH (n:P) SET n.v = 200");
+    let _ = run_plan(&acc, w, &second);
+
+    let q = compile("MATCH (n:P) RETURN sum(n.v) AS r");
+    let hits_before = acc.columnar_scan_hits();
+    let rows = run_plan(&acc, w, &q);
+    assert!(
+        acc.columnar_scan_hits() > hits_before,
+        "the columnar path must be CONSULTED (and then decline per row); otherwise this test proves \
+         nothing about the witness"
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].value("r"),
+        Value::Integer(200 * N),
+        "W must read its own SECOND write; serving the captured first write is the `rmp` #967 stale \
+         read, and byte-equality on the cell is the only witness that can see it here"
+    );
+    acc.commit(w).expect("W commits");
+
+    // And the committed graph agrees, through a fresh read over the same (now stale) cache.
+    assert_eq!(
+        read_scalar(&mut acc, "MATCH (n:P) RETURN sum(n.v) AS r", "r"),
+        Value::Integer(200 * N)
     );
 }
 

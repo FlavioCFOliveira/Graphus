@@ -43,16 +43,17 @@ use crate::idalloc::{ElementIdAllocator, FreeList, NULL_ID, PhysicalAllocator};
 use crate::label_history::LabelHistory;
 use crate::labels;
 use crate::meta::{
-    CompositeIndexEntry, ConstraintEntry, CountKey, FulltextIndexEntry, IndexState, Meta,
-    RelCompositeIndexEntry, SchemaKey, SchemaValue, SpatialIndexEntry, Statistics, StoreMeta,
-    TextIndexEntry, VectorEntity, VectorIndexEntry,
+    CompositeIndexEntry, ConstraintEntry, CountKey, FulltextIndexEntry, IndexState,
+    LEGACY_FORMAT_VERSION, Meta, PROPERTY_UNDO_CHAIN_FORMAT_VERSION, RelCompositeIndexEntry,
+    SchemaKey, SchemaValue, SpatialIndexEntry, Statistics, StoreMeta, TextIndexEntry, VectorEntity,
+    VectorIndexEntry,
 };
 use crate::paging;
 use crate::read_view::{self, MetaSnapshot, StoreMetaSnapshot, StorePages, StoreReadView};
 use crate::record::{
     CHAIN_FLAG_END_FIRST, CHAIN_FLAG_START_FIRST, ChainSide, MVCC_HEADER_SIZE, MVCC_OFF_CREATED_TS,
     MVCC_OFF_EXPIRED_TS, MVCC_OFF_UNDO_PTR, MvccHeader, NODE_OFF_FIRST_PROP, NODE_OFF_FIRST_REL,
-    NODE_OFF_LABELS, NODE_RECORD_SIZE, NodeRecord, PROP_RECORD_SIZE, PropRecord,
+    NODE_OFF_LABELS, NODE_RECORD_SIZE, NodeRecord, PROP_CELL_REGION, PROP_RECORD_SIZE, PropRecord,
     REL_OFF_CHAIN_FLAGS, REL_OFF_END_PREV, REL_OFF_FIRST_PROP, REL_OFF_START_PREV, REL_RECORD_SIZE,
     RelRecord,
 };
@@ -79,10 +80,16 @@ const META_CHUNK_CAP: usize = paging::PAGE_PAYLOAD - 12;
 /// Bit set in the **head** metadata page's `chunk_len` field by every build that writes the undo
 /// area, i.e. by on-disk format version 2 and up (`05 §12.6`, `rmp` #966).
 ///
+/// It is set **unconditionally on every catalog this build writes**, so it keeps protecting each
+/// later version for free: a version-3 store (`rmp` #967) carries the same bit and a pre-#966 build
+/// refuses it by the same guard. The bit says "an undo-area-era catalog"; it does not encode *which*
+/// version, and it does not need to — the number in the payload does that, and only a build that can
+/// read the block gets that far.
+///
 /// # Why a flag bit in a length field
 ///
-/// `05 §12.6` requires that "opening a version-2 store under an older build must be **refused**
-/// rather than misread". An older build cannot be taught a new version check after the fact — it is
+/// `05 §12.6` requires that "opening a store of a newer version under an older build must be
+/// **refused** rather than misread". An older build cannot be taught a new version check after the fact — it is
 /// already shipped — so the refusal has to come from a validation it *already* performs. It performs
 /// exactly one on this frame: [`read_meta`](RecordStore::read_meta) rejects a chunk whose length runs
 /// past the page. Setting bit 31 of `chunk_len` makes the length astronomically larger than a page,
@@ -95,7 +102,7 @@ const META_CHUNK_CAP: usize = paging::PAGE_PAYLOAD - 12;
 /// authoritative version is the one in the catalog payload ([`Meta`]).
 ///
 /// **Ratified on 2026-08-03**, deliberately and with the trade-off stated: an old build failing
-/// immediately on a version-2 store is worth more than one reading it wrongly and then writing over
+/// immediately on an undo-area-era store is worth more than one reading it wrongly and then writing over
 /// it, and the error message it produces — "metadata chunk runs past the page", which does not name
 /// the version — is the accepted price. This is a design decision, not an accident of the encoding:
 /// removing the bit re-opens the silent-misread path (`05 §12.6`).
@@ -552,6 +559,30 @@ pub struct GcPassReport {
     pub first_freeze_violation: Option<FreezeFrontierViolation>,
 }
 
+/// What one property-chain sweep did, per owner and in total (`rmp` #967).
+///
+/// Two numbers rather than one because the gate that decides whether the **next** pass runs the sweep
+/// at all needs the second: `reclaimed` says what the pass achieved, `deferred_empty` says what it
+/// left behind and must come back for. A pass can legitimately reclaim nothing and still owe work —
+/// an empty cell whose watermark has not moved, or whose owner still holds a version chain — and
+/// disarming the gate on that pass strands those cells until an unrelated removal re-arms it. See
+/// [`RecordStore::gc_property_chain`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct PropChainSweep {
+    /// Property slots freed this sweep: reclaimable empty cells plus dead-link corpses.
+    reclaimed: usize,
+    /// Empty cells the sweep **saw but could not free yet** (condition 2 or 3 of
+    /// [`RecordStore::gc_property_chain`] unmet). Non-zero means a later pass still has work.
+    deferred_empty: usize,
+}
+
+impl std::ops::AddAssign for PropChainSweep {
+    fn add_assign(&mut self, rhs: Self) {
+        self.reclaimed += rhs.reclaimed;
+        self.deferred_empty += rhs.deferred_empty;
+    }
+}
+
 /// One in-use MVCC record found by the `rmp` #809 release-active freeze-frontier audit to still bear an
 /// **unfrozen committed-writer in-flight stamp** after the freeze sweep — i.e. a stamp whose writer the
 /// registry records as `Committed` but whose on-disk word is still the in-flight `TxnId` form. Forgetting
@@ -751,6 +782,24 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// the property sweep runs. Together with a non-empty `pending_tombstones[Prop]` it gates the
     /// property-chain sweep so a workload with no property deletes/aborts skips it entirely.
     pending_prop_corpses: bool,
+    /// Whether an **unreclaimed empty** property cell (`rmp` #967, `D-property-removal`) may exist:
+    /// set by [`empty_prop_cell`](Self::empty_prop_cell), and **re-derived** after every property
+    /// sweep from what that sweep actually saw ([`PropChainSweep::deferred_empty`]) rather than
+    /// cleared unconditionally.
+    ///
+    /// This replaces `pending_tombstones[Prop]` as the property sweep's gate. It has to: after #967 a
+    /// property operation never stamps `xmax`, so that set is never populated again and gating on it
+    /// would have left the sweep permanently off — the property store would grow without bound on any
+    /// workload that removes properties, with every test still green because nothing asserts that a
+    /// sweep *ran*.
+    ///
+    /// The re-derivation restores the one property the retired set had for free: it was reseeded from
+    /// on-disk state by the freeze sweep every pass, so a pass that reclaimed nothing left the gate
+    /// armed. A plain "clear after every sweep" does not, and the resulting stranding is reachable
+    /// with one long-running reader (`rmp` #967 audit): the reader holds the watermark, a `REMOVE`
+    /// commits, the pass defers the cell and disarms the gate, and the cell then survives every
+    /// subsequent pass until an unrelated removal re-arms it or the store reopens.
+    pending_empty_prop_cells: bool,
     /// Forces the first [`gc`](Self::gc) pass after [`open`](Self::open) to run the FULL corpse walk and
     /// property sweep (`rmp` #522), so any pre-existing on-disk corpses / tombstones a fresh process has
     /// no in-memory record of are caught. Cleared after that first pass; thereafter the gated
@@ -969,6 +1018,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             pending_tombstones: Default::default(),
             pending_corpse_rels: std::collections::BTreeSet::new(),
             pending_prop_corpses: false,
+            pending_empty_prop_cells: false,
             gc_full_scan_pending: true,
             gc_freeze_low_savepoint: None,
             // `rmp` #588: reader-safe slot-reuse overlay (in-memory; empty unless off-thread readers hold a slot).
@@ -1035,6 +1085,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // image arrives here with two EMPTY undo-area stores — which is exactly the state of a store
         // that has no version chains, so the upgrade is a no-op rather than a conversion — and an
         // image newer than this build understands never arrives at all, because `decode` refuses it.
+        // What `decode` CANNOT decide is whether an older image's properties still mean what this
+        // build reads; that is `refuse_legacy_property_tombstones` below (`rmp` #967).
         let store_format_version = meta.format_version;
         let mut stores = [
             FixedStore::from_meta(StoreKind::Node, &meta.stores[0])?,
@@ -1061,6 +1113,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // small to thread the corpse run to the committed head, so committed relationships below the
         // run become unreadable, and the allocator would re-hand-out a still-referenced corpse slot.
         Self::floor_high_water_over_mapped_corpses(&pool, &mut stores);
+        // `rmp` #967: a version-1 image may carry property MVCC tombstones this build cannot read.
+        // Runs after the two page-map reconstructions above so the scan sees every mapped record page,
+        // and before anything else touches a property cell.
+        Self::refuse_legacy_property_tombstones(&pool, &stores, store_format_version)?;
         let shared_len = shared.with(|w| w.durable_len());
         // Restore the transaction-id high-water from the durable WAL so the coordinator's id counter
         // resumes *past* every id already in the log. Without this the counter would restart low and
@@ -1102,6 +1158,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             pending_tombstones: Default::default(),
             pending_corpse_rels: std::collections::BTreeSet::new(),
             pending_prop_corpses: false,
+            pending_empty_prop_cells: false,
             gc_full_scan_pending: true,
             gc_freeze_low_savepoint: None,
             // `rmp` #588: reader-safe slot-reuse overlay (in-memory; empty unless off-thread readers hold a slot).
@@ -1162,10 +1219,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
 
     fn snapshot_meta(&self, committing: TxnId) -> Meta {
         Meta {
-            // Every catalog this build writes is a format-version-2 image, so a store opened at
-            // version 1 is UPGRADED by its first checkpoint (`05 §12.6`). The upgrade adds the two
-            // (empty) undo-area stores and loses nothing: a version-1 store has no chains, which is
-            // precisely what an empty undo area describes.
+            // Every catalog this build writes is a format-version-3 image, so a store opened at an
+            // earlier version is UPGRADED by its first checkpoint (`05 §12.6`). From version 1 the
+            // upgrade adds the two (empty) undo-area stores and loses nothing — a version-1 store has
+            // no chains, which is precisely what an empty undo area describes. From version 2 it
+            // changes nothing but the number: version 2 and version 3 differ only in what a property
+            // cell MEANS, and `refuse_legacy_property_tombstones` has already established at `open`
+            // that this image holds no cell whose meaning would change (`rmp` #967).
             format_version: graphus_core::constants::FORMAT_VERSION,
             element_id_next: self.element_ids.peek(),
             commit_ts_hw: self.commit_ts_hw,
@@ -1571,6 +1631,121 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         }
     }
 
+    /// **Refuses to open** a legacy store whose property chains still carry MVCC tombstones — the one
+    /// pre-`rmp`-#967 image this build would silently *misread* (`rmp` #967 audit, `05 §12.6`).
+    ///
+    /// # What the hazard is
+    ///
+    /// Before `D-property-removal`, a committed `REMOVE n.p` was one `props.store` cell left `in_use`
+    /// with its `expired_ts` stamped and **its value intact**; an overwrite was the same stamp plus a
+    /// new cell prepended above it. Visibility came from the cell's MVCC header. After #967 it does
+    /// not: the undo chain is the sole oracle, so
+    /// [`DecisionFold::seed`](crate::scan_polarity::DecisionFold) filters on `type_tag` alone and
+    /// [`read_view::collect_prop_chain`](crate::read_view) admits every `in_use` cell. Point this
+    /// build at such a store and every committed removal comes back holding its last value, the next
+    /// `SET` on those keys fails for ever ([`write_prop_cell`](Self::write_prop_cell) refuses a
+    /// non-zero `expired_ts`), and the superseded versions never reclaim (the sweep now keys on an
+    /// EMPTY cell, which a stamped one is not). Nothing else stops it: `Meta::decode` accepts a
+    /// version-1 image as an explicit lossless upgrade, and no property-chain migration exists.
+    ///
+    /// So the store is refused, exactly as `05 §12.6` already requires in the opposite direction ("a
+    /// store of a newer version under an older build must be refused rather than misread"). A wrong
+    /// answer that looks like data is worse than a failed startup.
+    ///
+    /// # Which versions this covers, and why it is both of them
+    ///
+    /// Every version **below** [`PROPERTY_UNDO_CHAIN_FORMAT_VERSION`] — 1 and 2 alike — was written
+    /// under the old property model, so both carry the hazard:
+    ///
+    /// * **version 1** is what every *released* build writes (v0.0.10 and earlier);
+    /// * **version 2** is what an *unreleased* build between `rmp` #966 and #967 writes — #966 bumped
+    ///   the version for the undo area while the property path was still tombstone-and-prepend.
+    ///
+    /// Version 3 (`rmp` #967) is the first version whose property cells mean what this build reads,
+    /// and it differs from version 2 **only in that number** — no field moved. That is precisely why
+    /// the number had to be bumped: without it the two images are indistinguishable, and the gate
+    /// below would have nothing to key on.
+    ///
+    /// # Why the tombstone scan, rather than refusing every pre-version-3 store
+    ///
+    /// Refusing unconditionally is one comparison and no I/O, but it also refuses every legacy store
+    /// that carries **no** property tombstone — which `Meta::decode` deliberately treats as a lossless
+    /// upgrade, and which is the normal state of any store whose GC has caught up with its removals,
+    /// or that never removed or overwrote a property at all. Those stores upgrade correctly and there
+    /// is no reason to strand them.
+    ///
+    /// The scan is paid **only** by a pre-version-3 image: every catalog this build writes is version
+    /// 3 ([`snapshot_meta`](Self::snapshot_meta)), so the first checkpoint after a successful upgrade
+    /// retires the cost permanently, and a store this build created never pays it once. It is also a
+    /// pass this store already performs: the first GC pass after every `open` scans `props.store` from
+    /// id 1 (`freeze_low` starts at `1`, `gc_full_scan_pending` is `true`), so the marginal cost of
+    /// the gate is one extra linear pass over the property store, once, on a legacy image.
+    ///
+    /// **Measured** before the choice was taken, on this project's file-backed device
+    /// (`FileBlockDevice` + `FileLogSink`, 8192-frame pool, release build, x86-64):
+    ///
+    /// | property cells | store size | this scan | whole `RecordStore::open` | share |
+    /// | --- | --- | --- | --- | --- |
+    /// | 1 000 000 | 127 MiB | 19.0 ms | 455 ms | 4.2 % |
+    /// | 4 000 000 | 509 MiB | 77.5 ms | 1.85 s | 4.2 % |
+    ///
+    /// Linear at ≈19 ns per cell and a constant fraction of an open that already reads those pages.
+    /// A one-off 4 % on the single open that upgrades a legacy store is not a reason to strand every
+    /// tombstone-free legacy store, which is what the unconditional refusal would do.
+    ///
+    /// # The second tier, which this does not replace
+    ///
+    /// This gate answers at `open`, before a single property is read, and it is the tier that can name
+    /// the cause and the migration route. It is not the only one: the consistency checker reports
+    /// every such cell as
+    /// [`MvccHeaderFault::PropertyCellTombstoned`](crate::check::MvccHeaderFault), and
+    /// [`verify_on_open`](crate::check::verify_on_open) — the server's inviolable gate on every
+    /// database it opens (`04 §4.6`/§4.8) — turns that into a refusal to serve. The two are
+    /// independent: the checker would still catch a tombstoned cell in a version-3 image, which is a
+    /// state no version number can describe and only a bug could produce.
+    ///
+    /// # Errors
+    /// Returns a storage error naming the cause and the migration route when `format_version` is below
+    /// [`PROPERTY_UNDO_CHAIN_FORMAT_VERSION`] and any in-use property cell carries a non-zero
+    /// `expired_ts`, or if the `props.store` scan cannot read a page.
+    fn refuse_legacy_property_tombstones(
+        pool: &ConcurrentBufferPool<D, SharedWal<S>>,
+        stores: &[FixedStore; STORE_COUNT],
+        format_version: u32,
+    ) -> Result<()> {
+        if format_version >= PROPERTY_UNDO_CHAIN_FORMAT_VERSION {
+            return Ok(());
+        }
+        let (count, first) = read_view::scan_property_tombstones(pool, stores)?;
+        let Some((id, expired_ts)) = first else {
+            return Ok(()); // a tombstone-free legacy image: the upgrade is lossless, open it
+        };
+        // Name the origin truthfully for each version rather than for the common one: a version-2
+        // image was NOT written by a released build, and telling an operator to go back to v0.0.10 to
+        // drain it would send them to a build that cannot open it.
+        let provenance = if format_version == LEGACY_FORMAT_VERSION {
+            "written by a released build, Graphus v0.0.10 or earlier"
+        } else {
+            "written by an unreleased build between `rmp` #966 (which added the undo area) and #967 \
+             (which moved the property path onto it)"
+        };
+        Err(GraphusError::Storage(format!(
+            "refusing to open this store: it carries on-disk format version {format_version} \
+             ({provenance}, so its properties predate `D-property-visibility`) and its property \
+             chains still hold {count} MVCC property tombstone(s) — the first at props.store record \
+             {id}, expired_ts {expired_ts:#018x}. This build (format version \
+             {PROPERTY_UNDO_CHAIN_FORMAT_VERSION}) resolves a property's visibility from the owning \
+             entity's undo chain and no longer reads a property cell's `xmax` (`rmp` #967), so \
+             opening this store would report every committed property removal as if the property \
+             were still present, reject the next write to each of those keys, and never reclaim \
+             their slots. Refusing to open rather than misread (`05 §12.6`). There is no in-place \
+             upgrade — the property cell's layout did not change, its MEANING did, so no catalog \
+             rewrite can recover which cells were removals. To migrate: open the store with the \
+             build that wrote it, export the graph from it (`graphus-bulk dump` writes the node and \
+             relationship CSV pair), and load that export into a NEW store created by this build."
+        )))
+    }
+
     /// Persists the in-memory catalog to the metadata page as one WAL-logged update under `txn`.
     /// When `commit` is set, `txn` is begun and committed around the write (standalone catalog
     /// change, `04 §2.6`); otherwise the write joins the caller's open `txn`.
@@ -1759,6 +1934,90 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         });
         self.pool.unpin(f);
         Ok(())
+    }
+
+    /// Rewrites property cell `id` **in place** — the whole of `rmp` #967's write path — as ONE page
+    /// latch, ONE WAL record and ONE contiguous byte patch over `PROP_CELL_REGION`.
+    ///
+    /// # Why exactly these bytes, and why one patch
+    ///
+    /// The region is `created_ts`, `expired_ts`, `undo_ptr`, `key`, `type_tag`, `value_inline` — every
+    /// field the value-level write owns — and it deliberately excludes both ends of the record:
+    ///
+    /// * **byte 0, `flags`.** The in-use bit is the slot's *structural* state, shared with the
+    ///   creation undo, the corpse discipline and GC. A value write never changes it, so it must not
+    ///   appear in this write's pre-image either.
+    /// * **`next_prop` (bytes 38..46).** The shared chain word, legitimately owned by
+    ///   [`gc_property_chain`](Self::gc_property_chain)'s splice and by a concurrent prepend. A
+    ///   whole-record [`write_prop`](Self::write_prop) here would log a whole-record pre-image undo of
+    ///   a word this transaction does not own, which is the exact `rmp` #172 / #220 / #239 defect
+    ///   family: an out-of-LIFO abort reverts a neighbour's committed chain edit and severs the chain.
+    ///
+    /// It is one patch rather than two (say, "stamp then value") because
+    /// [`read_view::read_prop`](crate::read_view::read_prop) copies all 46 bytes under a **single**
+    /// read latch: two `write_region` calls would open a window in which an off-thread reader
+    /// observes the new value with the old stamp, or the reverse — a version no writer ever produced.
+    /// Fields that do not change are carried through unchanged, which costs nothing (they are already
+    /// in the encoded record) and keeps the patch contiguous.
+    ///
+    /// # The abort story
+    ///
+    /// The undo is a **plain pre-image** of the region, which is exact here — unlike every other
+    /// shared-field write in this store — because the entity-granularity write-conflict check
+    /// ([`ensure_no_conflicting_writer`](Self::ensure_no_conflicting_writer)) means no other
+    /// transaction can be on this entity's property write path while this one holds it, so the
+    /// pre-image cannot go stale. See that method for the four-part proof obligation.
+    ///
+    /// `link_delta` writes the delta **before** this cell write, so a WAL rollback (newest-LSN-first)
+    /// restores the cell first and clears the delta's `in_use` flag second. The only observable
+    /// intermediate state is therefore (cell restored, delta still reading live), in which a
+    /// concurrent reader applies the delta and writes back the value already in the cell —
+    /// idempotent. The reverse ordering would expose (cell still new, delta already dead), in which
+    /// the reader keeps a value the aborting transaction wrote. That is why the order is fixed and
+    /// not incidental.
+    ///
+    /// # Errors
+    /// Returns a storage error if `id`'s page is not allocated or the write fails, or — failing
+    /// closed — if `cell` carries a non-zero `expired_ts` or `undo_ptr`. Neither is reachable through
+    /// this path: `expired_ts` is never written by a property operation after `D-property-removal`,
+    /// and a `props.store` record never anchors an undo chain (the `SetProperty` delta anchors on the
+    /// **owning** node/relationship). Writing either would build a second, invisible chain family.
+    fn write_prop_cell(&mut self, id: u64, cell: &PropRecord, txn: TxnId) -> Result<()> {
+        if cell.mvcc.expired_ts != 0 || cell.mvcc.undo_ptr != 0 {
+            return Err(GraphusError::Storage(format!(
+                "property cell {id} would be written with expired_ts {} / undo_ptr {}; after `rmp` \
+                 #967 a property operation never stamps `xmax`, and a property record never anchors \
+                 an undo chain (the `SetProperty` delta anchors on the owning entity)",
+                cell.mvcc.expired_ts, cell.mvcc.undo_ptr
+            )));
+        }
+        // `rmp` #522 FREEZE FRONTIER, re-armed for the `rmp` #967 in-place write path.
+        //
+        // This is the one place a property cell is rewritten IN PLACE, and every such rewrite restamps
+        // `created_ts` to the writer's in-flight stamp. Before #967 a property write always ALLOCATED a
+        // record, so a fresh in-flight stamp could only ever appear at or above the frontier and
+        // `note_created`'s `lower_freeze_low` was enough. After #967 a `SET`/`REMOVE` of an existing key
+        // restamps an EXISTING id, which is very often far BELOW the frontier — so the incremental
+        // freeze sweep (`[freeze_low, high_water)`) never revisits it, the stamp is never settled to
+        // `Committed(ts)`, and once the registry forgets that writer `is_visible` reads the stamp as
+        // unresolvable. That is the exact #522 silent-lost-committed-data shape, reopened from a new
+        // direction; `debug_assert_freeze_complete` caught it (DST
+        // `bulk_load_mid_abort_wal_bound_590` / `reader_store_growth`, "in-use Prop record N still
+        // bears an unfrozen committed-writer in-flight stamp").
+        //
+        // Lowering the frontier is the same remedy `note_created` documents for a reused id, and it
+        // fails CLOSED: the only cost of lowering it too far is a wider sweep on the next GC pass.
+        self.lower_freeze_low(StoreKind::Prop, id);
+        let mut buf = [0u8; PROP_RECORD_SIZE];
+        cell.encode(&mut buf);
+        let (rel_page, off) = paging::record_location(id, PROP_RECORD_SIZE);
+        let dev = self.device_page(StoreKind::Prop, rel_page)?;
+        self.write_region(
+            dev,
+            off + PROP_CELL_REGION.start,
+            &buf[PROP_CELL_REGION],
+            txn,
+        )
     }
 
     fn write_record(&mut self, kind: StoreKind, id: u64, buf: &[u8], txn: TxnId) -> Result<()> {
@@ -1988,11 +2247,27 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// open transaction is read-only (`rmp` task #902).
     ///
     /// "Has written data" means its mutations are already **physically present** in the store — a
-    /// record it created or tombstoned, or a label bitmap it changed — and would therefore be observed
-    /// by any caller that reads the store raw instead of through a [`Snapshot`](graphus_txn::Snapshot).
-    /// The three lists this reads are exactly the ones the commit/rollback paths consume to settle or
-    /// undo those mutations, so a transaction with all three empty has changed nothing a raw scan can
-    /// see, and its future writes are subject to whatever the caller declares in the meantime.
+    /// record it created or tombstoned, a label bitmap it changed, or a property value it overwrote in
+    /// place — and would therefore be observed by any caller that reads the store raw instead of
+    /// through a [`Snapshot`](graphus_txn::Snapshot). The four lists this reads are exactly the ones
+    /// the commit/rollback paths consume to settle or undo those mutations, so a transaction with all
+    /// four empty has changed nothing a raw scan can see, and its future writes are subject to whatever
+    /// the caller declares in the meantime.
+    ///
+    /// # Why `undo_links` is in that set (`rmp` #967)
+    ///
+    /// A property write used to PREPEND a new record and tombstone the old one, so it always showed up
+    /// in `created` + `expired`. After `rmp` #967 (`D-property-removal`) it is written **in place**:
+    /// no record is created, none is tombstoned, no label word moves — the only trace it leaves in the
+    /// Active Transaction Table is the `SetProperty` delta it linked onto the entity's undo chain.
+    ///
+    /// Without this clause a transaction whose only uncommitted mutation is `SET n.p = …` became
+    /// INVISIBLE to this predicate, which silently disabled the `rmp` #902 fail-closed guard: the
+    /// constraint DDL judged the committed image alone, ACCEPTED `IS UNIQUE`, and the open writer then
+    /// committed a duplicate under a live constraint — a committed duplicate no SSI edge can undo,
+    /// because the DDL takes no predicate marker. Pinned by
+    /// `graphus-cypher/tests/constraint_validation_visibility.rs::create_constraint_refuses_while_another_transaction_holds_uncommitted_writes`,
+    /// which caught exactly this regression.
     ///
     /// This is the store's answer to "is the committed image decidable right now?", used by the
     /// constraint DDL to refuse rather than judge existing data it cannot resolve
@@ -2014,7 +2289,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.active
             .iter()
             .filter(|(_, a)| {
-                !a.created.is_empty() || !a.expired.is_empty() || !a.labelled_nodes.is_empty()
+                !a.created.is_empty()
+                    || !a.expired.is_empty()
+                    || !a.labelled_nodes.is_empty()
+                    || !a.undo_links.is_empty()
             })
             .map(|(txn, _)| *txn)
             .min()
@@ -2780,13 +3058,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Returns a storage error if `id` is out of range, its page is unreadable, or the slot is
     /// occupied but does not decode.
     fn read_delta(&self, id: u64) -> Result<Option<UndoDelta>> {
-        let buf = self.read_undo_slot_bytes(StoreKind::Undo, id, undo::UNDO_RECORD_SIZE)?;
-        if undo::is_zeroed(&buf) {
-            return Ok(None);
-        }
-        UndoDelta::decode(&buf)
-            .map(Some)
-            .map_err(|e| GraphusError::Storage(format!("undo delta {id}: {e}")))
+        // `rmp` #967: one body, shared with the off-thread reader pool. The inline path and
+        // `StoreReadView` MUST decode a delta through the same code, or the pool answers a property
+        // read from a different mechanism than this path does — the #755/#768/#769/#770 family. The
+        // record-read probe lives there for the same reason.
+        read_view::read_delta(&self.pool, &self.stores, id)
     }
 
     /// Reads the `commit.store` slot at physical id `id`. `Ok(None)` for a zeroed slot, exactly as
@@ -2796,31 +3072,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Returns a storage error if `id` is out of range, its page is unreadable, or the slot is
     /// occupied but does not decode.
     fn read_commit_slot(&self, id: u64) -> Result<Option<CommitSlot>> {
-        let buf = self.read_undo_slot_bytes(StoreKind::Commit, id, undo::COMMIT_RECORD_SIZE)?;
-        if undo::is_zeroed(&buf) {
-            return Ok(None);
-        }
-        CommitSlot::decode(&buf)
-            .map(Some)
-            .map_err(|e| GraphusError::Storage(format!("commit slot {id}: {e}")))
-    }
-
-    /// Copies the `len` raw bytes of undo-area record `id` out from its resident page under one read
-    /// latch. Bounds-checked against the store's high-water mark first, so a dangling chain pointer
-    /// is reported as such rather than silently reading a neighbouring slot.
-    fn read_undo_slot_bytes(&self, kind: StoreKind, id: u64, len: usize) -> Result<Vec<u8>> {
-        if id == NULL_ID || id >= self.store(kind).alloc.high_water() {
-            return Err(GraphusError::Storage(format!(
-                "{kind:?} store id {id} is outside 1..{}",
-                self.store(kind).alloc.high_water()
-            )));
-        }
-        let (rel_page, off) = paging::record_location(id, kind.record_size());
-        let dev = self.device_page(kind, rel_page)?;
-        let f = self.pool.fetch(dev)?;
-        let bytes = self.pool.with_page(f, |p| p[off..off + len].to_vec());
-        self.pool.unpin(f);
-        Ok(bytes)
+        // One body, shared with the off-thread reader pool — see [`read_delta`](Self::read_delta).
+        read_view::read_commit_slot(&self.pool, &self.stores, id)
     }
 
     /// Returns a physical id for a fresh `undo.store` delta: a reclaimed id when one is available,
@@ -3052,28 +3305,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// chain fails to terminate within the store's id space — both of which are corruption, not
     /// states a healthy store can reach.
     fn undo_chain(&self, kind: StoreKind, entity: u64) -> Result<Vec<(u64, UndoDelta)>> {
-        let mut out = Vec::new();
-        let mut cur = self.read_mvcc(kind, entity)?.undo_ptr;
-        // One step per allocated delta is the exact ceiling: a well-formed chain visits each delta at
-        // most once, so exceeding it proves a cycle without needing a visited set on the hot path.
-        let guard = self.store(StoreKind::Undo).alloc.high_water();
-        let mut steps = 0u64;
-        while cur != NULL_ID {
-            steps += 1;
-            if steps > guard {
-                return Err(GraphusError::Storage(format!(
-                    "undo chain of {kind:?} {entity} is malformed (cycle?)"
-                )));
-            }
-            let Some(delta) = self.read_delta(cur)? else {
-                return Err(GraphusError::Storage(format!(
-                    "undo chain of {kind:?} {entity} reaches empty delta slot {cur}"
-                )));
-            };
-            out.push((cur, delta));
-            cur = delta.next;
-        }
-        Ok(out)
+        // One body, shared with the off-thread reader pool — see [`read_delta`](Self::read_delta).
+        read_view::undo_chain(&self.pool, &self.stores, kind, entity)
     }
 
     /// Detaches entity `(kind, entity)`'s **whole** undo chain under `txn` and reclaims every delta on
@@ -3103,13 +3336,41 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         Ok(chain.len())
     }
 
-    /// Reclaims one unreachable delta: clears its `in_use` bit, releases its hold on its commit slot,
-    /// and returns its id to the free list.
+    /// Reclaims one unreachable delta: frees the `strings.store` overflow chain it owns (if any),
+    /// clears its `in_use` bit, releases its hold on its commit slot, and returns its id to the free
+    /// list.
     ///
     /// Only the flag byte is written, not the whole record — the same discipline every other store
     /// uses when it frees a slot (the body survives until the slot is reused), and one 1-byte WAL
     /// patch instead of 56.
+    ///
+    /// # The overflow chain, and the one gate that must never be removed
+    ///
+    /// After `rmp` #967 a live [`SetProperty`](UndoAction::SetProperty) delta is the **sole owner**
+    /// of the old value's overflow chain: the cell stopped naming it the moment the new value was
+    /// written in place, and exactly one record names any `strings.store` head (the consistency
+    /// checker enforces that —
+    /// [`HeapChainFault::AliasedBetweenCellAndDelta`](crate::check::HeapChainFault::AliasedBetweenCellAndDelta)).
+    /// So freeing the delta must free the chain, or the blocks leak for the life of the store.
+    ///
+    /// **But only if the delta is live.** A `!in_use` delta is a *corpse* — an aborting transaction's,
+    /// whose creation undo cleared the flag while preserving the body. Its transaction's WAL rollback
+    /// already restored the pre-image of the cell, so the chain the corpse still names is the one the
+    /// **live cell** owns again. Freeing it here would hand those blocks to the free list while a
+    /// live property still reads through them: silent corruption, surfacing later as one property's
+    /// value appearing inside another's. [`delta_is_dead`](Self::delta_is_dead) returns `true` for a
+    /// corpse, so [`free_undo_chain`](Self::free_undo_chain) *does* reach this line with one. The
+    /// `in_use()` gate is the whole defence, and
+    /// `tests/property_undo_chain_967.rs::the_corpse_delta_of_an_aborted_overwrite_never_frees_the_restored_chain`
+    /// is what keeps it here.
     fn free_delta(&mut self, id: u64, delta: UndoDelta, txn: TxnId) -> Result<()> {
+        if delta.in_use()
+            && delta.action == UndoAction::SetProperty
+            && delta.type_tag & valenc::OVERFLOW_BIT != 0
+            && delta.value_inline != NULL_ID
+        {
+            self.free_chain(txn, delta.value_inline)?;
+        }
         let (rel_page, off) = paging::record_location(id, undo::UNDO_RECORD_SIZE);
         let dev = self.device_page(StoreKind::Undo, rel_page)?;
         self.write_region(dev, off + undo::UNDO_OFF_FLAGS, &[0u8], txn)?;
@@ -3144,6 +3405,209 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             self.free_push(StoreKind::Commit, slot, txn);
         }
         Ok(())
+    }
+
+    /// **The write-conflict check** (`D-property-write-conflict`, ratified 2026-08-03): refuses a
+    /// property write on `(kind, entity)` while another **still-open** transaction holds that
+    /// entity's undo chain.
+    ///
+    /// The head of an entity's chain names the last transaction to have written it. If that
+    /// transaction is still open, letting a second writer prepend on top would interleave two
+    /// transactions' deltas on one chain — and then their commit timestamps can end up **ascending**
+    /// down the chain, because commit order is not link order. The read path's `Stop` rule
+    /// ([`DeltaVerdict::Stop`](crate::scan_polarity::DeltaVerdict)) is precisely the claim that they
+    /// cannot: it ends the walk at the first delta the snapshot already reflects, which is only sound
+    /// if everything below committed no later. So this check is not a nicety layered on top of the
+    /// read path — it is the read path's precondition.
+    ///
+    /// The granularity is the **entity**, not the property, matching Memgraph's `PrepareForWrite`
+    /// (`/data/refsrc/memgraph/src/storage/v2/mvcc.hpp`, read 2026-08-03), which every mutating
+    /// accessor calls before linking its delta. The Cypher seam already imposed exactly this rule
+    /// keyed on the node id (`RecordGraph::set_node_property` → `note_write`), so the coordinated
+    /// path's behaviour is unchanged; what becomes newly constrained is the direct `RecordStore`
+    /// caller.
+    ///
+    /// Uses [`is_txn_active`](Self::is_txn_active) and **never**
+    /// `CommitRegistry::outcome(w) == InFlight`, which is documented on that method as dead — always
+    /// `false` — and has already caused two silent-data-loss defects (`rmp` #522, #778).
+    ///
+    /// # It is also what makes the in-place cell undo exact
+    ///
+    /// [`write_prop_cell`](Self::write_prop_cell) logs a **plain pre-image** undo of the cell region,
+    /// which is only correct if no other transaction can rewrite that region between the write and
+    /// the abort. Four things have to hold, and each was verified in the code rather than assumed:
+    ///
+    /// 1. **No concurrent property writer.** This check: while `W` holds the entity, every other
+    ///    transaction's property write on it is refused.
+    /// 2. **The freeze sweep will not touch it.**
+    ///    [`freeze_store_headers_incremental`](Self::freeze_store_headers_incremental) rewrites only
+    ///    stamps that [`frozen_word`](Self::frozen_word) resolves to a **committed** writer;
+    ///    `W` is unresolved, so its `created_ts` is skipped.
+    /// 3. **GC will not reclaim the cell.** [`gc_property_chain`](Self::gc_property_chain) requires
+    ///    the owner's `undo_ptr == 0`, and `W`'s open delta is on that chain, so the head is non-zero.
+    /// 4. **The whole chain will not be freed.** [`free_property_chain`](Self::free_property_chain)
+    ///    runs only from [`reclaim_node`](Self::reclaim_node) / [`reclaim_rel`](Self::reclaim_rel),
+    ///    which need the owner tombstoned **and** committed at or below the GC watermark — and `W`
+    ///    holds the entity, so nothing tombstoned it.
+    ///
+    /// # Errors
+    /// Returns [`GraphusError::Transaction`] — a **retriable serialization failure** — when the chain
+    /// head belongs to another open transaction, and a storage error if the chain head dangles.
+    fn ensure_no_conflicting_writer(&self, kind: StoreKind, entity: u64, txn: TxnId) -> Result<()> {
+        let head = self.read_mvcc(kind, entity)?.undo_ptr;
+        if head == NULL_ID {
+            return Ok(());
+        }
+        let Some(delta) = self.read_delta(head)? else {
+            // A chain head that names a zeroed slot is corruption, not a state to be tolerated:
+            // fail closed rather than proceed as if the entity were unheld.
+            return Err(GraphusError::Storage(format!(
+                "undo chain of {kind:?} {entity} reaches empty delta slot {head}"
+            )));
+        };
+        if !delta.in_use() {
+            // A corpse head: its transaction aborted, so it holds nothing.
+            return Ok(());
+        }
+        let Some(slot) = self.read_commit_slot(delta.commit_info)? else {
+            return Err(GraphusError::Storage(format!(
+                "undo delta {head} names commit slot {} which holds no record (`05 §12.4`)",
+                delta.commit_info
+            )));
+        };
+        if let Some(holder) = crate::scan_polarity::open_writer_of(slot)
+            && holder != txn
+            && self.is_txn_active(holder)
+        {
+            return Err(GraphusError::Transaction(format!(
+                "write-write conflict: {kind:?} {entity} held by transaction {}; retry \
+                 (serialization failure)",
+                holder.0
+            )));
+        }
+        Ok(())
+    }
+
+    /// Links the [`UndoAction::SetProperty`] delta that records one property write on
+    /// `(kind, entity)`, carrying the value the key held **before** it (`05 §12.3`).
+    ///
+    /// The delta anchors on the **owning node or relationship**, never on the `props.store` cell:
+    /// a cell is the entity's current value for a key, not a versioned entity of its own, and its
+    /// `undo_ptr` stays `0` forever (the consistency checker enforces that —
+    /// [`UndoChainFault::PropertyCellAnchorsChain`](crate::check::UndoChainFault)). The debug
+    /// assertion below is the near-miss guard: [`StoreKind::is_versioned`] answers `true` for `Prop`
+    /// as well, so `link_delta(StoreKind::Prop, …)` would compile and silently build a second,
+    /// parallel chain family that nothing reads.
+    ///
+    /// `old_type_tag` of [`undo::TYPE_TAG_ABSENT`] with a zero `old_value` is the **"the key was
+    /// absent"** encoding, which is what makes an added key invisible to an older snapshot. It is not
+    /// optional: after `D-property-visibility` the cell's own stamp decides nothing, so without this
+    /// delta an older snapshot would read a key that a still-open transaction had just added.
+    ///
+    /// A no-op for the reserved [`SYSTEM_TXN`], which writes only the catalog, is never rolled back,
+    /// and has no [`VersionStamp`] form — exactly as [`note_entity_deleted`](Self::note_entity_deleted).
+    ///
+    /// # Errors
+    /// Returns a storage error if the delta cannot be allocated, written, or linked.
+    fn link_set_property(
+        &mut self,
+        kind: StoreKind,
+        entity: u64,
+        token: u32,
+        old_type_tag: u8,
+        old_value: u64,
+        txn: TxnId,
+    ) -> Result<()> {
+        debug_assert!(
+            matches!(kind, StoreKind::Node | StoreKind::Rel),
+            "a SetProperty delta anchors on the OWNING entity; anchoring it on the `props.store` \
+             cell would build a second chain family that no reader walks"
+        );
+        if txn == SYSTEM_TXN {
+            return Ok(());
+        }
+        let mut delta = UndoDelta::new(UndoAction::SetProperty, 0, 0, 0);
+        delta.token = token;
+        delta.type_tag = old_type_tag;
+        delta.value_inline = old_value;
+        self.link_delta(kind, entity, delta, txn)?;
+        Ok(())
+    }
+
+    /// The live `props.store` cell holding `key` on the chain rooted at `first_prop`, if any.
+    ///
+    /// `O(K)` in the number of **distinct keys** the entity holds — not `O(M)` in the number of times
+    /// the key has been written, which is the whole point of `rmp` #967. It is honestly not `O(1)`:
+    /// an entity with K properties keeps K cells on one singly-linked chain, and finding one key
+    /// means walking it. Threads through `!in_use` corpses exactly as every other chain walk does.
+    ///
+    /// # Errors
+    /// Returns a storage error if a chain page is missing or the chain does not terminate.
+    fn find_live_prop_cell(
+        &self,
+        first_prop: u64,
+        key: u32,
+        owner_label: &str,
+    ) -> Result<Option<(u64, PropRecord)>> {
+        let mut cur = first_prop;
+        let guard = self.store(StoreKind::Prop).alloc.high_water() + 1;
+        let mut steps = 0u64;
+        while cur != NULL_ID {
+            steps += 1;
+            if steps > guard {
+                return Err(GraphusError::Storage(format!(
+                    "property chain of {owner_label} is malformed (cycle?)"
+                )));
+            }
+            let prop = self.read_prop(cur)?;
+            if prop.mvcc.in_use() && prop.key == key {
+                return Ok(Some((cur, prop)));
+            }
+            cur = prop.next_prop;
+        }
+        Ok(None)
+    }
+
+    /// Every live `props.store` cell on the chain rooted at `first_prop`, head to tail.
+    ///
+    /// # Errors
+    /// Returns a storage error if a chain page is missing or the chain does not terminate.
+    fn live_prop_cells(
+        &self,
+        first_prop: u64,
+        owner_label: &str,
+    ) -> Result<Vec<(u64, PropRecord)>> {
+        let mut out = Vec::new();
+        let mut cur = first_prop;
+        let guard = self.store(StoreKind::Prop).alloc.high_water() + 1;
+        let mut steps = 0u64;
+        while cur != NULL_ID {
+            steps += 1;
+            if steps > guard {
+                return Err(GraphusError::Storage(format!(
+                    "property chain of {owner_label} is malformed (cycle?)"
+                )));
+            }
+            let prop = self.read_prop(cur)?;
+            if prop.mvcc.in_use() {
+                out.push((cur, prop));
+            }
+            cur = prop.next_prop;
+        }
+        Ok(out)
+    }
+
+    /// The `first_prop` chain head of a node or relationship owner, and a label for diagnostics.
+    fn owner_chain_head(&self, kind: StoreKind, id: u64) -> Result<u64> {
+        Ok(match kind {
+            StoreKind::Node => self.read_node(id)?.first_prop,
+            StoreKind::Rel => self.read_rel(id)?.first_prop,
+            StoreKind::Prop | StoreKind::Strings | StoreKind::Undo | StoreKind::Commit => {
+                return Err(GraphusError::Storage(format!(
+                    "{kind:?} is not a property-chain owner"
+                )));
+            }
+        })
     }
 
     /// Writes the `DeleteObject` delta that records the creation of node / relationship `id` under
@@ -4113,27 +4577,50 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // referential integrity and the incidence chains stay well-formed throughout.
             reclaimed += self.reclaim_pending(StoreKind::Node, txn, watermark)?;
 
-            // ---- Phase D: sweep PROPERTY chains, gated (`rmp` #522). ----
-            // Reclaims tombstoned property versions (`rmp` task #50) and dead-link property corpses (#172)
-            // from every surviving owner's chain. The full owner walk runs ONLY when a property tombstone or
-            // corpse may exist (a non-empty `pending_tombstones[Prop]`, `pending_prop_corpses`, or the first
-            // post-open pass) — a workload with no property deletes/aborts skips it. A reclaimed owner's whole
-            // chain was already freed by its reclamation, so re-checking liveness here reclaims each once.
-            if self.gc_full_scan_pending
-                || !self.pending_tombstones[StoreKind::Prop as usize].is_empty()
-                || self.pending_prop_corpses
-            {
-                reclaimed += self.sweep_property_chains(txn, watermark)?;
-                self.pending_prop_corpses = false;
-                self.prune_settled_tombstones(StoreKind::Prop)?;
-            }
-
             // ---- Phase F: reclaim undo chains no live snapshot can reach (`rmp` #966). ----
-            // Runs LAST among the reclamation sweeps, so a node/relationship reclaimed above has
-            // already had its own chain freed with it and is not walked again here. Candidate-set
-            // driven exactly as Phases A–D are, with the same first-post-open full-scan seeding.
+            // Runs after the node/relationship sweeps, so an entity reclaimed above has already had
+            // its own chain freed with it and is not walked again here. Candidate-set driven exactly
+            // as Phases A–C are, with the same first-post-open full-scan seeding.
+            //
+            // ORDER (`rmp` #967): it runs BEFORE the property sweep, and that is a LATENCY choice,
+            // not a correctness one. Phase D reclaims an empty property cell only once its owner's
+            // `undo_ptr` is `0` — a conservative, O(1) proof that Phase F has already retired the
+            // owner's whole history, NOT (as an earlier version of this comment claimed) because a
+            // reconstruction could land in the cell; it never does, and
+            // [`gc_property_chain`](Self::gc_property_chain) documents the worked counter-example.
+            // Running D first would therefore find every just-written owner still chained and defer
+            // every empty cell to the next pass. Freeing the chains first restores single-pass
+            // reclamation: F clears `undo_ptr`, D then sees an unchained owner. Both orders are
+            // correct; this one is one pass faster and keeps the property store's steady-state
+            // footprint independent of the GC cadence.
             self.bump_drain_progress();
             undo_deltas_reclaimed = self.gc_reclaim_undo_chains(txn, watermark)?;
+
+            // ---- Phase D: sweep PROPERTY chains, gated (`rmp` #522). ----
+            // Reclaims **empty** property cells (`rmp` #967, `D-property-removal`) and dead-link
+            // property corpses (#172) from every surviving owner's chain. The full owner walk runs
+            // ONLY when an empty cell or a corpse may exist (`pending_empty_prop_cells`,
+            // `pending_prop_corpses`, or the first post-open pass) — a workload with no property
+            // removals or aborts skips it. A reclaimed owner's whole chain was already freed by its
+            // reclamation, so re-checking liveness here reclaims each once.
+            if self.gc_full_scan_pending
+                || self.pending_empty_prop_cells
+                || self.pending_prop_corpses
+            {
+                let sweep = self.sweep_property_chains(txn, watermark)?;
+                reclaimed += sweep.reclaimed;
+                // A corpse is reclaimed unconditionally by the walk that finds it, so the corpse gate
+                // is genuinely satisfied by one sweep. An EMPTY CELL is not: it is deferred whenever
+                // the watermark has not passed the write that emptied it, or the owner still holds a
+                // chain. Re-arm the gate from what the sweep actually saw, so a pass that reclaimed
+                // nothing does not disarm it (`rmp` #967 audit — a long-running reader used to leave
+                // the cells stranded until an unrelated removal re-armed the flag or the store
+                // reopened). This is the on-disk-derived, self-healing signal the retired
+                // `pending_tombstones[Prop]` gate had, recovered without its per-id bookkeeping.
+                self.pending_prop_corpses = false;
+                self.pending_empty_prop_cells = sweep.deferred_empty > 0;
+                self.prune_settled_tombstones(StoreKind::Prop)?;
+            }
         }
 
         // ---- Phase E: freeze committed-but-unfrozen MVCC stamps (`rmp` task #59), frontier-based. ----
@@ -4574,16 +5061,25 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     }
 
     /// The property-chain sweep of [`gc`](Self::gc) (`rmp` #522, Phase D): for every surviving live node
-    /// and relationship owner, [`gc_property_chain`](Self::gc_property_chain) reclaims its tombstoned
-    /// property versions and dead-link property corpses. Gated by the caller so it runs only when a
-    /// property tombstone/corpse may exist. Returns the count of property records reclaimed.
-    fn sweep_property_chains(&mut self, txn: TxnId, watermark: Timestamp) -> Result<usize> {
-        let mut reclaimed = 0usize;
+    /// and relationship owner, [`gc_property_chain`](Self::gc_property_chain) reclaims its **empty**
+    /// property cells (`rmp` #967) and its dead-link property corpses. Gated by the caller so it runs
+    /// only when an empty cell or a corpse may exist.
+    ///
+    /// Returns the whole-sweep [`PropChainSweep`]: what it freed, and — the number the caller's gate
+    /// depends on — how many empty cells it saw and had to defer. Because this walks **every**
+    /// surviving owner, `deferred_empty == 0` is a complete statement about the store, which is what
+    /// makes it safe to disarm the gate on (`rmp` #967 audit).
+    fn sweep_property_chains(
+        &mut self,
+        txn: TxnId,
+        watermark: Timestamp,
+    ) -> Result<PropChainSweep> {
+        let mut total = PropChainSweep::default();
         self.bump_drain_progress();
         let node_live = read_view::scan_in_use_mvcc(&self.pool, &self.stores, StoreKind::Node)?;
         for (i, &(id, mvcc)) in node_live.iter().enumerate() {
             if Self::is_live_version(mvcc) {
-                reclaimed += self.gc_property_chain(txn, StoreKind::Node, id, watermark)?;
+                total += self.gc_property_chain(txn, StoreKind::Node, id, watermark)?;
             }
             if i % 4096 == 0 {
                 self.bump_drain_progress();
@@ -4593,13 +5089,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         let rel_live = read_view::scan_in_use_mvcc(&self.pool, &self.stores, StoreKind::Rel)?;
         for (i, &(id, mvcc)) in rel_live.iter().enumerate() {
             if Self::is_live_version(mvcc) {
-                reclaimed += self.gc_property_chain(txn, StoreKind::Rel, id, watermark)?;
+                total += self.gc_property_chain(txn, StoreKind::Rel, id, watermark)?;
             }
             if i % 4096 == 0 {
                 self.bump_drain_progress();
             }
         }
-        Ok(reclaimed)
+        Ok(total)
     }
 
     /// Drops entries from [`pending_tombstones[kind]`](Self::pending_tombstones) whose record is no
@@ -6363,23 +6859,74 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         Ok(freed)
     }
 
-    /// Garbage-collects the property chain of a **still-live** owner (`rmp` task #50): walks the
-    /// chain rooted at `owner_kind`/`owner_id`'s `first_prop` and physically reclaims every property
-    /// record that [`is_reclaimable`](Self::is_reclaimable) at `watermark` — a tombstone whose `xmax`
-    /// committed at or before `watermark`, so no live or future snapshot can still see that version.
-    /// Returns the number of records reclaimed.
+    /// Garbage-collects the property chain of a **still-live** owner: walks the chain rooted at
+    /// `owner_kind`/`owner_id`'s `first_prop` and physically reclaims every cell that is no longer
+    /// needed, returning how many it reclaimed.
     ///
-    /// For each reclaimable record it frees the property's overflow heap chain, clears the record's
-    /// in-use bit (`MvccHeader::default()`) **while PRESERVING its `next_prop` forward link** (`rmp`
-    /// #821/#811 — so a concurrent off-thread reader mid-walk threads through it to the live successor
-    /// below; see the inline note), returns its id to the Prop free list, and **splices it out** of the
-    /// chain: if it was the head (no kept predecessor) the owner's
-    /// `first_prop` is repointed past it and the owner record rewritten, otherwise the last kept
-    /// predecessor's `next_prop` is repointed past it. A non-reclaimable record (a live version, or a
-    /// not-yet-committed / not-yet-old-enough tombstone) is kept and becomes the new predecessor.
-    /// This mirrors the splice the pre-MVCC `remove_*_property_value` performed, but gates removal on
-    /// the GC watermark rather than a key match — so chains stay well-formed and leak-free (the
-    /// consistency checker passes after a GC pass).
+    /// # What is reclaimable after `rmp` #967 — and why the old rule became silently dead
+    ///
+    /// This method used to key on `expired_ts != 0` (an MVCC tombstone whose `xmax` committed at or
+    /// before `watermark`). After `D-property-removal` **a property operation never writes
+    /// `expired_ts` again**, so that arm would have matched nothing, for ever, while still looking
+    /// like a working reclaimer: a permanently dead, silently-vacuous GC path, and the property store
+    /// would have grown without bound on any workload that removes properties. It is replaced rather
+    /// than left alone.
+    ///
+    /// A cell is reclaimable when **all three** hold:
+    ///
+    /// 1. it is **empty** (`type_tag == 0 && value_inline == 0`) — the key is gone, not merely
+    ///    overwritten. An overwritten key keeps its cell: that cell IS the current value.
+    /// 2. the write that emptied it is **committed at or before `watermark`**, so no live or future
+    ///    snapshot resolves the cell as present;
+    /// 3. the **owner's `undo_ptr` is `0`** — the owner has no version chain at all.
+    ///
+    /// # What condition 3 does and does NOT buy (`rmp` #967 audit)
+    ///
+    /// An earlier version of this comment justified condition 3 by claiming that, while any delta
+    /// survives, some snapshot may still reconstruct a value **into this cell**, so reclaiming the
+    /// cell would splice away the row the reconstruction lands in. **That is false, and the code says
+    /// so:** no reconstruction ever lands in a cell.
+    /// [`DecisionFold::seed`](crate::scan_polarity::DecisionFold) drops every empty cell *before* the
+    /// fold begins, and `DecisionFold::apply` therefore finds the key absent and **pushes** a fresh
+    /// `CandidateSource::Delta` candidate. The reconstructed value is carried entirely by the delta;
+    /// the cell contributes nothing to it, present or reclaimed.
+    ///
+    /// Visibility is settled by condition 2 alone. Worked counter-example to the old claim: `REMOVE
+    /// n.k` commits at `ts = 5` (cell emptied, delta `D_k` carries the old value), `SET n.j` commits
+    /// at `ts = 8` (delta `D_j`), and a reader holds `watermark = 6`. Condition 2 holds for the cell
+    /// (`5 <= 6`) while condition 3 does not (`D_j` is alive, so `undo_ptr != 0`). Reclaiming the cell
+    /// anyway would still read correctly at snapshot 6: the seed drops the empty cell either way, the
+    /// walk applies `D_j` (committed 8 > 6) and then **stops** at `D_k` (committed 5 <= 6), so `k`
+    /// reads absent — which is right. Condition 3 is therefore **sufficient, not necessary**.
+    ///
+    /// What it does buy is a cheap structural proof, and that is why it is kept. `undo_ptr == 0` is
+    /// this store's only O(1) evidence that **Phase F has already retired the owner's entire
+    /// history** — [`gc_reclaim_undo_chains`](Self::gc_reclaim_undo_chains) frees a chain
+    /// all-or-nothing, and only once *every* delta on it is dead. An empty cell is consequently only
+    /// ever unlinked from an owner for which no reader has any history left to reconstruct, so the
+    /// splice can never race a reader that is at that moment mid-reconstruction on the same owner —
+    /// the property-chain and undo-chain walks being two separate, non-atomic reads of one entity
+    /// (`read_view::decision_scan_node_properties`). Re-deriving that per cell would cost a
+    /// commit-slot resolution per delta per cell; this costs one header read per owner. The gate is
+    /// fail-safe in the only direction that matters: getting it wrong defers a reclamation, never a
+    /// read.
+    ///
+    /// Because it is conservative, it **defers**: a cell that satisfies (1) and (2) but not (3) is
+    /// counted in [`PropChainSweep::deferred_empty`] and re-arms
+    /// [`pending_empty_prop_cells`](Self#structfield.pending_empty_prop_cells), so the next pass
+    /// looks again. That re-arming is what makes "a one-pass-later reclamation and never a leak" a
+    /// true statement rather than an aspiration (`rmp` #967 audit): the flag used to be cleared
+    /// unconditionally after every sweep, so a pass that deferred everything disarmed the gate and
+    /// the cells stayed until an unrelated removal re-armed it or the store reopened.
+    ///
+    /// The **corpse** arm is unchanged (`rmp` #172): a `!in_use` cell not on the free list, left by
+    /// an aborted/crashed creation, is spliced out and freed here. Its overflow heap is NOT freed —
+    /// the aborting transaction already released those blocks through its own WAL undo, so freeing
+    /// again would double-free.
+    ///
+    /// For each reclaimed cell it clears the in-use bit **while PRESERVING its `next_prop` forward
+    /// link** (`rmp` #821/#811 — see the inline note), returns its id to the Prop free list, and
+    /// splices it out of the chain.
     ///
     /// `owner_kind` MUST be [`StoreKind::Node`] or [`StoreKind::Rel`]; the owner is expected to be a
     /// live version (a tombstoned owner is reclaimed wholesale by
@@ -6395,9 +6942,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         owner_kind: StoreKind,
         owner_id: u64,
         watermark: Timestamp,
-    ) -> Result<usize> {
+    ) -> Result<PropChainSweep> {
         let mut first_prop = self.owner_first_prop(owner_kind, owner_id)?;
-        let mut reclaimed = 0usize;
+        // Read once, before the walk: `undo_ptr == 0` is the O(1) proof that Phase F has already
+        // retired this owner's whole history (see the method docs for what that does and does not
+        // buy). While it is non-zero the empty cells below are DEFERRED, not skipped for ever.
+        let owner_has_chain = self.read_mvcc(owner_kind, owner_id)?.undo_ptr != NULL_ID;
+        let mut sweep = PropChainSweep::default();
         let mut prev: u64 = NULL_ID; // last *kept* property record (NULL => list head is the owner)
         let mut cur = first_prop;
         let guard = self.store(StoreKind::Prop).alloc.high_water() + 1;
@@ -6411,7 +6962,18 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             }
             let prop = self.read_prop(cur)?;
             let next = prop.next_prop;
-            let is_tombstone = Self::is_reclaimable(prop.mvcc, watermark, &self.commit_registry);
+            // Condition 1 on its own: the cell is EMPTY. Split out from the reclaim test so a cell
+            // that is empty but not yet reclaimable can be counted as deferred below — the liveness
+            // signal that keeps the sweep gate armed until it really is reclaimed (`rmp` #967 audit).
+            let is_empty_cell = prop.mvcc.in_use()
+                && prop.type_tag == undo::TYPE_TAG_ABSENT
+                && prop.value_inline == NULL_ID;
+            let is_tombstone = is_empty_cell
+                && !owner_has_chain
+                && self
+                    .commit_registry
+                    .resolve_commit_ts(prop.mvcc.created_ts)
+                    .is_some_and(|ts| ts <= watermark);
             // A dead-link property **corpse** (`rmp` #172): a `!in_use` record not on the free list,
             // left by an aborted/crashed property creation whose header-only undo cleared in-use while
             // PRESERVING its `next_prop` body (so live walks thread through it to the committed
@@ -6421,10 +6983,15 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             let is_corpse =
                 !prop.mvcc.in_use() && !self.store(StoreKind::Prop).free.ids().contains(&cur);
             if is_tombstone || is_corpse {
-                if is_tombstone {
-                    // Only a tombstone owns its still-in-use overflow chain; free it before reclaiming.
-                    self.free_property_overflow(txn, &prop)?;
-                }
+                // An EMPTY cell owns no overflow chain by construction (`type_tag == 0` carries no
+                // value), and a corpse's blocks were already released by its transaction's WAL undo.
+                // So — unlike the pre-#967 tombstone arm — neither branch frees a heap chain here.
+                // The old value's chain is owned by the delta that carries it and is freed with the
+                // delta in [`free_delta`](Self::free_delta): exactly one owner, exactly one free.
+                debug_assert!(
+                    !is_tombstone || prop.type_tag & valenc::OVERFLOW_BIT == 0,
+                    "an empty cell must not carry the overflow bit",
+                );
                 let mut dead = prop;
                 dead.mvcc = MvccHeader::default(); // clears in_use (no-op for a corpse, already clear)
                 // `rmp` #821/#811: PRESERVE `dead.next_prop` (do NOT zero it). This tombstone/corpse sits
@@ -6455,13 +7022,20 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                     p.next_prop = next;
                     self.write_prop(prev, &p, txn)?;
                 }
-                reclaimed += 1;
+                sweep.reclaimed += 1;
             } else {
+                // An empty cell that survives this pass failed condition 2 or condition 3, both of
+                // which a later pass can satisfy (the watermark advances; Phase F retires the chain).
+                // Count it so the caller keeps the sweep gate armed instead of disarming it on a pass
+                // that reclaimed nothing.
+                if is_empty_cell {
+                    sweep.deferred_empty += 1;
+                }
                 prev = cur; // kept: it becomes the predecessor of whatever follows
             }
             cur = next;
         }
-        Ok(reclaimed)
+        Ok(sweep)
     }
 
     /// Reads the `first_prop` head pointer of a node or relationship owner (GC helper).
@@ -6576,6 +7150,21 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Creates a property `(key, type_tag, value_inline)` under `txn` and prepends it to node
     /// `node_id`'s property chain; returns the property's physical id.
     ///
+    /// # This is the LOW-LEVEL cell primitive, and it is not isolation-aware
+    ///
+    /// It writes a cell and nothing else: no write-conflict check, and **no undo delta**. After
+    /// `rmp` #967's `D-property-visibility` a cell's own `created_ts` decides nothing — the undo
+    /// chain is the sole visibility oracle for a property's value — so a cell created through this
+    /// method alone is visible to **every** snapshot the instant it is written, including snapshots
+    /// older than `txn`, and including while `txn` is still open.
+    ///
+    /// That is correct for its callers and wrong for anything else. Use it only where the writer
+    /// holds the entity exclusively and no concurrent reader can observe an intermediate state — a
+    /// bulk import into a database not yet serving traffic, or a test fixture. **Every production
+    /// path must go through [`set_node_property_value`](Self::set_node_property_value)**, which runs
+    /// the conflict check and links the "the key was absent" delta that hides the new key from an
+    /// older snapshot. That method calls this one only after doing both.
+    ///
     /// # Errors
     /// Returns a storage error if the node is not in use or a write fails.
     pub fn add_node_property(
@@ -6632,12 +7221,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// occurrence of a key is its NEWEST version (`rmp` task #905 named the polarity; see
     /// [`scan_polarity`](crate::scan_polarity) for the taxonomy).
     ///
-    /// # This includes MVCC tombstones
+    /// # This includes every historical value
     ///
-    /// A removed or overwritten version keeps its slot (and its place in the chain) until [`gc`](Self::gc)
-    /// reclaims it, so a record here may carry a non-zero `expired_ts`; a version written by a
-    /// transaction that has not committed is here too. That is the point: an index refill has no
-    /// snapshot and must populate a **superset** its consumers re-check (`rmp` task #766).
+    /// After `rmp` #967 the entity's *older* values are not cells at all — they are `SetProperty`
+    /// deltas on its undo chain — so the superset is `cells + delta history`, reached through
+    /// [`SupersetProperties::candidates`]. A caller that reads only the cells sees the **current**
+    /// image and silently loses every value an older snapshot still needs. That is the point: an
+    /// index refill has no snapshot and must populate a **superset** its consumers re-check
+    /// (`rmp` task #766).
     ///
     /// # It is the wrong read for a decision
     ///
@@ -6675,71 +7266,184 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         node_id: u64,
         snapshot: Snapshot,
     ) -> Result<DecidedProperties> {
-        Ok(self
-            .superset_scan_node_properties(node_id)?
-            .decide(snapshot, self.commit_registry()))
+        read_view::decision_scan_node_properties(&self.pool, &self.stores, node_id, snapshot)
     }
 
-    /// MVCC-tombstones the **live** property records in the chain rooted at `owner_first_prop`
-    /// (`rmp` task #50): for each prop that [`is_live_version`](Self::is_live_version) and — when
-    /// `key_filter` is `Some(k)` — whose `key == k`, it stamps `xmax = in_flight(txn)` via
-    /// [`patch_header_word`](Self::patch_header_word) and notes it expired so `commit` settles the
-    /// stamp. A `key_filter` of `None` tombstones every live property in the chain (used by
-    /// `clear_*_properties` for `SET n = map`).
-    ///
-    /// This is the property analogue of [`delete_node`](Self::delete_node) /
-    /// [`delete_rel`](Self::delete_rel): the tombstoned record keeps its `in_use` slot, its
-    /// `next_prop` link and its overflow heap chain, so an older snapshot still observes the old
-    /// value and the chain stays well-formed for the consistency checker. Physical reclamation
-    /// (record + overflow blocks + splice) is deferred to [`gc`](Self::gc) via
-    /// [`gc_property_chain`](Self::gc_property_chain) once no live snapshot can see the old version.
-    /// It therefore frees nothing, clears nothing and splices nothing here.
-    ///
-    /// `owner_label` is only used in the cycle-guard diagnostic (e.g. `"node 5"` / `"rel 7"`).
-    /// Returns the number of property records tombstoned (callers that only need "did anything
-    /// change?" compare it against `0`).
-    ///
-    /// # Errors
-    /// Returns a storage error if a chain read or a tombstone write fails, or the chain does not
-    /// terminate within the cycle guard.
-    fn tombstone_props_for_key(
+    // ---------- the value-level property write path (`rmp` #967, `04 §5.1.2` / §5.1.5) ----------
+    //
+    // Three operations — SET, REMOVE and "replace the whole set" — over two owner kinds, all built
+    // from the same four steps, in this order and no other:
+    //
+    //   1. the owner must be a live version;
+    //   2. `ensure_no_conflicting_writer` (`D-property-write-conflict`);
+    //   3. `link_set_property` — the delta carrying the OLD value, written IN FULL and published as
+    //      the entity's chain head;
+    //   4. `write_prop_cell` — the new value, in place, as one contiguous patch.
+    //
+    // Steps 3 and 4 are ordered, not incidental: see `write_prop_cell`'s "abort story".
+    //
+    // What is NOT here any more is the whole of the old mechanism: no `xmax` stamp, no fresh record,
+    // no `first_prop` prepend, and no walk of the entity's accumulated versions. `tombstone_props_for_key`
+    // — which walked the entity's WHOLE chain on every write regardless of the key filter, and was
+    // the quadratic term `rmp` #967 exists to remove — is retired, together with the `Prop` arm of
+    // `note_expired` / `pending_tombstones` that fed the tombstone reclamation.
+
+    /// Sets `(kind, entity)`'s property `key` to `value` under `txn`, replacing whatever it held.
+    /// Returns the physical id of the cell that now holds the value.
+    fn set_entity_property_value(
         &mut self,
         txn: TxnId,
-        owner_first_prop: u64,
-        key_filter: Option<u32>,
-        owner_label: &str,
-    ) -> Result<usize> {
-        let mut tombstoned = 0usize;
-        let mut cur = owner_first_prop;
-        let guard = self.store(StoreKind::Prop).alloc.high_water() + 1;
-        let mut steps = 0u64;
-        while cur != NULL_ID {
-            steps += 1;
-            if steps > guard {
-                return Err(GraphusError::Storage(format!(
-                    "property chain of {owner_label} is malformed (cycle?)"
-                )));
-            }
-            let prop = self.read_prop(cur)?;
-            let next = prop.next_prop;
-            if Self::is_live_version(prop.mvcc) && key_filter.is_none_or(|key| prop.key == key) {
-                // `rmp` #301: compare-and-set undo for the property tombstone stamp — the finding this
-                // task fixes. A plain pre-image undo of a shared `xmax` word under a non-LIFO abort
-                // resurrects a stale stamp (a lost-update / visibility breach); the CAS undo reverts
-                // only if this txn's stamp is still on the word (see `patch_header_word_cas`).
-                self.patch_header_word_cas(
-                    StoreKind::Prop,
-                    cur,
-                    MVCC_OFF_EXPIRED_TS,
-                    VersionStamp::in_flight(txn),
-                    txn,
-                )?;
-                self.note_expired(txn, StoreKind::Prop, cur);
-                tombstoned += 1;
-            }
-            cur = next;
+        kind: StoreKind,
+        entity: u64,
+        key: u32,
+        value: &graphus_core::Value,
+    ) -> Result<u64> {
+        // P2: encode first, so a value this build cannot persist errors before any mutation.
+        let (type_tag, value_inline) = self.encode_property_value(txn, value)?;
+        debug_assert_ne!(
+            type_tag,
+            undo::TYPE_TAG_ABSENT,
+            "no encoder may emit the absent sentinel; `undo::TYPE_TAG_ABSENT` would become \
+             ambiguous with a real value (pinned by `undo::tests::no_encoder_can_emit_the_absent_type_tag`)"
+        );
+        let label = Self::owner_label(kind, entity);
+        if !Self::is_live_version(self.read_mvcc(kind, entity)?) {
+            return Err(GraphusError::Storage(format!("{label} not in use")));
         }
-        Ok(tombstoned)
+        self.ensure_no_conflicting_writer(kind, entity, txn)?; // P1
+        let first_prop = self.owner_chain_head(kind, entity)?;
+        match self.find_live_prop_cell(first_prop, key, &label)? {
+            // (a) The key already has a cell — live or emptied by an earlier `REMOVE`. Reuse it: the
+            // old value (or its absence) descends onto the chain and the cell is rewritten in place.
+            // No allocation, no `first_prop` change, no tombstone. That is the whole quadratic
+            // removal.
+            Some((pid, cell)) => {
+                self.link_set_property(kind, entity, key, cell.type_tag, cell.value_inline, txn)?;
+                let mut next = cell;
+                next.mvcc.created_ts = VersionStamp::in_flight(txn);
+                next.type_tag = type_tag;
+                next.value_inline = value_inline;
+                self.write_prop_cell(pid, &next, txn)?;
+                Ok(pid)
+            }
+            // (b) The key is absent. The "was absent" delta is written FIRST and is not optional: it
+            // is the only thing that hides the new key from an older snapshot now that the cell's own
+            // stamp decides nothing (`D-property-visibility`).
+            None => {
+                self.link_set_property(kind, entity, key, undo::TYPE_TAG_ABSENT, NULL_ID, txn)?;
+                self.add_entity_property(txn, kind, entity, key, type_tag, value_inline)
+            }
+        }
+    }
+
+    /// Removes `(kind, entity)`'s property `key` under `txn`, returning whether anything changed.
+    fn remove_entity_property_value(
+        &mut self,
+        txn: TxnId,
+        kind: StoreKind,
+        entity: u64,
+        key: u32,
+    ) -> Result<bool> {
+        let label = Self::owner_label(kind, entity);
+        if !Self::is_live_version(self.read_mvcc(kind, entity)?) {
+            return Err(GraphusError::Storage(format!("{label} not in use")));
+        }
+        self.ensure_no_conflicting_writer(kind, entity, txn)?; // P1
+        let first_prop = self.owner_chain_head(kind, entity)?;
+        let Some((pid, cell)) = self.find_live_prop_cell(first_prop, key, &label)? else {
+            return Ok(false);
+        };
+        if cell.type_tag == undo::TYPE_TAG_ABSENT {
+            // Already empty: the key is absent, so removing it changes nothing and must not push a
+            // delta (a chain of no-op deltas would grow without bound under a repeated `REMOVE`).
+            return Ok(false);
+        }
+        self.link_set_property(kind, entity, key, cell.type_tag, cell.value_inline, txn)?;
+        self.empty_prop_cell(pid, cell, txn)?;
+        Ok(true)
+    }
+
+    /// Empties every live property cell of `(kind, entity)` under `txn` (`SET n = map`), returning
+    /// how many cells were cleared.
+    fn clear_entity_properties(
+        &mut self,
+        txn: TxnId,
+        kind: StoreKind,
+        entity: u64,
+    ) -> Result<usize> {
+        let label = Self::owner_label(kind, entity);
+        if !Self::is_live_version(self.read_mvcc(kind, entity)?) {
+            return Err(GraphusError::Storage(format!("{label} not in use")));
+        }
+        // ONE conflict check for the whole operation: it is the entity that is held, not the key.
+        self.ensure_no_conflicting_writer(kind, entity, txn)?; // P1
+        let first_prop = self.owner_chain_head(kind, entity)?;
+        // Collect before mutating: the walk reads the same records the loop rewrites.
+        let cells = self.live_prop_cells(first_prop, &label)?;
+        let mut cleared = 0usize;
+        for (pid, cell) in cells {
+            if cell.type_tag == undo::TYPE_TAG_ABSENT {
+                continue; // already empty — nothing to descend onto the chain
+            }
+            self.link_set_property(
+                kind,
+                entity,
+                cell.key,
+                cell.type_tag,
+                cell.value_inline,
+                txn,
+            )?;
+            self.empty_prop_cell(pid, cell, txn)?;
+            cleared += 1;
+        }
+        Ok(cleared)
+    }
+
+    /// Rewrites cell `pid` in place to the **empty** form (`D-property-removal`): `type_tag = 0`,
+    /// `value_inline = 0`, `created_ts` restamped to this writer, `in_use` and `next_prop` untouched
+    /// so the cell keeps its slot and its place in the owner's chain and a later `SET` of the same
+    /// key reuses it with no allocation.
+    ///
+    /// The caller MUST already have linked the delta carrying the old value: after this write the
+    /// cell no longer names the old `strings.store` chain, so the delta is its **only** owner. That
+    /// is exactly the single-owner rule that makes the empty cell safe to reclaim later.
+    fn empty_prop_cell(&mut self, pid: u64, cell: PropRecord, txn: TxnId) -> Result<()> {
+        let mut empty = cell;
+        empty.mvcc.created_ts = VersionStamp::in_flight(txn);
+        empty.type_tag = undo::TYPE_TAG_ABSENT;
+        empty.value_inline = NULL_ID;
+        self.write_prop_cell(pid, &empty, txn)?;
+        // An empty cell is what GC's property sweep now reclaims, so gate the sweep on one existing.
+        self.pending_empty_prop_cells = true;
+        Ok(())
+    }
+
+    /// Dispatches the low-level cell creation to the owner kind's chain.
+    fn add_entity_property(
+        &mut self,
+        txn: TxnId,
+        kind: StoreKind,
+        entity: u64,
+        key: u32,
+        type_tag: u8,
+        value_inline: u64,
+    ) -> Result<u64> {
+        match kind {
+            StoreKind::Node => self.add_node_property(txn, entity, key, type_tag, value_inline),
+            StoreKind::Rel => self.add_rel_property(txn, entity, key, type_tag, value_inline),
+            StoreKind::Prop | StoreKind::Strings | StoreKind::Undo | StoreKind::Commit => Err(
+                GraphusError::Storage(format!("{kind:?} is not a property-chain owner")),
+            ),
+        }
+    }
+
+    /// `"node 5"` / `"rel 7"` — the diagnostic label the chain walks and errors use.
+    fn owner_label(kind: StoreKind, id: u64) -> String {
+        match kind {
+            StoreKind::Node => format!("node {id}"),
+            StoreKind::Rel => format!("rel {id}"),
+            other => format!("{other:?} {id}"),
+        }
     }
 
     // --------------------- strings.store overflow heap ----------------------
@@ -6875,16 +7579,27 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     // block id into the property record's `value_inline`. Reading reverses the choice.
 
     /// Sets node `node_id`'s property `key` to `value` under `txn`, **replacing** any current value
-    /// of that key via per-value MVCC (`rmp` task #50): it **MVCC-tombstones** every live property
-    /// record for `key` (stamping `xmax = in_flight(txn)`, like a node/rel delete in `rmp` task #45),
-    /// then prepends a fresh, in-flight version. The old version keeps its slot and its overflow
-    /// chain so an older snapshot still reads the previous value; physical reclamation of the
-    /// tombstoned record and its overflow blocks happens at [`gc`](Self::gc), not here. Inline
-    /// scalars (`Integer`/`Float`/`Boolean`) stay inline (#38); `String`/`List`/temporal values are
-    /// serialized to the `strings.store` overflow heap and the property holds the head block id with
-    /// the `type_tag` overflow bit set (`04 §2.3`). Returns the new property's physical id.
+    /// of that key (`rmp` #967, `04 §5.1.5`).
+    ///
+    /// The newest version is written **in place**: the key's existing cell — creating one only if the
+    /// key is genuinely absent — is rewritten with the new `(type_tag, value_inline)`, and the value
+    /// it held descends onto the owning node's undo-delta chain as a
+    /// [`SetProperty`](UndoAction::SetProperty) delta, which is what an older snapshot reconstructs
+    /// its view from (`D-property-visibility`). Nothing is tombstoned, nothing is prepended, and the
+    /// property chain does not grow — so overwriting one key M times costs `Θ(M)` in total rather
+    /// than the `Θ(M²)` the tombstone-and-prepend path cost.
+    ///
+    /// Inline scalars (`Integer`/`Float`/`Boolean`) stay inline (#38); `String`/`List`/temporal values
+    /// are serialized to the `strings.store` overflow heap and the cell holds the head block id with
+    /// the `type_tag` overflow bit set (`04 §2.3`). The **old** value's overflow chain is not freed
+    /// here: once the delta is linked the delta owns it exclusively, and GC frees it with the delta.
+    ///
+    /// Returns the physical id of the cell that now holds the value.
     ///
     /// # Errors
+    /// - [`GraphusError::Transaction`] — a **retriable serialization failure** — if another still-open
+    ///   transaction holds this node (`D-property-write-conflict`; see
+    ///   `ensure_no_conflicting_writer`).
     /// - [`GraphusError::Storage`] if the node is not in use or a write fails.
     /// - [`GraphusError::Runtime`] (from the value codecs) if `value` is `Null` (not persisted) or a
     ///   class this build cannot store (e.g. `Map`, a heterogeneous `List`).
@@ -6895,43 +7610,31 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         key: u32,
         value: &graphus_core::Value,
     ) -> Result<u64> {
-        // Encode first so a non-persistable value errors before any mutation (no partial write).
-        let (type_tag, value_inline) = self.encode_property_value(txn, value)?;
-        let node = self.read_node(node_id)?;
-        if !Self::is_live_version(node.mvcc) {
-            return Err(GraphusError::Storage(format!("node {node_id} not in use")));
-        }
-        self.tombstone_props_for_key(txn, node.first_prop, Some(key), &format!("node {node_id}"))?;
-        self.add_node_property(txn, node_id, key, type_tag, value_inline)
+        self.set_entity_property_value(txn, StoreKind::Node, node_id, key, value)
     }
 
-    /// Removes node `node_id`'s property `key` under `txn` via per-value MVCC (`rmp` task #50):
-    /// **MVCC-tombstones** every live property record for `key` (stamping `xmax = in_flight(txn)`)
-    /// rather than freeing it immediately. The tombstoned record keeps its slot, its `next_prop`
-    /// link and its overflow heap chain so an older snapshot still observes the value; physical
-    /// reclamation (record + overflow blocks + splice) is deferred to [`gc`](Self::gc). Returns
-    /// whether anything was tombstoned (so a caller can distinguish a real removal from a no-op,
-    /// e.g. for `REMOVE n.p`).
+    /// Removes node `node_id`'s property `key` under `txn` (`rmp` #967, `D-property-removal`).
+    ///
+    /// The cell is rewritten **in place** to the empty form (`type_tag = 0`, `value_inline = 0`),
+    /// keeping its `in_use` bit and its place in the node's `first_prop` chain, and the removed value
+    /// descends onto the node's undo chain so an older snapshot still reads it. There is no `xmax`
+    /// tombstone: after this task a property operation never writes `expired_ts` at all. A later
+    /// `SET` of the same key reuses the empty cell with no allocation.
+    ///
+    /// Returns whether anything changed, so a caller can distinguish a real removal from a no-op
+    /// (`REMOVE n.p` on a key the node does not hold).
     ///
     /// # Errors
-    /// Returns a storage error if the node is not in use or a write fails.
+    /// - [`GraphusError::Transaction`] on a write-write conflict, as
+    ///   [`set_node_property_value`](Self::set_node_property_value).
+    /// - [`GraphusError::Storage`] if the node is not in use or a write fails.
     pub fn remove_node_property_value(
         &mut self,
         txn: TxnId,
         node_id: u64,
         key: u32,
     ) -> Result<bool> {
-        let node = self.read_node(node_id)?;
-        if !Self::is_live_version(node.mvcc) {
-            return Err(GraphusError::Storage(format!("node {node_id} not in use")));
-        }
-        let tombstoned = self.tombstone_props_for_key(
-            txn,
-            node.first_prop,
-            Some(key),
-            &format!("node {node_id}"),
-        )?;
-        Ok(tombstoned > 0)
+        self.remove_entity_property_value(txn, StoreKind::Node, node_id, key)
     }
 
     /// Encodes `value` into the `(type_tag, value_inline)` pair to store in a property record,
@@ -6994,36 +7697,46 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         node_id: u64,
     ) -> Result<Vec<(u64, u32, graphus_core::Value)>> {
         let chain = self.superset_scan_node_properties(node_id)?;
-        let mut out = Vec::with_capacity(chain.len());
-        for (pid, prop) in chain.into_every_version() {
-            let value = self.decode_property_value(prop.type_tag, prop.value_inline)?;
-            out.push((pid, prop.key, value));
+        let candidates: Vec<_> = chain.candidates().collect();
+        let mut out = Vec::with_capacity(candidates.len());
+        for c in candidates {
+            let value = self.decode_property_value(c.type_tag, c.value_inline)?;
+            out.push((c.source.id(), c.key, value));
         }
         Ok(out)
     }
 
-    /// Clears **all** of node `node_id`'s properties under `txn` via per-value MVCC (`rmp` task #50):
-    /// **MVCC-tombstones** every live property record in the node's chain (stamping
-    /// `xmax = in_flight(txn)`), leaving the slots, the `next_prop` links and the overflow chains in
-    /// place so older snapshots still observe the old property set. Used by `SET n = map`, which
-    /// replaces the whole property set. The head pointer `first_prop` is **not** reset (the
-    /// tombstoned records stay linked until GC); physical reclamation (records + overflow blocks +
-    /// splice) is deferred to [`gc`](Self::gc). Returns the number of property records tombstoned.
+    /// Clears **all** of node `node_id`'s properties under `txn` — the storage half of `SET n = map`,
+    /// which replaces the whole property set (`rmp` #967).
+    ///
+    /// Every live cell is emptied **in place** exactly as
+    /// [`remove_node_property_value`](Self::remove_node_property_value) empties one, each preceded by
+    /// its own `SetProperty` delta carrying that cell's old `(key, type_tag, value)`, so an older
+    /// snapshot reconstructs the complete previous property set. The cells keep their slots and their
+    /// `next_prop` links, and `first_prop` is not reset.
+    ///
+    /// Returns the number of cells **cleared** — note the changed meaning: it used to be the number
+    /// of records tombstoned. A cell that was already empty is not counted (and pushes no delta),
+    /// so callers comparing against `0` still read "did anything change?".
     ///
     /// # Errors
-    /// Returns a storage error if the node is not in use or a write fails.
+    /// - [`GraphusError::Transaction`] on a write-write conflict, as
+    ///   [`set_node_property_value`](Self::set_node_property_value).
+    /// - [`GraphusError::Storage`] if the node is not in use or a write fails.
     pub fn clear_node_properties(&mut self, txn: TxnId, node_id: u64) -> Result<usize> {
-        let node = self.read_node(node_id)?;
-        if !Self::is_live_version(node.mvcc) {
-            return Err(GraphusError::Storage(format!("node {node_id} not in use")));
-        }
-        self.tombstone_props_for_key(txn, node.first_prop, None, &format!("node {node_id}"))
+        self.clear_entity_properties(txn, StoreKind::Node, node_id)
     }
 
     /// Frees the overflow heap chain a property record owns, if any: a no-op for an inline scalar;
     /// for an overflowed `String`/`List`/temporal value it frees the chain whose head is
-    /// `value_inline` (`rmp` task #43). Used when a property value is overwritten or removed so its
-    /// old bytes are not leaked.
+    /// `value_inline` (`rmp` task #43).
+    ///
+    /// **Not used by the value-level write path** since `rmp` #967, and it must not be: an overwrite
+    /// or a removal hands the old chain to the `SetProperty` delta that carries it, and the delta is
+    /// then its **sole** owner until GC frees the two together
+    /// (`free_delta`). Freeing here as well would be a double-free. Its
+    /// remaining caller is `free_property_chain`, which reclaims a
+    /// deleted entity's cells and the chains those cells still own.
     ///
     /// # Errors
     /// Returns a storage error if freeing the chain fails.
@@ -7048,7 +7761,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Creates a property `(key, type_tag, value_inline)` under `txn` and prepends it to relationship
     /// `rel_id`'s property chain (`rmp` task #44); returns the property's physical id. The low-level
     /// inline counterpart to [`add_node_property`](Self::add_node_property), over
-    /// [`RelRecord.first_prop`](crate::record::RelRecord).
+    /// [`RelRecord.first_prop`](crate::record::RelRecord) — **including its isolation contract**:
+    /// no conflict check, no undo delta, so the cell it writes is visible to every snapshot at once.
+    /// Read that method's docs before calling this one.
     ///
     /// # Errors
     /// Returns a storage error if the relationship is not in use or a write fails.
@@ -7111,22 +7826,18 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         rel_id: u64,
         snapshot: Snapshot,
     ) -> Result<DecidedProperties> {
-        Ok(self
-            .superset_scan_rel_properties(rel_id)?
-            .decide(snapshot, self.commit_registry()))
+        read_view::decision_scan_rel_properties(&self.pool, &self.stores, rel_id, snapshot)
     }
 
     /// Sets relationship `rel_id`'s property `key` to `value` under `txn`, **replacing** any current
-    /// value of that key via per-value MVCC (`rmp` task #50): it **MVCC-tombstones** every live
-    /// property record for `key` (stamping `xmax = in_flight(txn)`, like a node/rel delete in
-    /// `rmp` task #45), then prepends a fresh, in-flight version. The old version keeps its slot and
-    /// its overflow chain so an older snapshot still reads the previous value; physical reclamation
-    /// happens at [`gc`](Self::gc), not here. Inline scalars (`Integer`/`Float`/`Boolean`) stay
-    /// inline (#38); `String`/`List`/temporal values overflow to the `strings.store` heap with
-    /// the `type_tag` overflow bit set (`04 §2.3`). Returns the new property's physical id. The
-    /// relationship analogue of [`set_node_property_value`](Self::set_node_property_value).
+    /// value of that key — the relationship analogue of
+    /// [`set_node_property_value`](Self::set_node_property_value), with the same in-place write, the
+    /// same `SetProperty` delta on the **relationship's** undo chain, and the same overflow
+    /// ownership rule. Returns the physical id of the cell that now holds the value.
     ///
     /// # Errors
+    /// - [`GraphusError::Transaction`] — a retriable serialization failure — if another still-open
+    ///   transaction holds this relationship.
     /// - [`GraphusError::Storage`] if the relationship is not in use or a write fails.
     /// - [`GraphusError::Runtime`] (from the value codecs) if `value` is `Null` (not persisted) or a
     ///   class this build cannot store (e.g. `Map`, a heterogeneous `List`).
@@ -7137,34 +7848,19 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         key: u32,
         value: &graphus_core::Value,
     ) -> Result<u64> {
-        // Encode first so a non-persistable value errors before any mutation (no partial write).
-        let (type_tag, value_inline) = self.encode_property_value(txn, value)?;
-        let rel = self.read_rel(rel_id)?;
-        if !Self::is_live_version(rel.mvcc) {
-            return Err(GraphusError::Storage(format!("rel {rel_id} not in use")));
-        }
-        self.tombstone_props_for_key(txn, rel.first_prop, Some(key), &format!("rel {rel_id}"))?;
-        self.add_rel_property(txn, rel_id, key, type_tag, value_inline)
+        self.set_entity_property_value(txn, StoreKind::Rel, rel_id, key, value)
     }
 
-    /// Removes relationship `rel_id`'s property `key` under `txn` via per-value MVCC (`rmp` task
-    /// #50): **MVCC-tombstones** every live property record for `key` (stamping
-    /// `xmax = in_flight(txn)`) rather than freeing it immediately. The tombstoned record keeps its
-    /// slot, its `next_prop` link and its overflow heap chain so an older snapshot still observes the
-    /// value; physical reclamation is deferred to [`gc`](Self::gc). Returns whether anything was
-    /// tombstoned (so `REMOVE r.p` can distinguish a real removal from a no-op). The relationship
-    /// analogue of [`remove_node_property_value`](Self::remove_node_property_value).
+    /// Removes relationship `rel_id`'s property `key` under `txn` — the relationship analogue of
+    /// [`remove_node_property_value`](Self::remove_node_property_value): the cell is emptied in place
+    /// and the removed value descends onto the relationship's undo chain. Returns whether anything
+    /// changed, so `REMOVE r.p` can distinguish a real removal from a no-op.
     ///
     /// # Errors
-    /// Returns a storage error if the relationship is not in use or a write fails.
+    /// - [`GraphusError::Transaction`] on a write-write conflict.
+    /// - [`GraphusError::Storage`] if the relationship is not in use or a write fails.
     pub fn remove_rel_property_value(&mut self, txn: TxnId, rel_id: u64, key: u32) -> Result<bool> {
-        let rel = self.read_rel(rel_id)?;
-        if !Self::is_live_version(rel.mvcc) {
-            return Err(GraphusError::Storage(format!("rel {rel_id} not in use")));
-        }
-        let tombstoned =
-            self.tombstone_props_for_key(txn, rel.first_prop, Some(key), &format!("rel {rel_id}"))?;
-        Ok(tombstoned > 0)
+        self.remove_entity_property_value(txn, StoreKind::Rel, rel_id, key)
     }
 
     /// The **superset**-polarity read of relationship `rel_id`'s properties, **decoded** (`rmp` task
@@ -7183,23 +7879,15 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         read_view::superset_scan_rel_property_values(&self.pool, &self.stores, rel_id)
     }
 
-    /// Clears **all** of relationship `rel_id`'s properties under `txn` via per-value MVCC (`rmp`
-    /// task #50): **MVCC-tombstones** every live property record in the relationship's chain
-    /// (stamping `xmax = in_flight(txn)`), leaving the slots, the `next_prop` links and the overflow
-    /// chains in place so older snapshots still observe the old property set. Used by `SET r = map`,
-    /// which replaces the whole property set. The head pointer `first_prop` is **not** reset (the
-    /// tombstoned records stay linked until GC); physical reclamation is deferred to
-    /// [`gc`](Self::gc). Returns the number of property records tombstoned. The relationship analogue
-    /// of [`clear_node_properties`](Self::clear_node_properties).
+    /// Clears **all** of relationship `rel_id`'s properties under `txn` (`SET r = map`) — the
+    /// relationship analogue of [`clear_node_properties`](Self::clear_node_properties), including its
+    /// changed return value: the number of cells **cleared**, not of records tombstoned.
     ///
     /// # Errors
-    /// Returns a storage error if the relationship is not in use or a write fails.
+    /// - [`GraphusError::Transaction`] on a write-write conflict.
+    /// - [`GraphusError::Storage`] if the relationship is not in use or a write fails.
     pub fn clear_rel_properties(&mut self, txn: TxnId, rel_id: u64) -> Result<usize> {
-        let rel = self.read_rel(rel_id)?;
-        if !Self::is_live_version(rel.mvcc) {
-            return Err(GraphusError::Storage(format!("rel {rel_id} not in use")));
-        }
-        self.tombstone_props_for_key(txn, rel.first_prop, None, &format!("rel {rel_id}"))
+        self.clear_entity_properties(txn, StoreKind::Rel, rel_id)
     }
 
     // ------------------------------ adjacency -------------------------------
@@ -7263,6 +7951,51 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         let store = self.store(StoreKind::Rel);
         // ids run 1..high_water (id 0 is the reserved null), minus those returned to the free list.
         (store.alloc.high_water().saturating_sub(1)).saturating_sub(store.free.len() as u64)
+    }
+
+    /// The number of **used** property slots, the [`used_rel_slots`](Self::used_rel_slots) measure
+    /// applied to `props.store`: physical ids below the high-water that are NOT on the free list.
+    ///
+    /// It counts every allocated property record — live cells, **empty** cells awaiting reclamation
+    /// (`rmp` #967) and dead-link corpses (#172) — so it is the measure that exposes a property-slot
+    /// leak. After a `REMOVE` the key's cell stays allocated and empty until a GC pass whose watermark
+    /// has passed the removal (and whose owner has no surviving version chain) frees it; this count is
+    /// what proves that pass actually happened, which no value-level read can show.
+    #[must_use]
+    pub fn used_prop_slots(&self) -> u64 {
+        let store = self.store(StoreKind::Prop);
+        (store.alloc.high_water().saturating_sub(1)).saturating_sub(store.free.len() as u64)
+    }
+
+    /// Stamps `expired_ts` on property cell `prop_id` — a **forging accessor for tests**
+    /// (`rmp` #967), in the spirit of
+    /// [`clear_directional_rel_counts_for_test`](Self::clear_directional_rel_counts_for_test).
+    ///
+    /// It exists to construct the one state this build's write path can no longer produce: the
+    /// pre-#967 property MVCC tombstone (`D-property-removal` empties the cell in place instead, and
+    /// `write_prop_cell` fails closed on a non-zero `expired_ts`). That state is exactly what the
+    /// legacy-image gate `refuse_legacy_property_tombstones` must detect at `open`, and there is no
+    /// other way to reach it from inside this build.
+    ///
+    /// Not a repair tool and not a write path: it patches one header word under `txn`, leaving every
+    /// other invariant to the caller. A store this is used on is, by construction, one this build
+    /// considers ill-formed.
+    ///
+    /// # Errors
+    /// Returns a storage error if `prop_id`'s page is not allocated or the patch write fails.
+    pub fn stamp_property_tombstone_for_test(
+        &mut self,
+        txn: TxnId,
+        prop_id: u64,
+        expired_ts: u64,
+    ) -> Result<()> {
+        self.patch_header_word(
+            StoreKind::Prop,
+            prop_id,
+            MVCC_OFF_EXPIRED_TS,
+            expired_ts,
+            txn,
+        )
     }
 
     /// Empties both directional relationship-count projections — an **inspection accessor for tests**
@@ -8703,6 +9436,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.store(kind).free.ids().to_vec()
     }
 
+    /// The number of interned `PropKey`-namespace tokens (`04 §2.6`): key token ids are dense in
+    /// `0..prop_key_token_count`. The consistency checker uses this to flag a `SetProperty` delta
+    /// that names a key the token store does not have (`rmp` #967).
+    pub(crate) fn checker_prop_key_token_count(&self) -> usize {
+        self.tokens.len(Namespace::PropKey)
+    }
+
     /// The number of interned `Label`-namespace tokens (`04 §2.6`): label token ids are dense in
     /// `0..label_token_count`. The consistency checker uses this to verify that a node's label
     /// bitmap references only token ids that exist in the token store (`rmp` task #42).
@@ -8772,9 +9512,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
 
     /// The on-disk format version this store was **opened** at (`05 §12.6`).
     ///
-    /// [`graphus_core::constants::FORMAT_VERSION`] for a store this build created, and `1` for one
-    /// created before the undo area existed — which this build upgrades in place at its first
-    /// catalog checkpoint, since a version-1 image is exactly a version-2 image with no chains.
+    /// [`graphus_core::constants::FORMAT_VERSION`] for a store this build created; `1` for one
+    /// created before the undo area existed (`rmp` #966) and `2` for one created before the property
+    /// path moved onto it (`rmp` #967). Both earlier versions are upgraded in place at the first
+    /// catalog checkpoint — a version-1 image is a version-2 image with no chains, and a version-2
+    /// image is a version-3 image whose property cells this build has already proved carry no
+    /// tombstone (`RecordStore::refuse_legacy_property_tombstones` runs first, at `open`).
     #[must_use]
     pub fn opened_format_version(&self) -> u32 {
         self.opened_format_version
@@ -9571,15 +10314,19 @@ mod tests {
         s.commit(txn).unwrap();
     }
 
-    // ----------------------- per-value property MVCC (`rmp` task #50) -----------------------
+    // ------------------ per-value property MVCC (`rmp` task #50, `rmp` #967) ------------------
     //
     // Regression guards for the dirty-read bug per-value MVCC fixes: `set_*_property_value` used to
     // *compact* (free the old record + overflow chain, prepend the new), so a concurrent older
-    // snapshot could no longer read the previous value. The fix tombstones the old version (it keeps
-    // its slot, its chain link and its overflow chain) and prepends a fresh version, deferring
-    // physical reclamation to GC -- so an older snapshot still observes the old value until no live
-    // snapshot can. These tests assert the store-level mechanics that make that possible; the
-    // reader-side visibility filtering lives in `graphus-cypher` (out of scope here).
+    // snapshot could no longer read the previous value.
+    //
+    // `rmp` #967 changed WHERE the old value survives, not WHETHER it does. It is no longer a
+    // tombstoned cell in the owner's `first_prop` chain; it is a `SetProperty` delta on the owner's
+    // undo chain, and the newest value is written into the cell in place. The tests below were
+    // rewritten accordingly — each retired mechanism assertion replaced by a named semantic
+    // equivalent that is at least as strong (`D-retired-mechanism-tests`), which in practice means
+    // asserting the EXACT old value an older snapshot reads rather than merely that the cell count
+    // changed.
 
     use graphus_core::{Value, VersionStamp};
 
@@ -9591,8 +10338,20 @@ mod tests {
         report.reclaimed
     }
 
+    /// **Semantic equivalent of** the retired
+    /// `overwriting_a_node_property_tombstones_the_old_version_and_keeps_both_until_gc`.
+    ///
+    /// That test asserted the retired *mechanism*: two cells in the chain, one live and one carrying
+    /// a committed `xmax`. This asserts the *semantic* the mechanism existed for, and asserts more of
+    /// it: that an older snapshot reads back the **exact previous value**, that the newest value is
+    /// in the cell, that the old one lives on the undo chain, and that GC honours the watermark in
+    /// both directions.
+    ///
+    /// The strengthening matters. The failure mode this task introduces is that an older snapshot
+    /// finds no value at all and reads the property as *absent* — every "the value is not 2"
+    /// assertion passes in that case, and this one does not.
     #[test]
-    fn overwriting_a_node_property_tombstones_the_old_version_and_keeps_both_until_gc() {
+    fn overwriting_a_node_property_keeps_the_exact_old_value_readable_until_gc() {
         let mut s = fresh();
         let key = s.intern_token(Namespace::PropKey, "v").unwrap();
 
@@ -9600,70 +10359,179 @@ mod tests {
         let t1 = TxnId(1);
         s.begin(t1);
         let (n, _) = s.create_node(t1).unwrap();
-        s.set_node_property_value(t1, n, key, &Value::Integer(1))
+        let cell = s
+            .set_node_property_value(t1, n, key, &Value::Integer(1))
             .unwrap();
         s.commit(t1).unwrap();
         let snap_after_v1 = s.snapshot_ts(); // a reader that began here must still see `v = 1`
 
-        // Txn 2: overwrite to `v = 2`, commit. The old version is tombstoned, not freed.
+        // Txn 2: overwrite to `v = 2`, commit. The cell is rewritten IN PLACE — same physical id,
+        // no new record — and `1` descends onto the node's undo chain.
         let t2 = TxnId(2);
         s.begin(t2);
-        s.set_node_property_value(t2, n, key, &Value::Integer(2))
+        let same_cell = s
+            .set_node_property_value(t2, n, key, &Value::Integer(2))
             .unwrap();
         s.commit(t2).unwrap();
-
-        // The chain now holds BOTH in-use records: the new live one (xmax == 0) and the old
-        // tombstoned one (xmax committed). `superset_scan_node_properties` returns every in-use
-        // record (the reader layer filters by visibility), so we see exactly two.
-        let chain = s.superset_scan_node_properties(n).unwrap();
-        assert_eq!(chain.len(), 2, "old version tombstoned, not freed");
-        let live: Vec<_> = chain
-            .every_version()
-            .iter()
-            .filter(|(_, p)| Store::is_live_version(p.mvcc))
-            .collect();
-        assert_eq!(live.len(), 1, "exactly one live version");
         assert_eq!(
-            s.decode_property_value(live[0].1.type_tag, live[0].1.value_inline)
-                .unwrap(),
-            Value::Integer(2)
+            same_cell, cell,
+            "the overwrite must reuse the cell, not allocate a new one",
         );
-        let tomb: Vec<_> = chain
-            .every_version()
-            .iter()
-            .filter(|(_, p)| p.mvcc.in_use() && p.mvcc.expired_ts != 0)
-            .collect();
-        assert_eq!(tomb.len(), 1, "exactly one tombstoned old version");
+
+        let chain = s.superset_scan_node_properties(n).unwrap();
+        assert_eq!(chain.len(), 1, "exactly one cell, rewritten in place");
+        let cells = chain.cells_ignoring_history();
         assert_eq!(
-            s.decode_property_value(tomb[0].1.type_tag, tomb[0].1.value_inline)
+            s.decode_property_value(cells[0].1.type_tag, cells[0].1.value_inline)
+                .unwrap(),
+            Value::Integer(2),
+            "the cell holds the newest value",
+        );
+        assert_eq!(
+            cells[0].1.mvcc.expired_ts, 0,
+            "`D-property-removal`: a property operation never stamps `xmax` again",
+        );
+        assert_eq!(
+            cells[0].1.mvcc.undo_ptr, 0,
+            "a property cell never anchors a chain; the delta anchors on the owning node",
+        );
+
+        // The superset carries BOTH values — the current one from the cell and the previous one from
+        // the chain — which is what keeps an index refill correct after this task.
+        let mut candidates: Vec<Value> = chain
+            .candidates()
+            .map(|c| s.decode_property_value(c.type_tag, c.value_inline).unwrap())
+            .collect();
+        candidates.sort_by_key(|v| match v {
+            Value::Integer(i) => *i,
+            _ => unreachable!("integers only"),
+        });
+        assert_eq!(
+            candidates,
+            vec![Value::Integer(1), Value::Integer(2)],
+            "the superset must contain every value any snapshot can ask for",
+        );
+
+        // THE POINT: the older snapshot reads the EXACT old value, not merely "not 2", and above all
+        // not `None`.
+        let old_reader = Snapshot {
+            owner: TxnId(90),
+            ts: snap_after_v1,
+        };
+        let decided = s.decision_scan_node_properties(n, old_reader).unwrap();
+        let seen = decided
+            .visible_version(key)
+            .expect("the older snapshot must still HOLD the key, not read it as absent");
+        assert_eq!(
+            s.decode_property_value(seen.type_tag, seen.value_inline)
                 .unwrap(),
             Value::Integer(1),
-            "the old value survives for an older snapshot"
+            "an older snapshot reads the exact previous value",
         );
 
-        // Snapshot isolation: GC at a watermark BELOW the tombstone's commit timestamp (the snapshot
-        // an older reader holds) must NOT reclaim the old version -- it is still observable.
+        // Snapshot isolation: GC at a watermark BELOW the overwrite's commit timestamp must NOT
+        // reclaim the delta the older reader still needs.
+        gc_at(&mut s, TxnId(3), snap_after_v1);
         assert_eq!(
-            gc_at(&mut s, TxnId(3), snap_after_v1),
-            0,
-            "GC must not reclaim a version an older snapshot can still see"
+            s.superset_scan_node_properties(n).unwrap().history_len(),
+            3,
+            "GC must not reclaim a delta an older snapshot can still resolve through (the chain is \
+             `SET v=2` / `v was absent` / `node created`, and a chain is reclaimed WHOLE or not at \
+             all — the newest delta committed after this watermark, so none of them goes)",
         );
+        let seen = s
+            .decision_scan_node_properties(n, old_reader)
+            .unwrap()
+            .visible_version(key)
+            .expect("still readable after a too-early GC");
         assert_eq!(
-            s.superset_scan_node_properties(n).unwrap().len(),
-            2,
-            "old version still present after a too-early GC"
+            s.decode_property_value(seen.type_tag, seen.value_inline)
+                .unwrap(),
+            Value::Integer(1),
         );
 
-        // Once no live snapshot predates the overwrite (watermark = latest commit), GC reclaims the
-        // tombstoned old version and splices it out, leaving exactly the live one.
+        // Once no live snapshot predates the overwrite, GC reclaims the whole chain and the cell
+        // stands alone holding the current value.
         let latest = s.snapshot_ts();
         gc_at(&mut s, TxnId(4), latest);
         let chain = s.superset_scan_node_properties(n).unwrap();
-        assert_eq!(chain.len(), 1, "tombstoned old version reclaimed at GC");
+        assert_eq!(chain.len(), 1, "the cell survives");
+        assert_eq!(chain.history_len(), 0, "the undo chain is reclaimed at GC");
         assert_eq!(
             s.superset_scan_node_property_values(n).unwrap(),
-            vec![(chain.every_version()[0].0, key, Value::Integer(2))]
+            vec![(cell, key, Value::Integer(2))]
         );
+    }
+
+    /// The removal twin, and the same strengthening: after a committed `REMOVE` the key is absent to
+    /// a new reader and reads back its **exact** old value to an older one.
+    #[test]
+    fn removing_a_node_property_empties_the_cell_and_keeps_the_exact_old_value() {
+        let mut s = fresh();
+        let key = s.intern_token(Namespace::PropKey, "v").unwrap();
+        let t1 = TxnId(1);
+        s.begin(t1);
+        let (n, _) = s.create_node(t1).unwrap();
+        let cell = s
+            .set_node_property_value(t1, n, key, &Value::Integer(7))
+            .unwrap();
+        s.commit(t1).unwrap();
+        let before_removal = s.snapshot_ts();
+
+        let t2 = TxnId(2);
+        s.begin(t2);
+        assert!(s.remove_node_property_value(t2, n, key).unwrap());
+        s.commit(t2).unwrap();
+
+        // The cell keeps its slot and its place in the chain, emptied in place.
+        let chain = s.superset_scan_node_properties(n).unwrap();
+        assert_eq!(chain.len(), 1, "the cell keeps its slot");
+        let (pid, emptied) = chain.cells_ignoring_history()[0];
+        assert_eq!(pid, cell);
+        assert!(
+            emptied.mvcc.in_use(),
+            "`in_use` keeps its structural meaning"
+        );
+        assert_eq!(emptied.type_tag, undo::TYPE_TAG_ABSENT);
+        assert_eq!(emptied.value_inline, 0);
+        assert_eq!(emptied.mvcc.expired_ts, 0, "no `xmax` tombstone");
+
+        let now = Snapshot {
+            owner: TxnId(90),
+            ts: s.snapshot_ts(),
+        };
+        assert!(
+            s.decision_scan_node_properties(n, now)
+                .unwrap()
+                .visible_version(key)
+                .is_none(),
+            "a committed removal makes the key absent",
+        );
+
+        let old = Snapshot {
+            owner: TxnId(91),
+            ts: before_removal,
+        };
+        let seen = s
+            .decision_scan_node_properties(n, old)
+            .unwrap()
+            .visible_version(key)
+            .expect("an older snapshot must still hold the key");
+        assert_eq!(
+            s.decode_property_value(seen.type_tag, seen.value_inline)
+                .unwrap(),
+            Value::Integer(7),
+        );
+
+        // A later SET of the same key REUSES the empty cell — no allocation (`D-property-removal`).
+        let t3 = TxnId(3);
+        s.begin(t3);
+        let reused = s
+            .set_node_property_value(t3, n, key, &Value::Integer(8))
+            .unwrap();
+        s.commit(t3).unwrap();
+        assert_eq!(reused, cell, "a later SET reuses the emptied cell");
+        assert_eq!(s.superset_scan_node_properties(n).unwrap().len(), 1);
     }
 
     #[test]
@@ -9711,53 +10579,60 @@ mod tests {
     /// pre-image over the newer stamp — a lost-update / visibility breach mirroring the `rmp` #239
     /// non-LIFO relationship-recovery defect and the `rmp` #578 free-list-restore hazard.
     ///
+    /// **Retargeted for `rmp` #967, not weakened.** The primitive under test is unchanged and so is
+    /// the property it proves; only the *store* changed. `rmp` #967 retired the property tombstone
+    /// (`D-property-removal`: a removal empties the cell in place, and `expired_ts` is never written
+    /// by a property operation again), so a `Prop` `xmax` is no longer a state the store can hold —
+    /// the consistency checker now reports one as
+    /// [`MvccHeaderFault::PropertyCellTombstoned`](crate::check::MvccHeaderFault). The CAS undo's
+    /// remaining users are the node and relationship delete tombstones
+    /// ([`delete_node`](RecordStore::delete_node) / [`delete_rel`](RecordStore::delete_rel)), so the
+    /// test now drives the identical two-writer interleaving on a **node**'s `xmax`. Swapping
+    /// `patch_header_word_cas` back to the plain `patch_header_word` still makes the final assertion
+    /// fail (T1's abort restores `0`, clobbering T2).
+    ///
     /// Reachability: the public delete/tombstone API is guarded by
     /// [`is_live_version`](RecordStore::is_live_version), which — with the single-threaded engine and
     /// SSI — currently serialises `xmax` writes so two live transactions cannot stamp the same word.
     /// This is therefore a **defense-in-depth** hardening of the storage undo primitive (the `rmp`
     /// #220/#239 discipline: a shared-field undo must be intrinsically non-LIFO-safe, never rely on a
     /// higher layer). The test drives the primitive directly to model exactly the two-writer
-    /// interleaving the guard elides. Swapping `patch_header_word_cas` back to the plain
-    /// `patch_header_word` makes the final assertion fail (T1's abort restores `0`, clobbering T2).
+    /// interleaving the guard elides.
     #[test]
     fn tombstone_xmax_undo_is_non_lifo_safe_301() {
         let mut s = fresh();
-        let key = s.intern_token(Namespace::PropKey, "v").unwrap();
 
-        // Committed node H with a live property V0 (xmax == 0).
+        // A committed node H, live (xmax == 0).
         let setup = TxnId(1);
         s.begin(setup);
         let (h, _) = s.create_node(setup).unwrap();
-        let v0 = s
-            .set_node_property_value(setup, h, key, &Value::Integer(1))
-            .unwrap();
         s.commit(setup).unwrap();
-        assert_eq!(s.property(v0).unwrap().mvcc.expired_ts, 0, "V0 starts live");
+        assert_eq!(s.node(h).unwrap().mvcc.expired_ts, 0, "H starts live");
 
-        // Two concurrently-open transactions BOTH stamp V0's xmax. T1 stamps first, T2 second — the
+        // Two concurrently-open transactions BOTH stamp H's xmax. T1 stamps first, T2 second — the
         // interleaving the `is_live_version` guard elides, modelled directly on the storage primitive.
         let t1 = TxnId(2);
         let t2 = TxnId(3);
         s.begin(t1);
         s.begin(t2);
         s.patch_header_word_cas(
-            StoreKind::Prop,
-            v0,
+            StoreKind::Node,
+            h,
             MVCC_OFF_EXPIRED_TS,
             VersionStamp::in_flight(t1),
             t1,
         )
         .unwrap();
         s.patch_header_word_cas(
-            StoreKind::Prop,
-            v0,
+            StoreKind::Node,
+            h,
             MVCC_OFF_EXPIRED_TS,
             VersionStamp::in_flight(t2),
             t2,
         )
         .unwrap();
         assert_eq!(
-            VersionStamp::from_raw(s.property(v0).unwrap().mvcc.expired_ts),
+            VersionStamp::from_raw(s.node(h).unwrap().mvcc.expired_ts),
             VersionStamp::InFlight(t2),
             "T2's stamp is the current xmax before the non-LIFO abort"
         );
@@ -9767,7 +10642,7 @@ mod tests {
         // it no-ops and T2's stamp is PRESERVED. A plain pre-image undo would restore 0 (a clobber).
         s.rollback(t1).unwrap();
         assert_eq!(
-            VersionStamp::from_raw(s.property(v0).unwrap().mvcc.expired_ts),
+            VersionStamp::from_raw(s.node(h).unwrap().mvcc.expired_ts),
             VersionStamp::InFlight(t2),
             "rmp #301: T1's non-LIFO abort must NOT clobber T2's concurrent xmax stamp"
         );
@@ -9776,9 +10651,9 @@ mod tests {
         s.commit(t2).unwrap();
         assert!(
             s.commit_registry()
-                .resolve_commit_ts(s.property(v0).unwrap().mvcc.expired_ts)
+                .resolve_commit_ts(s.node(h).unwrap().mvcc.expired_ts)
                 .is_some(),
-            "V0's tombstone resolves to T2's commit ts — the delete survived"
+            "H's tombstone resolves to T2's commit ts — the delete survived"
         );
         let watermark = s.snapshot_ts();
         s.begin(TxnId(4));
@@ -9792,12 +10667,19 @@ mod tests {
         );
     }
 
-    /// `rmp` #301 (companion): the CAS tombstone undo is a strict superset of the old plain undo for
-    /// the common **LIFO single-transaction** abort — a property delete that rolls back alone must
-    /// restore the record to live (`xmax == 0`), exactly as before. Guards against the CAS undo
-    /// regressing the ordinary abort path.
+    /// **Semantic equivalent of** the retired
+    /// `tombstone_xmax_lifo_single_txn_abort_restores_live_301`, which asserted the ordinary LIFO
+    /// abort of a property `REMOVE` restored `xmax == 0` on the tombstoned record.
+    ///
+    /// After `rmp` #967 a `REMOVE` does not stamp anything — it rewrites the cell in place — so the
+    /// mechanism that test guarded no longer exists. The **semantic** it guarded does, and it is
+    /// asserted here in its stronger form: an aborted `REMOVE` must leave the property readable
+    /// **with its exact previous value**, not merely leave some record un-tombstoned. The plain
+    /// pre-image undo of the cell region ([`RecordStore::write_prop_cell`]) is what has to hold, and
+    /// the abort window's benign ordering (delta written before cell, so rollback restores cell
+    /// first) is what makes it hold.
     #[test]
-    fn tombstone_xmax_lifo_single_txn_abort_restores_live_301() {
+    fn a_single_txn_abort_of_a_removal_restores_the_exact_value_967() {
         let mut s = fresh();
         let key = s.intern_token(Namespace::PropKey, "v").unwrap();
         let setup = TxnId(1);
@@ -9808,25 +10690,35 @@ mod tests {
             .unwrap();
         s.commit(setup).unwrap();
 
-        // A real delete via the public API, then a single-transaction abort.
+        // A real removal via the public API, then a single-transaction abort.
         let t1 = TxnId(2);
         s.begin(t1);
         s.remove_node_property_value(t1, h, key).unwrap();
-        assert_ne!(
-            s.property(v0).unwrap().mvcc.expired_ts,
-            0,
-            "V0 is tombstoned in-flight before the abort"
+        assert_eq!(
+            s.property(v0).unwrap().type_tag,
+            undo::TYPE_TAG_ABSENT,
+            "the cell is emptied in place before the abort"
         );
         s.rollback(t1).unwrap();
+
+        let cell = s.property(v0).unwrap();
         assert_eq!(
-            s.property(v0).unwrap().mvcc.expired_ts,
-            0,
-            "a LIFO single-txn abort restores V0 to live (CAS undo reverts its own stamp)"
+            s.decode_property_value(cell.type_tag, cell.value_inline)
+                .unwrap(),
+            Value::Integer(1),
+            "the abort restores the EXACT previous value into the cell, not merely a live slot",
         );
+        assert_eq!(cell.mvcc.expired_ts, 0);
         assert_eq!(
             s.superset_scan_node_property_values(h).unwrap(),
             vec![(v0, key, Value::Integer(1))],
-            "the property is readable again after the abort"
+            "the property is readable again after the abort, with nothing left on the chain",
+        );
+        let report = crate::check::check_store(&mut s, &[]).unwrap();
+        assert!(
+            report.is_consistent(),
+            "store consistent after the aborted removal: {:?}",
+            report.violations
         );
     }
 
@@ -10652,8 +11544,18 @@ mod tests {
         );
     }
 
+    /// **Semantic equivalent of** the retired
+    /// `gc_reclaims_only_committed_tombstones_below_the_watermark`, which counted cells in the
+    /// `first_prop` chain (2 before GC, 1 after) — a count the in-place write path no longer
+    /// produces.
+    ///
+    /// The semantic it protected is the one that matters and is asserted here directly: GC reclaims
+    /// an old value **only** once no live or future snapshot can resolve it, and never while the
+    /// writing transaction is still open. It is asserted on the structure that now holds the old
+    /// value (the undo chain) *and* on the observable answer (what an older snapshot reads), so it
+    /// cannot pass by counting the wrong thing.
     #[test]
-    fn gc_reclaims_only_committed_tombstones_below_the_watermark() {
+    fn gc_reclaims_an_old_property_value_only_below_the_watermark() {
         let mut s = fresh();
         let key = s.intern_token(Namespace::PropKey, "v").unwrap();
         let t1 = TxnId(1);
@@ -10662,28 +11564,54 @@ mod tests {
         s.set_node_property_value(t1, n, key, &Value::Integer(1))
             .unwrap();
         s.commit(t1).unwrap();
+        let after_v1 = s.snapshot_ts();
 
-        // An in-flight (uncommitted) tombstone is never reclaimable: GC inside the still-open writing
-        // txn leaves the old version in place.
+        // An IN-FLIGHT write's delta is never reclaimable: GC inside the still-open writing txn
+        // leaves the chain alone.
         let t2 = TxnId(2);
         s.begin(t2);
         s.set_node_property_value(t2, n, key, &Value::Integer(2))
             .unwrap();
-        // Within t2 the old version's xmax is in-flight; a GC at the current watermark cannot touch
-        // it (and would be unsafe to). We run GC under t2's own id so the chain is consistent.
         let wm = s.snapshot_ts();
         assert_eq!(
-            s.gc(t2, wm).unwrap().reclaimed,
+            s.gc(t2, wm).unwrap().undo_deltas_reclaimed,
             0,
-            "an in-flight tombstone is not reclaimable"
+            "an in-flight write's delta is not reclaimable",
         );
         s.commit(t2).unwrap();
-        assert_eq!(s.superset_scan_node_properties(n).unwrap().len(), 2);
 
-        // After commit, a GC at the latest watermark reclaims it.
+        // Committed, but a snapshot older than the overwrite still exists: still not reclaimable,
+        // and that snapshot still reads the exact old value.
+        gc_at(&mut s, TxnId(3), after_v1);
+        let old_reader = Snapshot {
+            owner: TxnId(90),
+            ts: after_v1,
+        };
+        let seen = s
+            .decision_scan_node_properties(n, old_reader)
+            .unwrap()
+            .visible_version(key)
+            .expect("the older snapshot still holds the key");
+        assert_eq!(
+            s.decode_property_value(seen.type_tag, seen.value_inline)
+                .unwrap(),
+            Value::Integer(1),
+        );
+
+        // Once the watermark passes the overwrite, the whole chain goes and the cell stands alone.
         let latest = s.snapshot_ts();
-        gc_at(&mut s, TxnId(3), latest);
-        assert_eq!(s.superset_scan_node_properties(n).unwrap().len(), 1);
+        gc_at(&mut s, TxnId(4), latest);
+        let chain = s.superset_scan_node_properties(n).unwrap();
+        assert_eq!(chain.history_len(), 0, "the chain is reclaimed");
+        assert_eq!(
+            chain.len(),
+            1,
+            "the cell holding the current value survives"
+        );
+        assert_eq!(
+            s.superset_scan_node_property_values(n).unwrap(),
+            vec![(chain.cells_ignoring_history()[0].0, key, Value::Integer(2))],
+        );
     }
 
     #[test]
@@ -11022,9 +11950,9 @@ mod tests {
         assert_eq!(
             s.superset_scan_node_properties(node)
                 .unwrap()
-                .into_every_version()
-                .into_iter()
-                .map(|(pid, _)| pid)
+                .cells_ignoring_history()
+                .iter()
+                .map(|(pid, _)| *pid)
                 .collect::<Vec<_>>(),
             vec![a],
             "the owner's live chain is bridged to exactly the live property A"
@@ -11074,7 +12002,11 @@ mod tests {
                         // The live property A (pid `a`) is NEVER deleted, so it must be present on every
                         // read: only a severed walk can drop it.
                         Ok(props) => {
-                            if !props.every_version().iter().any(|(pid, _)| *pid == a) {
+                            if !props
+                                .cells_ignoring_history()
+                                .iter()
+                                .any(|(pid, _)| *pid == a)
+                            {
                                 losses.fetch_add(1, Ordering::Relaxed);
                             }
                         }

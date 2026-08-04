@@ -23,25 +23,67 @@
 //!
 //! # The reviewer-facing census: raw reads that are deliberately correct
 //!
+//! ## Where a property's old values live since `rmp` #967
+//!
+//! The property path moved onto the unified undo chain. An overwrite is now written **in place** and
+//! the superseded value descends onto the owning entity's undo chain, so:
+//!
+//! * `SupersetProperties::cells_ignoring_history()` is the **current image** — no longer a superset;
+//! * `SupersetProperties::candidates()` is the **superset** — cells plus every retained historical
+//!   value;
+//! * `RecordStore::decision_scan_*` / `StoreReadView::decision_scan_*` is the **decision** read, and
+//!   it is the only way to obtain a `DecidedProperties`.
+//!
+//! That renamed every call site's polarity question, which is why this census names the *current
+//! image* reads explicitly below and counts them (`the_census_of_current_image_property_reads_is_complete`).
+//!
 //! ## Superset — index population (a hole is unrecoverable, an extra entry is dropped by the re-check)
 //!
-//! * `TxnCoordinator::index_one_node`, `index_one_node_composite`, `index_one_node_fulltext`,
-//!   `index_one_node_spatial`, `index_one_node_text`, `index_one_node_vector`,
-//!   `index_one_node_bitmap` — each indexes **every** property version with no visibility filter
-//!   (`rmp` #766) and gates label membership on the live-OR-retained union
-//!   `RecordStore::node_label_superset` (`rmp` #904). Both are required: a seek's re-check can remove a
-//!   candidate but never resurrect one, so the tree must be a superset in both directions. Pinned by
+//! * `TxnCoordinator::index_one_node`, `index_one_node_spatial`, `index_one_node_text`,
+//!   `index_one_node_bitmap` (and their `index_one_rel*` twins) — each indexes **every** property
+//!   candidate with no visibility filter (`rmp` #766, #773, #779), through the decoded superset
+//!   `superset_scan_*_property_values`, which since #967 yields cells **and** undo-chain history.
+//! * `TxnCoordinator::index_one_node_composite` / `index_one_rel_composite` — the same superset, but
+//!   read through `stamped_candidates`, which rebuilds each candidate's validity interval from the
+//!   undo chain. A composite index indexes *tuples*, and a tuple is observable only if its members
+//!   were current at one common instant, so the intervals cannot be dropped: without them the build
+//!   must either collapse to one value per key (losing the candidate that catches a committed
+//!   duplicate on a NODE KEY / REL KEY — `rmp` #683 / #765) or emit the `O(V^k)` Cartesian product.
+//!   Pinned by `a_composite_refill_reads_the_superset_with_intervals`.
+//! * Every one of them gates label membership on the live-OR-retained union
+//!   `RecordStore::node_label_superset` (`rmp` #904). Both axes are required: a seek's re-check can
+//!   remove a candidate but never resurrect one. Pinned by
 //!   `every_index_refill_gates_on_the_label_superset` below.
-//! * `TxnCoordinator::index_one_rel*` — the relationship twins. They gate on `RelRecord::type_id`, read
-//!   live and **not** widened, because a relationship's type is fixed at creation and no statement
-//!   changes it; there is no older version for a superset to recover. Their property reads are the same
-//!   every-version superset as the node twins.
+//! * `TxnCoordinator::index_one_rel*` gate on `RelRecord::type_id`, read live and **not** widened,
+//!   because a relationship's type is fixed at creation and no statement changes it; there is no older
+//!   version for a superset to recover.
+//!
+//! ## Current image — structures that hold ONE value per entity and cannot union versions
+//!
+//! * `TxnCoordinator::index_one_node_fulltext` / `index_one_rel_fulltext` — a full-text **document** is
+//!   indexed whole and `fulltext_query` re-checks a hit's visibility and current label but never its
+//!   terms, so a term unioned in from an older version is a wrong row the consumer cannot drop. This
+//!   build has therefore never been a superset; what makes it safe is the `rmp` #778 option-(b) gate,
+//!   which refuses to bake at all while an in-flight writer holds the newest version of a covered key.
+//!   It reads `cells_ignoring_history` for both halves — the bake, and the gate, which needs the EMPTY
+//!   cells a `REMOVE` leaves behind and `candidates()` drops.
+//! * `TxnCoordinator::index_one_node_vector` / `index_one_rel_vector` — an HNSW graph holds one
+//!   embedding per entity, and `rmp` #780 already settled that a conflicted entity is left out
+//!   entirely rather than indexed at an older version. Same read, same gate.
+//! * `TxnCoordinator::rebuild_columns` — see "Live word" below; its witness names a `props.store`
+//!   **cell**, and an undo-store id read as a cell id is not a stale row, it is a wrong one.
+//!
+//! ## Decision — the query read path
+//!
 //! * `graphus_cypher::read_source::{read_node_props, read_rel_props, read_node_prop_one,
-//!   read_rel_prop_one}` and their `RecordStoreGraph` twins — these read the superset and apply the
-//!   visibility fold themselves, one record at a time, so that a hot single-property probe stops at the
-//!   first visible version instead of materialising the whole narrowed set. The polarity is decision;
-//!   the *read* is superset by construction, which is why the call is spelled
-//!   `superset_scan_*` at those sites. Pinned by `the_query_read_path_folds_visibility_over_the_superset`.
+//!   read_rel_prop_one}` and their `RecordStoreGraph` twins — these resolve at the reader's snapshot
+//!   through `decision_scan_*`. Before `rmp` #967 they read the superset and folded `is_visible` over
+//!   each record themselves, which was sound only while every version of a key was a cell with its own
+//!   MVCC stamps; `D-property-visibility` made the undo chain the sole oracle, so the fold moved into
+//!   the storage-side walk. Both the inline `RecordStore` path and the off-thread `StoreReadView` path
+//!   go through the same seam method for exactly that reason (`rmp` #755/#768/#769/#770). Pinned by
+//!   `the_query_read_path_resolves_at_its_snapshot` and
+//!   `both_read_sources_resolve_properties_through_the_same_seam`.
 //!
 //! ## Conservative — pruning structures (an excluded range disappears before any re-check runs)
 //!
@@ -60,11 +102,26 @@
 //!
 //! ## Live word — write-path enforcement and total-fallback memoization
 //!
-//! * `RecordStoreGraph::note_node_predicate_write` / `reindex_node` / `reindex_node_bitmap` /
-//!   `note_node_label_predicate_write` (`record_graph.rs`) — the write path reads the node's **current**
-//!   labels because the state it is announcing or indexing is the state it has just written. There is no
-//!   snapshot to resolve against and no superset to widen to: the question is "what does this record say
-//!   now".
+//! * `RecordStoreGraph::note_predicate_write_preimage` / `reindex_node` /
+//!   `enforce_constraints_for_node` (`record_graph.rs`) — the write path reads the node's **current**
+//!   labels because the state it is announcing, indexing or enforcing against is the state it has just
+//!   written. There is no snapshot to resolve against and no superset to widen to: the question is
+//!   "what does this record say now". Pinned by
+//!   `the_census_of_live_word_reads_in_record_graph_is_complete`.
+//!   (These three names were wrong in this census until `rmp` #967's audit: it listed
+//!   `note_node_predicate_write`, `reindex_node_bitmap` and `note_node_label_predicate_write`, two of
+//!   which have never existed. Prose naming a function nothing checks is exactly how a census rots,
+//!   which is why they are now asserted rather than listed.)
+//!
+//! ## Superset — SSI predicate announcement (`record_graph.rs`)
+//!
+//! * `RecordStoreGraph::rel_type_and_resolved_props` — the read behind `note_rel_property_preimage`
+//!   and `note_rel_predicate_write_full`, whose output is an **rw-edge**, not a row. A *missing*
+//!   marker is a lost edge and therefore a serializability hole; an *extra* marker is a spurious,
+//!   retryable abort. That is superset polarity exactly, so the candidate superset is the right read
+//!   — and after `rmp` #967 it is strictly **more** conservative than before (a key whose cell a
+//!   `REMOVE` emptied now also announces its pre-removal value), never less. Pinned by
+//!   `the_census_of_superset_property_reads_in_record_graph_is_complete`.
 //! * `TxnCoordinator::rebuild_columns` (the columnar accelerator) reads the live word on purpose. The
 //!   column is a **memoization with a total fallback**, not a candidate source: `columnar_scan`
 //!   re-checks every candidate's visibility and label through `label_bitmap_at`, and a row the column
@@ -86,8 +143,17 @@
 //!
 //! ## Scope of this census
 //!
-//! It covers `graphus-cypher`, which is where the two opposite polarities meet — the same file holds
-//! the index refills and the constraint walks. The `superset_scan_*` reads outside this crate are all
+//! It covers `graphus-cypher`, and — since `rmp` #967's audit — it covers `record_graph.rs` **as a
+//! whole**, not only the handful of functions named above. It did not before, and the consequence was
+//! immediate: `reindex_rel` resolved its values by folding first-occurrence-wins over
+//! `superset_scan_rel_property_values`, which after #967 yields the candidate superset, so a
+//! `REMOVE r.p` re-baked the pre-removal value into the relationship full-text index (a wrong row) and
+//! back into the ANN graph (a phantom candidate that costs a genuine neighbour its row). That read sat
+//! in no section of this file and was covered by no assertion, which is why it could happen at all.
+//! `the_census_of_superset_property_reads_in_record_graph_is_complete` and
+//! `per_write_index_maintenance_resolves_at_the_statement_snapshot` now hold that file.
+//!
+//! The `superset_scan_*` reads outside this crate are all
 //! **offline or diagnostic** surfaces that hold no snapshot and answer no query: the consistency
 //! checker (`graphus_storage::check`), the whole-graph dumper and bulk importer, the backup/restore
 //! paths, and the DST oracles. They read the physical image on purpose, because the physical image is
@@ -98,15 +164,120 @@ const COORDINATOR: &str = include_str!("../src/coordinator.rs");
 const RECORD_GRAPH: &str = include_str!("../src/record_graph.rs");
 const READ_SOURCE: &str = include_str!("../src/read_source.rs");
 
-/// Every read that returns raw physical state on the property axis, by the name it is called at a call
-/// site. A decision path must contain none of these.
-const SUPERSET_POLARITY_READS: &[&str] = &[
+/// Every raw read on the **property** axis, of whatever polarity, by the name it is called at a call
+/// site: the decoded and undecoded superset scans, both `SupersetProperties` accessors, and the
+/// stamped-superset helper.
+///
+/// A function that performs none of these resolves its property values through `decision_scan_*` or
+/// through a helper that does — which, for anything that is not an index population, is the only
+/// correct answer.
+///
+/// `.cells_ignoring_history()` belongs here as much as `.candidates()` does: since `rmp` #967 the
+/// current image is not a superset either, and it is just as wrong in a decision path, because it
+/// answers "what does the cell say now" rather than "what does this snapshot see".
+const PROPERTY_AXIS_RAW_READS: &[&str] = &[
     "superset_scan_node_properties",
     "superset_scan_rel_properties",
     "superset_scan_node_property_values",
     "superset_scan_rel_property_values",
-    "every_version(",
-    "node_label_superset",
+    ".candidates()",
+    ".cells_ignoring_history()",
+    "stamped_candidates(",
+];
+
+/// The raw reads on the **label** axis. Held here rather than in the type system because the live
+/// word, the candidate superset and the snapshot-exact resolver all deal in the same `u64` bitmap.
+const LABEL_AXIS_RAW_READS: &[&str] = &["node_label_superset"];
+
+/// Every read that returns raw physical state, on either axis. A decision path must contain none of
+/// them.
+fn raw_reads() -> impl Iterator<Item = &'static &'static str> {
+    PROPERTY_AXIS_RAW_READS
+        .iter()
+        .chain(LABEL_AXIS_RAW_READS.iter())
+}
+
+/// The reads that return the **current image** of the property axis (`rmp` #967): the live cells and
+/// nothing else. Correct only where the structure being populated holds one value per entity and
+/// nothing downstream can repair an extra one — never in a decision path, and never in a candidate
+/// structure a later reader re-checks.
+const CURRENT_IMAGE_PROPERTY_READS: &[&str] = &[".cells_ignoring_history()"];
+
+/// The functions in `record_graph.rs` that may perform a raw **property**-axis read, each with the
+/// reason it is correct there. Anything else performing one in that file fails the census.
+const RECORD_GRAPH_RAW_PROPERTY_READERS: &[(&str, &str)] = &[(
+    "rel_type_and_resolved_props",
+    "SSI predicate ANNOUNCEMENT, not a population and not a decision: it feeds \
+     `note_rel_property_preimage` / `note_rel_predicate_write_full`, whose output is an rw-EDGE, not \
+     a row. A missing marker is a lost edge and therefore a serializability hole; an extra marker is \
+     a spurious, retryable abort — superset polarity exactly. After `rmp` #967 the read is strictly \
+     MORE conservative than before (a key whose cell a `REMOVE` emptied now also announces its \
+     pre-removal value), never less",
+)];
+
+/// The functions in `record_graph.rs` that may read the **live** label word, each with its reason.
+const RECORD_GRAPH_LIVE_WORD_READERS: &[(&str, &str)] = &[
+    (
+        "note_predicate_write_preimage",
+        "announces the labels the node currently carries, BEFORE the mutation that changes them — the \
+         pre-image IS the live word, and there is no snapshot to resolve it against",
+    ),
+    (
+        "reindex_node",
+        "per-write maintenance: the state being indexed is the state this statement has just written, \
+         so the question is 'what does this record say now'",
+    ),
+    (
+        "enforce_constraints_for_node",
+        "write-path enforcement: the constraints that apply are the ones on the labels the node \
+         carries after this statement's write. Fails CLOSED on a read fault (`rmp` #733/#967) rather \
+         than skipping enforcement",
+    ),
+];
+
+/// The per-entity index-maintenance seams in `record_graph.rs`, and the **decision** read each one
+/// must reach — directly, or through the named helper that does.
+const INDEX_MAINTENANCE_SEAMS: &[(&str, &str)] = &[
+    ("reindex_node", "read_node_props"),
+    ("reindex_rel", "decision_scan_rel_properties"),
+];
+
+/// The functions that may perform a **current-image** property read in `coordinator.rs`, each with the
+/// reason it is correct there. Anything else calling `cells_ignoring_history` in that file fails the
+/// census — which is the check that catches a population path quietly switched off the superset.
+const CURRENT_IMAGE_READERS: &[(&str, &str)] = &[
+    (
+        "index_one_node_fulltext",
+        "a full-text document is indexed WHOLE and `fulltext_query` never re-checks terms, so a term \
+         from an older version is a wrong row the consumer cannot drop; the `rmp` #778 gate refuses \
+         to bake while an in-flight writer holds a covered key, and that gate needs the EMPTY cells \
+         `candidates()` drops",
+    ),
+    (
+        "index_one_rel_fulltext",
+        "the relationship twin of `index_one_node_fulltext`, same argument",
+    ),
+    (
+        "index_one_node_vector",
+        "an HNSW graph holds ONE embedding per entity and `rmp` #780 leaves a conflicted entity out \
+         entirely rather than indexing an older version; the gate reads the cells' own MVCC headers",
+    ),
+    (
+        "index_one_rel_vector",
+        "the relationship twin of `index_one_node_vector`, same argument",
+    ),
+    (
+        "rebuild_columns",
+        "memoization with a total fallback whose witness names a `props.store` CELL: a candidate from \
+         the undo store would be read back at an undo-store id, and a row the column omits falls \
+         through to `read_node_prop_one`, so a hole costs a decode and never a row",
+    ),
+    (
+        "stamped_candidates",
+        "not a current-image read at all: it reads the cells as the FIRST half of the superset and \
+         then walks `history()` for the second, which is why it is also required to call `.history()` \
+         (`a_composite_refill_reads_the_superset_with_intervals`)",
+    ),
 ];
 
 /// The constraint-validation surface: the functions whose answer is written into the catalogue and is
@@ -191,7 +362,7 @@ fn code_hits(body: &str, needle: &str) -> usize {
 fn a_decision_path_never_performs_a_superset_polarity_read() {
     for f in DECISION_POLARITY_FNS {
         let body = method_body(COORDINATOR, f);
-        for read in SUPERSET_POLARITY_READS {
+        for read in raw_reads() {
             assert_eq!(
                 code_hits(&body, read),
                 0,
@@ -397,16 +568,60 @@ fn the_census_of_live_word_reads_in_the_coordinator_is_complete() {
     );
 }
 
-/// The query read path reads the superset and folds visibility over it itself. Both halves matter: the
-/// read must be spelled as a superset read (so the polarity is stated at the call site), and the fold
-/// must be there (so the answer is a decision).
+/// The body of `name` in `src`, whether it is declared at `impl` level (four-space indent) or as a
+/// free function at column 0. Used by the censuses that classify a name without knowing which it is.
+///
+/// # Panics
+/// Panics when `name` is found in neither form, because that means the census is inspecting a stale
+/// name and would otherwise pass vacuously.
+fn any_fn_body(src: &str, name: &str) -> String {
+    if src.contains(&format!("\n    fn {name}(")) || src.contains(&format!("\n    pub fn {name}("))
+    {
+        return method_body(src, name);
+    }
+    let start = src
+        .find(&format!("\nfn {name}("))
+        .unwrap_or_else(|| panic!("`{name}` not found at impl level or at column 0"));
+    let rest = &src[start + 1..];
+    let end = rest.find("\n}\n").unwrap_or(rest.len());
+    rest[..end].to_owned()
+}
+
+/// The body of the free function `name` in `read_source.rs` (declared at column 0).
+///
+/// # Panics
+/// Panics when the function is not found, because that means the census is inspecting a stale name and
+/// would otherwise pass vacuously.
+fn free_fn_body(src: &str, name: &str) -> String {
+    let start = src
+        .find(&format!("\nfn {name}<"))
+        .unwrap_or_else(|| panic!("`{name}` not found in read_source.rs"));
+    let rest = &src[start + 1..];
+    let end = rest.find("\n}\n").unwrap_or(rest.len());
+    rest[..end].to_owned()
+}
+
+/// **THE `rmp` #967 QUERY-PATH SHAPE, as a check.** A query materialising a property resolves it at
+/// the reader's snapshot, through the storage-side decision walk — it does **not** read a raw chain
+/// and fold visibility itself.
+///
+/// That fold used to live here and was correct while every version of a key was a cell carrying its
+/// own `xmin`/`xmax`. After `rmp` #967 an overwrite is written in place and the superseded value
+/// descends onto the entity's undo chain, which `D-property-visibility` makes the sole oracle: a fold
+/// over the cells' own stamps now resolves the CURRENT value for every reader, including one whose
+/// snapshot predates the overwrite.
 #[test]
-fn the_query_read_path_folds_visibility_over_the_superset() {
+fn the_query_read_path_resolves_at_its_snapshot() {
     for (src, name, fns) in [
         (
             READ_SOURCE,
             "read_source.rs",
-            &["read_node_prop_one", "read_rel_prop_one"][..],
+            &[
+                "read_node_prop_one",
+                "read_rel_prop_one",
+                "read_node_props",
+                "read_rel_props",
+            ][..],
         ),
         (
             RECORD_GRAPH,
@@ -416,25 +631,265 @@ fn the_query_read_path_folds_visibility_over_the_superset() {
     ] {
         for f in fns {
             let body = if src == READ_SOURCE {
-                // Free functions in `read_source.rs` are declared at column 0.
-                let start = src
-                    .find(&format!("\nfn {f}<"))
-                    .unwrap_or_else(|| panic!("`{f}` not found in {name}"));
-                let rest = &src[start + 1..];
-                let end = rest.find("\n}\n").unwrap_or(rest.len());
-                rest[..end].to_owned()
+                free_fn_body(src, f)
             } else {
                 method_body(src, f)
             };
             assert!(
-                code_hits(&body, "superset_scan_") >= 1,
-                "`{f}` ({name}) reads a raw property chain, so the call must say so: \
-                 `superset_scan_*`",
+                code_hits(&body, "decision_scan_") >= 1,
+                "`{f}` ({name}) materialises a property for a query, so it must resolve the version \
+                 through `decision_scan_*` — the read that cannot be performed without a `Snapshot` \
+                 (`rmp` tasks #905, #967)",
             );
-            assert!(
-                code_hits(&body, "visible(prop.mvcc)") >= 1,
-                "`{f}` ({name}) must fold `is_visible` over every version it walks — the read is a \
-                 superset, the answer owed to a query is a decision",
+            for raw in raw_reads() {
+                assert_eq!(
+                    code_hits(&body, raw),
+                    0,
+                    "`{f}` ({name}) must not perform the raw read `{raw}`: after `rmp` #967 the \
+                     entity's undo chain is the sole visibility oracle for a property, so a fold over \
+                     the cells' own MVCC stamps serves the CURRENT value to a reader whose snapshot \
+                     predates the overwrite",
+                );
+            }
+            assert_eq!(
+                code_hits(&body, "visible(prop.mvcc)"),
+                0,
+                "`{f}` ({name}) must not re-decide visibility from a property cell's own MVCC header: \
+                 `D-property-visibility` made that stamp informative (`rmp` #967)",
+            );
+        }
+    }
+}
+
+/// **THE `rmp` #755/#768/#769/#770 SHAPE, as a check.** The inline path and the off-thread reader pool
+/// resolve a property version through the **same** mechanism.
+///
+/// That family of defects is one shape repeated: the reader pool quietly answered from a different
+/// mechanism than the inline path — full-scanning where the inline path sought, declining an index the
+/// inline path used. A property version is now reconstructed by an undo-chain walk, which is exactly
+/// the kind of mechanism that can be reimplemented slightly differently on one side and diverge
+/// silently. So it lives on the `StoreReadSource` seam, and both implementations forward to the one
+/// storage body.
+#[test]
+fn both_read_sources_resolve_properties_through_the_same_seam() {
+    for m in [
+        "decision_scan_node_properties",
+        "decision_scan_rel_properties",
+    ] {
+        assert_eq!(
+            code_hits(READ_SOURCE, &format!("fn {m}(")),
+            3,
+            "`{m}` must appear exactly three times in read_source.rs: the `StoreReadSource` \
+             declaration, the `LiveSource` (inline) implementation and the `ReadViewSource` \
+             (off-thread reader pool) implementation. A missing implementation means one of the two \
+             paths resolves versions some other way (`rmp` #755/#768/#769/#770)",
+        );
+    }
+    // Each implementation is a pure forward to the one storage body — the inline path to
+    // `RecordStore`, the off-thread path to `StoreReadView`, both of which delegate to
+    // `graphus_storage::read_view`. A body that did anything else would be a second mechanism.
+    for (recv, m) in [
+        ("self.0.decision_scan_node_properties(", "LiveSource node"),
+        ("self.0.decision_scan_rel_properties(", "LiveSource rel"),
+        (
+            "self.view.decision_scan_node_properties(",
+            "ReadViewSource node",
+        ),
+        (
+            "self.view.decision_scan_rel_properties(",
+            "ReadViewSource rel",
+        ),
+    ] {
+        assert_eq!(
+            code_hits(READ_SOURCE, recv),
+            1,
+            "the {m} implementation must be a single forward to the shared storage body (`{recv}…`)",
+        );
+    }
+}
+
+/// **THE `rmp` #967 COMPOSITE SHAPE, as a check.** A composite refill reads the superset **with**
+/// per-candidate validity intervals, and never the current image.
+///
+/// A composite index indexes tuples, and a tuple is observable only if its members were current at one
+/// common instant, so this build cannot use the stampless `candidates()` — it would have to collapse
+/// to one value per key (dropping the candidate that catches a committed duplicate on a NODE KEY /
+/// REL KEY: `rmp` #683 / #765) or emit the Cartesian product. And it cannot use the current image at
+/// all, for the same reason plus one more: after #967 the cells hold only the newest value.
+#[test]
+fn a_composite_refill_reads_the_superset_with_intervals() {
+    for f in ["index_one_node_composite", "index_one_rel_composite"] {
+        let body = method_body(COORDINATOR, f);
+        assert!(
+            code_hits(&body, "stamped_candidates(") >= 1,
+            "`{f}` must build its candidate tuples from `stamped_candidates`, the superset read that \
+             rebuilds each value's validity interval from the undo chain (`rmp` #967)",
+        );
+        for raw in CURRENT_IMAGE_PROPERTY_READS {
+            assert_eq!(
+                code_hits(&body, raw),
+                0,
+                "`{f}` must not read the current image (`{raw}`): after `rmp` #967 the live cells hold \
+                 only the NEWEST value of each key, so a refill that reads them drops every tuple an \
+                 older snapshot still needs — and for a NODE KEY / REL KEY the write path's duplicate \
+                 check then finds nothing and ADMITS a committed duplicate (`rmp` #683 / #765)",
+            );
+        }
+    }
+    // And the helper itself must read BOTH halves of the superset: the cells give the current value of
+    // each key, the history gives every value an older snapshot can still ask for.
+    let helper = {
+        let start = COORDINATOR
+            .find("\nfn stamped_candidates(")
+            .expect("`stamped_candidates` not found: the census is inspecting a stale name");
+        let rest = &COORDINATOR[start + 1..];
+        let end = rest.find("\n}\n").unwrap_or(rest.len());
+        rest[..end].to_owned()
+    };
+    for half in [".cells_ignoring_history()", ".history()"] {
+        assert!(
+            code_hits(&helper, half) >= 1,
+            "`stamped_candidates` must read `{half}`: the superset is cells PLUS undo history, and \
+             either half alone loses candidates (`rmp` #967)",
+        );
+    }
+}
+
+/// The census of **current-image** property reads in `coordinator.rs` is complete: every one of them
+/// sits in a function this file has classified, with a reason. A population path switched off the
+/// superset onto the current image fails here until somebody writes down why that is sound — which,
+/// for a structure whose consumer re-checks candidates, it is not.
+#[test]
+fn the_census_of_current_image_property_reads_is_complete() {
+    for read in CURRENT_IMAGE_PROPERTY_READS {
+        let total = code_hits(COORDINATOR, read);
+        let classified: usize = CURRENT_IMAGE_READERS
+            .iter()
+            .map(|(f, _)| code_hits(&any_fn_body(COORDINATOR, f), read))
+            .sum();
+        assert_eq!(
+            total, classified,
+            "`coordinator.rs` performs {total} current-image property read(s) (`{read}`) but only \
+             {classified} of them sit in a function this census has classified. After `rmp` #967 the \
+             live cells are the CURRENT image and not a superset, so this read is correct only where \
+             the structure holds one value per entity and nothing downstream needs an older one. \
+             Classify the new one against `graphus_storage::scan_polarity` and add it to \
+             `CURRENT_IMAGE_READERS` with its reason, or change it to the candidate superset.",
+        );
+        assert!(
+            classified > 0,
+            "the census found no classified current-image read at all, so it is passing vacuously",
+        );
+    }
+}
+
+/// **THE `rmp` #967 `reindex_rel` SHAPE, as a check.** The census of raw **property**-axis reads in
+/// `record_graph.rs` is complete: every one of them sits in a function this file has classified, with
+/// a reason.
+///
+/// This assertion did not exist, and that is why the defect it now catches could happen. The census's
+/// three earlier assertions each scanned `coordinator.rs` only, or a hard-coded list of names — so
+/// `reindex_rel`, the per-write maintenance of every derived RELATIONSHIP index, could fold
+/// first-occurrence-wins over `superset_scan_rel_property_values` and appear in no section and no
+/// check. After #967 that read is the candidate superset (cells, with the empty cell a `REMOVE` leaves
+/// behind skipped, then the undo history), so a removed key's first surviving candidate is its
+/// pre-removal value, and the wholesale re-index put it back into the full-text terms and the ANN
+/// graph.
+///
+/// `record_graph.rs` is where the query seam lives, so a raw property read here is nearly always
+/// wrong. Classifying one is meant to be an unusual, deliberate act.
+#[test]
+fn the_census_of_superset_property_reads_in_record_graph_is_complete() {
+    let mut total = 0usize;
+    let mut classified = 0usize;
+    for read in PROPERTY_AXIS_RAW_READS {
+        total += code_hits(RECORD_GRAPH, read);
+        classified += RECORD_GRAPH_RAW_PROPERTY_READERS
+            .iter()
+            .map(|(f, _)| code_hits(&any_fn_body(RECORD_GRAPH, f), read))
+            .sum::<usize>();
+    }
+    assert_eq!(
+        total, classified,
+        "`record_graph.rs` performs {total} raw property-axis read(s) but only {classified} of them \
+         sit in a function this census has classified. `record_graph.rs` is the QUERY seam: its \
+         property reads resolve at the reader's snapshot through `decision_scan_*`, and a raw read \
+         here answers 'what does the cell say now' (or, worse since `rmp` #967, 'what did it once \
+         say') to a question that was about a snapshot. Either resolve through `decision_scan_*`, or \
+         classify the new read in `RECORD_GRAPH_RAW_PROPERTY_READERS` with the reason it is correct — \
+         and an entry with no justification is not an entry.",
+    );
+    assert!(
+        classified > 0,
+        "the census found no classified raw property read in `record_graph.rs` at all, so it is \
+         passing vacuously — the classified read must still exist for this check to have teeth"
+    );
+}
+
+/// The census of **live label word** reads in `record_graph.rs` is complete, the same way the
+/// coordinator's is. A new one fails here until it is classified.
+///
+/// This also keeps the prose honest: until `rmp` #967's audit the module docs above named
+/// `note_node_predicate_write`, `reindex_node_bitmap` and `note_node_label_predicate_write` as the
+/// classified readers, and two of those three have never existed in this crate. `any_fn_body` panics
+/// on a name it cannot find, so a stale entry now fails the gate instead of reassuring a reviewer.
+#[test]
+fn the_census_of_live_word_reads_in_record_graph_is_complete() {
+    let total = code_hits(RECORD_GRAPH, ".node_labels(");
+    let classified: usize = RECORD_GRAPH_LIVE_WORD_READERS
+        .iter()
+        .map(|(f, _)| code_hits(&any_fn_body(RECORD_GRAPH, f), ".node_labels("))
+        .sum();
+    assert_eq!(
+        total, classified,
+        "`record_graph.rs` performs {total} live-label-word read(s) but only {classified} of them sit \
+         in a function this census has classified. The live word is a SUBSET while an uncommitted \
+         `REMOVE n:L` is open and a SUPERSET-of-nothing for an older reader, so it is correct only on \
+         the write path (where it is the state just written) — anywhere else it must be \
+         `node_label_superset` (population) or `label_bitmap_at` (decision). Classify the new one in \
+         `RECORD_GRAPH_LIVE_WORD_READERS` with its reason, or change the read.",
+    );
+    assert!(
+        classified > 0,
+        "the census found no classified live-word read in `record_graph.rs` at all, so it is passing \
+         vacuously"
+    );
+}
+
+/// **THE POPULATION-PATH SHAPE, as a check.** Per-write index maintenance resolves its property
+/// values at the **statement's snapshot**, and performs no raw property read of any polarity.
+///
+/// This is the assertion that would have caught `reindex_rel` directly, and it catches the two ways
+/// the same mistake is spelled: reading the candidate superset (which after `rmp` #967 resurrects a
+/// removed key's pre-removal value) and reading the current image `cells_ignoring_history` (which is
+/// not a superset either, and answers without a snapshot).
+///
+/// Both seams maintain structures that hold ONE value per entity and whose consumers do not re-check
+/// that value — the full-text inverted index re-checks a hit's visibility and label/type but never its
+/// terms, and the ANN graph is not re-checked at candidate-selection time at all — so what they owe is
+/// the decision read, exactly like the query path.
+#[test]
+fn per_write_index_maintenance_resolves_at_the_statement_snapshot() {
+    for (f, resolver) in INDEX_MAINTENANCE_SEAMS {
+        let body = method_body(RECORD_GRAPH, f);
+        assert!(
+            code_hits(&body, resolver) >= 1,
+            "`{f}` maintains structures that hold one value per entity, so it must resolve that value \
+             at this statement's snapshot through `{resolver}` (`rmp` tasks #905, #967)",
+        );
+        for raw in PROPERTY_AXIS_RAW_READS {
+            assert_eq!(
+                code_hits(&body, raw),
+                0,
+                "`{f}` must not perform the raw property read `{raw}`. After `rmp` #967 the candidate \
+                 superset yields the live cells — with the EMPTY cell a `REMOVE` leaves behind \
+                 skipped — followed by the undo history, so folding first-occurrence-wins over it \
+                 resolves a REMOVED key to its pre-removal value; and the current image \
+                 (`cells_ignoring_history`) answers without a snapshot at all. Either one re-bakes a \
+                 committed-removed value into the full-text terms (a wrong ROW: the query re-checks \
+                 visibility and label/type, never terms) and back into the ANN graph (a phantom that \
+                 consumes the `2k` over-fetch budget, costing a genuine neighbour its row). Resolve \
+                 through `{resolver}`.",
             );
         }
     }

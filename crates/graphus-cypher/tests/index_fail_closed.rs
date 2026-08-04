@@ -211,7 +211,46 @@ const MATCHING: usize = 300;
 const NON_MATCHING: usize = 150;
 /// The buffer-pool size of a faulted store: small enough that a full store scan cannot be served from
 /// memory, so the injected read fault is actually reachable.
-const FAULTED_POOL_PAGES: usize = 4;
+///
+/// **Why 8 and not 4** (`rmp` #967). It must be small, but it must not be smaller than the *working
+/// set of a single read*, or the pool **thrashes**: each step evicts the page the next step needs, so
+/// the device-read count stops measuring the scan and starts measuring the eviction pathology. Most
+/// tests here enumerate an operation's device reads and then re-run it once per read position, so
+/// their cost is quadratic in that count and the thrashing is not a slowdown but a wall.
+///
+/// #967 moved the property path onto the undo chain, so one property read now touches five stores in
+/// a cycle (`nodes` → `props` → `strings` → `undo` → `commit`) instead of three. Four frames cannot
+/// hold five pages. Measured on `a_fault_at_any_point_of_the_rebuild_still_answers_correctly`'s own
+/// `total_reads` — which is also the number of fault-injection points it performs:
+///
+/// | pool | before #967 | after #967 |
+/// |---:|---:|---:|
+/// | 4 | 34 | **6824** |
+/// | 8 | 23 | **34** |
+/// | 16 and above | 17 | 27 |
+///
+/// Eight restores the sweep to **exactly the 34 injection points it had before #967**, so the coverage
+/// is unchanged rather than merely cheaper, and the fixture's purpose is equally intact: a 450-node
+/// store still spans far more than eight pages, so a full scan still cannot be served from memory and
+/// every injected fault is still reachable.
+///
+/// The cliff is **not a product hazard**: it is unreachable in production, where `graphus-server`
+/// refuses an explicit `buffer_pool_pages` below `MIN_BUFFER_POOL_PAGES` (64) and the hardware auto
+/// path never goes below `AUTO_BUFFER_POOL_FLOOR_PAGES` (4096). At any pool at or above 8 the real
+/// cost of #967 is a flat **~1.6×** in device reads — one undo delta plus one commit slot per property
+/// — which is the honest, bounded price of versioned properties. It was purely this fixture sitting
+/// below the server's own documented minimum, and it cost the suite ~50 minutes in this one binary.
+const FAULTED_POOL_PAGES: usize = 8;
+
+/// The pool for the three **poison** tests, which is deliberately *below* the read working set.
+///
+/// They are the exception to [`FAULTED_POOL_PAGES`]: their subject is what happens when a page is
+/// evicted and its re-read faults, so the eviction is the mechanism under test rather than an
+/// accident of sizing. Each asserts its own non-vacuity against it ("no page poisoned a build — the
+/// test would be vacuous"), and each fails outright at a pool of 16, which is the proof that this
+/// value is load-bearing here and must not be raised. They can afford it because none of them is
+/// quadratic in the device-read count the way the sweeps are.
+const POISON_POOL_PAGES: usize = 4;
 
 type FaultyStore = RecordStore<FaultyDevice, MemLogSink>;
 type FaultyCoord = TxnCoordinator<FaultyDevice, MemLogSink>;
@@ -1412,7 +1451,7 @@ fn a_dead_property_page_does_not_cause_an_unbounded_poison_resurrect_cycle() {
         let (device, wal) = restart_on_faulty_device(&mut store);
         let fault = device.handle();
         let faulty: FaultyStore =
-            RecordStore::open(device, wal, FAULTED_POOL_PAGES).expect("open store");
+            RecordStore::open(device, wal, POISON_POOL_PAGES).expect("open store");
         let mut coord: FaultyCoord = TxnCoordinator::new(faulty);
 
         // Declare an INCREMENTAL node-property build (deferred per-node indexing — the queue the
@@ -2128,7 +2167,7 @@ fn a_poisoned_build_is_distinguishable_from_a_healthy_build_in_progress() {
         let mut store = make_store();
         let (device, wal) = restart_on_faulty_device(&mut store);
         let faulty: FaultyStore =
-            RecordStore::open(device, wal, FAULTED_POOL_PAGES).expect("open store");
+            RecordStore::open(device, wal, POISON_POOL_PAGES).expect("open store");
         let mut coord: FaultyCoord = TxnCoordinator::new(faulty);
         coord
             .begin_online_node_property_index("Article", "slug")
@@ -2167,7 +2206,7 @@ fn a_poisoned_build_is_distinguishable_from_a_healthy_build_in_progress() {
         let (device, wal) = restart_on_faulty_device(&mut store);
         let fault = device.handle();
         let faulty: FaultyStore =
-            RecordStore::open(device, wal, FAULTED_POOL_PAGES).expect("open store");
+            RecordStore::open(device, wal, POISON_POOL_PAGES).expect("open store");
         let mut coord: FaultyCoord = TxnCoordinator::new(faulty);
 
         // Kill a page for good, then declare the build. A node-slot page fails the declare's own
@@ -2389,7 +2428,7 @@ fn dropping_an_index_with_a_poisoned_build_does_not_resurrect_it() {
         let (device, wal) = restart_on_faulty_device(&mut store);
         let fault = device.handle();
         let faulty: FaultyStore =
-            RecordStore::open(device, wal, FAULTED_POOL_PAGES).expect("open store");
+            RecordStore::open(device, wal, POISON_POOL_PAGES).expect("open store");
         let mut coord: FaultyCoord = TxnCoordinator::new(faulty);
 
         // Poison a build by killing a property page for good.

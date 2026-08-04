@@ -5,11 +5,12 @@
 #   1. workspace build + clippy + fmt check
 #   2. anomaly checker (Elle/DSG serializability)
 #   3. the read-polarity census (superset / decision / conservative storage reads)
-#   4. proptest invariants (codec round-trips + order-preserving key codec)
-#   5. the criterion regression gate (vs the committed baseline)
-#   6. the LDBC-SNB macro harness (tiny scale)
-#   7. the examples suite, in BOTH modes (self-boot + attached to a running instance)
-#   8. the official Neo4j driver interop suite (real drivers over Bolt; needs node/npm, python3, go + network)
+#   4. the property visible-read record-count gate (`rmp` #967 AC2; needs --features read-probe)
+#   5. proptest invariants (codec round-trips + order-preserving key codec)
+#   6. the criterion regression gate (vs the committed baseline)
+#   7. the LDBC-SNB macro harness (tiny scale)
+#   8. the examples suite, in BOTH modes (self-boot + attached to a running instance)
+#   9. the official Neo4j driver interop suite (real drivers over Bolt; needs node/npm, python3, go + network)
 #
 # The SLOW gates are deliberately NOT run here (they are documented in VERIFICATION.md and run on a
 # nightly/manual job): the loom model-check, the miri UB gate, the full Criterion suites, and any
@@ -38,12 +39,12 @@ done
 
 step() { printf '\n\033[1;34m==> %s\033[0m\n' "$1"; }
 
-step "1/8  build + clippy + fmt (workspace)"
+step "1/9  build + clippy + fmt (workspace)"
 cargo build --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 
-step "2/8  anomaly gate — Elle/DSG serializability checker"
+step "2/9  anomaly gate — Elle/DSG serializability checker"
 cargo test -p graphus-cypher --test elle
 
 # A read of the record store returns raw physical state; which answer the caller owes back is one of
@@ -51,18 +52,33 @@ cargo test -p graphus-cypher --test elle
 # defects, each of them behind a docstring that asserted the wrong polarity and was believed. This
 # gate reads source text, costs milliseconds, and fails when a polarity-sensitive read appears or
 # moves without being classified (`rmp` #905; VERIFICATION.md gate 10).
-step "3/8  read-polarity census — superset / decision / conservative storage reads"
+step "3/9  read-polarity census — superset / decision / conservative storage reads"
 cargo test -p graphus-cypher --test read_polarity_census
 cargo test -p graphus-storage --test scan_polarity_barrier
 
-step "4/8  proptest invariants — codec round-trips + order-preserving key codec"
+# Acceptance criterion 2 of `rmp` #967 — "reading the visible property does not walk the chain" —
+# proven by a RECORD-READ COUNT rather than a timing, because a timing is a property of the host's
+# cache and the count is a property of the algorithm. The instrumentation is a cargo FEATURE that is
+# off by default (it sits on the hottest read in the engine and must not perturb the benchmark or the
+# production build), and the test file is `#![cfg(feature = "read-probe")]`, so a plain
+# `cargo test -p graphus-storage` compiles it away and asserts nothing.
+#
+# That is precisely the shape of `rmp` #960 (gate 11 below): a suite behind an opt-in feature that no
+# automated gate ever enabled, so the defect it existed to catch survived on `main` with every other
+# gate green. `04-technical-design.md` §11.6 was ratified by #967 itself to stop that recurring, and a
+# headline acceptance criterion asserted by nothing any gate runs is the same defect again. Hence the
+# explicit `--features read-probe` invocation here.
+step "4/9  property visible-read record count — `rmp` #967 AC2 (needs --features read-probe)"
+cargo test -p graphus-storage --features read-probe --test prop_visible_read_record_count
+
+step "5/9  proptest invariants — codec round-trips + order-preserving key codec"
 cargo test -p graphus-storage --test proptest_codecs
 cargo test -p graphus-cypher --test proptest_keycodec
 
-step "5/8  criterion regression gate — vs committed baseline (release)"
+step "6/9  criterion regression gate — vs committed baseline (release)"
 cargo run -q -p graphus-bench --release --bin bench_gate
 
-step "6/8  LDBC-SNB macro harness — tiny scale (release)"
+step "7/9  LDBC-SNB macro harness — tiny scale (release)"
 cargo run -q -p graphus-bench --release --bin ldbc_snb
 
 # The examples are the project's instrument for exposing regressions and resource inefficiencies in a
@@ -70,7 +86,7 @@ cargo run -q -p graphus-bench --release --bin ldbc_snb
 # evidence defects this gate now guards against (a failing example sitting unnoticed on `main`, reports
 # publishing fabricated zeros, a baseline gate comparing 0.0 to 0.0) survived precisely because nothing
 # executed the suite. It runs BOTH modes: self-boot, and attached to an already-running instance.
-step "7/8  examples suite — E2E, both modes (self-boot + attach to a running instance)"
+step "8/9  examples suite — E2E, both modes (self-boot + attach to a running instance)"
 scripts/examples-gate.sh
 
 # The official-driver interop suite is the ONLY test that proves the four inviolable wire claims (Bolt,
@@ -95,7 +111,7 @@ scripts/examples-gate.sh
 # indistinguishable from a gate that passes, which is the failure mode being closed; the prerequisites
 # are documented in VERIFICATION.md and in the suite's own module docs. Checking them HERE also means a
 # missing toolchain is reported at the gate, with a clear message, instead of deep inside a test helper.
-step "8/8  official Neo4j driver interop — real drivers over Bolt (needs node/npm, python3, go + network)"
+step "9/9  official Neo4j driver interop — real drivers over Bolt (needs node/npm, python3, go + network)"
 missing_interop_tools=""
 for tool in node npm python3 go; do
     command -v "$tool" >/dev/null 2>&1 || missing_interop_tools="$missing_interop_tools $tool"

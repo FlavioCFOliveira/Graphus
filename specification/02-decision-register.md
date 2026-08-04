@@ -12,7 +12,7 @@ and its status set to `ratified`.
 > **Status: all 24 decisions of the original 2026-06-05 round are ratified.** The chosen option is
 > recorded on each `Decision` node (`status: ratified`, property `chosen`). Twelve further decisions
 > were ratified after that round; they are recorded in the same index below, each carrying its own
-> ratification date. The register therefore holds **36 decisions** in total. The decision index in
+> ratification date. The register therefore holds **40 decisions** in total. The decision index in
 > the next section is the canonical enumeration; the options tables below it are kept for the
 > rationale and trade-offs, and are not a decision list.
 
@@ -74,6 +74,10 @@ Parse contract, to be preserved by any future edit:
 | `D-write-conflict-detection` | ratified | 2026-08-02 | **A write-write conflict is detected on the entity's own MVCC header and aborts the writer immediately, with no waiting** (the Memgraph `PrepareForWrite` model). The writer inspects the head of the entity's delta chain: if that head belongs to a transaction that is neither itself nor committed before its own start timestamp, it aborts at once with a retriable serialization failure. **The write-lock table and the wait-for-graph deadlock detector are retired**, and with them every lock wait and every lock-wait timeout. Design in `04-technical-design.md` §5.7. |
 | `D-multi-writer` | ratified | 2026-08-02 | **Graphus is multi-writer: N transactions write to the same database in parallel.** MVCC becomes the central and only concurrency-control mechanism, and the single-writer-thread engine model is retired. This supersedes the "keep the single-writer-thread engine model" facet of `D-read-parallelism` (rmp #146), whose read-side deferral was already discharged by the off-thread reader pool (rmp #336). Design in `04-technical-design.md` §5.7; the runtime shape that carries it is §9.1. |
 | `D-dst-writer-scheduler` | ratified | 2026-08-02 | **The DST simulator gains a deterministic writer scheduler, and it is a prerequisite of multi-writer certification.** Multi-writer correctness may not be signed off on non-deterministic evidence alone: the simulator must dispatch several concurrent writers against one database from a seeded schedule, so that any lost update, resurrection, or torn chain is reproducible from its seed. This extends the cooperative interleaver of `D-vopr` (`07-dst-simulator.md` §5) to the write path and narrows the named fidelity ceiling of `07-dst-simulator.md` §5.1. |
+| `D-property-write-conflict` | ratified | 2026-08-03 | **The write-write conflict check arrives with task #967, at entity granularity.** Before a property write links any delta, the writer reads the head of the entity's undo chain and aborts with a retriable serialization failure if that head belongs to another transaction that is still open. This makes `04-technical-design.md` §5.1.2 step 1 real at the granularity §5.7 already specifies — the entity's own MVCC state, not the property cell's. It is a prerequisite of the property migration rather than a consequence of it, because the in-place overwrite, the commit-ordering of the chain, and the exactness of the abort-time pre-image all depend on it. Task **#971** later consumes this check rather than replacing it. Refines `D-write-conflict-detection` by fixing when and at what granularity it lands; no ratified outcome changes. Design in `04-technical-design.md` §5.1.2 and §5.7. |
+| `D-property-removal` | ratified | 2026-08-03 | **`REMOVE n.p` (and `SET n.p = null`) rewrites the property cell in place to an empty cell — `type_tag = 0, value_inline = 0` — and is not an `xmax` tombstone.** The cell keeps its `in_use` bit and its position in the `first_prop` chain; the old value descends onto the entity's undo chain in a `SetProperty` delta. Two consequences are normative: **exactly one owner names any `strings.store` overflow chain** (the live cell owns the current value, a delta owns each historical value, and the two sets are disjoint), and a later `SET` of the same key reuses the empty cell with no allocation. `expired_ts` is never again written by a property operation, and `RecordStore::tombstone_props_for_key` is retired. Design in `04-technical-design.md` §5.1.5 row 1; format in `05-storage-format.md` §12.2. |
+| `D-property-visibility` | ratified | 2026-08-03 | **The undo chain is the sole visibility oracle for a property's value.** The property cell's own `created_ts` becomes informative rather than authoritative: a reader resolves which value it is entitled to see by starting from the in-place image and walking the entity's undo chain, never by comparing the cell's stamp. The cell's MVCC header keeps its structural meaning — `in_use` for slot occupancy and corpse threading. The ground is that the frozen 56-byte delta of `05-storage-format.md` §12.2 has no field for the old `created_ts`, so no logical undo can ever restore it, and under this decision none needs to. This is what allows task **#970** to be a rollback change only, with no second rewrite of the read path. Design in `04-technical-design.md` §5.6. |
+| `D-retired-mechanism-tests` | ratified | 2026-08-03 | **When a task retires a mechanism, an acceptance criterion of the form "all existing tests stay green" is read as "every semantic those tests protected remains asserted by a test that fails if the semantic breaks".** Each retired mechanism test must be replaced by a named semantic-equivalent that is at least as strong, and the replacement must be listed in the task's closure summary. A general rule of the project's testing obligations, not a #967-only one. Specified in `04-technical-design.md` §11.6. |
 
 <!-- END decision-index -->
 
@@ -327,7 +331,7 @@ scope and are propagated into `00-overview.md` and `01-needs-survey.md`:
 > | --- | --- |
 > | `undo_ptr` is dead. The field is reserved in every node, relationship and property record and is **never written non-zero in production**, so no version chain exists. | `crates/graphus-storage/src/record.rs:74` (`MvccHeader::live` always sets `undo_ptr: 0`); `crates/graphus-storage/src/check.rs:1196-1199`, which states in the consistency checker's own documentation that "the per-value version chain is a documented follow-up, so today `undo_ptr` is always `0`". 8 bytes per record are reserved and unused. |
 > | The transaction manager was written against a **placeholder** store because the representation was an open spike. | `crates/graphus-txn/src/store.rs:6-8` and `:27-31`: "the real `graphus_storage` does not yet implement version-chain mechanics" and wiring it up "is a follow-up task, intentionally **out of scope** here". |
-> | Property updates are a tombstone plus a chain prepend, and the tombstone pass walks the whole chain. Measured cost is **O(M²)** in the number of properties set on one entity. | The chain walk is `RecordStore::tombstone_props_for_key`, `crates/graphus-storage/src/store.rs:5646-5666`. Measured: **15.1 µs/op at M = 1000** and **97.8 µs/op at M = 8000**. |
+> | Property updates are a tombstone plus a chain prepend, and the tombstone pass walks the whole chain. Measured cost is **O(M²)** in the number of properties set on one entity. | The chain walk is `RecordStore::tombstone_props_for_key`, `crates/graphus-storage/src/store.rs:6710-6753`. Measured: **15.1 µs/op at M = 1000** and **97.8 µs/op at M = 8000**. |
 > | Labels are a bitmap **mutated in place**, whose version history exists **only in memory** and is therefore not durable and not recoverable. | `crates/graphus-storage/src/label_history.rs:143` (`pub struct LabelHistory`), an in-process structure shared by `Arc` between the engine thread and the reader pool. |
 > | Chain heads and the label word are undone by an **ad-hoc compare-and-set**, one bespoke mechanism per field, because a whole-record pre-image undo would revert words a concurrently-committed writer legitimately owns. | `crates/graphus-storage/src/record.rs:114-123`; `crates/graphus-storage/src/store.rs:2507` (`write_chain_head`) and `:2541` (the label word). |
 > | Rollback is **physical ARIES undo**: it reverts bytes. This is the origin of the recurring defect family rmp #220 / #172 / #239 / #301 / #578 / #772 — every one of them a case of one transaction's byte-level undo damaging another's committed state. | `RecordStore::rollback`, `crates/graphus-storage/src/store.rs:3644`. |
@@ -358,6 +362,48 @@ scope and are propagated into `00-overview.md` and `01-needs-survey.md`:
 > **doublewrite buffer stays**, with group staging (rmp #993/#994), and §4.5 is unchanged. They do not
 > alter the SSI algebra of §5.4 or the read polarities of §5.3. They resolve exactly one open spike,
 > `04-technical-design.md` §12 item 2.
+
+## Ratified decision (2026-08-03) — the property path on the undo chain
+
+> **Four decisions, ratified together on 2026-08-03, settle how properties move onto the undo chain
+> in task #967.** They refine the 2026-08-02 round rather than replacing any part of it:
+> `D-version-representation`, `D-write-conflict-detection`, `D-multi-writer` and
+> `D-dst-writer-scheduler` are unchanged, and every one of the four inviolable requirements of
+> `CLAUDE.md` stands as written. No byte of the frozen undo-area format
+> (`05-storage-format.md` §12) changes.
+>
+> **Status: ratified (all four).**
+>
+> **Why now.** Task #966 built the undo area and brought `undo_ptr` to life. Task #967 is the first
+> task to put a *value* on the chain, and a design pass over the code established that three
+> questions had to be answered before the property path could be written down without ambiguity:
+> when the conflict check arrives and at what granularity; what a property removal physically is;
+> and which stamp decides what a reader may see. The fourth decision generalizes a testing
+> obligation the same pass surfaced.
+>
+> | Decision | Ratified choice | Grounding |
+> | --- | --- | --- |
+> | **`D-property-write-conflict`** | **The conflict check arrives with #967, at entity granularity.** Before a property write links any delta, the writer reads the head of the entity's undo chain and aborts with a retriable serialization failure if that head belongs to another transaction that is still open. | Memgraph's `PrepareForWrite` (Source, read 2026-08-03: `/data/refsrc/memgraph/src/storage/v2/mvcc.hpp:112-137`), which every mutating accessor calls first — the property path at `vertex_accessor.cpp:425`, immediately before the delta link at `:450` and the in-place mutation at `:451`. In Graphus the Cypher seam **already imposes exactly this rule**, keyed on the node id: `RecordGraph::set_node_property` calls `note_write(node_ssi_key(node.0))` (`crates/graphus-cypher/src/record_graph.rs:5893`), and `note_write` (`:506`) surfaces a "write-write conflict … retry (serialization failure)" on a conflicting holder. So the coordinated path's behaviour does not change; what becomes newly constrained is the direct `RecordStore` callers. |
+> | **`D-property-removal`** | **An empty cell in place (`type_tag = 0, value_inline = 0`), not an `xmax` tombstone.** The cell keeps its `in_use` bit and its place in the `first_prop` chain; the old value descends onto the chain in a `SetProperty` delta. | Memgraph represents removal as a `SetProperty` whose **new** value is an empty `PropertyValue`: `PropertyStore::SetProperty` (`/data/refsrc/memgraph/src/storage/v2/property_store.cpp:2829`) erases the property when `value.IsNull()` (`:2831`, `:2841`), while the delta written at `vertex_accessor.cpp:450` carries the **old** value. There is no separate removal action and no tombstone. |
+> | **`D-property-visibility`** | **The undo chain is the sole visibility oracle for a property's value.** The cell's `created_ts` becomes informative; the cell's MVCC header keeps only its structural meaning (`in_use` for slot occupancy and corpse threading). | The frozen 56-byte delta (`05-storage-format.md` §12.2) has **no field for the old `created_ts`** — its `SetProperty` payload is `token`, `type_tag` and `value_inline` and nothing else. A logical undo therefore cannot restore that stamp, so it must not be load-bearing. Under this decision none needs to be. |
+> | **`D-retired-mechanism-tests`** | **"All existing tests stay green" is read as "every semantic those tests protected remains asserted by a test that fails if the semantic breaks".** Each retired mechanism test is replaced by a named semantic-equivalent that is at least as strong, listed in the task's closure summary. | The project's own record of the defect class in which a test passes — or simply never runs — while the feature is broken: `VERIFICATION.md` gate 11 documents how `rmp` #960 stayed hidden because the only suite that would have caught it was never enabled, so "every gate that *does* run stayed green, start to finish". Deleting a mechanism's tests along with the mechanism reproduces that outcome by a different route. |
+>
+> **The consequences that are normative.**
+>
+> - **Exactly one owner names any `strings.store` overflow chain.** The live cell owns the current
+>   value; a delta owns each historical value; the two sets are disjoint. This is what makes the
+>   empty-cell representation safe to reclaim.
+> - **A later `SET` of the same key reuses the empty cell**, with no allocation.
+> - **`expired_ts` is never again written by a property operation**, and
+>   `RecordStore::tombstone_props_for_key`
+>   (`crates/graphus-storage/src/store.rs:6710-6753`) is retired.
+> - **Task #970 is a rollback change only.** Because the chain is already the oracle, logical
+>   rollback does not require a second rewrite of the read path.
+>
+> **Where this is specified.** The conflict check is `04-technical-design.md` §5.1.2 step 1 and
+> §5.7; the empty-cell representation and the retirement of the tombstone pass are §5.1.5 row 1; the
+> visibility oracle is §5.6; the testing rule is §11.6. The `type_tag == 0` clarification to the
+> frozen delta table is `05-storage-format.md` §12.2 — prose filling a gap, not an amendment.
 
 ## TCK target (pinned — closes `D-cypher-line` open question 1)
 

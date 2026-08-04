@@ -87,17 +87,37 @@ fn node_shape_bytes<D: BlockDevice, S: LogSink>(store: &mut RecordStore<D, S>, i
         .collect();
     labels.sort();
 
-    // Newest-wins per key (the property chain is prepend-ordered), then sorted by key.
+    // The node's CURRENT properties, sorted by key.
+    //
+    // POLARITY — CURRENT IMAGE (`rmp` #967). A content hash is a fingerprint of the graph's *logical
+    // contents*, so it must fold the value each key holds NOW and nothing else. Since #967 an
+    // overwrite is written in place and the superseded value descends onto the node's undo chain, so
+    // the decoded superset (`superset_scan_node_property_values`) yields the historical values too —
+    // and, worse for a newest-wins fold, `candidates()` drops the EMPTY cell a `REMOVE` leaves behind,
+    // which would make the key's first surviving candidate a value the graph no longer has. The live
+    // cells are exactly the current image.
     let mut by_key: BTreeMap<String, String> = BTreeMap::new();
     let mut seen: HashSet<u32> = HashSet::new();
-    for (_pid, key_token, value) in store.superset_scan_node_property_values(id).expect("props") {
-        if seen.insert(key_token) && !is_empty_value(&value) {
-            let key = store
-                .token_name(Namespace::PropKey, key_token)
-                .unwrap()
-                .to_owned();
-            by_key.insert(key, value_repr(&value));
+    let cells = store
+        .superset_scan_node_properties(id)
+        .expect("props")
+        .cells_ignoring_history()
+        .to_vec();
+    for (_pid, cell) in cells {
+        if cell.type_tag == graphus_storage::undo::TYPE_TAG_ABSENT || !seen.insert(cell.key) {
+            continue;
         }
+        let value = store
+            .decode_property_value(cell.type_tag, cell.value_inline)
+            .expect("decode property");
+        if is_empty_value(&value) {
+            continue;
+        }
+        let key = store
+            .token_name(Namespace::PropKey, cell.key)
+            .unwrap()
+            .to_owned();
+        by_key.insert(key, value_repr(&value));
     }
 
     let mut buf = String::with_capacity(64);
@@ -166,19 +186,30 @@ pub fn content_hash<D: BlockDevice, S: LogSink>(store: &mut RecordStore<D, S>) -
         let start_shape = node_shape_bytes(store, rec.start_node);
         let end_shape = node_shape_bytes(store, rec.end_node);
 
+        // The relationship's CURRENT properties — the same current-image polarity, and the same
+        // reason, as `node_shape_bytes` above (`rmp` #967).
         let mut by_key: BTreeMap<String, String> = BTreeMap::new();
         let mut seen: HashSet<u32> = HashSet::new();
-        for (_pid, key_token, value) in store
-            .superset_scan_rel_property_values(*id)
+        let cells = store
+            .superset_scan_rel_properties(*id)
             .expect("rel props")
-        {
-            if seen.insert(key_token) && !is_empty_value(&value) {
-                let key = store
-                    .token_name(Namespace::PropKey, key_token)
-                    .unwrap()
-                    .to_owned();
-                by_key.insert(key, value_repr(&value));
+            .cells_ignoring_history()
+            .to_vec();
+        for (_pid, cell) in cells {
+            if cell.type_tag == graphus_storage::undo::TYPE_TAG_ABSENT || !seen.insert(cell.key) {
+                continue;
             }
+            let value = store
+                .decode_property_value(cell.type_tag, cell.value_inline)
+                .expect("decode rel property");
+            if is_empty_value(&value) {
+                continue;
+            }
+            let key = store
+                .token_name(Namespace::PropKey, cell.key)
+                .unwrap()
+                .to_owned();
+            by_key.insert(key, value_repr(&value));
         }
 
         let mut h = Fnv128::new();

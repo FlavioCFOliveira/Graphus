@@ -552,9 +552,12 @@ fn recovered_contains_sentinel(
 ) -> bool {
     for node in store.scan_node_ids().unwrap_or_default() {
         if let Ok(props) = store.superset_scan_node_properties(node) {
-            for (_pid, pr) in props.every_version() {
+            // `rmp` #967: EVERY candidate — the live cells and the entity's undo history. A
+            // sentinel written by a transaction that was later overwritten lives on the chain, not
+            // in a cell, and this predicate asks "did this sentinel survive recovery at all?".
+            for c in props.candidates() {
                 if let Ok(Value::Integer(v)) =
-                    graphus_storage::propenc::decode_inline(pr.type_tag, pr.value_inline)
+                    graphus_storage::propenc::decode_inline(c.type_tag, c.value_inline)
                     && v == sentinel
                 {
                     return true;

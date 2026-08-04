@@ -27,12 +27,13 @@
 //!   at rebuild (a node with no such value contributes no row);
 //! - `values` — the column of [`Value`]s, stored **graphus-columnar-encoded** (dictionary for
 //!   strings, integer FOR/Delta for integers; raw otherwise) and decoded back exactly on demand;
-//! - `prop_pids` — the physical id of the [`PropRecord`](graphus_storage::record::PropRecord) each
-//!   value came from, and
-//! - `node_first_props` — the node record's `first_prop` chain-head pointer at rebuild.
+//! - `witnesses` — one [`ColumnWitness`] per row: the physical id of the
+//!   [`PropRecord`](graphus_storage::record::PropRecord) the value came from, the exact
+//!   `(type_tag, value_inline, created_ts)` that cell held at rebuild, and the node record's
+//!   `first_prop` chain-head pointer at rebuild.
 //!
-//! The last two are the **staleness witnesses** that make the read-time re-check both cheap (O(1) per
-//! node, no property-chain walk) and provably correct — see [`ColumnSnapshot`].
+//! The witnesses are what make the read-time re-check both cheap (O(1) per node, no property-chain
+//! walk) and provably correct — see [`ColumnWitness`].
 //!
 //! ## The win
 //!
@@ -58,17 +59,9 @@ struct Column {
     ids: Vec<u64>,
     /// The graphus-columnar-encoded value column (see [`ColumnEncoding`]).
     encoded: ColumnEncoding,
-    /// `prop_pids[i]` is the physical id of the [`PropRecord`](graphus_storage::record::PropRecord)
-    /// that supplied `ids[i]`'s value at rebuild. Re-read O(1) at query time to detect a tombstone
-    /// (`REMOVE n.p`, which stamps `xmax` in place without moving the chain head).
-    prop_pids: Vec<u64>,
-    /// `node_first_props[i]` is `ids[i]`'s node record `first_prop` chain-head pointer at rebuild.
-    /// Any property write to the node (`SET`/overwrite/add, or a concurrent uncommitted prepend)
-    /// changes `first_prop`, so an unchanged value proves no prepend happened since rebuild — the
-    /// cached `PropRecord` is therefore still the newest version of its key (no overwrite went
-    /// unseen). The one mutation `first_prop` does **not** catch (an in-place tombstone) is caught by
-    /// the `prop_pids` visibility re-check, so the two witnesses together are exact.
-    node_first_props: Vec<u64>,
+    /// `witnesses[i]` is the staleness witness captured for `ids[i]` at rebuild. See
+    /// [`ColumnWitness`] for what each field proves and why the set is exactly sufficient.
+    witnesses: Vec<ColumnWitness>,
     /// This column's **build generation** (`rmp` task #375), assigned by the cache from a monotonic
     /// counter the instant the column is installed by [`set_column`](ColumnCache::set_column). A
     /// column is **immutable after build** — the only mutations the cache exposes are *replacing* a
@@ -125,26 +118,23 @@ enum ColumnEncoding {
 }
 
 impl Column {
-    /// Builds an encoded column from the captured `(id, value, prop_pid, node_first_prop)` rows,
-    /// choosing the codec that fits the column's value shape. The four arrays stay index-aligned.
-    /// `generation` is the cache-assigned build stamp (`rmp` task #375).
-    fn build(rows: Vec<(u64, Value, u64, u64)>, generation: u64) -> Self {
+    /// Builds an encoded column from the captured [`ColumnRow`]s, choosing the codec that fits the
+    /// column's value shape. The three arrays stay index-aligned. `generation` is the cache-assigned
+    /// build stamp (`rmp` task #375).
+    fn build(rows: Vec<ColumnRow>, generation: u64) -> Self {
         let mut ids = Vec::with_capacity(rows.len());
         let mut values = Vec::with_capacity(rows.len());
-        let mut prop_pids = Vec::with_capacity(rows.len());
-        let mut node_first_props = Vec::with_capacity(rows.len());
-        for (id, value, pid, first_prop) in rows {
-            ids.push(id);
-            values.push(value);
-            prop_pids.push(pid);
-            node_first_props.push(first_prop);
+        let mut witnesses = Vec::with_capacity(rows.len());
+        for row in rows {
+            ids.push(row.node_id);
+            values.push(row.value);
+            witnesses.push(row.witness);
         }
         let encoded = encode_column(&values);
         Self {
             ids,
             encoded,
-            prop_pids,
-            node_first_props,
+            witnesses,
             generation,
             decoded: std::cell::RefCell::new(None),
             index_map: std::cell::RefCell::new(None),
@@ -265,10 +255,10 @@ fn encode_column(values: &[Value]) -> ColumnEncoding {
 /// An immutable, point-in-time **snapshot of one declared column**, handed to the read path so the
 /// columnar scan needs no borrow of the live cache while it re-validates against the store.
 ///
-/// Each entry is `(node_id, value, witness)` where `witness = ColumnWitness { prop_pid,
-/// node_first_prop }`. The read path ([`crate::record_graph`]) walks these, and for each one performs
-/// the O(1) re-check that decides whether the cached value is still the node's exact snapshot-visible
-/// value — see [`ColumnWitness`] for the soundness argument.
+/// Each entry is a `(node_id, value, [`ColumnWitness`])` triple, held in three index-aligned arrays.
+/// The read path ([`crate::record_graph`]) walks these, and for each one performs the O(1) re-check
+/// that decides whether the cached value is still the node's exact snapshot-visible value — see
+/// [`ColumnWitness`] for the soundness argument.
 pub struct ColumnSnapshot {
     /// The dense node ids, ascending.
     pub ids: Vec<u64>,
@@ -299,34 +289,78 @@ impl ColumnSnapshot {
     }
 }
 
-/// The two staleness witnesses captured for one cached `(node, value)` row (`rmp` #329).
+/// The staleness witnesses captured for one cached `(node, value)` row (`rmp` #329, extended by
+/// `rmp` #967).
 ///
-/// # Why these two words are exactly sufficient
+/// # Why this set is exactly sufficient
 ///
-/// The read path holds these from the rebuild snapshot and re-reads the node's *current* records:
+/// The read path holds these from the rebuild snapshot and re-reads the node's *current* records.
+/// The cached value may be served only when **all** of the following hold, which together say "the
+/// cell this value came from is byte-for-byte the cell we captured, it is still the node's cell for
+/// this key, and this snapshot sees it":
 ///
-/// * **`node_first_prop`** is the node record's property-chain head. Every property mutation that
-///   *adds a version* — a fresh property, an overwrite (`SET n.p = x` prepends a new
-///   [`PropRecord`](graphus_storage::record::PropRecord)), or a concurrent uncommitted prepend —
-///   changes `first_prop`. So `current.first_prop == node_first_prop` proves **no prepend** has
-///   happened since rebuild ⇒ the cached `PropRecord` is still the **newest** version of its key (no
-///   overwrite slipped past, newest-visible-wins is preserved).
-/// * **`prop_pid`** is the physical id of the cached value's `PropRecord`. Re-reading it and checking
-///   it is still **visible** to the query snapshot catches the one mutation `first_prop` does *not*:
-///   an in-place **tombstone** (`REMOVE n.p` / `SET n.p = null` stamps `xmax` on the record without
-///   moving the chain head). A tombstoned record fails the visibility test ⇒ fallback.
+/// * **`node_first_prop`** is the node record's property-chain head. A property *addition* links a
+///   new cell, which changes `first_prop`, so `current.first_prop == node_first_prop` proves no key
+///   was added to the node since rebuild.
+/// * **`prop_pid`** is the physical id of the cached value's `PropRecord`; re-reading it and checking
+///   its `key` proves the slot still belongs to the key this column caches (and has not been
+///   reclaimed and re-handed to another).
+/// * **`type_tag` + `value_inline`** are the exact bytes that cell held at rebuild. **This is the
+///   witness `rmp` #967 made load-bearing.** Before #967 an overwrite *prepended* a new
+///   [`PropRecord`](graphus_storage::record::PropRecord) and a removal *tombstoned* in place, so
+///   `first_prop` caught the first and the visibility probe caught the second. After #967
+///   (`D-property-removal`) an overwrite rewrites the cell **in place** and a removal empties it in
+///   place: `first_prop` does not move and no `xmax` is stamped, so **both of the pre-#967 witnesses
+///   survive an overwrite** and the cache would serve the pre-overwrite value — a wrong query answer.
+///   Requiring the re-read cell's `(type_tag, value_inline)` to be byte-identical is what detects it:
+///   an overwrite changes the pair, and a removal changes `type_tag` to
+///   [`TYPE_TAG_ABSENT`](graphus_storage::undo::TYPE_TAG_ABSENT).
+/// * the re-read cell must still be **visible** to the query snapshot. Because every write restamps
+///   `created_ts` in place, this is what stops a reader *older* than the last write from being served
+///   the current value: that write's stamp is not visible to it, so it falls back and reconstructs
+///   the older version off the undo chain.
+/// * **`created_ts`** is that cell's creating stamp at rebuild. Stated honestly, so that a future
+///   reader does not mistake which control carries the weight: **this one is defence in depth, not
+///   the fix.** Byte-equality plus the visibility test above already decide every case — a write that
+///   leaves the bytes unchanged leaves the correct answer unchanged too, and a write that changes
+///   them is caught by the bytes. `created_ts` is kept because it is one word, it makes the witness a
+///   complete image of the cell rather than a chosen projection of it, and it fails *closed* (an
+///   extra decline costs one property read, never a wrong row). It must not be relied on as the
+///   detector: it does **not** move when one transaction overwrites the same key twice, which is
+///   exactly the shape
+///   `columnar_analytical.rs::an_in_place_overwrite_makes_the_cached_entry_decline` pins — that test
+///   fails with the byte check removed and passes with only `created_ts`, which is how this ordering
+///   was established rather than assumed.
 ///
-/// Together they are exact: the cached value is the node's snapshot-visible newest value **iff** the
-/// node is visible, `first_prop` is unchanged, and the cached `PropRecord` is the same key and still
-/// visible. Any divergence (a mutation, a concurrent writer, a reused slot) makes the re-check fail
-/// and the caller falls back to the authoritative [`read_node_prop_one`](crate::record_graph) — which
-/// is always correct, so the cache is a pure accelerator that can never return a wrong row.
-#[derive(Debug, Clone, Copy)]
+/// Any divergence (a mutation, a concurrent writer, a reused slot) makes the re-check fail and the
+/// caller falls back to the authoritative [`read_node_prop_one`](crate::record_graph) — which is
+/// always correct, so the cache stays a pure accelerator that can never return a wrong row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ColumnWitness {
-    /// Physical id of the cached value's `PropRecord` (re-read O(1) to detect a tombstone).
+    /// Physical id of the cached value's `PropRecord` (re-read O(1)).
     pub prop_pid: u64,
-    /// The node record `first_prop` chain head at rebuild (compared O(1) to detect any prepend).
+    /// The node record `first_prop` chain head at rebuild (compared O(1) to detect an added key).
     pub node_first_prop: u64,
+    /// The value class + inline/overflow discriminant that cell held at rebuild (`rmp` #967).
+    pub type_tag: u8,
+    /// The inline value, or the overflow-chain head id, that cell held at rebuild (`rmp` #967).
+    pub value_inline: u64,
+    /// The cell's `created_ts` at rebuild — restamped in place by every write (`rmp` #967).
+    pub created_ts: u64,
+}
+
+/// One captured row of a declared column: the node, its value, and the witnesses that decide at read
+/// time whether the value is still fresh (`rmp` #329 / #967).
+///
+/// A named struct rather than a tuple because the witness grew past the point where positional
+/// arguments could be checked by eye — a swapped `type_tag`/`value_inline` pair would compile.
+pub struct ColumnRow {
+    /// The node the value belongs to.
+    pub node_id: u64,
+    /// The value captured at rebuild.
+    pub value: Value,
+    /// The staleness witness captured alongside it.
+    pub witness: ColumnWitness,
 }
 
 /// A derived, in-memory columnar value cache over declared `(label_token, prop_key)` columns
@@ -429,14 +463,9 @@ impl ColumnCache {
     }
 
     /// Installs the captured rows for `(label_token, prop_key)` (called by the coordinator's rebuild
-    /// with the freshly-scanned column). Rows are `(node_id, value, prop_pid, node_first_prop)` in
-    /// node-id order. A no-op-but-stored empty column is fine (it simply yields no rows).
-    pub fn set_column(
-        &mut self,
-        label_token: u32,
-        prop_key: u32,
-        rows: Vec<(u64, Value, u64, u64)>,
-    ) {
+    /// with the freshly-scanned column), in node-id order. A no-op-but-stored empty column is fine
+    /// (it simply yields no rows).
+    pub fn set_column(&mut self, label_token: u32, prop_key: u32, rows: Vec<ColumnRow>) {
         // A fresh generation per installed column (`rmp` task #375): replacing the column with
         // freshly-captured rows changes its contents, so any reader's cached decode keyed on the old
         // generation is now stale and must rebuild. The new `Column` starts with an empty decode cell.
@@ -483,15 +512,7 @@ impl ColumnCache {
         if was_cached {
             self.decode_cache_hits.set(self.decode_cache_hits.get() + 1);
         }
-        let witnesses = col
-            .prop_pids
-            .iter()
-            .zip(&col.node_first_props)
-            .map(|(&prop_pid, &node_first_prop)| ColumnWitness {
-                prop_pid,
-                node_first_prop,
-            })
-            .collect();
+        let witnesses = col.witnesses.clone();
         Some(ColumnSnapshot {
             ids: col.ids.clone(),
             decoded,
@@ -565,12 +586,23 @@ impl ColumnCache {
 mod tests {
     use super::*;
 
-    fn rows(items: &[(u64, Value)]) -> Vec<(u64, Value, u64, u64)> {
-        // Synthetic witnesses (pid = id*10, first_prop = id*100) — the cache treats them opaquely;
-        // the real witnesses come from the store at rebuild. Here we only test capture + exact decode.
+    fn rows(items: &[(u64, Value)]) -> Vec<ColumnRow> {
+        // Synthetic witnesses (pid = id*10, first_prop = id*100, and a distinct cell image per id) —
+        // the cache treats them opaquely; the real witnesses come from the store at rebuild. Here we
+        // only test capture + exact decode.
         items
             .iter()
-            .map(|(id, v)| (*id, v.clone(), id * 10, id * 100))
+            .map(|(id, v)| ColumnRow {
+                node_id: *id,
+                value: v.clone(),
+                witness: ColumnWitness {
+                    prop_pid: id * 10,
+                    node_first_prop: id * 100,
+                    type_tag: 1,
+                    value_inline: id * 1000,
+                    created_ts: id * 7,
+                },
+            })
             .collect()
     }
 
@@ -595,6 +627,11 @@ mod tests {
         // Witnesses index-aligned and preserved.
         assert_eq!(snap.witnesses[1].prop_pid, 20);
         assert_eq!(snap.witnesses[1].node_first_prop, 200);
+        // The `rmp` #967 half of the witness survives capture too: without it an in-place overwrite
+        // leaves both of the pre-#967 witnesses intact and the cache serves the pre-overwrite value.
+        assert_eq!(snap.witnesses[1].type_tag, 1);
+        assert_eq!(snap.witnesses[1].value_inline, 2000);
+        assert_eq!(snap.witnesses[1].created_ts, 14);
     }
 
     #[test]

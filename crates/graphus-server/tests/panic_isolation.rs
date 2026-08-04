@@ -127,7 +127,7 @@ fn engine(reader_threads: usize) -> Engine {
 fn run_collect(handle: &EngineHandle, mode: AccessMode, stmt: &str) -> Result<Option<i64>, ()> {
     let ticket = handle.begin_auto_commit_blocking(mode).map_err(|_| ())?;
     let mut reply = handle
-        .run_blocking(ticket, stmt.to_owned(), vec![], true, None)
+        .run_blocking(ticket, stmt.to_owned(), vec![], true, None, None)
         .map_err(|_| ())?;
     let mut first: Option<i64> = None;
     loop {
@@ -204,7 +204,7 @@ fn run_reply_err(handle: &EngineHandle, mode: AccessMode, stmt: &str) -> Result<
         .begin_auto_commit_blocking(mode)
         .map_err(|e| e.to_string())?;
     handle
-        .run_blocking(ticket, stmt.to_owned(), vec![], true, None)
+        .run_blocking(ticket, stmt.to_owned(), vec![], true, None, None)
         .map(|_| ())
         .map_err(|e| e.to_string())
 }

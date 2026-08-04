@@ -123,7 +123,7 @@ async fn run_write(handle: &EngineHandle, query: &str) -> Result<Vec<Vec<Value>>
         .await
         .map_err(|e| e.to_string())?;
     let reply = handle
-        .run(ticket, query.to_owned(), Vec::new(), true, None)
+        .run(ticket, query.to_owned(), Vec::new(), true, None, None)
         .await
         .map_err(|e| e.to_string())?;
     tokio::task::spawn_blocking(move || {

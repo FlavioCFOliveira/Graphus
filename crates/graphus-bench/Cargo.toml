@@ -11,6 +11,13 @@ description = "Criterion micro-benchmarks and LDBC SNB macro harness for Graphus
 # `benches/common.rs` (included by each target via `#[path]`) is not itself built as a bench target.
 autobenches = false
 
+[features]
+# Forwards `graphus-storage`'s record-read counters to the `prop_overwrite` bench, which reports the
+# `props.store` reads one visible-property read performs (`rmp` #967, acceptance criterion 2). OFF by
+# default so the bench's timing columns measure the uninstrumented production read path; see
+# `graphus-storage/src/read_probe.rs` for what the counter costs when it is on.
+read-probe = ["graphus-storage/read-probe"]
+
 [dependencies]
 graphus-core = { path = "../graphus-core" }
 # The LDBC-SNB macro harness (`src/ldbc/`) and its `ldbc_snb` binary drive the real engine end to
@@ -62,4 +69,14 @@ harness = false
 
 [[bench]]
 name = "read_path"
+harness = false
+
+# Same-key property overwrite cost vs chain length (`rmp` #967, acceptance criterion 1): the
+# instrument that decides whether replacing tombstone-and-prepend with the undo-delta chain removed
+# the O(M^2). Not a Criterion bench — its cost depends on accumulated state, so Criterion's
+# repeated-iteration model does not apply, and it reports a table with derived growth ratios plus a
+# record-read count (same reasoning as `graphus-storage`'s `eviction_convoy`). Hence no default harness.
+#   cargo bench -p graphus-bench --bench prop_overwrite [--features read-probe]
+[[bench]]
+name = "prop_overwrite"
 harness = false

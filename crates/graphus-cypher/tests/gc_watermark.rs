@@ -182,11 +182,21 @@ fn coordinator_gc_preserves_an_open_readers_version() {
     // Run a coordinator GC pass: it derives the watermark from R's snapshot, so it cannot reclaim the
     // old version R still needs. (It freezes committed headers — `frozen` may be > 0 — but reclaims
     // nothing protected by R.)
+    // `rmp` #967 moved WHERE the superseded value lives, not whether the reader protects it. Before
+    // #967 the overwrite prepended a record and tombstoned the old one, so the protected version was a
+    // dead `props.store` record and `GcPassReport::reclaimed` counted it. After #967 the overwrite is
+    // written IN PLACE and the old value descends onto the node's undo chain, so it is an
+    // `undo.store` delta — reported separately (`rmp` #966) so that `reclaimed` keeps its
+    // "live-record versions" meaning. Both halves of this test therefore assert on the TOTAL
+    // reclamation work; asserting on `reclaimed` alone would make the "protects" half trivially true
+    // and the "becomes reclaimable" half impossible.
     let report = coord.gc().expect("coordinator gc pass");
     assert_eq!(
-        report.reclaimed, 0,
-        "the open reader R protects the old version from reclamation: reclaimed = {}",
-        report.reclaimed
+        report.reclaimed + report.undo_deltas_reclaimed,
+        0,
+        "the open reader R protects the old version from reclamation: records = {}, undo deltas = {}",
+        report.reclaimed,
+        report.undo_deltas_reclaimed
     );
 
     // R, still open, still reads its snapshot's value — no lost version (the ACID guarantee).
@@ -206,9 +216,11 @@ fn coordinator_gc_preserves_an_open_readers_version() {
     );
     let report2 = coord.gc().expect("second gc pass");
     assert!(
-        report2.reclaimed >= 1,
-        "with no open reader the old tombstoned version becomes reclaimable: reclaimed = {}",
-        report2.reclaimed
+        report2.reclaimed + report2.undo_deltas_reclaimed >= 1,
+        "with no open reader the superseded version R was protecting becomes reclaimable: \
+         records = {}, undo deltas = {}",
+        report2.reclaimed,
+        report2.undo_deltas_reclaimed
     );
 
     // A fresh reader sees the surviving current value v = 2.

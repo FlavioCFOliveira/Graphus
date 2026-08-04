@@ -59,13 +59,24 @@ fn decided_properties_is_constructed_in_exactly_one_place() {
         .nth(1)
         .expect("`SupersetProperties::decide` must exist: it is the only way in");
     assert!(
-        decide.starts_with("self, snapshot: Snapshot, registry: &CommitRegistry)"),
-        "`decide` must take the snapshot and the commit registry it narrows against",
+        decide.starts_with("self, snapshot: Snapshot)"),
+        "`decide` must take the snapshot it narrows against — and, since `rmp` #967, ONLY that: \
+         `D-property-visibility` makes the undo chain the sole visibility oracle for a property \
+         value, so a `&CommitRegistry` parameter here would be a second oracle inviting exactly the \
+         divergence the single-oracle rule exists to prevent",
     );
     let decide_body = &decide[..decide.find("\n    }").unwrap_or(decide.len())];
     assert!(
-        decide_body.contains("is_visible("),
-        "`decide` must narrow through the production `is_visible` predicate, not a local re-derivation",
+        decide_body.contains("delta_verdict("),
+        "`decide` must narrow through the shared `delta_verdict` predicate — the SAME one the \
+         early-stopping walk in `read_view` applies — not a local re-derivation, so the two \
+         reconstruction paths cannot disagree about the answer",
+    );
+    assert!(
+        !decide_body.contains("is_visible("),
+        "`decide` must NOT consult the retired per-cell oracle: after `rmp` #967 a property cell's \
+         own `created_ts`/`expired_ts` decides nothing, and reading it back in would resurrect the \
+         very mechanism `D-property-visibility` retired",
     );
 }
 
@@ -101,7 +112,7 @@ fn every_producer_of_a_decided_view_takes_a_snapshot() {
 
 /// The superset view does not silently become a sequence: nothing may iterate, index or deref it into
 /// the raw records without naming the polarity. This is what forces a would-be `rmp` #902 author to
-/// write `every_version()` — a name that states what the slice contains — instead of walking a `Vec`
+/// write `candidates()` — a name that states what the sequence contains — instead of walking a `Vec`
 /// that looks like the entity's properties.
 #[test]
 fn the_superset_view_is_not_a_transparent_sequence() {
@@ -113,9 +124,9 @@ fn the_superset_view_is_not_a_transparent_sequence() {
     ] {
         assert!(
             !SCAN_POLARITY.contains(forbidden),
-            "`SupersetProperties` must not implement `{forbidden}`: reaching the raw records has to \
-             go through `every_version()` / `into_every_version()`, whose names say that MVCC \
-             tombstones and uncommitted versions are included (`rmp` task #905)",
+            "`SupersetProperties` must not implement `{forbidden}`: reaching the values has to go \
+             through `candidates()`, whose name says these are candidates to be re-checked rather \
+             than rows (`rmp` tasks #905, #967)",
         );
     }
 }
@@ -160,12 +171,18 @@ fn the_two_polarities_answer_differently_over_the_same_chain() {
         .superset_scan_node_properties(node)
         .expect("the superset read");
     assert!(
-        superset
-            .every_version()
+        superset.candidates().any(|c| c.key == key),
+        "the superset must still carry the removed value: after `rmp` #967 it lives on the node's \
+         undo chain, which is not reclaimed until GC runs — and GC has no automatic trigger \
+         (`rmp` #305)",
+    );
+    assert!(
+        !superset
+            .cells_ignoring_history()
             .iter()
-            .any(|(_pid, prop)| prop.key == key),
-        "the superset must still carry the removed version: its slot is not reclaimed until GC runs, \
-         and GC has no automatic trigger (`rmp` #305)",
+            .any(|(_pid, cell)| cell.key == key && cell.type_tag != 0),
+        "and the cell alone does NOT carry it: the removal emptied the cell in place, which is \
+         exactly why a population path that reads only the cells loses the candidate (`rmp` #967)",
     );
 
     let decided: DecidedProperties = store
@@ -180,6 +197,8 @@ fn the_two_polarities_answer_differently_over_the_same_chain() {
 
     // And the same superset, narrowed by hand, gives the same answer: `decision_scan_*` is the
     // convenience, `decide` is the barrier.
-    let by_hand = superset.decide(snapshot, store.commit_registry());
+    let by_hand = superset
+        .decide(snapshot)
+        .expect("the superset narrows to the same decision");
     assert!(by_hand.visible_version(key).is_none());
 }

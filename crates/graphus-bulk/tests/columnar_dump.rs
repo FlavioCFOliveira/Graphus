@@ -21,7 +21,7 @@ use graphus_bulk::{
 };
 use graphus_core::Value;
 use graphus_io::MemBlockDevice;
-use graphus_storage::check::verify_on_open;
+use graphus_storage::check::verify_warm;
 use graphus_storage::{Namespace, RecordStore};
 use graphus_wal::{MemLogSink, WalManager};
 
@@ -143,7 +143,11 @@ fn import_csv(nodes: &[u8], rels: &[u8]) -> Store {
     imp.import_nodes(nodes).expect("import nodes");
     imp.import_relationships(rels).expect("import rels");
     let (mut store, _stats) = imp.finish();
-    verify_on_open(&mut store, &[]).expect("store consistent");
+    // The importer has just written this store and nothing has flushed it, so its buffer pool is
+    // WARM by construction (write-back is deferred to a checkpoint). The structural report is exactly
+    // what is wanted here and is valid warm; `verify_on_open` is the COLD-open startup hook and
+    // asserts the opposite precondition under `--features check-cold-assert`.
+    verify_warm(&mut store, &[]).expect("store consistent");
     store
 }
 

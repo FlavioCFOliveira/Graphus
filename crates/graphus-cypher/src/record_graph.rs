@@ -1268,67 +1268,67 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     /// Value)>`, mapped every key id back to a name and sorted it — all to keep one value. On an
     /// analytical scan that touches one property over millions of rows (the measured `top_liked`
     /// hot path) that amplification dominates. This probe instead resolves the key name to its
-    /// interned id once, then returns the **first visible** record of that id from the prepend-
-    /// ordered (newest-first) chain — decoding exactly one value. A key name that was never interned
-    /// cannot occur on any record, so it short-circuits to `None`. Result is identical to the old
-    /// `find` (the first visible record of a key id is its newest visible version).
+    /// interned id once, then resolves exactly that key at this query's snapshot and decodes exactly
+    /// one value. A key name that was never interned cannot occur on any record, so it short-circuits
+    /// to `None`.
+    ///
+    /// POLARITY — DECISION (`rmp` #967). It used to keep the first record of the key that
+    /// [`is_visible`] accepted while walking the prepend-ordered chain, which was sound only while
+    /// every version of a key was a cell carrying its own MVCC stamps. After #967 the newest version
+    /// is written **in place** and the old value descends onto the node's undo chain, so the version
+    /// is chosen by [`RecordStore::decision_scan_node_properties`] — the same walk the off-thread
+    /// reader pool runs through `StoreReadView`, so the two paths cannot answer from different
+    /// mechanisms (`rmp` #755/#768/#769/#770).
     fn read_node_prop_one(&self, node: NodeId, key: &str) -> Option<Value> {
         // Read-only store access: `rmp` #337 Slice 2 made every read method (`token_id`,
-        // `node_properties`, `decode_property_value`) take `&self`, so a shared borrow suffices.
+        // `decision_scan_node_properties`, `decode_property_value`) take `&self`, so a shared borrow
+        // suffices.
         let store = self.store.borrow();
         let key_id = store.token_id(Namespace::PropKey, key)?;
-        let chain = match store.superset_scan_node_properties(node.0) {
-            Ok(chain) => chain,
+        let decided = match store.decision_scan_node_properties(node.0, self.snapshot) {
+            Ok(decided) => decided,
             Err(e) => {
                 drop(store);
                 self.capture(e);
                 return None;
             }
         };
-        for (_pid, prop) in chain.every_version() {
-            if prop.key != key_id || !self.visible(prop.mvcc) {
-                continue;
+        let prop = decided.visible_version(key_id)?;
+        match store.decode_property_value(prop.type_tag, prop.value_inline) {
+            Ok(value) => Some(value),
+            Err(e) => {
+                drop(store);
+                self.capture(e);
+                None
             }
-            return match store.decode_property_value(prop.type_tag, prop.value_inline) {
-                Ok(value) => Some(value),
-                Err(e) => {
-                    drop(store);
-                    self.capture(e);
-                    None
-                }
-            };
         }
-        None
     }
 
-    /// Reads `node`'s properties as newest-**visible**-wins `(key_name, value)` pairs (`rmp` task
-    /// #50), decoding both inline scalars (#38) and `String`/`List` overflow values (`rmp` task #43).
+    /// Reads `node`'s properties as `(key_name, value)` pairs **as of this query's snapshot** (`rmp`
+    /// task #50), decoding both inline scalars (#38) and `String`/`List` overflow values (`rmp` task
+    /// #43).
     ///
-    /// A property overwrite is an MVCC operation now (`rmp` task #50): the old `PropRecord` is
-    /// tombstoned and the new one prepended, so the chain (from
-    /// [`RecordStore::superset_scan_node_properties`])
-    /// holds **multiple versions per key**, live and not-yet-GC'd tombstones. Each is filtered through
-    /// [`is_visible`] on its `xmin`/`xmax`, so this query sees exactly the version committed at or
-    /// before its snapshot (or its own write) — never a concurrent transaction's uncommitted value.
-    /// The chain is prepend-ordered (newest first), so the **first visible** record per key id wins.
+    /// POLARITY — DECISION (`rmp` tasks #50, #967). A property overwrite used to prepend a new
+    /// `PropRecord` and tombstone the old one, so the chain held **multiple versions per key** and
+    /// this method resolved them itself with [`is_visible`] on each record's `xmin`/`xmax`. After
+    /// `rmp` #967 the newest version is written **in place** and the old value descends onto the
+    /// node's undo chain (`D-property-visibility` makes that chain the sole oracle), so the resolution
+    /// is [`RecordStore::decision_scan_node_properties`] — the same walk the off-thread reader pool
+    /// runs. The result is unchanged: exactly the version committed at or before this snapshot, or
+    /// this transaction's own write, and never a concurrent transaction's uncommitted value.
     fn read_node_props(&self, node: NodeId) -> Vec<(String, Value)> {
         // Read-only store access (`rmp` #337 Slice 2): `&self` read methods, shared borrow.
         let store = self.store.borrow();
-        let chain = match store.superset_scan_node_properties(node.0) {
-            Ok(chain) => chain,
+        let decided = match store.decision_scan_node_properties(node.0, self.snapshot) {
+            Ok(decided) => decided,
             Err(e) => {
                 drop(store);
                 self.capture(e);
                 return Vec::new();
             }
         };
-        let mut out: Vec<(u32, Value)> = Vec::new();
-        for (_pid, prop) in chain.into_every_version() {
-            // MVCC visibility filter + newest-visible-wins: skip versions invisible to this snapshot,
-            // and a key id already resolved to a newer visible version.
-            if !self.visible(prop.mvcc) || out.iter().any(|(k, _)| *k == prop.key) {
-                continue;
-            }
+        let mut out: Vec<(u32, Value)> = Vec::with_capacity(decided.len());
+        for prop in decided.visible_versions() {
             match store.decode_property_value(prop.type_tag, prop.value_inline) {
                 Ok(value) => out.push((prop.key, value)),
                 Err(e) => {
@@ -2091,20 +2091,41 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                 Err(_) => return, // cannot read the relationship: skip (a captured error already aborts).
             }
         };
-        // Resolve the relationship's current property values (newest-wins per key), so the index borrow
-        // below never overlaps a store borrow.
+        // Resolve the relationship's current property values, so the index borrow below never overlaps
+        // a store borrow.
+        //
+        // POLARITY — DECISION (`rmp` #967), exactly as the node twin `reindex_node` resolves through
+        // `read_node_props`. This is per-write maintenance of structures that hold **one** value per
+        // relationship, so the answer owed is "what does this relationship hold at this statement's
+        // snapshot", and nothing downstream can repair a wrong one.
+        //
+        // It used to fold "first occurrence per key wins" over
+        // `superset_scan_rel_property_values`, which was the same answer while every version of a key
+        // was a cell of its own. After #967 the newest value is written **in place** and the superseded
+        // value descends onto the relationship's undo chain, so that read yields the CANDIDATE superset
+        // — cells first, then history. A `REMOVE r.p` empties the cell in place, `candidates()` skips
+        // the empty cell, and the key's first surviving candidate is therefore the **pre-removal
+        // value**: the wholesale re-index below then re-baked a committed-removed value into the
+        // full-text terms (a wrong ROW: `fulltext_query_rel` re-checks visibility and type, never
+        // terms) and back into the ANN graph (a phantom candidate that consumes the `2k` over-fetch
+        // budget the procedure re-scores, so a genuine neighbour is crowded out and the query LOSES a
+        // row). `decision_scan_rel_properties` resolves a removal to absent, which is what turns the
+        // full-text and vector arms below into removals instead of re-inserts.
+        //
+        // The walk sees this transaction's own uncommitted writes (`delta_verdict` stops at a delta
+        // whose in-flight writer is `snapshot.owner`), so the value just written is the value indexed.
         let resolved: Vec<(u32, Value)> = {
             let store = self.store.borrow();
-            let chain = match store.superset_scan_rel_property_values(rel.0) {
-                Ok(chain) => chain,
-                Err(_) => return, // a non-storable / read fault: skip this relationship's properties.
+            let decided = match store.decision_scan_rel_properties(rel.0, self.snapshot) {
+                Ok(decided) => decided,
+                Err(_) => return, // a read fault: skip this relationship's properties.
             };
-            let mut out: Vec<(u32, Value)> = Vec::new();
-            for (_pid, key, value) in chain {
-                if out.iter().any(|(k, _)| *k == key) {
-                    continue; // newest-wins: keep only the first (head-most) occurrence per key.
+            let mut out: Vec<(u32, Value)> = Vec::with_capacity(decided.len());
+            for prop in decided.visible_versions() {
+                match store.decode_property_value(prop.type_tag, prop.value_inline) {
+                    Ok(value) => out.push((prop.key, value)),
+                    Err(_) => return, // a non-storable / unreadable overflow value: skip.
                 }
-                out.push((key, value));
             }
             out
         };
@@ -2229,56 +2250,6 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         let _ = index.note_ft_spatial_mutator(self.txn);
     }
 
-    /// Maintains **only** the bitmap (low-cardinality) indexes (`rmp` task #328) for `node` from its
-    /// current labels + property values, used by the removal paths (`REMOVE n.p`, `REMOVE n:Label`)
-    /// that deliberately skip the full [`reindex_node`](Self::reindex_node) (the other index kinds
-    /// tolerate the resulting stale candidate, dropped by the seek's re-check — see `set_node_property`).
-    ///
-    /// The bitmap, by contrast, is exposed as a **direct** candidate source (it is intersected for
-    /// multi-predicate AND), so it is kept membership-exact even across removals: the node is dropped
-    /// from every value-bitmap of each registered column and re-inserted only under its current value
-    /// (or left out if it lost the label / property). This is O(distinct) per column — cheap, because
-    /// the column is low-cardinality by construction. A no-op on the standalone path or when no bitmap
-    /// index is declared.
-    fn reindex_node_bitmaps(&self, node: NodeId) {
-        let Some(index) = &self.index else {
-            return;
-        };
-        if index.borrow().registered_bitmap().is_empty() {
-            return; // nothing declared — avoid the label/property reads entirely.
-        }
-        // Read the node's current labels + property values (store borrows released before the index
-        // borrow), mirroring `reindex_node`. Read-only: `node_labels` is `&self` (`rmp` #337 Slice 2).
-        let label_tokens: Vec<u32> = match self.store.borrow().node_labels(node.0) {
-            Ok(ids) => ids,
-            Err(_) => return,
-        };
-        let props = self.read_node_props(node);
-        let resolved_props: Vec<(u32, Value)> = {
-            let store = self.store.borrow();
-            props
-                .into_iter()
-                .filter_map(|(name, value)| {
-                    store
-                        .token_id(Namespace::PropKey, &name)
-                        .map(|prop_key| (prop_key, value))
-                })
-                .collect()
-        };
-        let mut index = index.borrow_mut();
-        // Record the node as bitmap-dirty for this txn before mutating (`rmp` #453, F-IDX-3 — same
-        // rationale as `reindex_node`: an abort/panic must be able to re-derive it from the store).
-        index.note_bitmap_dirty(self.txn, node.0);
-        for (label_token, prop_key) in index.registered_bitmap() {
-            index.remove_bitmap_node(label_token, prop_key, node.0);
-            if label_tokens.contains(&label_token) {
-                if let Some((_, value)) = resolved_props.iter().find(|(k, _)| *k == prop_key) {
-                    index.insert_bitmap_value(label_token, prop_key, value, node.0);
-                }
-            }
-        }
-    }
-
     /// Enforces every declared constraint (`rmp` task #99) that applies to `node`'s **current**
     /// labels, capturing a [`ConstraintViolation`] runtime error on the first breach so the statement
     /// aborts and the transaction rolls back **before commit** (the captured-error channel — see the
@@ -2314,11 +2285,26 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
 
         // The node's current label tokens (store borrow, released before consulting the registry).
         // Read-only: `node_labels` is `&self` (`rmp` #337 Slice 2), so a shared borrow suffices.
+        //
+        // FAIL CLOSED on a read fault (`rmp` tasks #733, #967). This arm used to `return` on `Err`,
+        // with a comment claiming "a captured store error already aborts" — which was simply false:
+        // nothing had captured it, and nothing would. Returning here skips the WHOLE constraint
+        // enforcement for a node that was already written to the store, so an unreadable node record
+        // meant the uniqueness / node-key / existence checks never ran and a **duplicate was
+        // committed** — silent committed-data corruption from one I/O error. `node_labels` errors only
+        // on a genuine fault (an unallocated page, a failed page read, or an overflow-form label
+        // bitmap), never on an ordinary "no labels" node, so capturing is never a false alarm; and
+        // capture aborts the statement before it can commit, exactly as the sibling fail-closed sites
+        // (`filter_label_candidates`, `scan_filter_eq`) do.
         let label_tokens: Vec<u32> = {
             let store = self.store.borrow();
             match store.node_labels(node.0) {
                 Ok(ids) => ids,
-                Err(_) => return, // cannot enumerate labels: skip (a captured store error already aborts)
+                Err(e) => {
+                    drop(store);
+                    self.capture(e);
+                    return;
+                }
             }
         };
         if label_tokens.is_empty() {
@@ -2532,11 +2518,22 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             return;
         };
         // The relationship's current type token (store borrow released before consulting the registry).
+        //
+        // FAIL CLOSED on a read fault (`rmp` tasks #733, #967) — the relationship twin of the node
+        // enforcement's first read, and the identical defect: `Err(_) => return` skipped every
+        // relationship constraint (REL UNIQUE / REL KEY / existence / property type) for a
+        // relationship already written to the store, so an unreadable relationship record committed a
+        // duplicate instead of aborting. `rel` errors only on a genuine fault, so capturing is never a
+        // false alarm.
         let type_token = {
             let store = self.store.borrow();
             match store.rel(rel.0) {
                 Ok(r) => r.type_id,
-                Err(_) => return, // cannot read the relationship: a captured store error already aborts
+                Err(e) => {
+                    drop(store);
+                    self.capture(e);
+                    return;
+                }
             }
         };
         let rules: Vec<ConstraintRule> = index.borrow().constraints_for_rel_type(type_token);
@@ -3816,15 +3813,21 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     /// current record is `node_rec` (`rmp` #329). Fresh means the cached value is provably the node's
     /// snapshot-visible *newest* value of the key, so it can be used in place of a property-chain read.
     ///
-    /// Two O(1) witness checks (see [`ColumnWitness`](crate::column_cache::ColumnWitness) for the full
-    /// argument):
+    /// The O(1) witness checks (see [`ColumnWitness`](crate::column_cache::ColumnWitness) for the full
+    /// argument, including why each one is load-bearing):
     ///
     /// 1. `node_rec.first_prop == witness.node_first_prop` — the property-chain head is unchanged, so
-    ///    **no prepend** happened since rebuild ⇒ the cached `PropRecord` is still the newest version
-    ///    of its key (no overwrite or addition slipped past, newest-visible-wins preserved).
-    /// 2. The cached `PropRecord` (re-read by `witness.prop_pid`) still has key `prop_key` **and is
-    ///    visible** to this snapshot — catching the one mutation `first_prop` does not: an in-place
-    ///    tombstone (`REMOVE n.p` / `SET n.p = null`), which stamps `xmax` without moving the head.
+    ///    no key was **added** to the node since rebuild.
+    /// 2. The cached `PropRecord` (re-read by `witness.prop_pid`) still has key `prop_key`, so the
+    ///    slot has not been reclaimed and re-handed to another key.
+    /// 3. That cell's `(type_tag, value_inline, created_ts)` is **byte-identical** to what was captured
+    ///    at rebuild (`rmp` #967). This is the check the undo-chain property path made mandatory: an
+    ///    overwrite now rewrites the cell **in place** and a removal empties it in place
+    ///    (`D-property-removal`), so it moves no chain head and stamps no `xmax` — witnesses 1 and 2
+    ///    both survive it, and without this the cache served the **pre-overwrite** value.
+    /// 4. The re-read cell is **visible** to this snapshot. Every write restamps `created_ts` in place,
+    ///    so this is what stops a reader older than the last write from being served the current value;
+    ///    it falls back and reconstructs the older version off the undo chain.
     ///
     /// On any storage fault reading the `PropRecord`, returns `false` (decline the cache → the caller
     /// falls back to the authoritative read, which surfaces the fault through the captured-error
@@ -3837,16 +3840,21 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         witness: crate::column_cache::ColumnWitness,
         prop_key: u32,
     ) -> bool {
-        // Witness 1: the chain head must be byte-identical (no prepend of any kind since rebuild).
+        // Witness 1: the chain head must be byte-identical (no key added since rebuild).
         if node_rec.first_prop != witness.node_first_prop {
             return false;
         }
-        // Witness 2: the cached `PropRecord` must still be the same key AND visible (not tombstoned).
+        // Witnesses 2-4: the cached cell must still hold the same key, the same value bytes, the same
+        // creating stamp — and be visible to this snapshot.
         let prop = match self.store.borrow().property(witness.prop_pid) {
             Ok(p) => p,
             Err(_) => return false, // a read fault: decline the cache, fall back to the row read.
         };
-        prop.key == prop_key && self.visible(prop.mvcc)
+        prop.key == prop_key
+            && prop.type_tag == witness.type_tag
+            && prop.value_inline == witness.value_inline
+            && prop.mvcc.created_ts == witness.created_ts
+            && self.visible(prop.mvcc)
     }
 
     /// `rmp` task #780 — OVER-FETCH. `k` hits from the graph become FEWER than `k` rows once the
@@ -5913,20 +5921,49 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             // A removal can only *relax* a uniqueness rule, but it **violates an existence (NOT NULL)
             // rule** if the node carries the constrained label (`rmp` task #99). Enforce after the
             // removal so the now-absent property is detected; the captured error aborts the statement
-            // before commit. No reindex is needed on a removal (dropping a key never adds a candidate).
-            // Suppressed while a multi-property write is mid-flight (the caller checks once at the end).
+            // before commit. Suppressed while a multi-property write is mid-flight (the caller checks
+            // once at the end).
             if !self.defer_constraint_check.get() {
                 self.enforce_constraints_for_node(node);
             }
-            // Keep the bitmap candidate source membership-exact after a `SET n.p = null` removal
-            // (`rmp` #328): the node must leave the column's value-bitmaps.
-            self.reindex_node_bitmaps(node);
+            // A REMOVAL RE-INDEXES, exactly like a set. This used to run only `reindex_node_bitmaps`,
+            // justified by "dropping a key never adds a candidate, and the seek re-checks the store so
+            // a stale candidate is filtered out". That is true of the candidate-with-re-check kinds
+            // (property, composite) and FALSE of the wholesale kinds — which is why the bitmap column,
+            // being membership-exact, already needed a hook here. It needs exactly the same hook for
+            // the same reason:
+            //
+            // * full text — `fulltext_query` re-checks a hit's visibility and current label, never its
+            //   TERMS, so the removed text stays a matching document and comes back as a ROW;
+            // * vector — the ANN graph keeps the removed embedding, and although the procedure
+            //   re-scores every candidate against its snapshot-visible value (so it is never a wrong
+            //   row), the phantom is still a candidate and only `2k` of them are over-fetched before
+            //   that re-score, so a genuine neighbour is crowded out and the query LOSES a row;
+            // * spatial — the grid keeps the removed point (masked today only by the exact
+            //   `distance(...)` residual the planner keeps above the seek).
+            //
+            // `reindex_node` is the one seam that puts every derived structure back in agreement with
+            // the store, and its bitmap block is character-for-character the one this call replaces, so
+            // this is strictly more maintenance and none of it duplicated. It also raises the `rmp`
+            // #467 full-text/spatial mutator marker, which a removal that changes a posting now
+            // genuinely needs: a concurrent stale reader must decline to the scan until this
+            // transaction retires.
+            self.reindex_node(node);
             return;
         }
         // Inline scalars stay inline (#38); String/List values overflow to the strings.store heap
-        // (`rmp` task #43). `set_node_property_value` replaces any current value of the key, freeing
-        // its old overflow chain (no leak). A class the store cannot persist (Map/Bytes/temporal,
-        // heterogeneous List) is captured as a runtime error, never a silently-dropped property.
+        // (`rmp` task #43). `set_node_property_value` replaces any current value of the key.
+        //
+        // It does NOT free the old overflow chain, and must not: this comment claimed it did, which was
+        // already wrong and became dangerous with `rmp` #967. The old value now descends onto the
+        // node's undo chain in a `SetProperty` delta, and that delta is the chain's **sole owner**
+        // until GC reclaims the two together — freeing it here would hand a live older snapshot a
+        // reclaimed `strings.store` chain. Exactly one owner names any overflow chain: the live cell
+        // for the current value, the delta for each historical one, and the two sets are disjoint
+        // (`D-property-removal`, `02-decision-register.md`).
+        //
+        // A class the store cannot persist (Map/Bytes/temporal, heterogeneous List) is captured as a
+        // runtime error, never a silently-dropped property.
         if let Err(e) = self
             .store
             .borrow_mut()
@@ -5981,11 +6018,20 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                 .remove_rel_property_value(self.txn, rel.0, key_id)
             {
                 self.capture(e);
-            } else if !self.defer_constraint_check.get() {
-                // A removal can violate a relationship existence / key constraint (`rmp` #638): enforce
-                // after the removal so the now-absent property is detected. Suppressed while a
-                // multi-property write is mid-flight (the caller checks once at the end).
-                self.enforce_constraints_for_rel(rel);
+            } else {
+                if !self.defer_constraint_check.get() {
+                    // A removal can violate a relationship existence / key constraint (`rmp` #638):
+                    // enforce after the removal so the now-absent property is detected. Suppressed
+                    // while a multi-property write is mid-flight (the caller checks once at the end).
+                    self.enforce_constraints_for_rel(rel);
+                }
+                // A REMOVAL RE-INDEXES — see the `SET n.p = null` branch of `set_node_property` for the
+                // full argument. This path ran NO index maintenance at all, so a committed
+                // `SET r.p = null` left the relationship full-text index returning the relationship for
+                // the removed text (a wrong ROW: `fulltext_query_rel` never re-checks terms), left the
+                // removed embedding in the ANN graph (a phantom that consumes the `2k` over-fetch and
+                // costs a genuine neighbour its row), and left the removed point in the grid.
+                self.reindex_rel(rel);
             }
             return;
         }
@@ -6029,12 +6075,11 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                 self.enforce_constraints_for_rel(rel);
             }
             // Index the relationship's now-current value into any registered relationship-property index
-            // (`rmp` task #646), so a subsequent seek / index-backed uniqueness check finds it. A removal
-            // (`SET r.p = null`, handled in the branch above) needs no reindex — dropping a key never
-            // adds a candidate, and the seek re-checks the store so a stale candidate is filtered out.
-            // Runs during `create_rel`'s property loop too (reindexing incrementally), which is why the
-            // final `enforce_constraints_for_rel` in `create_rel` sees the relationship's own entry (it
-            // is excluded by id in the conflict finder).
+            // (`rmp` task #646), so a subsequent seek / index-backed uniqueness check finds it. The
+            // removal branch above re-indexes too, for the wholesale kinds that cannot tolerate a stale
+            // entry. Runs during `create_rel`'s property loop too (reindexing incrementally), which is
+            // why the final `enforce_constraints_for_rel` in `create_rel` sees the relationship's own
+            // entry (it is excluded by id in the conflict finder).
             self.reindex_rel(rel);
         }
     }
@@ -6095,9 +6140,14 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                 self.bump(|c| c.labels_removed += 1);
             }
         }
-        // Keep the bitmap candidate source membership-exact after a label loss (`rmp` #328): a node
-        // that no longer carries the covered label must drop out of the column's bitmaps.
-        self.reindex_node_bitmaps(node);
+        // Re-index the node against its now-current labels. This used to run only
+        // `reindex_node_bitmaps` ("a node that no longer carries the covered label must drop out of the
+        // column's bitmaps", `rmp` #328) — but membership-exactness is not a bitmap peculiarity: a
+        // full-text index covering the lost label must also drop the node (`reindex_fulltext_node`
+        // removes a node that lost coverage), and so must the spatial grid and the ANN graph. See the
+        // `SET n.p = null` branch of `set_node_property` for the full argument; `reindex_node`'s bitmap
+        // block is character-for-character the one this call replaces.
+        self.reindex_node(node);
     }
 
     fn remove_node_property(&mut self, node: NodeId, key: &str) {
@@ -6135,9 +6185,12 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         if !self.defer_constraint_check.get() {
             self.enforce_constraints_for_node(node);
         }
-        // Keep the bitmap candidate source membership-exact after a property removal (`rmp` #328): the
-        // node must leave the column's value-bitmaps (the other index kinds tolerate the stale entry).
-        self.reindex_node_bitmaps(node);
+        // Re-index the node against its now-current state. This used to run only
+        // `reindex_node_bitmaps`, on the premise that "the other index kinds tolerate the stale entry"
+        // — true of the candidate-with-re-check kinds and false of the wholesale ones (full text,
+        // vector, spatial). See the `SET n.p = null` branch of `set_node_property` for the full
+        // argument; the two paths are the same removal spelled two ways and now do the same thing.
+        self.reindex_node(node);
     }
 
     fn remove_rel_property(&mut self, rel: RelId, key: &str) {
@@ -6168,12 +6221,18 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             .remove_rel_property_value(self.txn, rel.0, key_id)
         {
             self.capture(e);
-        } else if !self.defer_constraint_check.get() {
-            // Exactly like `SET r.p = null`, `REMOVE r.p` **violates a relationship existence /
-            // key constraint** if the relationship's type is constrained (`rmp` #650): enforce after
-            // the removal so the now-absent property is detected. Suppressed while a multi-property
-            // write is mid-flight (the caller checks once at the end).
-            self.enforce_constraints_for_rel(rel);
+        } else {
+            if !self.defer_constraint_check.get() {
+                // Exactly like `SET r.p = null`, `REMOVE r.p` **violates a relationship existence /
+                // key constraint** if the relationship's type is constrained (`rmp` #650): enforce
+                // after the removal so the now-absent property is detected. Suppressed while a
+                // multi-property write is mid-flight (the caller checks once at the end).
+                self.enforce_constraints_for_rel(rel);
+            }
+            // A REMOVAL RE-INDEXES — see the `SET r.p = null` branch of `set_rel_property`, which this
+            // path is the other spelling of, and the `SET n.p = null` branch of `set_node_property` for
+            // the full argument.
+            self.reindex_rel(rel);
         }
     }
 
@@ -6211,6 +6270,11 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         if !self.has_error() {
             self.enforce_constraints_for_node(node);
         }
+        // `SET n = {}` (or an all-null map) re-sets nothing, so the loop above ran no
+        // `set_node_property` and therefore no `reindex_node` — leaving every wholesale index holding
+        // the properties the clear just vacated. Re-index once here: `reindex_node` is wholesale and
+        // idempotent, so on a non-empty map this simply repeats the last key's maintenance.
+        self.reindex_node(node);
     }
 
     fn merge_node_properties(&mut self, node: NodeId, properties: &[(String, Value)]) {
@@ -6273,6 +6337,11 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         if !self.has_error() {
             self.enforce_constraints_for_rel(rel);
         }
+        // `SET r = {}` (or an all-null map) re-sets nothing, so the loop above ran no
+        // `set_rel_property` and therefore no `reindex_rel` — the relationship twin of the hole
+        // `replace_node_properties` closes. `reindex_rel` is wholesale and idempotent, and its O(1)
+        // `has_any_*` gate makes it free when no relationship index is declared.
+        self.reindex_rel(rel);
     }
 
     fn merge_rel_properties(&mut self, rel: RelId, properties: &[(String, Value)]) {
@@ -6370,7 +6439,9 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // once the seek is wired into the planner). Record the node as bitmap-dirty FIRST so an abort
         // re-derives (re-adds) it from the reverted store, then remove it from every bitmap. A store
         // read here would be wrong: the node is only tombstoned, so its labels/values are still present
-        // and would re-add it — hence the unconditional remove, not a `reindex_node_bitmaps`.
+        // and would re-add it — hence the unconditional remove, not a `reindex_node`. (The wholesale
+        // kinds need no hook here for the opposite reason: every one of their consumers re-checks a
+        // candidate's VISIBILITY, which is exactly what a tombstone changes.)
         if let Some(index) = &self.index {
             let mut index = index.borrow_mut();
             index.note_bitmap_dirty(self.txn, node.0);

@@ -55,7 +55,8 @@ use graphus_index::keycodec::{encode_equality_canonical, encode_single};
 use graphus_io::BlockDevice;
 use graphus_storage::record::{NodeRecord, RelRecord};
 use graphus_storage::{
-    MvccHeader, Namespace, RecordStore, StoreReadView, SupersetProperties, TokenSnapshot, labels,
+    DecidedProperties, MvccHeader, Namespace, RecordStore, StoreReadView, SupersetProperties,
+    TokenSnapshot, labels,
 };
 use graphus_txn::{CommitRegistry, PredicateRead, Snapshot, is_visible};
 use graphus_wal::LogSink;
@@ -204,6 +205,35 @@ pub trait StoreReadSource {
     fn superset_scan_rel_properties(&self, rel_id: u64)
     -> Result<SupersetProperties, GraphusError>;
 
+    /// The **decision**-polarity read of `node_id`'s properties: the value of each key exactly as
+    /// `snapshot` sees it, reconstructed by the early-stopping undo-chain walk (`rmp` #967,
+    /// `04 §5.6`).
+    ///
+    /// This is the read every query property materialisation owes. After `rmp` #967 an overwrite is
+    /// written **in place** and the old value descends onto the entity's undo chain, so a version can
+    /// no longer be selected by folding the chain against each cell's own MVCC stamp — the cell's
+    /// `created_ts` is informative and the chain is the sole visibility oracle
+    /// (`D-property-visibility`).
+    ///
+    /// It is on the seam, rather than folded per implementation, so the **off-thread reader pool and
+    /// the inline path resolve visibility through the same mechanism**: both implementations forward
+    /// to the one body in [`graphus_storage::read_view`], and a reader pool that answers from a
+    /// different mechanism than the inline path is the `rmp` #755/#768/#769/#770 defect family.
+    fn decision_scan_node_properties(
+        &self,
+        node_id: u64,
+        snapshot: Snapshot,
+    ) -> Result<DecidedProperties, GraphusError>;
+
+    /// The **decision**-polarity read of `rel_id`'s properties — the relationship twin of
+    /// [`decision_scan_node_properties`](Self::decision_scan_node_properties), with the same
+    /// obligation and the same shared body.
+    fn decision_scan_rel_properties(
+        &self,
+        rel_id: u64,
+        snapshot: Snapshot,
+    ) -> Result<DecidedProperties, GraphusError>;
+
     /// The physical ids of the relationships incident to `node_id` (self-loops deduped, dead-link
     /// corpses threaded through transparently).
     fn incident_rels(&self, node_id: u64) -> Result<Vec<u64>, GraphusError>;
@@ -279,6 +309,20 @@ impl<D: BlockDevice, S: LogSink> StoreReadSource for LiveSource<'_, D, S> {
     ) -> Result<SupersetProperties, GraphusError> {
         self.0.superset_scan_rel_properties(rel_id)
     }
+    fn decision_scan_node_properties(
+        &self,
+        node_id: u64,
+        snapshot: Snapshot,
+    ) -> Result<DecidedProperties, GraphusError> {
+        self.0.decision_scan_node_properties(node_id, snapshot)
+    }
+    fn decision_scan_rel_properties(
+        &self,
+        rel_id: u64,
+        snapshot: Snapshot,
+    ) -> Result<DecidedProperties, GraphusError> {
+        self.0.decision_scan_rel_properties(rel_id, snapshot)
+    }
     fn incident_rels(&self, node_id: u64) -> Result<Vec<u64>, GraphusError> {
         self.0.incident_rels(node_id)
     }
@@ -353,6 +397,20 @@ impl<D: BlockDevice, S: LogSink> StoreReadSource for ReadViewSource<'_, D, S> {
         rel_id: u64,
     ) -> Result<SupersetProperties, GraphusError> {
         self.view.superset_scan_rel_properties(rel_id)
+    }
+    fn decision_scan_node_properties(
+        &self,
+        node_id: u64,
+        snapshot: Snapshot,
+    ) -> Result<DecidedProperties, GraphusError> {
+        self.view.decision_scan_node_properties(node_id, snapshot)
+    }
+    fn decision_scan_rel_properties(
+        &self,
+        rel_id: u64,
+        snapshot: Snapshot,
+    ) -> Result<DecidedProperties, GraphusError> {
+        self.view.decision_scan_rel_properties(rel_id, snapshot)
     }
     fn incident_rels(&self, node_id: u64) -> Result<Vec<u64>, GraphusError> {
         self.view.incident_rels(node_id)
@@ -3291,9 +3349,20 @@ pub fn incident_rels<S: StoreReadSource, K: ReadSink>(
 
 // --------------------------------- read-only property helpers ---------------------------------
 
-/// The body of `RecordStoreGraph::read_node_prop_one` (`rmp` #326 late materialization): the **first
-/// visible** record of `key`'s interned id from the prepend-ordered (newest-first) chain, decoding
-/// exactly one value. A never-interned key short-circuits to `None`.
+/// The body of `RecordStoreGraph::read_node_prop_one` (`rmp` #326 late materialization): the value
+/// `key`'s interned id holds **as of this query's snapshot**, decoding exactly one value. A
+/// never-interned key short-circuits to `None`.
+///
+/// POLARITY — DECISION (`rmp` #967). It used to walk the prepend-ordered chain and keep the first
+/// record `is_visible` accepted, which worked only while every version of a key was a cell with its
+/// own MVCC stamps. After #967 the newest version is written **in place** and the old value lives on
+/// the entity's undo chain, so the version is selected by the chain walk
+/// ([`StoreReadSource::decision_scan_node_properties`]) — the same body the off-thread reader pool
+/// runs, which is what keeps the two paths from answering from different mechanisms
+/// (`rmp` #755/#768/#769/#770).
+///
+/// The walk also **stops early**: it descends only as far as the first delta this snapshot already
+/// reflects, so the common "no history to undo" case costs one chain read and no delta reads at all.
 fn read_node_prop_one<S: StoreReadSource, K: ReadSink>(
     src: &S,
     ctx: &VisCtx,
@@ -3302,30 +3371,25 @@ fn read_node_prop_one<S: StoreReadSource, K: ReadSink>(
     key: &str,
 ) -> Option<Value> {
     let key_id = src.token_id(Namespace::PropKey, key)?;
-    let chain = match src.superset_scan_node_properties(node.0) {
-        Ok(chain) => chain,
+    let decided = match src.decision_scan_node_properties(node.0, ctx.snapshot) {
+        Ok(decided) => decided,
         Err(e) => {
             sink.capture(e);
             return None;
         }
     };
-    for (_pid, prop) in chain.every_version() {
-        if prop.key != key_id || !ctx.visible(prop.mvcc) {
-            continue;
+    let prop = decided.visible_version(key_id)?;
+    match src.decode_property_value(prop.type_tag, prop.value_inline) {
+        Ok(value) => Some(value),
+        Err(e) => {
+            sink.capture(e);
+            None
         }
-        return match src.decode_property_value(prop.type_tag, prop.value_inline) {
-            Ok(value) => Some(value),
-            Err(e) => {
-                sink.capture(e);
-                None
-            }
-        };
     }
-    None
 }
 
 /// The relationship analogue of [`read_node_prop_one`] (the body of
-/// `RecordStoreGraph::read_rel_prop_one`).
+/// `RecordStoreGraph::read_rel_prop_one`), with the same decision polarity.
 fn read_rel_prop_one<S: StoreReadSource, K: ReadSink>(
     src: &S,
     ctx: &VisCtx,
@@ -3334,45 +3398,41 @@ fn read_rel_prop_one<S: StoreReadSource, K: ReadSink>(
     key: &str,
 ) -> Option<Value> {
     let key_id = src.token_id(Namespace::PropKey, key)?;
-    let chain = match src.superset_scan_rel_properties(rel.0) {
-        Ok(chain) => chain,
+    let decided = match src.decision_scan_rel_properties(rel.0, ctx.snapshot) {
+        Ok(decided) => decided,
         Err(e) => {
             sink.capture(e);
             return None;
         }
     };
-    for (_pid, prop) in chain.every_version() {
-        if prop.key != key_id || !ctx.visible(prop.mvcc) {
-            continue;
+    let prop = decided.visible_version(key_id)?;
+    match src.decode_property_value(prop.type_tag, prop.value_inline) {
+        Ok(value) => Some(value),
+        Err(e) => {
+            sink.capture(e);
+            None
         }
-        return match src.decode_property_value(prop.type_tag, prop.value_inline) {
-            Ok(value) => Some(value),
-            Err(e) => {
-                sink.capture(e);
-                None
-            }
-        };
     }
-    None
 }
 
 /// The body of `RecordStoreGraph::read_node_props` (`rmp` task #50): `node`'s properties as
-/// newest-**visible**-wins `(name, value)` pairs, name-mapped and sorted by name. The chain is
-/// prepend-ordered (newest first), so the **first visible** record per key id wins.
+/// `(name, value)` pairs **as of this query's snapshot**, name-mapped and sorted by name.
+///
+/// POLARITY — DECISION (`rmp` #967), for the reason given on [`read_node_prop_one`].
 fn read_node_props<S: StoreReadSource, K: ReadSink>(
     src: &S,
     ctx: &VisCtx,
     sink: &K,
     node: NodeId,
 ) -> Vec<(String, Value)> {
-    let chain = match src.superset_scan_node_properties(node.0) {
-        Ok(chain) => chain,
+    let decided = match src.decision_scan_node_properties(node.0, ctx.snapshot) {
+        Ok(decided) => decided,
         Err(e) => {
             sink.capture(e);
             return Vec::new();
         }
     };
-    let out = match collect_visible_props(src, ctx, sink, chain) {
+    let out = match decode_decided_props(src, sink, &decided) {
         Some(out) => out,
         None => return Vec::new(),
     };
@@ -3386,36 +3446,39 @@ fn read_rel_props<S: StoreReadSource, K: ReadSink>(
     sink: &K,
     rel: RelId,
 ) -> Vec<(String, Value)> {
-    let chain = match src.superset_scan_rel_properties(rel.0) {
-        Ok(chain) => chain,
+    let decided = match src.decision_scan_rel_properties(rel.0, ctx.snapshot) {
+        Ok(decided) => decided,
         Err(e) => {
             sink.capture(e);
             return Vec::new();
         }
     };
-    let out = match collect_visible_props(src, ctx, sink, chain) {
+    let out = match decode_decided_props(src, sink, &decided) {
         Some(out) => out,
         None => return Vec::new(),
     };
     name_and_sort_props(src, out)
 }
 
-/// The shared newest-visible-wins fold over a property chain (factored out of `read_node_props` /
-/// `read_rel_props`, which were byte-identical apart from the chain source): skip versions invisible to
-/// this snapshot and a key id already resolved to a newer visible version; decode each kept value.
+/// Decodes every key an already-narrowed [`DecidedProperties`] holds (factored out of
+/// `read_node_props` / `read_rel_props`, which are byte-identical apart from the read).
+///
+/// The snapshot fold that used to live here — "skip versions invisible to this snapshot and a key id
+/// already resolved to a newer visible version" — moved into the storage-side chain walk in `rmp`
+/// #967, where it is the shared `DecisionFold` both the eager `SupersetProperties::decide` and the
+/// early-stopping `read_view` walk apply. So this is now decode-only, and the narrowing can no longer
+/// be skipped by construction: [`DecidedProperties`] has no constructor that does not take a
+/// [`Snapshot`].
+///
 /// Returns `None` if a decode hit a captured fault (the caller then yields an empty result, exactly as
 /// the originals did).
-fn collect_visible_props<S: StoreReadSource, K: ReadSink>(
+fn decode_decided_props<S: StoreReadSource, K: ReadSink>(
     src: &S,
-    ctx: &VisCtx,
     sink: &K,
-    chain: SupersetProperties,
+    decided: &DecidedProperties,
 ) -> Option<Vec<(u32, Value)>> {
-    let mut out: Vec<(u32, Value)> = Vec::new();
-    for (_pid, prop) in chain.into_every_version() {
-        if !ctx.visible(prop.mvcc) || out.iter().any(|(k, _)| *k == prop.key) {
-            continue;
-        }
+    let mut out: Vec<(u32, Value)> = Vec::with_capacity(decided.len());
+    for prop in decided.visible_versions() {
         match src.decode_property_value(prop.type_tag, prop.value_inline) {
             Ok(value) => out.push((prop.key, value)),
             Err(e) => {

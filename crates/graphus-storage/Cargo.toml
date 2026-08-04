@@ -39,6 +39,22 @@ bufpool-probe = ["graphus-bufpool/bufpool-probe"]
 # never exist on a durability path in production, is absent from that build entirely.
 dwb-probe = []
 
+# Per-thread record-read counters on the property read path (`rmp` #967, acceptance criterion 2):
+# `props.store` record reads and `undo.store` delta reads, counted at their sole decode sites. What
+# they prove, why a count rather than a timing, and what they cost is documented in `src/read_probe.rs`.
+#
+# Same reasoning as `bufpool-probe`: a FEATURE, not a dev-dependency. A dev-dependency carrying the
+# instrumentation would be unified into every `cargo test`/`cargo bench` resolve for the workspace, so
+# the certification gate would link a counter bump into `read_view::read_prop` — the hottest read in
+# the engine, and precisely the path #967's own benchmark must measure unperturbed. OFF by default:
+# the production build and the default gate compile the read path with no instrumentation at all.
+#
+# The observation API (`read_probe::counting`, `read_probe::RecordReads`) is gated on this feature and
+# is ABSENT without it, so a test that asserts a record-read count fails to compile rather than
+# passing vacuously against a stubbed zero.
+#   cargo test -p graphus-storage --features read-probe --test prop_visible_read_record_count
+read-probe = []
+
 [dependencies]
 graphus-core = { path = "../graphus-core" }
 graphus-io = { path = "../graphus-io" }

@@ -277,7 +277,7 @@ fn properties_chain_head_to_tail() {
     s.commit(txn).unwrap();
 
     let props = s.superset_scan_node_properties(a).unwrap();
-    let props = props.every_version();
+    let props = props.cells_ignoring_history();
     // Prepend order: p2 (age) then p1 (name).
     assert_eq!(props.len(), 2);
     assert_eq!(props[0].0, p2);

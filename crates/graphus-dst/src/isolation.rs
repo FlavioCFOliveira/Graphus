@@ -223,6 +223,119 @@ mod tests {
         );
     }
 
+    /// Runs `stmt` in `ticket` and reports whether the write path **admitted** it: `Ok(())` when the
+    /// statement ran to a clean end of stream, `Err(message)` when it was rejected — either before the
+    /// first row or as the stream's terminal item. The message is returned because the *class* of the
+    /// refusal is what the retry contract is keyed on.
+    fn try_write(eng: &mut Eng, ticket: TxTicket, stmt: &str) -> Result<(), String> {
+        let mut reply = match eng.run(ticket, stmt, vec![], false, None) {
+            Ok(reply) => reply,
+            Err(e) => return Err(e.to_string()),
+        };
+        loop {
+            match reply.rows.next() {
+                Ok(Some(_)) => {}
+                Ok(None) => return Ok(()),
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+    }
+
+    /// **Guards `rmp` #967** — the loser of a write–write conflict must not be able to COMMIT.
+    ///
+    /// A write–write conflict is refused at two sites that agree on the victim: the coordinator's
+    /// first-updater-wins `LockTable` (`RecordGraph::note_write`) and, since `rmp` #967, the store's
+    /// `RecordStore::ensure_no_conflicting_writer` (`D-property-write-conflict`). Both raise a
+    /// **retriable** `GraphusError::Transaction`, and both document the same contract: the error is
+    /// captured *so the caller rolls this transaction back*. That caller existed only for auto-commit
+    /// statements; an explicit transaction whose write was refused stayed open and **committed
+    /// successfully**, reporting success for a write the engine had rejected.
+    ///
+    /// That is not merely untidy: the refused writer's SSI footprint is announced *before* the refusal
+    /// (`note_write` records the write marker before it acquires the lock), so while it stays open the
+    /// holder acquires an outbound rw-edge to a write that never happened, becomes a Case-A pivot and
+    /// is aborted — leaving the phantom writer as the sole committer and the counter at its pre-image.
+    /// [`write_write_conflict_is_detected`] is the end-to-end oracle for that lost update; this is the
+    /// isolating control that pins the mechanism, so a regression is attributable rather than merely
+    /// visible.
+    #[test]
+    fn a_refused_second_writer_cannot_commit_967() {
+        let mut eng = engine();
+
+        let s = eng.begin(AccessMode::Write).expect("begin setup");
+        write(&mut eng, s, "CREATE (:Counter {k: 'x', v: 0})", vec![]);
+        eng.commit(s).expect("commit setup");
+
+        let t1 = eng.begin(AccessMode::Write).expect("begin t1");
+        let t2 = eng.begin(AccessMode::Write).expect("begin t2");
+
+        // T1 takes the entity. Non-vacuity: if this were refused the scenario would never reach the
+        // window under test.
+        try_write(&mut eng, t1, "MATCH (c:Counter {k: 'x'}) SET c.v = c.v + 1")
+            .expect("T1 is the first writer, so its write must be admitted");
+
+        assert_eq!(
+            eng.status_open_txns().expect("status"),
+            2,
+            "non-vacuity: both transactions must really be open here, so the count below measures \
+             T2's retirement and not an empty table"
+        );
+
+        // T2 is refused — and with the retriable class, not some incidental storage error.
+        let refused = try_write(&mut eng, t2, "MATCH (c:Counter {k: 'x'}) SET c.v = c.v + 1")
+            .expect_err("a second writer on an entity T1 holds must be refused");
+        assert!(
+            refused.contains("serialization failure"),
+            "non-vacuity: the refusal must be the retriable serialization class the driver retry \
+             logic keys on, not an unrelated failure; got {refused}"
+        );
+
+        // THE ASSERTION THIS SCENARIO EXISTS FOR. The refused writer is retired at STATEMENT END, so
+        // its phantom SSI footprint is gone before anybody commits. Asserted as a count rather than
+        // through `commit`, deliberately: a still-open T2 *also* fails to commit here — SSI aborts it
+        // as a pivot on the very structure the phantom footprint creates — so a `commit(t2).is_err()`
+        // oracle passes with and without the fix and measures nothing. (Observed, not reasoned about:
+        // the first draft of this test used exactly that oracle and passed against the unfixed
+        // engine.) The open-transaction count is the one observation the two states disagree on.
+        assert_eq!(
+            eng.status_open_txns().expect("status"),
+            1,
+            "a transaction whose write was REFUSED with a retriable serialization failure must be \
+             rolled back at statement end, leaving only its holder open (rmp #967)"
+        );
+        assert!(
+            eng.commit(t2).is_err(),
+            "and it must therefore not be committable — before the fix it committed cleanly, telling \
+             its client that a rejected write had been applied"
+        );
+
+        // ...and with the phantom footprint retired, the holder commits its increment.
+        eng.commit(t1).expect("the entity holder must commit");
+
+        let reader = eng.begin(AccessMode::Read).expect("begin reader");
+        let mut reply = eng
+            .run(
+                reader,
+                "MATCH (c:Counter {k: 'x'}) RETURN c.v AS v",
+                vec![],
+                false,
+                None,
+            )
+            .expect("read runs");
+        let mut observed = Vec::new();
+        while let Ok(Some(row)) = reply.rows.next() {
+            if let Some(MaterializedValue::Value(Value::Integer(n))) = row.first() {
+                observed.push(*n);
+            }
+        }
+        let _ = eng.commit(reader);
+        assert_eq!(
+            observed,
+            vec![1],
+            "the holder's increment must be the committed value; got {observed:?}"
+        );
+    }
+
     /// **Guards rmp #171** (phantom write-skew across two keys), FIXED. T1 reads y (empty) + inserts x;
     /// T2 reads x (empty) + inserts y; interleaved. Each transaction's predicate read of the *absence*
     /// of the other's key now registers a predicate SIREAD marker, so the concurrent matching insert

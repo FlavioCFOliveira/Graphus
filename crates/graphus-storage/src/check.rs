@@ -65,7 +65,7 @@ use crate::heap::{BLOCK_PAYLOAD, HeapBlock};
 use crate::idalloc::NULL_ID;
 use crate::record::{ChainSide, MvccHeader, NodeRecord, PropRecord, RelRecord};
 use crate::store::{ALL_STORE_KINDS, RecordStore, STORE_COUNT, StoreKind};
-use crate::undo::{CommitSlot, UndoDelta};
+use crate::undo::{CommitSlot, UndoAction, UndoDelta};
 use crate::valenc::OVERFLOW_BIT as PROP_OVERFLOW_BIT;
 
 /// One structural inconsistency found by [`check_store`]. Each variant names the offending ids /
@@ -212,6 +212,28 @@ pub enum UndoChainFault {
         /// The `commit.store` id the delta names.
         commit_info: u64,
     },
+    /// Walking a chain from its head, a delta's commit timestamp is **greater** than the one above
+    /// it — the ordering the read path's `Stop` rule depends on, broken (`rmp` #967).
+    ///
+    /// The reconstruction ends the walk at the first delta the reading snapshot already reflects, on
+    /// the argument that everything below committed no later. If that fails, a snapshot between the
+    /// two timestamps stops early and keeps a value it must not see: silent wrong data, with no
+    /// other symptom. The invariant is bought by the entity-granularity write-conflict check
+    /// (`D-property-write-conflict`), which stops two transactions interleaving deltas on one chain;
+    /// this fault is what proves the check is still doing its job.
+    CommitTimestampsNotDescending {
+        /// The commit timestamp of the delta nearer the head.
+        above: u64,
+        /// The commit timestamp of this delta, which is greater.
+        below: u64,
+    },
+    /// A [`SetProperty`](crate::undo::UndoAction::SetProperty) delta names a property-key token that
+    /// does not exist in the token store (`04 §2.6`) — a dangling key reference, so the value it
+    /// carries could never be attributed to a key if a snapshot restored it (`rmp` #967).
+    UnknownPropertyToken {
+        /// The offending token id.
+        token: u32,
+    },
 }
 
 /// The precise undo-area slot rule broken by a [`Violation::UndoSlot`] (`rmp` #966).
@@ -267,6 +289,18 @@ pub enum PropertyFault {
     DeadProp,
     /// The chain did not terminate within the cycle guard (a corrupted cycle).
     NonTerminating,
+    /// Two live cells on one owner's chain hold the same property key (`rmp` #967). After the
+    /// property path moved onto the undo chain there is exactly **one** cell per key — it is
+    /// rewritten in place, never duplicated — so a second one means either a store written by a
+    /// pre-#967 build (where every version was a cell) or a write path that prepended instead of
+    /// rewriting. Either way a reader resolves the key by first-cell-wins and the other cell's value
+    /// is unreachable and unreclaimable.
+    DuplicateLiveKey {
+        /// The property-key token held by both cells.
+        key: u32,
+        /// The physical id of the cell that was seen first (nearer the chain head).
+        first: u64,
+    },
 }
 
 /// The precise store/index agreement rule broken by a [`Violation::IndexAgreement`].
@@ -336,6 +370,19 @@ pub enum HeapChainFault {
         /// The corrupt `len` value.
         len: u16,
     },
+    /// One `strings.store` block is reachable from **both** a live property cell's overflow chain
+    /// and a live `undo.store` delta's — the two-owner state `rmp` #967's single-owner rule forbids.
+    ///
+    /// Exactly one record may name any overflow chain: the live cell owns the current value, a delta
+    /// owns each historical value, and the two sets are disjoint. Two owners means one of them will
+    /// free blocks the other still reads — the corpse double-free this rule exists to catch, whose
+    /// symptom is one property's bytes appearing inside another's value long after the fact.
+    AliasedBetweenCellAndDelta {
+        /// The `props.store` cell that names the block.
+        cell: u64,
+        /// The `undo.store` delta that also names it.
+        delta: u64,
+    },
 }
 
 /// The precise MVCC-header rule broken by a [`Violation::MvccHeader`] (`05 §7`; `rmp` storage
@@ -360,6 +407,25 @@ pub enum MvccHeaderFault {
     UndoPtrOutOfRange {
         /// The dangling `undo_ptr` value.
         undo_ptr: u64,
+    },
+    /// A `props.store` cell anchors an undo chain (`rmp` #967). It must not: a `SetProperty` delta
+    /// anchors on the **owning** node or relationship, and a cell's `undo_ptr` stays `0` for its
+    /// whole life. A non-zero one means a `link_delta(StoreKind::Prop, ...)` slipped through — which
+    /// compiles, because [`StoreKind::is_versioned`](crate::StoreKind::is_versioned) answers `true`
+    /// for `Prop` — and has built a second, parallel chain family that no reader walks and no GC
+    /// phase reclaims.
+    PropertyCellAnchorsChain {
+        /// The chain head the cell wrongly carries.
+        undo_ptr: u64,
+    },
+    /// A `props.store` cell carries an MVCC tombstone (`expired_ts != 0`), which after
+    /// `D-property-removal` no property operation ever writes (`rmp` #967): a removal empties the
+    /// cell in place instead. A stamped `xmax` here is either a store written by a pre-#967 build or
+    /// a resurrected tombstone path — and it is invisible to the retargeted GC sweep, so the cell
+    /// would never be reclaimed.
+    PropertyCellTombstoned {
+        /// The `expired_ts` stamp the cell wrongly carries.
+        expired_ts: u64,
     },
 }
 
@@ -585,6 +651,31 @@ pub fn verify_on_open<D: BlockDevice, S: LogSink>(
     indexes: &[IndexAgreement],
 ) -> Result<()> {
     assert_cold_open(store);
+    verify_warm(store, indexes)
+}
+
+/// The **structural** half of [`verify_on_open`], for a caller whose pool is legitimately *warm*:
+/// runs [`check_store`] and returns an error naming the first violation if the store is inconsistent.
+///
+/// Identical to [`verify_on_open`] except that it does **not** assert the cold-open precondition, and
+/// therefore makes no claim about the durable image's checksums beyond what a warm pass can see (a
+/// dirty resident page is served from cache without a disk read — see [`check_store`]).
+///
+/// This is the entry point for the callers [`verify_on_open`]'s own documentation already named as
+/// legitimate and warm — chiefly a bulk importer asserting the structure of the store it has just
+/// built, before that store is flushed and reopened. Those callers want the structural report, which
+/// is valid warm; they were reaching it through the cold-open entry point, so building with
+/// `check-cold-assert` (the fail-fast enforcement the startup and recovery paths exist to enable)
+/// turned a correct warm verification into a panic. Splitting the two gives each caller the contract
+/// it actually holds instead of asking the enforcement to look the other way.
+///
+/// # Errors
+/// Returns [`GraphusError::Storage`] if any violation is found, or propagates a hard I/O failure
+/// from [`check_store`].
+pub fn verify_warm<D: BlockDevice, S: LogSink>(
+    store: &mut RecordStore<D, S>,
+    indexes: &[IndexAgreement],
+) -> Result<()> {
     let report = check_store(store, indexes)?;
     if report.is_consistent() {
         return Ok(());
@@ -608,6 +699,10 @@ struct Catalog {
     /// Number of interned `Label`-namespace tokens; valid label token ids are `0..label_token_count`
     /// (`04 §2.6`). Used to flag a node label bitmap that references a non-existent label (#42).
     label_token_count: usize,
+    /// Number of interned `PropKey`-namespace tokens; valid property-key token ids are
+    /// `0..prop_key_token_count` (`04 §2.6`). Used to flag a `SetProperty` delta that names a
+    /// non-existent key (`rmp` #967).
+    prop_key_token_count: usize,
 }
 
 impl Catalog {
@@ -617,6 +712,7 @@ impl Catalog {
             free: ALL_STORE_KINDS.map(|k| store.checker_free_ids(k)),
             pages: store.mapped_pages(),
             label_token_count: store.checker_label_token_count(),
+            prop_key_token_count: store.checker_prop_key_token_count(),
         }
     }
 
@@ -945,6 +1041,9 @@ fn check_property_chains<D: BlockDevice, S: LogSink>(
             let mut cur = first_prop;
             let mut steps = 0u64;
             let mut seen: BTreeSet<u64> = BTreeSet::new();
+            // `rmp` #967: exactly one live cell per key. A `Vec` rather than a map because the number
+            // of distinct keys on one entity is small and the scan is over contiguous memory.
+            let mut keys_seen: Vec<(u32, u64)> = Vec::new();
             let mut prev = NULL_ID; // the record that pointed at `cur` (owner head = NULL)
             while cur != NULL_ID {
                 steps += 1;
@@ -974,6 +1073,15 @@ fn check_property_chains<D: BlockDevice, S: LogSink>(
                 // live chain is NOT a corpse (a freed-and-referenced prop is separately reported as
                 // `FreeListFault::ReferencedByLiveChain`), so it still trips `DeadProp` here.
                 let next = if let Some(rec) = scan.live_props.get(&cur) {
+                    match keys_seen.iter().find(|&&(k, _)| k == rec.key) {
+                        Some(&(key, first)) => report.push(Violation::PropertyChain {
+                            owner_kind,
+                            owner,
+                            prop: cur,
+                            detail: PropertyFault::DuplicateLiveKey { key, first },
+                        }),
+                        None => keys_seen.push((rec.key, cur)),
+                    }
                     rec.next_prop
                 } else if let Some(corpse) = scan.corpse_props.get(&cur) {
                     corpse.next_prop
@@ -1404,6 +1512,30 @@ fn check_mvcc_headers(cat: &Catalog, scan: &Scan, report: &mut ConsistencyReport
     for (&id, rec) in &scan.live_props {
         check(StoreKind::Prop, id, rec.mvcc);
     }
+    // The closure holds `report` uniquely; end its borrow before the property-cell pass below.
+    let _ = check;
+    // `rmp` #967: a property cell is not a versioned entity. It never anchors a chain and never
+    // carries a tombstone; both would be invisible to the reader and to the retargeted GC sweep.
+    for (&id, rec) in &scan.live_props {
+        if rec.mvcc.undo_ptr != NULL_ID {
+            report.push(Violation::MvccHeader {
+                kind: StoreKind::Prop,
+                id,
+                detail: MvccHeaderFault::PropertyCellAnchorsChain {
+                    undo_ptr: rec.mvcc.undo_ptr,
+                },
+            });
+        }
+        if rec.mvcc.expired_ts != 0 {
+            report.push(Violation::MvccHeader {
+                kind: StoreKind::Prop,
+                id,
+                detail: MvccHeaderFault::PropertyCellTombstoned {
+                    expired_ts: rec.mvcc.expired_ts,
+                },
+            });
+        }
+    }
 }
 
 /// 8. **Version-chain well-formedness** (`05 §12`, `04 §5.1`; `rmp` #966).
@@ -1446,9 +1578,14 @@ fn check_undo_chains(cat: &Catalog, scan: &Scan, report: &mut ConsistencyReport)
     }
     heads.extend(scan.orphan_chain_heads.iter().copied());
 
+    let prop_key_tokens = cat.prop_key_token_count as u32;
     for (kind, entity, head) in heads {
         let mut cur = head;
         let mut seen: BTreeSet<u64> = BTreeSet::new();
+        // `rmp` #967: the commit timestamps of a chain's non-corpse deltas must be non-increasing as
+        // the walk descends. `None` until the first committed delta is seen; corpses and still-open
+        // transactions carry no comparable timestamp and are skipped rather than compared.
+        let mut above: Option<u64> = None;
         while cur != NULL_ID {
             let fault = |detail| Violation::UndoChain {
                 kind,
@@ -1479,6 +1616,30 @@ fn check_undo_chains(cat: &Catalog, scan: &Scan, report: &mut ConsistencyReport)
                 report.push(fault(UndoChainFault::CommitInfoDangling {
                     commit_info: delta.commit_info,
                 }));
+            }
+            if delta.action == UndoAction::SetProperty && delta.token >= prop_key_tokens {
+                report.push(fault(UndoChainFault::UnknownPropertyToken {
+                    token: delta.token,
+                }));
+            }
+            // The ordering the read path's `Stop` rule rests on. Only live deltas whose slot records
+            // a real commit timestamp participate: a corpse never happened, and an open transaction
+            // has no timestamp to order by (and, under `D-property-write-conflict`, is the only
+            // writer on this chain anyway).
+            if delta.in_use()
+                && let Some(slot) = scan.commit_slots.get(&delta.commit_info)
+                && slot.in_use()
+                && let VersionStamp::Committed(ts) = VersionStamp::from_raw(slot.commit_ts)
+            {
+                if let Some(prev) = above
+                    && ts.0 > prev
+                {
+                    report.push(fault(UndoChainFault::CommitTimestampsNotDescending {
+                        above: prev,
+                        below: ts.0,
+                    }));
+                }
+                above = Some(ts.0);
             }
             cur = delta.next;
         }
@@ -1536,13 +1697,26 @@ fn check_heap_chains(cat: &Catalog, scan: &Scan, report: &mut ConsistencyReport)
     // distinct chains is an aliased block whose 48-byte payload would be shared between two property
     // values (`rmp` storage audit F13). `live_props` is a `BTreeMap`, so the "first owner" is
     // deterministically the smallest property id referencing the block.
-    let mut block_owner: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut block_owner: BTreeMap<u64, (u64, bool)> = BTreeMap::new();
 
-    for (&pid, prop) in &scan.live_props {
-        if prop.type_tag & PROP_OVERFLOW_BIT == 0 {
-            continue; // inline scalar: no overflow chain to validate
-        }
-        let mut cur = prop.value_inline;
+    // `rmp` #967: the census spans live cells AND live `SetProperty` deltas, because exactly one of
+    // them may name any chain. Cells are walked first, so a collision found during the delta pass
+    // always knows both owners.
+    let cell_chains = scan
+        .live_props
+        .iter()
+        .filter(|(_, p)| p.type_tag & PROP_OVERFLOW_BIT != 0)
+        .map(|(&pid, p)| (pid, p.value_inline, false));
+    let delta_chains = scan.live_deltas.iter().filter_map(|id| {
+        let delta = scan.deltas.get(id)?;
+        (delta.action == UndoAction::SetProperty
+            && delta.type_tag & PROP_OVERFLOW_BIT != 0
+            && delta.value_inline != NULL_ID)
+            .then_some((*id, delta.value_inline, true))
+    });
+
+    for (pid, head, owner_is_delta) in cell_chains.chain(delta_chains).collect::<Vec<_>>() {
+        let mut cur = head;
         let mut steps = 0u64;
         let mut seen: BTreeSet<u64> = BTreeSet::new();
         while cur != NULL_ID {
@@ -1572,15 +1746,25 @@ fn check_heap_chains(cat: &Catalog, scan: &Scan, report: &mut ConsistencyReport)
                 break;
             };
             // Cross-chain aliasing: this block already belongs to an earlier chain.
-            if let Some(&other_owner) = block_owner.get(&cur) {
+            if let Some(&(other_owner, other_is_delta)) = block_owner.get(&cur) {
+                let detail = if owner_is_delta && !other_is_delta {
+                    // The single-owner rule of `rmp` #967, broken: a live cell and a live delta both
+                    // name this chain, so whichever is freed first strands the other's value.
+                    HeapChainFault::AliasedBetweenCellAndDelta {
+                        cell: other_owner,
+                        delta: pid,
+                    }
+                } else {
+                    HeapChainFault::SharedBlock { other_owner }
+                };
                 report.push(Violation::HeapChain {
                     prop: pid,
                     block: cur,
-                    detail: HeapChainFault::SharedBlock { other_owner },
+                    detail,
                 });
                 break;
             }
-            block_owner.insert(cur, pid);
+            block_owner.insert(cur, (pid, owner_is_delta));
             // A corrupt `len` would be clamped silently by `HeapBlock::bytes`; report it here.
             if block.len as usize > BLOCK_PAYLOAD {
                 report.push(Violation::HeapChain {

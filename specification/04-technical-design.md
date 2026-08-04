@@ -560,7 +560,7 @@ own code, at the line cited.
 
 **The measured grounding.** The decision was not taken on preference. Property assignment today is a
 tombstone pass over the whole property chain followed by a prepend
-(`RecordStore::tombstone_props_for_key`, `crates/graphus-storage/src/store.rs:5646-5666`), which is
+(`RecordStore::tombstone_props_for_key`, `crates/graphus-storage/src/store.rs:6710-6753`), which is
 **O(M²)** in the number of properties set on one entity — measured at **15.1 µs/op at M = 1000** and
 **97.8 µs/op at M = 8000**. A delta chain replaces that walk with a constant-cost prepend.
 
@@ -609,6 +609,35 @@ the chain head. The lifecycle has five steps:
 
 1. **Conflict check.** Before any delta is created, the writer checks the entity's MVCC header for a
    write-write conflict and aborts immediately if there is one (§5.7).
+
+   **When this check arrives, and at what granularity** (`D-property-write-conflict`, ratified
+   2026-08-03). The check lands with **task #967**, the first task to put a value on the chain, and
+   it is keyed on **the entity** — the node or relationship that owns the property — not on the
+   property cell. That is the granularity §5.7 already specifies, and it is Memgraph's
+   (`PrepareForWrite`, `/data/refsrc/memgraph/src/storage/v2/mvcc.hpp:112-137`, called by the
+   property accessor at `vertex_accessor.cpp:425` immediately before the delta link at `:450` and
+   the in-place mutation at `:451`). Concretely: the writer reads the head of the entity's undo
+   chain and aborts with a retriable serialization failure if that head belongs to another
+   transaction that is still open.
+
+   It is a **prerequisite** of the property migration rather than a consequence of it, because
+   three separate things depend on it and none of them is sound without it:
+
+   - the in-place overwrite is an **update** rather than a lost update;
+   - the entity's chain is **commit-ordered**, which is what lets a reader stop walking as soon as
+     it reaches a version its snapshot may see (§5.3);
+   - the abort-time **pre-image of the in-place cell is provably exact**, because no other writer
+     can have touched it between the delta link and the rollback.
+
+   Task **#971** later consumes this check rather than replacing it: what #971 removes is the lock
+   table and the deadlock detector (§5.7), not the check itself.
+
+   **The Cypher seam already imposes exactly this rule.** `RecordGraph::set_node_property` calls
+   `note_write(node_ssi_key(node.0))` (`crates/graphus-cypher/src/record_graph.rs:5893`), and
+   `note_write` (`:506`) captures a "write-write conflict … retry (serialization failure)" when the
+   entity is held by another transaction. The coordinated path's behaviour therefore **does not
+   change**; what becomes newly constrained is the **direct `RecordStore` callers**, which today
+   reach the property path without passing through that seam.
 2. **Allocation.** The delta is allocated in the undo area under the writing transaction's ownership,
    carrying the action, its payload, the transaction's `command_id` (below), and a reference to the
    transaction's shared commit-info slot (below) — **not** a timestamp of its own.
@@ -690,7 +719,7 @@ undo area itself. This table is the authoritative list; the decision register
 | # | Mechanism today | Where it lives now | Replaced by | Retired in |
 | --- | --- | --- | --- | --- |
 | 0 | ~~**No undo area at all.** `undo_ptr` is reserved in every record and always written `0`, so there is no chain to anchor.~~ **CLOSED.** | was `crates/graphus-storage/src/record.rs`; now `crates/graphus-storage/src/undo.rs` + `StoreKind::Undo` / `StoreKind::Commit` | The undo area and the delta record; `undo_ptr` is the live chain head | **#966 — done** |
-| 1 | **Property tombstone plus chain prepend.** Setting a property walks the entity's whole property chain to tombstone the previous version, then prepends a new one — **O(M²)** over M assignments (15.1 µs/op at M = 1000; 97.8 µs/op at M = 8000). | `RecordStore::tombstone_props_for_key`, `crates/graphus-storage/src/store.rs:5646-5666` | One `SetProperty` delta carrying the old value; the home property record is updated in place | **#967** |
+| 1 | **Property tombstone plus chain prepend.** Setting a property walks the entity's whole property chain to tombstone the previous version, then prepends a new one — **O(M²)** over M assignments (15.1 µs/op at M = 1000; 97.8 µs/op at M = 8000). | `RecordStore::tombstone_props_for_key`, `crates/graphus-storage/src/store.rs:6710-6753` | One `SetProperty` delta carrying the old value; the home property record is updated in place, and a **removal** is an empty cell in place rather than a tombstone (below) | **#967** |
 | 2 | **Label bitmap mutated in place, with the version history held only in memory.** The history is an in-process structure shared by `Arc`; nothing about it is durable, so labels are not versioned on disk. | `crates/graphus-storage/src/label_history.rs:143` | `AddLabel` / `RemoveLabel` deltas on the same durable chain as every other change | **#968** |
 | 3 | **Ad-hoc compare-and-set undo for chain heads and the label word.** A bespoke undo per field, needed because a whole-record pre-image undo would revert words a concurrently-committed writer legitimately owns. | `crates/graphus-storage/src/record.rs:114-123`; `store.rs:2507` (`write_chain_head`), `:2541` (label word) | `AddIncidentEdge` / `RemoveIncidentEdge` deltas naming one incidence entry, so no shared pointer word is ever rewritten by an undo | **#969** |
 | 4 | **Physical ARIES rollback.** Undo reverts bytes. This is the origin of the recurring defect family rmp #220 / #172 / #239 / #301 / #578 / #772, each one a case of one transaction's byte-level undo damaging another's committed state. | `RecordStore::rollback`, `crates/graphus-storage/src/store.rs:3644` | Logical rollback: the transaction walks its own deltas and applies them | **#970** |
@@ -714,6 +743,38 @@ table is still in place. Each row names the task that closes it. The transaction
 runs against a placeholder store — "the real `graphus_storage` does not yet implement version-chain
 mechanics", and wiring it up "is a follow-up task, intentionally **out of scope** here"
 (`crates/graphus-txn/src/store.rs`).
+
+**Row 1 in detail: what a property removal becomes** (`D-property-removal`, ratified 2026-08-03).
+`REMOVE n.p` — and `SET n.p = null`, which Cypher defines as the same removal — rewrites the
+property cell **in place** to an **empty cell**: `type_tag = 0, value_inline = 0`. The cell keeps its
+`in_use` bit and its position in the entity's `first_prop` chain, and the old value descends onto the
+entity's undo chain in a `SetProperty` delta, exactly as an ordinary overwrite does. **A removal is
+therefore not an `xmax` tombstone**, and it is not a distinct delta action: there is one action for
+setting, changing and removing a property, and the removal case is the one whose *new* value is
+empty.
+
+This is Memgraph's representation. Its removal is a `SetProperty` whose new value is an empty
+`PropertyValue`: `PropertyStore::SetProperty`
+(`/data/refsrc/memgraph/src/storage/v2/property_store.cpp:2829`) erases the property when
+`value.IsNull()` (`:2831`, `:2841`), while the delta written just before it
+(`vertex_accessor.cpp:450`) carries the **old** value. There is no removal action and no tombstone in
+that design either.
+
+Three consequences are **normative**:
+
+1. **Exactly one owner names any `strings.store` overflow chain.** The live cell owns the **current**
+   value; a delta owns **each historical** value; the two sets are **disjoint**. No overflow chain is
+   ever named by both a cell and a delta, or by two deltas. This is what makes the representation
+   safe to reclaim: GC frees an overflow chain when its single owner is reclaimed, with no
+   reference counting and no scan for co-owners.
+2. **A later `SET` of the same key reuses the empty cell, with no allocation.** The cell is already
+   in the chain and already `in_use`, so re-setting the key writes the new `type_tag` and
+   `value_inline` into it. This is the second half of the O(M²) fix: repeated assignment to one key
+   allocates nothing and walks nothing.
+3. **`expired_ts` is never again written by a property operation**, and
+   `RecordStore::tombstone_props_for_key`
+   (`crates/graphus-storage/src/store.rs:6710-6753`) is **retired**. The property path stops
+   expiring cells altogether; expiry remains meaningful only for the entity records themselves.
 
 ### 5.2 Timestamps and snapshots
 
@@ -836,14 +897,32 @@ back; this is surfaced as an observability metric (NFR-10) so a stuck reader pin
 ### 5.6 Interaction with the record store and indexes
 
 Under `D-version-representation` the store is **MVCC-native** (§2.3): versioning is a property of the
-record itself, not a layer above a single-version store. Six consequences follow, and they are the
+record itself, not a layer above a single-version store. Seven consequences follow, and they are the
 contract between §5 and the rest of the engine.
 
 - **A write mutates the home record in place and leaves a delta behind.** The writer allocates the
   delta, links it at the head of the entity's chain, advances `undo_ptr`, and only then changes the
-  record body (§5.1.2, steps 2–4). The MVCC header keeps its meaning unchanged from §5.2: `xmin` is
-  the creating transaction, `xmax` the expiring one, and `undo_ptr` is now the live head of the undo
-  chain rather than a permanently-zero reserved word.
+  record body (§5.1.2, steps 2–4). The MVCC header of the **entity record** keeps its meaning
+  unchanged from §5.2: `xmin` is the creating transaction, `xmax` the expiring one, and `undo_ptr` is
+  now the live head of the undo chain rather than a permanently-zero reserved word. **This sentence
+  is about the entity record and must not be read as extending to the property cell** — the cell's
+  stamp is settled by the next bullet.
+- **The undo chain is the sole visibility oracle for a property's value**
+  (`D-property-visibility`, ratified 2026-08-03). A reader resolves which value of a property it is
+  entitled to see by starting from the **in-place image** and walking the **entity's** undo chain,
+  applying `SetProperty` deltas backwards until it reaches the version its snapshot may see (§5.3).
+  It **never** decides by comparing the property cell's own `created_ts`. That stamp becomes
+  **informative** — useful in diagnostics and in the consistency checker, load-bearing in no
+  visibility decision. What the cell's MVCC header keeps is its **structural** meaning: `in_use` for
+  slot occupancy and corpse threading.
+
+  The ground for this is a property of the frozen format, not a preference. The 56-byte delta of
+  `05-storage-format.md` §12.2 has **no field for the old `created_ts`** — its `SetProperty` payload
+  is `token`, `type_tag` and `value_inline`, and nothing else. A logical undo therefore *cannot*
+  restore that stamp, so the stamp must not be something correctness depends on; under this decision
+  nothing does. The direct consequence is that **task #970 is a rollback change only**: because the
+  chain is already the oracle by the time #970 lands, logical rollback replaces physical undo without
+  a second rewrite of the read path.
 - **A read of the latest committed version costs one record fetch.** This is the whole point of
   in-place-latest, and it is what protects index-free adjacency: a traversal that reads the current
   version of every record it visits walks no chains at all. A reader on an older snapshot walks the
@@ -1828,6 +1907,50 @@ of each level.
 | Network | partition, drop, dup, slow client | backpressure, Bolt state machine, timeouts |
 | Memory | (Miri) UB, (loom) reordering | unsafe/lock-free soundness |
 
+### 11.6 Retiring a mechanism: how "all existing tests stay green" is read
+
+**Ratified on 2026-08-03 as `D-retired-mechanism-tests`** (`02-decision-register.md`). This is a
+general rule of the project's testing obligations, not a rule about any one task.
+
+A task that **retires a mechanism** deletes the code that mechanism's tests exercise. Those tests
+then fail to compile, or fail outright, and the cheapest way to make the suite green again is to
+delete them along with the mechanism. That is exactly what must not happen, because the tests were
+never protecting the *mechanism*; they were protecting the **semantics** the mechanism happened to
+implement, and those semantics survive it.
+
+**The rule.** When a task retires a mechanism, an acceptance criterion of the form "all existing
+tests stay green" is read as:
+
+> **every semantic those tests protected remains asserted by a test that fails if the semantic
+> breaks.**
+
+Two obligations follow, and both are checkable:
+
+1. **Each retired mechanism test is replaced by a named semantic-equivalent that is at least as
+   strong.** "At least as strong" means the replacement fails in every case the original would have
+   failed, against the new mechanism. A replacement that only asserts the new mechanism's internals
+   is weaker, and does not discharge the obligation.
+2. **The replacement is listed in the task's closure summary**, by name, paired with the test it
+   replaces. A reader of the closure summary must be able to see the correspondence without
+   re-deriving it from the diff.
+
+**Why the rule is written down.** This is the project's recurring defect class in which a test passes
+— or simply never runs — while the feature is broken. `VERIFICATION.md` gate 11 records the reference
+case: the only suite that would have caught `rmp` #960 sat behind an opt-in feature that no gate ever
+enabled, so when the defect landed "every gate that *does* run stayed green, start to finish".
+Deleting a mechanism's tests along with the mechanism reaches the same end state by a different
+route — a suite that is green because nothing is asking the question any more. The non-vacuity
+requirement of §11.1 and §11.3 is the same principle applied to a single test; this is that principle
+applied to a task.
+
+**Worked instance.** Task **#967** retires `RecordStore::tombstone_props_for_key` (§5.1.5 row 1) and,
+with it, every test that asserts a property tombstone's `expired_ts`, its chain position, or its
+deferred reclamation. The semantics those tests protected — an older snapshot still reads the
+previous value; a removed property reads as absent; an overwritten property's overflow chain is
+freed exactly once; the chain stays well-formed for the consistency checker — all survive under the
+empty-cell-plus-delta representation, and each one needs a named replacement asserting it against
+the undo chain.
+
 ---
 
 ## 12. Open technical questions to resolve (spikes / measurements before/while coding)
@@ -1848,7 +1971,7 @@ escalations already in `02-decision-register.md`.
    version — a single record fetch with no chain walk. The measured ground for the delta half of the
    choice is the present property path, a tombstone walk plus prepend that is **O(M²)** in the number
    of assignments to one entity (`RecordStore::tombstone_props_for_key`,
-   `crates/graphus-storage/src/store.rs:5646-5666`; **15.1 µs/op at M = 1000**, **97.8 µs/op at
+   `crates/graphus-storage/src/store.rs:6710-6753`; **15.1 µs/op at M = 1000**, **97.8 µs/op at
    M = 8000**), which a constant-cost delta prepend replaces. The model is Memgraph's
    (`/data/refsrc/memgraph/src/storage/v2/delta.hpp:244-392`, `delta_action.hpp:17-33`); the InnoDB
    parallel is cited from official documentation only, as no InnoDB source tree is present in

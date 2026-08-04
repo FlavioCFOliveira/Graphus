@@ -17,7 +17,7 @@
 use graphus_core::{TxnId, Value};
 use graphus_io::MemBlockDevice;
 use graphus_storage::{Namespace, RecordStore};
-use graphus_txn::{CommitRegistry, Snapshot, is_visible};
+use graphus_txn::Snapshot;
 use graphus_wal::{MemLogSink, WalManager};
 
 type Store = RecordStore<MemBlockDevice, MemLogSink>;
@@ -28,35 +28,26 @@ fn fresh() -> Store {
     RecordStore::create(device, wal, 32, 1).expect("create store")
 }
 
-/// The value a reader at `reader` sees for `node`'s property `key`, resolved exactly as the production
-/// read path does: walk the chain, keep the first record of `key` that `is_visible` to `reader`.
+/// The value a reader at `reader` sees for `node`'s property `key`, resolved exactly as the
+/// production read path does.
+///
+/// **Semantic equivalent of** the retired hand-rolled fold (walk the `first_prop` chain, keep the
+/// first record `graphus_txn::is_visible` accepts). That fold encoded the retired oracle — the
+/// cell's own `created_ts`/`expired_ts` — which after `rmp` #967's `D-property-visibility` decides
+/// nothing. It is replaced by the store's own decision-polarity read, which is *stronger* here: the
+/// helper can no longer drift from the production rule, because it now IS the production rule.
 fn visible_value(store: &Store, node: u64, key: u32, reader: Snapshot) -> Option<i64> {
-    let registry: CommitRegistry = store.commit_registry().clone();
-    for (_pid, prop) in store
-        .superset_scan_node_properties(node)
-        .expect("walk property chain")
-        .every_version()
+    let decided = store
+        .decision_scan_node_properties(node, reader)
+        .expect("decision-polarity property read");
+    let seen = decided.visible_version(key)?;
+    match store
+        .decode_property_value(seen.type_tag, seen.value_inline)
+        .expect("decode visible value")
     {
-        if prop.key != key {
-            continue;
-        }
-        if !is_visible(
-            reader,
-            prop.mvcc.created_ts,
-            prop.mvcc.expired_ts,
-            &registry,
-        ) {
-            continue;
-        }
-        return match store
-            .decode_property_value(prop.type_tag, prop.value_inline)
-            .expect("decode visible value")
-        {
-            Value::Integer(i) => Some(i),
-            other => panic!("expected an integer property, got {other:?}"),
-        };
+        Value::Integer(i) => Some(i),
+        other => panic!("expected an integer property, got {other:?}"),
     }
-    None
 }
 
 #[test]

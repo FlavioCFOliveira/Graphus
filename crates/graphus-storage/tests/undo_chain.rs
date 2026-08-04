@@ -394,11 +394,11 @@ fn deltas_are_allocated_a_page_at_a_time() {
 
 /// A store whose durable catalog carries **no** undo-area block is a format-version-1 store: it is
 /// reported as such, opened as an upgrade (no chains, which is exactly what version 1 means), and
-/// rewritten as version 2 by its first checkpoint.
+/// rewritten at the current version by its first checkpoint.
 ///
 /// **Non-vacuity.** The positive control is the round trip: the store is *first* observed at version
-/// 1 and *then* at version 2 after a commit, so neither half can pass by the version being a
-/// hard-coded constant. It fails against a tree with no version field at all, which does not compile.
+/// 1 and *then* at the current version, so neither half can pass by the version being a hard-coded
+/// constant. It fails against a tree with no version field at all, which does not compile.
 #[test]
 fn a_version_1_catalog_is_migrated_on_open() {
     use graphus_storage::Meta;
@@ -410,7 +410,7 @@ fn a_version_1_catalog_is_migrated_on_open() {
     let magic_at = v2
         .windows(8)
         .rposition(|w| w == b"GRPHUNDO")
-        .expect("the version-2 image carries the undo-area magic");
+        .expect("a current-version image carries the undo-area magic");
     let v1 = &v2[..magic_at];
 
     let decoded = Meta::decode(v1).expect("a version-1 image decodes");
@@ -426,14 +426,20 @@ fn a_version_1_catalog_is_migrated_on_open() {
         "a version-1 store has no commit store"
     );
 
-    // ... and the version-2 image of the same catalog decodes as version 2 with the same content.
-    let decoded_v2 = Meta::decode(&v2).expect("a version-2 image decodes");
-    assert_eq!(decoded_v2.format_version, 2);
+    // ... and the full image of the same catalog decodes at the current version with the same
+    // content. The undo-area block's layout is identical from version 2 up (`rmp` #967 changed what a
+    // property cell MEANS, not where anything sits), so this asserts against the live constant rather
+    // than a literal that would have to be edited on every bump.
+    let decoded_v2 = Meta::decode(&v2).expect("a current-version image decodes");
+    assert_eq!(
+        decoded_v2.format_version,
+        graphus_core::constants::FORMAT_VERSION
+    );
     assert_eq!(decoded_v2.element_id_next, decoded.element_id_next);
 }
 
 /// The **head metadata page** carries the format-version tripwire that makes a pre-`rmp`-#966 build
-/// refuse a version-2 store instead of misreading it (`05 §12.6`).
+/// refuse an undo-area-era store instead of misreading it (`05 §12.6`).
 ///
 /// An already-shipped build cannot be taught a new version check, so the refusal has to come from a
 /// validation it already performs. It performs exactly one on this frame: it rejects a catalog chunk
@@ -463,13 +469,32 @@ fn the_head_metadata_page_carries_the_format_tripwire() {
     assert_ne!(
         raw & 0x8000_0000,
         0,
-        "the head metadata page must carry the format-version-2 tripwire, so a pre-#966 build \
+        "the head metadata page must carry the undo-area-era tripwire, so a pre-#966 build \
          fails its own `chunk runs past the page` guard rather than dropping the undo area"
     );
     let len = (raw & !0x8000_0000) as usize;
     assert!(
         len > 0 && len <= graphus_io::PAGE_SIZE - HEADER_SIZE,
         "the masked length is a real chunk length ({len}), so the flag bit can never collide with one"
+    );
+
+    // `rmp` #967: the tripwire must keep protecting each NEW version, not just the one it shipped
+    // for. This store is a version-3 store, and the check below is the *pre-#966* read path executed
+    // verbatim — that build did not know the flag, so it took the raw `u32` as the length and
+    // compared `HEADER_SIZE + 12 + chunk_len` against the page. Reproducing its arithmetic here is
+    // what turns "the bit is set" into "the old build refuses this exact image".
+    assert_eq!(
+        s.opened_format_version(),
+        graphus_core::constants::FORMAT_VERSION,
+        "the fixture must be a store at the CURRENT version, or the claim below is about the wrong \
+         image"
+    );
+    let unmasked_chunk_len = raw as usize;
+    assert!(
+        HEADER_SIZE + 12 + unmasked_chunk_len > graphus_io::PAGE_SIZE,
+        "a pre-#966 build reads the length unmasked ({unmasked_chunk_len}) and must fail its own \
+         `metadata chunk runs past the page` guard on this image; if this ever fits in a page it \
+         would parse the catalog and silently drop the trailing undo-area block"
     );
 }
 
@@ -511,7 +536,7 @@ fn a_future_format_version_is_refused() {
 }
 
 /// A store this build creates **persists** the current format version, so reopening it reports
-/// version 2 rather than falling back to the version-1 default — and `verify_on_open` accepts the
+/// the current version rather than falling back to the version-1 default — and `verify_on_open` accepts the
 /// reopened store with its chains intact.
 ///
 /// **Non-vacuity.** The version is read back from the durable catalog after a real reopen, so a build
