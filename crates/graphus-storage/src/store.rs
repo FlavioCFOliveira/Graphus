@@ -3530,9 +3530,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///
     /// An earlier draft of `rmp` #969 broke the induction and this note records it, because the
     /// failure was silent and the repair is easy to undo by accident. It anchored the incidence
-    /// deltas on the **endpoint node** and let them interleave across transactions; a transaction's
-    /// own incidence delta could then sit on another's uncommitted delta, and a head-only check waved
-    /// the next sequential write through onto it. The chain `[Seq(T1)] → [Inc(T1)] → [Inc(T2)] →
+    /// deltas on the **endpoint node** and let them interleave across transactions, behind an extra
+    /// `incoming_is_non_sequential` parameter this function no longer has; a transaction's own
+    /// incidence delta could then sit on another's uncommitted delta, and a head-only check waved the
+    /// next sequential write through onto it. The chain `[Seq(T1)] → [Inc(T1)] → [Inc(T2)] →
     /// [Seq(T2)]` became reachable, its commit timestamps ascended, and the reproduced consequences
     /// were a lost update, a committed write destroyed by a concurrent abort, and a dirty read of a
     /// label belonging to a still-open transaction. `D-incidence-anchor` removes the possibility at
@@ -6294,6 +6295,21 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// - [`GraphusError::Runtime`] (from [`LabelError`](crate::labels::LabelError)) if
     ///   `label_token_id` is `>= 63`, or the node's bitmap is already in overflow form (#39).
     pub fn add_label(&mut self, txn: TxnId, id: u64, label_token_id: u32) -> Result<()> {
+        // **The conflict check runs BEFORE the liveness test and BEFORE the idempotent no-op exit**,
+        // and both orderings are load-bearing (`rmp` #971).
+        //
+        // Before the no-op exit: the `labels` word this read returns is the **live** one, so it
+        // already carries a bit another open transaction wrote in place. "Already present" is then a
+        // dirty read, and returning `Ok(())` on it reports success for a write that never happened —
+        // if that writer later aborts, the label is simply gone and the transaction that was told it
+        // succeeded has lost its write. Two transactions are enough, and the `LockTable` was the only
+        // thing standing in the way; this check is what replaces it.
+        //
+        // Before the liveness test: a challenger that finds the entity tombstoned by an unresolved
+        // holder must get a **retriable** `Transaction` error, not `Storage`. `Storage` is not
+        // retriable at the Bolt seam and does not trigger the statement-level rollback, so the
+        // refused transaction is left open.
+        self.ensure_no_conflicting_writer(StoreKind::Node, id, txn)?;
         let node = self.read_node(id)?;
         if !Self::is_live_version(node.mvcc) {
             return Err(GraphusError::Storage(format!("node {id} not in use")));
@@ -6322,6 +6338,21 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// - [`GraphusError::Runtime`] (from [`LabelError`](crate::labels::LabelError)) if
     ///   `label_token_id` is `>= 63`, or the node's bitmap is already in overflow form (#39).
     pub fn remove_label(&mut self, txn: TxnId, id: u64, label_token_id: u32) -> Result<()> {
+        // **The conflict check runs BEFORE the liveness test and BEFORE the idempotent no-op exit**,
+        // and both orderings are load-bearing (`rmp` #971).
+        //
+        // Before the no-op exit: the `labels` word this read returns is the **live** one, so it
+        // already reflects a bit another open transaction cleared in place. "Already absent" is then a
+        // dirty read, and returning `Ok(())` on it reports success for a write that never happened —
+        // if that writer later aborts, the label is simply gone and the transaction that was told it
+        // succeeded has lost its write. Two transactions are enough, and the `LockTable` was the only
+        // thing standing in the way; this check is what replaces it.
+        //
+        // Before the liveness test: a challenger that finds the entity tombstoned by an unresolved
+        // holder must get a **retriable** `Transaction` error, not `Storage`. `Storage` is not
+        // retriable at the Bolt seam and does not trigger the statement-level rollback, so the
+        // refused transaction is left open.
+        self.ensure_no_conflicting_writer(StoreKind::Node, id, txn)?;
         let node = self.read_node(id)?;
         if !Self::is_live_version(node.mvcc) {
             return Err(GraphusError::Storage(format!("node {id} not in use")));
@@ -7550,10 +7581,15 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
              ambiguous with a real value (pinned by `undo::tests::no_encoder_can_emit_the_absent_type_tag`)"
         );
         let label = Self::owner_label(kind, entity);
+        // The conflict check runs BEFORE the liveness test (`rmp` #971). A challenger that finds the
+        // entity tombstoned by an **unresolved** holder must be told "retry", not "not in use":
+        // `GraphusError::Storage` is not retriable at the Bolt seam and does not trigger the
+        // statement-level rollback, so the refused transaction was left open. Reproduced on
+        // `SET n = {}`, the one path the retired lock table never covered.
+        self.ensure_no_conflicting_writer(kind, entity, txn)?; // P1
         if !Self::is_live_version(self.read_mvcc(kind, entity)?) {
             return Err(GraphusError::Storage(format!("{label} not in use")));
         }
-        self.ensure_no_conflicting_writer(kind, entity, txn)?; // P1
         let first_prop = self.owner_chain_head(kind, entity)?;
         match self.find_live_prop_cell(first_prop, key, &label)? {
             // (a) The key already has a cell — live or emptied by an earlier `REMOVE`. Reuse it: the
@@ -7588,10 +7624,15 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         key: u32,
     ) -> Result<bool> {
         let label = Self::owner_label(kind, entity);
+        // The conflict check runs BEFORE the liveness test (`rmp` #971). A challenger that finds the
+        // entity tombstoned by an **unresolved** holder must be told "retry", not "not in use":
+        // `GraphusError::Storage` is not retriable at the Bolt seam and does not trigger the
+        // statement-level rollback, so the refused transaction was left open. Reproduced on
+        // `SET n = {}`, the one path the retired lock table never covered.
+        self.ensure_no_conflicting_writer(kind, entity, txn)?; // P1
         if !Self::is_live_version(self.read_mvcc(kind, entity)?) {
             return Err(GraphusError::Storage(format!("{label} not in use")));
         }
-        self.ensure_no_conflicting_writer(kind, entity, txn)?; // P1
         let first_prop = self.owner_chain_head(kind, entity)?;
         let Some((pid, cell)) = self.find_live_prop_cell(first_prop, key, &label)? else {
             return Ok(false);
@@ -7615,11 +7656,16 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         entity: u64,
     ) -> Result<usize> {
         let label = Self::owner_label(kind, entity);
+        // The conflict check runs BEFORE the liveness test (`rmp` #971). A challenger that finds the
+        // entity tombstoned by an **unresolved** holder must be told "retry", not "not in use":
+        // `GraphusError::Storage` is not retriable at the Bolt seam and does not trigger the
+        // statement-level rollback, so the refused transaction was left open. Reproduced on
+        // `SET n = {}`, the one path the retired lock table never covered.
+        self.ensure_no_conflicting_writer(kind, entity, txn)?; // P1
         if !Self::is_live_version(self.read_mvcc(kind, entity)?) {
             return Err(GraphusError::Storage(format!("{label} not in use")));
         }
         // ONE conflict check for the whole operation: it is the entity that is held, not the key.
-        self.ensure_no_conflicting_writer(kind, entity, txn)?; // P1
         let first_prop = self.owner_chain_head(kind, entity)?;
         // Collect before mutating: the walk reads the same records the loop rewrites.
         let cells = self.live_prop_cells(first_prop, &label)?;
