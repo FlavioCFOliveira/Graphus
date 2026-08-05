@@ -960,9 +960,12 @@ and does not restate it.
 | 5 | ~~**Write-lock table plus wait-for-graph deadlock detector.**~~ **CLOSED.** | was `crates/graphus-txn/src/lock.rs` | Conflict detection on the entity's MVCC header, aborting immediately without waiting (§5.7) | **#971 — done** |
 
 Two further tasks complete the model rather than replacing a mechanism. **#972 — done** introduced
-`command_id` and statement-level isolation (§5.1.4). The deterministic writer scheduler required by
-`D-dst-writer-scheduler` extends `07-dst-simulator.md` §5 so that multi-writer behaviour is certified
-from a seed rather than from a race; that one is still outstanding.
+`command_id` and statement-level isolation (§5.1.4). **#973 — done** built the deterministic thread
+scheduler required by `D-dst-writer-scheduler`, so that multi-writer behaviour is certified from a
+seed rather than from a race: the mechanism and its yield points are specified in
+`07-dst-simulator.md` §5.2, and what it did and did not move is in §5.1 of that document. What that
+task delivered is the **scheduler**; the N-concurrent-writer scenarios that consume it are **#975**,
+and until they exist the four write-path yield points are installed but not yet exercised.
 
 **Status of this section: rows 0–5 are closed.** #966 built the undo area, the delta record, the
 commit-info slot and the chain, and brought `undo_ptr` to life; #967 moved the property path onto that
@@ -973,10 +976,15 @@ the engine performs is therefore a delta on one chain, each transaction's commit
 into its slot, chains are reclaimed by watermark at GC, and the consistency checker validates every
 one of them.
 
-**What is still the specified target rather than present behaviour** is the deterministic writer
-scheduler required by `D-dst-writer-scheduler`. `command_id` is no longer on that list: **#972** made
-it live, so a delta carries the statement that wrote it and is `0` only when the write happened
-outside any statement (§5.1.4). The `graphus-txn` transaction manager also still runs against a
+**What is still the specified target rather than present behaviour** is the seeded dispatch of
+**several concurrent writers** against one database, which `D-dst-writer-scheduler` names as the
+prerequisite of multi-writer certification. The scheduler that makes such a run reproducible is no
+longer outstanding — **#973** built it, and the `rmp` #811 class (garbage collection racing an
+off-thread reader at page-latch granularity) is now reproducible from a seed
+(`07-dst-simulator.md` §5.2) — but the writers it is to order are not created until **#975**.
+`command_id` is likewise no longer outstanding: **#972** made it live, so a delta carries the
+statement that wrote it and is `0` only when the write happened outside any statement (§5.1.4). The
+`graphus-txn` transaction manager also still runs against a
 placeholder store — "the real `graphus_storage` does not yet implement version-chain mechanics", and
 wiring it up "is a follow-up task, intentionally **out of scope** here"
 (`crates/graphus-txn/src/store.rs`); that is a statement about the SSI harness's own test seam (§5.7),
@@ -1333,9 +1341,15 @@ block one another either — they either proceed or abort.
 
 **Certification.** Multi-writer correctness is certified from a **deterministic writer schedule**, not
 from an unreproducible race: `D-dst-writer-scheduler` requires the DST simulator to dispatch several
-concurrent writers against one database from a seeded schedule, extending the cooperative interleaver
-of `07-dst-simulator.md` §5 to the write path and narrowing the fidelity ceiling named in §5.1 of that
-document. This is a prerequisite of the multi-writer sign-off, not a follow-up to it.
+concurrent writers against one database from a seeded schedule. This is a prerequisite of the
+multi-writer sign-off, not a follow-up to it. The scheduling mechanism arrived with task **#973** and
+is specified in `07-dst-simulator.md` §5.2: a single execution token handed between real OS threads at
+declared yield points, with the successor drawn from a seeded RNG, so the global order of operations
+becomes a pure function of the seed. It narrows the fidelity ceiling named in §5.1 of that document —
+garbage collection racing an off-thread reader at page-latch granularity is now seed-reproducible —
+without removing it. **The certification itself is not yet complete**: the write-path yield points are
+installed but not exercised, because a database still has one writer thread. Task **#975** creates the
+concurrent writers the schedule is meant to order.
 
 **What was retired — CLOSED by task #971.** The write-lock table and the wait-for-graph deadlock
 detector lived in `crates/graphus-txn/src/lock.rs`; the file is gone, and with it the lock-wait
@@ -2195,6 +2209,12 @@ injected capabilities (a lint/architecture test enforces this).
 - **Simulation mode:** a single-threaded deterministic scheduler drives time, RNG (seeded), task
   interleaving, and a model filesystem. The **entire storage/txn/cypher stack runs inside the
   simulator** in one thread, so a run is **fully reproducible from a seed**.
+- **Scheduled-thread mode:** reproducibility is **not** confined to a single thread. A run may also
+  install the deterministic **thread** scheduler (`07-dst-simulator.md` §5.2, task #973), which hands
+  one execution token between **real OS threads** at declared yield points and draws the successor
+  from a seeded RNG. Several real threads sharing one store then produce a byte-identical history for
+  a given seed. It is gated on the `det-sched` cargo feature, costs production builds nothing, and is
+  mutually exclusive with ThreadSanitizer and `loom`, which own the interleaving themselves.
 - **Fault injection points:** the model FS injects torn writes, short writes, **fsync failures**
   (to exercise §4.9 PANIC), reordered/dropped writes, and crashes **at arbitrary LSNs**; the
   scheduler injects task delays and unfavorable interleavings; the network layer injects partitions

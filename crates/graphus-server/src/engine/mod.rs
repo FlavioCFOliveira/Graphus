@@ -245,6 +245,12 @@ impl WalSyncThread {
         let handle = std::thread::Builder::new()
             .name(format!("graphus-walsync-{db_name}"))
             .spawn(move || {
+                // `rmp` #973: deliberately OUTSIDE the deterministic scheduler. This thread exists to
+                // take a blocking `fdatasync` off the engine thread; scheduling it would put a real
+                // syscall on the critical path of the token, and durability latency is not what a
+                // deterministic interleaving is trying to model. Marked EXPLICITLY rather than left
+                // unregistered, so an unmarked thread reaching a yield point still fails loudly.
+                graphus_core::sched::exempt();
                 // Run each submitted `fdatasync` in order, forwarding its outcome. The loop ends (and
                 // the thread exits cleanly) when the engine drops `job_tx` at shutdown, or if the
                 // result channel is gone (engine already torn down).
@@ -4439,6 +4445,12 @@ where
         .stack_size(QUERY_ENGINE_STACK_SIZE)
         .spawn(move || match build() {
             Ok(coordinator) => {
+                // `rmp` #973: the server's engine thread is deliberately OUTSIDE the deterministic
+                // scheduler. Bringing the server engine under it needs the blocking command/reply
+                // channels handled first (a thread parked in `recv()` holding the token freezes the
+                // run), which is its own task; the DST drives `LocalEngine` inline instead. Marked
+                // explicitly so it never reaches a yield point unregistered.
+                graphus_core::sched::exempt();
                 // Install the shared drain-progress beacon into the store (`rmp` #563) so its long GC
                 // and flush loops heartbeat the SAME `AtomicU64` the handle exposes to `stop_engine`.
                 coordinator.set_drain_progress(loop_drain_progress);

@@ -10506,6 +10506,12 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     }
 
     pub fn read_task_inputs(&self, txn: TxnId) -> Result<ReadTaskInputs<D, S>> {
+        // `rmp` #973: the snapshot an off-thread read task carries away, together with the page map
+        // and token snapshot it will read through. Everything the task later sees is fixed here.
+        graphus_core::sched::yield_at(
+            graphus_core::sched::YieldSite::SnapshotReadTaskInputs,
+            graphus_core::sched::ResourceId::txn(txn.0),
+        );
         let snapshot = self.active.get(&txn).map(|a| a.snapshot).ok_or_else(|| {
             GraphusError::Transaction(format!("read dispatch for inactive txn {}", txn.0))
         })?;
@@ -11007,6 +11013,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// that reader's begin timestamp, deliberately holding reclamation of everything it might read.
     #[must_use]
     pub fn oldest_active_snapshot(&self) -> Option<Timestamp> {
+        // `rmp` #973: the reclamation floor every GC watermark derives from. A transaction that
+        // begins (or ends) either side of this read moves the floor, so which interleaving reaches it
+        // decides what GC is allowed to reclaim — exactly the kind of ordering a seed must be able to
+        // replay.
+        graphus_core::sched::yield_at(
+            graphus_core::sched::YieldSite::SnapshotOldestActive,
+            graphus_core::sched::ResourceId::NONE,
+        );
         self.active.values().map(|a| a.snapshot.ts).min()
     }
 

@@ -111,7 +111,13 @@ impl FsyncPool {
             let receiver: Arc<std::sync::Mutex<Receiver<Job>>> = Arc::clone(&receiver);
             let handle = std::thread::Builder::new()
                 .name(format!("graphus-fsync-{i}"))
-                .spawn(move || worker_loop(&receiver))
+                .spawn(move || {
+                    // `rmp` #973: fsync workers are deliberately OUTSIDE the deterministic scheduler
+                    // — they exist to move a blocking syscall off a latency-critical thread, and they
+                    // block on a channel receive.
+                    graphus_core::sched::exempt();
+                    worker_loop(&receiver);
+                })
                 .expect("spawn fsync worker thread");
             workers.push(handle);
         }

@@ -8,6 +8,26 @@ repository.workspace = true
 authors.workspace = true
 description = "Shared vocabulary (IDs, value model, errors, capability traits, constants) for Graphus."
 
+[features]
+# Deterministic writer scheduling for DST (`rmp` #973, `src/sched.rs`): turns the engine's yield
+# points — page-latch acquisition and release, thread spawn/exit, commit publication, snapshot
+# acquisition, GC phases — into hand-offs of a single execution token driven by a seeded RNG, so the
+# global interleaving of N real writer threads becomes a pure function of the seed.
+#
+# OFF by default and enabled by NO dependency declaration anywhere in the workspace: only
+# `graphus-dst`'s own `det-sched` passthrough turns it on, and only for the targets that declare
+# `required-features = ["det-sched"]`. That isolation is the point. Cargo unifies features per
+# resolve, so a crate that merely *declared* this dependency would arm the hook in every build that
+# transitively reaches `graphus-core` — which is every crate in the workspace.
+#
+# Deliberately a cargo feature rather than `debug_assertions` (the gate `src/latch.rs` chose). The
+# latch tripwire wants to be armed across the whole test suite because it is a *correctness*
+# tripwire that costs a thread-local increment. A scheduler hook is *hot-path instrumentation* — it
+# sits on `with_page_fetched`, the single hottest read in the engine — and arming it in every
+# `cargo test --workspace` would instrument the very paths the certification gates exist to certify,
+# the argument `graphus-storage/Cargo.toml` already makes for `read-probe` and `bufpool-probe`.
+det-sched = []
+
 [dependencies]
 # IANA time-zone resolution (src/timezone.rs). It lives in this crate — the one every layer can
 # already reach — because the two ingress paths for a named zone MUST resolve it identically:
@@ -26,3 +46,12 @@ description = "Shared vocabulary (IDs, value model, errors, capability traits, c
 # not pull in `chrono`.
 jiff-tzdb = "0.1.6"
 tz-rs = "0.7.3"
+
+# `loom` (set by the buffer pool's model-check lane) and `tsan` (set by `scripts/tsan-soak.sh`) are
+# known custom cfgs this crate reads in `src/sched.rs` to REFUSE the combination with `det-sched`:
+# both of those lanes own the thread interleaving themselves, and the deterministic scheduler running
+# underneath them would make their findings vacuous. Register them so `unexpected_cfgs` — and
+# therefore `clippy -D warnings` — stays quiet without a build script, exactly as
+# `graphus-bufpool/Cargo.toml` does for `loom`.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(tsan)'] }

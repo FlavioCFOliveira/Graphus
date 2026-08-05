@@ -140,6 +140,7 @@
 use rustc_hash::FxHashMap as HashMap;
 
 use graphus_core::error::{GraphusError, Result};
+use graphus_core::sched::{self, ReleaseAllOnDrop, ReleaseOnDrop, ResourceId, YieldSite};
 use graphus_core::{Lsn, PageId};
 use graphus_io::{BlockDevice, PAGE_SIZE, Page};
 
@@ -622,14 +623,40 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
         })
     }
 
-    fn shard_of(&self, page_id: PageId) -> &Mutex<HashMap<PageId, Slot>> {
+    /// Which shard of the page table owns `page_id`.
+    fn shard_index(page_id: PageId) -> usize {
         // A cheap, deterministic spread; the exact hash is not load-bearing for correctness.
         let h = page_id.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize;
-        &self.table[h % SHARD_COUNT]
+        h % SHARD_COUNT
     }
 
-    fn lock_shard(&self, page_id: PageId) -> MutexGuard<'_, HashMap<PageId, Slot>> {
-        unwrap_lock(self.shard_of(page_id).lock())
+    fn shard_of(&self, page_id: PageId) -> &Mutex<HashMap<PageId, Slot>> {
+        &self.table[Self::shard_index(page_id)]
+    }
+
+    /// Takes the page-table shard lock for `page_id`, entering a **no-hand-off region** for as long
+    /// as it is held (`rmp` #973).
+    ///
+    /// The shard lock is deliberately *not* a yield point, and that is a safety property rather than
+    /// an omission. It is taken around work that itself reaches yield points and, worse, around work
+    /// that holds a frame latch: `fetch` publishes its `Ready` entry under the shard lock while still
+    /// holding the freshly loaded victim's write latch, and `select_victim` runs its entire CLOCK
+    /// sweep under it. Handing the execution token over anywhere in there would park a thread holding
+    /// a lock every other thread blocks on — and with only one thread running at a time, that is a
+    /// frozen simulation, not a slow one.
+    ///
+    /// Suppressing the hand-off (rather than forbidding the yield) keeps the history complete: a
+    /// yield point reached inside the region is still recorded, so `select_victim`'s site is provably
+    /// visited even though the schedule cannot act on it there.
+    ///
+    /// With `det-sched` off the scope is a zero-sized type with an empty `Drop` and this is exactly
+    /// the `unwrap_lock(shard.lock())` it replaced.
+    fn lock_shard(&self, page_id: PageId) -> ShardGuard<'_> {
+        let no_switch = sched::NoSwitchScope::new();
+        ShardGuard {
+            guard: unwrap_lock(self.shard_of(page_id).lock()),
+            _no_switch: no_switch,
+        }
     }
 
     /// Acquires a **shared read** guard on the device for the `&self` methods (`read_page`,
@@ -672,7 +699,8 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
     /// distinct frames concurrently. `func` must not block or call back into the pool with this
     /// frame.
     pub fn with_page<R>(&self, f: PinnedFrame, func: impl FnOnce(&Page) -> R) -> R {
-        let meta = unwrap_lock(self.slot(f).meta.read());
+        let _release = frame_release(f.0);
+        let meta = latch_read(self.slot(f), f.0, YieldSite::FrameReadWithPage);
         func(&meta.data)
     }
 
@@ -684,7 +712,8 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
     /// Returns a storage error if `f` is out of bounds for this pool.
     pub fn try_with_page<R>(&self, f: PinnedFrame, func: impl FnOnce(&Page) -> R) -> Result<R> {
         let slot = self.try_slot(f)?;
-        let meta = unwrap_lock(slot.meta.read());
+        let _release = frame_release(f.0);
+        let meta = latch_read(slot, f.0, YieldSite::FrameReadTryWithPage);
         Ok(func(&meta.data))
     }
 
@@ -732,7 +761,11 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
                 // latch-before-unpin discipline (`rmp` #337 Slice 1) is preserved with no second latch
                 // acquisition and no extra per-hit cost.
                 let guard = self.pin_guard(PinnedFrame(idx));
-                let meta = unwrap_lock(self.frames[idx].meta.read());
+                // The scheduler's release announcement sits BETWEEN the pin guard and the latch, so
+                // the reverse-drop order becomes latch → announce → unpin: a parked thread is only
+                // ever woken for a latch that is already free (`rmp` #973).
+                let _release = frame_release(idx);
+                let meta = latch_read(&self.frames[idx], idx, YieldSite::FrameReadFetched);
                 if meta.page_id == Some(page_id) {
                     let r = func(&meta.data);
                     drop(meta); // release the read latch first...
@@ -761,7 +794,8 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
     /// Takes the frame's **write latch** for the duration of `func` (exclusive). `func` must not
     /// block or call back into the pool with this frame.
     pub fn with_page_mut<R>(&self, f: PinnedFrame, func: impl FnOnce(&mut Page) -> R) -> R {
-        let mut meta = unwrap_lock(self.slot(f).meta.write());
+        let _release = frame_release(f.0);
+        let mut meta = latch_write(self.slot(f), f.0, YieldSite::FrameWriteWithPageMut);
         meta.dirty = true;
         func(&mut meta.data)
     }
@@ -782,7 +816,8 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
         lsn: Lsn,
         func: impl FnOnce(&mut Page) -> R,
     ) -> R {
-        let mut meta = unwrap_lock(self.slot(f).meta.write());
+        let _release = frame_release(f.0);
+        let mut meta = latch_write(self.slot(f), f.0, YieldSite::FrameWriteWithPageMutLsn);
         meta.dirty = true;
         page::set_page_lsn(&mut meta.data, lsn);
         func(&mut meta.data)
@@ -862,7 +897,8 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
                         self.frames[idx].pin_count.fetch_add(1, Ordering::Acquire);
                         self.frames[idx].ref_bit.store(1, Ordering::Relaxed);
                         drop(shard);
-                        let meta = unwrap_lock(self.frames[idx].meta.read());
+                        let _release = frame_release(idx);
+                        let meta = latch_read(&self.frames[idx], idx, YieldSite::FrameReadFetch);
                         if meta.page_id == Some(page_id) {
                             #[cfg(feature = "bufpool-probe")]
                             self.probe.record_retry_iters(iter);
@@ -1199,6 +1235,11 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
     pub fn flush(&self, f: PinnedFrame) -> Result<()> {
         for _ in 0..WAL_HOIST_ATTEMPTS {
             let needs_harden = {
+                // Offer the token BEFORE the latched region opens (`rmp` #973). It cannot be offered
+                // at the acquisition below: the tripwire scope is armed first, so a hand-off there
+                // would park this thread holding the frame latch.
+                sched::yield_at(YieldSite::FrameWriteFlush, ResourceId::frame(f.0));
+                let _release = frame_release(f.0);
                 let latch = graphus_core::latch::FrameLatchScope::new();
                 let mut meta = unwrap_lock(self.frames[f.0].meta.write());
                 if !meta.dirty {
@@ -1244,6 +1285,8 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
         // No hoist loop is needed: an unlogged page has nothing in the WAL that must precede it, so
         // this path never hardens. The tripwire is still armed, so a future change that introduces a
         // barrier here is caught rather than silently reopening the `rmp` #974 convoy.
+        sched::yield_at(YieldSite::FrameWriteFlushUnlogged, ResourceId::frame(f.0));
+        let _release = frame_release(f.0);
         let _latch = graphus_core::latch::FrameLatchScope::new();
         let mut meta = unwrap_lock(self.frames[f.0].meta.write());
         self.write_back(&mut meta, true)
@@ -1561,6 +1604,12 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
             }
             // Unpinned ⇒ a real eviction candidate, even if we cannot take it this pass.
             all_pinned = false;
+            // Offer the token before contending for this candidate's latch (`rmp` #973). The sweep
+            // runs under the caller's shard lock, so this is inside a no-hand-off region: the step is
+            // recorded — the site is provably reached — but the token stays put, because parking here
+            // would strand the shard lock every other thread needs. A future caller that sweeps with
+            // no shard lock held gets a real hand-off from the same line.
+            sched::yield_at(YieldSite::FrameWriteSelectVictim, ResourceId::frame(idx));
             // `try_write` never blocks: a frame momentarily latched by a reader/loader is skipped this
             // pass — it is unpinned, so it WILL become takeable shortly (the caller retries).
             let Ok(guard) = slot.meta.try_write() else {
@@ -1617,6 +1666,7 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
                 idx,
                 guard,
                 _latch: latch,
+                _release: frame_release(idx),
             });
         }
         #[cfg(feature = "bufpool-probe")]
@@ -2074,6 +2124,10 @@ struct Victim<'a> {
     /// this thread holds the victim's latch, which is the whole of
     /// `select_victim` → `load_into` → `evict_held` → `write_back`.
     _latch: graphus_core::latch::FrameLatchScope,
+    /// The scheduler's release announcement (`rmp` #973), declared **last** so it fires after both
+    /// the latch guard and the tripwire scope: the blocked set therefore reopens only once this
+    /// frame's latch is genuinely free. Zero-sized with `det-sched` off.
+    _release: ReleaseOnDrop,
 }
 
 /// The dirty frames of one batch flush, with their write latches held.
@@ -2084,6 +2138,12 @@ struct Victim<'a> {
 struct FlushBatch<'a> {
     guards: Vec<(usize, RwLockWriteGuard<'a, FrameMeta>)>,
     _latch: graphus_core::latch::FrameLatchScope,
+    /// The scheduler's release announcement (`rmp` #973), declared **last** so it fires after every
+    /// guard has been dropped. It reopens the blocked set for *all* resources rather than naming
+    /// each frame: this batch latches and releases many frames at once, and a superset wake-up is
+    /// safe (a thread woken for a resource still held retries and re-parks) where a missed one would
+    /// be a lost wake-up reported as a deadlock. Zero-sized with `det-sched` off.
+    _release: ReleaseAllOnDrop,
 }
 
 impl<'a> FlushBatch<'a> {
@@ -2095,6 +2155,10 @@ impl<'a> FlushBatch<'a> {
         pool: &'a ConcurrentBufferPool<D, W>,
         want: Option<&rustc_hash::FxHashSet<u64>>,
     ) -> Self {
+        // Offer the token BEFORE the batch's latched region opens (`rmp` #973). It cannot be offered
+        // per frame inside the loop: from the first guard onwards this thread holds latches, and a
+        // hand-off there would park a holder of N of them.
+        sched::yield_at(YieldSite::FrameWriteFlushBatch, ResourceId::NONE);
         let latch = graphus_core::latch::FrameLatchScope::new();
         let mut guards: Vec<(usize, RwLockWriteGuard<'a, FrameMeta>)> = Vec::new();
         for (idx, slot) in pool.frames.iter().enumerate() {
@@ -2111,6 +2175,7 @@ impl<'a> FlushBatch<'a> {
         Self {
             guards,
             _latch: latch,
+            _release: ReleaseAllOnDrop::new(YieldSite::FrameLatchRelease),
         }
     }
 }
@@ -2198,6 +2263,78 @@ enum VictimChoice<'a> {
 /// guard is taken via [`PoisonError::into_inner`] rather than re-panicking.
 fn unwrap_lock<G>(r: std::result::Result<G, std::sync::PoisonError<G>>) -> G {
     r.unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The page-table shard lock, held together with the no-hand-off region it implies (`rmp` #973).
+///
+/// Field order is load-bearing: `guard` drops first (releasing the lock), `_no_switch` second
+/// (leaving the region), so the region can never outlive the lock it protects. Derefs to the shard
+/// map, so every existing `shard.get(..)` / `shard.insert(..)` / `drop(shard)` reads unchanged; with
+/// `det-sched` off the scope is zero-sized with an empty `Drop` and the derefs inline away.
+struct ShardGuard<'a> {
+    guard: MutexGuard<'a, HashMap<PageId, Slot>>,
+    _no_switch: sched::NoSwitchScope,
+}
+
+impl std::ops::Deref for ShardGuard<'_> {
+    type Target = HashMap<PageId, Slot>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for ShardGuard<'_> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+/// Takes a frame's **read** latch through the deterministic-scheduler seam (`rmp` #973).
+///
+/// The seam offers the execution token back at `site` *before* the latch is taken — never with it in
+/// hand — and then acquires. Under a scheduler the non-blocking attempt is what makes contention
+/// visible: a thread that cannot take the latch parks on the frame and the token moves on, so a
+/// contended acquisition becomes a scheduled wait (or a reported deadlock) rather than a frozen
+/// simulation. With `det-sched` off — every production build — this reduces to exactly the
+/// `unwrap_lock(…read())` the call sites used before, with the closure eliminated as dead code.
+///
+/// The non-blocking attempt maps a *poisoned* latch to "not taken", matching what
+/// [`ConcurrentBufferPool::select_victim`] already does with its `try_write`; the blocking fallback
+/// keeps the pool's poison-recovery policy ([`unwrap_lock`]) unchanged.
+#[inline]
+fn latch_read(slot: &FrameSlot, index: usize, site: YieldSite) -> RwLockReadGuard<'_, FrameMeta> {
+    sched::acquire(
+        site,
+        ResourceId::frame(index),
+        || slot.meta.try_read().ok(),
+        || unwrap_lock(slot.meta.read()),
+    )
+}
+
+/// Takes a frame's **write** latch through the deterministic-scheduler seam. See [`latch_read`].
+#[inline]
+fn latch_write(slot: &FrameSlot, index: usize, site: YieldSite) -> RwLockWriteGuard<'_, FrameMeta> {
+    sched::acquire(
+        site,
+        ResourceId::frame(index),
+        || slot.meta.try_write().ok(),
+        || unwrap_lock(slot.meta.write()),
+    )
+}
+
+/// The release half of the frame-latch protocol (`rmp` #973).
+///
+/// Declare it **before** the latch guard: locals drop in reverse declaration order, so the guard
+/// releases the latch first and this announcement reopens the scheduler's blocked set second — a
+/// parked thread is therefore only ever woken for a latch that is genuinely free. Without the release
+/// half the blocked set never reopens and the run livelocks; it is not an optional companion to the
+/// acquisition hook, it is the other half of it.
+#[inline]
+fn frame_release(index: usize) -> ReleaseOnDrop {
+    ReleaseOnDrop::new(YieldSite::FrameLatchRelease, ResourceId::frame(index))
 }
 
 /// Eviction-diagnostics probe (`rmp` #359, `bufpool-probe` feature only). A small set of atomic

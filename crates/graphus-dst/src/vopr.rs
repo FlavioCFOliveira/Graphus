@@ -419,6 +419,19 @@ pub struct VoprReport {
     pub trace_hash: u64,
     /// Stable hash of the final graph state (an ordered snapshot of nodes + relationships).
     pub state_hash: u64,
+    /// Stable hash of the **thread-scheduling** history of this run (`rmp` #973), folded through the
+    /// same [`Fnv`] as the two digests above.
+    ///
+    /// `VoprReport` derives `PartialEq` and the determinism gate compares whole reports, so adding
+    /// the field puts the schedule under the existing gate without touching it.
+    ///
+    /// Today this is **`0` for every VOPR run**, and honestly so: the wire/engine VOPR drives the
+    /// engine inline on one thread with no scheduler installed, so there is no interleaving to
+    /// digest — `graphus_core::sched::history_hash()` returns `None` and the field records the
+    /// absence rather than inventing a number. It becomes live the moment a VOPR run drives real
+    /// concurrent writers under `crate::detsched` (`rmp` #975), at which point a schedule divergence
+    /// fails the same gate a trace divergence already does.
+    pub sched_history_hash: u64,
     /// Logical time (ns) at the end of the run.
     pub end_time: u64,
     /// Number of `:Person` nodes the workload asked to create (the generator's id space). This counts
@@ -1031,6 +1044,9 @@ fn run_inner(cfg: VoprConfig, mode: RunMode) -> (VoprReport, Vec<ElleTxn>, Liven
         err_ops,
         trace_hash: trace.finish(),
         state_hash,
+        // `None` (no scheduler installed) folds to `0`, which is what every inline VOPR run records.
+        // See the field's documentation: this is the absence of a schedule, not a fabricated digest.
+        sched_history_hash: graphus_core::sched::history_hash().unwrap_or(0),
         end_time,
         created_nodes,
         persisted_nodes,
@@ -2355,14 +2371,25 @@ fn error_class(msg: &str) -> &'static str {
 }
 
 /// A tiny, dependency-free FNV-1a 64-bit hasher used to build the stable run digests.
-struct Fnv(u64);
+///
+/// `pub(crate)` so the deterministic scheduler (`crate::detsched`, `rmp` #973) folds its scheduling
+/// history through the **same** hasher this module already uses for the trace and state digests —
+/// one digest implementation for every stable run identity in the harness, rather than two that
+/// could drift.
+pub(crate) struct Fnv(u64);
+
+impl std::fmt::Debug for Fnv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Fnv({:#018x})", self.0)
+    }
+}
 
 impl Fnv {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self(0xcbf2_9ce4_8422_2325)
     }
 
-    fn bytes(&mut self, data: &[u8]) {
+    pub(crate) fn bytes(&mut self, data: &[u8]) {
         for &b in data {
             self.0 ^= u64::from(b);
             self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
@@ -2374,6 +2401,15 @@ impl Fnv {
     }
 
     fn finish(&self) -> u64 {
+        self.0
+    }
+
+    /// The digest so far, without consuming the hasher (the scheduler keeps folding into it).
+    ///
+    /// Only the deterministic scheduler needs a running read; `finish` serves every other caller, so
+    /// this is gated with the module that uses it rather than left as dead code in the default build.
+    #[cfg(feature = "det-sched")]
+    pub(crate) fn peek(&self) -> u64 {
         self.0
     }
 }
@@ -3216,6 +3252,7 @@ mod tests {
             err_ops: 0,
             trace_hash: 0,
             state_hash: 0,
+            sched_history_hash: 0,
             end_time: 0,
             created_nodes: 5,
             persisted_nodes: 5,

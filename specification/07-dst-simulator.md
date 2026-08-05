@@ -46,6 +46,8 @@ draws.
 | `MemBlockDevice` + `FaultPlan` | `graphus-io` (`mem`) | The simulated disk; a seeded `FaultPlan` arms the full disk-corruption model (bit-rot, misdirected I/O, latent sector error, ENOSPC, write reordering) — see section 6. |
 | `SimNet` + `TransportFaultPlan` | `graphus-sim` (`net`) | Deterministic in-memory network with a seeded transport-fault model (mid-message drop, truncate-then-stall, slow consumer) — see section 6. |
 | VOPR core | `graphus-dst` (`vopr`) | Builds the world, runs the seed-driven **cooperative interleaver** of overlapping explicit transactions, records a canonical FNV-1a event trace + state hash, and runs the oracles. CLI: `graphus-dst vopr --seed B --seeds K`. |
+| Thread-scheduling seam | `graphus-core` (`sched`) | The yield points at which a **real OS thread** offers the execution token back: page-latch acquisition and release, thread spawn/exit, both halves of commit publication, snapshot acquisition, free-list push, and each GC phase. Behind the `det-sched` cargo feature, off by default — see section 5.2. |
+| `DetScheduler` | `graphus-dst` (`detsched`) | The seeded policy behind that seam: one execution token, an ordered runnable set, a `SimRng`-drawn successor, park/release on contended resources, deadlock and stall detection, a bounded step budget, and a byte-comparable `SchedHistory`. Driven by `run_scheduled` — see section 5.2. |
 | Fault scheduler | `graphus-dst` (`vopr_fault`) | Schedules disk/clock/transport/crash faults on the VOPR timeline under a bounded `FaultBudget`, folded into the canonical trace — see section 6. |
 | Reference-model oracle | `graphus-dst` (`vopr_oracle`) | A deterministic shadow LPG compared cell-by-cell against the engine on every commit — see section 8. |
 | Repro + shrink | `graphus-dst` (`vopr_repro`) | Persisted JSON replay artifacts and a deterministic config shrinker — see section 11. |
@@ -86,6 +88,13 @@ transaction open at the same scheduler instant** — real overlap, not serialize
 The interleaver runs **single-threaded**. All randomness comes from the scheduler's seeded RNG, so the
 entire interleaving is a pure function of the seed.
 
+**It is not the simulator's only deterministic scheduler, and the two are not interchangeable.** The
+cooperative interleaver orders **transaction lifetimes** on one OS thread, with each Cypher statement
+atomic. The **deterministic thread scheduler** of section 5.2 orders **real OS threads**, at the
+granularity of a declared yield point *inside* a statement. They answer different questions — a
+transaction-ordering anomaly against an intra-operation interleaving race — and they coexist: the
+interleaver is always on, the thread scheduler is installed only by a run that asks for it.
+
 - **`advance_client`** advances exactly one client's state machine by one step, executes it against the
   engine, folds the `(client, step kind, outcome)` into the canonical trace in dispatch order, and
   schedules the client's following step.
@@ -97,40 +106,254 @@ entire interleaving is a pure function of the seed.
   (trace, state, counts, oracle). Any mismatch is a determinism failure — the simulator's own core
   invariant — counted and listed for one-line reproduction.
 
-### 5.1 Concurrency-fidelity ceiling — what DST does **not** cover, and who owns it (rmp #460)
+### 5.1 Concurrency-fidelity ceiling — what DST does **not** cover, and who owns it (rmp #460, #973)
 
 The cooperative interleaver's "concurrency" is **overlapping transaction lifetimes on one cooperative
 OS thread**, with **each Cypher statement executed atomically to completion** before the next client's
-step begins. This is deliberate: true OS-thread parallelism would reintroduce non-determinism and break
-the seed-replay gate. The consequence is a precise, named **fidelity ceiling**: an entire class of
-**true-parallel races is structurally invisible to DST** and is therefore **owned by other suites, not
-DST**. Reviewers must not attribute a parallel-memory property to "DST-proven".
+step begins. On its own that leaves a precise, named **fidelity ceiling**: a class of **true-parallel
+races is invisible to it** and is therefore **owned by other suites, not by the interleaver**.
+Reviewers must not attribute a parallel-memory property to "DST-proven".
+
+The deterministic thread scheduler of section 5.2 **narrows that ceiling. It does not remove it.**
+What moved and what did not is stated exactly below, and the distinction is load-bearing.
 
 What DST genuinely covers: transaction-overlap / SSI logical races (e.g. `#171`/`#172`/`#220`),
 durability and atomicity across ARIES crash-restart, determinism, single-thread disk/clock fault
 recovery, the backup/restore/key-rotation crash windows (section 10), and the property-value /
-secondary-index oracle (section 8). What DST **cannot** exercise, with its real owner:
+secondary-index oracle (section 8).
 
-| Parallel-race class (invisible to DST) | Owning suite(s) — the authoritative proof |
+**What the thread scheduler moved inside the ceiling.** **Garbage collection racing an off-thread
+reader, at the granularity of the buffer-pool page latch, is now reproducible deterministically from a
+seed.** The demonstrated case is `rmp` #811: the reader is placed mid-property-chain-walk — it has
+captured the record id of the next link and has not yet read it — while the engine thread runs GC
+phase D and rewrites that record in place. `graphus-dst/tests/det_scheduler_gc_reader_811.rs` enters
+that window **by construction** in 24 GC cycles, and **proves** it entered it by locating the phase-D
+step between two of the reader's record-read steps in the recorded history. `graphus-storage`'s own
+`offthread_reader_never_loses_live_property_across_gc_811` remains the probabilistic owner of the same
+window: it hammers 20 000 cycles hoping the OS scheduler cooperates, and nothing in it can say whether
+the window was ever entered. Two real threads sharing one store — the engine thread (writer and GC)
+and an off-thread reader — therefore now produce a **byte-identical history for a given seed**.
+
+**What that claim does not extend to.** It is reproducibility of an *interleaving*, over the threads
+that share a store today. It is **not** a certification of N parallel writers: this simulator creates
+none. The N-writer scenarios that `D-dst-writer-scheduler` requires arrive with `rmp` #975, and the
+four write-path yield points (`WriteReadMvcc`, `WriteConflictCheck`, `WriteChainHeadUnheld`,
+`WriteLinkDelta`) are installed but **not yet exercised** — with one writer thread per database there
+is nothing to interleave at them. The code says so at each of them, and so does this specification.
+
+What remains **outside** the ceiling, with its real owner:
+
+| Parallel-race class (still invisible to DST) | Owning suite(s) — the authoritative proof |
 | --- | --- |
-| Off-thread reader pool (`#336`): reads run **inline** under DST (`ReadDispatch::Inline` is hardcoded in `LocalEngine`), never on the pool | `graphus-server/tests/concurrent_read_scaling.rs`, `concurrent_reader_serializability.rs` |
-| Intra-query **morsel** fan-out (`#339`): DST never sets `morsel_threads > 1`, so it runs fully serial (degree 1) | `concurrent_read_scaling.rs` (real reader pool + morsel threads) |
-| `ConcurrentBufferPool` contended victim sweep / the `#359` fetch livelock; concurrent evictors | `graphus-bufpool/tests/loom_bufpool.rs`, `loom_eviction_storm.rs`, `loom_freeze_vs_reader.rs` |
+| The server's off-thread reader **pool** (`#336`). DST drives `LocalEngine`, whose dispatch is a hardcoded `ReadDispatch::Inline`; the pool's workers are marked `sched::exempt` because they block in `recv()` on a bounded channel, and a thread that parks in `recv()` holding the execution token freezes the simulation. Bringing them under the scheduler requires the channel to become a scheduled resource. *(A single off-thread reader **thread** against GC is covered — see above. The **pool** is not.)* | `graphus-server/tests/concurrent_read_scaling.rs`, `concurrent_reader_serializability.rs` |
+| Intra-query **morsel** fan-out (`#339`): DST never sets `morsel_threads > 1`, so it runs fully serial (degree 1). The rayon workers are marked `sched::exempt` for a different reason of their own — rayon owns its work-stealing scheduler, and two schedulers cannot both decide which thread runs | `concurrent_read_scaling.rs` (real reader pool + morsel threads) |
+| `ConcurrentBufferPool` contended victim sweep / the `#359` fetch livelock; concurrent evictors. The scheduler **records** `select_victim` but cannot hand the token over there: the sweep runs under the page-table shard lock (section 5.2) | `graphus-bufpool/tests/loom_bufpool.rs`, `loom_eviction_storm.rs`, `loom_freeze_vs_reader.rs` |
 | Doublewrite-buffer (DWB) eviction ring (`#411`/`#412`) | `graphus-bufpool/tests/loom_dwb_ring.rs`, `graphus-storage/tests/dwb_concurrent_eviction_411.rs` |
 | SSI commit-path interleavings at the memory level | `graphus-txn/tests/loom_ssi.rs` |
 | Real-OS-thread supernode write contention (the true-parallel pair to the DST `#220` logical guard) | `graphus-dst/tests/real_thread_supernode_stress.rs` |
-| Engine-thread panic isolation; blocking-thread budget under load | `graphus-server/tests/panic_isolation.rs`, `blocking_thread_budget.rs`, `connection_stress.rs`, `slow_consumer_no_head_of_line_block.rs` |
+| Engine-thread panic isolation; blocking-thread budget under load. The server's engine thread is `sched::exempt`: bringing it under the scheduler needs its blocking command/reply channels handled first | `graphus-server/tests/panic_isolation.rs`, `blocking_thread_budget.rs`, `connection_stress.rs`, `slow_consumer_no_head_of_line_block.rs` |
+
+**The memory model stays outside, by construction and by refusal.** This is a limitation, not a
+detail. The scheduler creates a *happens-before* edge between every pair of consecutive steps, so a
+program running underneath it is **totally ordered**: ThreadSanitizer would observe no concurrent
+access at all and report **zero** races — hiding precisely what the `scripts/tsan-soak.sh` lane exists
+to find. The combination is therefore refused at **compile time** (`compile_error!` in
+`graphus_core::sched`), as is the combination with `--cfg loom`, because loom takes ownership of the
+interleaving itself and two schedulers cannot both own it. **The deterministic thread scheduler proves
+interleaving defects, not memory-model defects.** Everything that already belonged to the loom family
+and to the real-OS-thread family still belongs to them.
 
 These owners fall in two families: **loom** suites (exhaustive interleaving of the atomic-level memory
 operations) and **real-OS-thread** tests (genuine parallelism across threads). Both are **non-determin­istic
 by nature**, so they are run as a **soak lane** (section 13, `scripts/tsan-soak.sh`) under
 ThreadSanitizer — and that lane **must never feed the deterministic seed-replay gate**, whose
-byte-identical contract requires single-threaded execution.
+byte-identical contract requires the interleaving to be **seed-driven**, which OS scheduling is not.
+Single-threaded execution was the original way of meeting that contract; since `rmp` #973 it is one
+way of meeting it, and no longer the only one.
 
 A second, narrower caveat (**F-DST-2**): the `#220` "concurrent writers" guard expresses K concurrency
 as **K overlapping tickets executed sequentially** (commutative-overlap-at-commit), which is narrower
 than the word "concurrent" suggests. Its true-parallel counterpart is the real-OS-thread supernode
 stress named above.
+
+### 5.2 The deterministic thread scheduler (rmp #973)
+
+`D-dst-writer-scheduler` requires that multi-writer correctness be certified from a **seeded
+schedule** rather than from an unreproducible race. The mechanism that carries that requirement is a
+second deterministic scheduler, distinct from the cooperative interleaver of section 5 and working at
+a different granularity. The two coexist.
+
+| | Cooperative interleaver (section 5) | Deterministic thread scheduler (this section) |
+| --- | --- | --- |
+| What it orders | Transaction **lifetimes** | Real **OS threads** |
+| Granularity | One scripted step per event; each Cypher statement runs atomically to completion | One declared **yield point**, inside a statement |
+| Threads | One | N registered threads, exactly one running at a time |
+| Source of the order | The `SimScheduler` event key `(due, rng-priority, seq)` | A seeded draw taken at each yield point |
+| Recorded as | The canonical FNV-1a trace + state hash | A fixed-width byte history (`SchedHistory`) |
+| Availability | Always | Only with the `det-sched` cargo feature |
+
+#### 5.2.1 The mechanism
+
+An installed scheduler owns a **single execution token**. Only the thread holding it runs; every other
+registered thread is parked. At each yield point the running thread offers the token back, and the
+scheduler draws the successor from a seeded `SimRng`. The global order of operations is therefore a
+pure function of the seed.
+
+Four rules make that a property of the design rather than a hope, and each is enforced in one place:
+
+1. **No address ever enters a decision or the history.** `ResourceId` is a newtype over a
+   class-tagged `u64` — a frame index, a page id, a store slot, a transaction id, a logical thread —
+   and it has **no constructor from a pointer**. An address would differ between two runs of the same
+   seed under ASLR, and the replay would diverge for a reason that has nothing to do with the
+   schedule.
+2. **No `std::thread::ThreadId`.** Logical thread ids are minted by the scheduler in registration
+   order, and they are minted **by the parent while it holds the token**, before the child runs. Were
+   children to register themselves on arrival, the registration order would itself be a race and
+   determinism would be lost at birth.
+3. **The runnable set is ordered** (a `BTreeSet`, never a `HashSet`), because its iteration order is
+   an input to the RNG-indexed choice.
+4. **No wall clock on a decision path.** Every draw comes from the `SimRng`. The only clock reads are
+   the stall and hang backstops, which influence no schedule and fire only on a run that has already
+   stopped making progress.
+
+**Amortisation is seeded, never timed.** A hand-off at every visit to `with_page_fetched`, the hottest
+read in the engine, would mean tens of millions of context switches, so each yield point draws once
+and switches only with probability `switch_permille / 1000` (default 250; `DetSchedConfig::exhaustive`
+raises it to 1000, which is what a scenario whose window is a handful of record reads wide requires).
+This stays deterministic precisely *because* the token serialises the draws into one global stream. A
+counter keyed on **time** would not, which is why there is none.
+
+#### 5.2.2 The invariant: where the token may change hands
+
+**The token is only ever handed over at a point where the yielding thread holds no buffer-pool frame
+latch and no page-table shard lock.** A thread parked while holding either one freezes the simulation
+rather than slowing it: only one thread runs at a time, so every other thread's blocking acquisition
+of that lock waits for a holder that can never be scheduled. The invariant is enforced twice, by two
+different mechanisms, because the two locks fail differently:
+
+- **Frame latches** — `YieldSite::requires_no_frame_latch` classifies every latch-class site, and
+  reaching one with a latch held trips the `rmp` #974/#993 latch-depth tripwire
+  (`graphus_core::latch`) with a loud assertion. Reusing that tripwire is deliberate rather than
+  inventing a second mechanism for the same property, and it inherits the tripwire's documented
+  scope: exact in the debug profile every DST scenario runs under, vacuous in release. The
+  yield is therefore placed **before** the latched region opens, never inside it, and the matching
+  **release** is announced through `ReleaseOnDrop` / `ReleaseAllOnDrop` guards declared so that
+  reverse drop order reopens the blocked set only once the latch is genuinely free.
+- **The page-table shard lock** — this one cannot be forbidden, because the buffer pool genuinely
+  takes it *around* work that reaches yield points: `select_victim` runs its entire CLOCK sweep under
+  it, and `fetch` publishes its `Ready` entry under it **while still holding the freshly loaded
+  victim's frame latch**. Handing the token over anywhere in there would park a thread holding both.
+  A `NoSwitchScope` therefore suppresses the **hand-off** for the duration of the region. Inside such
+  a region a yield point is still **recorded** — the site is provably reached, and the history stays a
+  complete account of the run — but the token stays put, and no coin is drawn, so a suppressed
+  hand-off never consumes the RNG stream.
+
+`NoSwitchScope` was added to the design because of `fetch` and `select_victim`; it is not a general
+escape hatch, and every use of it narrows what a seed can explore. That is the price of the invariant,
+and it is why the contended victim sweep remains an entry in the section 5.1 table.
+
+#### 5.2.3 Failure is a finding, never a hang
+
+A thread that cannot take a contended resource parks on it and the token moves on; a release reopens
+the set. Four backstops turn every way that can go wrong into a reported failure carrying the history:
+
+- **Deadlock** — the runnable set empties while threads are parked. Reported with a dump of who is
+  runnable and who is parked on what, never left to hang.
+- **Stall** — the token holder stops making progress for `stall_timeout`, which means it is blocked
+  inside a lock the scheduler does not mediate: a yield point placed inside a latched region, or an
+  unscheduled thread holding a resource a scheduled thread needs.
+- **Step budget** — a bounded `max_steps` fails a run that spins through yield points without
+  converging.
+- **Watchdog** — a separate, deliberately exempt thread aborts with a diagnostic in the one case the
+  in-condvar stall check cannot observe: **every** scheduled thread wedged, so no thread is left to
+  report it.
+
+An unregistered, non-exempt thread that reaches a yield point **panics**. A thread the scheduler does
+not control runs freely and would destroy the determinism of the whole run in silence, so a thread
+that is deliberately outside the simulation must say so explicitly by calling `sched::exempt()`, at
+the point where it is created and for a reason recorded there. Today that covers the reader-pool
+workers and both WAL fsync offloads, which block in a channel `recv()`; the rayon analytics workers,
+because rayon owns its own work-stealing scheduler; the server's engine thread, whose blocking
+command and reply channels must become scheduled resources first; and the scheduler's own watchdog.
+
+#### 5.2.4 The history
+
+One scheduling decision is one `Step`, serialised into exactly **24 little-endian bytes** — sequence
+number, logical thread, site code, a `switched` flag, an explicit pad byte, and the resource. Fixed
+width and explicitly padded, so two histories compare as `Vec<u8> == Vec<u8>`, byte for byte, with
+nothing to parse and nothing to normalise: a divergence is **located**, not merely detected. The
+`YieldSite` discriminants are `#[repr(u16)]` and **append-only**; renumbering an existing site would
+invalidate every recorded history, and two codes retired during design stay retired rather than being
+recycled.
+
+`SchedHistory` also carries the run's **non-vacuity numbers**: the count of steps at which the token
+actually moved to a different thread, and the number of distinct threads that appear. A run in which
+only one thread ever ran is perfectly deterministic and perfectly useless, so every suite asserts on
+these before it asserts on the invariant it is really testing.
+
+The digest is folded through the **same** FNV-1a hasher the VOPR already uses for its trace and state
+digests, and `VoprReport` carries a `sched_history_hash` field so a schedule divergence would fail the
+existing determinism gate without that gate being touched. **That field is `0` for every VOPR run
+today, and honestly so**: the wire/engine VOPR drives the engine inline on one thread with no
+scheduler installed, so there is no interleaving to digest, and the field records the absence rather
+than inventing a number. It becomes live when a VOPR run first drives real concurrent writers
+(`rmp` #975).
+
+#### 5.2.5 Installed yield points
+
+| Group | Sites |
+| --- | --- |
+| Buffer-pool frame latches | Every acquisition path (`with_page`, `try_with_page`, `with_page_fetched`, `fetch`, `with_page_mut`, `with_page_mut_lsn`, `flush`, `flush_unlogged`, `select_victim`, the batch flush) **and** the matching release |
+| Thread lifecycle | Spawn, start, exit, join |
+| Commit publication | The **durable** slot publication, the **in-memory** registry record, and the settling of the active-set entry — three sites, not one, because the window in which a commit is durable but not yet visible is exactly what a scheduled reader must be able to observe |
+| Snapshot acquisition | The reclamation floor every GC watermark derives from, and the snapshot an off-thread read task carries away |
+| Storage | Free-list push (a slot becomes reusable), undo-chain-head publication |
+| Garbage collection | Phases A, B, C, B2, F, D and E **individually** — not the pass as a whole. The pass is the coarsest possible grain and would make every reclamation atomic with respect to a reader, which is exactly the interleaving the `rmp` #811 class lives inside |
+| Write-path header reads | `read_mvcc`, the write-write conflict check, the chain-head ownership check, and the chain-head read in `link_delta`. **Installed but not yet exercised**: their writer-versus-writer value arrives only with `rmp` #975 |
+
+#### 5.2.6 Cost, gating, and what runs it
+
+**The cost in production is zero.** With `det-sched` off, `yield_at` is an empty
+`#[inline(always)] const fn`, the release announcements are zero-sized types with empty `Drop` bodies,
+`acquire` reduces to calling its blocking closure, and `spawn` is `std::thread::spawn`. There is no
+branch to predict and no code to eliminate. The installation API — the `Scheduler` trait, `install`,
+`Installed` — does **not exist** without the feature, so a test that installs a scheduler fails to
+compile in the default build rather than silently running unscheduled and asserting a determinism
+property it never exercised. `scripts/verify.sh` proves the claim mechanically rather than arguing it:
+it builds the release server the way the shipped binary is built
+(`cargo build --release --locked -p graphus-server`) and requires **zero** scheduler symbols in the
+result. A `-p graphus-server` resolve cannot reach the feature, so every scheduler symbol must be
+absent.
+
+**The gate is a cargo feature, deliberately not `debug_assertions`.** `graphus_core::latch` chose
+`debug_assertions` for its tripwire, and rightly: a *correctness* tripwire costing a thread-local
+increment should be armed across the whole suite. A scheduler hook is *hot-path instrumentation* — it
+sits on `with_page_fetched` — and under `debug_assertions` it would be live in every
+`cargo test --workspace`, instrumenting the very paths the other gates exist to certify. The feature
+is enabled by **no dependency declaration anywhere in the workspace**; only `graphus-dst`'s own
+passthrough turns it on, and only for the two test targets that declare
+`required-features = ["det-sched"]`. That isolation is the point: Cargo unifies features per resolve,
+so a crate that merely *declared* the dependency would arm the hook in every build that transitively
+reaches `graphus-core`, which is every crate in the workspace.
+
+Because those targets are outside the default resolve, `cargo test --workspace` does not even compile
+them. A suite behind an opt-in feature that no automated gate ever enables is a defect class this
+project has already been bitten by, so `scripts/verify.sh` invokes all three — the scheduler's own
+unit tests and both scenario suites — explicitly, at step 5, together with the symbol-absence check
+above. It is gate 13 of `VERIFICATION.md`.
+
+#### 5.2.7 What the suites prove
+
+| Suite | Claim |
+| --- | --- |
+| `graphus-dst/src/detsched.rs` unit tests | The mechanism itself: byte-identical replay, distinct interleavings across seeds, fixed-width records, and an unreleasable park reported as a deadlock |
+| `graphus-dst/tests/det_scheduler_gc_reader_811.rs` | Over the **real two-thread engine**: the same seed replays byte-identically, different seeds explore, the `rmp` #811 window is entered by construction and provably so, and the installed yield points are actually reached |
+| `graphus-dst/tests/det_scheduler_elle_oracle.rs` | The isolation oracle still rules on what the scheduler produces — on a genuinely two-threaded scheduled history, and on the existing VOPR safety run with a scheduler installed over it, whose report must stay identical |
+
+The two headline claims — that one seed replays byte-identically and that different seeds explore
+different interleavings — are asserted **over the engine scenario**, not over the scheduler's own
+self-test. A self-test of the mechanism is a legitimate unit test of the mechanism, but it cannot
+stand in for those claims: it would let them pass without the engine ever having been scheduled.
 
 ## 6. Fault models
 
@@ -567,12 +790,25 @@ replay artifacts so the exact failure can be reproduced locally via `vopr-repro 
 `panic_isolation`, `blocking_thread_budget`, `connection_stress`,
 `slow_consumer_no_head_of_line_block`), the `graphus-storage` DWB real-thread test
 (`dwb_concurrent_eviction_411`), and the `graphus-dst` real-thread supernode stress
-(`real_thread_supernode_stress`). This lane is the **named owner** of the true-parallel races DST cannot
-see; it asserts the absence of data races that a single-threaded, byte-identical seed-replay run cannot
-detect. It is **deliberately excluded from the deterministic seed-replay gate** — its thread interleaving
+(`real_thread_supernode_stress`). This lane is the **named owner** of the true-parallel races that remain
+outside the section 5.1 ceiling; it asserts the absence of **data races**, which no byte-identical
+seed-replay run can detect — including a scheduled one, whose steps are totally ordered. It is
+**deliberately excluded from the deterministic seed-replay gate** — its thread interleaving
 is OS-scheduled, not seed-driven, so feeding it into the byte-identical gate would be a category error.
 The loom suites (`graphus-bufpool/tests/loom_*`, `graphus-txn/tests/loom_ssi`) are the exhaustive-interleaving
 complement and run on their own (`RUSTFLAGS=--cfg loom`).
+
+This lane must also **never be combined with the deterministic thread scheduler** of section 5.2, and
+the combination is refused at compile time rather than left to discipline: the scheduler totally
+orders the program, so ThreadSanitizer running underneath it would observe no concurrent access and
+report zero races — a vacuously clean soak. The same refusal applies to `--cfg loom`.
+
+**Deterministic thread-scheduler suites** (`scripts/verify.sh` gate 5; `VERIFICATION.md` gate 13). The
+scheduler's own unit tests and the two scenario suites of section 5.2.7 are run with
+`--features det-sched` explicitly, because `required-features` keeps them out of the default
+`cargo test --workspace` resolve entirely. A companion step rebuilds the release server and requires
+**zero** scheduler symbols in the binary, which is how the zero-production-cost claim is verified
+rather than asserted.
 
 ## 14. Findings (engine gaps surfaced by the simulator)
 

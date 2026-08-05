@@ -16,6 +16,22 @@ path = "src/lib.rs"
 name = "graphus-dst"
 path = "src/main.rs"
 
+[features]
+# Deterministic writer scheduling (`rmp` #973, `src/detsched.rs`). A pure passthrough to
+# `graphus-core`'s own `det-sched`: this is the ONLY place in the workspace that turns it on, and it
+# is OFF by default here too.
+#
+# The isolation matters. Cargo unifies features per resolve, so had the feature been declared as part
+# of the `graphus-core` dependency line above, every `cargo test`/`cargo bench` that reaches
+# graphus-dst — which is the whole workspace test resolve — would compile the scheduler hook into
+# `with_page_fetched`, the hottest read in the engine. Behind an opt-in feature, the default gate
+# compiles the production shape, exactly as `read-probe` and `bufpool-probe` do.
+#
+# The suites that need it declare `required-features = ["det-sched"]` below, and `scripts/verify.sh`
+# gate 5 runs them explicitly — a suite behind an opt-in feature that no automated gate ever enables
+# is the `rmp` #960 defect class, and it survived on `main` with every other gate green.
+det-sched = ["graphus-core/det-sched"]
+
 [dependencies]
 graphus-core = { path = "../graphus-core" }
 graphus-sim = { path = "../graphus-sim" }
@@ -75,3 +91,15 @@ serde = { version = "1", features = ["derive"] }
 graphus-txn = { path = "../graphus-txn" }
 
 [dev-dependencies]
+
+# The deterministic-scheduler suites (`rmp` #973). `required-features` keeps them out of the default
+# `cargo test --workspace` resolve entirely — the same isolation `graphus-storage`'s `eviction_convoy`
+# bench uses — so the workspace gate keeps compiling the production shape. `scripts/verify.sh` gate 5
+# runs them with the feature explicitly enabled.
+[[test]]
+name = "det_scheduler_gc_reader_811"
+required-features = ["det-sched"]
+
+[[test]]
+name = "det_scheduler_elle_oracle"
+required-features = ["det-sched"]

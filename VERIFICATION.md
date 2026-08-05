@@ -25,6 +25,7 @@ how CI should schedule it.
 | 10 | Read-polarity census (superset / decision / conservative) | `graphus-cypher/tests/read_polarity_census.rs`, `graphus-storage/tests/scan_polarity_barrier.rs` | every push | < 1 s |
 | 11 | Official Neo4j driver interop (real driver over Bolt) | `graphus-server/tests/neo4j_driver_interop.rs` (feature `neo4j-interop`) | every push | ~1–3 min |
 | 12 | Property visible-read record count (`rmp` #967 AC2) | `graphus-storage/tests/prop_visible_read_record_count.rs` (feature `read-probe`) | every push | < 1 s |
+| 13 | Deterministic writer scheduler (`rmp` #973) | `graphus-dst/tests/det_scheduler_gc_reader_811.rs`, `graphus-dst/tests/det_scheduler_elle_oracle.rs`, `graphus-dst/src/detsched.rs` (feature `det-sched`) | every push | ~5 s |
 
 > **What "every push" means today.** It is the *intended* cadence, and it is what `scripts/verify.sh`
 > runs — but nothing invokes that script automatically: `.github/workflows/` holds only the on-demand
@@ -493,11 +494,80 @@ new indirection was introduced between the cell and its value. Check which of th
 
 ---
 
+## 13. Deterministic writer scheduler (`rmp` #973)
+
+Puts the **interleaving of real OS threads** under a seeded scheduler, so a concurrency defect
+reproduces from a seed the way a crash already does. A single execution token is handed from thread
+to thread at declared yield points — page-latch acquisition and release, thread spawn/exit, the two
+halves of commit publication, snapshot acquisition, each GC phase — and the successor is drawn from a
+`SimRng`. The global order of operations is therefore a pure function of the seed.
+
+The scheduling history is materialised as fixed-width 24-byte little-endian records, so two runs are
+compared **byte for byte** (`Vec<u8> == Vec<u8>`) rather than through a digest that can only say
+"different".
+
+**What the suites assert**
+
+| Suite | Claim |
+| ----- | ----- |
+| `graphus-dst/src/detsched.rs` unit tests | the mechanism itself: replay, exploration, fixed-width records, and that an unreleasable park is reported as a **deadlock** rather than hanging |
+| `tests/det_scheduler_gc_reader_811.rs` | over the **real two-thread engine**: the same seed replays byte-identically; different seeds explore; and the `rmp` #811 severance window (an off-thread reader mid-chain-walk while GC reclaims the tombstone above it) is now entered **by construction** rather than by luck |
+| `tests/det_scheduler_elle_oracle.rs` | the isolation oracle still rules on the histories produced — on a genuinely two-threaded scheduled history, and on the existing VOPR safety run with a scheduler installed over it |
+
+`graphus-storage`'s own `offthread_reader_never_loses_live_property_across_gc_811` remains the
+probabilistic owner of the same window: it hammers 20 000 cycles hoping the OS scheduler cooperates,
+and it cannot say whether the window was ever entered. The scheduled suite enters it in 24 cycles and
+**proves** it did, by finding the GC phase-D step between two of the reader's record-read steps in
+the history.
+
+**Cost in production: zero.** The seam (`graphus_core::sched`) is gated on the `det-sched` cargo
+feature, off by default and enabled by no dependency declaration anywhere in the workspace. With it
+off, `yield_at` is an empty `#[inline(always)] const fn`, `acquire` reduces to its blocking closure,
+the release guards are zero-sized types with empty `Drop` bodies, and `spawn` is
+`std::thread::spawn`. Verified mechanically:
+
+```sh
+cargo build --release --locked -p graphus-server
+nm -C target/release/graphus-server | grep -c 'graphus_core.*sched'   # must print 0
+```
+
+Deliberately **not** `debug_assertions` (the gate `graphus_core::latch` uses). That tripwire wants to
+be armed across the whole suite because it is a correctness tripwire costing a thread-local
+increment; a scheduler hook is hot-path instrumentation sitting on `with_page_fetched`, and arming it
+in every `cargo test --workspace` would instrument the very paths the other gates certify.
+
+It is also mutually exclusive with `--cfg loom` and with ThreadSanitizer, enforced by `compile_error!`:
+both of those lanes own the thread interleaving themselves, and TSan running under a scheduler that
+totally orders every step would report **zero** races — a vacuously clean soak.
+
+**Run it:**
+
+```sh
+cargo test -p graphus-dst --features det-sched --lib detsched::
+cargo test -p graphus-dst --features det-sched --test det_scheduler_gc_reader_811
+cargo test -p graphus-dst --features det-sched --test det_scheduler_elle_oracle
+```
+
+`scripts/verify.sh` runs all three as step 5. The suites declare `required-features = ["det-sched"]`,
+so `cargo test --workspace` does not even compile them — which is deliberate, and which is exactly
+why the gate invokes them explicitly: a suite behind an opt-in feature that no gate enables is the
+`rmp` #960 defect class.
+
+**When gate 13 fails**, read the message before the diff. A *byte divergence at step N* names the
+first step where two runs of one seed disagreed — look for a new source of nondeterminism on the
+scheduled path (an address in a decision, a `HashMap` iteration, a wall-clock read). A *DEADLOCK*
+or *STALLED* report means a yield point was placed inside a latched region, or an unscheduled thread
+holds a resource a scheduled thread needs; the message prints who is runnable and who is parked on
+what.
+
+---
+
 ## Quick start
 
 ```sh
 # Fast gates only (build/clippy/fmt, anomaly, read-polarity census, visible-read record count,
-# proptest, regression gate, LDBC, examples, official-driver interop) — every push:
+# deterministic writer scheduler, proptest, regression gate, LDBC, examples, official-driver
+# interop) — every push:
 scripts/verify.sh
 
 # Add the slow gates as needed:

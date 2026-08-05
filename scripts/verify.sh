@@ -6,11 +6,12 @@
 #   2. anomaly checker (Elle/DSG serializability)
 #   3. the read-polarity census (superset / decision / conservative storage reads)
 #   4. the property visible-read record-count gate (`rmp` #967 AC2; needs --features read-probe)
-#   5. proptest invariants (codec round-trips + order-preserving key codec)
-#   6. the criterion regression gate (vs the committed baseline)
-#   7. the LDBC-SNB macro harness (tiny scale)
-#   8. the examples suite, in BOTH modes (self-boot + attached to a running instance)
-#   9. the official Neo4j driver interop suite (real drivers over Bolt; needs node/npm, python3, go + network)
+#   5. the deterministic writer-scheduler suites (`rmp` #973; needs --features det-sched)
+#   6. proptest invariants (codec round-trips + order-preserving key codec)
+#   7. the criterion regression gate (vs the committed baseline)
+#   8. the LDBC-SNB macro harness (tiny scale)
+#   9. the examples suite, in BOTH modes (self-boot + attached to a running instance)
+#  10. the official Neo4j driver interop suite (real drivers over Bolt; needs node/npm, python3, go + network)
 #
 # The SLOW gates are deliberately NOT run here (they are documented in VERIFICATION.md and run on a
 # nightly/manual job): the loom model-check, the miri UB gate, the full Criterion suites, and any
@@ -39,12 +40,12 @@ done
 
 step() { printf '\n\033[1;34m==> %s\033[0m\n' "$1"; }
 
-step "1/9  build + clippy + fmt (workspace)"
+step "1/10 build + clippy + fmt (workspace)"
 cargo build --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 
-step "2/9  anomaly gate — Elle/DSG serializability checker"
+step "2/10 anomaly gate — Elle/DSG serializability checker"
 cargo test -p graphus-cypher --test elle
 
 # A read of the record store returns raw physical state; which answer the caller owes back is one of
@@ -52,7 +53,7 @@ cargo test -p graphus-cypher --test elle
 # defects, each of them behind a docstring that asserted the wrong polarity and was believed. This
 # gate reads source text, costs milliseconds, and fails when a polarity-sensitive read appears or
 # moves without being classified (`rmp` #905; VERIFICATION.md gate 10).
-step "3/9  read-polarity census — superset / decision / conservative storage reads"
+step "3/10 read-polarity census — superset / decision / conservative storage reads"
 cargo test -p graphus-cypher --test read_polarity_census
 cargo test -p graphus-storage --test scan_polarity_barrier
 
@@ -63,22 +64,62 @@ cargo test -p graphus-storage --test scan_polarity_barrier
 # production build), and the test file is `#![cfg(feature = "read-probe")]`, so a plain
 # `cargo test -p graphus-storage` compiles it away and asserts nothing.
 #
-# That is precisely the shape of `rmp` #960 (gate 11 below): a suite behind an opt-in feature that no
+# That is precisely the shape of `rmp` #960 (gate 10 below): a suite behind an opt-in feature that no
 # automated gate ever enabled, so the defect it existed to catch survived on `main` with every other
 # gate green. `04-technical-design.md` §11.6 was ratified by #967 itself to stop that recurring, and a
 # headline acceptance criterion asserted by nothing any gate runs is the same defect again. Hence the
 # explicit `--features read-probe` invocation here.
-step "4/9  property visible-read record count — `rmp` #967 AC2 (needs --features read-probe)"
+step "4/10 property visible-read record count — `rmp` #967 AC2 (needs --features read-probe)"
 cargo test -p graphus-storage --features read-probe --test prop_visible_read_record_count
 
-step "5/9  proptest invariants — codec round-trips + order-preserving key codec"
+# `rmp` #973 puts the DST's thread interleaving under a seeded scheduler, so a concurrency defect
+# reproduces from a seed the way a crash already does. Its suites are behind the opt-in `det-sched`
+# cargo feature and declare `required-features`, so `cargo test --workspace` does not even COMPILE
+# them — which is deliberate (the hook sits on `with_page_fetched`, the hottest read in the engine,
+# and must not instrument the very paths the gates above certify).
+#
+# That is also, precisely, how `rmp` #960 hid: a suite behind an opt-in feature that no automated
+# gate ever enabled, so the defect it existed to catch survived on `main` with every other gate
+# green. A headline acceptance criterion asserted only by a suite nothing runs is that defect again.
+# Hence the explicit `--features det-sched` invocation here, covering BOTH suites and the
+# scheduler's own unit tests.
+step "5/10 deterministic writer scheduler — `rmp` #973 (needs --features det-sched)"
+cargo test -p graphus-dst --features det-sched --lib detsched::
+cargo test -p graphus-dst --features det-sched --test det_scheduler_gc_reader_811
+cargo test -p graphus-dst --features det-sched --test det_scheduler_elle_oracle
+
+# `rmp` #973 acceptance criterion 3 — the production cost is ZERO — asserted mechanically rather
+# than argued. The release build below reproduces the container image's `-p graphus-server` package
+# selection (`Dockerfile`, which additionally cross-compiles with `--target "$RUST_TARGET"`; the
+# target does not change which features the resolve reaches, which is the only thing this check is
+# about). That selection is what makes the check meaningful: `det-sched` is enabled by no dependency
+# declaration anywhere, so a `-p graphus-server` resolve cannot reach it, and every scheduler symbol
+# must therefore be absent from the shipped binary.
+#
+# The patterns are anchored on `graphus_core::sched::` and not on `sched` — matching loosely finds
+# eight `tokio::runtime::blocking::schedule::BlockingSchedule` symbols and would make this gate
+# report a violation that does not exist. A gate that cries wolf is retired by the next person who
+# sees it, so it is anchored here on purpose.
+step "5b/10 deterministic scheduler costs production NOTHING — `rmp` #973 AC3"
+cargo build --release --locked -p graphus-server
+for pattern in 'graphus_core::sched::' 'detsched' 'YieldSite'; do
+    found=$(nm -C target/release/graphus-server | grep -c -- "$pattern" || true)
+    if [ "$found" -ne 0 ]; then
+        echo "FAIL: $found symbol(s) matching '$pattern' in the release server binary;" >&2
+        echo "      the det-sched seam must compile to nothing outside the DST." >&2
+        exit 1
+    fi
+done
+echo "    no scheduler symbol reaches the release binary (3 patterns, 0 matches)"
+
+step "6/10 proptest invariants — codec round-trips + order-preserving key codec"
 cargo test -p graphus-storage --test proptest_codecs
 cargo test -p graphus-cypher --test proptest_keycodec
 
-step "6/9  criterion regression gate — vs committed baseline (release)"
+step "7/10 criterion regression gate — vs committed baseline (release)"
 cargo run -q -p graphus-bench --release --bin bench_gate
 
-step "7/9  LDBC-SNB macro harness — tiny scale (release)"
+step "8/10 LDBC-SNB macro harness — tiny scale (release)"
 cargo run -q -p graphus-bench --release --bin ldbc_snb
 
 # The examples are the project's instrument for exposing regressions and resource inefficiencies in a
@@ -86,7 +127,7 @@ cargo run -q -p graphus-bench --release --bin ldbc_snb
 # evidence defects this gate now guards against (a failing example sitting unnoticed on `main`, reports
 # publishing fabricated zeros, a baseline gate comparing 0.0 to 0.0) survived precisely because nothing
 # executed the suite. It runs BOTH modes: self-boot, and attached to an already-running instance.
-step "8/9  examples suite — E2E, both modes (self-boot + attach to a running instance)"
+step "9/10 examples suite — E2E, both modes (self-boot + attach to a running instance)"
 scripts/examples-gate.sh
 
 # The official-driver interop suite is the ONLY test that proves the four inviolable wire claims (Bolt,
@@ -111,7 +152,7 @@ scripts/examples-gate.sh
 # indistinguishable from a gate that passes, which is the failure mode being closed; the prerequisites
 # are documented in VERIFICATION.md and in the suite's own module docs. Checking them HERE also means a
 # missing toolchain is reported at the gate, with a clear message, instead of deep inside a test helper.
-step "9/9  official Neo4j driver interop — real drivers over Bolt (needs node/npm, python3, go + network)"
+step "10/10 official Neo4j driver interop — real drivers over Bolt (needs node/npm, python3, go + network)"
 missing_interop_tools=""
 for tool in node npm python3 go; do
     command -v "$tool" >/dev/null 2>&1 || missing_interop_tools="$missing_interop_tools $tool"

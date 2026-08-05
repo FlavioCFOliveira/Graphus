@@ -41,6 +41,15 @@ pub mod checker;
 pub mod cli;
 pub mod command_isolation;
 pub mod count_txn_undo;
+/// The deterministic writer scheduler (`rmp` #973): the seeded policy behind
+/// [`graphus_core::sched`]'s yield points, which turns the interleaving of N real writer threads into
+/// a pure function of the seed.
+///
+/// Gated on the `det-sched` feature. The module — and therefore any test that installs a scheduler —
+/// does **not compile** without it, so a determinism assertion can never pass vacuously in a build
+/// where nothing was ever scheduled.
+#[cfg(feature = "det-sched")]
+pub mod detsched;
 pub mod fault;
 pub mod faults;
 pub mod freelist_reuse;

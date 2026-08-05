@@ -358,7 +358,15 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                 // the default ~2 MiB stack overflows on a legal at-the-limit query and a stack overflow
                 // aborts the whole process.
                 .stack_size(super::QUERY_ENGINE_STACK_SIZE)
-                .spawn(move || worker_loop(&work_rx, egress_stall_timeout, &retire_tx, &metrics))
+                .spawn(move || {
+                    // `rmp` #973: reader-pool workers are deliberately OUTSIDE the deterministic
+                    // scheduler. They block in `recv()` on a bounded `sync_channel`, and a thread
+                    // that parks in `recv()` holding the execution token freezes the whole
+                    // simulation — bringing them under it needs the channel handled as a scheduled
+                    // resource, which is a task of its own.
+                    graphus_core::sched::exempt();
+                    worker_loop(&work_rx, egress_stall_timeout, &retire_tx, &metrics);
+                })
                 // A failure to spawn a worker is a startup-time OS resource error; surfacing it as a
                 // panic here is acceptable (the server is coming up and the pool size is bounded/small).
                 .expect("INVARIANT: spawning a bounded reader worker thread");

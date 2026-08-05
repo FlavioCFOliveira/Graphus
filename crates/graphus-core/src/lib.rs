@@ -39,6 +39,11 @@ pub mod status;
 /// ever issued while a buffer-pool frame latch is held. Compiled out of release builds.
 pub mod latch;
 
+/// The deterministic writer-scheduling seam (`rmp` #973): the yield points through which a DST run
+/// takes control of real-thread interleaving, so a concurrency defect reproduces from a seed. Gated
+/// on the `det-sched` cargo feature; zero cost — and, for the installation API, non-existent — off.
+pub mod sched;
+
 /// Identifier newtypes used across the storage, transaction, and query layers.
 pub mod ids {
     /// Physical page identifier within a store file.

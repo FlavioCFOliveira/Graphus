@@ -32,6 +32,7 @@ use std::sync::Arc;
 use graphus_bufpool::ConcurrentBufferPool;
 use graphus_bufpool::page::{self, HEADER_SIZE};
 use graphus_core::error::{GraphusError, Result};
+use graphus_core::sched::{self, ResourceId, YieldSite};
 use graphus_core::{
     CommandId, ElementId, Lsn, MAX_TIMESTAMP, PageId, Timestamp, TxnId, VersionStamp,
 };
@@ -2716,6 +2717,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // from `rmp` #967, when deltas first carried a value; #968 made it observable, because a
         // label change — unlike a property overwrite by the same failing writer — is read by
         // `label_bitmap_at` on a node every snapshot can see.
+        // `rmp` #973: the DURABLE half of commit publication. The interesting window for a
+        // concurrent reader is BETWEEN this and `commit_registry.record_commit` below — the slot is
+        // on disk but the in-memory registry still answers "in flight" — so both halves are yield
+        // points, not one.
+        sched::yield_at(YieldSite::CommitPublishSlot, ResourceId::txn(txn.0));
         self.publish_commit_slot(txn, commit_ts)?;
         // PREPARE: append the `COMMIT` record with NO `fdatasync` (the group-commit deferral, `rmp`
         // #528). The caller hardens the whole batch with a single `harden_wal`.
@@ -2737,10 +2743,15 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // `Committed(commit_ts)` — the same answer the settle then writes down. The reverse order would
         // open a window in which a settled label version read as committed while the record headers of
         // the same transaction still read as aborted.
+        // `rmp` #973: the IN-MEMORY half — this is the instant the commit becomes visible to every
+        // reader resolving a delta through the registry. Yielding here is what lets a scheduled
+        // reader observe the durable-but-not-yet-visible state the line above created.
+        sched::yield_at(YieldSite::CommitRegistryRecord, ResourceId::txn(txn.0));
         self.commit_registry.record_commit(txn, commit_ts);
         // Releases the active-set entry — and with it this transaction's count delta and schema undo log
         // (`rmp` #866). This must happen before `open_txn_holds_pending_ddl()` below, which asks whether
         // any *other* open transaction still holds unpersisted DDL and would otherwise count this one's.
+        sched::yield_at(YieldSite::CommitSettle, ResourceId::txn(txn.0));
         self.settle_committed_txn(txn, commit_ts);
         // `rmp` #813: record this durable write's `(commit_lsn, commit_ts)` so a read transaction's causal
         // bookmark can advance to it — but ONLY once the deferred harden makes `commit_lsn` durable. The
@@ -3318,6 +3329,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             "only a record carrying the `05 §7` MVCC header can anchor an undo chain"
         );
         let slot = self.commit_slot_for(txn)?;
+        // `rmp` #973: INSTALLED BUT NOT YET EXERCISED (see `read_mvcc`). The chain head is READ here
+        // and REPUBLISHED further down; the window between the two is the one a second writer would
+        // race, so the two instants are separate yield points rather than one.
+        sched::yield_at(
+            YieldSite::WriteLinkDelta,
+            ResourceId::slot(kind as u8, entity),
+        );
         let head = self.read_mvcc(kind, entity)?.undo_ptr;
         // STEP 1 (`04 §5.1.2`), and it belongs HERE rather than in each caller. The read path's
         // early stop (`DeltaVerdict::Stop`) is the claim that commit timestamps never ascend down a
@@ -3328,6 +3346,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // each new writer to remember. Costs nothing on a fresh chain and reuses the `head` already
         // read above.
         self.ensure_chain_head_unheld(kind, entity, head, txn)?;
+        // The publication half of the head window opened above.
+        sched::yield_at(
+            YieldSite::UndoChainHeadPublish,
+            ResourceId::slot(kind as u8, entity),
+        );
         let id = self.alloc_undo_id(txn)?;
         delta.flags = undo::FLAG_IN_USE;
         delta.commit_info = slot;
@@ -3606,6 +3629,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Returns [`GraphusError::Transaction`] — a **retriable serialization failure** — when the chain
     /// head belongs to another open transaction, and a storage error if the chain head dangles.
     fn ensure_no_conflicting_writer(&self, kind: StoreKind, entity: u64, txn: TxnId) -> Result<()> {
+        // `rmp` #973: INSTALLED BUT NOT YET EXERCISED (see `read_mvcc`) — the write-write conflict
+        // check, whose whole point only exists once `rmp` #975 gives it a second writer to race.
+        sched::yield_at(
+            YieldSite::WriteConflictCheck,
+            ResourceId::slot(kind as u8, entity),
+        );
         let head = self.read_mvcc(kind, entity)?.undo_ptr;
         self.ensure_chain_head_unheld(kind, entity, head, txn)
     }
@@ -3663,6 +3692,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         head: u64,
         txn: TxnId,
     ) -> Result<()> {
+        // `rmp` #973: INSTALLED BUT NOT YET EXERCISED (see `read_mvcc`) — the undo-chain-head
+        // ownership check. It becomes a real interleaving seam with `rmp` #975.
+        sched::yield_at(
+            YieldSite::WriteChainHeadUnheld,
+            ResourceId::slot(kind as u8, entity),
+        );
         if head == NULL_ID {
             return Ok(());
         }
@@ -4551,6 +4586,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Mirrors [`note_created`](Self::note_created) / [`note_expired`](Self::note_expired), including the
     /// `SYSTEM_TXN` guard (the system transaction never frees records and is never rolled back).
     fn free_push(&mut self, kind: StoreKind, id: u64, txn: TxnId) {
+        // `rmp` #973 coverage point: the instant a slot becomes reusable. Paired with the `rmp` #588
+        // `held_slots` shadow-hold below, this is where a reader that predates the free races slot
+        // recycling, so an interleaving that reaches it is worth being able to replay.
+        sched::yield_at(YieldSite::FreeListPush, ResourceId::slot(kind as u8, id));
         self.store_mut(kind).free.push(id);
         if txn != SYSTEM_TXN {
             self.active
@@ -4859,6 +4898,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // pending set). Reclaimable ones are freed; the rest stay pending. Runs before the corpse splice
             // (so a corpse whose neighbour was just reclaimed sees the updated chain) and before the node
             // sweep (so a node whose only incidences were reclaimed becomes reclaimable this pass).
+            // `rmp` #973: GC yields per PHASE, not once per pass. The pass is the coarsest possible
+            // grain and would make every reclamation atomic with respect to a reader — which is
+            // exactly the interleaving the #811 class lives inside.
+            sched::yield_at(YieldSite::GcPhaseA, ResourceId::txn(txn.0));
             reclaimed += self.reclaim_pending(StoreKind::Rel, txn, watermark)?;
 
             // ---- Phase B: splice out dead-link RELATIONSHIP corpses (`rmp` #220), gated (`rmp` #522). ----
@@ -4869,6 +4912,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // is walk-driven (re-derives each corpse's true chain position), so it never severs a live chain.
             if self.gc_full_scan_pending || !self.pending_corpse_rels.is_empty() {
                 self.bump_drain_progress();
+                sched::yield_at(YieldSite::GcPhaseB, ResourceId::txn(txn.0));
                 reclaimed += self.gc_splice_corpses(txn)?;
                 self.pending_corpse_rels.clear();
             }
@@ -4876,6 +4920,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // ---- Phase C: reclaim reclaimable NODE tombstones (pending-set driven). ----
             // A node is reclaimed only once no live (not-yet-reclaimed) relationship still references it, so
             // referential integrity and the incidence chains stay well-formed throughout.
+            sched::yield_at(YieldSite::GcPhaseC, ResourceId::txn(txn.0));
             reclaimed += self.reclaim_pending(StoreKind::Node, txn, watermark)?;
 
             // ---- Phase B2: return the slots a logical rollback ORPHANED (`rmp` #970, AC 7). ----
@@ -4883,6 +4928,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // not list them (see `pending_orphan_slots`). They are reachable from nothing, so this is
             // a pure accounting step — but it is still guarded on the record actually being retired,
             // so a slot some later writer has legitimately re-used cannot be double-freed.
+            sched::yield_at(YieldSite::GcPhaseB2, ResourceId::txn(txn.0));
             reclaimed += self.gc_reclaim_orphan_slots(txn)?;
 
             // ---- Phase F: reclaim undo chains no live snapshot can reach (`rmp` #966). ----
@@ -4902,6 +4948,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // correct; this one is one pass faster and keeps the property store's steady-state
             // footprint independent of the GC cadence.
             self.bump_drain_progress();
+            sched::yield_at(YieldSite::GcPhaseF, ResourceId::txn(txn.0));
             undo_deltas_reclaimed = self.gc_reclaim_undo_chains(txn, watermark)?;
 
             // ---- Phase D: sweep PROPERTY chains, gated (`rmp` #522). ----
@@ -4915,6 +4962,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 || self.pending_empty_prop_cells
                 || self.pending_prop_corpses
             {
+                // The `rmp` #811 severance window: this sweep reclaims a tombstone sitting on a
+                // LIVE owner's chain, in place, while an off-thread reader may be mid-walk with a
+                // pointer to that very record already captured. Yielding immediately before it is
+                // what lets a seed put the reader exactly there.
+                sched::yield_at(YieldSite::GcPhaseD, ResourceId::txn(txn.0));
                 let sweep = self.sweep_property_chains(txn, watermark)?;
                 reclaimed += sweep.reclaimed;
                 // A corpse is reclaimed unconditionally by the walk that finds it, so the corpse gate
@@ -4943,6 +4995,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         let mut freeze_scanned = 0u64;
         for kind in [StoreKind::Rel, StoreKind::Node, StoreKind::Prop] {
             self.bump_drain_progress();
+            sched::yield_at(YieldSite::GcPhaseE, ResourceId::slot(kind as u8, 0));
             let (f, s) = self.freeze_store_headers_incremental(txn, kind)?;
             frozen += f;
             freeze_scanned += s;
@@ -5094,6 +5147,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Reads just the 25-byte MVCC header of record `id` in `kind`'s store (freeze-sweep helper —
     /// avoids decoding the full record when only the header words matter).
     fn read_mvcc(&self, kind: StoreKind, id: u64) -> Result<MvccHeader> {
+        // `rmp` #973: INSTALLED BUT NOT YET EXERCISED. This is the header read every write-path
+        // conflict decision starts from, so it is the seam a writer-vs-writer interleaving needs —
+        // but there is only one writer thread per database today, so nothing can currently interleave
+        // here. `rmp` #975 (N concurrent writers) is what turns it live; wiring it now means that
+        // task adds seeds, not plumbing. Stated plainly rather than presented as coverage it is not.
+        sched::yield_at(YieldSite::WriteReadMvcc, ResourceId::slot(kind as u8, id));
         read_view::read_mvcc(&self.pool, &self.stores, kind, id)
     }
 

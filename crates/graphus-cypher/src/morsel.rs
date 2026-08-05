@@ -386,6 +386,11 @@ fn analytics_pool() -> &'static rayon::ThreadPool {
         rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .thread_name(|i| format!("graphus-analytics-{i}"))
+            // `rmp` #973: rayon owns its own work-stealing scheduler, so its workers are deliberately
+            // OUTSIDE the deterministic one. `start_handler` is the only hook rayon offers for
+            // per-worker initialisation, and marking them here is what stops one of them reaching a
+            // yield point unregistered and panicking a legitimate run.
+            .start_handler(|_| graphus_core::sched::exempt())
             .build()
             .unwrap_or_else(|_| {
                 // A pool build failure is exceedingly unlikely (only on resource exhaustion); fall back
