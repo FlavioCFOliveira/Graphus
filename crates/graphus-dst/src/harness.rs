@@ -386,10 +386,20 @@ impl Driver {
                 let Some(node) = resolve(node_slot, &live) else {
                     return;
                 };
-                let _pid = self
+                // A property write takes the entity's write-conflict check
+                // (`D-property-write-conflict`, and since `rmp` #970 on this raw-tag entry point too),
+                // so a second writer on a node another open transaction holds is refused with a
+                // **retriable serialization failure**. That is a legitimate outcome of the
+                // interleaving, not a fault: nothing was written, so the effect must not enter the
+                // model — exactly the "stage only what succeeded" discipline the VOPR oracle uses.
+                match self
                     .store
                     .add_node_property(tid, node, self.prop_key, PROP_TYPE_TAG, value)
-                    .expect("add_node_property");
+                {
+                    Ok(_pid) => {}
+                    Err(graphus_core::GraphusError::Transaction(_)) => return,
+                    Err(e) => panic!("add_node_property: {e:?}"),
+                }
                 pending.push(Effect::AddProp(
                     node,
                     PropTriple {

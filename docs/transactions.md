@@ -39,6 +39,25 @@ you then run belongs to that transaction until you `COMMIT` (durably applies all
 Use an explicit transaction when you need several statements to succeed or fail together, or to
 read-modify-write under the strongest isolation (see below).
 
+### What a rollback costs
+
+A rollback is **proportional to what your transaction wrote**, not to the size of the database.
+Graphus is MVCC-native: every change a transaction makes is recorded as a *delta* — the inverse of
+that one change to that one entity — and a rollback simply applies its own deltas, newest first.
+Nothing is scanned, no catalog is rebuilt, and no other transaction's work is examined.
+
+Two consequences are worth knowing when you design a workload:
+
+- **A large transaction is expensive to roll back, a small one is cheap**, and the price is the same
+  whether the database holds a thousand nodes or a billion. Measured on a fixed eight-record
+  transaction, the rollback takes the same time on a 500-node store and on a 16 000-node store with
+  a 4 000-key dictionary.
+- **A rollback never blocks or disturbs a concurrent transaction.** It writes only to the entities
+  the rolling-back transaction itself touched, so a transaction that aborts next to yours cannot
+  slow it down, change what it reads, or undo anything it committed.
+
+Rolling back a read-only transaction is free: it writes nothing to the log and issues no `fsync`.
+
 ### Administrative termination
 
 An administrator can stop an open transaction with `TERMINATE TRANSACTIONS '<id>'` (the id comes

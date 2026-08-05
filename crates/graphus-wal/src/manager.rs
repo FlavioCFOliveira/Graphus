@@ -352,6 +352,46 @@ impl<S: LogSink> WalManager<S> {
         lsn
     }
 
+    /// Logs a page modification by `txn` that has **no physical inverse** (`rmp` #970): the record
+    /// carries a redo image and an empty undo image, and no entry joins the transaction's undo
+    /// back-chain, so neither a rollback nor recovery's undo phase compensates it.
+    ///
+    /// # This is not "an undo we forgot to write"
+    ///
+    /// It is the form a write takes when its inverse is **logical** and lives elsewhere. The chain
+    /// heads of the storage core (`undo_ptr`, `first_rel`, `first_prop`) are the case it exists for:
+    /// a prepend is undone by *unlinking the entry*, computed from the state at abort time
+    /// (`RecordStore`'s logical rollback), never by restoring the word — and restoring the word is
+    /// exactly what could not be made safe. A plain pre-image undo of a shared head clobbers a
+    /// concurrently-committed prepend (`rmp` #220), and the compare-and-set undo that replaced it was
+    /// only *narrower*, not sound: it still restores an id, and once a slot can be freed and re-used
+    /// the id it restores may name a different record entirely — reproduced as a committed edge
+    /// dropped out of its node's incidence chain after recovery.
+    ///
+    /// The corresponding state after recovery is a head naming a `!in_use` record — a *corpse* — which
+    /// every walker in the storage core already threads through and the GC splice reclaims. That is
+    /// the state `rmp` #220 / #172 designed the header-only creation undo around, and it is the one
+    /// this leaves behind instead of an unsound restoration.
+    ///
+    /// A record with an empty undo image is skipped by [`crate::recover`]'s undo phase, which follows
+    /// `prev_lsn` past it.
+    pub fn log_update_redo_only(&mut self, txn: TxnId, page_id: PageId, redo: &[u8]) -> Lsn {
+        let prev = self.active.get(&txn).map_or(Lsn(0), |s| s.last_lsn);
+        let mut r = LogRecord::new(RecordType::Update, txn, page_id);
+        r.prev_lsn = prev;
+        let lsn = self.next_lsn();
+        self.buf.clear();
+        r.encode_header_to(lsn, redo, &[], &mut self.buf);
+        self.sink.append(&self.buf);
+        let st = self.active.entry(txn).or_insert(TxnState {
+            first_lsn: lsn,
+            last_lsn: lsn,
+            undo: Vec::new(),
+        });
+        st.last_lsn = lsn;
+        lsn
+    }
+
     /// Commits `txn` (group commit): appends its `COMMIT` record and hardens the log so the commit
     /// and everything before it are durable before returning. The record carries no MVCC timestamp
     /// (it decodes to the `0` sentinel via [`LogRecord::commit_ts`]); generic transactions that are
@@ -487,6 +527,33 @@ impl<S: LogSink> WalManager<S> {
         self.append(&mut end);
         self.harden();
         Ok(())
+    }
+
+    /// Ends `txn` as **aborted** without applying any compensation (`rmp` #970).
+    ///
+    /// The caller has already undone the transaction's effects itself — logically, by applying the
+    /// transaction's own MVCC deltas against the current state — and those repairs are ordinary
+    /// redo-logged changes appended under `txn`. What is left is the one thing the log alone can say:
+    /// that `txn` ended without committing. That is what the `ABORT` record does, and it is
+    /// load-bearing rather than cosmetic — recovery's loser set is exactly the transactions with log
+    /// records and neither a `COMMIT` nor an `ABORT` ([`crate::recover`]), so without this record the
+    /// repairs would themselves be undone by the next recovery.
+    ///
+    /// Retaining the undo chain would be pointless here (nothing will ever apply it), so it is
+    /// dropped with the active-table entry, releasing the memory the images held.
+    ///
+    /// A transaction that logged **nothing** has no entry and is a no-op, exactly as in
+    /// [`rollback`](Self::rollback): a read-only abort still costs zero WAL bytes and zero syncs.
+    ///
+    /// # Panics
+    /// Panics if the `fdatasync` fails (`§4.9`).
+    pub fn abort(&mut self, txn: TxnId) {
+        if self.active.remove(&txn).is_none() {
+            return;
+        }
+        let mut end = LogRecord::new(RecordType::Abort, txn, PageId(0));
+        self.append(&mut end);
+        self.harden();
     }
 
     /// Writes a fuzzy checkpoint (`§4.7`): a `CHECKPOINT-BEGIN`, then a `CHECKPOINT-END`

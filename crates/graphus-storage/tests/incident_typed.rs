@@ -181,10 +181,20 @@ fn self_loop_emitted_once_typed() {
 }
 
 #[test]
-fn typed_walk_threads_through_dead_link_corpse() {
-    // #220: a rolled-back rel creation leaves a dead-link corpse (`!in_use`, preserved body). A live
-    // edge prepended BEFORE the corpse, and a live edge that the corpse's chain threads THROUGH, must
-    // both still be reachable by the typed walk — the corpse itself must NOT be emitted.
+fn typed_walk_after_an_aborted_prepend_sees_exactly_the_live_edges() {
+    // `rmp` #970 (was #220). A rolled-back relationship creation used to leave a **dead-link corpse**
+    // at the head of the node's chain — `!in_use`, body preserved — that every walk had to thread
+    // through, and that only the GC incidence splice could remove. The logical rollback unlinks the
+    // edge from both endpoint chains instead, so the abort leaves the chain in exactly the shape it
+    // had before the aborted transaction ran, and the slot is reusable at once.
+    //
+    // What the typed walk owes is unchanged and is what this asserts: every live edge of the
+    // requested type, each exactly once, and nothing else — across an abort and the reuse of the
+    // aborted slot by a later committed edge.
+    //
+    // (The walk's tolerance of a genuine `!in_use` record still on a chain is not retired with this
+    // test: a crash-recovered abort still produces one, and `tests/crash_recovery.rs` and
+    // `tests/mvcc.rs` assert the walk over it.)
     let mut s = fresh();
     let setup = TxnId(1);
     s.begin(setup);
@@ -196,34 +206,45 @@ fn typed_walk_threads_through_dead_link_corpse() {
     let (live1, _) = s.create_rel(setup, t, a, b).unwrap();
     s.commit(setup).unwrap();
 
-    // A rolled-back creation on `a` leaves a corpse at the head of a's chain (its header-only undo
-    // cleared in_use but preserved the forward link to `live1`).
+    // An aborted prepend on `a`.
     let txn_abort = TxnId(2);
     s.begin(txn_abort);
-    let (corpse, _) = s.create_rel(txn_abort, t, a, c).unwrap();
+    let (aborted, _) = s.create_rel(txn_abort, t, a, c).unwrap();
     s.rollback(txn_abort).unwrap();
 
-    // A later committed prepend threads on top of the corpse.
+    // The chain is back to exactly its pre-abort shape — no corpse at the head.
+    assert_eq!(
+        s.incident_rels(a).unwrap(),
+        vec![live1],
+        "rmp #970: the abort left a's chain exactly as it found it"
+    );
+
+    // A later committed prepend. It appends a fresh slot rather than recycling the aborted one:
+    // `undo_own_creation` deliberately leaves a freshly-appended id off the free list, because the
+    // in-memory latest-state indexes key their documents by physical node id and are not
+    // transactional — see the note there.
     let txn3 = TxnId(3);
     s.begin(txn3);
     let (live2, _) = s.create_rel(txn3, t, a, c).unwrap();
     s.commit(txn3).unwrap();
+    assert_ne!(
+        live2, aborted,
+        "the aborted creation's fresh slot is retired, not recycled"
+    );
+    assert!(
+        !s.rel(aborted).unwrap().mvcc.in_use(),
+        "rmp #970: and it is genuinely retired — `!in_use`, unlinked from every chain"
+    );
 
     let typed = s.incident_rels_typed(a, &[t]).unwrap();
-    let ids: Vec<u64> = typed.iter().map(|(id, _)| *id).collect();
-    // Both live edges reachable; the corpse never emitted.
-    assert!(ids.contains(&live1), "live1 reachable through the corpse");
+    let mut ids: Vec<u64> = typed.iter().map(|(id, _)| *id).collect();
+    assert!(ids.contains(&live1), "live1 reachable");
     assert!(ids.contains(&live2), "live2 reachable");
-    assert!(
-        !ids.contains(&corpse),
-        "corpse is NOT emitted (it is !in_use)"
-    );
     assert_eq!(ids.len(), 2, "exactly the two live edges");
 
     // Membership matches the untyped chain walk restricted to type T (= all of them here).
     let mut untyped = s.incident_rels(a).unwrap();
-    let mut got = ids.clone();
     untyped.sort_unstable();
-    got.sort_unstable();
-    assert_eq!(got, untyped, "typed walk membership == incident_rels");
+    ids.sort_unstable();
+    assert_eq!(ids, untyped, "typed walk membership == incident_rels");
 }

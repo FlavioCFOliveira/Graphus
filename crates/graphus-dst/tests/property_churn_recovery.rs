@@ -63,6 +63,9 @@ struct PropChurnReport {
     /// Whether the recovered shared node's `first_prop` legitimately pointed at a `!in_use` dead-link
     /// corpse (`rmp` #172) — the exact post-recovery state the #468/#301 class mishandles.
     head_pointed_at_corpse: bool,
+    /// Whether the loser left IN FLIGHT at the crash had a property write accepted — the non-vacuity
+    /// witness that an uncommitted property record was materialised for recovery to undo.
+    in_flight_wrote: bool,
     /// Whether the crash stole (flushed) dirty pages home before recovery.
     steal: bool,
 }
@@ -99,6 +102,19 @@ fn run_prop_churn_crash(seed: u64) -> PropChurnReport {
             .intern_token(Namespace::PropKey, &format!("k{k}"))
             .expect("intern propkey");
         keys.push(key);
+    }
+    // Keys reserved for the LOSERS (`rmp` #970). A write of a key the entity already holds rewrites
+    // that cell IN PLACE (`rmp` #967), so a loser drawing only from the survivors' keys would never
+    // prepend a record and the soak would stop materialising an uncommitted property record at all —
+    // which is the state the crash has to be made to recover from. Drawing from both keeps the
+    // in-place overwrite interleaving AND the prepend.
+    let mut loser_keys = keys.clone();
+    for k in 4..8u32 {
+        loser_keys.push(
+            store
+                .intern_token(Namespace::PropKey, &format!("k{k}"))
+                .expect("intern propkey"),
+        );
     }
     store.commit(setup).expect("commit setup");
 
@@ -157,6 +173,7 @@ fn run_prop_churn_crash(seed: u64) -> PropChurnReport {
         tids.push(t);
     }
     let mut rem: Vec<u64> = (0..losers).map(|_| rng.range_inclusive(1, 4)).collect();
+    let mut wrote: Vec<bool> = vec![false; losers];
     let mut remaining: u64 = rem.iter().sum();
     while remaining > 0 {
         // Pick a loser that still has budget (seeded), interleaving the prepends across all losers.
@@ -164,18 +181,34 @@ fn run_prop_churn_crash(seed: u64) -> PropChurnReport {
         while rem[pick] == 0 {
             pick = (pick + 1) % losers;
         }
-        let key = keys[rng.index(keys.len())];
+        let key = loser_keys[rng.index(loser_keys.len())];
         let value = 0x9000 + remaining; // loser values: never acknowledged ⇒ never modelled.
-        store
-            .add_node_property(tids[pick], shared, key, INLINE_TAG, value)
-            .expect("add loser property");
+        // A property write takes the OWNING ENTITY's write-conflict check
+        // (`D-property-write-conflict`; since `rmp` #970 on this raw-tag entry point too), so only one
+        // of the interleaved losers holds the shared node's chain at a time and the others are refused
+        // with a retriable serialization failure. That is a legitimate outcome — nothing was written —
+        // and the refused loser stays open for its next turn.
+        match store.add_node_property(tids[pick], shared, key, INLINE_TAG, value) {
+            Ok(_) => wrote[pick] = true,
+            Err(graphus_core::GraphusError::Transaction(_)) => {}
+            Err(e) => panic!("add loser property: {e:?}"),
+        }
         rem[pick] -= 1;
         remaining -= 1;
     }
 
     // Roll all losers back LIVE except the last, which stays in flight at the crash. A seeded shuffle
     // of which stays in flight broadens the interleaving family.
-    let in_flight = rng.index(losers);
+    // Prefer to leave IN FLIGHT a loser whose write was accepted: it is its uncommitted property
+    // record that the crash must materialise and recovery must undo, so a seed that left an
+    // all-refused loser in flight would exercise nothing on the property axis.
+    let accepted: Vec<usize> = (0..losers).filter(|&i| wrote[i]).collect();
+    let in_flight = if accepted.is_empty() {
+        rng.index(losers)
+    } else {
+        accepted[rng.index(accepted.len())]
+    };
+    let in_flight_wrote = wrote[in_flight];
     for (i, &t) in tids.iter().enumerate() {
         if i != in_flight {
             store.rollback(t).expect("live rollback loser");
@@ -213,6 +246,7 @@ fn run_prop_churn_crash(seed: u64) -> PropChurnReport {
         recovery_losers,
         losers,
         head_pointed_at_corpse,
+        in_flight_wrote,
         steal,
     }
 }
@@ -263,6 +297,7 @@ const SEEDS: u64 = 10_000;
 fn property_churn_crash_recovery_holds_across_ten_thousand_seeds() {
     let mut passed = 0u64;
     let mut hit_corpse_head = 0u64;
+    let mut hit_in_flight_write = 0u64;
     let mut hit_losers = 0u64;
     let mut hit_three = 0u64;
     let mut hit_steal = 0u64;
@@ -277,6 +312,9 @@ fn property_churn_crash_recovery_holds_across_ten_thousand_seeds() {
         }
         if r.head_pointed_at_corpse {
             hit_corpse_head += 1;
+        }
+        if r.in_flight_wrote {
+            hit_in_flight_write += 1;
         }
         if r.recovery_losers > 0 {
             hit_losers += 1;
@@ -316,9 +354,18 @@ fn property_churn_crash_recovery_holds_across_ten_thousand_seeds() {
     // Non-vacuity: the soak must actually reach the vulnerable post-recovery state (a corpse head
     // with committed properties below it), produce recovery losers, exercise 3-loser interleavings,
     // and exercise the steal crash mode — otherwise it proves nothing about #468/#301.
+    // The `rmp` #468/#301 corpse head, still reached — by a different route since `rmp` #970: the
+    // interleaving that used to produce it (two transactions' cells on one chain) is refused by the
+    // entity write-conflict check, and what produces it now is the ordinary crash of a single loser,
+    // because a chain-head publication is redo-only and ARIES leaves the loser's cell as the head.
     assert!(
         hit_corpse_head > 0,
         "no seed reached a property corpse head — soak not exercising the #468/#301 condition"
+    );
+    assert!(
+        hit_in_flight_write > 0,
+        "no seed left an in-flight loser with an accepted property write — the soak materialises no \
+         uncommitted property record and is vacuous"
     );
     assert!(
         hit_losers > 0,

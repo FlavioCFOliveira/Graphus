@@ -427,6 +427,17 @@ it would violate NFR-1.
   phase rolls them back. This is what makes large transactions possible without unbounded buffer
   pressure, and it is the reason undo logging is mandatory.
 
+**What undo logging still decides, and what it no longer decides** (task **#970**). Undo logging
+stays mandatory, for two reasons that outlive the move to logical rollback. It is how recovery rolls
+back the **losers** of a crash (§4.8, phase 3), and it is the inverse of a **maintenance**
+transaction — a GC reclamation, a corpse splice, a freeze sweep — whose writes are physical space
+management naming no MVCC version. What it is no longer is the mechanism of **isolation**: a live
+data transaction is rolled back by applying its own deltas against the current state of each record
+it touched, never by reverting the bytes it wrote (§5.1.5 row 4). One test selects between the two
+paths — whether the transaction owns a commit-info slot (§5.1.3), which it does if and only if it
+linked a delta: `RecordStore::rollback` (`crates/graphus-storage/src/store.rs:5795`) dispatches to
+`rollback_logical` (`:5840`) or to `rollback_physical` (`:5916`).
+
 ### 4.4 CLRs (Compensation Log Records)
 
 During undo (rollback or recovery), each undone action writes a **CLR** recording the compensating
@@ -434,11 +445,33 @@ change and an `undo_next_lsn` pointer to the next record still to be undone. CLR
 they make undo itself idempotent and crash-safe (a crash mid-rollback resumes from the last CLR
 rather than re-undoing). This is the standard ARIES guarantee against repeated undo.
 
+**CLRs belong to the physical undo path.** Recovery's undo phase writes them, and so does the
+rollback of a transaction that owns no commit-info slot (§4.3). The **logical** rollback of a data
+transaction writes none: it repairs each record with an ordinary redo-logged write and then ends the
+transaction in the log with a single `ABORT` record and no compensation at all
+(`WalManager::abort`, `crates/graphus-wal/src/manager.rs:550`). That record is load-bearing rather
+than cosmetic — recovery's loser set is exactly the transactions that have log records and neither a
+`COMMIT` nor an `ABORT` (`crates/graphus-wal/src/recovery.rs:255-259`) — so without it the next
+recovery would undo the repairs themselves.
+
+**A third form of page-update record: redo-only**, beside the record whose undo image is a physical
+pre-image and the record whose undo image is a compare-and-set (§5.1.5 row 3). A write whose inverse
+is *logical* logs a redo image and an **empty** undo image
+(`WalManager::log_update_redo_only`, `crates/graphus-wal/src/manager.rs:378`), so neither a rollback
+nor recovery's undo phase compensates it: recovery writes its CLR and applies nothing
+(`crates/graphus-wal/src/recovery.rs:296-301`). The chain-head publications of the storage core are
+the case it exists for — the prepend onto `undo_ptr` / `first_rel` / `first_prop` and the relink of
+the head it displaces. Their inverse is to **unlink the entry**, computed from the state at abort
+time and carried by the transaction's own deltas (§5.1.5 row 3), and the state such a write leaves
+after recovery is a head naming a `!in_use` record: a corpse, which every walk in the storage core
+already threads through and the GC splice reclaims.
+
 **A live rollback that fails leaves its transaction OPEN.** That ARIES guarantee is about *crash*
 recovery, which restarts the undo from the durable log. A *live* rollback has no such restart point:
-its WAL undo, its compensation replay into the buffer pool and its catalog reload are one indivisible
-repair, and once the WAL manager has consumed the transaction's active-transaction entry a second
-call finds no undo chain and would report success over pages it never repaired. So a live rollback
+its undo — WAL images on the physical path, its own deltas on the logical one — and everything the
+repair depends on are one indivisible operation, and once the WAL manager has consumed the
+transaction's active-transaction entry a second call finds nothing left to undo and would report
+success over records it never repaired. So a live rollback
 releases the transaction's active-set entry only after every fallible step has succeeded. A failure —
 or an unwind out of the `fdatasync` panic of §4.9 — therefore leaves the transaction visibly **active**
 and holding uncommitted state, which is the truth: its writes are still on the page. Every gate that
@@ -558,11 +591,11 @@ tree was read, because none is present in `/data/refsrc`.** Every statement belo
 concrete field, call site, or control flow is grounded in the Memgraph source or in this repository's
 own code, at the line cited.
 
-**The measured grounding.** The decision was not taken on preference. Property assignment today is a
-tombstone pass over the whole property chain followed by a prepend
-(`RecordStore::tombstone_props_for_key`, `crates/graphus-storage/src/store.rs:6710-6753`), which is
-**O(M²)** in the number of properties set on one entity — measured at **15.1 µs/op at M = 1000** and
-**97.8 µs/op at M = 8000**. A delta chain replaces that walk with a constant-cost prepend.
+**The measured grounding.** The decision was not taken on preference. Property assignment was, when it
+was taken, a tombstone pass over the whole property chain followed by a prepend
+(`RecordStore::tombstone_props_for_key`), which is **O(M²)** in the number of properties set on one
+entity — measured at **15.1 µs/op at M = 1000** and **97.8 µs/op at M = 8000**. The delta chain
+replaced that walk with a constant-cost prepend (task #967, §5.1.5 row 1).
 
 #### 5.1.1 The delta
 
@@ -585,7 +618,7 @@ Graphus defines **seven delta actions**, one for each mutation the engine can pe
 | `SetProperty` | sets, changes, or removes a property | the property key token and the **old** value (`NULL` when the property did not exist before) | the previous value of that one property, or its previous absence |
 | `AddLabel` | **removes** a label from a node | the label token | that label's membership |
 | `RemoveLabel` | **adds** a label to a node | the label token | that label's absence |
-| `AddIncidentEdge` | **removes** an incident relationship from a node | the relationship type token, the other endpoint's physical id, the relationship's physical id, and the direction | that one incidence entry |
+| `AddIncidentEdge` | **removes** an incident relationship from a node — *frozen but unwritten; no write path emits it (below)* | the relationship type token, the other endpoint's physical id, the relationship's physical id, and the direction | that one incidence entry |
 | `RemoveIncidentEdge` | **adds** an incident relationship to a node | the same four fields as `AddIncidentEdge` | the absence of that incidence entry |
 
 Two properties of this set matter downstream. First, **a delta is per-entity and per-change, never
@@ -630,14 +663,21 @@ actions, `delta.hpp:394-396`) to keep edge-heavy imports viable. Graphus reconst
 nothing — every relationship carries its own MVCC header and the incidence walk filters per element
 (§2.4) — so it needs neither the walk nor the escape.
 
-The same difference decides where `AddIncidentEdge` is written, and the honest answer is **nowhere,
-yet**. Memgraph's `DeleteEdge` erases the edge from both containers in place, so it must write the
-restoring delta. Graphus's deletion is a tombstone: the relationship keeps its slot and its links so
-an older snapshot can still traverse to it (§5.3), and the adjacency is not mutated at all — the
-version that covers the deletion is the relationship's own `RecreateObject`. Physically unlinking on
-delete instead would sever an off-thread reader mid-traversal, which is the `rmp` #811 defect class.
-`AddIncidentEdge` is therefore the frozen inverse of `RemoveIncidentEdge`, written by the logical
-rollback of **#970** and by nothing before it.
+The same difference decides where `AddIncidentEdge` is written, and the answer is **nowhere**.
+Memgraph's `DeleteEdge` erases the edge from both containers in place, so it must write the restoring
+delta. Graphus's deletion is a tombstone: the relationship keeps its slot and its links so an older
+snapshot can still traverse to it (§5.3), and the adjacency is not mutated at all — the version that
+covers the deletion is the relationship's own `RecreateObject`. Physically unlinking on delete
+instead would sever an off-thread reader mid-traversal, which is the `rmp` #811 defect class.
+
+`AddIncidentEdge` is therefore **frozen but unwritten**: the format keeps it so the pair of incidence
+actions is complete, and no write path emits it. Task **#970** did not change that, and it is the
+detail a reader is most likely to get backwards. What its logical rollback *applies* is
+`RemoveIncidentEdge` — the delta an edge insertion left behind, whose application removes that one
+incidence entry (`RecordStore::undo_own_incidence`,
+`crates/graphus-storage/src/store.rs:5572`). An `AddIncidentEdge` delta found on a chain is treated
+as corruption and fails the rollback, because nothing in this build can have removed an incidence
+entry for it to restore (`apply_own_delta`, `:5420-5424`).
 
 The delta record's on-disk layout, its size, and the store that holds it are frozen in
 `05-storage-format.md` §12.
@@ -695,9 +735,14 @@ the chain head. The lifecycle has five steps:
    place and its predecessor is recoverable from the delta just linked.
 5. **Resolution.** On commit, the transaction publishes its commit timestamp once (below) and its
    deltas become the historical versions other snapshots read. On abort, the transaction walks **its
-   own** deltas and applies each one, which restores exactly the state it found — a *logical* undo, in
-   contrast with today's physical byte-level ARIES undo (`RecordStore::rollback`,
-   `crates/graphus-storage/src/store.rs:3644`). Memgraph's abort is the same walk
+   own** deltas in the reverse of the order it linked them and applies each one against the
+   **current** state of the entity, which restores exactly the state it found; it then detaches them
+   from the chains they are on — always a head prefix, never a splice in the middle — reclaims them
+   together with its commit slot, and ends in the log with an `ABORT` record and no compensation
+   (`RecordStore::rollback_logical`, `crates/graphus-storage/src/store.rs:5840`). This is a *logical*
+   undo, and since task **#970** it is what the rollback of a data transaction is; the physical
+   byte-level ARIES undo it replaced survives only for transactions that own no commit slot (§4.3).
+   Memgraph's abort is the same walk
    (`/data/refsrc/memgraph/src/storage/v2/inmemory/storage.cpp:1489-1560`).
 
 A delta becomes reclaimable once no live snapshot can reach it, which is the same watermark rule the
@@ -754,19 +799,20 @@ introduced with the delta record and is the subject of task **#972**.
 
 #### 5.1.5 What the unified chain replaces
 
-**Five** mechanisms currently stand in for the version chain, and they exist only because there is no
-chain to carry the change. The table below lists each of the five (rows 1–5) with its replacement and
-the task that retires it, preceded by row 0 — the missing foundation all five depend on, which is the
-undo area itself. This table is the authoritative list; the decision register
-(`02-decision-register.md`) summarises it and does not restate it.
+**Five** mechanisms stood in for the version chain, and they existed only because there was no chain
+to carry the change. The table below lists each of the five (rows 1–5) with its replacement and the
+task that retired it, preceded by row 0 — the missing foundation all five depended on, which is the
+undo area itself. **Every row is now closed**, and the table is kept as the authoritative record of
+what each mechanism was replaced by; the decision register (`02-decision-register.md`) summarises it
+and does not restate it.
 
-| # | Mechanism today | Where it lives now | Replaced by | Retired in |
+| # | Mechanism, and what became of it | Where it lives now | Replaced by | Retired in |
 | --- | --- | --- | --- | --- |
 | 0 | ~~**No undo area at all.** `undo_ptr` is reserved in every record and always written `0`, so there is no chain to anchor.~~ **CLOSED.** | was `crates/graphus-storage/src/record.rs`; now `crates/graphus-storage/src/undo.rs` + `StoreKind::Undo` / `StoreKind::Commit` | The undo area and the delta record; `undo_ptr` is the live chain head | **#966 — done** |
-| 1 | **Property tombstone plus chain prepend.** Setting a property walks the entity's whole property chain to tombstone the previous version, then prepends a new one — **O(M²)** over M assignments (15.1 µs/op at M = 1000; 97.8 µs/op at M = 8000). | `RecordStore::tombstone_props_for_key`, `crates/graphus-storage/src/store.rs:6710-6753` | One `SetProperty` delta carrying the old value; the home property record is updated in place, and a **removal** is an empty cell in place rather than a tombstone (below) | **#967** |
-| 2 | **Label bitmap mutated in place, with the version history held only in memory.** The history is an in-process structure shared by `Arc`; nothing about it is durable, so labels are not versioned on disk. | `crates/graphus-storage/src/label_history.rs:143` | `AddLabel` / `RemoveLabel` deltas on the same durable chain as every other change | **#968** |
-| 3 | **Ad-hoc compare-and-set undo for chain heads and the label word.** A bespoke undo per field, needed because a whole-record pre-image undo would revert words a concurrently-committed writer legitimately owns. | `crates/graphus-storage/src/record.rs:114-123`; `store.rs:2507` (`write_chain_head`), `:2541` (label word) | `AddIncidentEdge` / `RemoveIncidentEdge` deltas naming one incidence entry, so no shared pointer word is ever rewritten by an undo | **#969** (the deltas) + **#970** (the compensations they replace) |
-| 4 | **Physical ARIES rollback.** Undo reverts bytes. This is the origin of the recurring defect family rmp #220 / #172 / #239 / #301 / #578 / #772, each one a case of one transaction's byte-level undo damaging another's committed state. | `RecordStore::rollback`, `crates/graphus-storage/src/store.rs:3644` | Logical rollback: the transaction walks its own deltas and applies them | **#970** |
+| 1 | ~~**Property tombstone plus chain prepend.** Setting a property walks the entity's whole property chain to tombstone the previous version, then prepends a new one — **O(M²)** over M assignments (15.1 µs/op at M = 1000; 97.8 µs/op at M = 8000).~~ **CLOSED.** | was `RecordStore::tombstone_props_for_key`; now the one property write path, `RecordStore::set_entity_property_encoded`, `crates/graphus-storage/src/store.rs:8117` | One `SetProperty` delta carrying the old value; the home property record is updated in place, and a **removal** is an empty cell in place rather than a tombstone (below) | **#967 — done** |
+| 2 | ~~**Label bitmap mutated in place, with the version history held only in memory.** The history is an in-process structure shared by `Arc`; nothing about it is durable, so labels are not versioned on disk.~~ **CLOSED.** | was `crates/graphus-storage/src/label_history.rs`; now `RecordStore::link_label_deltas`, `crates/graphus-storage/src/store.rs:3664` | `AddLabel` / `RemoveLabel` deltas on the same durable chain as every other change | **#968 — done** |
+| 3 | ~~**Ad-hoc compare-and-set undo for chain heads.**~~ **CLOSED.** A chain-head publication and the relink of the head it displaces are logged **redo-only** (§4.4); their inverse is to unlink the entry, never to restore the word. **What survives is a different mechanism, deliberately kept:** the node's `labels` word and the MVCC header word keep a compare-and-set undo, because each is a whole-word write whose inverse *is* the word — and that undo is now consumed only by recovery, since a data transaction's live rollback applies no WAL undo image at all. | was `store.rs` `write_chain_head` (pre-image, then compare-and-set) and `write_rel_field_keep`; now `RecordStore::write_field_redo_only`, `crates/graphus-storage/src/store.rs:3052`. The surviving compare-and-set is `patch_header_word_cas`, `:2984`, and `write_node_labels`, `:4307` | `AddIncidentEdge` / `RemoveIncidentEdge` deltas naming one incidence entry, so no shared pointer word is ever rewritten by an undo | **#969** (the deltas) + **#970 — done** (the compensations) |
+| 4 | ~~**Physical ARIES rollback.** Undo reverts bytes. This is the origin of the recurring defect family rmp #220 / #172 / #239 / #301 / #578 / #772, each one a case of one transaction's byte-level undo damaging another's committed state.~~ **CLOSED for every transaction that holds MVCC state.** | was `RecordStore::rollback`; now `RecordStore::rollback_logical`, `crates/graphus-storage/src/store.rs:5840`. `rollback_physical`, `:5916`, survives as the inverse of a maintenance or catalog-only transaction — one that owns no commit slot (§4.3) | Logical rollback: the transaction walks its own deltas and applies them | **#970 — done** |
 | 5 | ~~**Write-lock table plus wait-for-graph deadlock detector.**~~ **CLOSED.** | was `crates/graphus-txn/src/lock.rs` | Conflict detection on the entity's MVCC header, aborting immediately without waiting (§5.7) | **#971 — done** |
 
 Two further tasks complete the model rather than replacing a mechanism: **#972** introduces
@@ -774,19 +820,57 @@ Two further tasks complete the model rather than replacing a mechanism: **#972**
 `D-dst-writer-scheduler` extends `07-dst-simulator.md` §5 so that multi-writer behaviour is certified
 from a seed rather than from a race.
 
-**Status of this section.** Row 0 is **closed**: task #966 built the undo area, the delta record, the
-commit-info slot and the chain, and brought `undo_ptr` to life. The engine writes a `DeleteObject`
-delta when it creates a node or relationship and a `RecreateObject` delta when it deletes one, publishes
-each transaction's commit with a single store into its slot, reclaims chains by watermark at GC, and
-validates every chain in the consistency checker. `command_id` is carried in every delta and is always
-`0` until **#972** introduces statement-level isolation.
+**Status of this section: rows 0–5 are closed.** #966 built the undo area, the delta record, the
+commit-info slot and the chain, and brought `undo_ptr` to life; #967 moved the property path onto that
+chain; #968 versioned labels on it and retired the in-memory label history; #969 versioned adjacency
+on the relationship's chain; #970 made the rollback of a data transaction logical and retired the
+chain-head compensations; #971 retired the lock table and the deadlock detector. Every mutation kind
+the engine performs is therefore a delta on one chain, each transaction's commit is a single store
+into its slot, chains are reclaimed by watermark at GC, and the consistency checker validates every
+one of them.
 
-Rows 1–5 are still the **specified target**, not present behaviour: property assignment, label change
-and incidence change still use the mechanisms listed, rollback is still physical, and the write-lock
-table is still in place. Each row names the task that closes it. The transaction manager likewise still
-runs against a placeholder store — "the real `graphus_storage` does not yet implement version-chain
-mechanics", and wiring it up "is a follow-up task, intentionally **out of scope** here"
-(`crates/graphus-txn/src/store.rs`).
+**What is still the specified target rather than present behaviour** is `command_id`: it is carried in
+every delta and is always `0` until **#972** introduces statement-level isolation. The deterministic
+writer scheduler required by `D-dst-writer-scheduler` is likewise outstanding. The `graphus-txn`
+transaction manager also still runs against a placeholder store — "the real `graphus_storage` does not
+yet implement version-chain mechanics", and wiring it up "is a follow-up task, intentionally **out of
+scope** here" (`crates/graphus-txn/src/store.rs`); that is a statement about the SSI harness's own
+test seam (§5.7), not about the storage engine, whose chain is live.
+
+**Row 4 in detail: what a rollback costs, and what it stopped costing.** The physical path is
+`O(store)`, and not incidentally: it calls `reload_catalog`, which rebuilds the whole in-memory
+catalog — every free list, the token dictionary, the whole `Statistics` — from the durable metadata
+page, and must then restore, from pre-rollback snapshots, everything that reload discarded and that
+did not belong to the aborting transaction: the free lists (rmp #578), the live-record counters
+(#866), the physical-id and `ElementId` high-water marks (#220/#172), the token dictionary and the
+schema-catalog superset (#534/#734). The logical path discards nothing, so it restores nothing: every
+id the transaction consumed is returned by the action that retires its record, its counter movements
+are withdrawn as its own exactly-invertible delta, high-water marks and tokens are never lowered, and
+its schema DDL is reverted entry by entry on the live catalog. The cost is therefore bounded by the
+transaction's own writes rather than by the size of the store. Measured over a fixed set of writes
+(`crates/graphus-storage/tests/rollback_cost_970.rs`): **66 µs → 21 µs** on a 500-node store, and
+**1 087 µs → 25 µs** on a 16 000-node store with 4 000 interned property keys — a 16× spread with
+store size, replaced by a flat one. The structural contract, not the clock, is what the test pins: a
+data transaction's rollback performs **no catalog reload at all**.
+
+**Row 4, second consequence: the slots an abort orphans are parked, not reused immediately.**
+Retiring a record the aborting transaction created (applying its `DeleteObject` delta) frees the
+record's property chain and zeroes its 25-byte MVCC header, but does **not** return its physical id to
+the free list. The id is held in an in-memory pending set and returned by a GC phase that runs after
+the tombstone sweeps (`RecordStore::gc_reclaim_orphan_slots`,
+`crates/graphus-storage/src/store.rs:5720`). The abort knows the slot is unreachable — it is what
+unlinked it — so the restraint is deliberate, and its reason lies outside the storage engine: the
+latest-state TEXT, FULLTEXT and SPATIAL indexes are in-memory (§6.7) and **not transactional**, and
+key their documents by **physical node id**. An aborted node's posting survives its rollback as a
+harmless false positive that the re-check filters out; handing the id straight back out instead turns
+the next writer's *insert* into what the index reads as the **replacement of a still-committed
+document**, which is the shape `rmp` #756 must fail closed on — the freshness marker is poisoned and
+every text or spatial seek degrades to a full scan until a rebuild. Parking keeps the space guarantee
+(the slots do come back, so an abort-heavy workload does not grow the store) while moving the recycle
+to a maintenance boundary; it becomes unnecessary once the indexes are version-aware. The set is in
+memory only, and losing it to a crash costs nothing: the slot is `!in_use` on the page, so no read can
+reach it and no invariant is broken — it is space the next store rebuild reclaims, exactly like an
+undo-area orphan.
 
 **Row 1 in detail: what a property removal becomes** (`D-property-removal`, ratified 2026-08-03).
 `REMOVE n.p` — and `SET n.p = null`, which Cypher defines as the same removal — rewrites the
@@ -964,9 +1048,9 @@ contract between §5 and the rest of the engine.
   `05-storage-format.md` §12.2 has **no field for the old `created_ts`** — its `SetProperty` payload
   is `token`, `type_tag` and `value_inline`, and nothing else. A logical undo therefore *cannot*
   restore that stamp, so the stamp must not be something correctness depends on; under this decision
-  nothing does. The direct consequence is that **task #970 is a rollback change only**: because the
-  chain is already the oracle by the time #970 lands, logical rollback replaces physical undo without
-  a second rewrite of the read path.
+  nothing does. The direct consequence is that **task #970 was a rollback change only**: because the
+  chain was already the oracle when #970 landed, logical rollback replaced physical undo with no
+  second rewrite of the read path.
 - **A read of the latest committed version costs one record fetch.** This is the whole point of
   in-place-latest, and it is what protects index-free adjacency: a traversal that reads the current
   version of every record it visits walks no chains at all. A reader on an older snapshot walks the
@@ -975,9 +1059,9 @@ contract between §5 and the rest of the engine.
 - **Every delta is WAL-logged and recovered by the same ARIES machinery** as the record it belongs to
   (§4.8). The undo area is an ordinary region of ordinary logical pages (`05-storage-format.md` §12),
   not a side structure with its own recovery rules, so a crash mid-chain is recovered by redo exactly
-  as a crash mid-record is. This is what makes labels durably versioned for the first time: today
-  their history is in memory only (`crates/graphus-storage/src/label_history.rs:143`) and is lost on
-  restart.
+  as a crash mid-record is. This is what made labels durably versioned for the first time (**#968**):
+  their history used to live in memory only, in an in-process structure shared by `Arc`, and was lost
+  on restart.
 - **Indexes are unchanged and stay unversioned (§6.3).** An index entry points at a record; visibility
   is resolved by reading that record's MVCC header and, where the entry's key was itself changed by an
   in-flight transaction, by resolving the delta chain. The three read polarities of §5.3 are

@@ -10,9 +10,9 @@ to the domain/component it constrains. On ratification, the chosen option is rec
 and its status set to `ratified`.
 
 > **Status: all 24 decisions of the original 2026-06-05 round are ratified.** The chosen option is
-> recorded on each `Decision` node (`status: ratified`, property `chosen`). Twelve further decisions
+> recorded on each `Decision` node (`status: ratified`, property `chosen`). Twenty further decisions
 > were ratified after that round; they are recorded in the same index below, each carrying its own
-> ratification date. The register therefore holds **40 decisions** in total. The decision index in
+> ratification date. The register therefore holds **44 decisions** in total. The decision index in
 > the next section is the canonical enumeration; the options tables below it are kept for the
 > rationale and trade-offs, and are not a decision list.
 
@@ -79,6 +79,9 @@ Parse contract, to be preserved by any future edit:
 | `D-property-removal` | ratified | 2026-08-03 | **`REMOVE n.p` (and `SET n.p = null`) rewrites the property cell in place to an empty cell — `type_tag = 0, value_inline = 0` — and is not an `xmax` tombstone.** The cell keeps its `in_use` bit and its position in the `first_prop` chain; the old value descends onto the entity's undo chain in a `SetProperty` delta. Two consequences are normative: **exactly one owner names any `strings.store` overflow chain** (the live cell owns the current value, a delta owns each historical value, and the two sets are disjoint), and a later `SET` of the same key reuses the empty cell with no allocation. `expired_ts` is never again written by a property operation, and `RecordStore::tombstone_props_for_key` is retired. Design in `04-technical-design.md` §5.1.5 row 1; format in `05-storage-format.md` §12.2. |
 | `D-property-visibility` | ratified | 2026-08-03 | **The undo chain is the sole visibility oracle for a property's value.** The property cell's own `created_ts` becomes informative rather than authoritative: a reader resolves which value it is entitled to see by starting from the in-place image and walking the entity's undo chain, never by comparing the cell's stamp. The cell's MVCC header keeps its structural meaning — `in_use` for slot occupancy and corpse threading. The ground is that the frozen 56-byte delta of `05-storage-format.md` §12.2 has no field for the old `created_ts`, so no logical undo can ever restore it, and under this decision none needs to. This is what allows task **#970** to be a rollback change only, with no second rewrite of the read path. Design in `04-technical-design.md` §5.6. |
 | `D-retired-mechanism-tests` | ratified | 2026-08-03 | **When a task retires a mechanism, an acceptance criterion of the form "all existing tests stay green" is read as "every semantic those tests protected remains asserted by a test that fails if the semantic breaks".** Each retired mechanism test must be replaced by a named semantic-equivalent that is at least as strong, and the replacement must be listed in the task's closure summary. A general rule of the project's testing obligations, not a #967-only one. Specified in `04-technical-design.md` §11.6. |
+| `D-rollback-dispatch` | ratified | 2026-08-05 | **A rollback is dispatched by one test — whether the transaction owns a commit-info slot — and there are exactly two paths.** A transaction that linked any delta owns a slot, so every change it made to MVCC state is on an undo chain and is undone **logically**: it applies its own deltas newest-first against the *current* state, detaches them (always a head prefix, never a splice in the middle), reclaims them with its slot, and ends in the log with an `ABORT` record carrying no compensation. A transaction with **no** slot linked no delta; two kinds reach that case — a maintenance pass (GC reclamation, corpse splice, freeze sweep), whose writes are physical space management naming no MVCC version, and a catalog-only writer, whose effects are in-memory schema that the metadata page settles — and both keep the **physical** ARIES path, because physical undo is the right inverse of a physical change and a GC pass is a single non-yielding call, so no concurrent writer can stale its pre-images. Retiring the physical path outright belongs to the tasks that version the catalog and make collection concurrent, not to task **#970**. Closes `04-technical-design.md` §5.1.5 row 4; design in `04-technical-design.md` §4.3, §4.4 and §5.1.5. |
+| `D-chain-head-redo-only` | ratified | 2026-08-05 | **A chain-head publication (`undo_ptr`, `first_rel`, `first_prop`) and the relink of the head it displaces are logged redo-only, with an empty undo image.** Their inverse is to *unlink the entry*, computed at abort time from the transaction's own deltas, and never the restoration of the word. Neither form of restoration could be made safe: a plain pre-image undo of a shared head clobbers a concurrently-committed prepend (the whole of `rmp` #220), and the compare-and-set undo that replaced it was narrower but still unsound, because it restores an **id**, and once a slot can be freed and handed out again the id it restores may name a different record. The state a redo-only write leaves after recovery is a head naming a `!in_use` record — a **corpse**, which every chain walk in the storage core already threads through and the GC splice reclaims — and that is the state `rmp` #220 / #172 already designed the header-only creation undo around. Two exceptions are deliberate: the GC's clearing of `undo_ptr` keeps a physical undo, because it is not a prepend; and the compare-and-set undo itself is **not** retired, surviving on the node's `labels` word and on the MVCC header word, where a whole-word write's inverse *is* the word. Closes the chain-head half of `04-technical-design.md` §5.1.5 row 3; design in `04-technical-design.md` §4.4, and format consequences in `05-storage-format.md` §7 and §12.5. |
+| `D-orphan-slot-parking` | ratified | 2026-08-05 | **A record slot that a logical rollback orphans is parked in memory until the next garbage-collection pass, not returned to the free list by the abort itself.** The abort knows the slot is unreachable — it is what unlinked it — so the restraint is deliberate, and its reason lies outside the storage engine: the latest-state TEXT, FULLTEXT and SPATIAL indexes are in memory, **not transactional**, and key their documents by **physical node id**. An aborted node's posting survives its rollback as a harmless false positive that the re-check filters out, but recycling the id immediately turns the next writer's *insert* into what the index reads as the **replacement of a still-committed document** — the one shape `rmp` #756 must fail closed on, at the cost of a poisoned freshness marker and of every text or spatial seek degrading to a full scan until a rebuild. Parking keeps the space guarantee (the slots do come back, so an abort-heavy workload does not grow the store) while moving the recycle to a maintenance boundary; the GC phase is guarded on the record still being retired, so a slot legitimately re-used by some other path is never double-freed. The parking becomes unnecessary once those indexes are version-aware. Design in `04-technical-design.md` §5.1.5. |
 
 <!-- END decision-index -->
 
@@ -405,6 +408,58 @@ scope and are propagated into `00-overview.md` and `01-needs-survey.md`:
 > §5.7; the empty-cell representation and the retirement of the tombstone pass are §5.1.5 row 1; the
 > visibility oracle is §5.6; the testing rule is §11.6. The `type_tag == 0` clarification to the
 > frozen delta table is `05-storage-format.md` §12.2 — prose filling a gap, not an amendment.
+
+## Ratified decision (2026-08-05) — logical rollback
+
+> **Three decisions, ratified together on 2026-08-05, settle how a transaction is undone once every
+> mutation kind is a delta on the undo chain (task #970).** They refine the 2026-08-02 and 2026-08-03
+> rounds rather than replacing any part of them: `D-version-representation`,
+> `D-write-conflict-detection`, `D-multi-writer`, `D-dst-writer-scheduler`, `D-incidence-anchor` and
+> the four property-path decisions are unchanged, and every one of the four inviolable requirements of
+> `CLAUDE.md` stands as written. No byte of the frozen undo-area format (`05-storage-format.md` §12)
+> changes.
+>
+> **Status: ratified (all three).**
+>
+> **Why now.** Tasks #966 to #969 put every mutation kind on the chain, and #971 made the entity's own
+> MVCC header the engine's only conflict mechanism. Rollback was the last mechanism still working from
+> bytes, and three questions had to be answered before it could be written down without ambiguity:
+> which transactions the logical undo covers and what happens to the rest; what becomes of the page
+> writes whose inverse is not a byte image; and when the slots an abort strands may be handed out
+> again.
+>
+> | Decision | Ratified choice | Grounding |
+> | --- | --- | --- |
+> | **`D-rollback-dispatch`** | **Logical undo for a transaction that owns a commit-info slot; the ARIES physical path for one that does not.** The two kinds that own no slot are a maintenance pass and a catalog-only writer. | Memgraph's abort is the same walk over the transaction's own deltas (`/data/refsrc/memgraph/src/storage/v2/inmemory/storage.cpp:1489-1560`). The dispatch is `RecordStore::rollback` (`crates/graphus-storage/src/store.rs:5795`), over `rollback_logical` (`:5840`) and `rollback_physical` (`:5916`). |
+> | **`D-chain-head-redo-only`** | **Chain-head publications and the relink of the displaced head log a redo image and an empty undo image.** The compare-and-set undo survives only where a whole-word write's inverse is the word itself. | `WalManager::log_update_redo_only` (`crates/graphus-wal/src/manager.rs:378`) and `RecordStore::write_field_redo_only` (`crates/graphus-storage/src/store.rs:3052`). The unsoundness of the compare-and-set undo was **reproduced**, not argued: the DST simulator (VOPR seed 12) drops a committed edge out of its node's incidence chain after recovery, because the restored id names a slot that had since been freed and re-used. |
+> | **`D-orphan-slot-parking`** | **A slot orphaned by a logical rollback is parked until the next GC pass.** | The latest-state TEXT / FULLTEXT / SPATIAL indexes are in-memory, non-transactional and keyed by physical node id (`rmp` #467 / #756). The failure the parking prevents is reproduced by `crates/graphus-cypher/tests/text_index.rs::rmp756_constraint_rejected_insert_keeps_the_text_seek_selective`, where two constraint-rejected `CREATE`s in a row recycled one id. |
+>
+> **The consequences that are normative.**
+>
+> - **The cost of an abort is bounded by the transaction's own writes, not by the size of the store.**
+>   `reload_catalog` leaves the abort path, and with it every snapshot that existed only to put back
+>   what the reload had discarded: the free lists (`rmp` #578), the live-record counters (#866), the
+>   physical-id and `ElementId` high-water marks (#220/#172), the token dictionary and the
+>   schema-catalog superset (#534/#734). Measured over a fixed set of writes
+>   (`crates/graphus-storage/tests/rollback_cost_970.rs`): **66 µs → 21 µs** on a 500-node store and
+>   **1 087 µs → 25 µs** on a 16 000-node store with 4 000 interned property keys. The contract the
+>   test pins is structural rather than a clock — a data transaction's rollback performs no catalog
+>   reload at all.
+> - **Every property write goes through the versioned path.** The raw-tag entry points
+>   (`add_node_property` / `add_rel_property`) used to write an unversioned cell with no conflict check
+>   and no delta. Under logical rollback that is not a shortcut but a hole: a write with no delta is a
+>   write no abort can undo. They now reach the same four steps as every other property write, and the
+>   raw cell primitives are private.
+> - **A failed rollback still leaves its transaction OPEN.** The contract of `04-technical-design.md`
+>   §4.4 is unchanged and holds on both paths: the active-set entry is released only after every
+>   fallible step has succeeded, so every gate that asks "is a writer holding uncommitted state?" keeps
+>   failing closed.
+>
+> **Where this is specified.** The dispatch and what WAL undo still decides are
+> `04-technical-design.md` §4.3; the `ABORT` record and the redo-only page-update record are §4.4;
+> the delta-application order, the detach and the measured cost are §5.1.2 step 5 and §5.1.5 row 4;
+> the parked slots are §5.1.5. The format-side consequences are `05-storage-format.md` §7 (the
+> chain-head write carries no undo image) and §12.5 (how a live abort and a crashed loser differ).
 
 ## TCK target (pinned — closes `D-cypher-line` open question 1)
 

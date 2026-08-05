@@ -169,6 +169,16 @@ pub struct RollbackFaultReport {
     /// The store's view of an unrelated, still-open bystander after the fault, proving the fault did
     /// not simply freeze the whole active set.
     pub bystander_after: WriterVisibility,
+    /// The committed label bitmap the seed established — what the node's live word must hold once the
+    /// writer's change has been undone.
+    pub committed_labels: u64,
+    /// The node's LIVE label word after the fault, with no MVCC arbitration (`rmp` #970). The logical
+    /// rollback applies its deltas BEFORE asking the WAL to record the abort, so by the time the
+    /// armed `fdatasync` panics the page already carries the committed value again. That is what
+    /// moved with #970: the fault window is no longer "the undo did not happen" but "the undo
+    /// happened and the log could not be told about it", which is the strictly safer of the two — a
+    /// crash from here has recovery undo the transaction physically, reaching the same state.
+    pub live_labels_after: u64,
 }
 
 /// The outcome of [`run_io_error_at_commit_of_a_label_writer`].
@@ -326,7 +336,7 @@ fn relabel<D: graphus_io::BlockDevice, S: LogSink>(
 pub fn run_wal_sync_failure_during_rollback() -> RollbackFaultReport {
     let fail_sync = Arc::new(AtomicBool::new(false));
     let mut store = create_fault_store(&fail_sync);
-    let (node, _committed, written) = seed(&mut store);
+    let (node, committed_labels, written) = seed(&mut store);
 
     // The writer takes the LOWER id, so `uncommitted_data_writer` — which reports the lowest open
     // data writer, deterministically — names it while it is open.
@@ -355,12 +365,15 @@ pub fn run_wal_sync_failure_during_rollback() -> RollbackFaultReport {
 
     let after = observe(&store, writer, node, written);
     let bystander_after = observe(&store, bystander, node, written);
+    let live_labels_after = live_bitmap(&store, node);
 
     RollbackFaultReport {
         fault_surfaced,
         before,
         after,
         bystander_after,
+        committed_labels,
+        live_labels_after,
     }
 }
 
@@ -774,9 +787,15 @@ mod tests {
              `uncommitted_data_writer` must still name the writer whose effects are still on the page \
              (rmp #955)"
         );
+        assert_eq!(
+            r.live_labels_after, r.committed_labels,
+            "rmp #970: the logical undo runs BEFORE the abort is recorded, so the page already holds \
+             the committed label word when the armed fdatasync panics. What must never happen — and \
+             is asserted below — is the transaction being dropped from the active set on the way out"
+        );
         assert!(
-            r.after.holds_inflight_label_versions,
-            "the failed undo must not have settled or dropped the writer's retained label versions"
+            !r.after.label_change_is_visible,
+            "the writer's label change must remain INVISIBLE across the fault"
         );
         assert!(
             !r.after.label_change_is_visible,

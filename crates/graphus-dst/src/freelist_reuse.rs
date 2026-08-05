@@ -231,12 +231,21 @@ fn drive_scenario(seed: u64) -> ScenarioOutcome {
         .expect("intern reltype");
     store.commit(t_tok).expect("commit token");
 
-    // --- Committed node H. ---
+    // --- Committed nodes H and H2. ---
+    //
+    // H2 exists because of `rmp` #970: a property write now takes the OWNING ENTITY's write-conflict
+    // check (`D-property-write-conflict`) on the raw-tag entry point too, so `C` cannot write a
+    // property on `H` while `A` holds it open — it would be refused with a retriable serialization
+    // failure before ever reaching `alloc_id`. The defect this module reproduces is in the
+    // **store-global free list**, not in the chain `C` writes to, so `C` allocates on H2 and the
+    // double-pop is exercised exactly as before.
     let t_h = next_txn(&mut next);
     store.begin(t_h);
     let (h, _) = store.create_node(t_h).expect("create H");
+    let (h2, _) = store.create_node(t_h).expect("create H2");
     store.commit(t_h).expect("commit H");
     model.add_node(h);
+    model.add_node(h2);
 
     // --- Committed survivors threaded BELOW the churn (committed data a corruption must not lose). ---
     let t_surv = next_txn(&mut next);
@@ -331,7 +340,7 @@ fn drive_scenario(seed: u64) -> ScenarioOutcome {
     //     self-cycles the chain); post-fix the free list is empty so a fresh id is handed out. ---
     let c = next_txn(&mut next);
     store.begin(c);
-    let c_allocated_id = alloc_on_h(&mut store, c, target, rel_type, h, 400, 0x4000_0000);
+    let c_allocated_id = alloc_on_h(&mut store, c, target, rel_type, h2, 400, 0x4000_0000);
     let double_alloc_averted = c_allocated_id != reused_id;
 
     // Commit A and C — both are acknowledged, so both belong in the model.
@@ -348,7 +357,7 @@ fn drive_scenario(seed: u64) -> ScenarioOutcome {
                 },
             );
             model.add_node_prop(
-                h,
+                h2,
                 PropTriple {
                     key: 400,
                     type_tag: INLINE_TAG,
@@ -358,7 +367,7 @@ fn drive_scenario(seed: u64) -> ScenarioOutcome {
         }
         Target::Rel => {
             model.add_rel(reused_id, h, h);
-            model.add_rel(c_allocated_id, h, h);
+            model.add_rel(c_allocated_id, h2, h2);
         }
     }
 

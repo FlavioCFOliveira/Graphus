@@ -235,9 +235,18 @@ fn run_triple_crash(seed: u64) -> TripleCrashReport {
                 .expect("create loser self-loop");
         } else {
             let key = keys[rng.index(keys.len())];
-            let _ = store
-                .add_node_property(tid, shared, key, INLINE_TAG, 0x9000 + remaining)
-                .expect("add loser property");
+            // A property write takes the OWNING ENTITY's write-conflict check
+            // (`D-property-write-conflict`; since `rmp` #970 on this raw-tag entry point too), so only
+            // ONE of the interleaved losers holds the shared node's property chain at a time and the
+            // others are refused with a retriable serialization failure — a legitimate outcome of the
+            // interleaving that writes nothing and leaves the loser open for its next turn. The
+            // self-loop half does not conflict (an incidence delta anchors on the fresh relationship,
+            // `D-incidence-anchor`), so the churn keeps its teeth.
+            match store.add_node_property(tid, shared, key, INLINE_TAG, 0x9000 + remaining) {
+                Ok(_) => {}
+                Err(graphus_core::GraphusError::Transaction(_)) => {}
+                Err(e) => panic!("add loser property: {e:?}"),
+            }
         }
         rem[pick] -= 1;
         remaining -= 1;
@@ -356,6 +365,10 @@ fn triple_crash_recovery_is_idempotent_across_seeds() {
         rel_corpse > 0,
         "no seed reached a rel corpse head — soak vacuous"
     );
+    // The `rmp` #301 property corpse head, still reached — by a different route since `rmp` #970: a
+    // chain-head publication is redo-only, so ARIES leaves a crashed loser's cell as the head and the
+    // header-only creation undo marks it `!in_use`. (The interleaving that used to produce it — two
+    // transactions' cells on one chain — is now refused by the entity write-conflict check.)
     assert!(
         prop_corpse > 0,
         "no seed reached a prop corpse head — soak vacuous"

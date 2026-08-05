@@ -308,21 +308,6 @@ struct IncidenceSide {
 struct ActiveTxn {
     created: Vec<(StoreKind, u64)>,
     expired: Vec<(StoreKind, u64)>,
-    /// Relationship ids this transaction captured as the **pre-image of a node's `first_rel`** while
-    /// prepending an edge (`rmp` #969). Its rollback will write one of these back into `first_rel`, so
-    /// GC must not reclaim any of them in the meantime — the abort would otherwise restore a head
-    /// naming a slot on the free list, which the next allocation hands to an unrelated relationship.
-    ///
-    /// This is the **exact** question, and it is worth saying why the obvious approximation is not
-    /// good enough. Asking instead "does either endpoint carry an uncommitted incidence delta?"
-    /// answers a strictly larger question: on a hub under sustained insertion there is *always* such a
-    /// delta, so every tombstoned relationship incident to it becomes unreclaimable and the space
-    /// leak is unbounded (measured: eight consecutive GC passes reclaiming zero). Naming the captured
-    /// ids costs one `u64` per prepend, is O(1) to test, and has no false positives.
-    ///
-    /// Cleared with the transaction, on either outcome: once it commits, the pre-image is never
-    /// written back; once it aborts, the write-back has already happened.
-    captured_rel_heads: BTreeSet<u64>,
     /// Physical ids this transaction pushed onto a store's free list (`rmp` #578). Only the
     /// GC/reclaim paths free ids, and they route every push through
     /// [`free_push`](RecordStore::free_push), which records it here. On a **live** rollback these
@@ -358,14 +343,10 @@ struct ActiveTxn {
     /// **`rmp` #966.** Every delta this transaction linked onto an entity's undo chain, in link
     /// order.
     ///
-    /// A delta's creation is undone by the compare-and-set undo of the entity's `undo_ptr`
-    /// ([`write_chain_head`](RecordStore::write_chain_head)), which fires **only if this
-    /// transaction's delta is still the head** — so after the undo a delta is either unreachable
-    /// (its slot is free again) or still threaded as a corpse, because another transaction prepended
-    /// on top of it. [`reclaim_aborted_undo`](RecordStore::reclaim_aborted_undo) decides which by
-    /// re-walking each touched entity's chain, exactly as
-    /// [`reclaim_aborted_pops`](RecordStore::reclaim_aborted_pops) re-walks an incidence chain for
-    /// the same question about a reused relationship slot.
+    /// Read in reverse by [`rollback_logical`](RecordStore::rollback_logical): the deltas of a
+    /// transaction are always the head prefix of every chain they are on, so it applies each one
+    /// against the current state, republishes each touched entity's head past its own run, and frees
+    /// them ([`detach_own_deltas`](RecordStore::detach_own_deltas)).
     undo_links: Vec<UndoLink>,
     /// This transaction's own pending **schema-catalog DDL**, as a per-entry undo log (`rmp` #734) —
     /// the `Statistics` twin of [`freed_ids`](Self#structfield.freed_ids) / [`popped_ids`](Self#structfield.popped_ids).
@@ -700,6 +681,15 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// The count mutators (`inc_node`/`inc_rel`/…) are *not* tracked here: they only ever run inside a
     /// record-writing operation, so `WalManager::is_active` already covers them.
     catalog_dirty: bool,
+    /// How many times [`reload_catalog`](Self::reload_catalog) has rebuilt the in-memory catalog from
+    /// the durable metadata page (`rmp` #970, and observability for #985).
+    ///
+    /// It is here because it is the one **deterministic** witness of the cost `rmp` #970 removed from
+    /// the abort path: a reload is `O(free list + token dictionary + schema)`, i.e. `O(store)`, and
+    /// the whole `pre_free` / `pre_tokens` / `pre_statistics` snapshot family existed only to put
+    /// back what it threw away. A data transaction's rollback must not perform one — asserted by
+    /// `tests/rollback_cost_970.rs` without measuring a clock.
+    catalog_reloads: u64,
     /// Monotonic stamp handed to each [`SchemaUndo`] so catalog mutations carry a **store-global**
     /// order (`rmp` #734). Purely in-memory: undo logs never outlive the transactions that own them,
     /// so this needs no durability and is not part of [`Meta`].
@@ -793,6 +783,26 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// corpses are caught by the full first pass. Cleared when the splice runs (it collects every
     /// corpse in one walk).
     pending_corpse_rels: std::collections::BTreeSet<u64>,
+    /// Node / relationship slots a **logical rollback** retired: unlinked from every chain, header
+    /// zeroed, and belonging to no free list yet (`rmp` #970, acceptance criterion 7).
+    ///
+    /// The abort could return them to the free list itself — it knows they are unreachable, because it
+    /// is what unlinked them. It deliberately does not, and the reason is outside this crate: the
+    /// latest-state TEXT / FULLTEXT / SPATIAL indexes are in-memory, **not transactional**, and key
+    /// their documents by **physical node id** (`rmp` #467 / #756). An aborted node's posting survives
+    /// its rollback as a harmless, re-check-filterable false positive; handing the id straight back out
+    /// turns the next writer's *insert* into what the index sees as a **replace of a still-committed
+    /// document**, which is the one shape #756 must fail closed on — the freshness marker is poisoned
+    /// and every text/spatial seek in the database degrades to a full scan until a rebuild.
+    /// (Reproduced directly by
+    /// `graphus-cypher/tests/text_index.rs::rmp756_constraint_rejected_insert_keeps_the_text_seek_selective`,
+    /// where two constraint-rejected `CREATE`s in a row recycled one id.)
+    ///
+    /// Parking them until the GC pass keeps the space guarantee — the slots come back, so an
+    /// abort-heavy workload does not grow the store — while moving the recycle to a maintenance
+    /// boundary. When the indexes become version-aware (#992) the parking can go and the abort can free
+    /// the slot directly.
+    pending_orphan_slots: [std::collections::BTreeSet<u64>; STORE_COUNT],
     /// Whether property dead-link corpses (`rmp` #172) may exist since the last property sweep (`rmp`
     /// #522): set on [`rollback`](Self::rollback) of a transaction that created properties, cleared when
     /// the property sweep runs. Together with a non-empty `pending_tombstones[Prop]` it gates the
@@ -1017,6 +1027,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             durable_write_commit_ts_hw: 0,
             active: HashMap::new(),
             catalog_dirty: false,
+            catalog_reloads: 0,
             schema_seq: 0,
             schema_last_seq: HashMap::default(),
             meta_chain: Vec::new(),
@@ -1032,6 +1043,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             freeze_audit_from: [1; STORE_COUNT],
             pending_tombstones: Default::default(),
             pending_corpse_rels: std::collections::BTreeSet::new(),
+            pending_orphan_slots: std::array::from_fn(|_| std::collections::BTreeSet::new()),
             pending_prop_corpses: false,
             pending_empty_prop_cells: false,
             gc_full_scan_pending: true,
@@ -1156,6 +1168,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             durable_write_commit_ts_hw: meta.commit_ts_hw,
             active: HashMap::new(),
             catalog_dirty: false,
+            catalog_reloads: 0,
             schema_seq: 0,
             schema_last_seq: HashMap::default(),
             meta_chain,
@@ -1171,6 +1184,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             freeze_audit_from: [1; STORE_COUNT],
             pending_tombstones: Default::default(),
             pending_corpse_rels: std::collections::BTreeSet::new(),
+            pending_orphan_slots: std::array::from_fn(|_| std::collections::BTreeSet::new()),
             pending_prop_corpses: false,
             pending_empty_prop_cells: false,
             gc_full_scan_pending: true,
@@ -2220,6 +2234,15 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// maps an unknown id to `Aborted`, never `InFlight` — so the naive predicate silently reports every
     /// genuinely open writer as resolved. Live membership in the Active Transaction Table is the correct
     /// "this writer might still commit, so treat its versions as uncommitted" signal.
+    /// How many times this store has rebuilt its in-memory catalog from the durable metadata page
+    /// (`rmp` #970). Zero for a store that has only ever committed and logically rolled back data
+    /// transactions; it advances on `open`, on a maintenance/catalog-only transaction's physical
+    /// rollback, and on nothing else.
+    #[must_use]
+    pub fn catalog_reloads(&self) -> u64 {
+        self.catalog_reloads
+    }
+
     #[must_use]
     pub fn is_txn_active(&self, txn: TxnId) -> bool {
         self.active.contains_key(&txn)
@@ -2950,7 +2973,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// interleaving because a later writer can legitimately own the word by abort time; a plain undo
     /// would then resurrect a stale stamp (a lost-update / visibility breach). Used for the MVCC
     /// **tombstone** (`xmax = in_flight(txn)`) writes of [`delete_node`](Self::delete_node),
-    /// [`delete_rel`](Self::delete_rel) and [`tombstone_props_for_key`](Self::tombstone_props_for_key).
+    /// [`delete_rel`](Self::delete_rel).
     /// The GC-time freeze ([`freeze_store_headers`](Self::freeze_store_headers)) keeps the plain
     /// [`patch_header_word`](Self::patch_header_word): it runs only inside a GC pass that holds the
     /// store exclusively (no interleaving mutator), so its undo can never race a concurrent writer.
@@ -2987,73 +3010,74 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         Ok(())
     }
 
-    // ------------- chain-safe writes (logical-undo discipline, `rmp` #220 / #172) -------------
+    // --------- chain writes: redo-only, because their inverse is logical (`rmp` #970) ---------
     //
-    // Three writes participate in a graph chain and must NOT log a plain whole-record pre-image undo,
-    // because under STATEMENT-granularity interleaving a concurrently-committed writer can prepend a
-    // record on top of (or relink into) the very field this txn touched. A plain pre-image abort would
-    // then clobber that committed structure. The fixes below replace the unsafe plain undos with the
-    // logical compensations the surviving `paging`/recovery contract replays identically live and on
-    // crash (`04 §4.1`):
+    // A prepend onto a chain head (`undo_ptr`, `first_rel`, `first_prop`) and the relink of the
+    // displaced old head are **not** undone by restoring the words they wrote. They are undone by
+    // *unlinking the entry*, computed from the state at abort time — the transaction's own
+    // `RemoveIncidentEdge` / `DeleteObject` deltas, applied by [`rollback_logical`](Self::rollback_logical).
+    // So these writes log a redo image and no undo at all.
     //
-    //   * `write_chain_head`  — pushing a record onto a `first_rel`/`first_prop` head: undo is a
-    //     compare-and-set ([`paging::encode_cas_patch`]) that resets the head to its old value ONLY if
-    //     it is still this txn's pushed id (else a later writer owns the head — no-op).
-    //   * `write_*_create`    — first write of a freshly-allocated rel/prop record: undo reverts ONLY
-    //     the MVCC header (marks the slot not-in-use), PRESERVING the record body (its forward chain
-    //     pointers). A surviving writer that prepended onto this record then threads THROUGH the dead
-    //     record to its successor instead of having the chain severed by a body-zeroing undo.
-    //   * `write_rel_field_keep` — a side write whose plain pre-image undo would also be unsafe (e.g.
-    //     `relink_old_head` making the old head look like the chain head): logged with undo == redo,
-    //     a no-op on abort; the GC corpse splice re-establishes the correct neighbour state. It writes
-    //     ONLY the touched chain-pointer/flags fields, never the MVCC header — so an out-of-LIFO abort
-    //     of two interleaved prependers cannot resurrect a neighbour record's in-use bit (`rmp` #239).
+    // # Why restoring the word could not be made safe, in either form
+    //
+    // A plain pre-image undo of a shared head clobbers a concurrently-committed prepend — the whole of
+    // `rmp` #220. The compare-and-set undo that replaced it ("reset the head to `old` only if it is
+    // still `new`") was narrower but not sound: it still *restores an id*, and an id is only meaningful
+    // while it names the same record. Once a slot can be freed and handed out again, the id restored at
+    // recovery may name a different record entirely. Reproduced: a writer prepends `S` and stays open;
+    // an interleaved writer's abort frees a slot below it; a third writer reuses that slot; the crash
+    // then has ARIES undo the still-open writer, the compare-and-set fires, and the node's `first_rel`
+    // is restored to a slot whose body now belongs to somebody else — a committed edge silently dropped
+    // out of its node's incidence chain (`graphus-dst` VOPR seed 12).
+    //
+    // The state a redo-only write leaves after recovery is a head naming a `!in_use` record — a
+    // **corpse** — which every walk in this crate already threads through (`incident_rels`,
+    // `collect_prop_chain`, `undo_chain`) and [`gc_splice_corpses`](Self::gc_splice_corpses) reclaims.
+    // That is the state `rmp` #220 / #172 designed the header-only creation undo around; it is
+    // recovered, not repaired by an unsound restoration.
+    //
+    // The one chain-head write that KEEPS a physical undo is the GC's
+    // [`free_undo_chain`](Self::free_undo_chain), which clears `undo_ptr` to `0`. It is not a prepend:
+    // leaving it un-undone on a rolled-back GC pass would leave an entity with no history while its
+    // deltas are restored, which is a visibility error rather than a reclaimable corpse. A GC pass is a
+    // single non-yielding call, so its plain pre-image can never go stale.
 
-    /// Writes the 8-byte chain-head field at `field_off` of record `id` in `kind`'s store to
-    /// `new_head`, logging a **compare-and-set logical undo** (`rmp` #220 / #172): redo installs
-    /// `new_head`; undo resets the field to `old_head` *only if it still equals `new_head`*. This is
-    /// the correct compensation for "push `new_head` onto the head" — it never clobbers a later
-    /// committed writer that has since pushed on top (its push moved the head off `new_head`, so the
-    /// CAS no-ops). Replays identically in live rollback (`PoolTarget`) and crash recovery
-    /// (`DeviceTarget`) via [`paging::apply_patch`].
+    /// Writes a chain-pointer / chain-flag field of record `id` in `kind`'s store with **no undo**
+    /// (`rmp` #970) — see the section note above. Touches exactly
+    /// `[field_off, field_off + bytes.len())` and never the MVCC header.
+    fn write_field_redo_only(
+        &mut self,
+        kind: StoreKind,
+        id: u64,
+        field_off: usize,
+        bytes: &[u8],
+        txn: TxnId,
+    ) -> Result<()> {
+        let (rel_page, off) = paging::record_location(id, kind.record_size());
+        let dev = self.ensure_store_page(kind, rel_page, txn)?;
+        let abs = off + field_off;
+        let end = abs + bytes.len();
+        let redo = paging::encode_patch(abs, bytes);
+        let f = self.pool.fetch(dev)?;
+        let lsn = self.wal.with(|w| w.log_update_redo_only(txn, dev, &redo));
+        self.pool.with_page_mut_lsn(f, lsn, |p| {
+            p[abs..end].copy_from_slice(bytes);
+        });
+        self.pool.unpin(f);
+        Ok(())
+    }
+
+    /// Publishes `new_head` into the 8-byte chain-head field at `field_off` of record `id`
+    /// (`rmp` #970): a redo-only write, undone by unlinking rather than by restoration.
     fn write_chain_head(
         &mut self,
         kind: StoreKind,
         id: u64,
         field_off: usize,
         new_head: u64,
-        old_head: u64,
         txn: TxnId,
     ) -> Result<()> {
-        // Name the relationship this transaction is capturing as a pre-image, so GC does not reclaim
-        // it out from under the undo that will write it back (`rmp` #969, see
-        // [`rel_head_captured_by_open_writer`](Self::rel_head_captured_by_open_writer)). Recorded here
-        // — the single door every `first_rel` publication passes through — rather than in `create_rel`,
-        // so a future prepend path inherits it instead of having to remember.
-        if kind == StoreKind::Node && field_off == NODE_OFF_FIRST_REL && old_head != NULL_ID {
-            self.active
-                .entry(txn)
-                .or_default()
-                .captured_rel_heads
-                .insert(old_head);
-        }
-        let (rel_page, off) = paging::record_location(id, kind.record_size());
-        let dev = self.device_page(kind, rel_page)?;
-        let abs = off + field_off;
-        // CAS-undo framing is byte-identical (`rmp` #220 / #172 depend on the exact undo bytes): the
-        // logical compare-and-set undo is still produced by `encode_cas_patch`; only the in-flight
-        // buffer type changed to an inline `Patch`. Redo is lent by borrow, undo retained by value.
-        let redo = paging::encode_patch(abs, &new_head.to_le_bytes());
-        let undo = paging::encode_cas_patch(abs, new_head, old_head).into_vec();
-        let f = self.pool.fetch(dev)?;
-        let lsn = self
-            .wal
-            .with(|w| w.log_update_borrowed(txn, dev, &redo, undo));
-        self.pool.with_page_mut_lsn(f, lsn, |p| {
-            p[abs..abs + 8].copy_from_slice(&new_head.to_le_bytes());
-        });
-        self.pool.unpin(f);
-        Ok(())
+        self.write_field_redo_only(kind, id, field_off, &new_head.to_le_bytes(), txn)
     }
 
     // ------------------- the undo area (`rmp` #966, `05 §12`, `04 §5.1`) -------------------
@@ -3062,8 +3086,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     // PREPEND to it and never rewrite an already-linked delta. It therefore inherits the whole
     // chain-safety discipline established above, and for the same reasons:
     //
-    //   * the head is published with `write_chain_head`, whose undo is a compare-and-set — an abort
-    //     never clobbers a head a later writer legitimately owns;
+    //   * the head is published redo-only (`rmp` #970): nothing restores the word, because what undoes
+    //     a prepend is unlinking the entry — so an abort can never clobber a head a later writer
+    //     legitimately owns;
     //   * a delta's first (and only) write uses a **header-only creation undo** that reverts just the
     //     `flags` byte, so an aborted delta becomes a *corpse* whose `next` is intact and a survivor
     //     that prepended on top still threads through it to its successor (`rmp` #220);
@@ -3229,7 +3254,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // naming the current head — and only then is the head republished. Reversed, a reader or the
         // GC could observe an `undo_ptr` pointing at a slot that is not yet a valid delta.
         self.write_undo_area_create(StoreKind::Undo, id, &buf, undo::UNDO_OFF_FLAGS, txn)?;
-        self.write_chain_head(kind, entity, MVCC_OFF_UNDO_PTR, id, head, txn)?;
+        self.write_chain_head(kind, entity, MVCC_OFF_UNDO_PTR, id, txn)?;
         self.active
             .entry(txn)
             .or_default()
@@ -3348,7 +3373,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// it, returning how many deltas were freed.
     ///
     /// Detaching before freeing is what keeps the chain valid at every instant: the head is set to
-    /// `0` first — with the same compare-and-set undo its publication used — so nothing can reach a
+    /// `0` first — with a plain pre-image undo, the one chain-head write that keeps one, because this
+    /// is not a prepend (see the section note on `write_field_redo_only`) — so nothing can reach a
     /// delta whose slot is about to be listed as free.
     ///
     /// # Errors
@@ -3358,8 +3384,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         if chain.is_empty() {
             return Ok(0);
         }
-        let head = chain[0].0;
-        self.write_chain_head(kind, entity, MVCC_OFF_UNDO_PTR, NULL_ID, head, txn)?;
+        // A physical pre-image undo, deliberately, and the only chain-head write that keeps one:
+        // see the section note on `write_field_redo_only`. Safe because a GC pass is a single
+        // non-yielding call, so no concurrent writer can stale the image.
+        self.patch_header_word(kind, entity, MVCC_OFF_UNDO_PTR, NULL_ID, txn)?;
         for &(id, delta) in &chain {
             self.free_delta(id, delta, txn)?;
         }
@@ -3879,9 +3907,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// baseline, with no chain at all, is 192). The budget is pinned by
     /// `tests/undo_chain.rs::the_wal_cost_of_a_created_entity_stays_within_its_budget`.
     ///
-    /// The abort story is unchanged and needs no compare-and-set: a creation's undo reverts the new
-    /// record's MVCC header — `undo_ptr` included — so an aborted creation leaves the head at `0`,
-    /// which is exactly what the compare-and-set undo would have restored.
+    /// The abort story needs nothing extra either way: a live abort retires the record outright
+    /// ([`undo_own_creation`](Self::undo_own_creation)), and after a crash the header-only creation
+    /// undo reverts the new record's MVCC header — `undo_ptr` included — so a recovered aborted
+    /// creation leaves the head at `0`.
     ///
     /// Returns `0` (no chain) for the reserved [`SYSTEM_TXN`], which writes only the catalog, is never
     /// rolled back and has no [`VersionStamp`] form (its id does not fit the stamp's 63-bit payload),
@@ -3938,26 +3967,21 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Reclaims the undo-area slots of a transaction that has just **aborted**, given the deltas it
     /// linked and the commit slot it owned (`rmp` #966).
     ///
-    /// Called from [`rollback`](Self::rollback) *after* the WAL undo has run, so every one of this
-    /// transaction's chain-head publications has already been compare-and-set-undone and every one of
-    /// its deltas has already had its `in_use` bit cleared. What is left to decide is purely a space
-    /// question, and it is decided **by re-walking each touched entity's chain** rather than by
-    /// assuming the undo fired: a delta another transaction prepended on top of would still be
-    /// threaded, as a corpse, and its slot must NOT be handed out again — the delta twin of
+    /// Called from [`rollback_physical`](Self::rollback_physical) *after* the WAL undo has run, so
+    /// every one of this transaction's deltas has already had its `in_use` bit cleared. What is left
+    /// to decide is purely a space question, and it is decided **by re-walking each touched entity's
+    /// chain** rather than by assuming the undo fired — the delta twin of
     /// [`reclaim_aborted_pops`](Self::reclaim_aborted_pops).
     ///
-    /// **The re-walk is a path genuinely taken again since `rmp` #969**, and this note used to say the
-    /// opposite. Between #968 and #969 it really was unreachable: `link_delta` refused to prepend onto
-    /// a chain head an *open* transaction held, so an aborting transaction's delta was always still
-    /// the head at its own rollback and its compare-and-set undo always fired.
+    /// # Reached only by a transaction that linked no delta
     ///
-    /// Incidence deltas are **non-sequential** (`D-incidence-non-sequential`): a second transaction
-    /// may prepend an edge insertion on top of a first one that is still open. If the *lower* writer
-    /// aborts, its delta is no longer the head, its compare-and-set undo correctly no-ops, and the
-    /// delta stays threaded below the survivor as a corpse — precisely the state this re-walk exists
-    /// to recognise. Handing that slot out again would splice a live chain onto a reused record. The
-    /// re-walk is what makes the sprint-96 concurrency safe rather than a fail-safe kept "just in
-    /// case", and its cost is bounded by the aborting transaction's own links.
+    /// Since `rmp` #970 a transaction that owns a commit slot rolls back **logically**, and
+    /// [`detach_own_deltas`](Self::detach_own_deltas) is what reclaims its deltas — exactly, from the
+    /// walk that detached them, rather than by inference. Only a transaction with no commit slot takes
+    /// the physical path, and a delta cannot exist without one, so both arguments here are empty in
+    /// every reachable call. It is kept, rather than deleted, as the physical path's own accounting:
+    /// that path stays the inverse of maintenance work, and a future maintenance pass that does link a
+    /// delta must not silently leak its slot.
     ///
     /// Infallible and best-effort by construction: it performs no page write (rollback's post-undo
     /// section must stay infallible, `rmp` #955) and any read error simply leaves the slot leaked,
@@ -4749,6 +4773,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // referential integrity and the incidence chains stay well-formed throughout.
             reclaimed += self.reclaim_pending(StoreKind::Node, txn, watermark)?;
 
+            // ---- Phase B2: return the slots a logical rollback ORPHANED (`rmp` #970, AC 7). ----
+            // The abort unlinked these from every chain and zeroed their headers but deliberately did
+            // not list them (see `pending_orphan_slots`). They are reachable from nothing, so this is
+            // a pure accounting step — but it is still guarded on the record actually being retired,
+            // so a slot some later writer has legitimately re-used cannot be double-freed.
+            reclaimed += self.gc_reclaim_orphan_slots(txn)?;
+
             // ---- Phase F: reclaim undo chains no live snapshot can reach (`rmp` #966). ----
             // Runs after the node/relationship sweeps, so an entity reclaimed above has already had
             // its own chain freed with it and is not walked again here. Candidate-set driven exactly
@@ -5173,46 +5204,6 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             if self.is_txn_active(w))
     }
 
-    /// Whether some **open** transaction captured relationship `id` as the pre-image of a node's
-    /// `first_rel` and will write it back if it aborts (`rmp` #969).
-    ///
-    /// # The defect this closes
-    ///
-    /// A writer `W` that prepends onto node `N` captures `N`'s current `first_rel` as the undo image
-    /// of its chain-head write. If GC then reclaims **that very relationship** — legitimate on its own
-    /// terms: it is tombstoned and committed at or below the watermark — `W`'s abort restores
-    /// `first_rel` to a slot that is now on the free list. A live node's incidence chain then heads
-    /// into a freed slot, which the next allocation hands to an unrelated relationship, and the
-    /// traversal walks a foreign record's pointers: a silently wrong traversal, and committed edges
-    /// lost from the walk. Reproduced end to end by
-    /// `tests/incidence_undo_chain_969.rs::gc_must_not_reclaim_the_chain_head_an_open_writer_will_restore`,
-    /// whose pre-fix failure is the checker reporting `Adjacency(DeadRel)` together with
-    /// `FreeList(ReferencedByLiveChain)`.
-    ///
-    /// The hazard is **pre-existing** and independent of how the head is written: the compare-and-set
-    /// undo (`rmp` #220) fires here too, because the head *is* still this writer's pushed id — what
-    /// went stale is the value the undo restores, not the word it tests. It is fixed here rather than
-    /// deferred because a pre-existing defect is fixed where it is found.
-    ///
-    /// # Why the exact question, and not the easy one
-    ///
-    /// The first version of this gate asked "does either endpoint carry an uncommitted incidence
-    /// delta?" — a strictly larger question, and one that starves reclamation: on a hub under
-    /// sustained edge insertion there is always such a delta, so every tombstoned relationship
-    /// incident to it becomes permanently unreclaimable (measured: eight consecutive GC passes
-    /// reclaiming zero, against a baseline of 2000). Naming the captured pre-images instead
-    /// ([`ActiveTxn::captured_rel_heads`]) is O(1) per candidate, has no false positives, and costs
-    /// one `u64` per prepend.
-    ///
-    /// This gate becomes unnecessary once `rmp` #970 makes rollback logical: an abort will then
-    /// unlink the edge from the chain's **current** state instead of restoring a captured pointer
-    /// word, so there is no stale image left to invalidate.
-    fn rel_head_captured_by_open_writer(&self, id: u64) -> bool {
-        self.active
-            .iter()
-            .any(|(txn, a)| a.captured_rel_heads.contains(&id) && self.is_txn_active(*txn))
-    }
-
     /// Reclaims the reclaimable MVCC tombstones of `kind` (`Rel` or `Node`) under `txn` (`rmp` #522).
     /// Iterates only the tracked [`pending_tombstones[kind]`](Self::pending_tombstones) set — with a
     /// full-store fallback on the first post-open pass (`gc_full_scan_pending`), which also seeds the set
@@ -5248,8 +5239,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 continue;
             }
             let reclaimable = Self::is_reclaimable(mvcc, watermark, &self.commit_registry)
-                && (kind != StoreKind::Node || !self.has_live_incident_rels(id)?)
-                && (kind != StoreKind::Rel || !self.rel_head_captured_by_open_writer(id));
+                && (kind != StoreKind::Node || !self.has_live_incident_rels(id)?);
             if reclaimable {
                 match kind {
                     StoreKind::Rel => self.reclaim_rel(txn, id)?,
@@ -5328,6 +5318,565 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         Ok(())
     }
 
+    // ========================= logical rollback (`rmp` #970, `04 §5.1.2` step 5) =========================
+    //
+    // **An abort applies the transaction's own deltas; it never reverts bytes.**
+    //
+    // Every action below is computed from the state the store is in *at abort time* and names one
+    // coordinate — a property key, a label bit, one incidence entry, one slot. Nothing is restored
+    // from an image captured earlier, so there is no image that can have gone stale, and therefore no
+    // way for an abort to overwrite what another transaction legitimately owns. That is the whole
+    // defect family `rmp` #220 / #172 / #239 / #301 / #578 / #772 removed at the root rather than
+    // patched one compensation at a time (`04 §5.1.5` row 4). Memgraph's `Abort` applies its deltas
+    // the same way and for the same reason
+    // (`/data/refsrc/memgraph/src/storage/v2/inmemory/storage.cpp:1489-1884`, read 2026-08-05).
+    //
+    // **The order is the exact inverse of the link order**, newest-first, which for one entity is its
+    // chain from the head down. That matters: the actions do not commute (two `SetProperty`s on one
+    // key are last-writer-wins, and a creation must be retired *after* the incidence entries that
+    // thread it), and newest-first is the only order that leaves the state the transaction found.
+    //
+    // **The transaction's deltas are the head prefix of every chain they are on.** `link_delta`
+    // refuses to prepend onto a head another open transaction holds
+    // ([`ensure_chain_head_unheld`](Self::ensure_chain_head_unheld)) and `D-incidence-anchor` gives
+    // every incidence delta a fresh, private relationship slot to anchor on, so no two open
+    // transactions ever share a chain. Detaching is therefore a **head** write, never a splice into
+    // the middle of a chain — the `05 §12.2` immutability of a linked delta's `next` is preserved.
+
+    /// The property-chain head of the entity that owns an undo chain.
+    ///
+    /// # Errors
+    /// Returns a storage error if the record cannot be read, or if `kind` is not an entity store (a
+    /// `SetProperty` / `DeleteObject` delta anchors only on a node or a relationship).
+    fn first_prop_of(&self, kind: StoreKind, entity: u64) -> Result<u64> {
+        match kind {
+            StoreKind::Node => Ok(self.read_node(entity)?.first_prop),
+            StoreKind::Rel => Ok(self.read_rel(entity)?.first_prop),
+            _ => Err(GraphusError::Storage(format!(
+                "{kind:?} {entity} owns no property chain; an undo delta cannot anchor on it"
+            ))),
+        }
+    }
+
+    /// Undoes every change `txn` made, by applying its **own** deltas newest-first (`rmp` #970).
+    ///
+    /// `links` is the transaction's delta list in link order, so iterating it in reverse is the
+    /// newest-first order the section note above requires.
+    ///
+    /// # Errors
+    /// Returns a storage error if a delta slot is empty (corruption — a transaction always owns every
+    /// delta it linked), or if applying one fails.
+    fn apply_own_deltas(&mut self, txn: TxnId, links: &[UndoLink]) -> Result<()> {
+        // The property cells this transaction allocated, so a key restored to *absent* can retire the
+        // cell that carried it instead of leaving it empty on the chain — see
+        // [`undo_own_property`](Self::undo_own_property).
+        let own_cells: BTreeSet<u64> = self
+            .active
+            .get(&txn)
+            .map(|a| {
+                a.created
+                    .iter()
+                    .filter(|(k, _)| *k == StoreKind::Prop)
+                    .map(|(_, id)| *id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        for link in links.iter().rev() {
+            let Some(delta) = self.read_delta(link.delta)? else {
+                return Err(GraphusError::Storage(format!(
+                    "rollback of transaction {} reaches empty delta slot {} on {:?} {}",
+                    txn.0, link.delta, link.kind, link.entity
+                )));
+            };
+            self.apply_own_delta(link.kind, link.entity, delta, txn, &own_cells)?;
+        }
+        Ok(())
+    }
+
+    /// Applies one of `txn`'s own deltas against the **current** state of `(kind, entity)`.
+    ///
+    /// # Errors
+    /// Returns a storage error if the entity, its property cell or its incidence chain cannot be
+    /// read or written.
+    fn apply_own_delta(
+        &mut self,
+        kind: StoreKind,
+        entity: u64,
+        delta: UndoDelta,
+        txn: TxnId,
+        own_cells: &BTreeSet<u64>,
+    ) -> Result<()> {
+        match delta.action {
+            UndoAction::SetProperty => self.undo_own_property(kind, entity, delta, txn, own_cells),
+            UndoAction::AddLabel => self.undo_own_label(entity, delta.token, true, txn),
+            UndoAction::RemoveLabel => self.undo_own_label(entity, delta.token, false, txn),
+            UndoAction::RemoveIncidentEdge => self.undo_own_incidence(entity, delta, txn),
+            UndoAction::AddIncidentEdge => Err(GraphusError::Storage(format!(
+                "relationship {entity} carries an AddIncidentEdge delta, which no write path in this \
+                 build emits: a deletion is a tombstone and never unlinks the incidence entry \
+                 (`04 §5.1.1`), so nothing can have removed one for this action to restore"
+            ))),
+            UndoAction::DeleteObject => self.undo_own_creation(kind, entity, txn),
+            UndoAction::RecreateObject => self.undo_own_deletion(kind, entity, txn),
+        }
+    }
+
+    /// Restores one property to the value the delta carries — the value the key held **before** the
+    /// write this delta undoes, or its absence when the tag is
+    /// [`TYPE_TAG_ABSENT`](undo::TYPE_TAG_ABSENT) (`D-property-removal`).
+    ///
+    /// # The overflow chain the transaction allocated is freed here, and only here
+    ///
+    /// A delta names the **old** value's `strings.store` chain and nothing else, so no delta
+    /// describes the chain the aborting transaction allocated for the value it wrote. The current
+    /// cell does: it is still naming it. Freeing it *when it differs from the one being restored* is
+    /// therefore exact — it uses only current state, needs no allocation tracking, and is the same
+    /// reasoning applied to every action here. The symmetric half is that freeing this transaction's
+    /// own `SetProperty` delta must **not** free the chain the delta names: the cell owns that chain
+    /// again from this write on (see [`free_own_delta`](Self::free_own_delta)).
+    ///
+    /// # Errors
+    /// Returns a storage error if the owner, the cell, or the overflow chain cannot be read or
+    /// written, or if the key's cell has vanished (corruption: a `SetProperty` delta always has one).
+    fn undo_own_property(
+        &mut self,
+        kind: StoreKind,
+        entity: u64,
+        delta: UndoDelta,
+        txn: TxnId,
+        own_cells: &BTreeSet<u64>,
+    ) -> Result<()> {
+        let first_prop = self.first_prop_of(kind, entity)?;
+        let Some((cell_id, mut cell)) =
+            self.find_live_prop_cell(first_prop, delta.token, "undo")?
+        else {
+            return Err(GraphusError::Storage(format!(
+                "rollback of {kind:?} {entity} finds no live cell for property key {}, which its \
+                 SetProperty delta must have written",
+                delta.token
+            )));
+        };
+        if cell.type_tag & valenc::OVERFLOW_BIT != 0
+            && cell.value_inline != NULL_ID
+            && cell.value_inline != delta.value_inline
+        {
+            self.free_chain(txn, cell.value_inline)?;
+        }
+        // Restoring "the key was absent" on a cell this transaction ALLOCATED retires the cell rather
+        // than emptying it (`rmp` #581's space guarantee, kept). Emptying is the right answer when the
+        // cell predates the transaction — `D-property-removal` keeps an empty cell in place so a later
+        // `SET` of the same key needs no allocation — but a cell the aborting transaction created
+        // itself has no such history to preserve, and leaving it would leak one slot per key per
+        // aborted write. Safe to unlink because a property write takes the entity's write-conflict
+        // check (`D-property-write-conflict`), so no other transaction can have prepended onto this
+        // chain while this one held it.
+        if delta.type_tag == undo::TYPE_TAG_ABSENT && own_cells.contains(&cell_id) {
+            return self.retire_own_prop_cell(kind, entity, cell_id, cell.next_prop, txn);
+        }
+        cell.type_tag = delta.type_tag;
+        cell.value_inline = delta.value_inline;
+        self.write_prop_cell(cell_id, &cell, txn)
+    }
+
+    /// Unlinks property cell `cell_id` from `(kind, entity)`'s chain and returns its slot to the free
+    /// list (`rmp` #970, keeping `rmp` #581's guarantee).
+    ///
+    /// # Errors
+    /// Returns a storage error if the chain cannot be walked, does not contain `cell_id`, or a write
+    /// fails.
+    fn retire_own_prop_cell(
+        &mut self,
+        kind: StoreKind,
+        entity: u64,
+        cell_id: u64,
+        successor: u64,
+        txn: TxnId,
+    ) -> Result<()> {
+        let head = self.first_prop_of(kind, entity)?;
+        if head == cell_id {
+            let field_off = match kind {
+                StoreKind::Node => NODE_OFF_FIRST_PROP,
+                _ => REL_OFF_FIRST_PROP,
+            };
+            let (rel_page, off) = paging::record_location(entity, kind.record_size());
+            let dev = self.device_page(kind, rel_page)?;
+            self.write_region(dev, off + field_off, &successor.to_le_bytes(), txn)?;
+        } else {
+            let guard = self.store(StoreKind::Prop).alloc.high_water() + 1;
+            let mut cur = head;
+            let mut steps = 0u64;
+            loop {
+                steps += 1;
+                if cur == NULL_ID || steps > guard {
+                    return Err(GraphusError::Storage(format!(
+                        "property chain of {kind:?} {entity} does not contain cell {cell_id}"
+                    )));
+                }
+                let mut pred = self.read_prop(cur)?;
+                if pred.next_prop == cell_id {
+                    pred.next_prop = successor;
+                    self.write_prop(cur, &pred, txn)?;
+                    break;
+                }
+                cur = pred.next_prop;
+            }
+        }
+        let (rel_page, off) = paging::record_location(cell_id, PROP_RECORD_SIZE);
+        let dev = self.device_page(StoreKind::Prop, rel_page)?;
+        self.write_region(dev, off, &[0u8; MVCC_HEADER_SIZE], txn)?;
+        self.free_push(StoreKind::Prop, cell_id, txn);
+        Ok(())
+    }
+
+    /// Restores one label bit on node `id` — set for [`AddLabel`](UndoAction::AddLabel), clear for
+    /// [`RemoveLabel`](UndoAction::RemoveLabel).
+    ///
+    /// Writes **only** the 8-byte `labels` word, never the record body: the node's `first_prop` /
+    /// `first_rel` / MVCC words belong to whoever wrote them last, and a whole-record write would
+    /// carry them along (`rmp` #772). One bit at a time is also what makes the operation exact —
+    /// a bit is a label token id, so the word is recomputed from the *current* word rather than
+    /// restored from a captured one.
+    ///
+    /// # Errors
+    /// Returns a storage error if the node or its page cannot be read or written.
+    fn undo_own_label(&mut self, id: u64, token: u32, present: bool, txn: TxnId) -> Result<()> {
+        let bit = 1u64 << token;
+        let live = self.read_node(id)?.labels;
+        let restored = if present { live | bit } else { live & !bit };
+        if restored == live {
+            return Ok(());
+        }
+        let (rel_page, off) = paging::record_location(id, NODE_RECORD_SIZE);
+        let dev = self.device_page(StoreKind::Node, rel_page)?;
+        self.write_region(dev, off + NODE_OFF_LABELS, &restored.to_le_bytes(), txn)
+    }
+
+    /// Removes one incidence entry the transaction added: unlinks relationship `edge` from the
+    /// incidence chain of the endpoint the delta's `direction` names (`rmp` #969 / #970).
+    ///
+    /// [`unlink_side_with`](Self::unlink_side_with) re-derives headship from the **node's**
+    /// `first_rel` rather than trusting the relationship's own `prev`, so it bridges correctly
+    /// whether or not a concurrently-committed writer has since prepended on top — and it repoints
+    /// the displaced neighbour's `prev` and first-in-chain marker, which is exactly the work
+    /// `relink_old_head` did on the way in. No shared pointer word is ever restored from an image.
+    ///
+    /// # Errors
+    /// Returns a storage error if the relationship cannot be read, the delta's `direction` is out of
+    /// domain, or the chain write fails.
+    fn undo_own_incidence(&mut self, edge: u64, delta: UndoDelta, txn: TxnId) -> Result<()> {
+        let rel = self.read_rel(edge)?;
+        let (side, node) = match IncidentDirection::from_byte(delta.direction) {
+            Some(IncidentDirection::Start) => (ChainSide::Start, rel.start_node),
+            Some(IncidentDirection::End) => (ChainSide::End, rel.end_node),
+            None => {
+                return Err(GraphusError::Storage(format!(
+                    "incidence delta on relationship {edge} has an invalid direction byte {}",
+                    delta.direction
+                )));
+            }
+        };
+        self.unlink_side_with(edge, &rel, side, node, txn)
+    }
+
+    /// Retires an entity the transaction created: frees its property chain, clears its slot, and
+    /// returns the id to the free list.
+    ///
+    /// Reached **after** the incidence deltas of a relationship (they were linked later, so
+    /// newest-first applies them first), so by the time this runs no chain reaches the record and it
+    /// can be retired outright. That is what `rmp` #970 acceptance criterion 7 asks for: a clean
+    /// disconnect, with no dead-link corpse left for the GC splice to repair afterwards.
+    ///
+    /// # Errors
+    /// Returns a storage error if the record, its property chain, or its page cannot be read or
+    /// written.
+    fn undo_own_creation(&mut self, kind: StoreKind, entity: u64, txn: TxnId) -> Result<()> {
+        let first_prop = self.first_prop_of(kind, entity)?;
+        if first_prop != NULL_ID {
+            self.free_property_chain(txn, entity, first_prop)?;
+        }
+        // Zero the whole MVCC header, not just the `in_use` bit: the slot is genuinely free again
+        // (nothing threads through it — see the doc above), so leaving a stale `created_ts` or
+        // `undo_ptr` behind would only give a later reader something to misread.
+        let (rel_page, off) = paging::record_location(entity, kind.record_size());
+        let dev = self.device_page(kind, rel_page)?;
+        self.write_region(dev, off, &[0u8; MVCC_HEADER_SIZE], txn)?;
+        // The slot is unreachable — this rollback is what unlinked it — but it is **parked**, not
+        // freed, so the next allocation does not recycle a physical id the in-memory latest-state
+        // indexes still hold a document for. See `pending_orphan_slots`. The GC pass returns it.
+        self.pending_orphan_slots[kind as usize].insert(entity);
+        Ok(())
+    }
+
+    /// Restores an entity the transaction deleted, by clearing the MVCC tombstone it stamped.
+    ///
+    /// The deletion never unlinked anything — it is a tombstone, and the relationship keeps its slot
+    /// and its links so an older snapshot can still traverse to it (`04 §5.1.1`) — so clearing
+    /// `expired_ts` is the whole of the undo.
+    ///
+    /// # Errors
+    /// Returns a storage error if the header word cannot be written.
+    fn undo_own_deletion(&mut self, kind: StoreKind, entity: u64, txn: TxnId) -> Result<()> {
+        self.patch_header_word(kind, entity, MVCC_OFF_EXPIRED_TS, 0, txn)
+    }
+
+    /// Detaches `txn`'s deltas from every chain they are on and reclaims their slots, together with
+    /// the transaction's commit slot (`rmp` #970).
+    ///
+    /// Runs **after** every action has been applied, and in that order for a reason: a `SetProperty`
+    /// delta is the sole owner of the old value's overflow chain until the cell takes it back, so
+    /// freeing the delta before restoring the cell would free blocks a live property is about to
+    /// read through.
+    ///
+    /// # Errors
+    /// Returns a storage error if a chain cannot be walked or a slot cannot be cleared.
+    fn detach_own_deltas(&mut self, txn: TxnId, links: &[UndoLink], slot: u64) -> Result<()> {
+        let mut seen: BTreeSet<(u8, u64)> = BTreeSet::new();
+        let entities: Vec<(StoreKind, u64)> = links
+            .iter()
+            .filter(|l| seen.insert((l.kind as u8, l.entity)))
+            .map(|l| (l.kind, l.entity))
+            .collect();
+        let mut detached: BTreeSet<u64> = BTreeSet::new();
+        let mut retired: BTreeSet<(u8, u64)> = BTreeSet::new();
+        for (kind, entity) in entities {
+            // A record this rollback has already retired holds a zeroed header: its chain went with
+            // it, and there is no head left to republish.
+            let mvcc = self.read_mvcc(kind, entity)?;
+            if !mvcc.in_use() {
+                retired.insert((kind as u8, entity));
+                continue;
+            }
+            let mut head = mvcc.undo_ptr;
+            let guard = self.store(StoreKind::Undo).alloc.high_water() + 1;
+            let mut steps = 0u64;
+            while head != NULL_ID {
+                steps += 1;
+                if steps > guard {
+                    return Err(GraphusError::Storage(format!(
+                        "undo chain of {kind:?} {entity} does not terminate (malformed)"
+                    )));
+                }
+                let Some(delta) = self.read_delta(head)? else {
+                    return Err(GraphusError::Storage(format!(
+                        "undo chain of {kind:?} {entity} reaches empty delta slot {head}"
+                    )));
+                };
+                if delta.commit_info != slot {
+                    break;
+                }
+                detached.insert(head);
+                head = delta.next;
+            }
+            if head != mvcc.undo_ptr {
+                self.patch_header_word(kind, entity, MVCC_OFF_UNDO_PTR, head, txn)?;
+            }
+        }
+        // Free ONLY what the walks above actually detached, and require that to be every delta the
+        // transaction linked. The head-prefix invariant is what makes those two sets equal — no other
+        // open transaction can hold a chain this one has deltas on
+        // ([`ensure_chain_head_unheld`](Self::ensure_chain_head_unheld) plus `D-incidence-anchor`) — so
+        // a mismatch means the invariant has been broken by some new writer, and the safe answer is to
+        // fail rather than free a slot that is still threaded (`rmp` #578 in reverse: a live chain
+        // spliced onto a reused record).
+        //
+        // The entities whose record this rollback RETIRED are exempt: their chain went with them, so
+        // their deltas are unreachable without having been walked.
+        for link in links.iter().rev() {
+            if detached.contains(&link.delta) || retired.contains(&(link.kind as u8, link.entity)) {
+                self.free_own_delta(link.delta, txn)?;
+            } else {
+                return Err(GraphusError::Storage(format!(
+                    "rollback of transaction {}: delta {} on {:?} {} is not on the head prefix of \
+                     its chain, so detaching it would splice a live chain (`05 §12.2`)",
+                    txn.0, link.delta, link.kind, link.entity
+                )));
+            }
+        }
+        self.free_own_commit_slot(slot, txn)
+    }
+
+    /// Returns to the free list every record slot a logical rollback orphaned (`rmp` #970,
+    /// acceptance criterion 7), and returns how many it reclaimed.
+    ///
+    /// Exact rather than census-based: the abort itself parked these ids, and it is the operation that
+    /// made them unreachable, so no store scan is needed to establish it. The `!in_use` guard is
+    /// nonetheless kept — a slot a later transaction has legitimately re-used through some other path
+    /// must never be double-freed (`rmp` #578 in reverse) — and an id that fails it is simply dropped
+    /// from the set rather than retried forever.
+    ///
+    /// The set is in memory only. A crash before a GC pass therefore leaves the retired slots
+    /// unlisted; they are `!in_use` on the page, so nothing can read them and nothing is corrupted —
+    /// they are space the store reclaims on the next rebuild, exactly like the undo-area orphans
+    /// [`gc_sweep_undo_orphans`](Self::gc_sweep_undo_orphans) exists to sweep.
+    ///
+    /// # Errors
+    /// Returns a storage error if a record header cannot be read.
+    fn gc_reclaim_orphan_slots(&mut self, txn: TxnId) -> Result<usize> {
+        let mut reclaimed = 0usize;
+        for kind in [StoreKind::Node, StoreKind::Rel] {
+            let ids: Vec<u64> = std::mem::take(&mut self.pending_orphan_slots[kind as usize])
+                .into_iter()
+                .collect();
+            for id in ids {
+                if self.read_mvcc(kind, id)?.in_use() {
+                    continue;
+                }
+                if self.store(kind).free.ids().contains(&id) {
+                    continue;
+                }
+                self.free_push(kind, id, txn);
+                reclaimed += 1;
+            }
+        }
+        Ok(reclaimed)
+    }
+
+    /// Frees one delta this aborting transaction owns.
+    ///
+    /// Deliberately **not** [`free_delta`](Self::free_delta): that one frees the old value's overflow
+    /// chain, which is right for a delta the GC reclaims (nothing else names the chain by then) and
+    /// wrong here (the cell has just taken it back — see
+    /// [`undo_own_property`](Self::undo_own_property)). It also decrements the commit slot's
+    /// `delta_count`, which an aborted transaction never published; the slot is freed once, by
+    /// [`free_own_commit_slot`](Self::free_own_commit_slot).
+    ///
+    /// # Errors
+    /// Returns a storage error if the delta's page cannot be written.
+    fn free_own_delta(&mut self, id: u64, txn: TxnId) -> Result<()> {
+        let (rel_page, off) = paging::record_location(id, undo::UNDO_RECORD_SIZE);
+        let dev = self.device_page(StoreKind::Undo, rel_page)?;
+        self.write_region(dev, off + undo::UNDO_OFF_FLAGS, &[0u8], txn)?;
+        self.free_push(StoreKind::Undo, id, txn);
+        Ok(())
+    }
+
+    /// Frees the commit slot of an aborting transaction, once every delta naming it is gone.
+    ///
+    /// # Errors
+    /// Returns a storage error if the slot's page cannot be written.
+    fn free_own_commit_slot(&mut self, slot: u64, txn: TxnId) -> Result<()> {
+        let (rel_page, off) = paging::record_location(slot, undo::COMMIT_RECORD_SIZE);
+        let dev = self.device_page(StoreKind::Commit, rel_page)?;
+        self.write_region(dev, off + undo::COMMIT_OFF_FLAGS, &[0u8], txn)?;
+        self.free_push(StoreKind::Commit, slot, txn);
+        Ok(())
+    }
+
+    /// Rolls `txn` back.
+    ///
+    /// # Two paths, and the line between them (`rmp` #970)
+    ///
+    /// **A transaction that owns a commit slot is a data transaction**: every change it made to MVCC
+    /// state is on the undo chain, so it is undone **logically** — by applying its own deltas against
+    /// the current state ([`rollback_logical`](Self::rollback_logical)). This is the sprint-96
+    /// mechanism and it is the only one that touches versioned state.
+    ///
+    /// **A transaction with no commit slot linked no delta.** Two kinds reach here: a *maintenance*
+    /// pass (GC reclamation, corpse splice, freeze sweep), whose writes are physical space management
+    /// with no MVCC version to name, and a *catalog-only* writer, whose effects are in-memory schema
+    /// the metadata page settles. Both keep the ARIES path
+    /// ([`rollback_physical`](Self::rollback_physical)) — physical undo is the right inverse for a
+    /// physical change, and a GC pass is a single non-yielding call, so no concurrent writer can
+    /// stale its pre-images. Retiring that path belongs to the tasks that version the catalog (#984)
+    /// and make collection concurrent (#979), not to this one.
+    ///
+    /// # Errors
+    /// Returns a storage error if the rollback fails; the transaction then stays **open**, exactly as
+    /// documented on both paths (`rmp` #955).
+    ///
+    /// # Panics
+    /// Panics if the WAL `fdatasync` fails (`04 §4.9`).
+    pub fn rollback(&mut self, txn: TxnId) -> Result<()> {
+        match self.active.get(&txn).and_then(|a| a.commit_slot) {
+            Some(slot) => self.rollback_logical(txn, slot),
+            None => self.rollback_physical(txn),
+        }
+    }
+
+    /// Undoes a data transaction by applying its own deltas (`rmp` #970) — see the section note above
+    /// [`first_prop_of`](Self::first_prop_of).
+    ///
+    /// # What it does *not* do, and why that is the point
+    ///
+    /// It reverts no bytes, reloads no catalog and captures no pre-rollback snapshot. Every in-memory
+    /// restore the physical path performs — the free lists (`rmp` #578), the live-record counters
+    /// (#866), the physical-id and `ElementId` high-waters (#220/#172), the token dictionary, the
+    /// schema-catalog superset (#534) — exists only because
+    /// [`reload_catalog`](Self::reload_catalog) throws the whole in-memory catalog away and the
+    /// snapshots have to put back what belonged to somebody else. Nothing is thrown away here, so
+    /// nothing has to be put back:
+    ///
+    /// * **free lists** — every id this transaction consumed is returned by the action that retires
+    ///   its record ([`undo_own_creation`](Self::undo_own_creation),
+    ///   [`free_own_delta`](Self::free_own_delta), the overflow-chain free in
+    ///   [`undo_own_property`](Self::undo_own_property)). A concurrent transaction's pops are never
+    ///   observed, let alone re-listed.
+    /// * **counters** — withdrawn as this transaction's own delta, which is exactly invertible.
+    /// * **high-waters, tokens, `ElementId`s** — never lowered, so never restored.
+    /// * **schema DDL** — [`apply_schema_undo`](Self::apply_schema_undo) reverts this transaction's
+    ///   own entries on the live `Statistics`; a concurrent transaction's pending DDL is never
+    ///   touched, so it needs no superset rescue.
+    ///
+    /// The cost is therefore bounded by the transaction's own writes rather than by the size of the
+    /// store — measured in `tests/rollback_cost_970.rs`.
+    ///
+    /// # Failure leaves the transaction OPEN (`rmp` #955)
+    ///
+    /// Same contract as the physical path: the active-set entry is released only after every fallible
+    /// step has succeeded, so a failed rollback keeps reporting `txn` as a live writer holding
+    /// uncommitted state and the caller must take the database to its degraded state.
+    ///
+    /// # Errors
+    /// Returns a storage error if a delta cannot be read or applied, or a chain cannot be detached.
+    ///
+    /// # Panics
+    /// Panics if the WAL `fdatasync` fails (`04 §4.9`).
+    fn rollback_logical(&mut self, txn: TxnId, slot: u64) -> Result<()> {
+        // ------------------------------------------------------------------------------------------
+        // FALLIBLE SECTION (`rmp` #955). Nothing in it may release or mutate this transaction's
+        // bookkeeping, so a failure leaves `txn` a fully-formed open writer rather than a
+        // half-dismantled one.
+        // ------------------------------------------------------------------------------------------
+        let links: Vec<UndoLink> = self
+            .active
+            .get(&txn)
+            .map(|a| a.undo_links.clone())
+            .unwrap_or_default();
+        self.apply_own_deltas(txn, &links)?;
+        self.detach_own_deltas(txn, &links, slot)?;
+        // The transaction ends as ABORTED in the log with **no** compensation to apply: its effects
+        // were undone by the ordinary redo-logged writes above. The `ABORT` record is what keeps it
+        // out of the recovery's loser set, so a crash after this point replays the repair rather than
+        // re-applying what it repaired.
+        self.wal.with(|w| w.abort(txn));
+        // ------------------------------------------------------------------------------------------
+        // UNDO SETTLED (`rmp` #955). Nothing below can fail.
+        // ------------------------------------------------------------------------------------------
+        let ActiveTxn {
+            schema_undo,
+            counts,
+            ..
+        } = self.active.remove(&txn).unwrap_or_default();
+        // The counts twin of the delta replay: this transaction's own increments and decrements,
+        // withdrawn from the live counters. Commutative and exactly invertible, so order is
+        // irrelevant and no image of the counters is needed (`rmp` #866).
+        counts.withdraw_from(&mut self.statistics);
+        if !schema_undo.is_empty() {
+            // Catalog DDL is not WAL-logged (it becomes durable only through the commit-time
+            // `checkpoint_meta`), so it has its own per-entry logical undo — the same shape as the
+            // delta replay, applied to the live schema rather than to a restored copy (`rmp` #734).
+            let Self {
+                statistics,
+                active,
+                schema_last_seq,
+                ..
+            } = self;
+            Self::apply_schema_undo(statistics, schema_last_seq, active, &schema_undo);
+            self.catalog_dirty = true;
+        }
+        Ok(())
+    }
+
     /// Rolls `txn` back: undoes its logged page changes newest-first (writing CLRs and applying
     /// the compensating images to the cached pages), then reloads the catalog from the now-reverted
     /// metadata page so the in-memory allocators, free lists and tokens match (`04 §4.4`).
@@ -5358,7 +5907,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///
     /// # Panics
     /// Panics if the WAL `fdatasync` fails (`04 §4.9`).
-    pub fn rollback(&mut self, txn: TxnId) -> Result<()> {
+    fn rollback_physical(&mut self, txn: TxnId) -> Result<()> {
         // PEEK at this transaction's pending catalog DDL — do NOT take the entry (`rmp` #955). The
         // entry stays in `active` across every fallible step below and is removed only once they have
         // all succeeded; see the method docs. The `pre_statistics` guard further down is the one thing
@@ -5854,6 +6403,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
 
     /// Rebuilds the in-memory catalog from the durable metadata page.
     fn reload_catalog(&mut self) -> Result<()> {
+        self.catalog_reloads += 1;
         let (meta, meta_chain) = Self::read_meta(&self.pool)?;
         self.element_ids = ElementIdAllocator::new(meta.element_id_next.max(1));
         // The commit-timestamp oracle is a strictly-monotonic counter that only ever ADVANCES (at
@@ -6537,14 +7087,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // — NOT carried in a plain `write_node` body — so the abort never clobbers a later
             // committed head (it CAS-no-ops once a committed writer pushed on top).
             self.write_rel_create(id, &rel, txn)?;
-            self.write_chain_head(
-                StoreKind::Node,
-                start,
-                NODE_OFF_FIRST_REL,
-                id,
-                old_head,
-                txn,
-            )?;
+            self.write_chain_head(StoreKind::Node, start, NODE_OFF_FIRST_REL, id, txn)?;
             self.link_incidence_deltas(id, type_id, start, end, txn)?;
             // Maintain the per-relationship-type live count (`rmp` task #79) and the grand-total
             // live-relationship count (`rmp` task #82): the self-loop is now a live version. Both
@@ -6587,15 +7130,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // carried in a plain `write_node` body — otherwise a loser's abort would restore a stale head
         // over a concurrently-committed prepend, collapsing a shared supernode's fan-out.
         self.write_rel_create(id, &rel, txn)?;
-        self.write_chain_head(
-            StoreKind::Node,
-            start,
-            NODE_OFF_FIRST_REL,
-            id,
-            start_head,
-            txn,
-        )?;
-        self.write_chain_head(StoreKind::Node, end, NODE_OFF_FIRST_REL, id, end_head, txn)?;
+        self.write_chain_head(StoreKind::Node, start, NODE_OFF_FIRST_REL, id, txn)?;
+        self.write_chain_head(StoreKind::Node, end, NODE_OFF_FIRST_REL, id, txn)?;
         self.link_incidence_deltas(id, type_id, start, end, txn)?;
         // Maintain the per-relationship-type live count (`rmp` task #79) and the grand-total
         // live-relationship count (`rmp` task #82): the relationship is now a written, live version
@@ -6684,42 +7220,21 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             end_prev = new_id;
             flags &= !CHAIN_FLAG_END_FIRST;
         }
-        self.write_rel_field_keep(old_head, REL_OFF_START_PREV, &start_prev.to_le_bytes(), txn)?;
-        self.write_rel_field_keep(old_head, REL_OFF_END_PREV, &end_prev.to_le_bytes(), txn)?;
-        self.write_rel_field_keep(old_head, REL_OFF_CHAIN_FLAGS, &[flags], txn)?;
-        Ok(())
-    }
-
-    /// Writes a single field region of relationship record `id` with **undo == redo** (a no-op on
-    /// abort/recovery), touching ONLY `[field_off, field_off + bytes.len())` and never the MVCC header
-    /// (`rmp` #239). The narrow-field, header-preserving counterpart used by
-    /// [`relink_old_head`](Self::relink_old_head) so a relink's undo cannot clobber a neighbour record's
-    /// MVCC header (which an out-of-LIFO abort of interleaved prependers would otherwise use to resurrect
-    /// an aborted record's in-use bit). The undo equals the redo, so the GC corpse splice — not this
-    /// write's undo — re-establishes the correct neighbour state.
-    fn write_rel_field_keep(
-        &mut self,
-        id: u64,
-        field_off: usize,
-        bytes: &[u8],
-        txn: TxnId,
-    ) -> Result<()> {
-        let (rel_page, off) = paging::record_location(id, REL_RECORD_SIZE);
-        let dev = self.ensure_store_page(StoreKind::Rel, rel_page, txn)?;
-        let abs = off + field_off;
-        let end = abs + bytes.len();
-        // undo == redo no-op-on-abort image (`rmp` #239), built once as an inline patch: redo lent by
-        // borrow, undo retained by value. Byte-identical to the prior `Vec`/`clone` path.
-        let redo = paging::encode_patch(abs, bytes);
-        let undo = redo.clone().into_vec();
-        let f = self.pool.fetch(dev)?;
-        let lsn = self
-            .wal
-            .with(|w| w.log_update_borrowed(txn, dev, &redo, undo));
-        self.pool.with_page_mut_lsn(f, lsn, |p| {
-            p[abs..end].copy_from_slice(bytes);
-        });
-        self.pool.unpin(f);
+        self.write_field_redo_only(
+            StoreKind::Rel,
+            old_head,
+            REL_OFF_START_PREV,
+            &start_prev.to_le_bytes(),
+            txn,
+        )?;
+        self.write_field_redo_only(
+            StoreKind::Rel,
+            old_head,
+            REL_OFF_END_PREV,
+            &end_prev.to_le_bytes(),
+            txn,
+        )?;
+        self.write_field_redo_only(StoreKind::Rel, old_head, REL_OFF_CHAIN_FLAGS, &[flags], txn)?;
         Ok(())
     }
 
@@ -7429,27 +7944,27 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
 
     // ----------------------------- property CRUD ----------------------------
 
-    /// Creates a property `(key, type_tag, value_inline)` under `txn` and prepends it to node
-    /// `node_id`'s property chain; returns the property's physical id.
+    /// Creates a property cell `(key, type_tag, value_inline)` under `txn` and prepends it to node
+    /// `node_id`'s property chain; returns the cell's physical id.
     ///
-    /// # This is the LOW-LEVEL cell primitive, and it is not isolation-aware
+    /// # This is the LOW-LEVEL cell primitive, and it is PRIVATE for a reason (`rmp` #970)
     ///
     /// It writes a cell and nothing else: no write-conflict check, and **no undo delta**. After
     /// `rmp` #967's `D-property-visibility` a cell's own `created_ts` decides nothing — the undo
     /// chain is the sole visibility oracle for a property's value — so a cell created through this
     /// method alone is visible to **every** snapshot the instant it is written, including snapshots
-    /// older than `txn`, and including while `txn` is still open.
+    /// older than `txn`, and including while `txn` is still open. Since `rmp` #970 it is also a cell
+    /// **no abort can remove**: the rollback applies the transaction's deltas, and this writes none.
     ///
-    /// That is correct for its callers and wrong for anything else. Use it only where the writer
-    /// holds the entity exclusively and no concurrent reader can observe an intermediate state — a
-    /// bulk import into a database not yet serving traffic, or a test fixture. **Every production
-    /// path must go through [`set_node_property_value`](Self::set_node_property_value)**, which runs
-    /// the conflict check and links the "the key was absent" delta that hides the new key from an
-    /// older snapshot. That method calls this one only after doing both.
+    /// Its one legitimate caller is step P4 of
+    /// [`set_entity_property_encoded`](Self::set_entity_property_encoded), which has already run the
+    /// conflict check and linked the "the key was absent" delta. It was public until #970; the DST
+    /// harness reached it directly and produced exactly the state described above — a property in the
+    /// store that the reference model never wrote and no rollback could retract.
     ///
     /// # Errors
     /// Returns a storage error if the node is not in use or a write fails.
-    pub fn add_node_property(
+    fn create_node_prop_cell(
         &mut self,
         txn: TxnId,
         node_id: u64,
@@ -7471,7 +7986,6 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // to its own transaction.
         let mut prop = PropRecord::new(VersionStamp::in_flight(txn), key, type_tag, value_inline);
         prop.next_prop = node.first_prop;
-        let old_head = node.first_prop;
         // Header-only creation undo for the prop + compare-and-set logical undo for the owner's
         // `first_prop` head (`rmp` #172). A loser's abort then reverts only the prop's in-use bit (its
         // `next_prop` body is preserved, so a committed prepend threads through it) and CAS-no-ops the
@@ -7479,14 +7993,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // version below the loser's record is never severed.
         self.write_prop_create(pid, &prop, txn)?;
         self.note_created(txn, StoreKind::Prop, pid);
-        self.write_chain_head(
-            StoreKind::Node,
-            node_id,
-            NODE_OFF_FIRST_PROP,
-            pid,
-            old_head,
-            txn,
-        )?;
+        self.write_chain_head(StoreKind::Node, node_id, NODE_OFF_FIRST_PROP, pid, txn)?;
         Ok(pid)
     }
 
@@ -7588,6 +8095,28 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             "no encoder may emit the absent sentinel; `undo::TYPE_TAG_ABSENT` would become \
              ambiguous with a real value (pinned by `undo::tests::no_encoder_can_emit_the_absent_type_tag`)"
         );
+        self.set_entity_property_encoded(txn, kind, entity, key, type_tag, value_inline)
+    }
+
+    /// [`set_entity_property_value`](Self::set_entity_property_value) over an **already-encoded**
+    /// value — steps P1–P4 of the section note above, with the encoding step already done.
+    ///
+    /// Split out so the raw-tag entry points ([`add_node_property`](Self::add_node_property) /
+    /// [`add_rel_property`](Self::add_rel_property)) reach the *same* four steps instead of writing a
+    /// cell of their own. Before `rmp` #970 they wrote one with **no undo delta at all**, which is a
+    /// hole rather than a shortcut: after `D-property-visibility` the chain is the sole oracle for a
+    /// property's value, so an unversioned cell is a value no older snapshot can undo — and, once the
+    /// rollback stopped reverting bytes, one no abort could remove either (caught by the DST harness,
+    /// `PropMismatch`: the store held a property the reference model never wrote).
+    fn set_entity_property_encoded(
+        &mut self,
+        txn: TxnId,
+        kind: StoreKind,
+        entity: u64,
+        key: u32,
+        type_tag: u8,
+        value_inline: u64,
+    ) -> Result<u64> {
         let label = Self::owner_label(kind, entity);
         // The conflict check runs BEFORE the liveness test (`rmp` #971). A challenger that finds the
         // entity tombstoned by an **unresolved** holder must be told "retry", not "not in use":
@@ -7726,12 +8255,60 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         value_inline: u64,
     ) -> Result<u64> {
         match kind {
-            StoreKind::Node => self.add_node_property(txn, entity, key, type_tag, value_inline),
-            StoreKind::Rel => self.add_rel_property(txn, entity, key, type_tag, value_inline),
+            StoreKind::Node => self.create_node_prop_cell(txn, entity, key, type_tag, value_inline),
+            StoreKind::Rel => self.create_rel_prop_cell(txn, entity, key, type_tag, value_inline),
             StoreKind::Prop | StoreKind::Strings | StoreKind::Undo | StoreKind::Commit => Err(
                 GraphusError::Storage(format!("{kind:?} is not a property-chain owner")),
             ),
         }
+    }
+
+    /// Sets node `node_id`'s property `key` to an **already-encoded** `(type_tag, value_inline)`
+    /// under `txn`, returning the physical id of the cell that now holds it.
+    ///
+    /// The raw-tag entry point to the one property write path: it runs the write-conflict check,
+    /// links the `SetProperty` delta carrying whatever the key held before, and writes the value in
+    /// place — reusing the key's existing cell when it has one. Identical in every respect to
+    /// [`set_node_property_value`](Self::set_node_property_value) except that the caller supplies the
+    /// encoded pair instead of a [`Value`](graphus_core::Value); use this only where the encoding is
+    /// already fixed (a bulk import that encodes once, a fixture pinning an exact tag).
+    ///
+    /// # It stopped being a raw cell write in `rmp` #970
+    ///
+    /// It used to prepend an unversioned cell — no conflict check, no delta — which the physical
+    /// rollback happened to erase by reverting bytes. With the logical rollback there is no such
+    /// accident: a write with no delta is a write no abort can undo. Routing it through the versioned
+    /// path is what makes "every property write is on the chain" true of the API surface and not only
+    /// of the query engine.
+    ///
+    /// # Errors
+    /// Returns [`GraphusError::Transaction`] — retriable — if another open transaction holds the
+    /// node, and a storage error if the node is not a live version or a write fails.
+    pub fn add_node_property(
+        &mut self,
+        txn: TxnId,
+        node_id: u64,
+        key: u32,
+        type_tag: u8,
+        value_inline: u64,
+    ) -> Result<u64> {
+        self.set_entity_property_encoded(txn, StoreKind::Node, node_id, key, type_tag, value_inline)
+    }
+
+    /// [`add_node_property`](Self::add_node_property) over a relationship's property chain
+    /// (`rmp` task #44). Same contract, including the `rmp` #970 change of behaviour.
+    ///
+    /// # Errors
+    /// As [`add_node_property`](Self::add_node_property).
+    pub fn add_rel_property(
+        &mut self,
+        txn: TxnId,
+        rel_id: u64,
+        key: u32,
+        type_tag: u8,
+        value_inline: u64,
+    ) -> Result<u64> {
+        self.set_entity_property_encoded(txn, StoreKind::Rel, rel_id, key, type_tag, value_inline)
     }
 
     /// `"node 5"` / `"rel 7"` — the diagnostic label the chain walks and errors use.
@@ -8055,16 +8632,15 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     // ARIES machinery (`04 §4`). Index seeks + MVCC over these chains remain `rmp` task #39,
     // untouched here.
 
-    /// Creates a property `(key, type_tag, value_inline)` under `txn` and prepends it to relationship
-    /// `rel_id`'s property chain (`rmp` task #44); returns the property's physical id. The low-level
-    /// inline counterpart to [`add_node_property`](Self::add_node_property), over
+    /// Creates a property cell `(key, type_tag, value_inline)` under `txn` and prepends it to
+    /// relationship `rel_id`'s property chain (`rmp` task #44); returns the cell's physical id. The
+    /// low-level counterpart to [`create_node_prop_cell`](Self::create_node_prop_cell), over
     /// [`RelRecord.first_prop`](crate::record::RelRecord) — **including its isolation contract**:
-    /// no conflict check, no undo delta, so the cell it writes is visible to every snapshot at once.
-    /// Read that method's docs before calling this one.
+    /// no conflict check, no undo delta. Read that method's docs before calling this one.
     ///
     /// # Errors
     /// Returns a storage error if the relationship is not in use or a write fails.
-    pub fn add_rel_property(
+    fn create_rel_prop_cell(
         &mut self,
         txn: TxnId,
         rel_id: u64,
@@ -8083,20 +8659,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // #50); `commit` settles it to the commit timestamp.
         let mut prop = PropRecord::new(VersionStamp::in_flight(txn), key, type_tag, value_inline);
         prop.next_prop = rel.first_prop;
-        let old_head = rel.first_prop;
         // Header-only creation undo + compare-and-set head undo (`rmp` #172), mirroring
         // `add_node_property`: a loser's abort never severs an unrelated committed property version
         // below this record, nor clobbers a committed head.
         self.write_prop_create(pid, &prop, txn)?;
         self.note_created(txn, StoreKind::Prop, pid);
-        self.write_chain_head(
-            StoreKind::Rel,
-            rel_id,
-            REL_OFF_FIRST_PROP,
-            pid,
-            old_head,
-            txn,
-        )?;
+        self.write_chain_head(StoreKind::Rel, rel_id, REL_OFF_FIRST_PROP, pid, txn)?;
         Ok(pid)
     }
 
@@ -11140,15 +11708,29 @@ mod tests {
         );
     }
 
-    /// `rmp` #581 (safety boundary): an aborting transaction's own reused-id pop that a
-    /// concurrently-committed writer prepended onto is a LIVE-REFERENCED corpse (the #220/#172
-    /// pattern) and MUST NOT be re-pushed — re-freeing a still-threaded slot would be the #578
-    /// double-allocation in reverse. It stays a corpse the GC property-chain splice reclaims, and the
-    /// storage consistency checker stays green throughout.
+    /// `rmp` #581 (safety boundary) → **`rmp` #970**: the interleaving that produced a
+    /// live-referenced **property** corpse is now refused at the door.
+    ///
+    /// # What changed, and why the old scenario is unreachable
+    ///
+    /// This used to interleave two property writers on one node — T1 pops a freed cell and stays
+    /// open, C prepends a second cell on top and commits — so T1's abort left its cell threaded below
+    /// C's committed one, a corpse `reclaim_aborted_pops` had to decline to re-push and the GC
+    /// property sweep later collected.
+    ///
+    /// That interleaving cannot happen any more, and not because of the rollback: since `rmp` #970
+    /// routed the raw-tag entry point through the one property write path, C's write takes the
+    /// entity's write-conflict check (`D-property-write-conflict`, `rmp` #971) and is refused with a
+    /// **retriable serialization failure** while T1 holds the node. A second writer never gets to
+    /// prepend, so no property cell can become a live-referenced corpse by this route.
+    ///
+    /// The test therefore asserts what is now true: the conflict is detected, the holder's abort
+    /// reclaims its own slot, and the challenger succeeds once the holder is gone.
     #[test]
-    fn aborted_pop_that_became_a_live_corpse_is_not_reclaimed_581() {
+    fn a_concurrent_property_writer_is_refused_while_the_holder_is_open_970() {
         let mut s = fresh();
         let (h, key, p) = setup_freed_prop_slot(&mut s);
+        let other = s.intern_token(Namespace::PropKey, "w").unwrap();
 
         // T1 pops P and links it as H's property head, staying OPEN.
         let t1 = TxnId(4);
@@ -11156,65 +11738,70 @@ mod tests {
         let reused = s.add_node_property(t1, h, key, 1, 0x20).unwrap();
         assert_eq!(reused, p, "T1 popped the freed slot P");
 
-        // A concurrent committed writer C prepends a NEW property Q on TOP of P (so P becomes
-        // referenced by Q.next_prop). C allocates fresh — T1's pop emptied the free list.
+        // A concurrent writer C tries to add a DIFFERENT key to the same node. The check is keyed on
+        // the ENTITY, not the key, so it is refused — retriably.
         let c = TxnId(5);
         s.begin(c);
-        let q = s.add_node_property(c, h, key + 1, 1, 0x30).unwrap();
-        assert_ne!(q, p, "C allocates a fresh slot (T1 emptied the free list)");
-        s.commit(c).unwrap();
+        let refused = s.add_node_property(c, h, other, 1, 0x30);
+        assert!(
+            matches!(refused, Err(GraphusError::Transaction(_))),
+            "rmp #970/#971: a second property writer on a held entity is refused with a retriable \
+             serialization failure, not allowed to prepend: {refused:?}"
+        );
+        s.rollback(c).unwrap();
 
-        // T1 aborts (non-LIFO relative to C): P is now a live-referenced corpse (H -> Q -> P -> NULL).
+        // T1 aborts: its own pop is unreferenced (nothing could prepend onto it) and comes straight
+        // back to the free list.
         s.rollback(t1).unwrap();
-        assert!(
-            s.store(StoreKind::Prop).free.is_empty(),
-            "rmp #581: a referenced-corpse pop must NOT be reclaimed (no double-free of a threaded slot)"
+        assert_eq!(
+            s.store(StoreKind::Prop).free.ids(),
+            &[p],
+            "rmp #581: the holder's own pop is reclaimed once it aborts"
         );
-        assert!(
-            !s.property(p).unwrap().mvcc.in_use(),
-            "P is a not-in-use corpse threaded below the committed prepend"
-        );
-        // The checker tolerates the corpse threaded in the live chain (no StillInUse / ReferencedByLiveChain).
         let report = crate::check::check_store(&mut s, &[]).unwrap();
         assert!(
             report.is_consistent(),
-            "corpse-threaded chain is consistent: {:?}",
+            "store consistent after the refusal + abort: {:?}",
             report.violations
         );
-        // A subsequent allocation does NOT hand out the still-referenced corpse slot P.
+
+        // With the holder gone the challenger's write succeeds, and reuses the reclaimed slot.
         let t2 = TxnId(6);
         s.begin(t2);
-        let fresh_id = s.add_node_property(t2, h, key + 2, 1, 0x40).unwrap();
-        assert_ne!(
-            fresh_id, p,
-            "the corpse slot P is not handed out (still referenced)"
-        );
+        let again = s.add_node_property(t2, h, other, 1, 0x30).unwrap();
+        assert_eq!(again, p, "the reclaimed slot is handed straight back out");
         s.commit(t2).unwrap();
-
-        // GC reclaims the corpse P via the property-chain splice; the checker stays green.
-        let wm2 = s.snapshot_ts();
-        s.begin(TxnId(7));
-        s.gc(TxnId(7), wm2).unwrap();
-        s.commit(TxnId(7)).unwrap();
         let report = crate::check::check_store(&mut s, &[]).unwrap();
         assert!(
             report.is_consistent(),
-            "store consistent after GC reclaims the corpse: {:?}",
+            "store consistent after the retry succeeds: {:?}",
             report.violations
         );
     }
 
-    /// `rmp` #581 (safety boundary, REL branch): the `Rel` mirror of
-    /// [`aborted_pop_that_became_a_live_corpse_is_not_reclaimed_581`]. An aborting transaction's own
-    /// reused-id relationship pop that a concurrently-committed writer prepended onto is a
-    /// LIVE-REFERENCED corpse (the #220/#172 pattern) and MUST NOT be re-pushed: re-freeing a slot
-    /// still threaded into a live incidence chain would hand the allocator a slot a committed edge
-    /// points at — the `rmp` #578 double-allocation in reverse, i.e. committed-data corruption. This
-    /// drives [`rel_slot_referenced`](Self::rel_slot_referenced) to return `true` so the decline at the
-    /// `Rel` arm of [`reclaim_aborted_pops`](Self::reclaim_aborted_pops) fires; the slot stays a corpse
-    /// the GC incidence-chain splice reclaims, and the consistency checker stays green throughout.
+    /// `rmp` #581 → **`rmp` #970**: an aborting transaction's own reused-id relationship pop that a
+    /// concurrently-committed writer prepended onto is **unlinked cleanly and reclaimed at once**.
+    ///
+    /// # The contract this test asserts changed with #970, deliberately
+    ///
+    /// Under the physical rollback this slot became a **live-referenced corpse**: the chain-head
+    /// compare-and-set undo no-oped (C had pushed S on top, so `first_rel` no longer named R), R
+    /// stayed threaded below the committed S, and `reclaim_aborted_pops` had to DECLINE to re-push it
+    /// — re-freeing a slot a committed edge still points at is the `rmp` #578 double-allocation in
+    /// reverse. The slot then waited for the GC incidence-chain splice.
+    ///
+    /// The logical rollback has no such state to leave behind: `RemoveIncidentEdge` unlinks R from
+    /// **both** endpoint chains against the current state — bridging S's forward link past it — so
+    /// when the creation delta retires the record there is nothing referencing it and the slot is
+    /// free immediately. That is `rmp` #970 acceptance criterion 7: no corpse dependent on a later
+    /// repair.
+    ///
+    /// **Non-vacuity.** The safety property #581 exists for is asserted unchanged and first: S — a
+    /// committed prepend by an unrelated transaction — must still be the head of both endpoint
+    /// chains after the abort, with its own record untouched. An abort that reverted the shared
+    /// `first_rel` word (the pre-#220 shape) fails that assertion before reaching the new ones.
     #[test]
-    fn aborted_rel_pop_that_became_a_live_corpse_is_not_reclaimed_581() {
+    fn aborted_rel_pop_is_unlinked_and_its_slot_reclaimed_by_gc_970() {
         let mut s = fresh();
         let (a, b, ty, r) = setup_freed_rel_slot(&mut s);
 
@@ -11264,54 +11851,70 @@ mod tests {
             "S's end-side chain link threads through R (R referenced by B's live chain)"
         );
 
-        // T1 aborts (non-LIFO relative to C): R is now a live-referenced corpse (A/B -> S -> R -> NULL).
+        // T1 aborts (non-LIFO relative to C).
         s.rollback(t1).unwrap();
+
+        // ---- the #581 safety property, unchanged: C's committed prepend survives intact ----
+        assert_eq!(
+            s.read_node(a).unwrap().first_rel,
+            sid,
+            "rmp #581/#220: the committed prepend S is still A's chain head after the abort"
+        );
+        assert_eq!(
+            s.read_node(b).unwrap().first_rel,
+            sid,
+            "rmp #581/#220: the committed prepend S is still B's chain head after the abort"
+        );
         assert!(
-            s.store(StoreKind::Rel).free.is_empty(),
-            "rmp #581: a referenced-corpse rel pop must NOT be reclaimed (no double-free of a threaded \
-             slot)"
+            s.read_rel(sid).unwrap().mvcc.in_use(),
+            "the committed relationship S is still live"
+        );
+
+        // ---- what #970 adds: R is unlinked, not left threaded as a corpse ----
+        let s_after = s.read_rel(sid).unwrap();
+        assert_eq!(
+            s_after.start_next_rel, NULL_ID,
+            "rmp #970: the abort bridged A's chain past R instead of leaving it threaded"
+        );
+        assert_eq!(
+            s_after.end_next_rel, NULL_ID,
+            "rmp #970: the abort bridged B's chain past R instead of leaving it threaded"
         );
         assert!(
             !s.read_rel(r).unwrap().mvcc.in_use(),
-            "R is a not-in-use corpse threaded below the committed prepend"
+            "R's slot is retired by the abort"
         );
-        // The corpse is still threaded below S in both chains (the abort's chain-head CAS no-oped
-        // because C had already pushed S on top, so `first_rel` no longer equals R).
-        assert_eq!(
-            s.read_rel(sid).unwrap().start_next_rel,
-            r,
-            "R is still threaded below S after the abort (the CAS chain-head undo no-oped)"
+        assert!(
+            !s.store(StoreKind::Rel).free.ids().contains(&r),
+            "rmp #970: the abort PARKS the unlinked slot rather than recycling it — the in-memory \
+             latest-state indexes still hold a document keyed on that physical id"
         );
-        // The checker tolerates the corpse threaded in the live chain (no double-free / dangling link).
         let report = crate::check::check_store(&mut s, &[]).unwrap();
         assert!(
             report.is_consistent(),
-            "corpse-threaded rel chain is consistent: {:?}",
+            "store consistent right after the abort, with no GC pass: {:?}",
             report.violations
         );
-        // A subsequent rel allocation does NOT hand out the still-referenced corpse slot R.
-        let t2 = TxnId(6);
-        s.begin(t2);
-        let (fresh_rel, _) = s.create_rel(t2, ty, a, b).unwrap();
-        assert_ne!(
-            fresh_rel, r,
-            "the corpse slot R is not handed out (still referenced)"
-        );
-        s.commit(t2).unwrap();
 
-        // GC reclaims the corpse R via the incidence-chain splice; the checker stays green.
+        // The GC orphan sweep returns it (`rmp` #970, AC 7), and only then is it reusable.
         let wm2 = s.snapshot_ts();
         s.begin(TxnId(7));
         s.gc(TxnId(7), wm2).unwrap();
         s.commit(TxnId(7)).unwrap();
         assert!(
-            !s.read_rel(r).unwrap().mvcc.in_use(),
-            "R is still a not-in-use slot after GC spliced it out of the chains"
+            s.store(StoreKind::Rel).free.ids().contains(&r),
+            "rmp #970 AC 7: the orphan sweep reclaims the slot the abort unlinked — clean disconnect \
+             does not leak"
         );
+        let t2 = TxnId(6);
+        s.begin(t2);
+        let (fresh_rel, _) = s.create_rel(t2, ty, a, b).unwrap();
+        assert_eq!(fresh_rel, r, "and it is handed back out");
+        s.commit(t2).unwrap();
         let report = crate::check::check_store(&mut s, &[]).unwrap();
         assert!(
             report.is_consistent(),
-            "store consistent after GC reclaims the rel corpse: {:?}",
+            "store consistent after the slot is reused: {:?}",
             report.violations
         );
     }

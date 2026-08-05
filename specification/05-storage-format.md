@@ -82,12 +82,11 @@ Measured on this host (`x86_64`, Rust 1.96, `--release`), hashing an 8 KiB page 
   deltas. GC prunes deltas older than the oldest active snapshot timestamp.
 - Trade-off: a reader on an old snapshot pays a chain walk proportional to concurrent long-running
   writers; acceptable for the target workload and bounded by GC.
-- **Measured ground for the delta half of the choice** (not a preference): the present property path
-  tombstones the previous version by walking the entity's whole property chain and then prepends the
-  new one (`RecordStore::tombstone_props_for_key`,
-  `crates/graphus-storage/src/store.rs:6710-6753`), which is **O(M²)** in the number of assignments
-  to one entity — **15.1 µs/op at M = 1000** and **97.8 µs/op at M = 8000**. A constant-cost delta
-  prepend replaces that walk.
+- **Measured ground for the delta half of the choice** (not a preference): the property path in force
+  when the decision was taken tombstoned the previous version by walking the entity's whole property
+  chain and then prepended the new one (`RecordStore::tombstone_props_for_key`), which is **O(M²)** in
+  the number of assignments to one entity — **15.1 µs/op at M = 1000** and **97.8 µs/op at M = 8000**.
+  A constant-cost delta prepend replaced that walk (task #967).
 - **One chain per entity carries every mutation kind** — creation, deletion, property assignment,
   label change, and incidence-list change. The chain is anchored by the record's `undo_ptr` (§7) and
   its on-disk format is frozen in §12. The delta actions, their lifecycle, their ownership by the
@@ -146,16 +145,19 @@ chain at all.
 > publishes it as that entity's chain head (`RecordStore::link_delta`, driven from `create_node` /
 > `create_rel` / `delete_node` / `delete_rel` in `crates/graphus-storage/src/store.rs`), so `undo_ptr`
 > is no longer the permanently-zero reserved word it was. The head is published with the same
-> compare-and-set chain-head write `first_rel` / `first_prop` use, and the consistency checker now
-> range-checks it against **`undo.store`**'s high-water and walks the chain below it
-> (`Violation::UndoChain`, `crates/graphus-storage/src/check.rs`). The frozen 25-byte header above did
-> **not** change: `undo_ptr` was always specified to mean this, and #966 made the engine honour the
-> specification rather than the other way round.
+> chain-head write `first_rel` / `first_prop` use, which since task **#970** carries **no undo image
+> at all**: the inverse of a prepend is to unlink the entry, computed at abort time from the
+> transaction's own deltas, and never the restoration of the word (`04` §4.4 and §5.1.5 row 3). The
+> consistency checker range-checks `undo_ptr` against **`undo.store`**'s high-water and walks the
+> chain below it (`Violation::UndoChain`, `crates/graphus-storage/src/check.rs`). The frozen 25-byte
+> header above did **not** change: `undo_ptr` was always specified to mean this, and #966 made the
+> engine honour the specification rather than the other way round.
 >
-> **Still to come.** #966 delivered the area and the entity-lifecycle actions (`DeleteObject` /
-> `RecreateObject`). Property assignment (**#967**), label change (**#968**) and incidence change
-> (**#969**) still use the mechanisms `04` §5.1.5 lists; they move onto this chain in their own tasks,
-> and the record format does not change again when they do.
+> **Every mutation kind now hangs on this chain.** #966 delivered the area and the entity-lifecycle
+> actions (`DeleteObject` / `RecreateObject`); property assignment (**#967**), label change
+> (**#968**) and incidence change (**#969**) followed, and **#970** made the rollback that applies
+> them logical. The record format did not change again when they landed, exactly as this section
+> said it would not.
 
 **How this header reads on a property record, from task #967 onward** (`D-property-visibility` and
 `D-property-removal`, ratified 2026-08-03; `04` §5.6). The 25-byte prefix above is shared by node,
@@ -225,8 +227,10 @@ machinery lands with the dense-node and large-value tasks.
 Tokens (labels / reltypes / propkeys) are bidirectional `u32 ↔ name` dictionaries, WAL-logged and
 recovered (§2.6). The `ElementId → physical id` direction is rebuilt in memory on open (each record
 self-describes its `ElementId`; the never-reused 128-bit counter is persisted in the metadata
-catalog). All mutations are WAL-logged as intra-page `(u16 offset, bytes)` redo/undo patches and are
-crash-recoverable via three-phase ARIES recovery (`04-technical-design.md` §4.8).
+catalog). All mutations are WAL-logged as intra-page `(u16 offset, bytes)` patches and are
+crash-recoverable via three-phase ARIES recovery (`04-technical-design.md` §4.8). Every mutation
+carries a redo patch; its undo patch is a physical pre-image, a compare-and-set, or — for a chain-head
+write, whose inverse is logical (§12.5) — **empty**.
 
 ---
 
@@ -389,6 +393,12 @@ is therefore the inverse of the action's name, and that is deliberate.
 
 Value `0` is reserved and is not a valid action, so a zeroed slot never decodes as a delta.
 
+**Action 6 is frozen but unwritten.** No write path emits `AddIncidentEdge`, because a relationship
+deletion is a tombstone and never unlinks an incidence entry, so nothing exists for that action to
+restore (`04` §5.1.1). It is retained in the encoding so the pair of incidence actions is complete
+and so a later build that does unlink on delete needs no format change. A rollback that meets an
+`AddIncidentEdge` delta on a chain treats it as corruption rather than applying it.
+
 **The two incidence actions anchor on the RELATIONSHIP** (`D-incidence-anchor`, ratified 2026-08-04;
 `04 §5.1.1`), so the entity whose chain carries them is the relationship itself and `direction` says
 which of that relationship's two ends the entry is on. `edge` therefore names the owning entity and is
@@ -438,18 +448,27 @@ itself (§12.5), and frees its slot with them.
   as an intra-page `(u16 offset, bytes)` patch and redone by the same three-phase ARIES machinery as a
   record-store page (`04-technical-design.md` §4.8). There is no separate undo-area recovery path and
   no rebuild on open.
-- **Redo stays physical; undo becomes logical.** Crash recovery still replays physical page images, so
-  the undo area is reconstructed byte-exactly. What changes is transaction rollback: instead of
-  reverting bytes (`RecordStore::rollback`, `crates/graphus-storage/src/store.rs:3644`), a rolling-back
-  transaction walks **its own** deltas and applies them, restoring exactly the state it found. This is
-  task **#970**, and it is what ends the defect family rmp #220 / #172 / #239 / #301 / #578 / #772, all
-  of which are cases of one transaction's byte-level undo damaging another's committed state.
-  **#970 is a rollback change only.** Because the undo chain is already the sole visibility oracle for
-  a property's value by the time #970 lands (`D-property-visibility`, ratified 2026-08-03; `04` §5.6),
-  replacing physical undo with logical undo needs **no second rewrite of the read path**.
-- **A loser transaction after a crash is undone the same way.** A slot whose `commit_ts` is still an
-  in-flight stamp when recovery reaches the ARIES undo phase belongs to a transaction that did not
-  commit; its deltas are applied, in chain order, exactly as a live rollback would apply them.
+- **Redo stays physical; the rollback of a data transaction became logical** (task **#970**, done).
+  Crash recovery still replays physical page images, so the undo area is reconstructed byte-exactly.
+  What changed is transaction rollback: instead of reverting bytes, a rolling-back transaction walks
+  **its own** deltas newest-first, applies each against the current state, detaches them from the
+  chains they head, reclaims them with its commit slot, and ends in the log with an `ABORT` record
+  carrying no compensation (`RecordStore::rollback_logical`,
+  `crates/graphus-storage/src/store.rs:5840`). This is what ends the defect family rmp #220 / #172 /
+  #239 / #301 / #578 / #772, all of which are cases of one transaction's byte-level undo damaging
+  another's committed state. **#970 was a rollback change only.** Because the undo chain was already
+  the sole visibility oracle for a property's value (`D-property-visibility`, ratified 2026-08-03;
+  `04` §5.6), replacing physical undo with logical undo needed **no second rewrite of the read path**.
+  Physical undo survives for a transaction that owns no commit slot — a GC or maintenance pass, or a
+  catalog-only writer — whose writes name no MVCC version (`rollback_physical`, `:5916`; `04` §4.3).
+- **A loser transaction after a crash is undone by the WAL, not by its deltas.** Recovery's undo
+  phase follows each loser's `prev_lsn` back-chain and applies the undo image of every record it
+  wrote (`04` §4.8): the in-place values revert byte for byte, and each delta the loser linked reverts
+  to `!in_use` through the header-only creation undo that installed it, keeping its `next` intact. The
+  chain-head publications carry no undo image (§7), so they are not reverted, and what recovery leaves
+  is an entity whose `undo_ptr` names a **corpse**: a `!in_use` delta that every chain walk threads
+  through and that the GC reclaims. Logical rollback is the inverse of a *live* transaction; the WAL
+  is the inverse of a crashed one.
 - **Consistency checking.** The checker's existing `undo_ptr` range guard
   (`MvccHeaderFault::UndoPtrOutOfRange`, `crates/graphus-storage/src/check.rs:1224-1229`) was written
   for this moment and needs no change in kind: it must now range-check against `undo.store`'s

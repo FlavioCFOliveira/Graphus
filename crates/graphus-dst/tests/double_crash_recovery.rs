@@ -83,6 +83,9 @@ struct DoubleCrashReport {
     rel_corpse_head_after_r1: bool,
     /// Whether the shared node's `first_prop` pointed at a corpse after the first recovery (#301).
     prop_corpse_head_after_r1: bool,
+    /// Whether the loser left IN FLIGHT at the crash had at least one property write accepted — the
+    /// non-vacuity witness for the property axis of this soak (see the assertions).
+    loser_wrote_prop: bool,
 }
 
 fn run_double_crash(seed: u64) -> DoubleCrashReport {
@@ -102,6 +105,20 @@ fn run_double_crash(seed: u64) -> DoubleCrashReport {
     let mut keys = Vec::new();
     for k in 0..3u32 {
         keys.push(
+            store
+                .intern_token(Namespace::PropKey, &format!("k{k}"))
+                .expect("intern propkey"),
+        );
+    }
+    // Keys reserved for the LOSERS. Since `rmp` #967 a write of a key the entity already holds
+    // rewrites that cell **in place**, so a loser reusing one of the survivor's three keys never
+    // prepends a cell and can therefore never leave one at the chain head. This soak's whole subject
+    // is the `!in_use` chain-head corpse a crashed prepend leaves (`rmp` #301 / #468), so the losers
+    // draw from the survivor's keys AND from three of their own: the shared keys keep the in-place
+    // overwrite interleaving, the private ones keep the prepend reachable.
+    let mut loser_keys = keys.clone();
+    for k in 3..6u32 {
+        loser_keys.push(
             store
                 .intern_token(Namespace::PropKey, &format!("k{k}"))
                 .expect("intern propkey"),
@@ -170,6 +187,10 @@ fn run_double_crash(seed: u64) -> DoubleCrashReport {
         store.begin(t);
         tids.push(t);
     }
+    // Which losers actually got a property write in — only one of them can hold the shared node's
+    // property chain at a time now (`D-property-write-conflict`), and the scenario's teeth depend on
+    // the transaction left IN FLIGHT at the crash being one that did.
+    let mut prop_writers: Vec<usize> = Vec::new();
     let mut rem: Vec<u64> = (0..losers).map(|_| rng.range_inclusive(1, 4)).collect();
     let mut remaining: u64 = rem.iter().sum();
     while remaining > 0 {
@@ -183,15 +204,33 @@ fn run_double_crash(seed: u64) -> DoubleCrashReport {
                 .create_rel(tid, rel_type, shared, shared)
                 .expect("create loser self-loop");
         } else {
-            let key = keys[rng.index(keys.len())];
-            let _ = store
-                .add_node_property(tid, shared, key, INLINE_TAG, 0x9000 + remaining)
-                .expect("add loser property");
+            let key = loser_keys[rng.index(loser_keys.len())];
+            // A property write takes the OWNING ENTITY's write-conflict check
+            // (`D-property-write-conflict`; since `rmp` #970 on this raw-tag entry point too), so only
+            // ONE of the interleaved losers can hold the shared node's property chain at a time. A
+            // refusal is a retriable serialization failure and a legitimate outcome of the
+            // interleaving: nothing was written, and the loser stays open for its next op. The
+            // scenario keeps its teeth through the self-loop half, which does not conflict (an
+            // incidence delta anchors on the fresh relationship, `D-incidence-anchor`).
+            match store.add_node_property(tid, shared, key, INLINE_TAG, 0x9000 + remaining) {
+                Ok(_) => prop_writers.push(pick),
+                Err(graphus_core::GraphusError::Transaction(_)) => {}
+                Err(e) => panic!("add loser property: {e:?}"),
+            }
         }
         rem[pick] -= 1;
         remaining -= 1;
     }
-    let in_flight = rng.index(losers);
+    // Prefer a loser that wrote a property: a prop cell left uncommitted by the CRASH is the only
+    // remaining source of the `!in_use` chain-head corpse this soak exists to exercise (a LIVE
+    // rollback now unlinks and reclaims its own cell — `rmp` #970). Falls back to the plain random
+    // pick when no loser got one in, which keeps the seed stream's shape.
+    let in_flight = if prop_writers.is_empty() {
+        rng.index(losers)
+    } else {
+        prop_writers[rng.index(prop_writers.len())]
+    };
+    let loser_wrote_prop = prop_writers.contains(&in_flight);
     for (i, &t) in tids.iter().enumerate() {
         if i != in_flight {
             store.rollback(t).expect("live rollback loser");
@@ -242,6 +281,7 @@ fn run_double_crash(seed: u64) -> DoubleCrashReport {
         result,
         rel_corpse_head_after_r1,
         prop_corpse_head_after_r1,
+        loser_wrote_prop,
     }
 }
 
@@ -284,6 +324,7 @@ fn double_crash_recovery_is_idempotent_across_seeds() {
     let mut passed = 0u64;
     let mut rel_corpse = 0u64;
     let mut prop_corpse = 0u64;
+    let mut loser_props = 0u64;
     let mut first_failure: Option<DoubleCrashReport> = None;
 
     for seed in 1..=SEEDS {
@@ -299,6 +340,9 @@ fn double_crash_recovery_is_idempotent_across_seeds() {
         if r.prop_corpse_head_after_r1 {
             prop_corpse += 1;
         }
+        if r.loser_wrote_prop {
+            loser_props += 1;
+        }
         assert_eq!(
             r,
             run_double_crash(seed),
@@ -313,17 +357,35 @@ fn double_crash_recovery_is_idempotent_across_seeds() {
         );
     }
     assert_eq!(passed, SEEDS, "every seed must survive a double crash");
-    // Non-vacuity: the double crash must reach the #468 (rel) and #301 (prop) corpse-head states.
+    // Non-vacuity, RELATIONSHIP axis: the double crash must still reach the `rmp` #468 corpse-head
+    // state. It stays reachable because two transactions CAN both prepend a self-loop onto one node —
+    // an incidence delta anchors on the fresh relationship, not on the endpoint (`D-incidence-anchor`),
+    // so the write-conflict check does not serialise them.
     assert!(
         rel_corpse > 0,
         "no seed reached a rel corpse head after R1 — double-crash soak is vacuous"
     );
+    // Non-vacuity, PROPERTY axis: the `rmp` #301 corpse head, still reached — and since `rmp` #970
+    // reached by a DIFFERENT route, which is worth naming because it changed under this task. It used
+    // to need two transactions' cells interleaved on one chain so that the loser's chain-head undo
+    // would no-op; every property write now takes the entity's write-conflict check
+    // (`D-property-write-conflict`, `rmp` #971), so that interleaving is refused. What produces it now
+    // is the ordinary one: a chain-head publication is **redo-only** (`rmp` #970), so ARIES leaves the
+    // loser's cell as the head and the header-only creation undo marks it `!in_use`. Every walk in the
+    // storage core threads through it and the GC splice reclaims it.
     assert!(
         prop_corpse > 0,
         "no seed reached a prop corpse head after R1 — double-crash soak is vacuous"
     );
+    // And that the losers' property writes were genuinely accepted, so the property half of the
+    // workload is not being silently refused away.
+    assert!(
+        loser_props > 0,
+        "no seed left an in-flight loser that had written a property — the property axis of the \
+         soak is vacuous"
+    );
     eprintln!(
         "double_crash soak: {SEEDS} seeds PASS (idempotent); rel-corpse-head {rel_corpse}, \
-         prop-corpse-head {prop_corpse}"
+         prop-corpse-head {prop_corpse}, in-flight losers with a property write {loser_props}"
     );
 }

@@ -96,9 +96,20 @@ impl Model {
         self.node_props.remove(&id);
     }
 
-    /// Appends a property to a node's modelled property multiset.
+    /// Sets a property on a node's modelled property set — **last write wins per key**.
+    ///
+    /// This was an append (a growing multiset, one entry per write) while the store's raw
+    /// `add_node_property` prepended a fresh cell for every assignment. Since `rmp` #967 an
+    /// assignment rewrites the key's cell in place and the previous value descends onto the entity's
+    /// undo chain, and since `rmp` #970 the raw entry point takes that same path — so a node holds
+    /// exactly one cell per key, and a model that kept every write drifted from the store on the
+    /// second assignment to a key.
     pub fn add_node_prop(&mut self, node: u64, prop: PropTriple) {
-        self.node_props.entry(node).or_default().push(prop);
+        let props = self.node_props.entry(node).or_default();
+        match props.iter_mut().find(|p| p.key == prop.key) {
+            Some(existing) => *existing = prop,
+            None => props.push(prop),
+        }
     }
 
     /// Whether `id` is a live node.
@@ -231,8 +242,12 @@ mod tests {
         assert!(!m.has_rel(10));
     }
 
+    /// A node holds **one value per key**, last write wins — the store's semantics since `rmp` #967
+    /// (an assignment rewrites the key's cell in place) and, since `rmp` #970, on every write path
+    /// including the raw-tag one. Before that the model kept a growing multiset, one entry per write,
+    /// which matched only the retired prepend-a-cell-per-assignment shape.
     #[test]
-    fn node_props_are_a_sorted_multiset() {
+    fn node_props_are_one_value_per_key_sorted() {
         let mut m = Model::new();
         m.add_node(1);
         m.add_node_prop(
@@ -248,9 +263,9 @@ mod tests {
             PropTriple {
                 key: 2,
                 type_tag: 1,
-                value_inline: 9,
+                value_inline: 42,
             },
-        ); // duplicate kept
+        ); // same key rewritten: replaces, never appends
         m.add_node_prop(
             1,
             PropTriple {
@@ -260,9 +275,10 @@ mod tests {
             },
         );
         let props = m.node_props_sorted(1);
-        assert_eq!(props.len(), 3);
+        assert_eq!(props.len(), 2, "two distinct keys, not three writes");
         assert_eq!(props[0].key, 1); // sorted: key 1 first
-        assert_eq!(props[1], props[2]); // the duplicate survives
+        assert_eq!(props[1].key, 2);
+        assert_eq!(props[1].value_inline, 42, "the later write won");
     }
 
     #[test]

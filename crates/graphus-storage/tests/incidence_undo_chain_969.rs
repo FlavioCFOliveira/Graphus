@@ -432,24 +432,28 @@ fn versioning_an_edge_writes_exactly_two_deltas_on_the_relationship() {
 // storage-systems-auditor and the concurrency-architect independently)
 // ==========================================================================================
 
-/// GC must not reclaim the relationship an open writer's chain-head undo will restore.
+/// **The hazard this used to guard is gone with the undo image that created it** (`rmp` #969 →
+/// `rmp` #970).
 ///
-/// A writer `W` prepending onto node `N` captures `N`'s current `first_rel` as its undo image. If GC
-/// reclaims **that** relationship in the meantime — legitimate on its own terms, since it is
-/// tombstoned and committed below the watermark — then `W`'s abort restores `first_rel` to a slot on
-/// the **free list**. The next allocation hands that slot to an unrelated relationship and the
-/// incidence walk follows a foreign record's pointers: a silently wrong traversal.
+/// A writer `W` prepending onto node `N` used to capture `N`'s current `first_rel` as its undo
+/// image, so GC reclaiming *that* relationship — legitimate on its own terms, since it is tombstoned
+/// and committed below the watermark — left `W`'s abort restoring `first_rel` to a slot on the free
+/// list, which the next allocation handed to an unrelated relationship: a silently wrong traversal.
+/// The fix was a GC deferral keyed on the set of captured heads.
 ///
-/// The hazard is pre-existing and does not depend on how the head is written: the compare-and-set
-/// undo of `rmp` #220 fires here too, because the head *is* still the writer's pushed id — what went
-/// stale is the value restored, not the word tested.
+/// `rmp` #970 removes the premise. A chain-head publication is **redo-only** — its inverse is the
+/// transaction's `RemoveIncidentEdge` delta, which unlinks against the state at abort time — so no
+/// image names the tombstoned head, nothing has to be deferred, and the captured-head bookkeeping is
+/// deleted. GC may reclaim the head while the writer is open, and the writer's abort still leaves a
+/// correct chain, because it recomputes rather than restores.
 ///
-/// **Non-vacuity.** Verified by running this test against the tree before the
-/// `rel_endpoints_held_by_open_writer` gate: the GC pass reports `reclaimed: 1`, the abort leaves
-/// `first_rel` naming the freed slot, and `check_store` reports exactly two violations —
-/// `Adjacency { detail: DeadRel }` and `FreeList { detail: ReferencedByLiveChain }`.
+/// **Non-vacuity.** The two assertions that matter are kept and are the ones that would fail if the
+/// abort had gone back to restoring a captured id: after `W` aborts, the node's chain contains
+/// exactly the live edges, and `check_store` is clean — the pre-#969 failure produced
+/// `Adjacency { detail: DeadRel }` and `FreeList { detail: ReferencedByLiveChain }` right here. The
+/// GC pass is asserted to have actually reclaimed, so the race is genuinely run.
 #[test]
-fn gc_must_not_reclaim_the_chain_head_an_open_writer_will_restore() {
+fn gc_may_reclaim_a_tombstoned_head_while_a_writer_prepends_onto_it() {
     let mut s = fresh();
     let rt = s.intern_token(Namespace::RelType, "R").expect("intern");
 
@@ -469,46 +473,32 @@ fn gc_must_not_reclaim_the_chain_head_an_open_writer_will_restore() {
     s.delete_rel(del, head).expect("tombstone the head");
     s.commit(del).expect("commit the deletion");
 
-    // W prepends a new edge; its chain-head undo image now names the tombstoned head.
+    // W prepends a new edge on top of the tombstoned head.
     let w = TxnId(3);
     s.begin(w);
     let (fresh_edge, _) = s.create_rel(w, rt, n, l2).expect("W prepends");
     assert_eq!(s.node(n).expect("read n").first_rel, fresh_edge);
 
-    // A GC pass runs while W is still open, at a watermark that would otherwise reclaim the head.
+    // A GC pass runs while W is still open, at a watermark that reclaims the head. No deferral.
     let watermark = s.snapshot_ts();
     let g = TxnId(4);
     s.begin(g);
     let pass = s.gc(g, watermark).expect("gc pass");
     s.commit(g).expect("commit gc");
-    assert_eq!(
-        pass.reclaimed, 0,
-        "GC must DEFER the tombstoned head while an open writer's undo image names it"
+    assert!(
+        pass.reclaimed >= 1,
+        "non-vacuity: the GC pass must actually reclaim the tombstoned head, or the race this test \
+         exists for never happens (got {})",
+        pass.reclaimed
     );
 
     s.rollback(w).expect("W aborts");
-    assert_eq!(
-        s.node(n).expect("read n").first_rel,
-        head,
-        "the abort restores the head it captured — which must still be a live slot"
-    );
-    assert_consistent(&mut s, "after a GC pass raced an open prepend");
-
-    // And once the writer is gone, the deferral lifts: the next pass reclaims the head.
-    let g2 = TxnId(5);
-    s.begin(g2);
-    let pass = s.gc(g2, s.snapshot_ts()).expect("second gc pass");
-    s.commit(g2).expect("commit gc");
-    assert!(
-        pass.reclaimed >= 1,
-        "the deferral is temporary: with no open writer the head is reclaimed, got {}",
-        pass.reclaimed
-    );
     assert!(
         s.incident_rels(n).expect("walk").is_empty(),
-        "W aborted and the head was reclaimed, so no edge survives on n"
+        "rmp #970: the abort unlinked its own edge and restored no captured id, so n's chain is \
+         empty — the reclaimed head is NOT resurrected onto the free list"
     );
-    assert_consistent(&mut s, "after the deferred reclaim finally runs");
+    assert_consistent(&mut s, "after a GC pass raced an open prepend");
 }
 
 /// Reclaiming a relationship that an **aborted prepend** left with a stale `prev` and a cleared
