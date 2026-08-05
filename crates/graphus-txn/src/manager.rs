@@ -2,7 +2,7 @@
 //! deadlock detection, and version GC, tying together every other module (`04 §5`).
 //!
 //! [`TxnManager`] owns the [`TimestampOracle`], the [`CommitRegistry`], the [`SsiTracker`], the
-//! [`LockTable`], and a [`VersionedStore`]. It is single-threaded by construction (consistent with
+//! and a [`VersionedStore`]. It is single-threaded by construction (consistent with
 //! the single-writer storage core of this milestone): callers drive transactions through
 //! [`begin`](TxnManager::begin) → reads/writes → [`commit`](TxnManager::commit) /
 //! [`rollback`](TxnManager::rollback).
@@ -35,7 +35,6 @@ use rustc_hash::FxHashMap as HashMap;
 use graphus_core::{GraphusError, Result, Timestamp, TxnId, VersionStamp};
 
 use crate::gc::{GcReport, collect};
-use crate::lock::{LockOutcome, LockTable};
 use crate::oracle::TimestampOracle;
 use crate::snapshot::{CommitRegistry, IsolationLevel, Snapshot};
 use crate::ssi::SsiTracker;
@@ -112,6 +111,9 @@ impl Default for TxnConfig {
 struct ActiveTxn {
     snapshot: Snapshot,
     isolation: IsolationLevel,
+    /// Keys this transaction has written, for the first-updater-wins check in
+    /// [`acquire_write`](TxnManager::acquire_write) (`rmp` #971, replacing the retired lock table).
+    written: std::collections::BTreeSet<Key>,
     /// Wall-clock instant of this transaction's most recent operation (begin/read/write/delete).
     /// Drives the idle-timeout reaper (SEC-198); refreshed on every operation.
     last_active: Instant,
@@ -128,7 +130,6 @@ pub struct TxnManager<S: VersionedStore, D: Durability> {
     oracle: TimestampOracle,
     registry: CommitRegistry,
     ssi: SsiTracker,
-    locks: LockTable,
     store: S,
     durability: D,
     active: HashMap<TxnId, ActiveTxn>,
@@ -160,7 +161,6 @@ impl<S: VersionedStore, D: Durability> TxnManager<S, D> {
             oracle: TimestampOracle::new(),
             registry: CommitRegistry::new(),
             ssi: SsiTracker::new(),
-            locks: LockTable::new(),
             store,
             durability,
             active: HashMap::default(),
@@ -220,6 +220,7 @@ impl<S: VersionedStore, D: Durability> TxnManager<S, D> {
             ActiveTxn {
                 snapshot,
                 isolation,
+                written: std::collections::BTreeSet::new(),
                 last_active: Instant::now(),
             },
         );
@@ -334,11 +335,10 @@ impl<S: VersionedStore, D: Durability> TxnManager<S, D> {
             return Err(e);
         }
 
-        // 4) Publish: stamp versions, record outcomes, release locks, free the snapshot.
+        // 4) Publish: stamp versions, record outcomes, free the snapshot.
         self.store.commit_writer(txn, commit_ts);
         self.registry.record_commit(txn, commit_ts);
         self.ssi.record_commit(txn, commit_ts);
-        self.locks.release_all(txn);
         let snapshot_ts = self.active.remove(&txn).map(|a| a.snapshot.ts);
         if let Some(ts) = snapshot_ts {
             // A defensive no-op if bookkeeping is inconsistent (SEC-200); never panic on commit.
@@ -347,7 +347,7 @@ impl<S: VersionedStore, D: Durability> TxnManager<S, D> {
         Ok(commit_ts)
     }
 
-    /// Rolls `txn` back: discards its writes, releases its locks, and frees its snapshot.
+    /// Rolls `txn` back: discards its writes and frees its snapshot.
     ///
     /// # Errors
     /// Returns [`GraphusError::Transaction`] if `txn` is not active.
@@ -503,66 +503,39 @@ impl<S: VersionedStore, D: Durability> TxnManager<S, D> {
         Ok(())
     }
 
+    /// First-updater-wins over this harness's in-memory writer set (`rmp` #971).
+    ///
+    /// This used to consult a `LockTable` and, on a wait, run a wait-for-graph deadlock search that
+    /// aborted the youngest transaction on the cycle. Both are **retired**: they never blocked (the
+    /// wait outcome was turned into an immediate retriable error at every call site), and in the
+    /// server the conflict is detected on the entity's own MVCC header by
+    /// `RecordStore::ensure_no_conflicting_writer`. What is left here is the same rule expressed
+    /// directly — if another **active** transaction has already written this key, the second writer
+    /// fails fast and retriably — which is what the SSI suites in `tests/` need from this harness.
     fn acquire_write(&mut self, txn: TxnId, key: Key) -> Result<()> {
-        match self.locks.acquire(txn, key) {
-            LockOutcome::Granted => Ok(()),
-            LockOutcome::Wait { holder } => {
-                // A wait-for edge `txn -> holder` was just recorded; a *new* cycle can only pass
-                // through that edge, so the edge-rooted search (O(cycle length)) suffices and picks
-                // the exact same youngest victim the full O(V+E) sweep would (debug-asserted inside).
-                if let Some(victim) = self.locks.find_deadlock_victim_for(txn, holder) {
-                    if victim == txn {
-                        self.abort_internal(txn);
-                        return Err(GraphusError::Transaction(format!(
-                            "deadlock: transaction {} aborted (youngest on the wait-for cycle); \
-                             retry",
-                            txn.0
-                        )));
-                    }
-                    // Abort the youngest victim (another transaction), then grant our lock.
-                    self.abort_internal(victim);
-                    // The key may now be free; re-acquire.
-                    return match self.locks.acquire(txn, key) {
-                        LockOutcome::Granted => Ok(()),
-                        LockOutcome::Wait { holder } => {
-                            // The re-acquire still waits (the freed key was immediately taken by a
-                            // third party). This wait fails fast too, so drop the pending wait edge
-                            // `txn -> holder` that `acquire` just recorded; `txn` stays active and
-                            // keeps the locks it already holds, but it is no longer waiting on anyone
-                            // — leaving the edge would let a later wait close a phantom cycle through
-                            // it and abort an innocent transaction (`rmp` #387).
-                            self.locks.clear_waits(txn);
-                            Err(GraphusError::Transaction(format!(
-                                "write-write conflict: key {key} held by transaction {}; retry",
-                                holder.0
-                            )))
-                        }
-                    };
-                }
-                // No deadlock, but the key is held: first-updater-wins, the second writer fails
-                // fast with a retriable error (NFR — readers stay non-blocking regardless).
-                //
-                // Drop the pending wait edge `txn -> holder` that `acquire` just recorded: `txn`
-                // stays active (and keeps any locks it already holds) but is no longer waiting on
-                // `holder`. A stale edge here violates the "wait-for graph is acyclic before each
-                // acquire" invariant and would let a later legitimate wait fabricate a phantom cycle
-                // through it, aborting an innocent transaction (`rmp` #387).
-                self.locks.clear_waits(txn);
-                Err(GraphusError::Transaction(format!(
-                    "write-write conflict: key {key} held by transaction {}; retry",
-                    holder.0
-                )))
-            }
+        if let Some(holder) = self
+            .active
+            .iter()
+            .find(|(t, a)| **t != txn && a.written.contains(&key))
+            .map(|(t, _)| *t)
+        {
+            return Err(GraphusError::Transaction(format!(
+                "write-write conflict: key {key} held by transaction {}; retry",
+                holder.0
+            )));
         }
+        if let Some(a) = self.active.get_mut(&txn) {
+            a.written.insert(key);
+        }
+        Ok(())
     }
 
-    /// Aborts `txn`: discards its store writes, records the abort, releases locks, frees the
+    /// Aborts `txn`: discards its store writes, records the abort, frees the
     /// snapshot, and forgets it from the SSI tracker.
     fn abort_internal(&mut self, txn: TxnId) {
         self.store.abort_writer(txn);
         self.registry.record_abort(txn);
         self.ssi.forget(txn);
-        self.locks.release_all(txn);
         if let Some(a) = self.active.remove(&txn) {
             // Defensive no-op on a bookkeeping inconsistency (SEC-200); abort must never panic.
             let _ = self.oracle.release_begin(a.snapshot.ts);

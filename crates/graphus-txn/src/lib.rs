@@ -9,8 +9,10 @@
 //! - **Serializable Snapshot Isolation** ([`ssi`]): non-blocking SIREAD markers, rw-antidependency
 //!   tracking, and pivot abort with PostgreSQL-style safe retry (`§5.4`). **Snapshot Isolation** is
 //!   a documented weaker opt-in ([`IsolationLevel`]).
-//! - **Write-write conflict handling** ([`lock`]): first-updater-wins with a wait-for-graph
-//!   **deadlock detector** that aborts the youngest on a cycle (`§5.7`).
+//! - **Write-write conflict handling**: first-updater-wins, detected on the entity's own MVCC
+//!   header and aborting the second writer immediately with a retriable serialization failure
+//!   (`§5.7`). There is **no lock table, no waiting and no deadlock detector** — since `rmp` #971 a
+//!   writer never waits, so no wait-for cycle can form.
 //! - **Version GC** ([`gc`]): reclaims versions dead below the oracle's low-water mark (`§5.5`).
 //! - A deterministic **serialization-graph checker** ([`serializability`]) — the Elle/Jepsen-style
 //!   anomaly oracle the manager is validated against.
@@ -58,7 +60,6 @@
 #![forbid(unsafe_code)]
 
 pub mod gc;
-pub mod lock;
 pub mod manager;
 pub mod oracle;
 pub mod serializability;
@@ -68,7 +69,6 @@ pub mod store;
 pub mod visibility;
 
 pub use gc::{GcReport, collect};
-pub use lock::{LockOutcome, LockTable};
 #[cfg(any(test, feature = "test-support"))]
 pub use manager::NoDurability;
 pub use manager::{

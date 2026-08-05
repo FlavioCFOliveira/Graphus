@@ -181,3 +181,43 @@ fn a_challenger_meeting_an_unresolved_tombstone_is_told_to_retry_not_that_it_is_
         assert_retriable(&err, what);
     }
 }
+
+/// The bulk-import twin: `set_node_labels` writes the whole label word at once and is the path
+/// `graphus-bulk` and the server's bulk loader take. It **never** passed through the Cypher seam
+/// where the retired lock table lived, so until `rmp` #971 it had no write-write protection at all.
+///
+/// If the requested set happens to equal the live word another open transaction just wrote in place,
+/// nothing changes, no delta is linked, and the conflict check inside `link_delta` is never reached.
+///
+/// **Non-vacuity.** Remove the `ensure_no_conflicting_writer` at the top of `set_node_labels` and the
+/// second writer returns `Ok(())`, after which the holder's rollback leaves the node with **no**
+/// labels while the committed transaction was told it set them.
+#[test]
+fn a_second_whole_word_label_writer_is_refused_on_the_bulk_import_path() {
+    let mut s = fresh();
+    let a = s.intern_token(Namespace::Label, "A").expect("intern");
+    let b = s.intern_token(Namespace::Label, "B").expect("intern");
+
+    let setup = TxnId(1);
+    s.begin(setup);
+    let (n, _) = s.create_node(setup).expect("node");
+    s.commit(setup).expect("commit setup");
+
+    let holder = TxnId(2);
+    s.begin(holder);
+    s.set_node_labels(holder, n, &[a, b])
+        .expect("the first writer wins");
+
+    let challenger = TxnId(3);
+    s.begin(challenger);
+    let err = s
+        .set_node_labels(challenger, n, &[a, b])
+        .expect_err("the second whole-word writer must be refused, not told it succeeded");
+    assert_retriable(&err, "a conflicting `set_node_labels`");
+
+    s.rollback(holder).expect("the holder aborts");
+    assert!(
+        !s.node_has_label(n, a).expect("read") && !s.node_has_label(n, b).expect("read"),
+        "the aborted holder's labels are gone — which is why the challenger had to be refused"
+    );
+}

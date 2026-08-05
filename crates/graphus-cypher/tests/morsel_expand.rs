@@ -57,7 +57,7 @@ use graphus_cypher::runtime::Row;
 use graphus_cypher::semantics::analyze;
 use graphus_io::MemBlockDevice;
 use graphus_storage::{Namespace, RecordStore};
-use graphus_txn::{LockTable, Snapshot, SsiReadBuffer, SsiTracker};
+use graphus_txn::{Snapshot, SsiReadBuffer, SsiTracker};
 use graphus_wal::{MemLogSink, WalManager};
 
 type Store = RecordStore<MemBlockDevice, MemLogSink>;
@@ -311,7 +311,6 @@ fn run_write(coord: &mut TxnCoordinator<MemBlockDevice, MemLogSink>, src: &str) 
 struct Coordinated {
     store: Rc<RefCell<Store>>,
     ssi: Rc<RefCell<SsiTracker>>,
-    locks: Rc<RefCell<LockTable>>,
     index: Rc<RefCell<IndexSet>>,
     columns: Rc<RefCell<graphus_cypher::column_cache::ColumnCache>>,
     zones: Rc<RefCell<graphus_cypher::zone_map::ZoneMap>>,
@@ -334,7 +333,6 @@ impl Coordinated {
         Self {
             store: Rc::new(RefCell::new(store)),
             ssi: Rc::new(RefCell::new(SsiTracker::new())),
-            locks: Rc::new(RefCell::new(LockTable::new())),
             index,
             columns: Rc::new(RefCell::new(
                 graphus_cypher::column_cache::ColumnCache::new(),
@@ -351,7 +349,6 @@ impl Coordinated {
             txn,
             snapshot,
             Rc::clone(&self.ssi),
-            Rc::clone(&self.locks),
             Rc::clone(&self.index),
             Rc::clone(&self.columns),
             Rc::clone(&self.zones),

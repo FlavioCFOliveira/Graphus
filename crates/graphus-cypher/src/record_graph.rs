@@ -82,10 +82,7 @@ use graphus_index::kinds::DEFAULT_HISTOGRAM_BUCKETS;
 use graphus_index::similarity_score;
 use graphus_io::BlockDevice;
 use graphus_storage::{ConstraintKind, IndexState, MvccHeader, Namespace, RecordStore};
-use graphus_txn::{
-    CommitRegistry, LockOutcome, LockTable, PredicateRead, Snapshot, SsiReadBuffer, SsiTracker,
-    is_visible,
-};
+use graphus_txn::{CommitRegistry, PredicateRead, Snapshot, SsiReadBuffer, SsiTracker, is_visible};
 use graphus_wal::LogSink;
 
 /// Tag bit distinguishing a relationship key from a node key in the shared [`SsiTracker`]
@@ -305,7 +302,6 @@ pub struct RecordStoreGraph<D: BlockDevice, S: LogSink> {
     /// The shared write-lock table, present iff coordinated. A write acquires the entity's lock
     /// first-updater-wins; a conflicting concurrent writer captures a retriable serialization error
     /// (`04 §5.7`, `rmp` task #46). Reads never touch it (they never block, NFR-4).
-    locks: Option<Rc<RefCell<LockTable>>>,
     /// The first storage / deferred-feature error encountered by a read or write, if any. While set,
     /// results are untrustworthy and the transaction should be rolled back (see module docs).
     error: RefCell<Option<GraphusError>>,
@@ -405,7 +401,6 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             // Standalone path: no coordinator ⇒ no tracker to merge into; the guard's appends are
             // no-ops, so reads register no SIREAD markers exactly as before (`rmp` #341).
             read_buffer: ReadBufferGuard::new(txn, None),
-            locks: None,
             error: RefCell::new(None),
             // Standalone path: no coordinator, so no derived index; every access falls back to a
             // full scan (`rmp` task #48). This keeps the standalone `record_store_graph.rs` path
@@ -433,7 +428,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     /// passes the shared `ssi` tracker so this statement's reads/writes contribute SIREAD markers and
     /// rw-edges. Unlike [`begin`](Self::begin) it does **not** begin a transaction and must not be
     /// committed/rolled back through this handle — the coordinator owns that lifecycle.
-    // Eight shared handles wired from the coordinator (store, txn, snapshot, ssi, locks, index,
+    // Seven shared handles wired from the coordinator (store, txn, snapshot, ssi, index,
     // columns, zones) — an internal constructor where threading a struct would only obscure the seam.
     #[allow(clippy::too_many_arguments)]
     pub fn attach(
@@ -441,7 +436,6 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         txn: TxnId,
         snapshot: Snapshot,
         ssi: Rc<RefCell<SsiTracker>>,
-        locks: Rc<RefCell<LockTable>>,
         index: Rc<RefCell<IndexSet>>,
         columns: Rc<RefCell<crate::column_cache::ColumnCache>>,
         zones: Rc<RefCell<crate::zone_map::ZoneMap>>,
@@ -462,7 +456,6 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             registry,
             ssi: Some(ssi),
             read_buffer,
-            locks: Some(locks),
             error: RefCell::new(None),
             // Coordinated path: the shared derived index is present, so label scans and node-property
             // predicates seek candidates from it and re-check them here (`rmp` task #48).
@@ -499,21 +492,28 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     }
 
     /// Records that this transaction wrote `key`: closes rw-antidependency edges with concurrent
-    /// readers in the shared tracker (`04 §5.4`) and acquires the write lock first-updater-wins
-    /// (`04 §5.7`). On a write-write conflict with another in-flight transaction, captures a
-    /// retriable serialization error so the caller rolls this transaction back. A no-op in the
-    /// standalone path (no concurrency).
+    /// readers in the shared tracker (`04 §5.4`). A no-op in the standalone path (no concurrency).
+    ///
+    /// # It no longer detects write-write conflicts, and that is the point (`rmp` #971)
+    ///
+    /// This used to also acquire a first-updater-wins lock from a `LockTable`. The lock table is
+    /// **retired**: write-write conflicts are detected on the entity's own MVCC header, in the
+    /// storage layer, by [`RecordStore::ensure_no_conflicting_writer`] — one mechanism instead of
+    /// two, at the point the write actually happens rather than at this seam.
+    ///
+    /// The move is a strict improvement in coverage, measured cell by cell over the full
+    /// holder × challenger matrix. The lock was keyed on an SSI key announced *here*, so any write
+    /// path that did not announce one was unprotected — `replace_node_properties` (`SET n = {}`) is
+    /// the whole family that never did. The header check is anchored on the entity and is reached by
+    /// every path that mutates it, including the bulk-import path, which never passes through this
+    /// seam at all.
+    ///
+    /// The SSI marker below is **independent** of the retired lock and stays: it closes
+    /// rw-antidependencies with concurrent readers, which conflict detection does not do and never
+    /// did.
     fn note_write(&self, key: u64) {
         if let Some(ssi) = &self.ssi {
             ssi.borrow_mut().record_write(self.txn, key);
-        }
-        if let Some(locks) = &self.locks
-            && let LockOutcome::Wait { holder } = locks.borrow_mut().acquire(self.txn, key)
-        {
-            self.capture(GraphusError::Transaction(format!(
-                "write-write conflict: entity held by transaction {}; retry (serialization failure)",
-                holder.0
-            )));
         }
     }
 
@@ -921,7 +921,6 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             // Standalone snapshot path: no coordinator ⇒ no tracker; the guard's appends are no-ops
             // (reads register no SIREAD markers, exactly as before — `rmp` #341).
             read_buffer: ReadBufferGuard::new(txn, None),
-            locks: None,
             error: RefCell::new(None),
             // Standalone snapshot path: no derived index (the index lives in the coordinator).
             index: None,

@@ -12,9 +12,7 @@
 use std::time::Duration;
 
 use graphus_core::{MAX_TIMESTAMP, TxnId, VersionStamp};
-use graphus_txn::{
-    IsolationLevel, LockOutcome, LockTable, MemVersionedStore, NoDurability, TxnConfig, TxnManager,
-};
+use graphus_txn::{IsolationLevel, MemVersionedStore, NoDurability, TxnConfig, TxnManager};
 
 fn mgr() -> TxnManager<MemVersionedStore, NoDurability> {
     TxnManager::with_durability(MemVersionedStore::new(), NoDurability)
@@ -157,82 +155,10 @@ fn sec198_reaper_does_not_abort_progressing_txn_after_op() {
 // SEC-199 — the deadlock detector is iterative: deep chains do not overflow the stack.
 // ---------------------------------------------------------------------------------------------
 
-/// Regression: SEC-199. A genuine two-transaction lock cycle is still detected (correctness
-/// preserved across the recursive→iterative rewrite).
-#[test]
-fn sec199_detects_real_lock_cycle() {
-    // Regression: SEC-199
-    let mut lt = LockTable::new();
-    let (t1, t2) = (TxnId(1), TxnId(2));
-    assert!(matches!(lt.acquire(t1, 10_u64), LockOutcome::Granted));
-    assert!(matches!(lt.acquire(t2, 20_u64), LockOutcome::Granted));
-    let _ = lt.acquire(t1, 20_u64); // T1 waits on T2
-    let _ = lt.acquire(t2, 10_u64); // T2 waits on T1 -> cycle
-    let victim = lt.find_deadlock_victim();
-    assert!(
-        victim == Some(t1) || victim == Some(t2),
-        "a real deadlock cycle must yield a victim, got {victim:?}"
-    );
-    assert_eq!(
-        victim,
-        Some(t2),
-        "the youngest (largest TxnId) is the victim"
-    );
-}
-
-/// Regression: SEC-199. A **pathologically deep** acyclic wait-for chain is processed without a
-/// stack overflow and correctly reports no deadlock. The previous recursive detector would recurse
-/// to `DEPTH` call frames; the iterative one uses heap-allocated work stacks instead. A depth of
-/// 200k comfortably exceeds the recursion budget the old code would have blown.
-#[test]
-fn sec199_deep_acyclic_chain_does_not_overflow_stack() {
-    // Regression: SEC-199
-    const DEPTH: u64 = 200_000;
-    let mut lt = LockTable::new();
-    // T(i) holds key(i).
-    for i in 0..DEPTH {
-        assert!(matches!(lt.acquire(TxnId(i + 1), i), LockOutcome::Granted));
-    }
-    // T(i) additionally waits on key(i-1) held by T(i-1): a single linear chain, no cycle.
-    for i in 1..DEPTH {
-        let _ = lt.acquire(TxnId(i + 1), i - 1);
-    }
-    // The detector must terminate without a stack overflow and find no victim.
-    assert_eq!(
-        lt.find_deadlock_victim(),
-        None,
-        "a deep acyclic chain has no deadlock victim and must not overflow the stack"
-    );
-}
-
-/// Regression: SEC-199. A deep chain that closes into a cycle at the far end is still detected by
-/// the iterative walk (the back-edge across the whole chain), and the youngest is chosen.
-#[test]
-fn sec199_deep_chain_with_far_cycle_is_detected() {
-    // Regression: SEC-199
-    const DEPTH: u64 = 50_000;
-    let mut lt = LockTable::new();
-    for i in 0..DEPTH {
-        assert!(matches!(lt.acquire(TxnId(i + 1), i), LockOutcome::Granted));
-    }
-    for i in 1..DEPTH {
-        let _ = lt.acquire(TxnId(i + 1), i - 1);
-    }
-    // Close the cycle: the head T(1) waits on the tail's key, held by T(DEPTH).
-    let _ = lt.acquire(TxnId(1), DEPTH - 1);
-    let victim = lt.find_deadlock_victim();
-    assert_eq!(
-        victim,
-        Some(TxnId(DEPTH)),
-        "the closing cycle is detected and the youngest is the victim"
-    );
-}
-
-// ---------------------------------------------------------------------------------------------
-// SEC-200 — the oracle refuses gracefully at exhaustion; release of an unknown ts is a no-op.
-// (The fine-grained oracle behaviour is unit-tested in `src/oracle.rs`; here we confirm the manager
-// surfaces a normal begin path and never panics on the happy path after the hardening.)
-// ---------------------------------------------------------------------------------------------
+// SEC-199 (wait-for-graph deadlock detection) had three tests here — a real cycle, a deep acyclic
+// chain that must not overflow the stack, and a far cycle. All three were removed with the mechanism
+// in `rmp` #971: there is no lock table, a writer never waits, and therefore no wait-for cycle can
+// form. The security property SEC-199 protected is now structural rather than detected.
 
 /// Regression: SEC-200. The happy-path lifecycle (begin → write → commit → re-read) still works
 /// after making the oracle fallible — the recoverable-error refactor introduced no regression.

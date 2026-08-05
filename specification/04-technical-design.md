@@ -673,7 +673,8 @@ the chain head. The lifecycle has five steps:
      can have touched it between the delta link and the rollback.
 
    Task **#971** later consumes this check rather than replacing it: what #971 removes is the lock
-   table and the deadlock detector (§5.7), not the check itself.
+   table and the deadlock detector (§5.7), not the check itself. **#971 is done**: the lock table
+   is gone and this check is the engine's only conflict mechanism.
 
    **The Cypher seam already imposes exactly this rule.** `RecordGraph::set_node_property` calls
    `note_write(node_ssi_key(node.0))` (`crates/graphus-cypher/src/record_graph.rs:5893`), and
@@ -766,7 +767,7 @@ undo area itself. This table is the authoritative list; the decision register
 | 2 | **Label bitmap mutated in place, with the version history held only in memory.** The history is an in-process structure shared by `Arc`; nothing about it is durable, so labels are not versioned on disk. | `crates/graphus-storage/src/label_history.rs:143` | `AddLabel` / `RemoveLabel` deltas on the same durable chain as every other change | **#968** |
 | 3 | **Ad-hoc compare-and-set undo for chain heads and the label word.** A bespoke undo per field, needed because a whole-record pre-image undo would revert words a concurrently-committed writer legitimately owns. | `crates/graphus-storage/src/record.rs:114-123`; `store.rs:2507` (`write_chain_head`), `:2541` (label word) | `AddIncidentEdge` / `RemoveIncidentEdge` deltas naming one incidence entry, so no shared pointer word is ever rewritten by an undo | **#969** (the deltas) + **#970** (the compensations they replace) |
 | 4 | **Physical ARIES rollback.** Undo reverts bytes. This is the origin of the recurring defect family rmp #220 / #172 / #239 / #301 / #578 / #772, each one a case of one transaction's byte-level undo damaging another's committed state. | `RecordStore::rollback`, `crates/graphus-storage/src/store.rs:3644` | Logical rollback: the transaction walks its own deltas and applies them | **#970** |
-| 5 | **Write-lock table plus wait-for-graph deadlock detector.** The only true blocking in the engine, with the cycle detection and lock-wait timeout that blocking requires. | `crates/graphus-txn/src/lock.rs`; driven from `crates/graphus-txn/src/manager.rs:472-552` | Conflict detection on the entity's MVCC header, aborting immediately without waiting (§5.7) | **#971** |
+| 5 | ~~**Write-lock table plus wait-for-graph deadlock detector.**~~ **CLOSED.** | was `crates/graphus-txn/src/lock.rs` | Conflict detection on the entity's MVCC header, aborting immediately without waiting (§5.7) | **#971 — done** |
 
 Two further tasks complete the model rather than replacing a mechanism: **#972** introduces
 `command_id` and statement-level isolation, and the deterministic writer scheduler required by
@@ -1061,11 +1062,31 @@ concurrent writers against one database from a seeded schedule, extending the co
 of `07-dst-simulator.md` §5 to the write path and narrowing the fidelity ceiling named in §5.1 of that
 document. This is a prerequisite of the multi-writer sign-off, not a follow-up to it.
 
-**What is retired, and when.** The write-lock table and the wait-for-graph deadlock detector exist
-today in `crates/graphus-txn/src/lock.rs` (`LockTable`, `find_deadlock_victim`), driven from
-`crates/graphus-txn/src/manager.rs:472-552`. They are removed in task **#971**, which is where the
-header check specified above becomes the engine's only conflict mechanism. Until then, this section
-describes the specified target and the code implements first-updater-wins with deadlock detection.
+**What was retired — CLOSED by task #971.** The write-lock table and the wait-for-graph deadlock
+detector lived in `crates/graphus-txn/src/lock.rs`; the file is gone, and with it the lock-wait
+timeout and the cycle search. The header check specified above is now the engine's **only** conflict
+mechanism.
+
+The substitution was certified cell by cell over the full holder × challenger matrix, run once with
+the lock table and once with its acquisition ablated: 287 of 289 cells identical, and the two that
+differed were **gaps in the lock's coverage that the header check closes**, not the reverse. Two
+findings came out of that exercise and were fixed before the removal, because each one loses a
+committed write once the lock is gone:
+
+* `add_label` / `remove_label` exited early on an idempotent no-op — "the label is already present" —
+  *before* reaching the conflict check. The word they tested is the **live** one, so it already
+  carried a bit an open transaction had written in place: a dirty read reported as a successful
+  write, and the label vanishes when that transaction aborts. The check now runs first. The
+  bulk-import path never passed through the Cypher seam, so it never had even the lock's protection.
+* In the three property-write functions the liveness test ran before the check, so a challenger that
+  met an entity tombstoned by an **unresolved** holder was told `Storage("not in use")` — not
+  retriable at the Bolt seam, not covered by the statement-level rollback, and not even true from
+  that challenger's snapshot. The check now runs first there too.
+
+The `TxnManager` in `crates/graphus-txn/src/manager.rs` is **not** the server's transaction engine —
+the server uses `TxnCoordinator` — and it is kept, without any locking, as the harness the SSI
+certification suites (`tests/isolation.rs`, `tests/elle_no_anomalies.rs`, `tests/ssi_staggered.rs`)
+run against. Its first-updater-wins rule is now expressed directly over its own writer set.
 
 ---
 

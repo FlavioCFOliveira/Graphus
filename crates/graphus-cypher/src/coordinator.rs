@@ -8,7 +8,7 @@
 //! - it owns the one shared [`RecordStore`] (so several transactions read/write the same graph) and
 //!   uses the store itself as the timestamp source (the store became the commit-timestamp oracle in
 //!   `rmp` task #45: [`RecordStore::snapshot_ts`] is the begin snapshot, and a `commit` advances it);
-//! - it owns the shared [`SsiTracker`] and [`LockTable`] from `graphus-txn` — the **complete,
+//! - it owns the shared [`SsiTracker`] from `graphus-txn` — the **complete,
 //!   tested** SSI machine — so each transaction's statements contribute non-blocking SIREAD markers
 //!   and rw-antidependency edges, and writes take a first-updater-wins lock;
 //! - at [`commit`](TxnCoordinator::commit) it runs SSI validation (SERIALIZABLE only) and aborts a
@@ -34,7 +34,7 @@
 //! A transaction spans many statements: [`begin`](TxnCoordinator::begin) once, any number of
 //! [`statement`](TxnCoordinator::statement) executions (the store is borrowed only for each
 //! statement's duration, never for the whole transaction), then [`commit`](TxnCoordinator::commit)
-//! or [`rollback`](TxnCoordinator::rollback). Markers and locks accumulate across statements in the
+//! or [`rollback`](TxnCoordinator::rollback). Markers accumulate across statements in the
 //! coordinator's shared trackers.
 //!
 //! ## Read polarity: this file holds two opposite ones (`rmp` task #905)
@@ -875,8 +875,7 @@ use graphus_storage::{
     VectorIndexEntry, VectorSimilarity,
 };
 use graphus_txn::{
-    CommitRegistry, IsolationLevel, LockTable, PredicateRead, Snapshot, SsiReadBuffer, SsiTracker,
-    is_visible,
+    CommitRegistry, IsolationLevel, PredicateRead, Snapshot, SsiReadBuffer, SsiTracker, is_visible,
 };
 use graphus_wal::LogSink;
 
@@ -1434,7 +1433,6 @@ pub struct TxnCoordinator<D: BlockDevice, S: LogSink> {
     /// The shared SSI dangerous-structure tracker (`04 §5.4`).
     ssi: Rc<RefCell<SsiTracker>>,
     /// The shared first-updater-wins write-lock table (`04 §5.7`).
-    locks: Rc<RefCell<LockTable>>,
     /// The shared derived secondary [`IndexSet`] (`rmp` task #48): the always-present label index
     /// plus any declared node-property indexes. Rebuilt from the store on [`new`](Self::new) and on
     /// [`create_node_property_index`](Self::create_node_property_index), and maintained per write by
@@ -1797,7 +1795,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         Self {
             store,
             ssi: Rc::new(RefCell::new(SsiTracker::new())),
-            locks: Rc::new(RefCell::new(LockTable::new())),
             index,
             // The columnar cache starts with no declared columns; a column is declared (and then
             // captured) via `declare_columnar_cache`. Derived/in-memory, never recovered (`rmp` #329),
@@ -1942,7 +1939,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     // `active`, so it would permanently pin the MVCC GC watermark, the SSI prune
                     // (`rmp` #552) and the WAL reclaim floor. It is also unreapable: the `rmp` #477 age
                     // sweep only sees transactions opened via `begin_at`. `rollback` frees
-                    // `active`/`ssi`/`locks` through `abort`'s cleanup guard even if the undo fails.
+                    // `active`/`ssi` through `abort`'s cleanup guard even if the undo fails.
                     let _ = self.rollback(txn);
                 }
             }
@@ -10419,7 +10416,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     }
 
     /// Borrows a per-statement [`RecordStoreGraph`] seam for the open transaction `txn`: the executor
-    /// runs over it, its reads/writes contribute SIREAD markers / rw-edges / write locks to the
+    /// runs over it, its reads/writes contribute SIREAD markers / rw-edges to the
     /// shared trackers, and it is dropped when the statement ends (the transaction stays open).
     ///
     /// # Errors
@@ -10441,7 +10438,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             txn,
             snapshot,
             Rc::clone(&self.ssi),
-            Rc::clone(&self.locks),
             Rc::clone(&self.index),
             Rc::clone(&self.columns),
             Rc::clone(&self.zones),
@@ -10839,9 +10835,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             .commit_ft_spatial_marker(txn, commit_ts);
 
         // 3) Publish the outcome: record the commit in the SSI tracker (kept for later conflict
-        //    resolution until GC), release write locks, and close the transaction.
+        //    resolution until GC) and close the transaction.
         self.ssi.borrow_mut().record_commit(txn, commit_ts);
-        self.locks.borrow_mut().release_all(txn);
         // Drop this txn's bitmap abort-repair tracking (`rmp` #453, F-IDX-3): on commit the eagerly
         // maintained bitmap already reflects the now-committed writes, so there is nothing to re-derive
         // — only the bookkeeping is freed (a no-op unless a bitmap index was touched).
@@ -10852,7 +10847,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
 
     /// Commit-**PREPARE** (cross-transaction group commit, phase 1, `04 §4.2` / `rmp` #528): runs SSI
     /// validation and the FULL in-memory commit publish of `txn` (assign commit timestamp, publish the
-    /// SSI outcome + full-text/spatial marker, release locks, retire the transaction) EXCEPT the WAL
+    /// SSI outcome + full-text/spatial marker, retire the transaction) EXCEPT the WAL
     /// group-commit `fdatasync`. Every observable effect is identical to [`commit`](Self::commit); only
     /// the durability sync is deferred, so the engine can PREPARE many committers and then issue ONE
     /// [`harden_wal`](Self::harden_wal) covering the whole batch.
@@ -10910,7 +10905,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // time (leaving prepared writers "active" in SSI), that mid-pipeline merge could MISS the structure
         // — so this ordering must not move.
         self.ssi.borrow_mut().record_commit(txn, commit_ts);
-        self.locks.borrow_mut().release_all(txn);
         self.index.borrow_mut().forget_dirty_bitmap_nodes(txn);
         self.active.remove(&txn);
         Ok((commit_ts, commit_lsn))
@@ -11311,7 +11305,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// committed nor been undone.
     ///
     /// This is deliberately the *store's* answer, not this coordinator's. [`abort`](Self::abort) frees
-    /// the coordinator-level footprint (SSI markers, locks, the `active` entry) in a drop guard that
+    /// the coordinator-level footprint (SSI markers, the `active` entry) in a drop guard that
     /// fires even when the durable undo fails or panics (`rmp` #415), because a dangling rw-edge would
     /// false-abort innocent successors. The store's active-set entry is the opposite obligation: it
     /// survives a failed undo precisely so that
@@ -11477,20 +11471,18 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// committed-data concern.
     fn abort(&mut self, txn: TxnId) -> Result<()> {
         /// Drop guard that frees the pure in-memory transaction state. Runs on normal return **and** on
-        /// unwind, so a panicking store undo can never leak the SSI markers, locks, or `active` entry.
+        /// unwind, so a panicking store undo can never leak the SSI markers or the `active` entry.
         struct Cleanup<'a> {
             ssi: &'a RefCell<SsiTracker>,
-            locks: &'a RefCell<LockTable>,
             index: &'a RefCell<IndexSet>,
             active: &'a mut HashMap<TxnId, ActiveTxn>,
             txn: TxnId,
         }
         impl Drop for Cleanup<'_> {
             fn drop(&mut self) {
-                // All four are idempotent no-ops for an already-removed/non-mutator txn, so this is safe
-                // even if the txn was somehow torn down concurrently / twice.
+                // All three are idempotent no-ops for an already-removed/non-mutator txn, so this is
+                // safe even if the txn was somehow torn down concurrently / twice.
                 self.ssi.borrow_mut().forget(self.txn);
-                self.locks.borrow_mut().release_all(self.txn);
                 // Cross-snapshot freshness marker (`rmp` tasks #467, #756): retire `txn` as a
                 // ROLLED-BACK full-text/spatial mutator. The store undo above (or below) does NOT roll
                 // back the in-memory inverted index / grid, so a rolled-back replace/delete may leave a
@@ -11515,7 +11507,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
 
         let cleanup = Cleanup {
             ssi: &self.ssi, // `&Rc<RefCell<_>>` coerces to `&RefCell<_>` via deref.
-            locks: &self.locks,
             index: &self.index,
             active: &mut self.active,
             txn,

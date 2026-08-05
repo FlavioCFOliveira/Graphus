@@ -45,7 +45,7 @@ use graphus_cypher::read_source::rel_ssi_key;
 use graphus_cypher::record_graph::RecordStoreGraph;
 use graphus_io::MemBlockDevice;
 use graphus_storage::{BLOCK_PAYLOAD, IndexState, Namespace, RecordStore};
-use graphus_txn::{LockTable, PredicateRead, Snapshot, SsiReadBuffer, SsiTracker};
+use graphus_txn::{PredicateRead, Snapshot, SsiReadBuffer, SsiTracker};
 use graphus_wal::{MemLogSink, WalManager};
 
 type Store = RecordStore<MemBlockDevice, MemLogSink>;
@@ -252,7 +252,6 @@ fn populate_label_index(store: &Store, index: &Rc<std::cell::RefCell<IndexSet>>)
 struct Coordinated {
     store: Rc<std::cell::RefCell<Store>>,
     ssi: Rc<std::cell::RefCell<SsiTracker>>,
-    locks: Rc<std::cell::RefCell<LockTable>>,
     index: Rc<std::cell::RefCell<IndexSet>>,
     columns: Rc<std::cell::RefCell<graphus_cypher::column_cache::ColumnCache>>,
     zones: Rc<std::cell::RefCell<graphus_cypher::zone_map::ZoneMap>>,
@@ -265,7 +264,6 @@ impl Coordinated {
         Self {
             store: Rc::new(std::cell::RefCell::new(store)),
             ssi: Rc::new(std::cell::RefCell::new(SsiTracker::new())),
-            locks: Rc::new(std::cell::RefCell::new(LockTable::new())),
             index,
             columns: Rc::new(std::cell::RefCell::new(
                 graphus_cypher::column_cache::ColumnCache::new(),
@@ -287,7 +285,6 @@ impl Coordinated {
             txn,
             snapshot,
             Rc::clone(&self.ssi),
-            Rc::clone(&self.locks),
             Rc::clone(&self.index),
             Rc::clone(&self.columns),
             Rc::clone(&self.zones),

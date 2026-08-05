@@ -6167,6 +6167,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///   `04 §2.6` / `05 §9`) if any token id is `>= 63` (the inline bitmap is full and the overflow
     ///   block is the follow-up #39).
     pub fn set_node_labels(&mut self, txn: TxnId, id: u64, label_token_ids: &[u32]) -> Result<()> {
+        // Before the liveness test, and before the whole-word write below can turn into a no-op
+        // (`rmp` #971). This is the path the **bulk-import** loader takes, and it never passed
+        // through the Cypher seam where the retired lock table lived — so until now it had no
+        // write-write protection of any kind. If the requested set happens to equal the live word
+        // another open transaction just wrote in place, `link_label_deltas` finds nothing changed,
+        // links no delta, and the conflict check is never reached: a dirty read reported as a
+        // successful write.
+        self.ensure_no_conflicting_writer(StoreKind::Node, id, txn)?;
         let node = self.read_node(id)?;
         if !Self::is_live_version(node.mvcc) {
             return Err(GraphusError::Storage(format!("node {id} not in use")));
@@ -8976,8 +8984,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // Counts half (`rmp` #866). Order-independent, but NOT because "integer deltas commute" on its
         // own: `add_keyed`/`add_total` saturate at 0, and saturation does not commute. It holds because
         // an intermediate withdrawal can never go negative — each negative unit in a delta is a
-        // distinct entity that transaction removed, and two open transactions cannot have removed the
-        // same entity (write-write conflict detection stops the second). So no ordering of the
+        // distinct entity or label bit that transaction removed, and two open transactions cannot have
+        // removed the same one. Since `rmp` #971 exactly one mechanism makes that true —
+        // `ensure_chain_head_unheld`, reached by every entity-removal path through
+        // `note_entity_deleted` → `link_delta`, and by every label removal through the check
+        // `remove_label` now runs BEFORE its idempotent no-op exit. Before #971 the label half of this
+        // argument rested on that no-op exit rather than on any conflict check, which was an accident
+        // of ordering; naming the mechanism is what makes it an argument. So no ordering of the
         // withdrawals can reach the saturating rail, and the sum over a HashMap's unstable iteration
         // order is deterministic without sorting. That determinism is load-bearing twice over: the
         // value is written into a DURABLE catalog, and an order-dependent one would also break DST
