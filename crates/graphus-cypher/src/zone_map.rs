@@ -158,9 +158,9 @@ pub struct ZoneMap {
     /// Declared columns; a column is summarized iff declared **and** completely scanned once.
     columns: HashMap<(u32, u32), Column>,
     /// Count of zones the most recent skip query pruned (observability / measurement, `rmp` #331).
-    zones_skipped: std::cell::Cell<u64>,
+    zones_skipped: std::sync::atomic::AtomicU64,
     /// Count of zones the most recent skip query kept (had to scan).
-    zones_scanned: std::cell::Cell<u64>,
+    zones_scanned: std::sync::atomic::AtomicU64,
 }
 
 impl ZoneMap {
@@ -355,21 +355,25 @@ impl ZoneMap {
                 skipped += 1;
             }
         }
-        self.zones_skipped.set(skipped);
-        self.zones_scanned.set(scanned);
+        self.zones_skipped
+            .store(skipped, std::sync::atomic::Ordering::Relaxed);
+        self.zones_scanned
+            .store(scanned, std::sync::atomic::Ordering::Relaxed);
         ranges
     }
 
     /// Zones pruned by the most recent `candidate_ranges_*` call (`rmp` #331 measurement).
     #[must_use]
     pub fn zones_skipped(&self) -> u64 {
-        self.zones_skipped.get()
+        self.zones_skipped
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Zones kept (scanned) by the most recent `candidate_ranges_*` call.
     #[must_use]
     pub fn zones_scanned(&self) -> u64 {
-        self.zones_scanned.get()
+        self.zones_scanned
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The number of summarized zones for a column (diagnostics / tests).

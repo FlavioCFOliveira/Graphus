@@ -46,7 +46,7 @@
 //! touches the property chain at all.
 
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use graphus_columnar::{dictionary, integer};
 use graphus_core::Value;
@@ -77,13 +77,13 @@ struct Column {
     /// when the column is re-captured (the new `Column` starts with an empty cell), so a stale decode
     /// can never be served after a write. `RefCell` because [`decode`](Self::decode) runs under the
     /// cache's `&self` snapshot path.
-    decoded: std::cell::RefCell<Option<Rc<DecodedColumn>>>,
+    decoded: std::sync::OnceLock<Arc<DecodedColumn>>,
     /// Memoized `node_id -> row index` lookup map (`rmp` task #375 (c)), shared (`Rc`) with the read
     /// path so a repeated scan of this immutable column re-uses it instead of rebuilding an O(n)
     /// `HashMap` per query (the [`record_graph`](crate::record_graph) hot path previously did exactly
     /// that on every scan). Built once, on the first [`index_map`](Self::index_map); a re-capture
     /// builds a fresh `Column` with an empty cell, so a stale map is never served.
-    index_map: std::cell::RefCell<Option<Rc<HashMap<u64, usize>>>>,
+    index_map: std::sync::OnceLock<Arc<HashMap<u64, usize>>>,
 }
 
 /// The materialized value column plus, for a dictionary-string column, its **codes and dictionary**
@@ -136,8 +136,8 @@ impl Column {
             encoded,
             witnesses,
             generation,
-            decoded: std::cell::RefCell::new(None),
-            index_map: std::cell::RefCell::new(None),
+            decoded: std::sync::OnceLock::new(),
+            index_map: std::sync::OnceLock::new(),
         }
     }
 
@@ -145,17 +145,14 @@ impl Column {
     /// this immutable column (`rmp` task #375 (c)). Later duplicate ids (which the rebuild scan never
     /// produces — node ids are scanned once, ascending) would resolve to the first occurrence; the
     /// arrays are dense and ascending, so the map is a faithful O(1) `id -> index`.
-    fn index_map(&self) -> Rc<HashMap<u64, usize>> {
-        if let Some(m) = self.index_map.borrow().as_ref() {
-            return Rc::clone(m);
-        }
-        let mut map = HashMap::with_capacity(self.ids.len());
-        for (i, &id) in self.ids.iter().enumerate() {
-            map.entry(id).or_insert(i);
-        }
-        let rc = Rc::new(map);
-        *self.index_map.borrow_mut() = Some(Rc::clone(&rc));
-        rc
+    fn index_map(&self) -> Arc<HashMap<u64, usize>> {
+        Arc::clone(self.index_map.get_or_init(|| {
+            let mut map = HashMap::with_capacity(self.ids.len());
+            for (i, &id) in self.ids.iter().enumerate() {
+                map.entry(id).or_insert(i);
+            }
+            Arc::new(map)
+        }))
     }
 
     /// The number of captured rows.
@@ -174,9 +171,9 @@ impl Column {
     /// this immutable column reuses the cached `Rc`, and a re-capture builds a fresh `Column` with an
     /// empty cell, so a stale decode is never served. The integer/raw arms carry no codes (`None`);
     /// only the dictionary arm exposes the fold-on-codes view.
-    fn decode(&self) -> Rc<DecodedColumn> {
-        if let Some(d) = self.decoded.borrow().as_ref() {
-            return Rc::clone(d);
+    fn decode(&self) -> Arc<DecodedColumn> {
+        if let Some(d) = self.decoded.get() {
+            return Arc::clone(d);
         }
         let count = self.ids.len();
         let decoded = match &self.encoded {
@@ -220,9 +217,11 @@ impl Column {
                 string_codes: None,
             },
         };
-        let rc = Rc::new(decoded);
-        *self.decoded.borrow_mut() = Some(Rc::clone(&rc));
-        rc
+        // `get_or_init` rather than a bare store: with the cache reachable from more than one
+        // thread (`rmp` #1009), two scans could race here, and `OnceLock` guarantees that exactly
+        // one of the decodes is published and both callers observe the SAME `Arc`. The loser's work
+        // is discarded, which is correct — the column is immutable, so the two decodes are equal.
+        Arc::clone(self.decoded.get_or_init(|| Arc::new(decoded)))
     }
 }
 
@@ -267,13 +266,13 @@ pub struct ColumnSnapshot {
     /// un-mutated column re-uses it without re-decoding. Read [`DecodedColumn::values`] for the
     /// [`Value`] view (byte-identical to the old `values` field) or
     /// [`DecodedColumn::string_codes`] to fold on codes.
-    pub decoded: Rc<DecodedColumn>,
+    pub decoded: Arc<DecodedColumn>,
     /// The per-row staleness witnesses, index-aligned with [`Self::ids`].
     pub witnesses: Vec<ColumnWitness>,
     /// The memoized `node_id -> row index` map (`rmp` task #375 (c)), shared with the cache: the read
     /// path looks up a candidate's row in O(1) without rebuilding a per-query `HashMap`. Index into
     /// [`Self::ids`] / [`DecodedColumn::values`] / [`Self::witnesses`].
-    pub index_map: Rc<HashMap<u64, usize>>,
+    pub index_map: Arc<HashMap<u64, usize>>,
     /// The column's build generation at the time this snapshot was taken (`rmp` task #375). The read
     /// path keys its per-query lookup map on `(label, prop, generation)`, so an un-mutated column is
     /// served from the prebuilt map and a re-captured column (new generation) forces a rebuild.
@@ -386,37 +385,37 @@ pub struct ColumnCache {
     /// observability counter: a monitor can confirm the accelerator is engaged, and a test asserts the
     /// vectorized path ran (rather than silently declining to the row path, which would make an
     /// equivalence check vacuous). `Cell` because [`snapshot`](Self::snapshot) takes `&self`.
-    scan_hits: std::cell::Cell<u64>,
+    scan_hits: std::sync::atomic::AtomicU64,
     /// The number of candidate nodes whose value was served **from the contiguous column** (a fresh
     /// witness match), i.e. with **zero** property-chain decode (`rmp` #329/#330). The accelerator's
     /// payoff signal.
-    value_hits: std::cell::Cell<u64>,
+    value_hits: std::sync::atomic::AtomicU64,
     /// The number of candidate nodes the columnar path had to read from the **authoritative property
     /// chain** ([`read_node_prop_one`](crate::record_graph)) because the cache was stale / missing for
     /// that node — i.e. the property-record decodes the columnar path still paid. On a fresh column
     /// this is `0`; it rises with the staleness of the cache. The row path, by contrast, pays one such
     /// decode for **every** matched node, so `value_hits` vs `fallback_reads` is the measured decode
     /// reduction.
-    fallback_reads: std::cell::Cell<u64>,
+    fallback_reads: std::sync::atomic::AtomicU64,
     /// The number of times the **parallel** label-property aggregation tier (`rmp` task #352) projected
     /// a snapshot off this cache and folded it across cores. A cheap observability counter, distinct
     /// from [`scan_hits`](Self::scan_hits) (which the serial columnar scan also bumps): a test asserts
     /// the *parallel* path was actually engaged (not silently declined to the serial tier, which would
     /// make a parallel-vs-serial equivalence check vacuous). `Cell` because the projection path takes
     /// `&self`.
-    parallel_scan_hits: std::cell::Cell<u64>,
+    parallel_scan_hits: std::sync::atomic::AtomicU64,
     /// A monotonic counter that stamps each installed column's **build generation** (`rmp` task #375).
     /// Bumped on every mutation that changes a column's contents — a [`set_column`](Self::set_column)
     /// (which replaces a column with freshly-captured rows) and a [`clear`](Self::clear) (which drops
     /// every column ahead of a rebuild). A column's generation therefore changes **iff** it was
     /// re-captured, so the read path can trust a `(label, prop, generation)` key: equal generation ⇒
     /// the column is byte-for-byte the one it last decoded ⇒ its memoized lookup map is still exact.
-    generation: std::cell::Cell<u64>,
+    generation: std::sync::atomic::AtomicU64,
     /// The number of [`snapshot`](Self::snapshot) calls that **re-used the column's memoized decode**
     /// rather than decoding afresh (`rmp` task #375). A test asserts a second scan of an un-mutated
     /// column hits this (proving the decode is paid once), and a monitor reads it to confirm the
     /// late-materialization cache is engaged. `Cell` because [`snapshot`](Self::snapshot) takes `&self`.
-    decode_cache_hits: std::cell::Cell<u64>,
+    decode_cache_hits: std::sync::atomic::AtomicU64,
 }
 
 impl ColumnCache {
@@ -459,7 +458,8 @@ impl ColumnCache {
     /// Advances the build-generation counter (`rmp` task #375). Saturating so a pathologically long-
     /// lived cache can never wrap to a previously-served generation and serve a stale decode.
     fn bump_generation(&self) {
-        self.generation.set(self.generation.get().saturating_add(1));
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Installs the captured rows for `(label_token, prop_key)` (called by the coordinator's rebuild
@@ -470,7 +470,7 @@ impl ColumnCache {
         // freshly-captured rows changes its contents, so any reader's cached decode keyed on the old
         // generation is now stale and must rebuild. The new `Column` starts with an empty decode cell.
         self.bump_generation();
-        let generation = self.generation.get();
+        let generation = self.generation.load(std::sync::atomic::Ordering::Relaxed);
         self.columns
             .insert((label_token, prop_key), Column::build(rows, generation));
     }
@@ -503,14 +503,16 @@ impl ColumnCache {
         let col = self.columns.get(&(label_token, prop_key))?;
         // Count a cache hit: this is reached only when the columnar analytical read path is taken for
         // a cached column (`rmp` #330 observability / test-engagement proof).
-        self.scan_hits.set(self.scan_hits.get() + 1);
+        self.scan_hits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // If this column was already decoded by an earlier scan (and not re-captured since), the
         // memoized `Rc` is reused — the dictionary/integer decode is paid once, not per query
         // (`rmp` task #375). `was_cached` is read *before* `decode()` populates the cell.
-        let was_cached = col.decoded.borrow().is_some();
+        let was_cached = col.decoded.get().is_some();
         let decoded = col.decode();
         if was_cached {
-            self.decode_cache_hits.set(self.decode_cache_hits.get() + 1);
+            self.decode_cache_hits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let witnesses = col.witnesses.clone();
         Some(ColumnSnapshot {
@@ -527,7 +529,8 @@ impl ColumnCache {
     /// Used by tests to prove a second scan of an un-mutated column avoids re-decoding.
     #[must_use]
     pub fn decode_cache_hits(&self) -> u64 {
-        self.decode_cache_hits.get()
+        self.decode_cache_hits
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The number of times the columnar analytical read path served a cached column (`rmp` #330) —
@@ -535,13 +538,14 @@ impl ColumnCache {
     /// by tests to confirm the accelerator was actually engaged.
     #[must_use]
     pub fn scan_hits(&self) -> u64 {
-        self.scan_hits.get()
+        self.scan_hits.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Records that `n` candidate values were served from the contiguous column (zero property-chain
     /// decode) — called by the read path with its per-scan tally (`rmp` #329/#330).
     pub fn record_value_hits(&self, n: u64) {
-        self.value_hits.set(self.value_hits.get() + n);
+        self.value_hits
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Records one engagement of the parallel label-property aggregation tier (`rmp` task #352): a
@@ -550,7 +554,7 @@ impl ColumnCache {
     /// projection.
     pub fn record_parallel_scan_hit(&self) {
         self.parallel_scan_hits
-            .set(self.parallel_scan_hits.get() + 1);
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The number of times the parallel aggregation tier projected a snapshot off this cache
@@ -558,27 +562,30 @@ impl ColumnCache {
     /// actually ran (so an equivalence assertion is not vacuous).
     #[must_use]
     pub fn parallel_scan_hits(&self) -> u64 {
-        self.parallel_scan_hits.get()
+        self.parallel_scan_hits
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Records that `n` candidate values had to be read from the authoritative property chain (a stale
     /// / missing cache entry) — the property-record decodes the columnar path still paid.
     pub fn record_fallback_reads(&self, n: u64) {
-        self.fallback_reads.set(self.fallback_reads.get() + n);
+        self.fallback_reads
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The cumulative count of values served from the contiguous column (zero decode) — the
     /// accelerator's payoff signal (`rmp` #329/#330).
     #[must_use]
     pub fn value_hits(&self) -> u64 {
-        self.value_hits.get()
+        self.value_hits.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The cumulative count of values the columnar path read from the property chain (a stale/missing
     /// cache entry). On a fresh column this stays `0`; the row path would pay one per matched node.
     #[must_use]
     pub fn fallback_reads(&self) -> u64 {
-        self.fallback_reads.get()
+        self.fallback_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -736,7 +743,7 @@ mod tests {
     #[test]
     fn repeated_scan_of_unmutated_column_reuses_decode() {
         // `rmp` #375 (c): a second scan of an un-mutated column must NOT re-decode — it reuses the
-        // memoized `Rc<DecodedColumn>` (proven by the decode-cache-hit counter and by `Rc` identity).
+        // memoized `Arc<DecodedColumn>` (proven by the decode-cache-hit counter and by `Rc` identity).
         let mut cache = ColumnCache::new();
         cache.declare(5, 6);
         cache.set_column(
@@ -753,7 +760,7 @@ mod tests {
         let s2 = cache.snapshot(5, 6).expect("cached");
         assert_eq!(cache.decode_cache_hits(), 1, "second scan reuses decode");
         // Same underlying decode (no re-decode): the snapshots share one `Rc`.
-        assert!(Rc::ptr_eq(&s1.decoded, &s2.decoded));
+        assert!(Arc::ptr_eq(&s1.decoded, &s2.decoded));
         // Generation unchanged across reads.
         assert_eq!(s1.generation, s2.generation);
     }
@@ -776,7 +783,7 @@ mod tests {
         assert!(g1 > g0, "set_column must bump the generation: {g0} -> {g1}");
         let s1 = cache.snapshot(5, 6).expect("cached");
         // Fresh decode (new column), and it reflects the new contents.
-        assert!(!Rc::ptr_eq(&s0.decoded, &s1.decoded));
+        assert!(!Arc::ptr_eq(&s0.decoded, &s1.decoded));
         assert_eq!(s1.values(), &[Value::String("blue".into())]);
         // The fresh column starts cold (no decode-cache hit was charged for `s1`).
         assert_eq!(cache.decode_cache_hits(), 0);

@@ -3,7 +3,7 @@
 //!
 //! Index pages are ordinary logical pages, so this module mirrors the storage core exactly:
 //!
-//! - [`SharedWal`] is the single-threaded shared handle to the [`WalManager`] that both the
+//! - [`SharedWal`] is the shared, `Send + Sync` handle to the [`WalManager`] that both the
 //!   B+-tree (for logging mutations) and the buffer pool's WAL rule (for the write-home ordering
 //!   guarantee, `04 §4.3`) drive over the *same* manager. The same ownership discipline as
 //!   `graphus-storage::wal_rule` applies: the logging borrow is always dropped before any pool
@@ -17,8 +17,7 @@
 //!   re-reads the root from the recovered meta page — there is **no separate index rebuild on
 //!   crash** (`04 §6.4`).
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use graphus_bufpool::WalRule;
 use graphus_bufpool::page;
@@ -27,16 +26,21 @@ use graphus_core::{Lsn, PageId};
 use graphus_io::{BlockDevice, PAGE_SIZE, Page};
 use graphus_wal::{ApplyTarget, LogSink, RecoveryReport, WalManager, recover};
 
-/// A single-threaded shared handle to the [`WalManager`], cloned by both the B+-tree and the
-/// buffer pool's WAL rule so they drive one log (mirrors `graphus-storage::wal_rule::SharedWal`).
+/// A shared, `Send + Sync` handle to the [`WalManager`], cloned by both the B+-tree and the buffer
+/// pool's WAL rule so they drive one log (mirrors `graphus-storage::wal_rule::SharedWal`, which has
+/// been `Arc<Mutex<…>>` since `rmp` #337).
+///
+/// It was `Rc<RefCell<…>>` until `rmp` #1009 (layer 1 of #975) — the last thing keeping
+/// [`IndexSet`](crate::IndexSet), and through it the whole `TxnCoordinator`, off `Send`. The storage
+/// twin had already made this move; this is the unfinished half of it, not a new design.
 pub struct SharedWal<S: LogSink> {
-    inner: Rc<RefCell<WalManager<S>>>,
+    inner: Arc<Mutex<WalManager<S>>>,
 }
 
 impl<S: LogSink> std::fmt::Debug for SharedWal<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SharedWal")
-            .field("strong_count", &Rc::strong_count(&self.inner))
+            .field("strong_count", &Arc::strong_count(&self.inner))
             .finish()
     }
 }
@@ -44,24 +48,32 @@ impl<S: LogSink> std::fmt::Debug for SharedWal<S> {
 impl<S: LogSink> Clone for SharedWal<S> {
     fn clone(&self) -> Self {
         Self {
-            inner: Rc::clone(&self.inner),
+            inner: Arc::clone(&self.inner),
         }
     }
 }
 
 impl<S: LogSink> SharedWal<S> {
-    /// Wraps `wal` in a shared, single-threaded handle.
+    /// Wraps `wal` in a shared, `Send + Sync` handle.
     #[must_use]
     pub fn new(wal: WalManager<S>) -> Self {
         Self {
-            inner: Rc::new(RefCell::new(wal)),
+            inner: Arc::new(Mutex::new(wal)),
         }
     }
 
-    /// Borrows the manager for a closure. The borrow lives only for `f`; callers must not invoke
-    /// buffer-pool write paths from within `f` (which would re-borrow through the WAL rule).
+    /// Borrows the manager for a closure. The lock is held only for `f`; callers must not invoke
+    /// buffer-pool write paths from within `f` (which would re-lock through the WAL rule).
+    ///
+    /// A poisoned lock is recovered rather than re-panicked, mirroring the storage twin and the
+    /// buffer pool's `unwrap_lock`: the manager's durability invariant is upheld by ARIES recovery,
+    /// and wedging every later index WAL access on one prior panic would be an availability failure.
     pub fn with<R>(&self, f: impl FnOnce(&mut WalManager<S>) -> R) -> R {
-        f(&mut self.inner.borrow_mut())
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(&mut guard)
     }
 
     /// Consumes the handle and returns the inner manager.
@@ -69,8 +81,14 @@ impl<S: LogSink> SharedWal<S> {
     /// # Errors
     /// Returns the handle back (as `Err`) if other clones still exist.
     pub fn into_inner(self) -> std::result::Result<WalManager<S>, Self> {
-        Rc::try_unwrap(self.inner)
-            .map_or_else(|inner| Err(Self { inner }), |cell| Ok(cell.into_inner()))
+        Arc::try_unwrap(self.inner).map_or_else(
+            |inner| Err(Self { inner }),
+            |cell| {
+                Ok(cell
+                    .into_inner()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner))
+            },
+        )
     }
 }
 
@@ -84,15 +102,25 @@ impl<S: LogSink> WalRule for SharedWal<S> {
     /// # Panics
     /// Panics (controlled abort) if the durability `fdatasync` fails (`04 §4.9`).
     fn ensure_durable(&mut self, up_to: Lsn) -> Result<()> {
-        // Fail closed on a re-entrant borrow instead of aborting the process (`rmp` #302).
+        // Fail closed on a re-entrant acquisition instead of aborting the process (`rmp` #302).
         //
-        // This handle is single-threaded (`Rc<RefCell<…>>`), so a failed `try_borrow_mut` can only
-        // mean the manager is ALREADY borrowed on this same thread: a caller is holding the WAL latch
+        // A failed `try_lock` means the manager is ALREADY held: a caller is holding the WAL latch
         // (`SharedWal::with`) across a buffer-pool write-back that re-entered this rule — the classic
         // ARIES "don't nest the buffer-pool flush under the log latch" hazard. Under a pathologically
-        // tiny buffer pool an eviction fires *inside* such a window; the old unconditional
-        // `borrow_mut()` turned that into an unrecoverable `RefCell already borrowed` panic (the
-        // `rmp` #302 crash the #242 shrinker hit when probing `pool_pages < 4`).
+        // tiny buffer pool an eviction fires *inside* such a window; the old unconditional borrow
+        // turned that into an unrecoverable `RefCell already borrowed` panic (the `rmp` #302 crash the
+        // #242 shrinker hit when probing `pool_pages < 4`).
+        //
+        // **What `rmp` #1009 changed, and what it did not.** The handle became `Arc<Mutex<…>>` so
+        // `IndexSet` — and through it the whole coordinator — can be `Send`. Under the one engine
+        // thread that still runs today, "already held" can only mean re-entrancy on this same thread,
+        // so the diagnosis below is exact and the behaviour is unchanged. **With N writer threads
+        // (`rmp` #1016) it stops being exact**: a failed `try_lock` will also mean "another thread is
+        // logging right now", which is ordinary contention and must *wait*, not fail the eviction.
+        // Distinguishing the two needs an owner-thread witness on the handle, and that is layer 7's
+        // work — it is recorded here rather than left for whoever next reads a spurious eviction
+        // failure. Failing closed stays the safe direction meanwhile: the page stays resident and
+        // dirty, never stolen ahead of its log record.
         //
         // Returning a clean storage error instead preserves WAL-before-data: the pool's `write_back`
         // propagates this `Err` via `?` BEFORE it writes the page home, so the dirty page is never
@@ -100,12 +128,20 @@ impl<S: LogSink> WalRule for SharedWal<S> {
         // dirty (recoverable, no corruption). The storage core's own live-rollback path already
         // avoids this nesting (it records compensations under the lock and replays them after
         // releasing it, `rmp` #337); this rule is the defence in depth for every other index path.
-        match self.inner.try_borrow_mut() {
+        match self.inner.try_lock() {
             Ok(mut manager) => {
                 manager.ensure_durable(up_to);
                 Ok(())
             }
-            Err(_) => Err(GraphusError::Storage(
+            // A POISONED lock is not re-entrancy: the manager is free, a previous holder panicked.
+            // Recover it, exactly as `with` does — refusing here would wedge every later eviction on
+            // one prior panic, which is the availability failure `rmp` #302 was fixing in the first
+            // place.
+            Err(std::sync::TryLockError::Poisoned(p)) => {
+                p.into_inner().ensure_durable(up_to);
+                Ok(())
+            }
+            Err(std::sync::TryLockError::WouldBlock) => Err(GraphusError::Storage(
                 "WAL re-entrancy: index ensure_durable was called while the WAL manager is already \
                  borrowed (a caller must not hold the WAL latch across a buffer-pool write-back)"
                     .to_owned(),
@@ -117,13 +153,17 @@ impl<S: LogSink> WalRule for SharedWal<S> {
     /// pool can tell before it takes a frame latch whether an index page's `page_lsn` is already
     /// covered — and hoist the `fdatasync` out from under the latch when it is not.
     ///
-    /// A re-entrant borrow yields the conservative `0` ("nothing known durable") rather than an
+    /// A re-entrant acquisition yields the conservative `0` ("nothing known durable") rather than an
     /// error: this method must not fail, and under-reporting only makes the pool hoist and call
     /// [`ensure_durable`](WalRule::ensure_durable), which surfaces the re-entrancy exactly as before.
+    /// A poisoned lock is likewise read through rather than treated as unknown — the frontier it
+    /// holds is still true.
     fn durable_len(&mut self) -> u64 {
-        self.inner
-            .try_borrow()
-            .map_or(0, |manager| manager.durable_len())
+        match self.inner.try_lock() {
+            Ok(manager) => manager.durable_len(),
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner().durable_len(),
+            Err(std::sync::TryLockError::WouldBlock) => 0,
+        }
     }
 }
 
@@ -281,11 +321,17 @@ mod tests {
     /// caller already holds the WAL latch (`with`) — must return a clean `Err`, never abort the
     /// process with a `RefCell already borrowed` panic. This is the exact double-borrow the #242
     /// shrinker provoked at `pool_pages < 4`, modelled here directly on the shared handle.
+    ///
+    /// Re-asserted after `rmp` #1009 turned the handle into `Arc<Mutex<…>>`: the failure mode must
+    /// still be a clean `Err` and not a **hang**. That is the whole hazard of the `RefCell → Mutex`
+    /// move — a `RefCell` double-borrow panics loudly, a non-reentrant `Mutex` re-lock blocks forever
+    /// — and it is why the rule uses `try_lock` rather than `lock`. If this test ever hangs instead of
+    /// failing, that is the regression.
     #[test]
     fn reentrant_ensure_durable_returns_err_not_panic() {
         let wal = WalManager::create(MemLogSink::new()).unwrap();
         let shared = SharedWal::new(wal);
-        let mut rule = shared.clone(); // a second handle over the SAME Rc<RefCell<…>>
+        let mut rule = shared.clone(); // a second handle over the SAME Arc<Mutex<…>>
         // Hold the manager borrowed (as `SharedWal::with` does for the whole closure), then re-enter
         // the WAL rule through the clone — exactly what a pool write-back nested under the latch does.
         let result = shared.with(|_manager| rule.ensure_durable(Lsn(1)));

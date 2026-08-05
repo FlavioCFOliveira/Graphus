@@ -9,7 +9,52 @@ from the source. Host: 16-core Ryzen, NVMe, `perf` blocked (CPU from `/proc/.../
 
 ---
 
+## 0.0 SUPERSEDED IN PART — read this before the numbers below (2026-08-05, `rmp` #975)
+
+**The headline measurement in §0 and §3 is pre-fix and no longer describes the tree.** This document
+was committed in `4359f4a` on 2026-07-03; the fix for the root cause it identifies in §3.3 —
+autocommit bypassing group commit — landed in `7957579` **the same day**, and the pipeline was
+deepened by `rmp` #570 after it. `finish_autocommit` now takes a `commit_batch` and goes through
+`commit_prepare` (`crates/graphus-server/src/engine/exec.rs`), so §3.3's "zero fsync coalescing on the
+most common OLTP shape" is fixed.
+
+Re-measured on the same class of host with the committed harness
+(`cargo test -p graphus-server --release --test pipeline_scaling -- --ignored --nocapture`, 4000
+disjoint auto-commit writes per thread, real `FileBlockDevice` + `FileLogSink`):
+
+| W | commits/s | engine cores | walsync cores | real `fdatasync`/commit |
+|--:|----------:|-------------:|--------------:|------------------------:|
+| 1 | 688.9 | 0.13 | 0.04 | 1.008 |
+| 2 | 780.3 | 0.21 | 0.06 | 0.801 |
+| 4 | 1216.0 | 0.33 | 0.08 | 0.391 |
+| 8 | 1784.3 | 0.45 | 0.08 | 0.155 |
+| 16 | **2092.1** | **0.51** | 0.10 | **0.082** |
+
+Three things changed, and each one moves a conclusion below:
+
+1. **Throughput is no longer flat.** It scales **3.04×** from W=1 to W=16. The "flat ~650–713 across
+   W=1→16" line in §0 and the `file` rows in §3.1 describe the pre-`7957579` tree.
+2. **Durability latency is no longer the ceiling.** Coalescing is working — the real `fdatasync` count
+   falls **12×** per commit, from 1.008 to 0.082 — and the `graphus-walsync` thread sits at 0.10
+   cores. Rank 1 of §5 has been delivered.
+3. **The engine thread is at 0.51 cores at W=16, not 0.21 and not 1.0.** So the remaining ceiling is
+   neither `fdatasync` nor CPU saturation. The residual serialisation is the one §3.3 already named as
+   the next opportunity: a depth-1 commit pipeline against closed-loop writers, each blocking on its
+   own commit round-trip. That is what the single engine thread now costs, and it is what `rmp` #975
+   removes.
+
+**What still stands** is the reasoning, the architecture comparison in §4, and the ranking's *shape*:
+coalescing before cores, and cores before sharding. What does not stand is the claim that adding cores
+cannot lift the number — it could not lift it *while the fsync barrier stood*, and that barrier is
+gone. Treat every `[PROFILE]` figure below as the pre-`7957579` baseline it is, and this table as the
+current one.
+
+---
+
 ## 0. TL;DR
+
+> The bullets in this section are the **2026-07-03 pre-fix** reading. See §0.0 above for the
+> re-measured numbers and which conclusions they change.
 
 - **The common write ceiling is NOT CPU — it is durability latency.** For indexed autocommit OLTP
   writes the single engine thread sits at **0.21 cores (79% idle, blocked in `fdatasync`)** and

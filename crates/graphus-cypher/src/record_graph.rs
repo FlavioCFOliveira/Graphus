@@ -3821,17 +3821,17 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         let snapshot = columns.borrow().snapshot(label_token, prop_key);
         // `(decode, id->index, witnesses)` of the cached column, or empty views when uncached.
         let (cached_decoded, cached_index, cached_witnesses): (
-            std::rc::Rc<crate::column_cache::DecodedColumn>,
-            std::rc::Rc<std::collections::HashMap<u64, usize>>,
+            std::sync::Arc<crate::column_cache::DecodedColumn>,
+            std::sync::Arc<std::collections::HashMap<u64, usize>>,
             Vec<crate::column_cache::ColumnWitness>,
         ) = match snapshot {
             Some(snap) => (snap.decoded, snap.index_map, snap.witnesses),
             None => (
-                std::rc::Rc::new(crate::column_cache::DecodedColumn {
+                std::sync::Arc::new(crate::column_cache::DecodedColumn {
                     values: Vec::new(),
                     string_codes: None,
                 }),
-                std::rc::Rc::new(std::collections::HashMap::new()),
+                std::sync::Arc::new(std::collections::HashMap::new()),
                 Vec::new(),
             ),
         };
