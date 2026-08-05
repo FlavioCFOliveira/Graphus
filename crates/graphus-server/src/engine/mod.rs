@@ -216,7 +216,7 @@ const MAX_DRAIN_COMMANDS: usize = 2 * MAX_COMMIT_BATCH;
 ///
 /// # Why a bare `std::thread`, not `graphus_io::FsyncPool`
 ///
-/// The async runtime is Tokio, but this engine loop is a plain, `!Send` blocking thread that must
+/// The async runtime is Tokio, but this engine loop is a plain, blocking thread that must
 /// `submit`/`wait` synchronously. `graphus_io::FsyncPool` is Tokio-only (its handles are futures),
 /// unusable from here — so this is a `std::thread` with std channels.
 ///
@@ -3243,7 +3243,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// #91). `CREATE` starts a non-blocking background build (returning promptly, no rows); `DROP`
 /// removes the index (no rows); `SHOW INDEXES` lists every declared index with its build state.
 ///
-/// Runs on the engine thread, so it may touch the (`!Send`) coordinator directly. The non-blocking
+/// Runs on the engine thread, so it may touch the coordinator directly. The non-blocking
 /// `CREATE` is what keeps the engine responsive: it enqueues the build and returns, and the loop
 /// drives the build between subsequent commands.
 fn handle_index_ddl<D: BlockDevice, S: LogSink>(
@@ -3494,7 +3494,7 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
 /// The identity [`Plain`](graphus_storage::Plain) codec is used here: the chain bytes are plaintext.
 /// Confidentiality at rest of the *operator backup file* is the catalog's responsibility (it seals
 /// the encoded artifact under the master key when the database is encrypted, rmp #89), keeping the
-/// `!Send` engine thread free of key material.
+/// engine thread free of key material.
 fn handle_backup<D: BlockDevice, S: LogSink>(
     coordinator: &mut TxnCoordinator<D, S>,
 ) -> Result<Vec<u8>> {
@@ -3522,7 +3522,7 @@ fn handle_backup<D: BlockDevice, S: LogSink>(
 /// GC pass (reclaim + freeze, lowering the WAL reclaim floor) followed by a sharp store checkpoint
 /// (flush dirty pages home + physically reclaim the WAL prefix below the floor). Releases RAM, disk
 /// and version slots that previously had no production reclamation trigger (`rmp` #305 / #313 / #315).
-/// Touches the (`!Send`) coordinator directly, between commands, never under a held statement seam.
+/// Touches the coordinator directly, between commands, never under a held statement seam.
 fn handle_checkpoint<D: BlockDevice, S: LogSink>(
     coordinator: &mut TxnCoordinator<D, S>,
     reuse_barrier: Option<u64>,
@@ -3548,7 +3548,7 @@ fn handle_checkpoint<D: BlockDevice, S: LogSink>(
 /// error without side effects if existing data violates it); `DROP` removes it (no rows);
 /// `SHOW CONSTRAINTS` lists every declared constraint.
 ///
-/// Runs on the engine thread, so it may touch the (`!Send`) coordinator directly. Unlike index DDL
+/// Runs on the engine thread, so it may touch the coordinator directly. Unlike index DDL
 /// there is no non-blocking build: a uniqueness constraint's backing index is (re)built synchronously
 /// inside `create_constraint`, which is acceptable because schema DDL is rare and serialised.
 /// Maps a parsed [`CreateConstraint`]'s `(entity, kind)` pair onto the durable
@@ -4321,19 +4321,34 @@ pub struct Engine {
     pub join: std::thread::JoinHandle<()>,
 }
 
-/// Spawns the engine on a dedicated OS thread, **constructing the (`!Send`) coordinator inside that
-/// thread** from the `Send` `build` closure, and returns the running [`Engine`] once startup
-/// succeeds.
+/// Spawns the engine on a dedicated OS thread, constructing the coordinator inside that thread from
+/// the `Send` `build` closure, and returns the running [`Engine`] once startup succeeds.
 ///
 /// ## Why the coordinator is built on the thread
 ///
-/// [`TxnCoordinator`] (and the [`RecordStore`] it owns) are `!Send` — they hold `Rc<RefCell<…>>`
-/// internally — so they **cannot** be moved across the thread boundary. The only sound way to run a
-/// `!Send` value on a dedicated thread is to construct it *there*, from `Send` ingredients (file
-/// paths, config). So `build` runs on the engine thread and does the whole
-/// open-device → recover → open-WAL → `RecordStore::open` → `verify_on_open` → `TxnCoordinator::new`
-/// sequence; its `Result` (which is `Send`) is reported back so `Server::run` can fail startup
-/// cleanly on a corrupt store (`04 §4.6`/§4.8).
+/// **This used to be a necessity and is now a choice — read the difference before relying on it.**
+///
+/// Until `rmp` #1010, [`TxnCoordinator`] was `!Send`: it held its shared state in `Rc<RefCell<…>>`,
+/// so it could not cross a thread boundary at all, and the only sound way to run it on a dedicated
+/// thread was to construct it *there*, from `Send` ingredients (file paths, config). That constraint
+/// is **gone**. The coordinator is `Send` (`crates/graphus-cypher/tests/coordinator_is_send_1010.rs`
+/// asserts it), and [`RecordStore`] has been `Send + Sync` since `rmp` #337.
+///
+/// Build-on-the-thread is retained because it is still the right shape for two reasons that have
+/// nothing to do with `Send`:
+///
+/// 1. **Startup failure reporting.** `build` does the whole
+///    open-device → recover → open-WAL → `RecordStore::open` → `verify_on_open` → `TxnCoordinator::new`
+///    sequence, and its `Result` (which is `Send`) comes back over a channel so `Server::run` can fail
+///    startup cleanly on a corrupt store (`04 §4.6`/§4.8). Moving that work to the caller would hand
+///    the caller a half-open store to unwind instead.
+/// 2. **Ownership stays where the work is**, so no handle to the store escapes to a thread that has
+///    no business flushing it.
+///
+/// What changes for `rmp` #975's later layers: N worker threads no longer need this closure dance.
+/// They can share one `Arc<TxnCoordinator>` built once, here, and that is exactly what layer 7
+/// (`rmp` #1016) does. Nothing in *this* function has to move for that to be possible — the type
+/// boundary it was working around no longer exists.
 ///
 /// The command channel is **bounded** by `engine_queue_capacity` (no unbounded channel on the
 /// request path — `04 §9.3`). The thread name is `graphus-engine`.

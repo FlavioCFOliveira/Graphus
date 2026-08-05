@@ -4,7 +4,7 @@
 //! Slice 3b-i lifted [`RecordStoreGraph`]'s read path into one shared body
 //! ([`graphus_cypher::read_source`]) that both the live seam and the new owned, `Send`
 //! [`ReadOnlyGraph`](graphus_cypher::read_only_graph::ReadOnlyGraph) run — the live seam sourcing store
-//! data from `Rc<RefCell<RecordStore>>`, the reader from an owned
+//! data from `SharedCell<RecordStore>`, the reader from an owned
 //! [`StoreReadView`](graphus_storage::StoreReadView) + [`TokenSnapshot`](graphus_storage::TokenSnapshot)
 //! captured on the engine thread. The whole point is to prove the reader produces **byte-identical**
 //! observable behaviour to the live path — same result, same captured error, **and the same SIREAD
@@ -31,7 +31,7 @@
 //! and the test proves index-arm == scan-fallback (results + markers), exactly the
 //! "index-present == index-absent" guarantee the seam promises.
 
-use std::rc::Rc;
+use graphus_cypher::shared_cell::SharedCell;
 
 use graphus_core::value::temporal::Date;
 use graphus_core::{Crs, Point, TxnId, Value};
@@ -233,7 +233,7 @@ fn populated() -> Fixture {
 /// coordinator's `rebuild_index` does for the label index: insert every node id under each of its
 /// current label tokens. The seek's per-candidate re-check then drops tombstoned / relabelled nodes, so
 /// an over-broad candidate set is always correct.
-fn populate_label_index(store: &Store, index: &Rc<std::cell::RefCell<IndexSet>>) {
+fn populate_label_index(store: &Store, index: &SharedCell<IndexSet>) {
     let node_ids = store.scan_node_ids().expect("scan node ids");
     let mut idx = index.borrow_mut();
     for id in node_ids {
@@ -247,30 +247,26 @@ fn populate_label_index(store: &Store, index: &Rc<std::cell::RefCell<IndexSet>>)
 
 /// A shared coordinated environment over one `Rc`-shared store: the `ssi` tracker (so reads register
 /// SIREAD markers), the lock table, and the populated derived index/column/zone sidecars `attach`
-/// requires. Owning the `Rc<RefCell<Store>>` here is what lets the test build the off-thread
+/// requires. Owning the `SharedCell<Store>` here is what lets the test build the off-thread
 /// `StoreReadView` from the very same store the live seam reads.
 struct Coordinated {
-    store: Rc<std::cell::RefCell<Store>>,
-    ssi: Rc<std::cell::RefCell<SsiTracker>>,
-    index: Rc<std::cell::RefCell<IndexSet>>,
-    columns: Rc<std::cell::RefCell<graphus_cypher::column_cache::ColumnCache>>,
-    zones: Rc<std::cell::RefCell<graphus_cypher::zone_map::ZoneMap>>,
+    store: SharedCell<Store>,
+    ssi: SharedCell<SsiTracker>,
+    index: SharedCell<IndexSet>,
+    columns: SharedCell<graphus_cypher::column_cache::ColumnCache>,
+    zones: SharedCell<graphus_cypher::zone_map::ZoneMap>,
 }
 
 impl Coordinated {
     fn new(store: Store) -> Self {
-        let index = Rc::new(std::cell::RefCell::new(IndexSet::new()));
+        let index = SharedCell::new(IndexSet::new());
         populate_label_index(&store, &index);
         Self {
-            store: Rc::new(std::cell::RefCell::new(store)),
-            ssi: Rc::new(std::cell::RefCell::new(SsiTracker::new())),
+            store: SharedCell::new(store),
+            ssi: SharedCell::new(SsiTracker::new()),
             index,
-            columns: Rc::new(std::cell::RefCell::new(
-                graphus_cypher::column_cache::ColumnCache::new(),
-            )),
-            zones: Rc::new(std::cell::RefCell::new(
-                graphus_cypher::zone_map::ZoneMap::new(),
-            )),
+            columns: SharedCell::new(graphus_cypher::column_cache::ColumnCache::new()),
+            zones: SharedCell::new(graphus_cypher::zone_map::ZoneMap::new()),
         }
     }
 
@@ -281,13 +277,13 @@ impl Coordinated {
         let snapshot = Snapshot::new(txn, ts);
         self.ssi.borrow_mut().register(txn, ts);
         RecordStoreGraph::attach(
-            Rc::clone(&self.store),
+            self.store.clone(),
             txn,
             snapshot,
-            Rc::clone(&self.ssi),
-            Rc::clone(&self.index),
-            Rc::clone(&self.columns),
-            Rc::clone(&self.zones),
+            self.ssi.clone(),
+            self.index.clone(),
+            self.columns.clone(),
+            self.zones.clone(),
             None,
         )
     }
@@ -1495,7 +1491,7 @@ fn off_thread_range_composite_text_seeks_equal_inline_rows_and_ssi_footprint() {
     };
 
     // Each capture is hoisted into a `let` so the engine index's `borrow_mut()` guard is released before
-    // `compare` runs — inside `compare` the inline seam borrows the same `Rc<RefCell<IndexSet>>`.
+    // `compare` runs — inside `compare` the inline seam borrows the same `SharedCell<IndexSet>`.
 
     // RANGE: `age >= 4` → the top four People (ids 4..=7), never the Company.
     let range_cap = coord.index.borrow_mut().capture_node_property_range(

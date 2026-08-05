@@ -177,6 +177,18 @@ scope and are propagated into `00-overview.md` and `01-needs-survey.md`:
 > (c) add the off-thread read executor and the engine routing — reassessed only after (a).
 > **Status:** accepted-as-is for single-node production; tracked as rmp #146.
 >
+> **Note (2026-08-05).** The paragraph above is the state of the engine **as it was read in sprint
+> 19**, and is kept as that record rather than maintained — the same treatment this register gives
+> the 2026-08-02 evidence table. Three of its premises have since been discharged and must not be
+> quoted as current: (a) the `RecordStore` read path moved onto `ConcurrentBufferPool` in rmp #337,
+> and `RecordStore` has asserted `Send + Sync` ever since; (b) snapshot-consistent read views and the
+> off-thread read executor landed in rmp #336/#543, so the prerequisite epic (a)–(c) is complete and
+> `D-read-parallelism` is superseded by `D-multi-writer`; (c) the `Rc<RefCell<…>>` views became
+> `Send` shared cells in rmp #1009/#1010 (layers 1–2 of #975), so the `!Send`/`!Sync` claim is no
+> longer true of any of them. What remains of the single-writer barrier is **not** a `Send` problem
+> at all: it is the `&mut self` exclusivity of the store's write methods, which #975's later layers
+> retire.
+>
 > **`D-perf-deferrals` (rmp #159) — DEFER three higher-risk efficiency optimizations.**
 > Each of the three is deferred for its own reason:
 > 1. **Per-commit catalog write (A1).** `RecordStore::commit` unconditionally rewrites the

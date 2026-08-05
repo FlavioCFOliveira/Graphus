@@ -948,7 +948,7 @@ fn open_wal_sink(wal_file: &Path, keyring: Option<&Keyring>) -> Result<WalSink, 
     }
 }
 
-/// Spawns one database's engine thread for the store in `dir`, constructing the `!Send`
+/// Spawns one database's engine thread for the store in `dir`, constructing the
 /// coordinator **on that thread** (see [`spawn_engine`]). Creates the directory if absent;
 /// opening-or-creating + WAL recovery + `verify_on_open` happen on the engine thread via
 /// [`open_or_create_coordinator`]. Blocking (waits for the engine's startup result); run it off
@@ -974,7 +974,7 @@ fn spawn_db_engine(
     if params.master_key.is_some() {
         crate::key_rotation::recover_pending_rotation(dir, &device_file, &wal_file)?;
     }
-    // The master key (if any) is cloned into the build closure (an `Arc` bump) so the `!Send`
+    // The master key (if any) is cloned into the build closure (an `Arc` bump) so the
     // coordinator can be built on the engine thread from `Send` ingredients (paths + the key).
     let master_key = params.master_key.clone();
     let build = move || {

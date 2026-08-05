@@ -8,7 +8,7 @@
 //! markers that make reads serializable — as the live
 //! [`RecordStoreGraph`](crate::record_graph::RecordStoreGraph), but sourcing store data from an owned,
 //! `Send + Sync` [`StoreReadView`] + [`TokenSnapshot`] instead of an
-//! `Rc<RefCell<RecordStore>>`. It does **not** duplicate the visibility heart: every read delegates to
+//! a live shared handle to the `RecordStore`. It does **not** duplicate the visibility heart: every read delegates to
 //! the single lifted body in [`crate::read_source`] (the same body `RecordStoreGraph`'s read methods now
 //! call), parameterised here over a [`ReadViewSource`] and this graph's own marker/error sink. That is
 //! what guarantees the off-thread reader produces byte-identical results — including which SIREAD
@@ -775,7 +775,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
 
     // Relationship full-text (`rmp` task #663): served off-thread from the captured catalogue via the
     // snapshot-correct relationship scan fallback, byte-identical to the inline store-backed path (never
-    // the coordinator's `!Send` inverted-index postings). A name the catalogue does not know yields
+    // the coordinator's inverted-index postings). A name the catalogue does not know yields
     // `None`, exactly as the inline `IndexSet::fulltext_rel_target(name).is_none()` path does.
     fn fulltext_query_rel(&self, name: &str, search: &str) -> Option<Vec<RelId>> {
         let target = self.fulltext.rel_target(name)?;

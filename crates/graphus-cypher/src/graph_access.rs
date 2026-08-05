@@ -1025,7 +1025,7 @@ pub trait GraphAccess {
     /// phase 1 of #336 — the parallel-read enabler).
     ///
     /// This is the seam through which the executor obtains a [`GraphSnapshot`] it can fold across all
-    /// cores (the live [`RecordStoreGraph`](crate::record_graph::RecordStoreGraph) is `!Send`, so a
+    /// cores (the live [`RecordStoreGraph`](crate::record_graph::RecordStoreGraph) is `!Sync`, so a
     /// heavy aggregation otherwise serializes on one core). The projection happens **here, on the
     /// engine thread, under this statement's already-pinned read snapshot**, so the returned snapshot
     /// is a frozen committed view consistent with every other read in the statement; once returned it

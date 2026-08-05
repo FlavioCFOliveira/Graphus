@@ -3,7 +3,7 @@
 //!
 //! ## Why a second engine driver
 //!
-//! Production runs the (`!Send`) [`graphus_cypher::TxnCoordinator`] on a **dedicated OS thread**
+//! Production runs the [`graphus_cypher::TxnCoordinator`] on a **dedicated OS thread**
 //! reached through a bounded channel ([`super::EngineHandle`] / [`super::spawn_engine`]). That model
 //! is correct for a multi-threaded Tokio server, but it is **non-deterministic**: thread scheduling,
 //! channel wake-ups and the wall clock all leak timing into behaviour, so a run cannot be replayed
@@ -79,8 +79,9 @@ const LOCAL_INDEX_BUILD_BUDGET: usize = usize::MAX;
 
 /// An inline, single-threaded driver of the real Graphus engine for Deterministic Simulation Testing.
 ///
-/// Owns the (`!Send`) [`TxnCoordinator`] directly and dispatches each operation synchronously on the
-/// calling thread. Construct one over the simulated in-memory store with [`Self::in_memory`], or over
+/// Owns the [`TxnCoordinator`] directly and dispatches each operation synchronously on the
+/// calling thread. (The coordinator became `Send` in `rmp` #1010; the single-threaded, inline
+/// dispatch here is a determinism requirement, not a type constraint, and stays either way.) Construct one over the simulated in-memory store with [`Self::in_memory`], or over
 /// an arbitrary already-built coordinator with [`Self::new`].
 pub struct LocalEngine<D: BlockDevice, S: LogSink> {
     /// The real coordinator, in an `Option` so [`Self::shutdown`] can consume it (mirrors the engine

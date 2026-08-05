@@ -2241,7 +2241,7 @@ impl IndexSet {
     /// An owned, `Send + Sync` snapshot of every declared full-text index's covered target, keyed by
     /// index name (`rmp` task #546) — captured on the engine thread into an off-thread read's
     /// [`ReadTaskInputs`](crate::coordinator::ReadTaskInputs) so `db.index.fulltext.queryNodes`
-    /// resolves the index by name on a reader thread without touching this `!Send` [`IndexSet`].
+    /// resolves the index by name on a reader thread without touching this [`IndexSet`].
     ///
     /// Includes **every** registered index (in any build state), matching the no-state-gate resolution
     /// [`fulltext_target`](Self::fulltext_target) gives the inline fast path — so the off-thread

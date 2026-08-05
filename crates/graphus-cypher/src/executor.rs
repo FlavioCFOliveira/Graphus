@@ -10304,7 +10304,7 @@ mod tests {
     /// `nodes_with_label` count (to drive the size gate over/under the threshold) and (b) returns a
     /// non-`None` `project_snapshot` (so a `Some` here is observable). Used to isolate the
     /// thread-count and size gates of [`try_parallel_label_property_aggregate`], which the integration
-    /// tests cannot exercise deterministically (the real `!Send` coordinator cannot enter `install`).
+    /// tests cannot exercise deterministically (the real coordinator's seam cannot enter `install`).
     struct ParallelGateStub {
         inner: MemGraph,
         label_count: u64,

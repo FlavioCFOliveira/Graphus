@@ -72,8 +72,8 @@
 //!   rolled back. This keeps a deferral a hard, surfaced error — never a wrong row.
 
 use std::cell::RefCell;
-use std::rc::Rc;
 
+use crate::shared_cell::SharedCell;
 use graphus_core::error::GraphusError;
 use graphus_core::{CommandId, Timestamp, TxnId, Value};
 use graphus_index::histogram::PropertyHistogram;
@@ -125,14 +125,14 @@ fn rel_ssi_key(id: u64) -> u64 {
 ///   thread with the happens-before the retirement channel establishes. After a take/flush the
 ///   buffer is empty, so the `Drop` merge is a no-op — the two delivery routes never double-apply.
 ///
-/// The guard owns a **clone of the `Rc<RefCell<SsiTracker>>`** (single-threaded; the tracker is only
+/// The guard owns a **clone of the `SharedCell<SsiTracker>`** (single-threaded; the tracker is only
 /// ever touched on the coordinator thread) so the merge does not depend on the rest of the seam, and
 /// so a *partial move* of the seam's `store` (in `commit`/`rollback`/`into_store`) still drops the
 /// guard normally and performs the merge. On the standalone path (`ssi: None`) there is nothing to
 /// merge and every method is a cheap no-op (the buffer stays empty — `note_*` skip the append).
 struct ReadBufferGuard {
     /// The shared tracker to merge into, or `None` on the standalone (un-coordinated) path.
-    ssi: Option<Rc<RefCell<SsiTracker>>>,
+    ssi: Option<SharedCell<SsiTracker>>,
     /// This statement's accumulated SIREAD markers. `None` once taken for off-thread delivery
     /// (`rmp` #336); `Some(empty)` after an explicit flush. `RefCell` because the read seams append
     /// through `&self`.
@@ -141,7 +141,7 @@ struct ReadBufferGuard {
 
 impl ReadBufferGuard {
     /// A guard for transaction `txn`, merging into `ssi` (or a no-op guard when `ssi` is `None`).
-    fn new(txn: TxnId, ssi: Option<Rc<RefCell<SsiTracker>>>) -> Self {
+    fn new(txn: TxnId, ssi: Option<SharedCell<SsiTracker>>) -> Self {
         Self {
             ssi,
             buffer: RefCell::new(Some(SsiReadBuffer::new(txn))),
@@ -288,12 +288,16 @@ fn snapshot_at_current_command<D: BlockDevice, S: LogSink>(
 /// DST device + log used by the executor/crash-recovery tests.
 #[must_use]
 pub struct RecordStoreGraph<D: BlockDevice, S: LogSink> {
-    /// The store, behind a `RefCell` so the `&self` [`GraphAccess`] reads can drive the store's
-    /// `&mut self` methods, and behind an `Rc` so a [`TxnCoordinator`](crate::coordinator::TxnCoordinator)
-    /// can share one store across the concurrent transactions it drives (`rmp` task #46). In the
-    /// standalone single-transaction path the `Rc` is the sole owner, so [`commit`](Self::commit) /
+    /// The store, behind a [`SharedCell`] so the `&self` [`GraphAccess`] reads can drive the store's
+    /// `&mut self` methods, and so a [`TxnCoordinator`](crate::coordinator::TxnCoordinator) can share
+    /// one store across the concurrent transactions it drives (`rmp` task #46). In the standalone
+    /// single-transaction path this handle is the sole owner, so [`commit`](Self::commit) /
     /// [`rollback`](Self::rollback) / [`into_store`](Self::into_store) unwrap it back to an owned store.
-    store: Rc<RefCell<RecordStore<D, S>>>,
+    ///
+    /// `Rc<RefCell<…>>` until `rmp` #1010 — see [`TxnCoordinator`](crate::coordinator::TxnCoordinator)'s
+    /// own `store` field and [`crate::shared_cell`] for why the wrapper is a named type rather than a
+    /// bare `Arc<Mutex<…>>`.
+    store: SharedCell<RecordStore<D, S>>,
     /// The single transaction this query runs in.
     txn: TxnId,
     /// This query's MVCC read snapshot (`04 §5.3`, `rmp` task #45): every read is filtered through
@@ -311,7 +315,7 @@ pub struct RecordStoreGraph<D: BlockDevice, S: LogSink> {
     /// into, so the coordinator can detect a dangerous structure and abort a pivot at commit
     /// (`04 §5.4`, `rmp` task #46). `None` in the standalone single-transaction path (no concurrency,
     /// nothing to track).
-    ssi: Option<Rc<RefCell<SsiTracker>>>,
+    ssi: Option<SharedCell<SsiTracker>>,
     /// This statement's deferred SIREAD-marker buffer + its merge-on-drop guard (`rmp` #341). Reads
     /// (`note_read`/`note_predicate_read`) **append** their markers here instead of recording them
     /// into the shared `ssi` tracker inline; the markers are merged back — sorted+deduped, so
@@ -335,7 +339,7 @@ pub struct RecordStoreGraph<D: BlockDevice, S: LogSink> {
     /// [`begin_at_snapshot`](Self::begin_at_snapshot) path, where every access falls back to a full
     /// scan (the index lives in the coordinator, rebuilt from the store). The index is in-memory and
     /// candidate-only, so it is never committed or recovered — see [`IndexSet`].
-    index: Option<Rc<RefCell<IndexSet>>>,
+    index: Option<SharedCell<IndexSet>>,
     /// While `true`, the per-property constraint check in
     /// [`set_node_property`](Self::set_node_property) is **suppressed** (`rmp` task #99). Set by
     /// [`create_node`](Self::create_node) and [`replace_node_properties`](Self::replace_node_properties)
@@ -354,11 +358,11 @@ pub struct RecordStoreGraph<D: BlockDevice, S: LogSink> {
     /// the *value* (not just a candidate id), so its read-time re-check is what guarantees the
     /// accelerator can never return a wrong row. `None` on the standalone path (every analytical scan
     /// then uses the row path).
-    columns: Option<Rc<RefCell<crate::column_cache::ColumnCache>>>,
+    columns: Option<SharedCell<crate::column_cache::ColumnCache>>,
     /// The shared derived **zone-map data-skipping sidecar** (`rmp` task #331), present only on the
     /// coordinated path. Maintained (widening) on write by [`reindex_node`](Self::reindex_node); the
     /// skip decision it drives is conservative, so it never changes which rows a scan returns.
-    zones: Option<Rc<RefCell<crate::zone_map::ZoneMap>>>,
+    zones: Option<SharedCell<crate::zone_map::ZoneMap>>,
     /// The coordinator's **opt-in** type-bucketed CSR adjacency accelerator (`rmp` task #324, "Win 2"),
     /// present only on the coordinated path **and** only when the
     /// [`csr_adjacency_enabled`](crate::read_source::csr_adjacency_enabled) knob is on. When `Some` and
@@ -369,7 +373,7 @@ pub struct RecordStoreGraph<D: BlockDevice, S: LogSink> {
     /// / [`delete_rel`](GraphAccess::delete_rel)) and then declines (`candidates` returns `None`), so the
     /// chain walk — always store-faithful — takes over until the next rebuild-on-open. `None` on the
     /// standalone path or when the knob is off (zero extra RAM).
-    csr: Option<Rc<RefCell<crate::csr_adjacency::CsrAdjacency>>>,
+    csr: Option<SharedCell<crate::csr_adjacency::CsrAdjacency>>,
     /// The exact side-effect tally for the statement this seam runs (`rmp` task #510), surfaced by
     /// [`write_counters`](GraphAccess::write_counters). Behind a `Cell`-style `RefCell` because the
     /// lowest shared label chokepoint ([`apply_add_labels`](Self::apply_add_labels)) is `&self`; the
@@ -385,8 +389,8 @@ pub struct RecordStoreGraph<D: BlockDevice, S: LogSink> {
     /// and drained by the profiling decorator through
     /// [`take_read_tally`](GraphAccess::take_read_tally) immediately after each seam call, which is
     /// what makes the counts attributable to the operator that made it. A `Cell` accumulator, not an
-    /// atomic: this seam is `!Sync` already (it drives the store through `RefCell`) and only ever runs
-    /// on one thread at a time; see [`ReadTally`](crate::read_source::ReadTally).
+    /// atomic: this seam is `!Sync` already (it drives the store through a `SharedCell` guard) and
+    /// only ever runs on one thread at a time; see [`ReadTally`](crate::read_source::ReadTally).
     tally: read_source::ReadTally,
 }
 
@@ -411,7 +415,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // and own in-flight writes are visible via the owner rule, not the table.
         let registry = store.commit_registry().clone();
         Self {
-            store: Rc::new(RefCell::new(store)),
+            store: SharedCell::new(store),
             txn,
             snapshot,
             registry,
@@ -450,14 +454,14 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     // columns, zones) — an internal constructor where threading a struct would only obscure the seam.
     #[allow(clippy::too_many_arguments)]
     pub fn attach(
-        store: Rc<RefCell<RecordStore<D, S>>>,
+        store: SharedCell<RecordStore<D, S>>,
         txn: TxnId,
         snapshot: Snapshot,
-        ssi: Rc<RefCell<SsiTracker>>,
-        index: Rc<RefCell<IndexSet>>,
-        columns: Rc<RefCell<crate::column_cache::ColumnCache>>,
-        zones: Rc<RefCell<crate::zone_map::ZoneMap>>,
-        csr: Option<Rc<RefCell<crate::csr_adjacency::CsrAdjacency>>>,
+        ssi: SharedCell<SsiTracker>,
+        index: SharedCell<IndexSet>,
+        columns: SharedCell<crate::column_cache::ColumnCache>,
+        zones: SharedCell<crate::zone_map::ZoneMap>,
+        csr: Option<SharedCell<crate::csr_adjacency::CsrAdjacency>>,
     ) -> Self {
         // Snapshot the shared store's Active/Recent Transaction Table for this statement's reads
         // (`rmp` task #49). Cloning at attach is consistent with snapshot isolation: a transaction
@@ -474,7 +478,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             snapshot_at_current_command(&store.borrow(), txn, snapshot.ts).with_view(snapshot.view);
         // The deferred-read buffer merges into the same shared tracker; clone the `Rc` for the guard
         // before `ssi` is moved into the field (`rmp` #341).
-        let read_buffer = ReadBufferGuard::new(txn, Some(Rc::clone(&ssi)));
+        let read_buffer = ReadBufferGuard::new(txn, Some(ssi.clone()));
         Self {
             store,
             txn,
@@ -940,7 +944,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         let registry = store.commit_registry().clone();
         let snapshot = snapshot_at_current_command(&store, txn, ts);
         Self {
-            store: Rc::new(RefCell::new(store)),
+            store: SharedCell::new(store),
             txn,
             snapshot,
             registry,
@@ -1049,9 +1053,37 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         id: u64,
         mvcc: MvccHeader,
     ) -> Result<bool, GraphusError> {
-        self.store
-            .borrow()
-            .entity_visible_at(kind, id, mvcc, self.snapshot, &self.registry)
+        let store = self.store.borrow();
+        self.entity_visible_in(&store, kind, id, mvcc)
+    }
+
+    /// [`entity_visible`](Self::entity_visible) against a store the caller has **already** borrowed.
+    ///
+    /// Exists for the same reason [`label_bitmap_at`](Self::label_bitmap_at) takes its store by
+    /// reference: the candidate-filtering loops
+    /// ([`filter_label_candidates`](Self::filter_label_candidates),
+    /// [`filter_any_label_candidates`](Self::filter_any_label_candidates)) hold one store borrow for
+    /// the whole loop and ask this question once per candidate. Re-borrowing inside that loop was
+    /// harmless under the `Rc<RefCell<…>>` these fields used to be — two *shared* `RefCell` borrows
+    /// nest happily — but it is a **re-entrant lock acquisition** now that they are
+    /// [`SharedCell`](crate::shared_cell::SharedCell), i.e. a deadlock in release and a tripwire panic
+    /// in debug (`rmp` #1010). It was a real one: it deadlocked the NODE KEY / composite-uniqueness
+    /// write path, which runs this loop on every `CREATE` against such a constraint.
+    ///
+    /// Threading the borrow through is the fix rather than shortening the loop's borrow, because the
+    /// loop genuinely wants one acquisition for N candidates — re-acquiring per candidate would be
+    /// correct but would pay a lock round-trip per row on a hot path.
+    ///
+    /// # Errors
+    /// Identical to [`entity_visible`](Self::entity_visible).
+    fn entity_visible_in(
+        &self,
+        store: &RecordStore<D, S>,
+        kind: StoreKind,
+        id: u64,
+        mvcc: MvccHeader,
+    ) -> Result<bool, GraphusError> {
+        store.entity_visible_at(kind, id, mvcc, self.snapshot, &self.registry)
     }
 
     /// The label bitmap node `id` presents to this query's snapshot (`rmp` task #767), given the
@@ -1219,12 +1251,13 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         Ok(store)
     }
 
-    /// Unwraps the sole-owner `Rc` back to an owned store. Panics if the store is still shared — only
-    /// a standalone graph (the single-transaction path) owns its store outright; a coordinated
-    /// statement handle must never end the transaction (the coordinator owns that lifecycle).
-    fn unwrap_store(store: Rc<RefCell<RecordStore<D, S>>>) -> RecordStore<D, S> {
-        match Rc::try_unwrap(store) {
-            Ok(cell) => cell.into_inner(),
+    /// Unwraps the sole-owner [`SharedCell`] back to an owned store. Panics if the store is still
+    /// shared — only a standalone graph (the single-transaction path) owns its store outright; a
+    /// coordinated statement handle must never end the transaction (the coordinator owns that
+    /// lifecycle).
+    fn unwrap_store(store: SharedCell<RecordStore<D, S>>) -> RecordStore<D, S> {
+        match store.into_inner() {
+            Ok(store) => store,
             Err(_) => panic!(
                 "RecordStoreGraph::{{commit,rollback,into_store}} requires sole ownership of the \
                  store; a coordinated statement handle must not end the transaction"
@@ -1545,7 +1578,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             // `View::Old` a node this very statement created is not yet there. A chain read fault
             // FAILS CLOSED here for the same reason the `node` arm above does — never the header's
             // own verdict, which is the answer the chain was consulted to correct.
-            let visible = match self.entity_visible(StoreKind::Node, id, rec.mvcc) {
+            let visible = match self.entity_visible_in(&store, StoreKind::Node, id, rec.mvcc) {
                 Ok(v) => v,
                 Err(e) => {
                     drop(store);
@@ -1642,11 +1675,11 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     /// executor's scan + residual; the write path's `unwrap_or_else(scan)` uniqueness check). It must
     /// NEVER be turned into `Some(vec![])`: a silently empty result is row loss plus a uniqueness bypass
     /// (`rmp` #680/#738) — the very defect this closes.
-    fn rebuilt_trees_serve_reader(&self, index: &Rc<RefCell<IndexSet>>) -> bool {
+    fn rebuilt_trees_serve_reader(&self, index: &SharedCell<IndexSet>) -> bool {
         self.snapshot.ts >= index.borrow().rebuilt_trees_trustworthy_from()
     }
 
-    fn label_candidates(&self, index: &Rc<RefCell<IndexSet>>, label_token: u32) -> Vec<u64> {
+    fn label_candidates(&self, index: &SharedCell<IndexSet>, label_token: u32) -> Vec<u64> {
         if index.borrow().labels_usable() {
             return index.borrow_mut().seek_label(label_token);
         }
@@ -1687,7 +1720,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             };
             examined += 1;
             // Statement-granular existence (`rmp` #972); fail-closed on a chain read fault.
-            let visible = match self.entity_visible(StoreKind::Node, id, rec.mvcc) {
+            let visible = match self.entity_visible_in(&store, StoreKind::Node, id, rec.mvcc) {
                 Ok(v) => v,
                 Err(e) => {
                     drop(store);
@@ -1973,6 +2006,33 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             .collect();
 
         // --- (re)insert the node's current entries into the index (index borrow only) ---
+        //
+        // ### A ~180-line index borrow, and why it is sound (`rmp` #1010)
+        //
+        // The longest borrow in this file. Every statement between here and the `drop(index)` below is
+        // an `index.*` call — an inherent `IndexSet` method reached through this one guard — and eight
+        // of them are `for` headers (`registered_spatial`, `registered_text`, `registered_vector`,
+        // `registered_bitmap`, `registered_composite`, …) whose own guard would nest if their bodies
+        // touched the index by any route other than this binding. They do not: each body reads only
+        // `label_tokens` / `resolved_props`, both materialised **before** the guard was taken, and
+        // writes back through `index`.
+        //
+        // That "materialised before" is the deliberate structure the method's doc comment describes:
+        // the store is read in two earlier scoped borrows that are closed before this one opens, so
+        // `store` and `index` are never held at the same time. Under `Rc<RefCell<…>>` that discipline
+        // bought clarity; under `SharedCell` it also removes any two-cell hold, and with it the lock
+        // ordering question that arises the moment layers 3-7 admit a second writer.
+        //
+        // The borrow is NOT shortened, and should not be: `clear_ft_spatial_dirty()` at the top and
+        // `note_ft_spatial_mutator(self.txn)` at the bottom bracket the whole maintenance pass, and the
+        // dirty flags they scope are global to the `IndexSet` (`rmp` #803). Releasing the guard in the
+        // middle would let another statement's maintenance interleave inside that bracket and be
+        // charged with this one's dirt — exactly the defect #803 closed.
+        //
+        // A note on the audit trail: this site was flagged as "crossing `rollback`". It does not. The
+        // word appears twice below, both times in comments explaining what the *abort path* will later
+        // do with the marker this pass sets (`rollback_ft_spatial_marker`). No rollback is called from
+        // inside this borrow.
         let mut index = index.borrow_mut();
         // `rmp` task #803 — SCOPE THE DIRTY FLAGS TO THIS STATEMENT.
         //
@@ -2257,6 +2317,19 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                 _ => None,
             })
             .collect();
+        // ### A ~110-line index borrow, and why it is sound (`rmp` #1010)
+        //
+        // The relationship twin of `reindex_node`'s borrow, and it is sound for the same reasons: every
+        // statement until the end of the method is an `index.*` call through this guard; the four `for`
+        // headers (`registered_rel_composite`, `registered_spatial_rel`, `registered_vector_rel`, …)
+        // hold their own guard for their whole body, and no body reaches the index by any other route —
+        // each reads only `resolved` / `string_props` / `type_token`, all materialised in store borrows
+        // that were closed before this one opened. So `store` and `index` are never held together.
+        //
+        // Not shortened, for the same #803 reason as `reindex_node`: `clear_ft_spatial_dirty()` here and
+        // `note_ft_spatial_mutator(self.txn)` at the end bracket the whole pass, and those dirty flags
+        // are global to the `IndexSet`. Releasing the guard mid-way would let another statement's
+        // maintenance interleave inside the bracket and inherit this one's dirt.
         let mut index = index.borrow_mut();
         // `rmp` task #803 — scope the dirty flags to this statement; see `reindex_node` for the full
         // rationale. Unconditional here even though the raises below are guarded, because the point is
@@ -4147,6 +4220,25 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
 /// and a captured error to the `error` cell. So calling the lifted body with `self` as the sink
 /// reproduces `RecordStoreGraph`'s prior behaviour exactly — the markers/errors land where they always
 /// did.
+///
+/// # INVARIANT: no method here may touch `self.store` (`rmp` #1010)
+///
+/// Around thirty call sites in this file have the shape
+/// `read_source::…(&LiveSource(&*self.store.borrow()), &self.vis_ctx(), self, …)`. In every one of
+/// them the `store` guard is **still alive** while the lifted body calls back into this sink — the
+/// temporary's lifetime is extended through the `LiveSource` tuple-struct constructor and lasts to the
+/// end of the enclosing block, which is precisely what makes `src` usable at all.
+///
+/// While `store` was `Rc<RefCell<…>>` a sink method that re-borrowed it was harmless: two shared
+/// `RefCell` borrows nest. Now that it is [`SharedCell`](crate::shared_cell::SharedCell) it would be a
+/// **re-entrant acquisition** — a deadlock in release, a tripwire panic in debug — and it would fire at
+/// all thirty sites at once, i.e. across essentially the whole read path.
+///
+/// The invariant holds today because every method below touches only per-statement cells (`tally`,
+/// `read_buffer`, `error`, `counters`), all of which are plain `RefCell`/`Cell` and none of which is
+/// shared with the coordinator. Keep it that way: if a future sink method needs the store, it must take
+/// it as a parameter (the convention [`entity_visible_in`](RecordStoreGraph::entity_visible_in) and
+/// [`label_bitmap_at`](RecordStoreGraph::label_bitmap_at) already follow), never re-borrow the cell.
 impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static> ReadSink
     for RecordStoreGraph<D, S>
 {
@@ -4309,14 +4401,27 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             // The index only accelerates computing the *result*, never narrows the read footprint:
             // keep the conservative SIREAD-every-live-node marker (the deferred index-range marker is
             // #16/#39) so write-skew over a label predicate stays serializable.
-            let src = LiveSource(&*self.store.borrow());
-            read_source::mark_all_live_nodes(&src, self);
             // The authoritative candidate set — from the label index when it is usable, else straight
             // from the store (`rmp` task #733: a failed rebuild leaves the label index EMPTY, and a
             // label scan is what every declined seek degrades to, so trusting it blindly would make the
-            // whole fallback chain return zero rows). It re-borrows the store *shared*, which coexists
-            // with `src`'s outstanding shared borrow.
+            // whole fallback chain return zero rows).
+            //
+            // Computed BEFORE the `LiveSource` guard below, and that order is load-bearing (`rmp`
+            // #1010). Its store-scan arm re-borrows the store *shared*, which coexisted happily with
+            // `src`'s outstanding shared borrow while these fields were `Rc<RefCell<…>>` — two shared
+            // `RefCell` borrows nest — but is a **re-entrant acquisition** now that they are
+            // `SharedCell`, i.e. a deadlock. It would have been a nasty one: the scan arm runs only when
+            // `labels_usable()` is false, i.e. only on the #733 fail-closed path *after* an index
+            // rebuild has already faulted, so the engine would wedge precisely when it was already
+            // degraded, and no ordinary test run would ever reach it.
+            //
+            // Hoisting is footprint-neutral, which is why it is the right fix rather than re-borrowing
+            // inside: `label_candidates` records no SIREAD/predicate marker (its only side effect is
+            // `capture` on a read fault, a different cell), and `mark_all_live_nodes` still runs
+            // unconditionally below — so the SSI footprint is identical either way.
             let candidates = self.label_candidates(index, token_id);
+            let src = LiveSource(&*self.store.borrow());
+            read_source::mark_all_live_nodes(&src, self);
             return read_source::filter_label_candidates(
                 &src,
                 &self.vis_ctx(),

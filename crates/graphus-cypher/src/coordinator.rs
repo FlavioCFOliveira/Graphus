@@ -61,9 +61,9 @@
 //! honest — including every raw read here that is deliberately correct, and why — is
 //! `tests/read_polarity_census.rs`.
 
-use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::rc::Rc;
+
+use crate::shared_cell::SharedCell;
 
 use graphus_core::Value;
 use graphus_core::error::{GraphusError, Result};
@@ -1427,11 +1427,17 @@ const _: () = {
 
 /// Drives concurrent, serializable Cypher transactions over one shared [`RecordStore`] (`04 §5`).
 pub struct TxnCoordinator<D: BlockDevice, S: LogSink> {
-    /// The one shared store, behind `Rc<RefCell<…>>` so each statement seam borrows it for the
+    /// The one shared store, behind a [`SharedCell`] so each statement seam borrows it for the
     /// statement's duration while the transaction stays open across statements.
-    store: Rc<RefCell<RecordStore<D, S>>>,
+    ///
+    /// All six shared fields below use the same wrapper. It was `Rc<RefCell<…>>` until `rmp` #1010,
+    /// which is what kept this whole type `!Send`; [`SharedCell`] is `Arc<Mutex<…>>` with `RefCell`'s
+    /// method names and — in a debug build — `RefCell`'s loud failure on re-entrancy, so the swap keeps
+    /// a double borrow a panic instead of turning it into a silent deadlock. See
+    /// [`crate::shared_cell`].
+    store: SharedCell<RecordStore<D, S>>,
     /// The shared SSI dangerous-structure tracker (`04 §5.4`).
-    ssi: Rc<RefCell<SsiTracker>>,
+    ssi: SharedCell<SsiTracker>,
     /// The shared first-updater-wins write-lock table (`04 §5.7`).
     /// The shared derived secondary [`IndexSet`] (`rmp` task #48): the always-present label index
     /// plus any declared node-property indexes. Rebuilt from the store on [`new`](Self::new) and on
@@ -1439,7 +1445,7 @@ pub struct TxnCoordinator<D: BlockDevice, S: LogSink> {
     /// each statement seam ([`RecordStoreGraph::reindex_node`]). It holds **candidate** ids only
     /// (never visibility-filtered), so it is in-memory and never committed or recovered — a fresh
     /// coordinator over a recovered store rebuilds a store-consistent index by construction.
-    index: Rc<RefCell<IndexSet>>,
+    index: SharedCell<IndexSet>,
     /// The shared derived **columnar value cache** (`rmp` tasks #329 / #330): a contiguous,
     /// graphus-columnar-encoded snapshot of each declared `(label, property)` column, used to
     /// accelerate an analytical property scan / aggregation. Like [`Self::index`] it is derived,
@@ -1450,18 +1456,18 @@ pub struct TxnCoordinator<D: BlockDevice, S: LogSink> {
     /// value against the node's current MVCC header and falls back to the authoritative row read on
     /// any mismatch — so the cache can be arbitrarily stale and never returns a wrong row. Maintenance
     /// is therefore **rebuild-only** (no commit-path hook), exactly the safe design `rmp` #329 mandates.
-    columns: Rc<RefCell<crate::column_cache::ColumnCache>>,
+    columns: SharedCell<crate::column_cache::ColumnCache>,
     /// The derived per-`(label, property)` **zone-map data-skipping sidecar** (`rmp` task #331),
     /// opt-in via [`declare_zone_map`](Self::declare_zone_map), rebuilt from the store and maintained
     /// (widening) on write. In-memory, never persisted/recovered — a re-opened coordinator re-declares.
-    zones: Rc<RefCell<crate::zone_map::ZoneMap>>,
+    zones: SharedCell<crate::zone_map::ZoneMap>,
     /// The **opt-in** type-bucketed CSR adjacency accelerator (`rmp` task #324, "Win 2"). `None` unless
     /// the [`csr_adjacency_enabled`](crate::read_source::csr_adjacency_enabled) knob is on at
     /// [`new`](Self::new) — so when off there is **zero** extra RAM and a typed `expand` behaves exactly
     /// as Win-1-only. When `Some`, it is built from the store on open (like [`Self::index`]) and handed
     /// to each statement seam; it is **marked stale** on the first relationship mutation and consulted
     /// only while fresh, falling back to the chain walk otherwise. Derived, in-memory, never recovered.
-    csr: Option<Rc<RefCell<crate::csr_adjacency::CsrAdjacency>>>,
+    csr: Option<SharedCell<crate::csr_adjacency::CsrAdjacency>>,
     /// Open transactions (begun, not yet committed/rolled back).
     active: HashMap<TxnId, ActiveTxn>,
     /// Monotonic transaction-id source (distinct from the commit timestamp, which the store issues).
@@ -1769,8 +1775,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // undone and an uncommitted record survives (an atomicity violation). Resuming past the
         // recovered high-water keeps ids globally unique across recovery. (`0` for a fresh store.)
         let recovered_txn_hw = store.recovered_txn_hw();
-        let store = Rc::new(RefCell::new(store));
-        let index = Rc::new(RefCell::new(IndexSet::new()));
+        let store = SharedCell::new(store);
+        let index = SharedCell::new(IndexSet::new());
         Self::rebuild_index(&store, &index);
         // Promote any index left `Populating` by an interrupted `rmp` task #91 build: the rebuild
         // above already fully populated it from the recovered store, so it is complete. Minted from the
@@ -1788,21 +1794,21 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let csr = if crate::read_source::csr_adjacency_enabled() {
             let mut adjacency = crate::csr_adjacency::CsrAdjacency::empty();
             adjacency.build_from_store(&store.borrow());
-            Some(Rc::new(RefCell::new(adjacency)))
+            Some(SharedCell::new(adjacency))
         } else {
             None
         };
         Self {
             store,
-            ssi: Rc::new(RefCell::new(SsiTracker::new())),
+            ssi: SharedCell::new(SsiTracker::new()),
             index,
             // The columnar cache starts with no declared columns; a column is declared (and then
             // captured) via `declare_columnar_cache`. Derived/in-memory, never recovered (`rmp` #329),
             // so a fresh coordinator over a recovered store simply re-declares + re-captures as asked.
-            columns: Rc::new(RefCell::new(crate::column_cache::ColumnCache::new())),
+            columns: SharedCell::new(crate::column_cache::ColumnCache::new()),
             // The zone-map data-skipping sidecar (`rmp` #331) likewise starts empty; columns are
             // declared via `declare_zone_map` and rebuilt from the store, derived/never-recovered.
-            zones: Rc::new(RefCell::new(crate::zone_map::ZoneMap::new())),
+            zones: SharedCell::new(crate::zone_map::ZoneMap::new()),
             csr,
             active: HashMap::new(),
             next_txn_id,
@@ -1964,8 +1970,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// leaves the index `Populating` (withheld from the planner, scan-and-filter fallback stays
     /// correct), to be retried on the next open.
     fn promote_recovered_populating_indexes(
-        store: &Rc<RefCell<RecordStore<D, S>>>,
-        index: &Rc<RefCell<IndexSet>>,
+        store: &SharedCell<RecordStore<D, S>>,
+        index: &SharedCell<IndexSet>,
         next_txn_id: u64,
     ) -> u64 {
         // The whole premise of this promotion is the sentence above: *"the rebuild has already fully
@@ -2090,7 +2096,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// (Self::list_node_property_indexes) falls back to the freshly-computed auto-name meanwhile, so
     /// reads stay correct. Startup is allowed to block (the engine is not yet serving).
     fn backfill_recovered_index_names(
-        store: &Rc<RefCell<RecordStore<D, S>>>,
+        store: &SharedCell<RecordStore<D, S>>,
         next_txn_id: u64,
     ) -> u64 {
         // Which declared node-property indexes carry no durable name? (Legacy anonymous indexes.)
@@ -2218,7 +2224,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// (not merely empty) so all consumers degrade to the always-correct store scan (`rmp` task #733).
     /// This matters at run time, not just on open: `rebuild_index` is also driven by index / constraint
     /// DDL.
-    fn rebuild_index(store: &Rc<RefCell<RecordStore<D, S>>>, index: &Rc<RefCell<IndexSet>>) {
+    fn rebuild_index(store: &SharedCell<RecordStore<D, S>>, index: &SharedCell<IndexSet>) {
         // Recover the durable index catalog (`rmp` task #90) into the in-memory set first: this is
         // what makes registration survive a crash. Done before `clear` (which keeps the registered set
         // but wipes entries) so the rebuild scan below indexes the recovered indexes too.
@@ -2848,7 +2854,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ///
     /// Returns [`None`] when the store scan faults — the caller must then **poison** the build (drop it
     /// un-promoted, leaving the index `Populating` and therefore unused), never resume it.
-    fn resnapshot_build(store: &Rc<RefCell<RecordStore<D, S>>>) -> Option<Vec<u64>> {
+    fn resnapshot_build(store: &SharedCell<RecordStore<D, S>>) -> Option<Vec<u64>> {
         // INVARIANT (`rmp` task #733, L1): every incremental build — node-property (`rmp` #91), full-text
         // (#72) and spatial (#98) — walks a snapshot of **node** ids, so one re-snapshot serves all three.
         // The relationship-covering indexes (rel-property, rel-composite, rel-full-text, rel-point,
@@ -2895,13 +2901,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// committed row silently lost to queries. The build that drove the helper reads this flag back and
     /// refuses to publish an index it knows is incomplete (a full rebuild goes
     /// [`IndexSet::fail_closed`]; an incremental build declines to promote itself `Online`).
-    fn note_rebuild_gap(index: &Rc<RefCell<IndexSet>>) {
+    fn note_rebuild_gap(index: &SharedCell<IndexSet>) {
         index.borrow_mut().note_rebuild_gap();
     }
 
     fn index_one_node_composite(
-        store: &Rc<RefCell<RecordStore<D, S>>>,
-        index: &Rc<RefCell<IndexSet>>,
+        store: &SharedCell<RecordStore<D, S>>,
+        index: &SharedCell<IndexSet>,
         id: u64,
         registered: &[(u32, Vec<u32>)],
     ) {
@@ -3019,8 +3025,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// skips that node's entries best-effort: a missing candidate degrades that node to the full-scan
     /// fallback for a reader, never to a wrong row (the candidate-set contract).
     fn index_one_node(
-        store: &Rc<RefCell<RecordStore<D, S>>>,
-        index: &Rc<RefCell<IndexSet>>,
+        store: &SharedCell<RecordStore<D, S>>,
+        index: &SharedCell<IndexSet>,
         id: u64,
         registered: &[(u32, u32)],
     ) {
@@ -3119,8 +3125,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// stale-entry removal is needed. Store and index are borrowed in separate, non-overlapping scopes
     /// (the file's borrow discipline); a read fault skips this relationship best-effort.
     fn index_one_rel(
-        store: &Rc<RefCell<RecordStore<D, S>>>,
-        index: &Rc<RefCell<IndexSet>>,
+        store: &SharedCell<RecordStore<D, S>>,
+        index: &SharedCell<IndexSet>,
         id: u64,
         registered: &[(u32, u32)],
     ) {
@@ -3193,8 +3199,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// skips this relationship best-effort. A relationship missing a covered property (an incomplete
     /// tuple) is left unindexed for that key.
     fn index_one_rel_composite(
-        store: &Rc<RefCell<RecordStore<D, S>>>,
-        index: &Rc<RefCell<IndexSet>>,
+        store: &SharedCell<RecordStore<D, S>>,
+        index: &SharedCell<IndexSet>,
         id: u64,
         registered: &[(u32, Vec<u32>)],
     ) {
@@ -3314,8 +3320,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// skips it best-effort (the candidate-set contract: a missing candidate degrades to the
     /// scan-and-filter fallback for that reader, never a wrong row).
     fn index_one_node_fulltext(
-        store: &Rc<RefCell<RecordStore<D, S>>>,
-        index: &Rc<RefCell<IndexSet>>,
+        store: &SharedCell<RecordStore<D, S>>,
+        index: &SharedCell<IndexSet>,
         id: u64,
     ) {
         // Read the node's label-membership SUPERSET (`rmp` task #904 — the live word unioned with every
@@ -3426,8 +3432,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// best-effort (the candidate-set contract). The store and the index are borrowed in **separate,
     /// non-overlapping** scopes, the load-bearing discipline of this file.
     fn index_one_rel_fulltext(
-        store: &Rc<RefCell<RecordStore<D, S>>>,
-        index: &Rc<RefCell<IndexSet>>,
+        store: &SharedCell<RecordStore<D, S>>,
+        index: &SharedCell<IndexSet>,
         id: u64,
     ) {
         // The relationship's type, covered full-text keys and live property CELLS in one shared borrow
@@ -3535,8 +3541,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// [`index_one_node_spatial`](Self::index_one_node_spatial) for why that is the only safe image
     /// (`rmp` #766/#779).
     fn index_one_rel_spatial(
-        store: &Rc<RefCell<RecordStore<D, S>>>,
-        index: &Rc<RefCell<IndexSet>>,
+        store: &SharedCell<RecordStore<D, S>>,
+        index: &SharedCell<IndexSet>,
         id: u64,
         registered: &[(u32, u32)],
     ) {
@@ -3615,8 +3621,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// [`insert_spatial_point`](IndexSet::insert_spatial_point)) stays last-wins, feeding one current
     /// point per key, so the union engages solely here.
     fn index_one_node_spatial(
-        store: &Rc<RefCell<RecordStore<D, S>>>,
-        index: &Rc<RefCell<IndexSet>>,
+        store: &SharedCell<RecordStore<D, S>>,
+        index: &SharedCell<IndexSet>,
         id: u64,
         registered: &[(u32, u32)],
     ) {
@@ -3696,8 +3702,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// key, so the union engages solely here. The store and index are borrowed in **separate,
     /// non-overlapping** scopes (this file's borrow discipline).
     fn index_one_node_text(
-        store: &Rc<RefCell<RecordStore<D, S>>>,
-        index: &Rc<RefCell<IndexSet>>,
+        store: &SharedCell<RecordStore<D, S>>,
+        index: &SharedCell<IndexSet>,
         id: u64,
         registered: &[(u32, u32)],
     ) {
@@ -3759,8 +3765,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// — so a node not carrying the covered label, or whose covered property is absent / malformed,
     /// contributes nothing. Store and index are borrowed in **separate, non-overlapping** scopes.
     fn index_one_node_vector(
-        store: &Rc<RefCell<RecordStore<D, S>>>,
-        index: &Rc<RefCell<IndexSet>>,
+        store: &SharedCell<RecordStore<D, S>>,
+        index: &SharedCell<IndexSet>,
         id: u64,
         registered: &[(u32, u32)],
     ) {
@@ -3917,8 +3923,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// [`index_one_node_vector`](Self::index_one_node_vector) (its structure mirrors
     /// [`index_one_rel_spatial`](Self::index_one_rel_spatial)).
     fn index_one_rel_vector(
-        store: &Rc<RefCell<RecordStore<D, S>>>,
-        index: &Rc<RefCell<IndexSet>>,
+        store: &SharedCell<RecordStore<D, S>>,
+        index: &SharedCell<IndexSet>,
         id: u64,
         registered: &[(u32, u32)],
     ) {
@@ -4033,8 +4039,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// extra membership is a false positive its consumer's re-check drops, while a node it wrongly
     /// OMITS is a committed row no re-check can ever resurrect.
     fn index_one_node_bitmap(
-        store: &Rc<RefCell<RecordStore<D, S>>>,
-        index: &Rc<RefCell<IndexSet>>,
+        store: &SharedCell<RecordStore<D, S>>,
+        index: &SharedCell<IndexSet>,
         id: u64,
         registered: &[(u32, u32)],
     ) {
@@ -5074,8 +5080,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// surviving candidate is then historical. Serving an older snapshot is not this structure's job —
     /// that reader's witness check fails and it falls back to the authoritative chain read.
     fn rebuild_columns(
-        store: &Rc<RefCell<RecordStore<D, S>>>,
-        columns: &Rc<RefCell<crate::column_cache::ColumnCache>>,
+        store: &SharedCell<RecordStore<D, S>>,
+        columns: &SharedCell<crate::column_cache::ColumnCache>,
     ) {
         // The declared columns, captured before the scan so the cache is not borrowed across a store
         // borrow. Drop all captured data first (keeping declarations) so a rebuild starts clean.
@@ -7771,6 +7777,19 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // duplicate check index-backed (a full rebuild repopulates them from the store). Existence and
         // property-type need no backing index (they are pure per-node predicates).
         let needs_rebuild = {
+            // ### A ~60-line index borrow, and why it is sound (`rmp` #1010)
+            //
+            // Every call inside this block is `idx.*`, i.e. an inherent `IndexSet` method reached
+            // through this one guard; nothing re-acquires `index`, and nothing touches `store`. The
+            // block is deliberately closed before `Self::rebuild_index(&self.store, &self.index)` below,
+            // which acquires **both** cells itself and would re-enter this one if the guard were still
+            // alive — so the `needs_rebuild` binding is not a stylistic choice, it is what keeps the
+            // rebuild outside the borrow.
+            //
+            // A note on the audit trail: this site was flagged as "crossing `scan_rel_ids`". It does
+            // not. `scan_rel_ids` appears only in the `RelKey` arm's *comment*, where it records the
+            // `rmp` #683 defect (an arity-1 REL KEY that registered no index fell through to a full
+            // relationship scan). No scan is called from inside this borrow.
             let mut idx = self.index.borrow_mut();
             idx.register_constraint(name, label_token, prop_keys.clone(), kind, type_descriptor);
             match kind {
@@ -9199,7 +9218,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         if node_keys.is_empty() && rel_keys.is_empty() {
             return false;
         }
-        let resolved = |writers: &[TxnId], store: &Rc<RefCell<RecordStore<D, S>>>| {
+        let resolved = |writers: &[TxnId], store: &SharedCell<RecordStore<D, S>>| {
             let store = store.borrow();
             writers.iter().all(|&w| !store.is_txn_active(w))
         };
@@ -9405,7 +9424,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // `CommitRegistry::outcome` (see `active_writer_holds_newest_covered`). Here the naive predicate
         // would have been dead in the OPPOSITE direction: reporting every writer resolved would make the
         // repair fire immediately and re-park in a loop, re-scanning the store on every command.
-        let resolved = |writers: &[TxnId], store: &Rc<RefCell<RecordStore<D, S>>>| {
+        let resolved = |writers: &[TxnId], store: &SharedCell<RecordStore<D, S>>| {
             let store = store.borrow();
             writers.iter().all(|&w| !store.is_txn_active(w))
         };
@@ -10252,6 +10271,22 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// not from any declared node-property index.
     pub fn catalog(&self) -> IndexCatalog {
         let mut builder = IndexCatalog::builder();
+        // ### A ~160-line store borrow, and why it is sound (`rmp` #1010)
+        //
+        // This guard is alive for the whole method, across a dozen `self.index.borrow…()` acquisitions
+        // and eight `for` headers. Sound because the two are **different cells**: nothing in this
+        // method re-acquires `store`, and every loop body reads only through this guard. `store` is
+        // used exclusively for `token_name` / `composite_indexes` / `rel_composite_indexes`, all
+        // inherent `RecordStore` reads with no path back to the coordinator.
+        //
+        // Two details that would matter if this method were edited:
+        //
+        // * The eight `for … in self.index.borrow…()` headers each hold an *index* guard for their
+        //   whole loop body (a `for`'s iterator expression outlives the loop, unlike an `if`
+        //   condition's temporaries). That is why no body may touch the index — only `store`, as they
+        //   all do today.
+        // * Resolving a token therefore costs no re-acquisition; that is the point of hoisting the
+        //   borrow here rather than taking it per lookup.
         let store = self.store.borrow();
 
         // The label (token-lookup) index, but only while it may be trusted: a rebuild whose store scan
@@ -10426,7 +10461,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     #[must_use]
     pub fn statistics(&self) -> CoordinatorStatistics<D, S> {
         CoordinatorStatistics {
-            store: Rc::clone(&self.store),
+            store: self.store.clone(),
         }
     }
 
@@ -10449,14 +10484,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             GraphusError::Transaction(format!("statement in inactive txn {}", txn.0))
         })?;
         Ok(RecordStoreGraph::attach(
-            Rc::clone(&self.store),
+            self.store.clone(),
             txn,
             snapshot,
-            Rc::clone(&self.ssi),
-            Rc::clone(&self.index),
-            Rc::clone(&self.columns),
-            Rc::clone(&self.zones),
-            self.csr.as_ref().map(Rc::clone),
+            self.ssi.clone(),
+            self.index.clone(),
+            self.columns.clone(),
+            self.zones.clone(),
+            self.csr.clone(),
         ))
     }
 
@@ -10602,6 +10637,23 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // Resolve names → tokens through the live store, exactly as the inline seek does. A label or
         // property key that was never interned cannot match any node, so it simply yields no request
         // (the reader misses and declines to its scan, which returns the same empty result).
+        //
+        // ### An ~85-line store borrow, and why it is sound (`rmp` #1010)
+        //
+        // The guard covers nine `filter_map` passes and is released by the explicit `drop(store)` below
+        // before the index is acquired — so `store` and `index` are never held together here, even
+        // though they are different cells and holding both would be legal.
+        //
+        // Sound because nothing inside re-acquires `store`: every closure calls only `store.token_id`,
+        // an inherent `RecordStore` read, through this guard. The early returns above all happen
+        // *before* the guard is taken, so no path leaves it held across a `?`; the passes themselves are
+        // infallible (`filter_map`, never `?`), which is what keeps the `drop` reachable on every path.
+        //
+        // The `drop` is load-bearing, not stylistic: the guard would otherwise live to the end of the
+        // function and overlap the `index` acquisition. That overlap is harmless *today* (two different
+        // cells, one thread), but holding two coordinator cells at once is the raw material of a
+        // lock-order cycle the moment layers 3-7 admit a second writer. Keeping the acquisitions
+        // disjoint costs nothing and removes the question.
         let store = self.store.borrow();
         let eq_requests: Vec<(u32, u32, Value)> = eq_seeks
             .into_iter()
@@ -11118,6 +11170,32 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let watermark = self.gc_watermark();
         self.next_txn_id += 1;
         let gc_txn = TxnId(self.next_txn_id);
+        // ### The longest store borrow in the coordinator, and why it is sound (`rmp` #1010)
+        //
+        // This one guard spans `begin` → `gc`/`gc_freeze_only` → (`rollback` |`commit`), i.e. an
+        // `O(store)` sweep **and** a durability barrier (`fdatasync`). It is the widest hold of the six
+        // this task audited, so it is the one worth stating explicitly.
+        //
+        // **Why no re-entrancy is possible.** Everything called inside is an inherent method on
+        // `RecordStore`, reached through the guard. `RecordStore` holds no handle to this coordinator
+        // and therefore has no path back to `self.store` — it cannot re-enter the cell no matter how
+        // deep the sweep goes. The buffer-pool eviction a sweep may trigger takes the *pool's* locks
+        // and, through the WAL rule, `graphus_storage::wal_rule::SharedWal` — a different `Arc<Mutex>`
+        // over a different value, whose own lock-ordering discipline is documented there. Nothing on
+        // that path re-acquires this cell. `gc_watermark()` above borrows the store too, but as a
+        // temporary in a preceding statement, so it is released before this guard is taken.
+        //
+        // **Why it is not shortened.** The three calls are one atomic maintenance transaction: the pass
+        // must commit (or roll back) on the very store image it swept. Releasing the guard between them
+        // would, the moment a second writer exists, let another transaction interleave between the
+        // sweep and its commit — trading a documented hold for a correctness hole.
+        //
+        // **What it costs, and when that starts to matter.** Holding a lock across an `fdatasync` is
+        // exactly the convoy shape `graphus_core::latch` exists to prevent elsewhere. It is free today
+        // (one thread, so the lock is uncontended) and stays free while the engine is single-writer.
+        // The moment layers 3-7 admit a second writer, this hold becomes a serialisation point and must
+        // be revisited — the fix will be the same one `rmp` #974/#993 applied to the pool: hoist the
+        // barrier out of the locked region, not shorten the transaction.
         let mut store = self.store.borrow_mut();
         store.begin(gc_txn);
         let gc_result = if freeze_only {
@@ -11397,8 +11475,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// [`statement`](Self::statement) has not been dropped).
     #[must_use]
     pub fn into_store(self) -> RecordStore<D, S> {
-        match Rc::try_unwrap(self.store) {
-            Ok(cell) => cell.into_inner(),
+        match self.store.into_inner() {
+            Ok(store) => store,
             Err(_) => panic!("into_store requires that no statement seam still shares the store"),
         }
     }
@@ -11502,8 +11580,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         /// Drop guard that frees the pure in-memory transaction state. Runs on normal return **and** on
         /// unwind, so a panicking store undo can never leak the SSI markers or the `active` entry.
         struct Cleanup<'a> {
-            ssi: &'a RefCell<SsiTracker>,
-            index: &'a RefCell<IndexSet>,
+            ssi: &'a SharedCell<SsiTracker>,
+            index: &'a SharedCell<IndexSet>,
             active: &'a mut HashMap<TxnId, ActiveTxn>,
             txn: TxnId,
         }
@@ -11535,7 +11613,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let dirty_bitmap_nodes = self.index.borrow_mut().take_dirty_bitmap_nodes(txn);
 
         let cleanup = Cleanup {
-            ssi: &self.ssi, // `&Rc<RefCell<_>>` coerces to `&RefCell<_>` via deref.
+            ssi: &self.ssi,
             index: &self.index,
             active: &mut self.active,
             txn,
@@ -11630,7 +11708,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
 /// drift.
 pub struct CoordinatorStatistics<D: BlockDevice, S: LogSink> {
     /// A clone of the coordinator's shared store handle (see the borrow-discipline doc above).
-    store: Rc<RefCell<RecordStore<D, S>>>,
+    store: SharedCell<RecordStore<D, S>>,
 }
 
 impl<D: BlockDevice, S: LogSink> CoordinatorStatistics<D, S> {
@@ -12436,19 +12514,21 @@ mod index_wipe_tests {
         }
 
         // The index went `Online`, so the planner routes a real seek at it...
+        // Both tokens are resolved in ONE store borrow that ends before the index is consulted
+        // (`rmp` #1010): two `store.borrow()` temporaries as sibling arguments would both stay live
+        // to the end of the statement, which a `RefCell` permits and a `Mutex` cannot.
+        let (label_token, prop_key) = {
+            let store = coord.store.borrow();
+            (
+                store.token_id(Namespace::Label, "Article").expect("label"),
+                store.token_id(Namespace::PropKey, "slug").expect("prop"),
+            )
+        };
         assert_eq!(
-            coord.index.borrow().node_property_state(
-                coord
-                    .store
-                    .borrow()
-                    .token_id(Namespace::Label, "Article")
-                    .expect("label"),
-                coord
-                    .store
-                    .borrow()
-                    .token_id(Namespace::PropKey, "slug")
-                    .expect("prop"),
-            ),
+            coord
+                .index
+                .borrow()
+                .node_property_state(label_token, prop_key),
             Some(IndexState::Online),
             "the build must complete and promote"
         );

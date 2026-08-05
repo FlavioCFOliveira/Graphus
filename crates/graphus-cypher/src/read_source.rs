@@ -3,8 +3,8 @@
 //!
 //! # The problem this solves
 //!
-//! [`RecordStoreGraph`](crate::record_graph::RecordStoreGraph) is the live, `!Send`, transaction-scoped
-//! [`GraphAccess`](crate::graph_access::GraphAccess) over an `Rc<RefCell<RecordStore>>`. Slice 3 moves
+//! [`RecordStoreGraph`](crate::record_graph::RecordStoreGraph) is the live, `!Sync`, transaction-scoped
+//! [`GraphAccess`](crate::graph_access::GraphAccess) over a shared, mutex-guarded `RecordStore`. Slice 3 moves
 //! OLTP **reads** onto reader threads, where the store cannot be `&`-aliased; Slice 3a gave us the owned,
 //! `Send + Sync` [`StoreReadView`] (the decode surface over
 //! `(Arc<pool>, MetaSnapshot)`) plus the [`TokenSnapshot`] (the
@@ -502,7 +502,7 @@ impl<D: BlockDevice, S: LogSink> StoreReadSource for ReadViewSource<'_, D, S> {
 /// # Why a memo of results and not a snapshot of the index
 ///
 /// The obvious move — share the [`IndexSet`](crate::index_set::IndexSet) with the reader — does not
-/// work, and not because of `Rc<RefCell<…>>`: **every read method of the backing `BTree` takes
+/// work, and not because of the shared-cell wrapper: **every read method of the backing `BTree` takes
 /// `&mut self`** (`lookup`, `range`, `scan_all`, and hence `PropertyIndex::seek_eq`), because the
 /// single-threaded `BufferPool` mutates frames and pin counts on fetch. A `Send + Sync` index shared
 /// behind `&self` would therefore still be unusable, and making the pool concurrent is the `rmp` #721
@@ -3148,7 +3148,7 @@ pub struct FulltextRelTarget {
 /// An owned, `Send + Sync` snapshot of the coordinator's declared full-text indexes (`rmp` tasks #546,
 /// #663), keyed by index name — captured on the engine thread and moved into an off-thread read so a
 /// `CALL db.index.fulltext.queryNodes(name, …)` / `…queryRelationships(name, …)` resolves the index by
-/// name without touching the coordinator's `!Send` [`IndexSet`](crate::index_set::IndexSet).
+/// name without touching the coordinator's [`IndexSet`](crate::index_set::IndexSet).
 ///
 /// It carries the index **catalogue** (name → covered `(labels/types, props, analyzer)`), **not** the
 /// inverted-index postings: the off-thread full-text query recomputes its matches directly from the

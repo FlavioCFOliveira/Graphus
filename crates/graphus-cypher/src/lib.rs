@@ -147,6 +147,7 @@ pub mod result;
 pub mod runtime;
 pub mod schema_error;
 pub mod semantics;
+pub mod shared_cell;
 pub mod snapshot;
 pub(crate) mod spatial_fns;
 pub mod statement_clock;

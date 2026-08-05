@@ -5,7 +5,7 @@
 //!
 //! ## Why a pool, and the dispatch duality
 //!
-//! Production runs the (`!Send`) [`graphus_cypher::TxnCoordinator`] on **one** engine thread reached
+//! Production runs the [`graphus_cypher::TxnCoordinator`] on **one** engine thread reached
 //! through a bounded channel ([`super::EngineHandle`]). Reads serialised on that thread in v1; this
 //! module breaks that serialisation for read-only statements by:
 //!

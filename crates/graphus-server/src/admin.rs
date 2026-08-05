@@ -4663,7 +4663,7 @@ fn show_procedures() -> AdminResult {
 ///
 /// `reader_safe` is a **threading** property (off-thread-reader-pool eligibility = no writes AND
 /// thread-safe), NOT the access mode: `db.awaitIndex` and the `db.index.vector.query*` procedures
-/// (`rmp` #671) are read procedures that run **inline** (the live HNSW / durable catalog is `!Send`),
+/// (`rmp` #671) are read procedures that run **inline** (the live HNSW / durable catalog is `!Sync`),
 /// so keying `mode` on `reader_safe` alone would mislabel them `WRITE`. Every reader-safe procedure is
 /// unambiguously `READ`; among the non-reader-safe ones only the mutating GDS surface writes.
 fn procedure_mode(name: &str, reader_safe: bool) -> &'static str {

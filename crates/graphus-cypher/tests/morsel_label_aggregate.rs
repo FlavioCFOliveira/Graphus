@@ -24,8 +24,7 @@
 //! Plus a focused guard that a restricted RBAC principal **declines** the morsel path (`None`) so it
 //! always runs serial, and that the knob (`morsel_threads`) gates the executor tier.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use graphus_cypher::shared_cell::SharedCell;
 
 use graphus_core::{TxnId, Value};
 use graphus_cypher::authorized_graph::{AuthorizedGraph, PrivilegeOracle};
@@ -54,16 +53,16 @@ fn fresh() -> Store {
 /// SIREAD markers), the lock table, and the populated derived index/column/zone sidecars `attach`
 /// requires. Mirrors `tests/read_only_graph_equivalence.rs::Coordinated`.
 struct Coordinated {
-    store: Rc<RefCell<Store>>,
-    ssi: Rc<RefCell<SsiTracker>>,
-    index: Rc<RefCell<IndexSet>>,
-    columns: Rc<RefCell<graphus_cypher::column_cache::ColumnCache>>,
-    zones: Rc<RefCell<graphus_cypher::zone_map::ZoneMap>>,
+    store: SharedCell<Store>,
+    ssi: SharedCell<SsiTracker>,
+    index: SharedCell<IndexSet>,
+    columns: SharedCell<graphus_cypher::column_cache::ColumnCache>,
+    zones: SharedCell<graphus_cypher::zone_map::ZoneMap>,
 }
 
 impl Coordinated {
     fn new(store: Store) -> Self {
-        let index = Rc::new(RefCell::new(IndexSet::new()));
+        let index = SharedCell::new(IndexSet::new());
         // Populate the label index from the committed nodes (so `morsel_label_scan` / `scan_nodes_by_
         // label` take the index arm, the coordinated path the morsel seam requires).
         {
@@ -78,13 +77,11 @@ impl Coordinated {
             }
         }
         Self {
-            store: Rc::new(RefCell::new(store)),
-            ssi: Rc::new(RefCell::new(SsiTracker::new())),
+            store: SharedCell::new(store),
+            ssi: SharedCell::new(SsiTracker::new()),
             index,
-            columns: Rc::new(RefCell::new(
-                graphus_cypher::column_cache::ColumnCache::new(),
-            )),
-            zones: Rc::new(RefCell::new(graphus_cypher::zone_map::ZoneMap::new())),
+            columns: SharedCell::new(graphus_cypher::column_cache::ColumnCache::new()),
+            zones: SharedCell::new(graphus_cypher::zone_map::ZoneMap::new()),
         }
     }
 
@@ -94,13 +91,13 @@ impl Coordinated {
         let snapshot = Snapshot::new(txn, ts);
         self.ssi.borrow_mut().register(txn, ts);
         RecordStoreGraph::attach(
-            Rc::clone(&self.store),
+            self.store.clone(),
             txn,
             snapshot,
-            Rc::clone(&self.ssi),
-            Rc::clone(&self.index),
-            Rc::clone(&self.columns),
-            Rc::clone(&self.zones),
+            self.ssi.clone(),
+            self.index.clone(),
+            self.columns.clone(),
+            self.zones.clone(),
             None,
         )
     }

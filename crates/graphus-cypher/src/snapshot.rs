@@ -2,8 +2,9 @@
 //!
 //! # Why this exists — the parallel-read enabler
 //!
-//! Graphus runs **one `!Send` thread per database**: the live graph
-//! ([`RecordStoreGraph`](crate::record_graph::RecordStoreGraph)) holds `Rc<RefCell<…>>`, so every
+//! Graphus runs **one engine thread per database**: the live graph
+//! ([`RecordStoreGraph`](crate::record_graph::RecordStoreGraph)) is `!Sync` and drives the store
+//! through `&mut self`, so every
 //! read and write serializes on roughly one core regardless of how many the machine has (a heavy
 //! read battery was measured at ~0.98 of 16 cores). The proven escape hatch already in the workspace
 //! is [`graphus-gds`](graphus_gds): it projects an immutable `Send + Sync` `CsrGraph` **off the live

@@ -11,7 +11,7 @@
 //!    runtime security mutations affect authentication immediately; the TLS config is built from it.
 //! 3. Load the **database catalog** ([`crate::dbcatalog`], decision `D-multi-db`) — a malformed
 //!    catalog fails startup closed. Start the **default database's** engine thread, which
-//!    constructs the `!Send` `TxnCoordinator` *on the thread*: it opens-or-creates the
+//!    constructs the `TxnCoordinator` *on the thread*: it opens-or-creates the
 //!    [`graphus_storage::RecordStore`], runs recovery, and — per `04 §4.6`/§4.8 — runs
 //!    `verify_on_open`, **refusing to serve a corrupt store** (its failure fails startup, exactly
 //!    the single-db behaviour). Then start every additional catalog database whose desired state
@@ -288,7 +288,7 @@ impl Server {
 
         // 2) The database catalog + engines (`crate::dbcatalog`, decision `D-multi-db`): load the
         //    durable catalog (malformed ⇒ fail startup closed), start the default database (its
-        //    failure fails startup — unchanged single-db behaviour; the `!Send` coordinator is
+        //    failure fails startup — unchanged single-db behaviour; the coordinator is
         //    constructed *on its engine thread*, opening/recovering/verifying there — `04
         //    §4.6`/§4.8), then start every additional database marked online (failures logged,
         //    never fatal). The returned handle already carries the admission limit (`04 §9.3`).
