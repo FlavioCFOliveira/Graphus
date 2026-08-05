@@ -72,10 +72,7 @@ fn value_at(s: &Store, node: u64, key: u32, snapshot: Snapshot) -> Option<Value>
 
 /// The value the newest committed state holds for `key`.
 fn current_value(s: &Store, node: u64, key: u32) -> Option<Value> {
-    let snapshot = Snapshot {
-        owner: TxnId(9_999),
-        ts: s.snapshot_ts(),
-    };
+    let snapshot = Snapshot::new(TxnId(9_999), s.snapshot_ts());
     value_at(s, node, key, snapshot)
 }
 
@@ -275,10 +272,7 @@ fn a_committed_overwrites_old_chain_survives_until_the_watermark_passes_it() {
         6,
         "the old chain must NOT be freed while a live snapshot can still reconstruct it",
     );
-    let old_reader = Snapshot {
-        owner: TxnId(90),
-        ts: before_overwrite,
-    };
+    let old_reader = Snapshot::new(TxnId(90), before_overwrite);
     assert_eq!(
         value_at(&s, n, key, old_reader),
         Some(first),
@@ -336,10 +330,7 @@ fn an_older_snapshot_reads_the_exact_old_value_never_absent() {
     );
     s.commit(t2).expect("commit");
 
-    let old = Snapshot {
-        owner: TxnId(90),
-        ts: epoch1,
-    };
+    let old = Snapshot::new(TxnId(90), epoch1);
 
     // The node property: the exact previous integer, not absent and not the new one.
     let seen = value_at(&s, a, key, old);
@@ -365,10 +356,7 @@ fn an_older_snapshot_reads_the_exact_old_value_never_absent() {
 
     // And the current state is what the newest snapshot sees.
     assert_eq!(current_value(&s, a, key), Some(Value::Integer(2)));
-    let now = Snapshot {
-        owner: TxnId(91),
-        ts: s.snapshot_ts(),
-    };
+    let now = Snapshot::new(TxnId(91), s.snapshot_ts());
     assert!(
         s.decision_scan_rel_properties(r, now)
             .expect("rel decision read")
@@ -448,10 +436,7 @@ fn a_second_writer_on_the_same_entity_is_refused_with_a_retriable_serialization_
 
     // The reader in between still sees the committed state: T1 is open, so neither of its writes is
     // visible, and `b` is untouched because T2 never got to write it.
-    let reader = Snapshot {
-        owner: TxnId(4),
-        ts: epoch,
-    };
+    let reader = Snapshot::new(TxnId(4), epoch);
     assert_eq!(value_at(&s, n, ka, reader), Some(Value::Integer(10)));
     assert_eq!(value_at(&s, n, kb, reader), Some(Value::Integer(20)));
 
@@ -552,10 +537,7 @@ fn clearing_the_property_set_keeps_every_old_value_for_an_older_snapshot() {
     assert_eq!(s.clear_node_properties(t2, n).expect("clear"), 4);
     s.commit(t2).expect("commit");
 
-    let old = Snapshot {
-        owner: TxnId(90),
-        ts: before_clear,
-    };
+    let old = Snapshot::new(TxnId(90), before_clear);
     for (i, &k) in keys.iter().enumerate() {
         assert_eq!(
             value_at(&s, n, k, old),
@@ -632,10 +614,7 @@ fn a_writer_reads_its_own_uncommitted_property_write_and_a_spectator_does_not() 
     // owner match can make the walk stop at T2's deltas. Reading the current `snapshot_ts()` here
     // would let a `Committed(ts) if ts <= snapshot.ts` arm stop the walk for the wrong reason and
     // make the test vacuous.
-    let own = Snapshot {
-        owner: t2,
-        ts: before,
-    };
+    let own = Snapshot::new(t2, before);
     assert_eq!(
         value_at(&s, a, key, own),
         Some(Value::Integer(2)),
@@ -656,10 +635,7 @@ fn a_writer_reads_its_own_uncommitted_property_write_and_a_spectator_does_not() 
 
     // The positive control, on the same chain at the same instant: a spectator at the same `ts` must
     // undo every one of T2's deltas and read the committed baseline back.
-    let spectator = Snapshot {
-        owner: TxnId(90),
-        ts: before,
-    };
+    let spectator = Snapshot::new(TxnId(90), before);
     assert_eq!(
         value_at(&s, a, key, spectator),
         Some(Value::Integer(1)),
@@ -763,10 +739,7 @@ fn an_empty_cell_deferred_by_the_watermark_is_reclaimed_by_a_later_pass() {
         2,
         "nothing may be freed while a snapshot below the removal is still entitled to the value",
     );
-    let old = Snapshot {
-        owner: TxnId(90),
-        ts: before_removal,
-    };
+    let old = Snapshot::new(TxnId(90), before_removal);
     assert_eq!(
         value_at(&s, n, gone, old),
         Some(Value::Integer(1)),

@@ -278,7 +278,7 @@ impl Coordinated {
     /// rw-edges from `ts`), and returns a **coordinated** live `RecordStoreGraph` seam for it — the same
     /// shape the coordinator's `statement` builds.
     fn live_at(&self, txn: TxnId, ts: graphus_core::Timestamp) -> Live {
-        let snapshot = Snapshot { owner: txn, ts };
+        let snapshot = Snapshot::new(txn, ts);
         self.ssi.borrow_mut().register(txn, ts);
         RecordStoreGraph::attach(
             Rc::clone(&self.store),
@@ -298,7 +298,7 @@ impl Coordinated {
     /// thread and hand to a reader thread.
     fn reader_at(&self, txn: TxnId, ts: graphus_core::Timestamp) -> ReadOnly {
         let store = self.store.borrow();
-        let snapshot = Snapshot { owner: txn, ts };
+        let snapshot = Snapshot::new(txn, ts);
         ReadOnlyGraph::new(
             store.read_view(),
             store.token_snapshot(),
@@ -756,10 +756,7 @@ fn self_delete_visibility_is_identical() {
     let ro = ReadOnlyGraph::new(
         view,
         tokens,
-        Snapshot {
-            owner: writer,
-            ts: committed_ts,
-        },
+        Snapshot::new(writer, committed_ts),
         registry,
         writer,
         SsiReadBuffer::new(writer),

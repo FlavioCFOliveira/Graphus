@@ -29,6 +29,7 @@ use std::cell::Cell;
 use std::fmt;
 
 use graphus_core::Value;
+use graphus_txn::View;
 
 use crate::ast::{
     BinaryOp, CaseExpr, Expr, ExprKind, LabelExpr, Literal, MapKey, MapProjectionSelector,
@@ -3976,6 +3977,16 @@ impl GraphAccess for ReadOnlyGraph<'_> {
         // underneath, so inheriting the ZERO default would report a fabricated absence of work for
         // every `EXISTS { ... }` sub-pipeline.
         self.0.take_read_tally()
+    }
+
+    // ---- statement-level isolation (`04 §5.1.4`, `rmp` #972) -------------------------------------
+    //
+    // `read_view` is forwarded so the sub-pipeline starts from the enclosing statement's polarity; the
+    // two mutators are NOT reachable through this adapter, which holds `&dyn GraphAccess`. That is not
+    // a gap: the sub-plan's own operators switch the view on the seam the *outer* cursor owns, and an
+    // `EXISTS { … }` body is read-only by compile-time construction, so it opens no statement.
+    fn read_view(&self) -> View {
+        self.0.read_view()
     }
 
     // ---- writes: never reached (the read-only inner plan emits no write operator) -------------

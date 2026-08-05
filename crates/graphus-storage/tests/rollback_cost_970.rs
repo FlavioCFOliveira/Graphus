@@ -147,10 +147,7 @@ fn a_data_transactions_rollback_reloads_no_catalog() {
         );
         // And that it undid the eight OVERWRITES too, not only the eight creations: the committed
         // value is 7 and the aborted transaction wrote 9 over it.
-        let snapshot = graphus_txn::Snapshot {
-            owner: TxnId(999),
-            ts: s.snapshot_ts(),
-        };
+        let snapshot = graphus_txn::Snapshot::new(TxnId(999), s.snapshot_ts());
         for &id in ids.iter().skip(nodes / 2).take(WRITES) {
             let decided = s
                 .decision_scan_node_properties(id, snapshot)

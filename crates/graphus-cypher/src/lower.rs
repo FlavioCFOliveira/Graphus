@@ -449,9 +449,32 @@ impl Planner {
             Clause::Remove(r) => self.lower_remove(r, current),
             Clause::Foreach(f) => self.lower_foreach(f, current),
             Clause::With(w) => {
-                self.lower_projection_body(&w.body, w.where_clause.as_ref(), w.span, current)
+                // A `WITH` that follows a write **opens the next statement** (`04 §5.1.4`, `rmp` #972).
+                //
+                // The rule is Memgraph's, transcribed: `rule_based_planner.cpp`'s `GenWith` computes
+                // `bool advance_command = is_write;` from whether the query part built so far performs
+                // a write, and threads it into the `Produce`. `GenReturn` passes the same flag as a
+                // literal `false` — a `RETURN` ends the query, so nothing after it can read the graph
+                // and there is no next statement to open. That asymmetry is why the two arms below
+                // differ, and it is the whole of the openCypher behaviour the TCK pins in
+                // `clauses/create/Create3.feature` [3]: `MATCH () CREATE () WITH * MATCH () CREATE ()`
+                // over 2 nodes creates 10 nodes, because the second `MATCH` runs at a NEW command and
+                // therefore does see the first `CREATE`'s rows, while neither `MATCH` sees its own.
+                //
+                // The test is on the plan accumulated **so far**, not on the whole query: a `WITH`
+                // before any write has no earlier command to close.
+                let follows_write = current.as_ref().is_some_and(contains_write);
+                self.lower_projection_body(
+                    &w.body,
+                    w.where_clause.as_ref(),
+                    w.span,
+                    current,
+                    follows_write,
+                )
             }
-            Clause::Return(r) => self.lower_projection_body(&r.body, None, r.span, current),
+            // `RETURN` never advances: `GenReturn` passes the flag as a literal `false`, because a
+            // `RETURN` ends the query and nothing after it can read the graph again.
+            Clause::Return(r) => self.lower_projection_body(&r.body, None, r.span, current, false),
         }
     }
 
@@ -1346,8 +1369,29 @@ impl Planner {
         where_clause: Option<&Expr>,
         clause_span: Span,
         current: Option<LogicalOp>,
+        advance_command: bool,
     ) -> LogicalOp {
-        let input = current.unwrap_or(LogicalOp::Empty);
+        let mut input = current.unwrap_or(LogicalOp::Empty);
+
+        // **Open the next statement, BELOW the projection** (`04 §5.1.4`, `rmp` #972).
+        //
+        // The position is the whole of the correctness here, and it is Memgraph's: `GenReturnBody`
+        // wraps the *input* in `Accumulate{advance_command}` and only then builds `Produce`, the
+        // `ORDER BY`/`SKIP`/`LIMIT` chain and finally the `WHERE`. Everything from the projection
+        // upwards therefore runs at the NEW command.
+        //
+        // Putting it above the projection instead — which is the obvious reading of "a WITH advances
+        // the command" — is measurably wrong: the `WITH`'s own `WHERE` is a `Filter`, `Filter` reads
+        // under `View::Old`, and at the OLD command that filter cannot see the values the preceding
+        // `SET` wrote. `MATCH (n:N) SET n.num = n.num + 1 WITH n WHERE n.num % 2 = 0 RETURN n.num`
+        // over `num = 1..5` then returns `3, 5` (the filter judged 1..5, the projection reported
+        // 2..6) instead of `2, 4, 6`. Below the projection, the same `Filter` sits at command `c+1`
+        // and the `SET`'s deltas at command `c` are `c >= c+1`-false, hence visible.
+        if advance_command {
+            input = LogicalOp::AdvanceCommand {
+                input: Box::new(input),
+            };
+        }
 
         // Build the projected columns. `*` carries through the incoming bindings; the planner does
         // not know the runtime column set, so `*` is represented by projecting each currently-bound
@@ -2931,6 +2975,60 @@ fn collect_referenced_vars(expr: &Expr, out: &mut BTreeSet<String>) {
     }
 }
 
+/// Whether the logical (sub)plan performs a graph **write** anywhere (`rmp` #972).
+///
+/// The logical-plan twin of `physical::contains_write`, needed one phase earlier: the `WITH`-advances
+/// rule is decided while the clause structure is still visible, before the physical planner has had a
+/// chance to fuse, reorder or rewrite anything.
+///
+/// The match is **exhaustive on purpose** — no `_ =>` arm. A new write operator added to
+/// [`LogicalOp`] must break this function's compilation rather than silently fail to open a statement
+/// after it, which would reintroduce exactly the Halloween anomaly this task closes.
+fn contains_write(op: &LogicalOp) -> bool {
+    match op {
+        // The write clauses.
+        LogicalOp::Create { .. }
+        | LogicalOp::Merge { .. }
+        | LogicalOp::SetClause { .. }
+        | LogicalOp::Delete { .. }
+        | LogicalOp::Remove { .. }
+        | LogicalOp::Foreach { .. } => true,
+
+        // Leaves: nothing below them.
+        LogicalOp::AllNodesScan { .. }
+        | LogicalOp::NodeByLabelScan { .. }
+        | LogicalOp::AllRelationshipsScan { .. }
+        | LogicalOp::Argument { .. }
+        | LogicalOp::Empty => false,
+
+        // Single-input operators: recurse into the one child.
+        LogicalOp::Expand { input, .. }
+        | LogicalOp::NamedPath { input, .. }
+        | LogicalOp::ShortestPath { input, .. }
+        | LogicalOp::QuantifiedPath { input, .. }
+        | LogicalOp::Filter { input, .. }
+        | LogicalOp::Projection { input, .. }
+        | LogicalOp::Aggregation { input, .. }
+        | LogicalOp::Sort { input, .. }
+        | LogicalOp::Skip { input, .. }
+        | LogicalOp::Limit { input, .. }
+        | LogicalOp::AdvanceCommand { input }
+        | LogicalOp::Unwind { input, .. }
+        | LogicalOp::LoadCsv { input, .. }
+        | LogicalOp::Optional { input, .. } => contains_write(input),
+
+        // Binary operators: either side may write.
+        LogicalOp::Apply { left, right } => contains_write(left) || contains_write(right),
+        LogicalOp::Union { left, right, .. } => contains_write(left) || contains_write(right),
+
+        // A procedure call is not itself treated as a write here, matching `physical::contains_write`
+        // — a writing procedure is dispatched through the write seam, not through a write *operator*,
+        // and the two predicates must agree or the eagerness barriers and the statement boundaries
+        // would disagree about the same plan. Its correlated input is still searched.
+        LogicalOp::ProcedureCall { input, .. } => input.as_deref().is_some_and(contains_write),
+    }
+}
+
 fn gather_bound_vars(plan: &LogicalOp, out: &mut Vec<Var>) {
     match plan {
         LogicalOp::AllNodesScan { variable } | LogicalOp::NodeByLabelScan { variable, .. } => {
@@ -2998,6 +3096,7 @@ fn gather_bound_vars(plan: &LogicalOp, out: &mut Vec<Var>) {
         LogicalOp::Filter { input, .. }
         | LogicalOp::Skip { input, .. }
         | LogicalOp::Limit { input, .. }
+        | LogicalOp::AdvanceCommand { input }
         | LogicalOp::Sort { input, .. } => gather_bound_vars(input, out),
         LogicalOp::Unwind {
             input, variable, ..

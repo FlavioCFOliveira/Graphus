@@ -89,10 +89,7 @@ fn node_with_overwrites(overwrites: u64) -> (Store, u64, u32, Snapshot) {
         store.commit(t).expect("commit overwrite");
     }
 
-    let snap = Snapshot {
-        owner: TxnId(next),
-        ts: store.snapshot_ts(),
-    };
+    let snap = Snapshot::new(TxnId(next), store.snapshot_ts());
     (store, node, key, snap)
 }
 
@@ -237,10 +234,7 @@ fn distinct_keys_still_cost_one_record_read_each() {
             store.commit(t).expect("commit write");
         }
 
-        let snap = Snapshot {
-            owner: TxnId(next),
-            ts: store.snapshot_ts(),
-        };
+        let snap = Snapshot::new(TxnId(next), store.snapshot_ts());
         let counts = reads_for_one_visible_read(&store, node, keys[k as usize - 1], snap);
         assert_eq!(
             counts.prop, k,

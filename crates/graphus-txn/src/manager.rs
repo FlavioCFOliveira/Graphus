@@ -209,10 +209,7 @@ impl<S: VersionedStore, D: Durability> TxnManager<S, D> {
         let begin_ts = self.oracle.begin()?;
         self.next_txn_id = next_id;
         let txn = TxnId(next_id);
-        let snapshot = Snapshot {
-            owner: txn,
-            ts: begin_ts,
-        };
+        let snapshot = Snapshot::new(txn, begin_ts);
         self.registry.register_begin(txn);
         self.ssi.register(txn, begin_ts);
         self.active.insert(

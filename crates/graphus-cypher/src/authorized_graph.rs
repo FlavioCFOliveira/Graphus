@@ -71,6 +71,7 @@
 
 use graphus_core::Value;
 use graphus_core::error::GraphusError;
+use graphus_txn::View;
 
 use crate::graph_access::{
     CompositeSeekHits, DeletedEntity, ExpandDirection, GraphAccess, Incident, IndexSeekHits,
@@ -1374,6 +1375,24 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
         // trait default would silently report ZERO for every RBAC-enforced statement, which is a
         // fabricated number, not an absent one.
         self.inner.take_read_tally()
+    }
+
+    // ---- statement-level isolation (`04 §5.1.4`, `rmp` #972) -------------------------------------
+    //
+    // Delegated, all three. A decorator that inherited the trait defaults would silently pin every
+    // RBAC-enforced statement to `View::New` while the un-decorated path switched to `Old` — the
+    // authorization layer would then change the ANSWER, not just which rows a principal may see.
+
+    fn read_view(&self) -> View {
+        self.inner.read_view()
+    }
+
+    fn set_read_view(&mut self, view: View) -> View {
+        self.inner.set_read_view(view)
+    }
+
+    fn begin_command(&mut self) {
+        self.inner.begin_command();
     }
 }
 

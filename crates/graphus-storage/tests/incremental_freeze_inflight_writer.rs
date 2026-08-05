@@ -89,10 +89,7 @@ fn committed_value_survives_a_gc_that_ran_while_its_writer_was_in_flight() {
     // stranded t2's stamp (never froze it) and the prune forgot t2, the value 2 resolves as INVISIBLE
     // (its in-flight stamp names a now-unknown → treated-as-aborted writer) — silent lost committed
     // data, even though the physical chain still holds the record.
-    let reader = Snapshot {
-        owner: TxnId(9999),
-        ts: s.snapshot_ts(),
-    };
+    let reader = Snapshot::new(TxnId(9999), s.snapshot_ts());
     assert_eq!(
         visible_value(&s, n, key, reader),
         Some(2),

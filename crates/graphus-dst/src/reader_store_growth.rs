@@ -170,10 +170,8 @@ pub fn run_reader_vs_store_growth(seed: u64) -> ReaderGrowthReport {
     //     reader-pool worker. Everything the writer does below happens WHILE this read is in flight.
     // ---------------------------------------------------------------------------------------------
     let view = s.read_view();
-    let reader_snapshot = Snapshot {
-        owner: TxnId(u64::MAX), // a reader ticket distinct from every writer below
-        ts: s.snapshot_ts(),
-    };
+    // A reader ticket distinct from every writer below.
+    let reader_snapshot = Snapshot::new(TxnId(u64::MAX), s.snapshot_ts());
     let registry = s.commit_registry().clone();
     let pages_before = s.store_page_count();
 

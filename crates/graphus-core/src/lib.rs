@@ -13,7 +13,7 @@ pub use error::{
     CONSTRAINT_VIOLATION_PREFIX, GraphusError, Result, SCHEMA_RULE_ERROR_PREFIX,
     SCHEMA_RULE_ERROR_SEP, WIRE_STATUS_CODE_PREFIX, WIRE_STATUS_CODE_SEP, wire_status_code_message,
 };
-pub use ids::{ElementId, Lsn, PageId, Timestamp, TxnId};
+pub use ids::{CommandId, ElementId, Lsn, PageId, Timestamp, TxnId};
 pub use temporal_calc::{TemporalError, TemporalResult};
 pub use value::Value;
 pub use value::numeric::cmp_int_float;
@@ -56,6 +56,42 @@ pub mod ids {
     /// Logical timestamp issued by the transaction timestamp oracle.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
     pub struct Timestamp(pub u64);
+
+    /// The statement counter within one transaction (`04 §5.1.4`).
+    ///
+    /// A transaction's first statement runs at [`CommandId::FIRST`] and each subsequent statement
+    /// advances it by one. Every undo delta records the command that produced it, which is what lets
+    /// a statement be shown the state that preceded it even for changes its **own** transaction made
+    /// (the `OLD` view of `graphus_txn::View`).
+    ///
+    /// It is a `u32` because that is the width `05 §12.2` froze for the delta's `command_id` field.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+    pub struct CommandId(pub u32);
+
+    impl CommandId {
+        /// The command a transaction's **first** statement runs at.
+        ///
+        /// It is `1`, not `0`, so that the `OLD` view of the first statement (`command_id <
+        /// FIRST`) excludes every delta the transaction could possibly have written — `0` is
+        /// reserved as "no statement has run yet" and is what a delta written outside any statement
+        /// carries.
+        pub const FIRST: Self = Self(1);
+
+        /// The value a delta carries when no statement was in progress: maintenance and recovery
+        /// writes, which no `OLD` view is ever resolved against.
+        pub const NONE: Self = Self(0);
+
+        /// The next command in the same transaction.
+        ///
+        /// Saturating rather than wrapping: a transaction that somehow issued `u32::MAX` statements
+        /// keeps a monotonic counter — the alternative wraps to `0` and would make a later
+        /// statement's own writes look older than its first, which is a visibility error rather
+        /// than an overflow.
+        #[must_use]
+        pub const fn next(self) -> Self {
+            Self(self.0.saturating_add(1))
+        }
+    }
 
     /// Stable, never-reused public element identifier (decision `D-element-id`).
     ///

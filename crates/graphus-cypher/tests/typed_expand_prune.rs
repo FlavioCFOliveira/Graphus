@@ -73,6 +73,17 @@ impl StoreReadSource for Counting<'_> {
     ) -> Result<u64, graphus_core::error::GraphusError> {
         self.inner.label_bitmap_at(id, live, head, snapshot)
     }
+    fn entity_visible_at(
+        &self,
+        kind: graphus_storage::StoreKind,
+        id: u64,
+        mvcc: graphus_storage::MvccHeader,
+        snapshot: graphus_txn::Snapshot,
+        registry: &graphus_txn::CommitRegistry,
+    ) -> Result<bool, graphus_core::error::GraphusError> {
+        self.inner
+            .entity_visible_at(kind, id, mvcc, snapshot, registry)
+    }
     fn superset_scan_node_properties(
         &self,
         id: u64,
@@ -175,10 +186,7 @@ fn typed_expand_skips_nonmatching_reads_and_marks() {
 
     let registry = s.commit_registry().clone();
     let ctx = VisCtx {
-        snapshot: Snapshot {
-            owner: TxnId(99),
-            ts: s.snapshot_ts(),
-        },
+        snapshot: Snapshot::new(TxnId(99), s.snapshot_ts()),
         registry: &registry,
         txn: TxnId(99),
     };
@@ -249,10 +257,7 @@ fn untyped_expand_marks_and_returns_all() {
 
     let registry = s.commit_registry().clone();
     let ctx = VisCtx {
-        snapshot: Snapshot {
-            owner: TxnId(99),
-            ts: s.snapshot_ts(),
-        },
+        snapshot: Snapshot::new(TxnId(99), s.snapshot_ts()),
         registry: &registry,
         txn: TxnId(99),
     };

@@ -691,6 +691,7 @@ impl PhysicalOp {
             | Self::Skip { input, .. }
             | Self::Limit { input, .. }
             | Self::Eager { input }
+            | Self::AdvanceCommand { input }
             | Self::Unwind { input, .. }
             | Self::LoadCsv { input, .. }
             | Self::Optional { input, .. }
@@ -775,6 +776,7 @@ impl PhysicalOp {
             | Self::Skip { input, .. }
             | Self::Limit { input, .. }
             | Self::Eager { input }
+            | Self::AdvanceCommand { input }
             | Self::Unwind { input, .. }
             | Self::LoadCsv { input, .. }
             | Self::Optional { input, .. }
@@ -856,6 +858,7 @@ impl PhysicalOp {
             Self::Skip { .. } => "Skip",
             Self::Limit { .. } => "Limit",
             Self::Eager { .. } => "Eager",
+            Self::AdvanceCommand { .. } => "AdvanceCommand",
             Self::Unwind { .. } => "Unwind",
             Self::LoadCsv { .. } => "LoadCsv",
             Self::NestedLoopJoin { .. } => "NestedLoopJoin",
@@ -1920,6 +1923,21 @@ pub enum PhysicalOp {
         /// The upstream relation, drained in full before any row is emitted.
         input: Box<PhysicalOp>,
     },
+    /// **Open the next statement** of the transaction (`04 §5.1.4`, `rmp` #972): drain `input`, then
+    /// advance the `command_id` every later write is stamped with, then emit the buffered rows.
+    ///
+    /// The physical form of [`LogicalOp::AdvanceCommand`](crate::logical::LogicalOp::AdvanceCommand) —
+    /// planted above a `WITH` that follows a write, and nowhere else. See that variant for why the rule
+    /// is `WITH`-only and why the drain is load-bearing rather than incidental.
+    ///
+    /// It is **not** a substitute for [`Eager`](Self::Eager) and does not replace one: the two solve
+    /// different halves of the same family. `Eager` decouples *row production* across a clause
+    /// boundary; `AdvanceCommand` re-polarises *visibility* across it. They are deliberately kept
+    /// side by side.
+    AdvanceCommand {
+        /// The upstream relation, drained in full before the command advances.
+        input: Box<PhysicalOp>,
+    },
     /// Expand `list` into one row per element bound to `variable` (`UNWIND`).
     Unwind {
         /// The upstream relation.
@@ -2558,6 +2576,11 @@ impl Planner<'_> {
                 arguments: arguments.clone(),
             },
             LogicalOp::Empty => PhysicalOp::Empty,
+            // `rmp` #972: a 1:1 lowering — the decision (does this `WITH` follow a write?) was already
+            // taken during lowering, where the clause structure is still visible.
+            LogicalOp::AdvanceCommand { input } => PhysicalOp::AdvanceCommand {
+                input: Box::new(self.lower(input, deps)),
+            },
 
             // ---- Filter: the index-selection trigger -----------------------------------------
             LogicalOp::Filter { input, predicate } => self.lower_filter(input, predicate, deps),
@@ -3965,6 +3988,7 @@ fn contains_read(op: &PhysicalOp) -> bool {
         | PhysicalOp::Skip { input, .. }
         | PhysicalOp::Limit { input, .. }
         | PhysicalOp::Eager { input }
+        | PhysicalOp::AdvanceCommand { input }
         | PhysicalOp::Unwind { input, .. }
         | PhysicalOp::LoadCsv { input, .. }
         | PhysicalOp::NamedPath { input, .. }
@@ -4013,6 +4037,7 @@ fn contains_write(op: &PhysicalOp) -> bool {
         | PhysicalOp::Skip { input, .. }
         | PhysicalOp::Limit { input, .. }
         | PhysicalOp::Eager { input }
+        | PhysicalOp::AdvanceCommand { input }
         | PhysicalOp::Unwind { input, .. }
         | PhysicalOp::LoadCsv { input, .. }
         | PhysicalOp::ExpandAll { input, .. }
@@ -4084,6 +4109,7 @@ fn contains_procedure_call(op: &PhysicalOp) -> bool {
         | PhysicalOp::Skip { input, .. }
         | PhysicalOp::Limit { input, .. }
         | PhysicalOp::Eager { input }
+        | PhysicalOp::AdvanceCommand { input }
         | PhysicalOp::Unwind { input, .. }
         | PhysicalOp::LoadCsv { input, .. }
         | PhysicalOp::ExpandAll { input, .. }
@@ -4179,6 +4205,7 @@ fn all_procedure_calls_reader_safe(
         | PhysicalOp::Skip { input, .. }
         | PhysicalOp::Limit { input, .. }
         | PhysicalOp::Eager { input }
+        | PhysicalOp::AdvanceCommand { input }
         | PhysicalOp::Unwind { input, .. }
         | PhysicalOp::LoadCsv { input, .. }
         | PhysicalOp::ExpandAll { input, .. }
@@ -7192,6 +7219,7 @@ fn op_expressions(op: &PhysicalOp) -> Vec<&Expr> {
         | PhysicalOp::NodeCountFromCountStore { .. }
         | PhysicalOp::RelationshipCountFromCountStore { .. }
         | PhysicalOp::Eager { .. }
+        | PhysicalOp::AdvanceCommand { .. }
         | PhysicalOp::NestedLoopJoin { .. }
         | PhysicalOp::HashJoin { .. }
         | PhysicalOp::Union { .. }
@@ -7759,6 +7787,7 @@ fn map_children(op: PhysicalOp, f: &dyn Fn(PhysicalOp) -> PhysicalOp) -> Physica
             count,
         },
         PhysicalOp::Eager { input } => PhysicalOp::Eager { input: go(input) },
+        PhysicalOp::AdvanceCommand { input } => PhysicalOp::AdvanceCommand { input: go(input) },
         PhysicalOp::Unwind {
             input,
             list,
@@ -8216,6 +8245,7 @@ fn contains_correlated_seek(op: &PhysicalOp) -> bool {
         | PhysicalOp::Skip { input, .. }
         | PhysicalOp::Limit { input, .. }
         | PhysicalOp::Eager { input }
+        | PhysicalOp::AdvanceCommand { input }
         | PhysicalOp::Unwind { input, .. }
         | PhysicalOp::LoadCsv { input, .. }
         | PhysicalOp::ExpandAll { input, .. }
@@ -8291,6 +8321,7 @@ fn contains_argument(op: &PhysicalOp) -> bool {
         | PhysicalOp::Skip { input, .. }
         | PhysicalOp::Limit { input, .. }
         | PhysicalOp::Eager { input }
+        | PhysicalOp::AdvanceCommand { input }
         | PhysicalOp::Unwind { input, .. }
         | PhysicalOp::LoadCsv { input, .. }
         | PhysicalOp::ExpandAll { input, .. }
@@ -8756,6 +8787,7 @@ fn gather_index_dependencies(op: &PhysicalOp, deps: &mut BTreeSet<IndexId>) {
         | PhysicalOp::Skip { input, .. }
         | PhysicalOp::Limit { input, .. }
         | PhysicalOp::Eager { input }
+        | PhysicalOp::AdvanceCommand { input }
         | PhysicalOp::Unwind { input, .. }
         | PhysicalOp::LoadCsv { input, .. }
         | PhysicalOp::ExpandAll { input, .. }
@@ -9928,6 +9960,7 @@ fn gather_bound_vars(plan: &PhysicalOp, out: &mut Vec<Var>) {
         | PhysicalOp::Skip { input, .. }
         | PhysicalOp::Limit { input, .. }
         | PhysicalOp::Eager { input }
+        | PhysicalOp::AdvanceCommand { input }
         // `rmp` #869. LOAD-BEARING, not a convenience: a semi-join binds EXACTLY what its driving
         // relation binds and nothing the inner branch introduced — the inner row is examined for
         // existence and discarded, never merged. Grouping it with `Filter` is the whole statement of
@@ -10563,6 +10596,10 @@ impl PhysicalOp {
             }
             Self::Eager { input } => {
                 writeln!(f, "Eager")?;
+                input.fmt_indented(f, depth + 1)
+            }
+            Self::AdvanceCommand { input } => {
+                writeln!(f, "AdvanceCommand")?;
                 input.fmt_indented(f, depth + 1)
             }
             Self::Unwind {

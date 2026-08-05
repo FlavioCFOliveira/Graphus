@@ -46,10 +46,7 @@ fn fresh() -> Store {
 /// physical id, so a slot the abort reclaims and a later writer reuses cannot make two different
 /// entities compare equal.
 fn committed_image(s: &Store, observer: TxnId) -> Vec<String> {
-    let snapshot = Snapshot {
-        owner: observer,
-        ts: s.snapshot_ts(),
-    };
+    let snapshot = Snapshot::new(observer, s.snapshot_ts());
     let registry = s.commit_registry();
     let visible = |mvcc: graphus_storage::MvccHeader| {
         mvcc.in_use() && is_visible(snapshot, mvcc.created_ts, mvcc.expired_ts, registry)

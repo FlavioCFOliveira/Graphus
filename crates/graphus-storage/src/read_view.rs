@@ -61,10 +61,10 @@ use std::sync::Arc;
 
 use graphus_bufpool::ConcurrentBufferPool;
 use graphus_core::error::{GraphusError, Result};
-use graphus_core::{PageId, Value};
+use graphus_core::{PageId, Value, VersionStamp};
 use graphus_io::BlockDevice;
 use graphus_pagemap::PageMap;
-use graphus_txn::Snapshot;
+use graphus_txn::{CommitRegistry, Snapshot, View, is_visible};
 use graphus_wal::LogSink;
 
 use crate::heap::{HeapBlock, STRINGS_RECORD_SIZE};
@@ -549,6 +549,92 @@ fn decide_properties<D: BlockDevice, S: LogSink, P: StorePages>(
     match failure {
         Some(e) => Err(e),
         None => Ok(DecidedProperties::from_fold(fold, snapshot)),
+    }
+}
+
+/// Whether entity `(kind, id)` **exists** as of `snapshot`, at statement granularity (`rmp` #972,
+/// `04 §5.1.4`).
+///
+/// [`graphus_txn::is_visible`] answers the same question across *transactions*, from the two header
+/// words alone. It cannot answer it within one transaction, because the header records only *which*
+/// transaction created or expired the entity and never *which statement of it* — that lives on the
+/// undo chain, where `05 §12.2` froze a `command_id` on every delta. So this refines `is_visible`
+/// exactly where the header runs out of information, and nowhere else.
+///
+/// # Why this costs nothing on the paths that do not need it
+///
+/// Three gates, in order, and the ordinary read fails the first:
+///
+/// 1. under [`View::New`] the two answers are identical by construction, because
+///    [`Snapshot::hides_own_command`] is `false` for every own write — so the walk is never entered;
+/// 2. the statement question only arises for an entity **this** transaction created or deleted while
+///    still in flight, which is what `own` tests for;
+/// 3. and such an entity with no chain at all cannot have a statement to distinguish.
+///
+/// So a scan under the default view pays one `View` comparison per row, and an `OLD`-view scan over
+/// entities the reader did not itself create pays two `u64` comparisons more.
+///
+/// # Why the walk terminates where it does
+///
+/// A creation writes `DeleteObject` and a deletion writes `RecreateObject` (`05 §12.3` — the action
+/// is the inverse of the event), so applying one flips existence and applying the other flips it
+/// back. Our own deltas sit at the head of the chain with descending `command_id`, so the walk stops
+/// at the first delta from a command the reader already reflects — for a node created by an earlier
+/// statement, that is the very first delta it reads.
+///
+/// # Errors
+/// As [`undo_chain`], plus a storage error if a live delta's commit slot cannot be resolved. A read
+/// fault is **never** answered with the header's own verdict: an entity whose existence cannot be
+/// resolved must fail the read, not be guessed either way (the fail-closed-on-read-fault contract,
+/// `rmp` #733).
+pub fn entity_visible_at<D: BlockDevice, S: LogSink, P: StorePages>(
+    pool: &Pool<D, S>,
+    pages: &P,
+    kind: StoreKind,
+    id: u64,
+    mvcc: MvccHeader,
+    snapshot: Snapshot,
+    registry: &CommitRegistry,
+) -> Result<bool> {
+    let header_says = is_visible(snapshot, mvcc.created_ts, mvcc.expired_ts, registry);
+    if snapshot.view == View::New || mvcc.undo_ptr == NULL_ID {
+        return Ok(header_says);
+    }
+    let own = VersionStamp::in_flight(snapshot.owner);
+    if mvcc.created_ts != own && mvcc.expired_ts != own {
+        return Ok(header_says);
+    }
+    let mut exists = header_says;
+    let mut failure = None;
+    walk_undo_chain(pool, pages, kind, id, mvcc.undo_ptr, |delta_id, delta| {
+        let slot = if delta.in_use() {
+            read_commit_slot(pool, pages, delta.commit_info)?
+        } else {
+            None
+        };
+        match delta_verdict(&delta, slot, snapshot, delta_id) {
+            Ok(DeltaVerdict::Skip) => Ok(true),
+            Ok(DeltaVerdict::Apply) => {
+                match delta.action {
+                    // Undoing a creation: as of this snapshot the entity is not there yet.
+                    UndoAction::DeleteObject => exists = false,
+                    // Undoing a deletion: as of this snapshot the entity is still there.
+                    UndoAction::RecreateObject => exists = true,
+                    // Not an existence event — this chain carries every kind of version.
+                    _ => {}
+                }
+                Ok(true)
+            }
+            Ok(DeltaVerdict::Stop) => Ok(false),
+            Err(e) => {
+                failure = Some(e);
+                Ok(false)
+            }
+        }
+    })?;
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(exists),
     }
 }
 
@@ -1438,6 +1524,22 @@ impl<D: BlockDevice, S: LogSink> StoreReadView<D, S> {
         snapshot: Snapshot,
     ) -> Result<u64> {
         label_bitmap_at(&self.pool, &self.meta, id, live, head, snapshot)
+    }
+
+    /// Whether entity `(kind, id)` exists as of `snapshot`, at statement granularity. See
+    /// [`entity_visible_at`].
+    ///
+    /// # Errors
+    /// Returns a storage error if the entity's undo chain cannot be walked (`rmp` #972).
+    pub fn entity_visible_at(
+        &self,
+        kind: StoreKind,
+        id: u64,
+        mvcc: MvccHeader,
+        snapshot: Snapshot,
+        registry: &CommitRegistry,
+    ) -> Result<bool> {
+        entity_visible_at(&self.pool, &self.meta, kind, id, mvcc, snapshot, registry)
     }
 
     /// Whether node `id` carries the label with `label_token_id`. See [`node_has_label`].

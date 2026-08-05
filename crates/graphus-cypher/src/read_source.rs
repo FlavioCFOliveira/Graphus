@@ -55,8 +55,8 @@ use graphus_index::keycodec::{encode_equality_canonical, encode_single};
 use graphus_io::BlockDevice;
 use graphus_storage::record::{NodeRecord, RelRecord};
 use graphus_storage::{
-    DecidedProperties, MvccHeader, Namespace, RecordStore, StoreReadView, SupersetProperties,
-    TokenSnapshot, labels,
+    DecidedProperties, MvccHeader, Namespace, RecordStore, StoreKind, StoreReadView,
+    SupersetProperties, TokenSnapshot, labels,
 };
 use graphus_txn::{CommitRegistry, PredicateRead, Snapshot, is_visible};
 use graphus_wal::LogSink;
@@ -191,6 +191,34 @@ pub trait StoreReadSource {
         snapshot: Snapshot,
     ) -> Result<u64, GraphusError>;
 
+    /// Whether the node / relationship `(kind, id)` carrying `mvcc` **exists** as of `snapshot`, at
+    /// statement granularity (`04 §5.1.4`, `rmp` #972).
+    ///
+    /// `graphus_txn::is_visible` answers the same question across *transactions*, from the two header
+    /// words alone. It cannot answer it **within** one transaction: the header records which
+    /// transaction created or expired the entity and never which statement of it, so a row the current
+    /// statement is creating is indistinguishable from one an earlier statement created. That
+    /// distinction lives on the undo chain, which this walks — and only when it can matter, so a read
+    /// under [`View::New`](graphus_txn::View::New) pays one comparison and no I/O.
+    ///
+    /// It is on the seam, rather than folded per implementation, for exactly the reason
+    /// [`decision_scan_node_properties`](Self::decision_scan_node_properties) is: the off-thread reader
+    /// pool and the inline path must resolve existence through the **same** mechanism. A reader pool
+    /// that answers from a different mechanism than the inline path is the `rmp` #755/#768/#769/#770
+    /// defect family.
+    ///
+    /// # Errors
+    /// Returns a storage error if the entity's undo chain cannot be walked. It is never answered with
+    /// the header's own verdict, which is the answer the chain was consulted to correct.
+    fn entity_visible_at(
+        &self,
+        kind: StoreKind,
+        id: u64,
+        mvcc: MvccHeader,
+        snapshot: Snapshot,
+        registry: &CommitRegistry,
+    ) -> Result<bool, GraphusError>;
+
     /// The **superset**-polarity read of `node_id`'s property chain, head to tail (newest first).
     ///
     /// This doc used to promise every *live* record. It does not: it returns every
@@ -302,6 +330,16 @@ impl<D: BlockDevice, S: LogSink> StoreReadSource for LiveSource<'_, D, S> {
     ) -> Result<u64, GraphusError> {
         self.0.label_bitmap_at(id, live, head, snapshot)
     }
+    fn entity_visible_at(
+        &self,
+        kind: StoreKind,
+        id: u64,
+        mvcc: MvccHeader,
+        snapshot: Snapshot,
+        registry: &CommitRegistry,
+    ) -> Result<bool, GraphusError> {
+        self.0.entity_visible_at(kind, id, mvcc, snapshot, registry)
+    }
     fn superset_scan_node_properties(
         &self,
         node_id: u64,
@@ -390,6 +428,17 @@ impl<D: BlockDevice, S: LogSink> StoreReadSource for ReadViewSource<'_, D, S> {
         snapshot: Snapshot,
     ) -> Result<u64, GraphusError> {
         self.view.label_bitmap_at(id, live, head, snapshot)
+    }
+    fn entity_visible_at(
+        &self,
+        kind: StoreKind,
+        id: u64,
+        mvcc: MvccHeader,
+        snapshot: Snapshot,
+        registry: &CommitRegistry,
+    ) -> Result<bool, GraphusError> {
+        self.view
+            .entity_visible_at(kind, id, mvcc, snapshot, registry)
     }
     fn superset_scan_node_properties(
         &self,
@@ -1232,10 +1281,39 @@ pub struct VisCtx<'a> {
 }
 
 impl VisCtx<'_> {
-    /// Whether the version carrying `mvcc` is visible to this query's snapshot (`04 §5.3`). The one
-    /// place the read body consults MVCC.
+    /// Whether the node / relationship `(kind, id)` carrying `mvcc` **exists** as of this query's
+    /// snapshot (`04 §5.3`), at statement granularity (`04 §5.1.4`, `rmp` #972). The one place the read
+    /// body consults MVCC for existence.
+    ///
+    /// It takes `src` for the same reason [`labels_at`](Self::labels_at) does: the header words settle
+    /// the cross-transaction half of the question, and the entity's undo chain settles the
+    /// within-transaction half, which only the store can walk. Under
+    /// [`View::New`](graphus_txn::View::New) the walk is not entered at all, so the default read path
+    /// costs one comparison more than the header-only test it replaced.
+    ///
+    /// # Errors
+    /// Returns a storage error if the entity's undo chain cannot be walked. **Every caller must fail
+    /// closed on it** (`rmp` #733) — capture through the sink and yield no row — never fall back to the
+    /// header's verdict, which is precisely the answer that needed correcting.
     #[inline]
-    pub fn visible(&self, mvcc: MvccHeader) -> bool {
+    pub fn visible<S: StoreReadSource>(
+        &self,
+        src: &S,
+        kind: StoreKind,
+        id: u64,
+        mvcc: MvccHeader,
+    ) -> Result<bool, GraphusError> {
+        src.entity_visible_at(kind, id, mvcc, self.snapshot, self.registry)
+    }
+
+    /// The header-only, cross-transaction visibility test (`04 §5.3`), for the callers whose subject is
+    /// **not** an entity that owns an undo chain — a property cell's own stamps, say.
+    ///
+    /// Kept distinct from [`visible`](Self::visible) rather than merged: a caller that reaches for this
+    /// on a node or a relationship silently loses statement granularity, and a differently-named method
+    /// makes that a visible choice instead of an invisible default.
+    #[inline]
+    pub fn visible_header(&self, mvcc: MvccHeader) -> bool {
         is_visible(
             self.snapshot,
             mvcc.created_ts,
@@ -1312,10 +1390,17 @@ pub fn scan_nodes<S: StoreReadSource, K: ReadSink>(src: &S, ctx: &VisCtx, sink: 
                 examined += 1;
                 // A full scan examines every node, so SIREAD-mark each (`04 §5.4`).
                 sink.note_read(node_ssi_key(id));
-                if ctx.visible(rec.mvcc) {
-                    out.push(NodeId(id));
-                } else {
-                    hidden += 1;
+                // Statement-granular existence (`rmp` #972): under `View::Old` a node this very
+                // statement created is not yet there. A chain read fault FAILS CLOSED (`rmp` #733) —
+                // never the header's own verdict, which is the answer the chain corrects.
+                match ctx.visible(src, StoreKind::Node, id, rec.mvcc) {
+                    Ok(true) => out.push(NodeId(id)),
+                    Ok(false) => hidden += 1,
+                    Err(e) => {
+                        sink.note_candidates(examined, hidden, 0);
+                        sink.capture(e);
+                        return Vec::new();
+                    }
                 }
             }
             Err(e) => {
@@ -1382,7 +1467,15 @@ pub fn filter_label_candidates<S: StoreReadSource, K: ReadSink>(
             }
         };
         examined += 1;
-        let visible = ctx.visible(rec.mvcc);
+        // Statement-granular existence (`rmp` #972), fail-closed on a chain read fault (`rmp` #733).
+        let visible = match ctx.visible(src, StoreKind::Node, id, rec.mvcc) {
+            Ok(v) => v,
+            Err(e) => {
+                sink.note_candidates(examined, hidden, filtered);
+                sink.capture(e);
+                return Vec::new();
+            }
+        };
         // SIREAD-mark every examined node, visible or not (the label predicate examined it).
         sink.note_read(node_ssi_key(id));
         if !visible {
@@ -1445,7 +1538,15 @@ pub fn filter_any_label_candidates<S: StoreReadSource, K: ReadSink>(
             }
         };
         examined += 1;
-        let visible = ctx.visible(rec.mvcc);
+        // Statement-granular existence (`rmp` #972), fail-closed on a chain read fault (`rmp` #733).
+        let visible = match ctx.visible(src, StoreKind::Node, id, rec.mvcc) {
+            Ok(v) => v,
+            Err(e) => {
+                sink.note_candidates(examined, hidden, filtered);
+                sink.capture(e);
+                return Vec::new();
+            }
+        };
         // SIREAD-mark every examined node exactly once, visible or not.
         sink.note_read(node_ssi_key(id));
         if !visible {
@@ -1541,9 +1642,18 @@ pub fn scan_label_property_morsel<S: StoreReadSource, K: ReadSink>(
         // SIREAD-mark every examined candidate, visible or not (the predicate examined it) — the
         // identical per-candidate marker `filter_label_candidates` records.
         sink.note_read(node_ssi_key(id));
-        if !ctx.visible(rec.mvcc) {
-            hidden += 1;
-            continue;
+        // Statement-granular existence (`rmp` #972), fail-closed on a chain read fault (`rmp` #733).
+        match ctx.visible(src, StoreKind::Node, id, rec.mvcc) {
+            Ok(true) => {}
+            Ok(false) => {
+                hidden += 1;
+                continue;
+            }
+            Err(e) => {
+                sink.note_candidates(examined, hidden, filtered);
+                sink.capture(e);
+                return (label_matches, values);
+            }
         }
         // Snapshot-correct label membership (`rmp` #767), resolved from the record read above.
         let bitmap = match ctx.labels_at(src, id, rec.labels, rec.mvcc.undo_ptr) {
@@ -1725,9 +1835,18 @@ pub fn scan_filter_eq<S: StoreReadSource, K: ReadSink>(
             }
         };
         seen += 1;
-        if !ctx.visible(rec.mvcc) {
-            hidden += 1;
-            continue;
+        // Statement-granular existence (`rmp` #972), fail-closed on a chain read fault (`rmp` #733).
+        match ctx.visible(src, StoreKind::Node, id, rec.mvcc) {
+            Ok(true) => {}
+            Ok(false) => {
+                hidden += 1;
+                continue;
+            }
+            Err(e) => {
+                sink.note_candidates(seen, hidden, filtered);
+                sink.capture(e);
+                return ScanFilter::default();
+            }
         }
         // Carries the label AS OF THIS SNAPSHOT (`rmp` #767)?
         let bitmap = match ctx.labels_at(src, id, rec.labels, rec.mvcc.undo_ptr) {
@@ -2480,9 +2599,19 @@ pub fn expand_with_csr<S: StoreReadSource, K: ReadSink>(
         // Skip relationships not visible to this snapshot (a concurrently-deleted tombstone an older
         // reader could still traverse, or a later-committed edge). The incidence chain threads them
         // until GC.
-        if !ctx.visible(rec.mvcc) {
-            hidden += 1;
-            continue;
+        // Statement-granular existence (`rmp` #972), fail-closed on a chain read fault (`rmp` #733):
+        // an edge this very statement created is not traversable under `View::Old`.
+        match ctx.visible(src, StoreKind::Rel, rid, rec.mvcc) {
+            Ok(true) => {}
+            Ok(false) => {
+                hidden += 1;
+                continue;
+            }
+            Err(e) => {
+                sink.note_candidates(examined, hidden, filtered);
+                sink.capture(e);
+                return Vec::new();
+            }
         }
         let touches_as_start = rec.start_node == node.0;
         let touches_as_end = rec.end_node == node.0;
@@ -2559,7 +2688,16 @@ pub fn node_exists<S: StoreReadSource, K: ReadSink>(
         }
     };
     sink.note_read(node_ssi_key(node.0));
-    ctx.visible(mvcc)
+    // Statement-granular existence (`rmp` #972). A chain read fault is captured and reported as
+    // "absent" — the same fail-closed discipline as the record `Err` arm above, and for the same
+    // reason: the caller inspects the captured error and abandons the result rather than trusting it.
+    match ctx.visible(src, StoreKind::Node, node.0, mvcc) {
+        Ok(v) => v,
+        Err(e) => {
+            sink.capture(e);
+            false
+        }
+    }
 }
 
 /// The body of `RecordStoreGraph::rel_exists` (`GraphAccess::rel_exists`). A storage `Err` is
@@ -2580,7 +2718,14 @@ pub fn rel_exists<S: StoreReadSource, K: ReadSink>(
         }
     };
     sink.note_read(rel_ssi_key(rel.0));
-    ctx.visible(mvcc)
+    // Statement-granular existence (`rmp` #972); fail-closed like [`node_exists`].
+    match ctx.visible(src, StoreKind::Rel, rel.0, mvcc) {
+        Ok(v) => v,
+        Err(e) => {
+            sink.capture(e);
+            false
+        }
+    }
 }
 
 /// The body of `RecordStoreGraph::node_labels` (`GraphAccess::node_labels`): the node's label names,
@@ -2772,16 +2917,23 @@ pub fn scan_rels_typed<S: StoreReadSource, K: ReadSink>(
             continue;
         }
         sink.note_read(rel_ssi_key(id));
-        if ctx.visible(rec.mvcc) {
+        // Statement-granular existence (`rmp` #972), fail-closed on a chain read fault (`rmp` #733):
+        // this body must return the EXACT visible set — a subset is silent row loss, and answering an
+        // unresolvable existence from the header would be exactly such a wrong row.
+        match ctx.visible(src, StoreKind::Rel, id, rec.mvcc) {
             // The endpoints come straight out of the record just decoded, so the caller never needs a
             // second `rel_data` read (which would also allocate the type name it does not want).
-            out.push(crate::graph_access::ScannedRel {
+            Ok(true) => out.push(crate::graph_access::ScannedRel {
                 rel: RelId(id),
                 start: NodeId(rec.start_node),
                 end: NodeId(rec.end_node),
-            });
-        } else {
-            hidden += 1;
+            }),
+            Ok(false) => hidden += 1,
+            Err(e) => {
+                sink.note_candidates(examined, hidden, filtered);
+                sink.capture(e);
+                return None;
+            }
         }
     }
     sink.note_candidates(examined, hidden, filtered);
@@ -2844,8 +2996,16 @@ pub(crate) fn rel_candidate<S: StoreReadSource, K: ReadSink>(
         }
     };
     sink.note_read(rel_ssi_key(rel.0));
-    if !ctx.visible(rec.mvcc) {
-        return RelCandidate::Hidden;
+    // Statement-granular existence (`rmp` #972). A chain read fault is captured and reported as
+    // `Faulted`, never as `Hidden` — the caller distinguishes the two, and reporting a fault as a
+    // legitimate miss is the swallowed-error shape `rmp` #359 exists to prevent.
+    match ctx.visible(src, StoreKind::Rel, rel.0, rec.mvcc) {
+        Ok(true) => {}
+        Ok(false) => return RelCandidate::Hidden,
+        Err(e) => {
+            sink.capture(e);
+            return RelCandidate::Faulted;
+        }
     }
     let rel_type = src
         .token_name(Namespace::RelType, rec.type_id)
@@ -2879,8 +3039,18 @@ pub fn rel_data_including_deleted<S: StoreReadSource, K: ReadSink>(
             return None;
         }
     };
-    // Visible normally, or a tombstone we wrote ourselves: both keep the type readable.
-    if !ctx.visible(rec.mvcc) && !ctx.deleted_by_self(rec.mvcc) {
+    // Visible normally, or a tombstone we wrote ourselves: both keep the type readable. Statement
+    // granularity applies to the first half only (`rmp` #972) — the self-tombstone discriminator is a
+    // question about our own transaction's stamps, not about which statement wrote them. A chain read
+    // fault is captured and yields `None`, never a type read off an unresolved existence.
+    let visible = match ctx.visible(src, StoreKind::Rel, rel.0, rec.mvcc) {
+        Ok(v) => v,
+        Err(e) => {
+            sink.capture(e);
+            return None;
+        }
+    };
+    if !visible && !ctx.deleted_by_self(rec.mvcc) {
         return None;
     }
     let rel_type = src
@@ -3394,7 +3564,16 @@ pub fn incident_rels<S: StoreReadSource, K: ReadSink>(
             };
             examined += 1;
             sink.note_read(rel_ssi_key(rid));
-            let visible = ctx.visible(mvcc);
+            // Statement-granular existence (`rmp` #972). A chain read fault is captured and the edge
+            // dropped, matching the record-read arm above: the caller inspects the captured error and
+            // abandons the result rather than acting on a partially-read incidence list.
+            let visible = match ctx.visible(src, StoreKind::Rel, rid, mvcc) {
+                Ok(v) => v,
+                Err(e) => {
+                    sink.capture(e);
+                    return false;
+                }
+            };
             if !visible {
                 hidden += 1;
             }

@@ -345,6 +345,25 @@ pub enum LogicalOp {
         count: Expr,
     },
 
+    /// **Open the next statement** of the transaction (`04 §5.1.4`, `rmp` #972): drain `input`, then
+    /// advance the `command_id` every subsequent write is stamped with, then emit the buffered rows.
+    ///
+    /// Planted by [`crate::lower`] above a `WITH` whose upstream contains a write, and nowhere else.
+    /// That is the rule Memgraph plans (`src/query/plan/rule_based_planner.cpp`, `GenWith`:
+    /// `bool advance_command = is_write;`), and the reason it is `WITH`-only is that `RETURN` ends the
+    /// query — `GenReturn` fixes the same flag to `false`, because nothing follows it that could read
+    /// the graph again.
+    ///
+    /// The **drain is the operator's whole point** and is not an implementation detail: advancing the
+    /// command while the previous command's writes are still being produced would stamp part of one
+    /// clause's writes with the next clause's id, and an `OLD`-view read downstream would then see half
+    /// of them. Draining first makes "everything before this point belongs to the earlier command" true
+    /// by construction.
+    AdvanceCommand {
+        /// The upstream relation, drained in full before the command advances.
+        input: Box<LogicalOp>,
+    },
+
     /// Expand `list` into one row per element, binding each to `variable` (openCypher
     /// `UNWIND <list> AS v`).
     ///
@@ -882,6 +901,10 @@ impl LogicalOp {
             }
             Self::Limit { input, count } => {
                 writeln!(f, "Limit({})", fmt_expr(count))?;
+                input.fmt_indented(f, depth + 1)
+            }
+            Self::AdvanceCommand { input } => {
+                writeln!(f, "AdvanceCommand")?;
                 input.fmt_indented(f, depth + 1)
             }
             Self::Unwind {

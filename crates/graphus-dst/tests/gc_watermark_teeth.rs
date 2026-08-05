@@ -111,10 +111,7 @@ fn reader_resolves(store: &Store, node_a: u64, key: u32, reader_snapshot: Snapsh
 /// not by `R`), so any id distinct from every writer in the scenario serves. This is the begin
 /// snapshot `TxnCoordinator::oldest_active_snapshot()` would report while `R` is the only open txn.
 fn reader_snapshot_at_ts1() -> Snapshot {
-    Snapshot {
-        owner: TxnId(999),
-        ts: graphus_core::Timestamp(1),
-    }
+    Snapshot::new(TxnId(999), graphus_core::Timestamp(1))
 }
 
 /// Part 1 — **the fix holds.** A reader on the old (ts 1) snapshot still resolves V1 after a
@@ -184,10 +181,7 @@ fn old_reader_keeps_its_version_under_safe_watermark() {
     );
 
     // Sanity: a fresh reader (snapshot ts 2) correctly sees the new value V2.
-    let fresh = Snapshot {
-        owner: TxnId(998),
-        ts: f.store.snapshot_ts(),
-    };
+    let fresh = Snapshot::new(TxnId(998), f.store.snapshot_ts());
     assert_eq!(
         reader_resolves(&f.store, f.node_a, f.key, fresh),
         Some(V2),
@@ -267,10 +261,7 @@ fn old_reader_loses_its_version_under_buggy_snapshot_ts_watermark() {
     // The live value itself survived the pass: the buggy watermark destroyed the version an open
     // reader still needed, not the property. (A GC regression that emptied the cell outright would
     // fail here while the assertions above still passed.)
-    let fresh = Snapshot {
-        owner: TxnId(998),
-        ts: f.store.snapshot_ts(),
-    };
+    let fresh = Snapshot::new(TxnId(998), f.store.snapshot_ts());
     assert_eq!(
         reader_resolves(&f.store, f.node_a, f.key, fresh),
         Some(V2),

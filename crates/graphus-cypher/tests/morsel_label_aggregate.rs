@@ -91,7 +91,7 @@ impl Coordinated {
     /// A coordinated live `RecordStoreGraph` for a read transaction at snapshot `ts`, registered with the
     /// shared SSI tracker — the same shape the coordinator's `statement` builds.
     fn live_at(&self, txn: TxnId, ts: graphus_core::Timestamp) -> Live {
-        let snapshot = Snapshot { owner: txn, ts };
+        let snapshot = Snapshot::new(txn, ts);
         self.ssi.borrow_mut().register(txn, ts);
         RecordStoreGraph::attach(
             Rc::clone(&self.store),

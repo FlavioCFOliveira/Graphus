@@ -13,6 +13,20 @@
 //! The two header words are raw `u64`s decoded through [`VersionStamp`];
 //! the [`CommitRegistry`] resolves in-flight writers. This module is **pure** — no mutation, no
 //! locking — which is exactly why reads never block writers (`04 §5.7`, NFR-4).
+//!
+//! ## What this module deliberately cannot answer (`rmp` #972)
+//!
+//! The header records **which transaction** created or expired a version and never **which statement
+//! of it**, because `05 §12.2` puts the `command_id` on the undo delta rather than in the live
+//! record. So the "own uncommitted writes" override above is stated at *transaction* granularity, and
+//! it is the strongest answer these two words support.
+//!
+//! Statement granularity — [`View::Old`](crate::View), the rule that stops a statement from
+//! observing its own writes — is therefore resolved one layer down, against the entity's undo chain:
+//! `graphus_storage::read_view::entity_visible_at` refines this predicate for exactly the case the
+//! header cannot decide, and `graphus_storage::scan_polarity::delta_verdict` applies the same rule to
+//! properties, labels and adjacency. A caller that needs the statement-granular answer must use those
+//! seams; this function is the cross-transaction half, and is complete as such.
 
 use crate::oracle::VersionStamp;
 use crate::snapshot::{CommitRegistry, Snapshot, TxnOutcome};
@@ -84,10 +98,7 @@ mod tests {
     use graphus_core::{Timestamp, TxnId};
 
     fn snap(owner: u64, ts: u64) -> Snapshot {
-        Snapshot {
-            owner: TxnId(owner),
-            ts: Timestamp(ts),
-        }
+        Snapshot::new(TxnId(owner), Timestamp(ts))
     }
 
     fn committed(ts: u64) -> u64 {

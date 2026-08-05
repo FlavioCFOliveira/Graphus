@@ -203,6 +203,10 @@ pub use graphus_index::fulltext::Analyzer;
 pub use graphus_storage::{
     ConstraintKind, FulltextEntity, SpatialEntity, VectorEntity, VectorSimilarity,
 };
+/// The MVCC statement view (`04 §5.1.4`, `rmp` #972), re-exported because it appears in
+/// [`GraphAccess`]'s own signature: an implementor of the seam must be able to name it without
+/// depending on `graphus-txn` directly.
+pub use graphus_txn::View;
 pub use index_set::{ConstraintRule, IndexSet};
 pub use lexer::{IntBase, IntLiteral, LexError, LexErrorKind, Span, Token, TokenKind, tokenize};
 pub use logical::{

@@ -100,7 +100,7 @@
 
 use std::collections::HashSet;
 
-use graphus_core::{GraphusError, Result, TxnId, VersionStamp};
+use graphus_core::{CommandId, GraphusError, Result, TxnId, VersionStamp};
 use graphus_txn::Snapshot;
 
 use crate::record::PropRecord;
@@ -242,9 +242,22 @@ pub(crate) fn delta_verdict(
         VersionStamp::Committed(ts) if ts <= snapshot.ts => DeltaVerdict::Stop,
         // Committed after this snapshot: undo it.
         VersionStamp::Committed(_) => DeltaVerdict::Apply,
-        // This snapshot's own writer: its uncommitted changes are visible to itself, so the image
-        // already reflects them and the walk is done.
-        VersionStamp::InFlight(w) if w == snapshot.owner => DeltaVerdict::Stop,
+        // This snapshot's own writer. Whether its uncommitted change is already reflected in the
+        // image is a **statement**-granularity question (`04 §5.1.4`): under `View::New` every one of
+        // our own writes is, so the walk is done; under `View::Old` the current statement's own
+        // writes are not, so they are undone and the walk continues down to the previous statement's.
+        //
+        // Continuing is sound for the same reason stopping is: our own deltas sit at the head of the
+        // chain in the order we linked them, so their command ids descend as the walk descends, and
+        // below them sit only commit-ordered deltas. The walk therefore still meets `Stop` exactly
+        // once, and never revisits a version it has already accounted for.
+        VersionStamp::InFlight(w) if w == snapshot.owner => {
+            if snapshot.hides_own_command(CommandId(delta.command_id)) {
+                DeltaVerdict::Apply
+            } else {
+                DeltaVerdict::Stop
+            }
+        }
         // Another open writer: invisible to this snapshot, so undo it.
         VersionStamp::InFlight(_) => DeltaVerdict::Apply,
         // `commit_ts` is `0`, which `CommitSlot::decode` already rejects — so reaching here means the
@@ -690,6 +703,7 @@ pub(crate) fn open_writer_of(slot: CommitSlot) -> Option<TxnId> {
 #[cfg(test)]
 mod tests {
     use graphus_core::{Timestamp, TxnId};
+    use graphus_txn::View;
 
     use super::*;
     use crate::record::MvccHeader;
@@ -751,9 +765,56 @@ mod tests {
     }
 
     fn snapshot_at(owner: u64, ts: u64) -> Snapshot {
-        Snapshot {
-            owner: TxnId(owner),
-            ts: Timestamp(ts),
+        Snapshot::new(TxnId(owner), Timestamp(ts))
+    }
+
+    /// [`delta_verdict`]'s statement arm, asserted directly on the three-way answer (`rmp` #972).
+    ///
+    /// The chain walks above this go through the fold, so an inverted comparison could in principle
+    /// be compensated for somewhere else; this pins the verdict itself. Everything **except** the own
+    /// in-flight writer must be untouched by the view, which is the other half of the claim.
+    #[test]
+    fn the_verdict_of_an_own_delta_is_decided_by_the_statement_and_the_view() {
+        let mine = TxnId(9);
+        let slot = in_flight(mine.0);
+        let mut delta = UndoDelta::new(UndoAction::SetProperty, 1, 0, 0);
+
+        for (writer_cmd, new_view, old_view) in [
+            // an earlier statement's write: already reflected under both views
+            (1u32, DeltaVerdict::Stop, DeltaVerdict::Stop),
+            // the current statement's own write: the one case the views disagree about
+            (5, DeltaVerdict::Stop, DeltaVerdict::Apply),
+            // a later statement's write: never reflected
+            (6, DeltaVerdict::Apply, DeltaVerdict::Apply),
+            // written outside any statement — the transaction's baseline, never undone
+            (0, DeltaVerdict::Stop, DeltaVerdict::Stop),
+        ] {
+            delta.command_id = writer_cmd;
+            for (view, expected) in [(View::New, new_view), (View::Old, old_view)] {
+                let snap = Snapshot::at_command(mine, Timestamp(30), CommandId(5), view);
+                assert_eq!(
+                    delta_verdict(&delta, Some(slot), snap, 1).expect("verdict"),
+                    expected,
+                    "delta written by command {writer_cmd}, read at command 5 on {view:?}"
+                );
+            }
+        }
+
+        // The view decides nothing outside our own in-flight writer.
+        for (slot, expected) in [
+            (committed(20), DeltaVerdict::Stop), // committed at or before the snapshot
+            (committed(40), DeltaVerdict::Apply), // committed after it
+            (in_flight(7), DeltaVerdict::Apply), // another open writer
+            (aborted(7), DeltaVerdict::Skip),    // an aborted one
+        ] {
+            for view in [View::New, View::Old] {
+                let snap = Snapshot::at_command(mine, Timestamp(30), CommandId(5), view);
+                assert_eq!(
+                    delta_verdict(&delta, Some(slot), snap, 1).expect("verdict"),
+                    expected,
+                    "{view:?} must not change a verdict about another transaction"
+                );
+            }
         }
     }
 

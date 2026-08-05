@@ -10,9 +10,9 @@ to the domain/component it constrains. On ratification, the chosen option is rec
 and its status set to `ratified`.
 
 > **Status: all 24 decisions of the original 2026-06-05 round are ratified.** The chosen option is
-> recorded on each `Decision` node (`status: ratified`, property `chosen`). Twenty further decisions
-> were ratified after that round; they are recorded in the same index below, each carrying its own
-> ratification date. The register therefore holds **44 decisions** in total. The decision index in
+> recorded on each `Decision` node (`status: ratified`, property `chosen`). Twenty-one further
+> decisions were ratified after that round; they are recorded in the same index below, each carrying
+> its own ratification date. The register therefore holds **45 decisions** in total. The decision index in
 > the next section is the canonical enumeration; the options tables below it are kept for the
 > rationale and trade-offs, and are not a decision list.
 
@@ -82,6 +82,7 @@ Parse contract, to be preserved by any future edit:
 | `D-rollback-dispatch` | ratified | 2026-08-05 | **A rollback is dispatched by one test — whether the transaction owns a commit-info slot — and there are exactly two paths.** A transaction that linked any delta owns a slot, so every change it made to MVCC state is on an undo chain and is undone **logically**: it applies its own deltas newest-first against the *current* state, detaches them (always a head prefix, never a splice in the middle), reclaims them with its slot, and ends in the log with an `ABORT` record carrying no compensation. A transaction with **no** slot linked no delta; two kinds reach that case — a maintenance pass (GC reclamation, corpse splice, freeze sweep), whose writes are physical space management naming no MVCC version, and a catalog-only writer, whose effects are in-memory schema that the metadata page settles — and both keep the **physical** ARIES path, because physical undo is the right inverse of a physical change and a GC pass is a single non-yielding call, so no concurrent writer can stale its pre-images. Retiring the physical path outright belongs to the tasks that version the catalog and make collection concurrent, not to task **#970**. Closes `04-technical-design.md` §5.1.5 row 4; design in `04-technical-design.md` §4.3, §4.4 and §5.1.5. |
 | `D-chain-head-redo-only` | ratified | 2026-08-05 | **A chain-head publication (`undo_ptr`, `first_rel`, `first_prop`) and the relink of the head it displaces are logged redo-only, with an empty undo image.** Their inverse is to *unlink the entry*, computed at abort time from the transaction's own deltas, and never the restoration of the word. Neither form of restoration could be made safe: a plain pre-image undo of a shared head clobbers a concurrently-committed prepend (the whole of `rmp` #220), and the compare-and-set undo that replaced it was narrower but still unsound, because it restores an **id**, and once a slot can be freed and handed out again the id it restores may name a different record. The state a redo-only write leaves after recovery is a head naming a `!in_use` record — a **corpse**, which every chain walk in the storage core already threads through and the GC splice reclaims — and that is the state `rmp` #220 / #172 already designed the header-only creation undo around. Two exceptions are deliberate: the GC's clearing of `undo_ptr` keeps a physical undo, because it is not a prepend; and the compare-and-set undo itself is **not** retired, surviving on the node's `labels` word and on the MVCC header word, where a whole-word write's inverse *is* the word. Closes the chain-head half of `04-technical-design.md` §5.1.5 row 3; design in `04-technical-design.md` §4.4, and format consequences in `05-storage-format.md` §7 and §12.5. |
 | `D-orphan-slot-parking` | ratified | 2026-08-05 | **A record slot that a logical rollback orphans is parked in memory until the next garbage-collection pass, not returned to the free list by the abort itself.** The abort knows the slot is unreachable — it is what unlinked it — so the restraint is deliberate, and its reason lies outside the storage engine: the latest-state TEXT, FULLTEXT and SPATIAL indexes are in memory, **not transactional**, and key their documents by **physical node id**. An aborted node's posting survives its rollback as a harmless false positive that the re-check filters out, but recycling the id immediately turns the next writer's *insert* into what the index reads as the **replacement of a still-committed document** — the one shape `rmp` #756 must fail closed on, at the cost of a poisoned freshness marker and of every text or spatial seek degrading to a full scan until a rebuild. Parking keeps the space guarantee (the slots do come back, so an abort-heavy workload does not grow the store) while moving the recycle to a maintenance boundary; the GC phase is guarded on the record still being retired, so a slot legitimately re-used by some other path is never double-freed. The parking becomes unnecessary once those indexes are version-aware. Design in `04-technical-design.md` §5.1.5. |
+| `D-statement-isolation` | ratified | 2026-08-05 | **A statement does not observe its own writes, and the rule is one comparison operator over the delta's `command_id`.** Every read carries a **view** — `New` (the default) or `Old` — beside its snapshot; the view decides nothing about other transactions and only whether the reader's own uncommitted deltas are undone (`New`: written by a later command; `Old`: written by a later command **or by the current one**). A delta written outside any statement carries `command_id = 0` and is undone by **no** view, because it belongs to the transaction's baseline rather than to a statement. The counter lives in the record store, which is its single source of truth, and it advances at exactly **two** points: when a cursor opens, and at a `WITH` that follows a write. Polarity is fixed per clause: `Old` for every scan, every index seek, every relationship expansion, a `MATCH`'s `Filter`, `UNWIND` and a read-only procedure `CALL`; `New` for `MERGE`'s match sub-plan, every update clause, projection, aggregation and ordering, and a writing procedure `CALL`. The planner's `Eager` barriers are **all retained**: they decouple row production while the view re-polarises visibility, and reforming them is separate work. Closes the `command_id` half of `04-technical-design.md` §5.1.4; design in `04-technical-design.md` §§5.1.4, 5.3 and `05-storage-format.md` §12.2. |
 
 <!-- END decision-index -->
 
@@ -339,7 +340,14 @@ scope and are propagated into `00-overview.md` and `01-needs-survey.md`:
 > | Labels are a bitmap **mutated in place**, whose version history exists **only in memory** and is therefore not durable and not recoverable. | `crates/graphus-storage/src/label_history.rs:143` (`pub struct LabelHistory`), an in-process structure shared by `Arc` between the engine thread and the reader pool. |
 > | Chain heads and the label word are undone by an **ad-hoc compare-and-set**, one bespoke mechanism per field, because a whole-record pre-image undo would revert words a concurrently-committed writer legitimately owns. | `crates/graphus-storage/src/record.rs:114-123`; `crates/graphus-storage/src/store.rs:2507` (`write_chain_head`) and `:2541` (the label word). |
 > | Rollback is **physical ARIES undo**: it reverts bytes. This is the origin of the recurring defect family rmp #220 / #172 / #239 / #301 / #578 / #772 — every one of them a case of one transaction's byte-level undo damaging another's committed state. | `RecordStore::rollback`, `crates/graphus-storage/src/store.rs:3644`. |
-> | There is **no `command_id`**, so there is no statement-level isolation: a statement cannot be shown the state that preceded it within its own transaction. | `command_id` has **zero** occurrences across `crates/graphus-txn` and `crates/graphus-storage`. |
+> | There is **no `command_id`**, so there is no statement-level isolation: a statement cannot be shown the state that preceded it within its own transaction. *(Closed by task **#972**; see `D-statement-isolation`, ratified 2026-08-05.)* | `command_id` had **zero** occurrences across `crates/graphus-txn` and `crates/graphus-storage`. |
+>
+> **This table is the state of the engine as it was read on 2026-08-02, and it is kept as that
+> record rather than maintained.** Every finding in it has since been closed: tasks #966 to #972
+> built the undo area and the chain, moved properties, labels and adjacency onto it, made rollback
+> logical, retired the lock table and the deadlock detector, and delivered `command_id`. What each
+> mechanism was replaced by, and in which task, is tabulated in `04-technical-design.md` §5.1.5,
+> which is the authoritative and maintained list.
 >
 > **The four ratified decisions.**
 >
@@ -430,8 +438,8 @@ scope and are propagated into `00-overview.md` and `01-needs-survey.md`:
 >
 > | Decision | Ratified choice | Grounding |
 > | --- | --- | --- |
-> | **`D-rollback-dispatch`** | **Logical undo for a transaction that owns a commit-info slot; the ARIES physical path for one that does not.** The two kinds that own no slot are a maintenance pass and a catalog-only writer. | Memgraph's abort is the same walk over the transaction's own deltas (`/data/refsrc/memgraph/src/storage/v2/inmemory/storage.cpp:1489-1560`). The dispatch is `RecordStore::rollback` (`crates/graphus-storage/src/store.rs:5795`), over `rollback_logical` (`:5840`) and `rollback_physical` (`:5916`). |
-> | **`D-chain-head-redo-only`** | **Chain-head publications and the relink of the displaced head log a redo image and an empty undo image.** The compare-and-set undo survives only where a whole-word write's inverse is the word itself. | `WalManager::log_update_redo_only` (`crates/graphus-wal/src/manager.rs:378`) and `RecordStore::write_field_redo_only` (`crates/graphus-storage/src/store.rs:3052`). The unsoundness of the compare-and-set undo was **reproduced**, not argued: the DST simulator (VOPR seed 12) drops a committed edge out of its node's incidence chain after recovery, because the restored id names a slot that had since been freed and re-used. |
+> | **`D-rollback-dispatch`** | **Logical undo for a transaction that owns a commit-info slot; the ARIES physical path for one that does not.** The two kinds that own no slot are a maintenance pass and a catalog-only writer. | Memgraph's abort is the same walk over the transaction's own deltas (`/data/refsrc/memgraph/src/storage/v2/inmemory/storage.cpp:1489-1560`). The dispatch is `RecordStore::rollback` (`crates/graphus-storage/src/store.rs:5941`), over `rollback_logical` (`:5840`) and `rollback_physical` (`:6062`). |
+> | **`D-chain-head-redo-only`** | **Chain-head publications and the relink of the displaced head log a redo image and an empty undo image.** The compare-and-set undo survives only where a whole-word write's inverse is the word itself. | `WalManager::log_update_redo_only` (`crates/graphus-wal/src/manager.rs:378`) and `RecordStore::write_field_redo_only` (`crates/graphus-storage/src/store.rs:3132`). The unsoundness of the compare-and-set undo was **reproduced**, not argued: the DST simulator (VOPR seed 12) drops a committed edge out of its node's incidence chain after recovery, because the restored id names a slot that had since been freed and re-used. |
 > | **`D-orphan-slot-parking`** | **A slot orphaned by a logical rollback is parked until the next GC pass.** | The latest-state TEXT / FULLTEXT / SPATIAL indexes are in-memory, non-transactional and keyed by physical node id (`rmp` #467 / #756). The failure the parking prevents is reproduced by `crates/graphus-cypher/tests/text_index.rs::rmp756_constraint_rejected_insert_keeps_the_text_seek_selective`, where two constraint-rejected `CREATE`s in a row recycled one id. |
 >
 > **The consequences that are normative.**
@@ -460,6 +468,97 @@ scope and are propagated into `00-overview.md` and `01-needs-survey.md`:
 > the delta-application order, the detach and the measured cost are §5.1.2 step 5 and §5.1.5 row 4;
 > the parked slots are §5.1.5. The format-side consequences are `05-storage-format.md` §7 (the
 > chain-head write carries no undo image) and §12.5 (how a live abort and a crashed loser differ).
+
+## Ratified decision (2026-08-05) — statement-level isolation
+
+> **`D-statement-isolation` settles how a statement is isolated from its own writes, in task #972.**
+> It refines the 2026-08-02, 2026-08-03 and 2026-08-04 rounds, and the logical-rollback round of the
+> same day, rather than replacing any part of them:
+> `D-version-representation`, `D-write-conflict-detection`, `D-multi-writer`,
+> `D-dst-writer-scheduler`, `D-incidence-anchor`, the four property-path decisions and the three
+> logical-rollback decisions are unchanged, and every one of the four inviolable requirements of
+> `CLAUDE.md` stands as written. **No byte of the frozen undo-area format
+> (`05-storage-format.md` §12) changes**: the delta's `command_id` field kept its offset and its
+> width and stopped being always zero.
+>
+> **Status: ratified.**
+>
+> **Why now.** Tasks #966 to #971 put every mutation kind on the undo chain and made the entity's own
+> MVCC header the engine's only conflict mechanism. `command_id` was the last field of the frozen
+> delta that no write path filled in, and the guarantee it exists for — that a statement does not
+> observe the rows it is itself creating — was carried entirely by the planner's eagerness barriers.
+> Five questions had to be answered before the mechanism could be written down without ambiguity:
+> what the rule is, including at both ends of its range; where the counter lives and who may stamp a
+> delta with it; where it advances; which clause reads under which view; and what becomes of the
+> eagerness barriers the new mechanism partly duplicates.
+>
+> | Facet | Ratified choice |
+> | --- | --- |
+> | The rule | **A read carries a view — `New` (the default) or `Old` — beside its snapshot, and the view decides nothing about other transactions.** It decides only whether one of the reader's **own** uncommitted deltas is undone: under `New` when the delta's command is **later** than the reader's, under `Old` when it is later **or the same**. The two views differ by one comparison operator and nothing else. |
+> | The `NONE` carve-out | **A delta written outside any statement carries `command_id = 0` and is undone by no view, at any command.** Recovery, maintenance passes and the catalog write deltas without ever running a statement; such a write belongs to the transaction's **baseline**, not to a statement. Without the carve-out, `0 >= 0` makes a maintenance transaction's own `Old` read erase its own work. A transaction's first statement therefore runs at `1`, so that its `Old` view excludes every delta the transaction could have written. |
+> | Where the counter lives | **In the record store, which is its single source of truth**, and it is stamped onto the delta by the store's own delta-linking path. **No caller may supply a `command_id`**, exactly as none may supply a `commit_info`: a caller that could would be able to stamp a delta with a statement that is not running. The counter **saturates** rather than wrapping, because a wrap would make a later statement's writes look older than its first. |
+> | Where it advances | **Two points, and only two: when a cursor opens, and at a `WITH` that follows a write.** The `WITH` case is a dedicated operator that **drains its input before advancing**, so that no clause is split across two commands. It does **not** advance at the coordinator's per-statement graph-seam factory, which runs again on every resume of a suspended cursor, nor when a correlated sub-plan opens a seeded cursor. |
+> | Polarity per clause | **`Old` for every access path, `New` for everything else.** `Old`: every node and relationship scan, every index seek of every kind, every relationship expansion, a `MATCH`'s `Filter`, `UNWIND`, and a read-only procedure `CALL`. `New`: `MERGE`'s match sub-plan, `CREATE` / `SET` / `REMOVE` / `DELETE` / `FOREACH`, the projection of `RETURN` and `WITH`, aggregation and ordering, and a writing procedure `CALL`. A seek and the scan it replaces read the **same** view, and the view filter is applied **per candidate the index returns**. |
+> | The `Eager` barriers | **All retained, deliberately.** `Eager` decouples row production across a clause boundary; the view re-polarises visibility across it. Retiring the barriers in the task that introduced the views would let the two mechanisms mask each other, so their reform is separate work. |
+>
+> **The alternatives weighed.**
+>
+> - **Planner-only eagerness, as the sole mechanism.** This is Neo4j's answer to the same family:
+>   `EagerWhereNeededRewriter` "insert[s] Eager only where it's needed to maintain correct semantics"
+>   (Source, read 2026-08-05:
+>   `/data/refsrc/neo4j/community/cypher/cypher-planner/src/main/scala/org/neo4j/cypher/internal/compiler/planner/logical/plans/rewriter/eager/EagerWhereNeededRewriter.scala:64`),
+>   driven by a read/write conflict analysis (`ConflictFinder`, `WriteFinder`,
+>   `ReadsAndWritesFinder` in the same package). Rejected **as the sole mechanism** on two grounds.
+>   Correctness would rest on that analysis being complete, so a conflict it does not model is a
+>   wrong answer with nothing beneath it to catch the miss; and a barrier costs full materialisation
+>   of its input where a view costs one comparison. Not rejected **as a mechanism**: the barriers
+>   stay, as the facet table records.
+> - **Statement-scoped visibility on the version chain.** Chosen. Memgraph carries exactly this, as a
+>   two-valued `View` beside the snapshot (Source, read 2026-08-05:
+>   `/data/refsrc/memgraph/src/storage/v2/view.hpp`) that its chain walk resolves against the delta's
+>   `command_id` — `View::NEW` stops on `cid <= transaction->command_id`, `View::OLD` on
+>   `cid < transaction->command_id` (`src/storage/v2/mvcc.hpp:72-94`) — and it plants the `OLD`
+>   polarity as the **default** on `ScanAll` and every `ScanAllBy*` variant
+>   (`src/query/plan/operator.hpp:565` and twelve sibling declarations), re-verifying each index
+>   candidate under that view rather than trusting the entry
+>   (`src/storage/v2/inmemory/label_property_index.cpp:444`). PostgreSQL is the same rule against a
+>   different representation: a tuple its own transaction inserted is invisible when
+>   `HeapTupleHeaderGetCmin(tuple) >= snapshot->curcid`
+>   (`/data/refsrc/postgres/src/backend/access/heap/heapam_visibility.c:965`), with `curcid` captured
+>   at `GetSnapshotData` (`src/backend/storage/ipc/procarray.c:2455`) and advanced by
+>   `CommandCounterIncrement` (`src/backend/access/transam/xact.c:1129-1171`). Graphus follows
+>   Memgraph's placement, because Graphus's delta chain **is** Memgraph's representation, and the
+>   field was already reserved for it by `05-storage-format.md` §12.2.
+> - **Advancing the counter on every statement-seam call.** Rejected: that seam runs again on **every
+>   resume** of a suspended cursor, so a long-running `CREATE` would advance the counter mid-flight
+>   and hide from itself the rows it had already applied in earlier batches. The advance therefore
+>   sits at cursor open, which is the one seam the server, the TCK harness, the CLI and the tests all
+>   funnel through.
+> - **Wrapping the counter at `u32::MAX`.** Rejected: a wrap makes a later statement's own writes look
+>   older than its first, which is a visibility error and not an overflow. Graphus saturates;
+>   PostgreSQL declines the same wrap by raising an error at the same ceiling
+>   (`CommandCounterIncrement`, "cannot have more than 2^32-2 commands in a transaction").
+>
+> **The consequences that are normative.**
+>
+> - **The label creator gate is narrowed to the creating statement.** A node the writing transaction
+>   created is not label-versioned, because no reader can ask what its labels were before. That
+>   justification now holds only **within the creating statement**: a node created by statement 1 and
+>   labelled by statement 2 is visible to statement 2's `Old` view. The gate is therefore "created by
+>   this **statement**", and the bulk-create fast path (`CREATE (:L)`) is unaffected.
+> - **A statement-granular read that faults fails closed.** An entity whose existence or whose value
+>   cannot be resolved from the chain fails the read; it is never answered with the record header's
+>   own verdict, which is the answer the chain was consulted to correct.
+> - **`graphus_txn::is_visible` remains the cross-transaction answer and is complete as such.** The
+>   record header names the transaction that created or expired a version and never the statement, so
+>   the statement-granular answer lives one layer down, on the chain.
+>
+> **Where this is specified.** The rule, the carve-out, the counter's home, the two advance points,
+> the per-clause polarity table and the coexistence with `Eager` are `04-technical-design.md` §5.1.4;
+> the split between the cross-transaction predicate and the chain-resolved refinement is §5.3; the
+> narrowed label creator gate is §5.1.5 "row 2, second consequence". The format-side clarification —
+> what `command_id == 0` means and who writes the field, with no byte of the frozen layout changing —
+> is `05-storage-format.md` §12.2.
 
 ## TCK target (pinned — closes `D-cypher-line` open question 1)
 

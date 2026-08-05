@@ -6,6 +6,13 @@
 //!
 //! - **MVCC visibility** to the letter of `04 §5.3` ([`visibility`]): a transaction reads from a
 //!   consistent snapshot; reads take **no locks** and never block writers (`§5.7`, NFR-4).
+//! - **Statement-level isolation** (`§5.1.4`, `rmp` #972): a [`Snapshot`] names not only the
+//!   transaction and its begin timestamp but the **statement** within it ([`graphus_core::CommandId`])
+//!   and which side of that statement the read is taken on ([`View`]). `View::New` is
+//!   read-your-own-writes in full; `View::Old` is the state the statement started from, which is what
+//!   stops a statement from observing the rows it is itself producing (the Halloween problem). The
+//!   rule is one comparison, [`command_hides_own_write`], and the chain walk in `graphus-storage`
+//!   applies it.
 //! - **Serializable Snapshot Isolation** ([`ssi`]): non-blocking SIREAD markers, rw-antidependency
 //!   tracking, and pivot abort with PostgreSQL-style safe retry (`§5.4`). **Snapshot Isolation** is
 //!   a documented weaker opt-in ([`IsolationLevel`]).
@@ -76,7 +83,9 @@ pub use manager::{
 };
 pub use oracle::{TimestampOracle, VersionStamp};
 pub use serializability::{HistoryChecker, Op, TxnHistory};
-pub use snapshot::{CommitRegistry, IsolationLevel, Snapshot, TxnOutcome};
+pub use snapshot::{
+    CommitRegistry, IsolationLevel, Snapshot, TxnOutcome, View, command_hides_own_write,
+};
 pub use ssi::{PredicateRead, SsiReadBuffer, SsiTracker};
 #[cfg(any(test, feature = "test-support"))]
 pub use store::MemVersionedStore;

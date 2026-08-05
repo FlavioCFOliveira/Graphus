@@ -43,6 +43,7 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::Instant;
 
 use graphus_core::Value;
+use graphus_txn::View;
 
 use crate::ast::{Expr, ExprKind, Label, RelDirection, RelType, SortDirection, VarLengthRange};
 use crate::binding::BoundParameters;
@@ -271,6 +272,29 @@ struct Ctx<'a> {
 }
 
 impl Ctx<'_> {
+    /// Runs `f` with the graph seam switched to `view`, restoring the previous view **unconditionally**
+    /// on the way out (`04 §5.1.4`, `rmp` #972).
+    ///
+    /// This is the whole of the per-operator polarity table: an operator wraps its **own** graph
+    /// accesses in the view its openCypher semantics owe, and nothing else. It must never wrap a
+    /// child's `next()` — that would impose this operator's polarity on the entire subtree, which is
+    /// exactly the bug the table exists to avoid (a `Filter` is `Old`, but the `Create` beneath it is
+    /// `New`).
+    ///
+    /// Nesting is safe precisely because of that discipline plus the restore: a `Filter` reading under
+    /// `Old` may evaluate an `EXISTS { … }` whose inner `Produce` reads under `New` and hands `Old`
+    /// back before the predicate finishes.
+    ///
+    /// The restore runs on the **error** path too, because `f` returns its `Result` rather than using
+    /// `?` inside this function — a view left switched after an early return would silently re-polarise
+    /// every subsequent read of the statement.
+    fn with_view<R>(&mut self, view: View, f: impl FnOnce(&mut Self) -> R) -> R {
+        let previous = self.graph.set_read_view(view);
+        let out = f(self);
+        self.graph.set_read_view(previous);
+        out
+    }
+
     /// Polls the cancellation token at a safe point; `Err(Cancelled)` unwinds the pipeline.
     ///
     /// The explicit cancel flag (client disconnect / `RESET` / external abort) is a cheap atomic load
@@ -699,7 +723,15 @@ impl Operator {
             Operator::Filter { input, predicate } => {
                 while let Some(row) = input.next(ctx)? {
                     ctx.check_cancelled()?;
-                    let t = predicate_truth(predicate, &row, ctx)?;
+                    // OLD (`rmp` #972). Memgraph: *"newly set values should not affect filtering of
+                    // old nodes and edges"* (`src/query/plan/operator.cpp`, `FilterCursor::Pull`). The
+                    // predicate is the `WHERE` of a `MATCH`, and it must judge the rows the statement
+                    // matched, not the rows the statement has since rewritten.
+                    //
+                    // Only the predicate is wrapped — never `input.next(ctx)` above it, which is a
+                    // child's work under the child's own polarity.
+                    let t =
+                        ctx.with_view(View::Old, |ctx| predicate_truth(predicate, &row, ctx))?;
                     if t.is_true() {
                         return Ok(Some(row));
                     }
@@ -722,6 +754,24 @@ impl Operator {
                 steps,
             } => {
                 if let Some(mut row) = input.next(ctx)? {
+                    // NEW (`rmp` #972), and this one is **measured**, not reasoned.
+                    //
+                    // The intuition says `Old`: the path is made of the relationships an expansion
+                    // produced, so it should be read the way they were. That is wrong, and the openCypher
+                    // TCK says so — `clauses/merge/Merge5.feature` [10] "Merge should bind a path":
+                    //
+                    //     MERGE (a {num: 1}) MERGE (b {num: 2}) MERGE p = (a)-[:R]->(b) RETURN p
+                    //
+                    // binds a path over a relationship the SAME statement just created. Under `Old`
+                    // `rel_data` cannot see it, the orientation lookup falls back to its default, and the
+                    // path comes back pointing at the wrong endpoint. (Measured: the scenario is the one
+                    // TCK regression the `Old` reading produced, 3913/3914.)
+                    //
+                    // The reason is that this operator does not *match* anything. Every id it uses is
+                    // already bound in the row; it only materialises the path value from them — which is
+                    // what `Produce` does, and `Produce` is `New`. Memgraph makes the same distinction by
+                    // construction: its `ConstructNamedPath` reads no storage at all, taking orientation
+                    // from the frame.
                     let path = reconstruct_named_path(&row, start, steps, &*ctx.graph);
                     row.set(variable.name.clone(), path);
                     Ok(Some(row))
@@ -789,14 +839,19 @@ impl Operator {
                 // Evaluate the list **structurally** (`eval`, not `eval_value`) so a list of nodes /
                 // relationships / paths is preserved — collapsing through a property `Value` would
                 // turn each entity into `Null` (regression guard: `UNWIND collect(node) AS x`).
-                let listv = eval(
-                    list,
-                    &base,
-                    ctx.params,
-                    ctx.graph,
-                    ctx.functions,
-                    &ctx.clock,
-                )?;
+                // OLD (`rmp` #972): `UNWIND` is a read clause, and its list expression may read the
+                // graph (`UNWIND [x IN nodes(p) | x.v] AS v`). It owes the same polarity as the
+                // `WHERE` beside it — the state as the statement found it.
+                let listv = ctx.with_view(View::Old, |ctx| {
+                    eval(
+                        list,
+                        &base,
+                        ctx.params,
+                        ctx.graph,
+                        ctx.functions,
+                        &ctx.clock,
+                    )
+                })?;
                 let elems = match listv.as_list_elems() {
                     Some(items) => VecDeque::from(items),
                     // UNWIND null produces no rows for that input row (Cypher).
@@ -879,59 +934,75 @@ impl Operator {
                 // e.g. `MATCH ()-[r]-() MATCH (a)-[r]-(b)`, or a list `MATCH (a)-[rs*]->(b)` with
                 // `rs` bound to a relationship list) constrains the traversal to exactly that
                 // relationship / list rather than enumerating fresh ones (TCK `Match4` [7]/[8]).
+                // OLD for every traversal below (`rmp` #972): an expansion must not follow the
+                // relationships its own statement is creating. Memgraph constructs `Expand` /
+                // `ExpandVariable` cursors under `storage::View::OLD` for the same reason.
+                //
+                // The wrap covers only this driving row's expansion — `input.next(ctx)` above already
+                // ran, under the child's polarity.
                 if base.get(&relationship.name).is_some() {
-                    bound_rel_expand(
-                        &base,
-                        from,
-                        relationship,
-                        to,
-                        *direction,
-                        types,
-                        *into,
-                        range.is_some(),
-                        prior_rels,
-                        ctx,
-                        pending,
-                    )?;
+                    ctx.with_view(View::Old, |ctx| {
+                        bound_rel_expand(
+                            &base,
+                            from,
+                            relationship,
+                            to,
+                            *direction,
+                            types,
+                            *into,
+                            range.is_some(),
+                            prior_rels,
+                            ctx,
+                            pending,
+                        )
+                    })?;
                     // `rmp` #870b: this traversal does not go through the walk that applies the
                     // far-endpoint predicate, so it is applied here instead. The planner declines to
                     // set `to_predicate` for a shape that can reach this branch, so this is a belt
                     // rather than a load-bearing path — but a predicate silently skipped would be a
                     // wrong answer, and that is not something to leave to a plan-time gate alone.
-                    retain_rows_satisfying(pending, to_predicate.as_ref(), ctx)?;
+                    ctx.with_view(View::Old, |ctx| {
+                        retain_rows_satisfying(pending, to_predicate.as_ref(), ctx)
+                    })?;
                 } else if let Some(range) = range {
-                    var_expand_into_pending(
-                        &base,
-                        from,
-                        relationship,
-                        to,
-                        *direction,
-                        type_names,
-                        *into,
-                        *range,
-                        prior_rels,
-                        rel_props.as_ref(),
-                        to_predicate.as_ref(),
-                        *pruning && !*into,
-                        ctx,
-                        pending,
-                    )?;
+                    ctx.with_view(View::Old, |ctx| {
+                        var_expand_into_pending(
+                            &base,
+                            from,
+                            relationship,
+                            to,
+                            *direction,
+                            type_names,
+                            *into,
+                            *range,
+                            prior_rels,
+                            rel_props.as_ref(),
+                            to_predicate.as_ref(),
+                            *pruning && !*into,
+                            ctx,
+                            pending,
+                        )
+                    })?;
                 } else {
-                    expand_into_pending(
-                        &base,
-                        from,
-                        relationship,
-                        to,
-                        *direction,
-                        type_names,
-                        *into,
-                        prior_rels,
-                        ctx,
-                        pending,
-                    )?;
+                    ctx.with_view(View::Old, |ctx| {
+                        expand_into_pending(
+                            &base,
+                            from,
+                            relationship,
+                            to,
+                            *direction,
+                            type_names,
+                            *into,
+                            prior_rels,
+                            ctx,
+                            pending,
+                        )
+                    })?;
                     // As above: a fixed-length hop never carries a `to_predicate` today, and if one
                     // ever arrives here it is honoured rather than dropped.
-                    retain_rows_satisfying(pending, to_predicate.as_ref(), ctx)?;
+                    ctx.with_view(View::Old, |ctx| {
+                        retain_rows_satisfying(pending, to_predicate.as_ref(), ctx)
+                    })?;
                 }
             },
 
@@ -953,19 +1024,23 @@ impl Operator {
                 let Some(base) = input.next(ctx)? else {
                     return Ok(None);
                 };
-                shortest_paths_into_pending(
-                    &base,
-                    from,
-                    to,
-                    relationship,
-                    path,
-                    *direction,
-                    types,
-                    *range,
-                    *all,
-                    ctx,
-                    pending,
-                )?;
+                // OLD (`rmp` #972): a shortest-path search is an expansion, and owes the expansion
+                // polarity — it must not route through edges its own statement is creating.
+                ctx.with_view(View::Old, |ctx| {
+                    shortest_paths_into_pending(
+                        &base,
+                        from,
+                        to,
+                        relationship,
+                        path,
+                        *direction,
+                        types,
+                        *range,
+                        *all,
+                        ctx,
+                        pending,
+                    )
+                })?;
             },
 
             Operator::QuantifiedPath {
@@ -991,24 +1066,28 @@ impl Operator {
                 let Some(base) = input.next(ctx)? else {
                     return Ok(None);
                 };
-                quantified_path_into_pending(
-                    &base,
-                    from,
-                    to,
-                    group_start,
-                    group_end,
-                    relationship,
-                    *direction,
-                    type_names,
-                    extra_hops,
-                    *min,
-                    *max,
-                    prior_rels,
-                    interior_predicate.as_ref(),
-                    *into,
-                    ctx,
-                    pending,
-                )?;
+                // OLD (`rmp` #972): a quantified path pattern is a variable-length expansion with an
+                // interior predicate — both halves owe the expansion / filter polarity.
+                ctx.with_view(View::Old, |ctx| {
+                    quantified_path_into_pending(
+                        &base,
+                        from,
+                        to,
+                        group_start,
+                        group_end,
+                        relationship,
+                        *direction,
+                        type_names,
+                        extra_hops,
+                        *min,
+                        *max,
+                        prior_rels,
+                        interior_predicate.as_ref(),
+                        *into,
+                        ctx,
+                        pending,
+                    )
+                })?;
             },
 
             Operator::Optional {
@@ -1068,7 +1147,12 @@ impl Operator {
                     let mut survives = true;
                     for predicate in predicates.iter() {
                         ctx.check_cancelled()?;
-                        if !predicate_truth(predicate, &candidate, ctx)?.is_true() {
+                        // OLD (`rmp` #972): these ARE the `Filter` operators the fusion absorbed, so
+                        // they owe the `Filter` polarity — the fusion must not change the answer.
+                        let t = ctx.with_view(View::Old, |ctx| {
+                            predicate_truth(predicate, &candidate, ctx)
+                        })?;
+                        if !t.is_true() {
                             survives = false;
                             break;
                         }
@@ -1099,33 +1183,38 @@ impl Operator {
                     return Ok(None);
                 };
                 *matched = false;
+                // OLD (`rmp` #972): the same expansion polarity the un-fused `Expand` owes.
                 if next_base.get(&relationship.name).is_some() {
-                    bound_rel_expand(
-                        &next_base,
-                        from,
-                        relationship,
-                        to,
-                        *direction,
-                        types,
-                        *into,
-                        false,
-                        &[],
-                        ctx,
-                        pending,
-                    )?;
+                    ctx.with_view(View::Old, |ctx| {
+                        bound_rel_expand(
+                            &next_base,
+                            from,
+                            relationship,
+                            to,
+                            *direction,
+                            types,
+                            *into,
+                            false,
+                            &[],
+                            ctx,
+                            pending,
+                        )
+                    })?;
                 } else {
-                    expand_into_pending(
-                        &next_base,
-                        from,
-                        relationship,
-                        to,
-                        *direction,
-                        type_names,
-                        *into,
-                        &[],
-                        ctx,
-                        pending,
-                    )?;
+                    ctx.with_view(View::Old, |ctx| {
+                        expand_into_pending(
+                            &next_base,
+                            from,
+                            relationship,
+                            to,
+                            *direction,
+                            type_names,
+                            *into,
+                            &[],
+                            ctx,
+                            pending,
+                        )
+                    })?;
                 }
                 *base = Some(next_base);
             },
@@ -1325,9 +1414,25 @@ impl Operator {
                         &ctx.clock,
                     )?);
                 }
+                // The `CALL` polarity (`rmp` #972). A **read-only** procedure is a read access path
+                // like any other and runs under `Old`; a **writing** procedure is a write and runs
+                // under `New`, because it must see — and be able to modify — what the statement has
+                // already done.
+                //
+                // The classification is `is_reader_safe`, which is the registry's own "this body
+                // performs no graph-store write" flag, and it defaults to `false`. That default is the
+                // right way round here: an unclassified procedure is treated as a writer and keeps the
+                // full read-your-own-writes view, so the failure mode of a missing classification is
+                // the *previous* behaviour, never a procedure that cannot see its own work.
+                let call_view = if ctx.procedures.is_reader_safe(name) {
+                    View::Old
+                } else {
+                    View::New
+                };
                 let rows = ctx
-                    .procedures
-                    .invoke(name, &arg_values, &mut *ctx.graph)
+                    .with_view(call_view, |ctx| {
+                        ctx.procedures.invoke(name, &arg_values, &mut *ctx.graph)
+                    })
                     .map_err(ExecError::Procedure)?;
                 if *void {
                     // VOID procedure: invoked for its effect; the driving row passes through once
@@ -2832,8 +2937,121 @@ fn build_operator(
     })
 }
 
+/// The MVCC [`View`] a **leaf** operator does its store work under (`04 §5.1.4`, `rmp` #972).
+///
+/// This is one half of the per-operator polarity table (the other half lives on the lazy operators in
+/// [`Operator::next`]); it is a function rather than an inline `matches!` so the table can be read,
+/// tested and cited in one place. It is **exhaustive on purpose** — no `_ =>` arm — so a new access
+/// path cannot silently inherit a polarity nobody chose.
+///
+/// | Leaf | View | Why |
+/// | --- | --- | --- |
+/// | every node / relationship scan | `Old` | a scan must not see the rows its own statement is creating (the Halloween problem) |
+/// | **every index seek**, of every kind | `Old` | identical semantics to the scan it replaces — a seek that read `New` while the scan read `Old` would make `CREATE INDEX` change the answer (`rmp` #738/#894) |
+/// | `Argument` / `Empty` | `New` | they read no store at all |
+/// | count-store answers | `New` | they are the `Aggregation` they replace, and their equivalence predicate already requires that no in-flight delta of this transaction exists (`rmp` #866) |
+///
+/// Memgraph plants the same polarity at the same place: every `ScanAll*` and `ScanAllByLabelProperty*`
+/// cursor is constructed with `storage::View::OLD` (`src/query/plan/operator.cpp`), and the property
+/// index re-verifies each candidate under that view rather than trusting the index entry
+/// (`src/storage/v2/inmemory/label_property_index.cpp`).
+fn leaf_read_view(op: &PhysicalOp) -> View {
+    match op {
+        // Scans and seeks: OLD, without exception. The seek list is spelled out rather than folded
+        // into a catch-all precisely because a seek that disagreed with its scan fallback is the
+        // "index changes the answer" defect class.
+        PhysicalOp::AllNodesScan { .. }
+        | PhysicalOp::NodeByLabelScan { .. }
+        | PhysicalOp::TokenLookupScan { .. }
+        | PhysicalOp::NodeIndexSeek { .. }
+        | PhysicalOp::NodeIndexMultiSeek { .. }
+        | PhysicalOp::NodeCompositeIndexSeek { .. }
+        | PhysicalOp::NodeLabelScanEq { .. }
+        | PhysicalOp::NodeIndexRangeSeek { .. }
+        | PhysicalOp::NodeIndexScan { .. }
+        | PhysicalOp::NodeIndexStartsWithSeek { .. }
+        | PhysicalOp::SpatialIndexSeek { .. }
+        | PhysicalOp::NodeTextIndexSeek { .. }
+        | PhysicalOp::AllRelationshipsScan { .. }
+        | PhysicalOp::RelIndexSeek { .. }
+        | PhysicalOp::RelIndexMultiSeek { .. }
+        | PhysicalOp::RelIndexRangeSeek { .. }
+        | PhysicalOp::RelCompositeIndexSeek { .. }
+        | PhysicalOp::RelSpatialIndexSeek { .. } => View::Old,
+
+        // Non-leaves that read the store **lazily**, in `Operator::next`. They polarise their own
+        // accesses there, per the decision table; polarising them *here* would impose one operator's
+        // view on the entire subtree this call recursively builds, which is the exact mistake the
+        // table exists to prevent.
+        PhysicalOp::ExpandAll { .. }
+        | PhysicalOp::ExpandInto { .. }
+        | PhysicalOp::OptionalExpand { .. }
+        | PhysicalOp::ShortestPath { .. }
+        | PhysicalOp::QuantifiedPath { .. }
+        | PhysicalOp::NamedPath { .. }
+        | PhysicalOp::Filter { .. }
+        | PhysicalOp::Unwind { .. }
+        | PhysicalOp::ProcedureCall { .. } => View::New,
+
+        // Row plumbing: they read no store at all, so the view cannot reach them.
+        PhysicalOp::Argument { .. }
+        | PhysicalOp::Empty
+        | PhysicalOp::Projection { .. }
+        | PhysicalOp::Aggregation { .. }
+        | PhysicalOp::Sort { .. }
+        | PhysicalOp::TopN { .. }
+        | PhysicalOp::Skip { .. }
+        | PhysicalOp::Limit { .. }
+        | PhysicalOp::Eager { .. }
+        | PhysicalOp::AdvanceCommand { .. }
+        | PhysicalOp::NestedLoopJoin { .. }
+        | PhysicalOp::HashJoin { .. }
+        | PhysicalOp::ValueHashJoin { .. }
+        | PhysicalOp::Union { .. }
+        | PhysicalOp::Optional { .. }
+        | PhysicalOp::SemiApply { .. }
+        | PhysicalOp::LoadCsv { .. } => View::New,
+
+        // The count-store accelerators read the maintained counters, not a version chain, so no view
+        // reaches them — and they cannot disagree with the scan they replace, because the seam
+        // **declines** whenever any transaction holds an uncommitted count delta and the
+        // `Aggregation`-over-scan `fallback` child then runs verbatim, polarised by its own leaf.
+        PhysicalOp::NodeCountFromCountStore { .. }
+        | PhysicalOp::RelationshipCountFromCountStore { .. } => View::New,
+
+        // Writes: `New` without exception. A write must see everything its transaction has done,
+        // including the statement performing it — `MERGE`'s match sub-plan included, which is the one
+        // match in the language that is deliberately `New`.
+        PhysicalOp::Create { .. }
+        | PhysicalOp::Merge { .. }
+        | PhysicalOp::SetClause { .. }
+        | PhysicalOp::Remove { .. }
+        | PhysicalOp::Delete { .. }
+        | PhysicalOp::Foreach { .. } => View::New,
+    }
+}
+
 /// [`build_operator`] without the profiling shim: the operator construction itself.
+///
+/// **Note on where the polarity is applied.** Leaf scans and seeks materialise their rows *here*, at
+/// build time, so [`leaf_read_view`] is applied around this whole dispatch — a leaf has no child to
+/// contaminate. Every other operator does its store work lazily in [`Operator::next`], and polarises
+/// its own accesses there; wrapping a non-leaf's construction would impose its polarity on the entire
+/// subtree it recursively builds, which is the exact mistake the table exists to prevent.
 fn build_operator_unprofiled(
+    op: &PhysicalOp,
+    arg: Option<&Row>,
+    ctx: &mut Ctx<'_>,
+) -> Result<Operator, ExecError> {
+    let view = leaf_read_view(op);
+    if view != View::New {
+        return ctx.with_view(view, |ctx| build_operator_leaf(op, arg, ctx));
+    }
+    build_operator_leaf(op, arg, ctx)
+}
+
+/// The body of [`build_operator_unprofiled`], entered with the leaf polarity already installed.
+fn build_operator_leaf(
     op: &PhysicalOp,
     arg: Option<&Row>,
     ctx: &mut Ctx<'_>,
@@ -3671,10 +3889,20 @@ fn build_operator_unprofiled(
                 // row-order-identical to (and worker-count-deterministic, unlike) serial. Tried before the
                 // scan→filter→project tier: an `ExpandAll` input is the 3c case, a bare label-scan input is
                 // the 3b case. Declines (falls through) for any non-conforming shape.
-                if let Some(rows) = try_morsel_expand_project(op, ctx)? {
+                // OLD (`rmp` #972). Every fused tier below SUBSUMES a leaf scan (and, in the
+                // expand variants, a traversal and a filter) into one pass, so it owes the polarity
+                // those operators owe. Its own shape gate refuses any plan with a write operator
+                // between the scan and the consumer, so the projection / aggregation half — which
+                // would otherwise owe NEW — can observe no difference: within one command there is
+                // nothing for the two views to disagree about here.
+                if let Some(rows) =
+                    ctx.with_view(View::Old, |ctx| try_morsel_expand_project(op, ctx))?
+                {
                     return Ok(Operator::Buffered { rows });
                 }
-                if let Some(rows) = try_morsel_scan_filter_project(op, &[], None, ctx)? {
+                if let Some(rows) = ctx.with_view(View::Old, |ctx| {
+                    try_morsel_scan_filter_project(op, &[], None, ctx)
+                })? {
                     return Ok(Operator::Buffered { rows });
                 }
             }
@@ -3712,7 +3940,10 @@ fn build_operator_unprofiled(
             // and SUM the per-anchor matching degrees (an order-independent combine). Bit-identical to
             // serial. Declines (falls through) for any non-conforming shape, below-threshold, knob<=1, RBAC
             // restriction, standalone / historical read, or a morsel error.
-            if let Some(rows) = try_morsel_expand_aggregate(input, group_keys, aggregates, ctx)? {
+            // OLD for every fused tier below — see the note in the `Projection` arm (`rmp` #972).
+            if let Some(rows) = ctx.with_view(View::Old, |ctx| {
+                try_morsel_expand_aggregate(input, group_keys, aggregates, ctx)
+            })? {
                 return Ok(Operator::Buffered { rows });
             }
             // Morsel-driven parallel GROUPED aggregation OVER AN EXPAND (`rmp` #558 / #340 — the `top_liked`
@@ -3726,9 +3957,9 @@ fn build_operator_unprofiled(
             // Byte-identical to serial; declines (falls through) for any non-conforming shape, impure
             // filter/key, float/avg/overflow sum, below-threshold, knob<=1, RBAC restriction, standalone /
             // historical read, or a morsel error.
-            if let Some(rows) =
-                try_morsel_expand_group_aggregate(input, group_keys, aggregates, ctx)?
-            {
+            if let Some(rows) = ctx.with_view(View::Old, |ctx| {
+                try_morsel_expand_group_aggregate(input, group_keys, aggregates, ctx)
+            })? {
                 return Ok(Operator::Buffered { rows });
             }
             // Morsel-driven parallel FRONTIER-seeded grouped aggregation (`rmp` #575 — the reco `r3_fof3`
@@ -3740,9 +3971,9 @@ fn build_operator_unprofiled(
             // the shape #558 declines (its final expand must anchor on a bare label scan, and it rejects the
             // anti-join pattern predicate); declines (falls through) for any non-conforming shape, knob<=1,
             // RBAC restriction, standalone / historical read, a non-constant seed, or a morsel error.
-            if let Some(rows) =
-                try_morsel_frontier_fof_aggregate(input, group_keys, aggregates, ctx)?
-            {
+            if let Some(rows) = ctx.with_view(View::Old, |ctx| {
+                try_morsel_frontier_fof_aggregate(input, group_keys, aggregates, ctx)
+            })? {
                 return Ok(Operator::Buffered { rows });
             }
             // Morsel-driven parallel GROUPED aggregation (`rmp` #360 — the actual LDBC-BI bottleneck): for
@@ -3752,19 +3983,23 @@ fn build_operator_unprofiled(
             // first-seen order) on the engine thread. Byte-identical to serial (mergeable aggregates only:
             // count/sum-no-overflow-int/min/max/collect; avg/percentile/composite/filtered shapes decline).
             // This is the non-empty-GROUP-BY counterpart of the keyless Slice-3a tier below.
-            if let Some(rows) = try_morsel_group_aggregate(input, group_keys, aggregates, ctx)? {
+            if let Some(rows) = ctx.with_view(View::Old, |ctx| {
+                try_morsel_group_aggregate(input, group_keys, aggregates, ctx)
+            })? {
                 return Ok(Operator::Buffered { rows });
             }
-            if let Some(rows) = try_morsel_label_aggregate(input, group_keys, aggregates, ctx)? {
+            if let Some(rows) = ctx.with_view(View::Old, |ctx| {
+                try_morsel_label_aggregate(input, group_keys, aggregates, ctx)
+            })? {
                 return Ok(Operator::Buffered { rows });
             }
             // Parallel FOLD fast path (`rmp` #352, phase 1 of #336): the prior tier, kept as the base for
             // when the morsel knob is off (the global `rayon` pool's fold over a serially-projected
             // column). Bit-identical to serial; declines for any non-conforming shape, float/avg,
             // below-threshold, single-thread, RBAC restriction, or historical read.
-            if let Some(rows) =
-                try_parallel_label_property_aggregate(input, group_keys, aggregates, ctx)?
-            {
+            if let Some(rows) = ctx.with_view(View::Old, |ctx| {
+                try_parallel_label_property_aggregate(input, group_keys, aggregates, ctx)
+            })? {
                 return Ok(Operator::Buffered { rows });
             }
             // Vectorized fast path (`rmp` #330): an analytical `MATCH (n:Label) RETURN agg(n.p)` over
@@ -3773,9 +4008,9 @@ fn build_operator_unprofiled(
             // MVCC-re-validated columnar scan) and declines to `None` for any shape it does not cover,
             // any uncached column, or under RBAC restriction — in which case the row-at-a-time Volcano
             // path below runs verbatim (the default + fallback).
-            if let Some(rows) =
-                try_vectorized_label_property_aggregate(input, group_keys, aggregates, ctx)?
-            {
+            if let Some(rows) = ctx.with_view(View::Old, |ctx| {
+                try_vectorized_label_property_aggregate(input, group_keys, aggregates, ctx)
+            })? {
                 return Ok(Operator::Buffered { rows });
             }
             let inner = build_operator(input, arg, ctx)?;
@@ -3790,7 +4025,9 @@ fn build_operator_unprofiled(
             // STABLE k-way merge (ties broken by ascending candidate order) — byte-identical to the serial
             // `sort_rows` stable `sort_by`. Declines (falls through to serial) for any non-conforming /
             // impure / below-threshold shape, knob<=1, RBAC restriction, or a morsel error.
-            if let Some(rows) = try_morsel_scan_filter_project(input, keys, None, ctx)? {
+            if let Some(rows) = ctx.with_view(View::Old, |ctx| {
+                try_morsel_scan_filter_project(input, keys, None, ctx)
+            })? {
                 return Ok(Operator::Buffered { rows });
             }
             let inner = build_operator(input, arg, ctx)?;
@@ -3803,8 +4040,9 @@ fn build_operator_unprofiled(
             // Morsel-driven parallel scan→filter→project + STABLE top-k (`rmp` #339, Slice 3b): as the
             // `Sort` case, but each morsel keeps its rows pre-sorted and the stable k-way merge bounds its
             // output to the first `n` rows — byte-identical to serial `sort_rows`' stable sort + `truncate(n)`.
-            if let Some(rows) = try_morsel_scan_filter_project(input, keys, Some(n as usize), ctx)?
-            {
+            if let Some(rows) = ctx.with_view(View::Old, |ctx| {
+                try_morsel_scan_filter_project(input, keys, Some(n as usize), ctx)
+            })? {
                 return Ok(Operator::Buffered { rows });
             }
             let inner = build_operator(input, arg, ctx)?;
@@ -3833,6 +4071,26 @@ fn build_operator_unprofiled(
             while let Some(row) = inner.next(ctx)? {
                 rows.push_back(row);
             }
+            Ok(Operator::Buffered { rows })
+        }
+        PhysicalOp::AdvanceCommand { input } => {
+            // The statement boundary of a `WITH` that follows a write (`04 §5.1.4`, `rmp` #972).
+            //
+            // DRAIN FIRST, then advance, then serve. The order is the guarantee, not a convenience:
+            // the input is still producing the *previous* command's writes, and advancing while it runs
+            // would stamp the tail of them with the next command's id. A downstream `OLD`-view read
+            // would then see part of the earlier clause's work and not the rest — a split-brain view of
+            // one clause, which is strictly worse than either polarity applied whole.
+            //
+            // Advancing under `View::New` is deliberate and not an oversight: this operator performs no
+            // graph read of its own, and the row buffer it serves was produced under whatever polarity
+            // each upstream operator owed.
+            let mut inner = build_operator(input, arg, ctx)?;
+            let mut rows = VecDeque::new();
+            while let Some(row) = inner.next(ctx)? {
+                rows.push_back(row);
+            }
+            ctx.graph.begin_command();
             Ok(Operator::Buffered { rows })
         }
         PhysicalOp::Unwind {
@@ -9289,6 +9547,12 @@ impl SuspendedCursor {
     /// The caller MUST pass a fresh seam for the same txn (same MVCC snapshot + the same uncommitted
     /// write buffer); the operator state continues coherently because it reads only through the
     /// per-`next()` [`Ctx`] built from these borrows.
+    ///
+    /// **It must never open a statement** (`04 §5.1.4`, `rmp` #972). A suspended cursor is the *same*
+    /// statement continuing, so the `command_id` must not move between batches: advancing it here
+    /// would hide from a `CREATE` the rows it had already applied in an earlier batch of its own run.
+    /// The fresh seam picks the current command back up from the `RecordStore`, which is exactly why
+    /// the counter's home is the store and not any per-statement handle.
     pub fn resume<'a>(
         self,
         graph: &'a mut dyn GraphAccess,
@@ -9468,6 +9732,19 @@ impl Executor {
         } else {
             crate::morsel::morsel_threads()
         };
+        // **Open the statement** (`04 §5.1.4`, `rmp` #972). This is the one cursor-open seam every
+        // caller funnels through — the server, the TCK harness, the CLI and the tests alike — which is
+        // why the advance lives here and not in `TxnCoordinator::statement()`: that function runs again
+        // on **every resume** of a suspended cursor, and advancing there would hide from a `CREATE` the
+        // rows it had already applied in earlier batches of the same statement.
+        //
+        // It is placed after the `EXPLAIN` early return above, so an explained statement leaves the
+        // transaction's counter exactly where it found it — `EXPLAIN` executes nothing and must
+        // therefore consume nothing.
+        //
+        // It is placed before `build_operator`, which is where the leaf scans actually read the store:
+        // the scan must run *at* this statement, not at the previous one.
+        graph.begin_command();
         let root = {
             let mut decorated;
             let graph: &mut dyn GraphAccess = match &profile {
@@ -9527,6 +9804,13 @@ impl Executor {
         let columns = result_columns(&self.plan.root, procedures);
         // Capture the statement clock once per open() — see `open_with_extensions` (`rmp` task #140).
         let clock = StatementClock::capture();
+        // **No `begin_command` here** (`04 §5.1.4`, `rmp` #972), deliberately. A seeded cursor drives a
+        // correlated sub-plan of the statement already running — the body of an `EXISTS { … }` — not a
+        // statement of its own. Advancing the counter mid-statement would move every write the enclosing
+        // statement has yet to perform to a *later* command than the one its own `Produce` reads at, and
+        // `View::New` hides a later command's writes: the outer `RETURN` would stop seeing its own
+        // `CREATE`. The statement clock is re-captured only because it is per-`Cursor` state; the
+        // command is per-*transaction* state and must not move.
         // The effective morsel-thread count for this statement (`rmp` task #339), frozen at open.
         let morsel_threads = crate::morsel::morsel_threads();
         let root = {
@@ -9722,6 +10006,7 @@ fn result_columns(op: &PhysicalOp, procedures: &dyn ProcedureRegistry) -> Vec<St
         | PhysicalOp::Skip { input, .. }
         | PhysicalOp::Limit { input, .. }
         | PhysicalOp::Eager { input }
+        | PhysicalOp::AdvanceCommand { input }
         | PhysicalOp::Sort { input, .. }
         | PhysicalOp::Optional { input, .. } => result_columns(input, procedures),
         // A write root has no `RETURN` (a `RETURN` would put a projection above it), so it declares

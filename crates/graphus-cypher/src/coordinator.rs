@@ -603,7 +603,7 @@ mod composite_sweep_equivalence {
                         .iter()
                         .find(|v| {
                             graphus_txn::is_visible(
-                                Snapshot { owner, ts: t },
+                                Snapshot::new(owner, t),
                                 v.xmin,
                                 v.xmax,
                                 registry,
@@ -4137,10 +4137,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.active.insert(
             txn,
             ActiveTxn {
-                snapshot: Snapshot {
-                    owner: txn,
-                    ts: begin_ts,
-                },
+                snapshot: Snapshot::new(txn, begin_ts),
                 isolation,
                 begin_nanos,
             },
@@ -7877,10 +7874,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // `begin_serializable` has just inserted the entry; the fallback reconstructs the identical
         // snapshot `begin_inner` builds rather than panicking on an invariant this method owns.
         let snapshot = self.active.get(&txn).map_or_else(
-            || Snapshot {
-                owner: txn,
-                ts: self.store.borrow().snapshot_ts(),
-            },
+            || Snapshot::new(txn, self.store.borrow().snapshot_ts()),
             |a| a.snapshot,
         );
         (txn, snapshot)
@@ -8368,9 +8362,30 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// `snapshot` (`rmp` task #903) — the constraint walk's node/relationship filter, delegating to the
     /// one production visibility predicate [`is_visible`] so the walk judges exactly the graph a
     /// `MATCH` in the same transaction would.
+    ///
+    /// # Why this stays on the `New` polarity (`04 §5.1.4`, `rmp` #972)
+    ///
+    /// Every other read in the executor was refined to statement granularity; this one is deliberately
+    /// **not**, and the difference is not an oversight.
+    ///
+    /// A constraint validation is not a query. It answers "does the state this transaction will
+    /// commit satisfy the constraint?", and the state it will commit includes everything the current
+    /// statement has just written. `Old` would hide precisely the rows the DDL is being asked to judge:
+    /// `CREATE (:P {e:'x'}) CREATE (:P {e:'x'})` followed by a uniqueness check that could not see
+    /// either node would accept a duplicate — a committed constraint violation, which is an ACID
+    /// failure, not a visibility nuance.
+    ///
+    /// It is therefore also correct that this takes the header words alone rather than the
+    /// chain-walking `entity_visible_at`: under `New` the two agree by construction, so consulting the
+    /// chain would cost I/O to reach the same verdict.
     fn visible_to(&self, snapshot: Snapshot, created_ts: u64, expired_ts: u64) -> bool {
         let store = self.store.borrow();
-        is_visible(snapshot, created_ts, expired_ts, store.commit_registry())
+        is_visible(
+            snapshot.with_view(graphus_txn::View::New),
+            created_ts,
+            expired_ts,
+            store.commit_registry(),
+        )
     }
 
     /// Scans every relationship visible to `ctx`'s snapshot carrying the type token `type_token` and

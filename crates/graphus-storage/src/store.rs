@@ -25,14 +25,16 @@
 //! and traversal dedupes it by relationship id (`04 §2.4`). [`RecordStore::incident_rels`] walks
 //! a node's chain in O(degree) with no index probe.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use std::sync::Arc;
 
 use graphus_bufpool::ConcurrentBufferPool;
 use graphus_bufpool::page::{self, HEADER_SIZE};
 use graphus_core::error::{GraphusError, Result};
-use graphus_core::{ElementId, Lsn, MAX_TIMESTAMP, PageId, Timestamp, TxnId, VersionStamp};
+use graphus_core::{
+    CommandId, ElementId, Lsn, MAX_TIMESTAMP, PageId, Timestamp, TxnId, VersionStamp,
+};
 use graphus_io::{BlockDevice, PAGE_SIZE};
 use graphus_pagemap::PageMapWriter;
 use graphus_txn::{CommitRegistry, Snapshot, TxnOutcome};
@@ -370,6 +372,31 @@ struct ActiveTxn {
     /// [`committed_statistics`](RecordStore::committed_statistics) withdraws every still-open
     /// transaction's before a checkpoint persists the catalog.
     counts: CountDelta,
+    /// **`rmp` #972.** The statement this transaction is currently executing (`04 §5.1.4`), stamped
+    /// into every delta [`link_delta`](RecordStore::link_delta) writes.
+    ///
+    /// [`CommandId::NONE`] until the statement seam calls
+    /// [`begin_command`](RecordStore::begin_command), which is deliberate rather than incidental: a
+    /// write that happens outside any statement — recovery, a maintenance pass, the catalog — carries
+    /// `NONE`, and `NONE` is below every real command, so no `OLD` view ever undoes it. A
+    /// statement-driven transaction advances it once per statement and never within one.
+    command: CommandId,
+    /// **`rmp` #972.** The entities this transaction created **in the current statement**, cleared
+    /// whenever [`begin_command`](RecordStore::begin_command) opens the next one.
+    ///
+    /// It exists for exactly one decision: [`link_label_deltas`](RecordStore::link_label_deltas)
+    /// skips linking a label delta for a node its own transaction created, because no reader can ask
+    /// what that node's labels were before. Once statements are isolated from each other that
+    /// justification is only true **within the creating statement** — a node created by statement 1
+    /// and labelled by statement 2 *is* visible to statement 2's `OLD` view, which would then read
+    /// the live word and see a label statement 2 had just added. So the gate is narrowed from "this
+    /// transaction created it" to "this statement created it", which is the precise condition, and
+    /// this set is what makes that test `O(1)`.
+    ///
+    /// Bounded by one statement's creations, and never larger than
+    /// [`created`](Self#structfield.created), which the transaction retains for its whole life
+    /// anyway.
+    created_this_command: HashSet<(u8, u64)>,
 }
 
 /// One transaction's pending, not-yet-committed change to the six live-record cardinality counters
@@ -2286,6 +2313,29 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         Ok((live, unresolved))
     }
 
+    /// How many **live** deltas the undo area holds, of any action (`rmp` #972).
+    ///
+    /// The action-agnostic twin of [`live_label_delta_census`](Self::live_label_delta_census), and an
+    /// observability seam for the same reason: it scans `undo.store`, so it belongs in scenario
+    /// oracles and diagnostics, never in a query. A corpse (an aborted writer's delta, `in_use`
+    /// clear) and a reclaimed slot are both **not** counted — what this measures is outstanding
+    /// version state, which after a crash and recovery must be zero.
+    ///
+    /// # Errors
+    /// Returns a storage error if an `undo.store` page cannot be read.
+    pub fn live_undo_delta_count(&self) -> Result<usize> {
+        let mut live = 0usize;
+        let high = self.stores[StoreKind::Undo as usize].alloc.high_water();
+        for id in 1..high {
+            if let Some(delta) = self.read_delta(id)?
+                && delta.in_use()
+            {
+                live += 1;
+            }
+        }
+        Ok(live)
+    }
+
     /// The lowest-numbered **open transaction that has already written data**, or [`None`] when every
     /// open transaction is read-only (`rmp` task #902).
     ///
@@ -2354,6 +2404,40 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// protect).
     pub fn begin(&mut self, txn: TxnId) {
         self.active.insert(txn, ActiveTxn::default());
+    }
+
+    /// Opens the next **statement** of `txn` and returns its [`CommandId`] (`04 §5.1.4`, `rmp` #972).
+    ///
+    /// Every delta the transaction links from now until the next call carries this id, which is what
+    /// lets a later read of the same transaction ask for the state as it stood **before** the
+    /// statement started ([`View::Old`](graphus_txn::View::Old)).
+    ///
+    /// It must be called **once** per statement, at the statement seam — not once per cursor visit. A
+    /// long-running statement that suspends and resumes is still one statement, and advancing the
+    /// counter mid-flight would hide a `CREATE`'s already-applied rows from its own later batches.
+    ///
+    /// Calling it for a transaction the store has never seen begin registers one, so a caller that
+    /// drives the store directly (the standalone seam, recovery tooling) needs no separate
+    /// [`begin`](Self::begin).
+    pub fn begin_command(&mut self, txn: TxnId) -> CommandId {
+        let entry = self.active.entry(txn).or_default();
+        entry.command = entry.command.next();
+        // The previous statement's creations are no longer "created by the current statement", which
+        // is what re-arms the label creator gate correctly for the new one.
+        entry.created_this_command.clear();
+        entry.command
+    }
+
+    /// The statement `txn` is currently executing, or [`CommandId::NONE`] if it has opened none.
+    ///
+    /// `NONE` is not a defect: recovery, maintenance and catalog transactions write deltas without
+    /// ever running a Cypher statement, and `NONE` sorts below every real command, so no `OLD` view
+    /// undoes their work.
+    #[must_use]
+    pub fn command_of(&self, txn: TxnId) -> CommandId {
+        self.active
+            .get(&txn)
+            .map_or(CommandId::NONE, |active| active.command)
     }
 
     /// The current MVCC read snapshot timestamp (`04 §5.2`): the largest commit timestamp issued so
@@ -3248,6 +3332,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         delta.flags = undo::FLAG_IN_USE;
         delta.commit_info = slot;
         delta.next = head;
+        // STEP 2's remaining field, and it belongs HERE for the same reason `commit_info` does: the
+        // transaction owns the statement counter, not the caller. A caller that could supply its own
+        // `command_id` could stamp a delta with a statement that is not running, and the `OLD` view
+        // would silently resolve against it (`04 §5.1.4`).
+        delta.command_id = self.command_of(txn).0;
         let mut buf = [0u8; undo::UNDO_RECORD_SIZE];
         delta.encode(&mut buf);
         // STEP 3, and its order is not negotiable: the delta is written IN FULL — `next` already
@@ -3674,8 +3763,19 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             );
             return Ok(());
         }
-        if VersionStamp::from_raw(creator) == VersionStamp::InFlight(txn) {
-            return Ok(()); // the creator gate — see the doc above
+        // The creator gate — see the doc above, and note the narrowing `rmp` #972 required. "Created
+        // by this transaction" is no longer sufficient: a node created by statement 1 and labelled by
+        // statement 2 IS visible to statement 2's `OLD` view, so skipping the delta there would make
+        // that view read the live word and see a label statement 2 has just added. The gate therefore
+        // tests "created by this **statement**", which is the exact condition under which no view of
+        // any statement can ask what the node's labels were before.
+        if VersionStamp::from_raw(creator) == VersionStamp::InFlight(txn)
+            && self.active.get(&txn).is_some_and(|a| {
+                a.created_this_command
+                    .contains(&(StoreKind::Node as u8, id))
+            })
+        {
+            return Ok(());
         }
         let mut changed = old_labels ^ new_labels;
         while changed != 0 {
@@ -3923,9 +4023,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             return Ok(NULL_ID);
         }
         let slot = self.commit_slot_for(txn)?;
+        let command = self.command_of(txn);
         let delta_id = self.alloc_undo_id(txn)?;
         let mut buf = [0u8; undo::UNDO_RECORD_SIZE];
-        UndoDelta::new(UndoAction::DeleteObject, slot, 0, NULL_ID).encode(&mut buf);
+        UndoDelta::new(UndoAction::DeleteObject, slot, command.0, NULL_ID).encode(&mut buf);
         self.write_undo_area_create(StoreKind::Undo, delta_id, &buf, undo::UNDO_OFF_FLAGS, txn)?;
         self.active
             .entry(txn)
@@ -4403,7 +4504,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // reused id lands below it). Recorded even for `SYSTEM_TXN` so a system-created record is frozen.
         self.lower_freeze_low(kind, id);
         if txn != SYSTEM_TXN {
-            self.active.entry(txn).or_default().created.push((kind, id));
+            let active = self.active.entry(txn).or_default();
+            active.created.push((kind, id));
+            // `rmp` #972: and remember it for the CURRENT statement, which is what
+            // [`link_label_deltas`](Self::link_label_deltas)'s creator gate is allowed to test.
+            active.created_this_command.insert((kind as u8, id));
         }
     }
 
@@ -7074,6 +7179,25 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         read_view::label_bitmap_at(&self.pool, &self.stores, id, live, head, snapshot)
     }
 
+    /// Whether entity `(kind, id)` exists as of `snapshot`, at statement granularity (`rmp` #972).
+    ///
+    /// The statement-granular twin of [`graphus_txn::is_visible`], which the header words alone
+    /// cannot answer — see [`read_view::entity_visible_at`] for the rule and for why the ordinary
+    /// read pays nothing for it.
+    ///
+    /// # Errors
+    /// Returns a storage error if the entity's undo chain cannot be walked.
+    pub fn entity_visible_at(
+        &self,
+        kind: StoreKind,
+        id: u64,
+        mvcc: MvccHeader,
+        snapshot: Snapshot,
+        registry: &CommitRegistry,
+    ) -> Result<bool> {
+        read_view::entity_visible_at(&self.pool, &self.stores, kind, id, mvcc, snapshot, registry)
+    }
+
     // --------------------------- relationship CRUD --------------------------
 
     /// Creates a relationship of `type_id` from `start` to `end` under `txn`, threading it into
@@ -9012,6 +9136,17 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Returns a storage error if `id`'s page is not allocated or the read fails.
     pub fn read_mvcc_for_test(&self, kind: StoreKind, id: u64) -> Result<MvccHeader> {
         self.read_mvcc(kind, id)
+    }
+
+    /// Reads the raw undo delta at `id` — an inspection accessor exposing the private `read_delta`
+    /// so the statement-isolation test (`rmp` #972) can assert the `command_id` a writer actually
+    /// stamped, rather than inferring it from what a read returns. Behaviour-identical to the
+    /// internal read.
+    ///
+    /// # Errors
+    /// Returns a storage error if `id`'s page is not allocated or the delta does not decode.
+    pub fn read_delta_for_test(&self, id: u64) -> Result<Option<undo::UndoDelta>> {
+        self.read_delta(id)
     }
 
     /// Reads the raw [`HeapBlock`] at `id` — an inspection accessor exposing the private `read_block`
@@ -11338,10 +11473,7 @@ mod tests {
 
         // THE POINT: the older snapshot reads the EXACT old value, not merely "not 2", and above all
         // not `None`.
-        let old_reader = Snapshot {
-            owner: TxnId(90),
-            ts: snap_after_v1,
-        };
+        let old_reader = Snapshot::new(TxnId(90), snap_after_v1);
         let decided = s.decision_scan_node_properties(n, old_reader).unwrap();
         let seen = decided
             .visible_version(key)
@@ -11420,10 +11552,7 @@ mod tests {
         assert_eq!(emptied.value_inline, 0);
         assert_eq!(emptied.mvcc.expired_ts, 0, "no `xmax` tombstone");
 
-        let now = Snapshot {
-            owner: TxnId(90),
-            ts: s.snapshot_ts(),
-        };
+        let now = Snapshot::new(TxnId(90), s.snapshot_ts());
         assert!(
             s.decision_scan_node_properties(n, now)
                 .unwrap()
@@ -11432,10 +11561,7 @@ mod tests {
             "a committed removal makes the key absent",
         );
 
-        let old = Snapshot {
-            owner: TxnId(91),
-            ts: before_removal,
-        };
+        let old = Snapshot::new(TxnId(91), before_removal);
         let seen = s
             .decision_scan_node_properties(n, old)
             .unwrap()
@@ -12542,10 +12668,7 @@ mod tests {
         // Committed, but a snapshot older than the overwrite still exists: still not reclaimable,
         // and that snapshot still reads the exact old value.
         gc_at(&mut s, TxnId(3), after_v1);
-        let old_reader = Snapshot {
-            owner: TxnId(90),
-            ts: after_v1,
-        };
+        let old_reader = Snapshot::new(TxnId(90), after_v1);
         let seen = s
             .decision_scan_node_properties(n, old_reader)
             .unwrap()

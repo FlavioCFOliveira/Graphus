@@ -435,8 +435,8 @@ management naming no MVCC version. What it is no longer is the mechanism of **is
 data transaction is rolled back by applying its own deltas against the current state of each record
 it touched, never by reverting the bytes it wrote (§5.1.5 row 4). One test selects between the two
 paths — whether the transaction owns a commit-info slot (§5.1.3), which it does if and only if it
-linked a delta: `RecordStore::rollback` (`crates/graphus-storage/src/store.rs:5795`) dispatches to
-`rollback_logical` (`:5840`) or to `rollback_physical` (`:5916`).
+linked a delta: `RecordStore::rollback` (`crates/graphus-storage/src/store.rs:5941`) dispatches to
+`rollback_logical` (`:5840`) or to `rollback_physical` (`:6062`).
 
 ### 4.4 CLRs (Compensation Log Records)
 
@@ -675,7 +675,7 @@ actions is complete, and no write path emits it. Task **#970** did not change th
 detail a reader is most likely to get backwards. What its logical rollback *applies* is
 `RemoveIncidentEdge` — the delta an edge insertion left behind, whose application removes that one
 incidence entry (`RecordStore::undo_own_incidence`,
-`crates/graphus-storage/src/store.rs:5572`). An `AddIncidentEdge` delta found on a chain is treated
+`crates/graphus-storage/src/store.rs:5718`). An `AddIncidentEdge` delta found on a chain is treated
 as corruption and fails the rollback, because nothing in this build can have removed an incidence
 entry for it to restore (`apply_own_delta`, `:5420-5424`).
 
@@ -717,8 +717,8 @@ the chain head. The lifecycle has five steps:
    is gone and this check is the engine's only conflict mechanism.
 
    **The Cypher seam already imposes exactly this rule.** `RecordGraph::set_node_property` calls
-   `note_write(node_ssi_key(node.0))` (`crates/graphus-cypher/src/record_graph.rs:5893`), and
-   `note_write` (`:506`) captures a "write-write conflict … retry (serialization failure)" when the
+   `note_write(node_ssi_key(node.0))` (`crates/graphus-cypher/src/record_graph.rs:6045`), and
+   `note_write` (`:540`) captures a "write-write conflict … retry (serialization failure)" when the
    entity is held by another transaction. The coordinated path's behaviour therefore **does not
    change**; what becomes newly constrained is the **direct `RecordStore` callers**, which today
    reach the property path without passing through that seam.
@@ -739,7 +739,7 @@ the chain head. The lifecycle has five steps:
    **current** state of the entity, which restores exactly the state it found; it then detaches them
    from the chains they are on — always a head prefix, never a splice in the middle — reclaims them
    together with its commit slot, and ends in the log with an `ABORT` record and no compensation
-   (`RecordStore::rollback_logical`, `crates/graphus-storage/src/store.rs:5840`). This is a *logical*
+   (`RecordStore::rollback_logical`, `crates/graphus-storage/src/store.rs:5986`). This is a *logical*
    undo, and since task **#970** it is what the rollback of a data transaction is; the physical
    byte-level ARIES undo it replaced survives only for transactions that own no commit slot (§4.3).
    Memgraph's abort is the same walk
@@ -758,8 +758,8 @@ Without it, committing a transaction that touched *k* records means writing *k* 
 one of those writes must be made durable and must be found again after a crash. Graphus pays that cost
 today: a committed writer's records keep an in-flight stamp until a **freeze sweep** rewrites each one
 in place, scanning `[freeze_low, high_water)` across all three stores
-(`crates/graphus-storage/src/store.rs:617-625`). The frontier is a correctness-critical invariant of
-its own, it has needed its own release-active audit (`store.rs:442-455`), and moving it past a live
+(`crates/graphus-storage/src/store.rs:778-786`). The frontier is a correctness-critical invariant of
+its own, it has needed its own release-active audit (`store.rs:571-576`), and moving it past a live
 writer caused a silent-data-loss defect (rmp #522). With the indirection, commit is **one atomic store
 into one slot**, and every delta of that transaction becomes committed at the same instant, because
 every one of them reads its timestamp through the slot. Memgraph does exactly this, in one line:
@@ -786,16 +786,160 @@ structure rather than reconstructed by a sweep.
 #### 5.1.4 Statement-level isolation: `command_id`
 
 Each delta records the **`command_id`** of the statement that produced it: a counter incremented once
-per statement within the transaction. It exists so that a statement can be shown the state that
-preceded it, even for changes its own transaction made — the "read-your-own-writes but not
-your-own-current-statement's-writes" rule that Cypher's `MERGE` and multi-clause updates depend on.
-Memgraph's read path takes both a snapshot **and** a view (`OLD` or `NEW`) and compares `command_id`
-to decide whether to undo a delta belonging to the reader's own transaction
-(`/data/refsrc/memgraph/src/storage/v2/mvcc.hpp:72-94`).
+per statement within the transaction, carried in the four bytes `05-storage-format.md` §12.2 froze at
+offset 4. It exists so that a statement can be shown the state that preceded it, even for changes its
+own transaction made — the "read-your-own-writes but not your-own-current-statement's-writes" rule
+that Cypher's `MERGE` and multi-clause updates depend on. **Task #972 delivered it**, and the rest of
+this section specifies the mechanism that is in the engine (decision `D-statement-isolation`, ratified
+2026-08-05).
 
-**Graphus has no `command_id` today**: the identifier has **zero occurrences** across
-`crates/graphus-txn` and `crates/graphus-storage`, so no statement-level isolation exists. It is
-introduced with the delta record and is the subject of task **#972**.
+**The rule.** A read carries a **view** alongside its snapshot — `New` (the default) or `Old` — and
+the view decides nothing about other transactions. It decides only what the reader sees of its **own**
+transaction's uncommitted deltas, and the whole of it is one comparison operator:
+
+| The delta was written at | `View::New` undoes it when | `View::Old` undoes it when |
+| --- | --- | --- |
+| `CommandId::NONE` | never | never |
+| a real command `c` | `c > current` | `c >= current` |
+
+`graphus_txn::command_hides_own_write` is that table and nothing else, and
+`Snapshot::hides_own_command` is the same rule bound to a snapshot's own `command` and `view`. Under
+`New` a later command's write cannot normally exist, because statements run one at a time; the
+comparison is `>` rather than a blanket "never" so that the rule stays total and no future
+concurrent-statement path can read a command that has not run.
+
+Memgraph carries the same two-valued distinction (`/data/refsrc/memgraph/src/storage/v2/view.hpp`)
+and writes the same rule the other way round — it *stops* the chain walk where Graphus *undoes* —
+at `/data/refsrc/memgraph/src/storage/v2/mvcc.hpp:72-94`, where `View::NEW` stops on
+`cid <= transaction->command_id` and `View::OLD` on `cid < transaction->command_id`. PostgreSQL
+expresses the same thing over the tuple header: a tuple the reader's own transaction inserted is
+invisible when `HeapTupleHeaderGetCmin(tuple) >= snapshot->curcid`
+(`/data/refsrc/postgres/src/backend/access/heap/heapam_visibility.c:965`, in
+`HeapTupleSatisfiesMVCC`), with `curcid` captured when the snapshot is taken
+(`src/backend/storage/ipc/procarray.c:2455`) and advanced by `CommandCounterIncrement`
+(`src/backend/access/transam/xact.c:1129-1171`).
+
+**`CommandId::NONE` is a carve-out, not an edge case.** A delta written outside any statement — by
+recovery, by a maintenance pass, by the catalog — carries `NONE`, and **no view ever undoes it**. Such
+a write belongs to the transaction's **baseline** rather than to one of its statements. Without the
+carve-out, `NONE >= NONE` would make a maintenance transaction's own `Old` read erase its own work.
+For the same reason `CommandId::FIRST` is `1` and not `0`: the `Old` view of the first statement must
+exclude every delta that transaction could possibly have written, so `0` has to stay reserved for "no
+statement has run".
+
+**The counter saturates rather than wrapping.** `CommandId::next` saturates at `u32::MAX`, because
+wrapping to `0` would make a later statement's own writes look **older** than its first — a visibility
+error rather than an overflow. PostgreSQL declines the same wrap by raising an error at the same
+ceiling ("cannot have more than 2^32-2 commands in a transaction", `CommandCounterIncrement`).
+
+**Where the counter lives, and who may stamp a delta.** The counter is one field of the writing
+transaction's active-transaction entry **inside the record store**: `RecordStore::begin_command` opens
+the next statement and returns its id, and `RecordStore::command_of` reads the current one. **The
+store is the single source of truth and no other component keeps a copy.** One explicit transaction
+runs many statements over many query-seam instances, and each new instance re-derives the counter from
+the store, so an attached seam continues the transaction's numbering instead of restarting it; a
+restart would let the `Old` view of statement 2 hide statement 1's writes. `RecordStore::link_delta`
+stamps `command_id` from that counter, and `creation_chain_head` does the same for the `DeleteObject`
+delta a creation publishes. **No caller may supply a `command_id` of its own**, for the same reason no
+caller may supply a `commit_info`: a caller that could would be able to stamp a delta with a statement
+that is not running, and the `Old` view would then silently resolve against it.
+
+**Where the counter advances — two points, and only two.**
+
+1. **At cursor open**, the seam every caller funnels through — the server, the TCK harness, the CLI
+   and the tests alike, and the same seam that already fixes the statement's temporal instant, which
+   every zero-argument temporal constructor in the statement reads. The advance
+   sits *after* the `EXPLAIN` early return, so an explained statement leaves the counter exactly where
+   it found it (`EXPLAIN` executes nothing and must therefore consume nothing), and *before* the
+   operator tree is built, because that is where leaf scans read the store and the scan must run at
+   **this** statement rather than the previous one.
+2. **At a `WITH` that follows a write**, through the dedicated `AdvanceCommand` operator the planner
+   inserts when — and only when — the plan accumulated so far already performs a write. The operator
+   **drains its input first** and advances only then: the input is still producing the previous
+   command's writes, and advancing while it runs would stamp the tail of them with the next command's
+   id, giving a downstream `Old` read a split-brain view of one clause. This is Memgraph's rule
+   transcribed: `GenWith` computes `advance_command = is_write` and threads it into the projection,
+   while `GenReturn` passes a literal `false` because a `RETURN` ends the query and nothing after it
+   can read the graph (`/data/refsrc/memgraph/src/query/plan/rule_based_planner.cpp:872` in `GenWith`,
+   against `:857` in `GenReturn`). It is the behaviour the TCK pins in
+   `clauses/create/Create3.feature`, scenario [3] "MATCH-CREATE-WITH-CREATE":
+   `MATCH () CREATE () WITH * MATCH () CREATE ()` over a graph of two nodes has the side effect
+   `+nodes 10`, because the second `MATCH` runs at a **new** command and therefore does see the first
+   `CREATE`'s rows, while neither `MATCH` sees its own.
+
+The counter deliberately does **not** advance at the coordinator's per-statement graph-seam factory
+(`TxnCoordinator::statement`), which is called again on **every resume** of a suspended cursor.
+Advancing there would hide from a long-running `CREATE` the rows it had already applied in earlier
+batches of the same statement. Nor does it advance when a correlated sub-plan opens a seeded cursor
+(the body of an `EXISTS { … }`): that is a sub-plan of the statement already running, not a statement
+of its own, and advancing would move every write the enclosing statement has yet to perform to a later
+command than the one its own projection reads at — so the outer `RETURN` would stop seeing its own
+`CREATE`.
+
+**What the view changes on the read path.** The view is resolved against the entity's undo chain,
+never against the record header, because `05-storage-format.md` §12.2 put the `command_id` on the
+**delta** and not in the live record (§5.3). Two seams consume it, and between them they cover every
+read that can observe a change:
+
+- `scan_polarity::delta_verdict` decides what a snapshot must do with one delta while reconstructing
+  an older version. Its "this snapshot's own in-flight writer" arm is where statement granularity
+  enters: the delta is **applied** (undone) when `Snapshot::hides_own_command` says so, and otherwise
+  the walk **stops**. This gives statement granularity to the two folds that already walked the
+  chain — a property's value and a node's label bitmap.
+- `read_view::entity_visible_at` decides whether a node or a relationship **exists** as of the
+  snapshot, which is also what makes an edge traversable. It refines `graphus_txn::is_visible`
+  exactly where the two header words run out of information, by applying the transaction's own
+  `DeleteObject` / `RecreateObject` deltas.
+
+`entity_visible_at` costs nothing on the paths that do not need it, and that is by construction rather
+than by measurement. Three gates run in order and an ordinary read fails the first: under `View::New`
+the two answers are identical, so no walk is entered; the question can only arise for an entity **this**
+transaction created or deleted while still in flight; and an entity with no chain has no statement to
+distinguish. A read fault inside the walk **fails closed** — the answer is an error, never the header's
+own verdict, which is the answer the chain was consulted to correct. That is the same
+fail-closed-on-read-fault contract the label and property folds already owe (`rmp` #733): an answer
+that cannot be resolved fails the read rather than being guessed either way.
+
+**Polarity per clause.** Which view a clause reads under is a fixed table, not a per-operator
+judgement. It is `Old` for everything that is an access path and `New` — the default — for everything
+else:
+
+| View | Clause or operator |
+| --- | --- |
+| **`Old`** | every node and relationship scan; **every index seek, of every kind**; every relationship expansion, including variable-length, shortest-path, quantified-path and named-path reconstruction; the `Filter` of a `MATCH`; `UNWIND`; a **read-only** procedure `CALL`; and any fused morsel pipeline that subsumes one of these scans |
+| **`New`** | the match sub-plan of `MERGE`; `CREATE`, `SET`, `REMOVE`, `DELETE` and `FOREACH` (targets and right-hand sides); the projection of `RETURN` and `WITH`; aggregation, `ORDER BY`, `SKIP` and `LIMIT`; a **writing** procedure `CALL`; and every operator that reads no store at all |
+
+Three properties of that table are normative:
+
+- **A seek and the scan it replaces read the same view.** An index seek that read `New` while its
+  fallback scan read `Old` would make `CREATE INDEX` change the answer — the defect class of
+  `rmp` #738 and #894. For the same reason the view filter is applied **per candidate the index
+  returns**, never only at candidate generation: an index is a candidate generator, and every
+  candidate is re-checked for statement-granular existence before it becomes a row.
+- **An operator sets the view around its own accesses only, never around a child's.** Wrapping a
+  child would impose one operator's polarity on a whole subtree, which is exactly what the table
+  exists to prevent: a `Filter` is `Old`, but the `Create` beneath it is `New`. The switch is always
+  restored, including on the error path, so nesting is safe — a `Filter` reading under `Old` may drive
+  an `EXISTS { … }` sub-plan whose projection reads under `New` and hands `Old` back on the way out.
+- **A procedure is `New` unless it is known to be read-only.** The classification fails safe: a
+  procedure the registry cannot vouch for runs under `New`, because a writing procedure must see what
+  it has just written.
+
+Memgraph plants the same polarity in the same place: `ScanAll` and every `ScanAllBy*` variant declare
+`storage::View view = storage::View::OLD` as their default
+(`/data/refsrc/memgraph/src/query/plan/operator.hpp:565`, the first of thirteen such declarations in
+that header), and its label-property index re-verifies each candidate under that view rather than
+trusting the index entry
+(`/data/refsrc/memgraph/src/storage/v2/inmemory/label_property_index.cpp:444`).
+
+**Coexistence with the planner's `Eager` barriers.** The planner's eagerness barriers are **all
+retained**, deliberately. `Eager` and `command_id` solve different halves of the same family:
+`Eager` decouples **row production** across a clause boundary, while the view re-polarises
+**visibility** across it. Removing the barriers in the same task that introduced the views would let
+the two mechanisms mask each other — a test that passes because the barrier is still there proves
+nothing about the view, and vice versa. Reforming the barriers in the light of statement-level
+isolation is therefore separate work, and until it is done the optimiser's own invariant holds: a pass
+may **add** a read-write `Eager` barrier and may never remove one.
 
 #### 5.1.5 What the unified chain replaces
 
@@ -809,16 +953,16 @@ and does not restate it.
 | # | Mechanism, and what became of it | Where it lives now | Replaced by | Retired in |
 | --- | --- | --- | --- | --- |
 | 0 | ~~**No undo area at all.** `undo_ptr` is reserved in every record and always written `0`, so there is no chain to anchor.~~ **CLOSED.** | was `crates/graphus-storage/src/record.rs`; now `crates/graphus-storage/src/undo.rs` + `StoreKind::Undo` / `StoreKind::Commit` | The undo area and the delta record; `undo_ptr` is the live chain head | **#966 — done** |
-| 1 | ~~**Property tombstone plus chain prepend.** Setting a property walks the entity's whole property chain to tombstone the previous version, then prepends a new one — **O(M²)** over M assignments (15.1 µs/op at M = 1000; 97.8 µs/op at M = 8000).~~ **CLOSED.** | was `RecordStore::tombstone_props_for_key`; now the one property write path, `RecordStore::set_entity_property_encoded`, `crates/graphus-storage/src/store.rs:8117` | One `SetProperty` delta carrying the old value; the home property record is updated in place, and a **removal** is an empty cell in place rather than a tombstone (below) | **#967 — done** |
-| 2 | ~~**Label bitmap mutated in place, with the version history held only in memory.** The history is an in-process structure shared by `Arc`; nothing about it is durable, so labels are not versioned on disk.~~ **CLOSED.** | was `crates/graphus-storage/src/label_history.rs`; now `RecordStore::link_label_deltas`, `crates/graphus-storage/src/store.rs:3664` | `AddLabel` / `RemoveLabel` deltas on the same durable chain as every other change | **#968 — done** |
-| 3 | ~~**Ad-hoc compare-and-set undo for chain heads.**~~ **CLOSED.** A chain-head publication and the relink of the head it displaces are logged **redo-only** (§4.4); their inverse is to unlink the entry, never to restore the word. **What survives is a different mechanism, deliberately kept:** the node's `labels` word and the MVCC header word keep a compare-and-set undo, because each is a whole-word write whose inverse *is* the word — and that undo is now consumed only by recovery, since a data transaction's live rollback applies no WAL undo image at all. | was `store.rs` `write_chain_head` (pre-image, then compare-and-set) and `write_rel_field_keep`; now `RecordStore::write_field_redo_only`, `crates/graphus-storage/src/store.rs:3052`. The surviving compare-and-set is `patch_header_word_cas`, `:2984`, and `write_node_labels`, `:4307` | `AddIncidentEdge` / `RemoveIncidentEdge` deltas naming one incidence entry, so no shared pointer word is ever rewritten by an undo | **#969** (the deltas) + **#970 — done** (the compensations) |
-| 4 | ~~**Physical ARIES rollback.** Undo reverts bytes. This is the origin of the recurring defect family rmp #220 / #172 / #239 / #301 / #578 / #772, each one a case of one transaction's byte-level undo damaging another's committed state.~~ **CLOSED for every transaction that holds MVCC state.** | was `RecordStore::rollback`; now `RecordStore::rollback_logical`, `crates/graphus-storage/src/store.rs:5840`. `rollback_physical`, `:5916`, survives as the inverse of a maintenance or catalog-only transaction — one that owns no commit slot (§4.3) | Logical rollback: the transaction walks its own deltas and applies them | **#970 — done** |
+| 1 | ~~**Property tombstone plus chain prepend.** Setting a property walks the entity's whole property chain to tombstone the previous version, then prepends a new one — **O(M²)** over M assignments (15.1 µs/op at M = 1000; 97.8 µs/op at M = 8000).~~ **CLOSED.** | was `RecordStore::tombstone_props_for_key`; now the one property write path, `RecordStore::set_entity_property_encoded`, `crates/graphus-storage/src/store.rs:8282` | One `SetProperty` delta carrying the old value; the home property record is updated in place, and a **removal** is an empty cell in place rather than a tombstone (below) | **#967 — done** |
+| 2 | ~~**Label bitmap mutated in place, with the version history held only in memory.** The history is an in-process structure shared by `Arc`; nothing about it is durable, so labels are not versioned on disk.~~ **CLOSED.** | was `crates/graphus-storage/src/label_history.rs`; now `RecordStore::link_label_deltas`, `crates/graphus-storage/src/store.rs:3751` | `AddLabel` / `RemoveLabel` deltas on the same durable chain as every other change | **#968 — done** |
+| 3 | ~~**Ad-hoc compare-and-set undo for chain heads.**~~ **CLOSED.** A chain-head publication and the relink of the head it displaces are logged **redo-only** (§4.4); their inverse is to unlink the entry, never to restore the word. **What survives is a different mechanism, deliberately kept:** the node's `labels` word and the MVCC header word keep a compare-and-set undo, because each is a whole-word write whose inverse *is* the word — and that undo is now consumed only by recovery, since a data transaction's live rollback applies no WAL undo image at all. | was `store.rs` `write_chain_head` (pre-image, then compare-and-set) and `write_rel_field_keep`; now `RecordStore::write_field_redo_only`, `crates/graphus-storage/src/store.rs:3132`. The surviving compare-and-set is `patch_header_word_cas`, `:3064`, and `write_node_labels`, `:4402` | `AddIncidentEdge` / `RemoveIncidentEdge` deltas naming one incidence entry, so no shared pointer word is ever rewritten by an undo | **#969** (the deltas) + **#970 — done** (the compensations) |
+| 4 | ~~**Physical ARIES rollback.** Undo reverts bytes. This is the origin of the recurring defect family rmp #220 / #172 / #239 / #301 / #578 / #772, each one a case of one transaction's byte-level undo damaging another's committed state.~~ **CLOSED for every transaction that holds MVCC state.** | was `RecordStore::rollback`; now `RecordStore::rollback_logical`, `crates/graphus-storage/src/store.rs:5986`. `rollback_physical`, `:6062`, survives as the inverse of a maintenance or catalog-only transaction — one that owns no commit slot (§4.3) | Logical rollback: the transaction walks its own deltas and applies them | **#970 — done** |
 | 5 | ~~**Write-lock table plus wait-for-graph deadlock detector.**~~ **CLOSED.** | was `crates/graphus-txn/src/lock.rs` | Conflict detection on the entity's MVCC header, aborting immediately without waiting (§5.7) | **#971 — done** |
 
-Two further tasks complete the model rather than replacing a mechanism: **#972** introduces
-`command_id` and statement-level isolation, and the deterministic writer scheduler required by
+Two further tasks complete the model rather than replacing a mechanism. **#972 — done** introduced
+`command_id` and statement-level isolation (§5.1.4). The deterministic writer scheduler required by
 `D-dst-writer-scheduler` extends `07-dst-simulator.md` §5 so that multi-writer behaviour is certified
-from a seed rather than from a race.
+from a seed rather than from a race; that one is still outstanding.
 
 **Status of this section: rows 0–5 are closed.** #966 built the undo area, the delta record, the
 commit-info slot and the chain, and brought `undo_ptr` to life; #967 moved the property path onto that
@@ -829,13 +973,29 @@ the engine performs is therefore a delta on one chain, each transaction's commit
 into its slot, chains are reclaimed by watermark at GC, and the consistency checker validates every
 one of them.
 
-**What is still the specified target rather than present behaviour** is `command_id`: it is carried in
-every delta and is always `0` until **#972** introduces statement-level isolation. The deterministic
-writer scheduler required by `D-dst-writer-scheduler` is likewise outstanding. The `graphus-txn`
-transaction manager also still runs against a placeholder store — "the real `graphus_storage` does not
-yet implement version-chain mechanics", and wiring it up "is a follow-up task, intentionally **out of
-scope** here" (`crates/graphus-txn/src/store.rs`); that is a statement about the SSI harness's own
-test seam (§5.7), not about the storage engine, whose chain is live.
+**What is still the specified target rather than present behaviour** is the deterministic writer
+scheduler required by `D-dst-writer-scheduler`. `command_id` is no longer on that list: **#972** made
+it live, so a delta carries the statement that wrote it and is `0` only when the write happened
+outside any statement (§5.1.4). The `graphus-txn` transaction manager also still runs against a
+placeholder store — "the real `graphus_storage` does not yet implement version-chain mechanics", and
+wiring it up "is a follow-up task, intentionally **out of scope** here"
+(`crates/graphus-txn/src/store.rs`); that is a statement about the SSI harness's own test seam (§5.7),
+not about the storage engine, whose chain is live.
+
+**Row 2, second consequence: the label creator gate is narrowed to the creating statement.** Row 2's
+replacement links an `AddLabel` or `RemoveLabel` delta per changed bit, with one exception: a node the
+writing transaction created itself is not versioned, because no reader can ask what its labels were
+before it existed. **#972** narrowed that exception, and the narrowing is a behaviour change rather
+than a restatement. Once statements are isolated from each other, "created by this transaction" is no
+longer the condition under which the question cannot be asked: a node created by statement 1 and
+labelled by statement 2 **is** visible to statement 2's `Old` view, which would then read the live
+word and see a label statement 2 had just added. The gate in `RecordStore::link_label_deltas`
+therefore tests "created by **this statement**", which is the precise condition. The test is `O(1)`
+against a per-statement set of created entities that `RecordStore::begin_command` clears when it opens
+the next statement, and the bulk-create fast path — `CREATE (:L)`, which creates and labels within one
+statement — is unaffected: the same test that pins the narrowing asserts that this path still links no
+label delta (`crates/graphus-storage/tests/command_isolation_972.rs`,
+`a_node_created_by_an_earlier_statement_has_its_labels_versioned`).
 
 **Row 4 in detail: what a rollback costs, and what it stopped costing.** The physical path is
 `O(store)`, and not incidentally: it calls `reload_catalog`, which rebuilds the whole in-memory
@@ -858,7 +1018,7 @@ Retiring a record the aborting transaction created (applying its `DeleteObject` 
 record's property chain and zeroes its 25-byte MVCC header, but does **not** return its physical id to
 the free list. The id is held in an in-memory pending set and returned by a GC phase that runs after
 the tombstone sweeps (`RecordStore::gc_reclaim_orphan_slots`,
-`crates/graphus-storage/src/store.rs:5720`). The abort knows the slot is unreachable — it is what
+`crates/graphus-storage/src/store.rs:5866`). The abort knows the slot is unreachable — it is what
 unlinked it — so the restraint is deliberate, and its reason lies outside the storage engine: the
 latest-state TEXT, FULLTEXT and SPATIAL indexes are in-memory (§6.7) and **not transactional**, and
 key their documents by **physical node id**. An aborted node's posting survives its rollback as a
@@ -926,6 +1086,37 @@ A transaction `T` with snapshot `s` sees version `v` iff:
 A transaction always sees its **own** uncommitted writes (its `TxnId` matches). This yields
 Snapshot Isolation reads; SSI (below) upgrades correctness to Serializable without adding read
 locks.
+
+**This two-clause rule is the answer *between* transactions, and it is complete as such.** It is not
+the whole answer *within* one, and it structurally cannot be: the two header words record **which
+transaction** created or expired a version and never **which statement of it**, because
+`05-storage-format.md` §12.2 put the `command_id` on the undo **delta** rather than in the live
+record. So the "own uncommitted writes" override above is stated at *transaction* granularity, which
+is the strongest answer those two words support. `graphus_txn::is_visible` implements exactly this
+rule and deliberately answers nothing finer.
+
+**Statement granularity is resolved one layer down, against the entity's undo chain** (§5.1.4). Two
+functions divide the work and neither duplicates the other:
+
+- `graphus_storage::read_view::entity_visible_at` answers **existence** — whether a node or a
+  relationship is there as of the reader's statement. It starts from `is_visible`'s verdict and
+  refines it only where the header cannot decide, by applying the reader's own transaction's
+  `DeleteObject` and `RecreateObject` deltas. Under `View::New` the two answers are identical by
+  construction, so the refinement costs one comparison and no chain walk.
+- `graphus_storage::scan_polarity::delta_verdict` applies the same statement rule while a fold
+  reconstructs a **value**: a property's current value and a node's label bitmap. Its own-writer arm
+  is where the two views diverge — the delta is undone when the reader's view hides the command that
+  wrote it, and otherwise the walk stops.
+
+A caller that needs the statement-granular answer must use those seams. A read fault inside either of
+them fails closed: an entity whose existence or whose value cannot be resolved fails the read and is
+never answered with the header's own verdict, which is precisely the answer the chain was consulted to
+correct.
+
+**The view and the read polarity below are orthogonal, and a read names both.** The `New` / `Old`
+**view** settles *which version* a read is entitled to see of its own transaction; the three
+**polarities** that follow settle *which obligation* the read is discharging — a superset, a decision,
+or a conservative summary. Neither substitutes for the other.
 
 **Read polarity: which reads owe this predicate, and which owe something else.** Every read of the
 record store returns raw physical state — the slot's current contents, including MVCC tombstones the
@@ -1082,7 +1273,7 @@ contract between §5 and the rest of the engine.
 
 **What disappears from this interface.** The freeze sweep does. Today a committed writer's records
 carry in-flight stamps until a sweep rewrites each one in place across
-`[freeze_low, high_water)` (`crates/graphus-storage/src/store.rs:617-625`); with the commit
+`[freeze_low, high_water)` (`crates/graphus-storage/src/store.rs:778-786`); with the commit
 indirection point (§5.1.3) a transaction's commit timestamp is published once, so there is nothing
 left to rewrite and no frontier to maintain.
 

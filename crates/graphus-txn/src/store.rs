@@ -286,10 +286,7 @@ mod tests {
     use graphus_core::Timestamp;
 
     fn snap(owner: u64, ts: u64) -> Snapshot {
-        Snapshot {
-            owner: TxnId(owner),
-            ts: Timestamp(ts),
-        }
+        Snapshot::new(TxnId(owner), Timestamp(ts))
     }
 
     #[test]

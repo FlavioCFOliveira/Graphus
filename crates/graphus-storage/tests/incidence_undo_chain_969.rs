@@ -218,10 +218,7 @@ fn inserting_edges_on_a_hub_does_not_grow_the_hubs_own_version_chain() {
     assert_eq!(s.degree(hub).expect("degree"), 200);
 
     // And the read the chain length would have cost still sees the seeded value.
-    let snapshot = Snapshot {
-        owner: TxnId(9_999),
-        ts: s.snapshot_ts(),
-    };
+    let snapshot = Snapshot::new(TxnId(9_999), s.snapshot_ts());
     assert_eq!(value_at(&s, hub, key, snapshot), Some(Value::Integer(1)));
     assert_consistent(&mut s, "after 200 edge insertions on one hub");
 }

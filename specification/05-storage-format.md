@@ -334,7 +334,7 @@ Two stores rather than one because the §9 addressing rule requires a single rec
 | 1 | 1 | `action` | one of the seven actions of §12.3. |
 | 2 | 1 | `type_tag` | `SetProperty` only: the old value's type tag, encoded exactly as `props.store`'s `type_tag` (§9), including its inline-vs-overflow bit. Zero for every other action. |
 | 3 | 1 | `direction` | the two incidence actions only: `1` = the **start** end of the relationship, `2` = its **end** end. Zero for every other action. |
-| 4 | 4 | `command_id` | the statement counter within the writing transaction (`04` §5.1.4). |
+| 4 | 4 | `command_id` | the statement counter within the writing transaction (`04` §5.1.4); `0` means the write happened outside any statement (below). |
 | 8 | 8 | `commit_info` | physical id in `commit.store` of the writing transaction's slot (§12.4). Never `0` on a live delta. |
 | 16 | 8 | `next` | physical id in `undo.store` of the next-older delta on this entity's chain; `0` = end of chain. |
 | 24 | 4 | `token` | `SetProperty`: the property-key token. `AddLabel`/`RemoveLabel`: the label token. The two incidence actions: the relationship-type token. Zero otherwise. |
@@ -374,6 +374,27 @@ respectively), never by the value word, so a zero `value_inline` alongside a non
 ordinary stored zero and not an absence. Note also that `valenc.rs`'s `TAG_LIST_EMPTY = 0` is **not**
 a counter-example: it is a private `elem_tag` written **inside** a serialized empty list's body to
 record that the list has no element class, and it never appears in a `type_tag` field.
+
+**Clarification (2026-08-05): what `command_id == 0` means, and who writes the field.** Until task
+**#972** no write path filled the field in and every delta carried `0`. It is now written on every
+delta, and — as with the 2026-08-03 clarification above — **no byte of the frozen layout changes**:
+the field keeps its offset, its width and its little-endian encoding, and no value that was
+previously legal becomes illegal or vice versa. What the two paragraphs below fill in is the meaning
+of the value, which the table never stated, and the rule about who is allowed to write it.
+
+A zero means **the write happened outside any statement**, so it belongs to the writing transaction's
+**baseline** rather than to one of its statements: recovery, a maintenance pass and the catalog all
+write deltas without ever running a Cypher statement. A baseline write is undone by **no** view —
+neither `New` nor `Old` — which is what stops a maintenance transaction's own `Old` read from erasing
+its own work (`04` §5.1.4). A transaction's first statement therefore runs at `command_id == 1` and
+not `0`, so that the `Old` view of that first statement excludes every delta the transaction could
+possibly have written.
+
+The field is written by `RecordStore::link_delta`, and by `RecordStore::creation_chain_head` for the
+`DeleteObject` delta a creation publishes, in both cases **from the writing transaction's own
+counter**. A caller may never supply it — exactly as it may never supply `commit_info` — because a
+caller that could would be able to stamp a delta with a statement that is not running, and an `Old`
+read would then silently resolve against it.
 
 ### 12.3 The `action` byte
 
@@ -425,7 +446,7 @@ only for its disk-backed storage mode and has no Graphus counterpart.
 **one** write, and all *k* of its deltas become committed at the same instant because each resolves its
 status through this slot. This is what removes the freeze sweep — the in-place rewrite of every
 committed writer's stamps across `[freeze_low, high_water)`
-(`crates/graphus-storage/src/store.rs:617-625`), a frontier that needs its own release-active audit and
+(`crates/graphus-storage/src/store.rs:778-786`), a frontier that needs its own release-active audit and
 whose mis-advance was a silent-data-loss defect (rmp #522). Memgraph publishes the same way, in one
 line: `transaction_.commit_info->timestamp.store(*commit_timestamp_, std::memory_order_release)`
 (`/data/refsrc/memgraph/src/storage/v2/inmemory/storage.cpp:1299`).
@@ -454,13 +475,13 @@ itself (§12.5), and frees its slot with them.
   **its own** deltas newest-first, applies each against the current state, detaches them from the
   chains they head, reclaims them with its commit slot, and ends in the log with an `ABORT` record
   carrying no compensation (`RecordStore::rollback_logical`,
-  `crates/graphus-storage/src/store.rs:5840`). This is what ends the defect family rmp #220 / #172 /
+  `crates/graphus-storage/src/store.rs:5986`). This is what ends the defect family rmp #220 / #172 /
   #239 / #301 / #578 / #772, all of which are cases of one transaction's byte-level undo damaging
   another's committed state. **#970 was a rollback change only.** Because the undo chain was already
   the sole visibility oracle for a property's value (`D-property-visibility`, ratified 2026-08-03;
   `04` §5.6), replacing physical undo with logical undo needed **no second rewrite of the read path**.
   Physical undo survives for a transaction that owns no commit slot — a GC or maintenance pass, or a
-  catalog-only writer — whose writes name no MVCC version (`rollback_physical`, `:5916`; `04` §4.3).
+  catalog-only writer — whose writes name no MVCC version (`rollback_physical`, `:6062`; `04` §4.3).
 - **A loser transaction after a crash is undone by the WAL, not by its deltas.** Recovery's undo
   phase follows each loser's `prev_lsn` back-chain and applies the undo image of every record it
   wrote (`04` §4.8): the in-place values revert byte for byte, and each delta the loser linked reverts

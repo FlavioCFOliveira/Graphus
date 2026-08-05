@@ -266,10 +266,7 @@ fn resolve_labels<D: graphus_io::BlockDevice, S: LogSink>(
 ) -> u64 {
     let live = live_bitmap(store, node);
     let head = store.node(node).expect("read node").mvcc.undo_ptr;
-    let snapshot = Snapshot {
-        owner: TxnId(u64::MAX),
-        ts: store.snapshot_ts(),
-    };
+    let snapshot = Snapshot::new(TxnId(u64::MAX), store.snapshot_ts());
     store
         .label_bitmap_at(node, live, head, snapshot)
         .expect("resolve labels from the node's undo chain")

@@ -128,10 +128,7 @@ fn reader_pins_reclaim_floor_until_it_rolls_back() {
         "the open reader pins the GC low-water at its snapshot (ts 1)"
     );
     // The reader's own begin snapshot, the one every resolution below is evaluated at.
-    let reader_snapshot = Snapshot {
-        owner: reader,
-        ts: ts1,
-    };
+    let reader_snapshot = Snapshot::new(reader, ts1);
     assert_eq!(
         resolves(&coord, node_a, key, reader_snapshot),
         Some(V1),
@@ -220,10 +217,7 @@ fn reader_pins_reclaim_floor_until_it_rolls_back() {
     );
     // ...and the reclamation was targeted, not a wholesale wipe: the live value survives it. (A GC
     // regression that emptied the cell outright would fail here while the assertions above passed.)
-    let current = Snapshot {
-        owner: TxnId(9_999),
-        ts: coord.with_store_mut(|s| s.snapshot_ts()),
-    };
+    let current = Snapshot::new(TxnId(9_999), coord.with_store_mut(|s| s.snapshot_ts()));
     assert_eq!(
         resolves(&coord, node_a, key, current),
         Some(V2),

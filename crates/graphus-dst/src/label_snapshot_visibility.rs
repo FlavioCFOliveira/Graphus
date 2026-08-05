@@ -94,10 +94,7 @@ impl LabelSnapshotReport {
 /// Resolves node `n`'s label bitmap as seen by `(owner, ts)`.
 fn sees_label(store: &Store, n: u64, owner: TxnId, ts: u64) -> bool {
     let rec = store.node(n).expect("read node n");
-    let snapshot = Snapshot {
-        owner,
-        ts: Timestamp(ts),
-    };
+    let snapshot = Snapshot::new(owner, Timestamp(ts));
     has_bit(
         store
             .label_bitmap_at(n, rec.labels, rec.mvcc.undo_ptr, snapshot)
@@ -310,10 +307,7 @@ pub fn run_reclaimed_id_reuse() -> (bool, u64, u64) {
     store.commit(t_new).expect("new node commits");
 
     let rec = store.node(m).expect("read new node");
-    let snapshot = Snapshot {
-        owner: TxnId(9_999),
-        ts: store.snapshot_ts(),
-    };
+    let snapshot = Snapshot::new(TxnId(9_999), store.snapshot_ts());
     let resolved = store
         .label_bitmap_at(m, rec.labels, rec.mvcc.undo_ptr, snapshot)
         .expect("resolve m's labels from its undo chain");

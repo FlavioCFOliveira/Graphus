@@ -128,10 +128,7 @@ fn build_multigraph() -> (Store, u64, usize) {
 fn ctx_for(s: &Store) -> (graphus_txn::CommitRegistry, Snapshot) {
     (
         s.commit_registry().clone(),
-        Snapshot {
-            owner: TxnId(99),
-            ts: s.snapshot_ts(),
-        },
+        Snapshot::new(TxnId(99), s.snapshot_ts()),
     )
 }
 
@@ -305,6 +302,17 @@ fn csr_eliminates_nonmatching_chain_reads() {
             snapshot: graphus_txn::Snapshot,
         ) -> Result<u64, graphus_core::error::GraphusError> {
             self.inner.label_bitmap_at(id, live, head, snapshot)
+        }
+        fn entity_visible_at(
+            &self,
+            kind: graphus_storage::StoreKind,
+            id: u64,
+            mvcc: graphus_storage::MvccHeader,
+            snapshot: graphus_txn::Snapshot,
+            registry: &graphus_txn::CommitRegistry,
+        ) -> Result<bool, graphus_core::error::GraphusError> {
+            self.inner
+                .entity_visible_at(kind, id, mvcc, snapshot, registry)
         }
         fn superset_scan_node_properties(
             &self,

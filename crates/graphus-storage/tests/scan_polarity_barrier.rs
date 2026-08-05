@@ -162,10 +162,7 @@ fn the_two_polarities_answer_differently_over_the_same_chain() {
     store.commit(remover).expect("commit the removal");
 
     // A reader that begins after the removal committed.
-    let snapshot = Snapshot {
-        owner: TxnId(3),
-        ts: store.snapshot_ts(),
-    };
+    let snapshot = Snapshot::new(TxnId(3), store.snapshot_ts());
 
     let superset: SupersetProperties = store
         .superset_scan_node_properties(node)

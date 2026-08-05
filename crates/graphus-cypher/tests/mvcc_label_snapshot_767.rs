@@ -436,10 +436,7 @@ mod off_thread {
     /// Builds an off-thread `ReadOnlyGraph` over `store` at snapshot `ts` — the same package the
     /// reader pool captures on the engine thread.
     fn reader_at(store: &Store, txn: u64, ts: u64) -> ReadOnlyGraph<MemBlockDevice, MemLogSink> {
-        let snapshot = Snapshot {
-            owner: TxnId(txn),
-            ts: Timestamp(ts),
-        };
+        let snapshot = Snapshot::new(TxnId(txn), Timestamp(ts));
         ReadOnlyGraph::new(
             store.read_view(),
             store.token_snapshot(),

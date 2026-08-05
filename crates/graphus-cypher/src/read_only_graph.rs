@@ -46,7 +46,7 @@ use graphus_core::error::GraphusError;
 use graphus_core::{TxnId, Value};
 use graphus_io::BlockDevice;
 use graphus_storage::{Namespace, StoreReadView, TokenSnapshot};
-use graphus_txn::{CommitRegistry, PredicateRead, Snapshot, SsiReadBuffer};
+use graphus_txn::{CommitRegistry, PredicateRead, Snapshot, SsiReadBuffer, View};
 use graphus_wal::LogSink;
 
 use crate::graph_access::{
@@ -959,6 +959,33 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
 
     fn delete_node(&mut self, _node: NodeId) {
         self.degrade_write();
+    }
+
+    // ---- statement-level isolation (`04 §5.1.4`, `rmp` #972) -------------------------------------
+
+    fn read_view(&self) -> View {
+        self.snapshot.view
+    }
+
+    fn set_read_view(&mut self, view: View) -> View {
+        // Implemented for real, even though this reader can observe no difference today: the polarity
+        // must reach the lifted read bodies identically on both paths, because a reader pool that
+        // resolves visibility by a different mechanism than the inline path is the `rmp`
+        // #755/#768/#769/#770 defect family. Threading it through the snapshot is all it takes — every
+        // off-thread read already carries `self.snapshot` down to `read_source`.
+        std::mem::replace(&mut self.snapshot.view, view)
+    }
+
+    fn begin_command(&mut self) {
+        // Deliberately a NO-OP, and it is the only correct behaviour here.
+        //
+        // The statement counter belongs to the *writing* transaction and is advanced by mutating the
+        // `RecordStore`'s active-transaction entry. This seam is a frozen, owned read view captured on
+        // the engine thread: it holds no store handle to advance, it never writes a delta that could
+        // carry a new command id, and it serves exactly one auto-commit read statement — so there is no
+        // second statement for the counter to separate. Advancing anything here would either be a lie
+        // (a local counter no delta is stamped with) or a data race (reaching back into the engine's
+        // store from a reader thread).
     }
 }
 

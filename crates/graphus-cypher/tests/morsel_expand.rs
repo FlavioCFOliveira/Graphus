@@ -342,7 +342,7 @@ impl Coordinated {
     }
 
     fn live_at(&self, txn: TxnId, ts: graphus_core::Timestamp) -> Live {
-        let snapshot = Snapshot { owner: txn, ts };
+        let snapshot = Snapshot::new(txn, ts);
         self.ssi.borrow_mut().register(txn, ts);
         RecordStoreGraph::attach(
             Rc::clone(&self.store),

@@ -556,6 +556,10 @@ fn estimate(op: &LogicalOp, stats: Option<&dyn Statistics>) -> f64 {
             }
         }
 
+        // Opening the next statement is a pure barrier: every input row is emitted, exactly once
+        // (`rmp` #972). It buffers rather than streams, but buffering changes latency, not cardinality.
+        LogicalOp::AdvanceCommand { input } => estimate(input, stats),
+
         // UNWIND emits one row per list element: input * average list length (a documented guess).
         LogicalOp::Unwind { input, .. } => estimate(input, stats) * DEFAULT_LIST_LENGTH,
 
@@ -1042,6 +1046,7 @@ fn label_for_var(op: &LogicalOp, variable: &str) -> Option<String> {
         | LogicalOp::Skip { input, .. }
         | LogicalOp::Limit { input, .. }
         | LogicalOp::Unwind { input, .. }
+        | LogicalOp::AdvanceCommand { input }
         | LogicalOp::LoadCsv { input, .. }
         | LogicalOp::Expand { input, .. }
         | LogicalOp::ShortestPath { input, .. }

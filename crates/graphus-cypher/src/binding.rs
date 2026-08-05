@@ -800,7 +800,12 @@ fn walk_physical(op: &PhysicalOp, record: &mut impl FnMut(&str, ParamType)) {
             input,
             null_variables: _,
         }
-        | PhysicalOp::Eager { input } => walk_physical(input, record),
+        | PhysicalOp::Eager { input }
+        // `rmp` #972: a pure barrier around the statement boundary. It carries no expression of its
+        // own, so there is nothing to record here — but the arm is written out rather than left to a
+        // fallthrough, because this walk is field-exhaustive ON PURPOSE (`rmp` #960): a missed operator
+        // silently loses a `$param` expectation and the parameter reads back as `Null`.
+        | PhysicalOp::AdvanceCommand { input } => walk_physical(input, record),
         // `rmp` #882: the fused one-hop `OPTIONAL MATCH` carries the predicates that used to be
         // `Filter` operators of its own, so its parameters must be recorded here or a
         // `OPTIONAL MATCH (a)-[r]->(b) WHERE b.x = $v` would silently lose the `$v` expectation the

@@ -75,14 +75,16 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use graphus_core::error::GraphusError;
-use graphus_core::{Timestamp, TxnId, Value};
+use graphus_core::{CommandId, Timestamp, TxnId, Value};
 use graphus_index::histogram::PropertyHistogram;
 use graphus_index::keycodec::{encode_equality_canonical, encode_single};
 use graphus_index::kinds::DEFAULT_HISTOGRAM_BUCKETS;
 use graphus_index::similarity_score;
 use graphus_io::BlockDevice;
-use graphus_storage::{ConstraintKind, IndexState, MvccHeader, Namespace, RecordStore};
-use graphus_txn::{CommitRegistry, PredicateRead, Snapshot, SsiReadBuffer, SsiTracker, is_visible};
+use graphus_storage::{ConstraintKind, IndexState, MvccHeader, Namespace, RecordStore, StoreKind};
+use graphus_txn::{
+    CommitRegistry, PredicateRead, Snapshot, SsiReadBuffer, SsiTracker, View, is_visible,
+};
 use graphus_wal::LogSink;
 
 /// Tag bit distinguishing a relationship key from a node key in the shared [`SsiTracker`]
@@ -259,6 +261,25 @@ struct ColumnarPass {
     rows: Vec<(NodeId, Value)>,
 }
 
+/// The read snapshot for `txn` at `ts`, pinned to the statement the **store** says `txn` is currently
+/// executing (`04 §5.1.4`, `rmp` #972).
+///
+/// The `RecordStore` owns the statement counter, so every seam that attaches to an already-open
+/// transaction must re-derive the command from it rather than restart the numbering. The floor at
+/// [`CommandId::FIRST`] is load-bearing, not defensive: a transaction that has opened no statement
+/// reports [`CommandId::NONE`], and an `OLD` view taken *at* `NONE` would undo the `NONE`-stamped
+/// deltas a maintenance or recovery write produced (`writer >= current` holds for `0 >= 0`). Pinning
+/// the read one command above them keeps every statement-less write visible to its own transaction,
+/// which is the invariant [`graphus_txn::command_hides_own_write`] is asserted against.
+fn snapshot_at_current_command<D: BlockDevice, S: LogSink>(
+    store: &RecordStore<D, S>,
+    txn: TxnId,
+    ts: Timestamp,
+) -> Snapshot {
+    let command = store.command_of(txn).max(CommandId::FIRST);
+    Snapshot::at_command(txn, ts, command, View::New)
+}
+
 /// A [`GraphAccess`] implementation over a real [`RecordStore`], scoped to one transaction
 /// (`rmp` task #38; see the module docs for the supported-vs-deferred matrix).
 ///
@@ -383,10 +404,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // what has committed so far, plus its own writes. Reads on a database that has changed since
         // this begin therefore stay on this consistent snapshot.
         store.begin(txn);
-        let snapshot = Snapshot {
-            owner: txn,
-            ts: store.snapshot_ts(),
-        };
+        let snapshot = snapshot_at_current_command(&store, txn, store.snapshot_ts());
         // Snapshot the store's Active/Recent Transaction Table at begin (`rmp` task #49): reads
         // resolve an on-disk in-flight stamp to its commit timestamp through this. A later commit is
         // correctly excluded whether or not this snapshot captured it (visibility filters by `ts`),
@@ -446,6 +464,14 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // that commits later is excluded by the `ts` filter regardless, and this statement's own
         // in-flight writes resolve via the owner rule.
         let registry = store.borrow().commit_registry().clone();
+        // **`rmp` #972.** The statement counter's single source of truth is the `RecordStore`, never a
+        // copy held by the coordinator: one explicit transaction runs many statements over many
+        // `RecordStoreGraph` instances, and each new instance must pick the counter up where the
+        // previous statement left it. Re-deriving it from the store here is what makes an attached
+        // seam continue the transaction rather than restart its statement numbering — a restart would
+        // let an `OLD` view of statement 2 hide statement 1's writes.
+        let snapshot =
+            snapshot_at_current_command(&store.borrow(), txn, snapshot.ts).with_view(snapshot.view);
         // The deferred-read buffer merges into the same shared tracker; clone the `Rc` for the guard
         // before `ssi` is moved into the field (`rmp` #341).
         let read_buffer = ReadBufferGuard::new(txn, Some(Rc::clone(&ssi)));
@@ -912,10 +938,11 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     pub fn begin_at_snapshot(mut store: RecordStore<D, S>, txn: TxnId, ts: Timestamp) -> Self {
         store.begin(txn);
         let registry = store.commit_registry().clone();
+        let snapshot = snapshot_at_current_command(&store, txn, ts);
         Self {
             store: Rc::new(RefCell::new(store)),
             txn,
-            snapshot: Snapshot { owner: txn, ts },
+            snapshot,
             registry,
             ssi: None,
             // Standalone snapshot path: no coordinator ⇒ no tracker; the guard's appends are no-ops
@@ -983,16 +1010,48 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         csr.borrow().candidates(node.0, &wanted)
     }
 
-    /// Whether the version carrying `mvcc` is visible to this query's snapshot (`04 §5.3`): its
-    /// creator committed at or before the snapshot (or is this transaction's own write) and its
-    /// expirer does not hide it. The one place the executor's reads consult MVCC.
-    fn visible(&self, mvcc: MvccHeader) -> bool {
+    /// Whether the version carrying `mvcc` is visible to this query's snapshot **from the header
+    /// words alone** (`04 §5.3`): its creator committed at or before the snapshot (or is this
+    /// transaction's own write) and its expirer does not hide it.
+    ///
+    /// This is the cross-*transaction* answer, and it is all a caller that is not asking about a
+    /// node or a relationship can have — a property cell's own stamps, for instance, which
+    /// [`column_witness_still_valid`](Self::column_witness_still_valid) tests as a cache witness.
+    /// Entity existence goes through [`entity_visible`](Self::entity_visible) instead, which refines
+    /// this to statement granularity (`rmp` #972).
+    fn visible_header(&self, mvcc: MvccHeader) -> bool {
         is_visible(
             self.snapshot,
             mvcc.created_ts,
             mvcc.expired_ts,
             &self.registry,
         )
+    }
+
+    /// Whether the node / relationship `(kind, id)` carrying `mvcc` **exists** as of this query's
+    /// snapshot, at statement granularity (`04 §5.1.4`, `rmp` #972).
+    ///
+    /// The header records *which transaction* created or expired the entity and never *which
+    /// statement of it*, so [`visible_header`](Self::visible_header) cannot tell a row this very
+    /// statement created from one an earlier statement of the same transaction created. That
+    /// distinction lives on the undo chain, which `RecordStore::entity_visible_at` walks — and only
+    /// when it can matter: under [`View::New`] the two answers are identical by construction and the
+    /// walk is never entered, so the ordinary read pays one comparison.
+    ///
+    /// # Errors
+    /// Returns a storage error if the entity's undo chain cannot be walked. Every caller must FAIL
+    /// CLOSED on it (`rmp` #733): an existence question that cannot be resolved must abort the read,
+    /// never fall back to the header's own verdict, which is exactly the answer the chain was
+    /// consulted to correct.
+    fn entity_visible(
+        &self,
+        kind: StoreKind,
+        id: u64,
+        mvcc: MvccHeader,
+    ) -> Result<bool, GraphusError> {
+        self.store
+            .borrow()
+            .entity_visible_at(kind, id, mvcc, self.snapshot, &self.registry)
     }
 
     /// The label bitmap node `id` presents to this query's snapshot (`rmp` task #767), given the
@@ -1127,6 +1186,18 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     #[must_use]
     pub fn has_error(&self) -> bool {
         self.error.borrow().is_some()
+    }
+
+    /// The statement this seam's reads are pinned to (`04 §5.1.4`, `rmp` #972).
+    ///
+    /// Observability: it is the id every delta this statement writes is stamped with, and the point
+    /// a [`View::Old`] read is resolved against. Exposed so a caller can assert that successive
+    /// statements of one transaction genuinely advance — the property that makes an explicit
+    /// multi-statement transaction behave like the auto-commit case, and the reason the counter's
+    /// home is the `RecordStore` rather than any per-statement seam.
+    #[must_use]
+    pub fn current_command(&self) -> CommandId {
+        self.snapshot.command
     }
 
     /// Mutates this statement's side-effect tally (`rmp` task #510). Takes `&self` because the lowest
@@ -1470,7 +1541,19 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                 }
             };
             examined += 1;
-            let visible = self.visible(rec.mvcc);
+            // Existence AS OF THIS STATEMENT (`rmp` #972), not merely as of this transaction: under
+            // `View::Old` a node this very statement created is not yet there. A chain read fault
+            // FAILS CLOSED here for the same reason the `node` arm above does — never the header's
+            // own verdict, which is the answer the chain was consulted to correct.
+            let visible = match self.entity_visible(StoreKind::Node, id, rec.mvcc) {
+                Ok(v) => v,
+                Err(e) => {
+                    drop(store);
+                    self.note_candidates(examined, hidden, filtered);
+                    self.capture(e);
+                    return Vec::new();
+                }
+            };
             // SIREAD-mark every examined node, visible or not (the label predicate examined it).
             self.note_read(node_ssi_key(id));
             if !visible {
@@ -1603,7 +1686,16 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                 }
             };
             examined += 1;
-            let visible = self.visible(rec.mvcc);
+            // Statement-granular existence (`rmp` #972); fail-closed on a chain read fault.
+            let visible = match self.entity_visible(StoreKind::Node, id, rec.mvcc) {
+                Ok(v) => v,
+                Err(e) => {
+                    drop(store);
+                    self.note_candidates(examined, hidden, filtered);
+                    self.capture(e);
+                    return Vec::new();
+                }
+            };
             // SIREAD-mark every examined node exactly once, visible or not.
             self.note_read(node_ssi_key(id));
             if !visible {
@@ -3775,9 +3867,20 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             // SIREAD-mark every examined candidate, visible or not (the predicate examined it) — the
             // identical per-candidate marker `filter_label_candidates` records.
             self.note_read(node_ssi_key(id));
-            if !self.visible(node_rec.mvcc) {
-                hidden += 1;
-                continue;
+            // Statement-granular existence (`rmp` #972). A chain read fault fails closed exactly as
+            // the record read above does: a swallowed error would silently drop a node from the
+            // aggregation, which is a wrong `count(*)` / `sum(...)` produced from an I/O error.
+            match self.entity_visible(StoreKind::Node, id, node_rec.mvcc) {
+                Ok(true) => {}
+                Ok(false) => {
+                    hidden += 1;
+                    continue;
+                }
+                Err(e) => {
+                    self.note_candidates(examined, hidden, filtered);
+                    self.capture(e);
+                    return Some(ColumnarPass::default());
+                }
             }
             // The node must carry the label AS OF THIS SNAPSHOT (`rmp` #767), the row label scan's
             // membership test — resolved from the record already decoded above, not re-read live.
@@ -3885,6 +3988,12 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         }
         // Witnesses 2-4: the cached cell must still hold the same key, the same value bytes, the same
         // creating stamp — and be visible to this snapshot.
+        //
+        // The header-only test is the right one here and needs no statement refinement (`rmp` #972):
+        // this is a *property cell*, not an entity, and the `created_ts` witness below already rejects
+        // every cell this transaction has itself rewritten — an in-place overwrite stamps the cell with
+        // our in-flight writer, which cannot equal the committed stamp the cache recorded. So a value
+        // our own current statement produced can never be served from the cache under either view.
         let prop = match self.store.borrow().property(witness.prop_pid) {
             Ok(p) => p,
             Err(_) => return false, // a read fault: decline the cache, fall back to the row read.
@@ -3893,7 +4002,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             && prop.type_tag == witness.type_tag
             && prop.value_inline == witness.value_inline
             && prop.mvcc.created_ts == witness.created_ts
-            && self.visible(prop.mvcc)
+            && self.visible_header(prop.mvcc)
     }
 
     /// `rmp` task #780 — OVER-FETCH. `k` hits from the graph become FEWER than `k` rows once the
@@ -6422,8 +6531,16 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             Ok(r) => r.mvcc,
             Err(_) => return,
         };
-        if !self.visible(mvcc) {
-            return;
+        // A write runs under `View::New` (`rmp` #972): a `DELETE` must be able to remove what the same
+        // statement just created, so the existence test here is the full read-your-own-writes one. A
+        // chain read fault fails closed — capture and delete nothing, never delete on a guess.
+        match self.entity_visible(StoreKind::Rel, rel.0, mvcc) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(e) => {
+                self.capture(e);
+                return;
+            }
         }
         // `rmp` #324, Win 2: deleting an edge changes incidence, so invalidate the CSR snapshot. No-op
         // when off; idempotent. Marked before the store mutation so a later read in this same
@@ -6455,8 +6572,14 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             Ok(n) => n.mvcc,
             Err(_) => return,
         };
-        if !self.visible(mvcc) {
-            return;
+        // `View::New`, and fail-closed on a chain read fault — see `delete_rel`.
+        match self.entity_visible(StoreKind::Node, node.0, mvcc) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(e) => {
+                self.capture(e);
+                return;
+            }
         }
         self.note_write(node_ssi_key(node.0));
         // Read-then-delete write-skew (`rmp` #171 blocker B1): announce the node's PRE-image predicate
@@ -6507,5 +6630,27 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     fn take_read_tally(&self) -> read_source::ReadCounts {
         // `rmp` #991: what the candidate re-verification above measured since the last drain.
         self.tally.take()
+    }
+
+    // ---- statement-level isolation (`04 §5.1.4`, `rmp` #972) -------------------------------------
+
+    fn read_view(&self) -> View {
+        self.snapshot.view
+    }
+
+    fn set_read_view(&mut self, view: View) -> View {
+        // The view lives ON the snapshot, so every read that already threads `self.snapshot` — the
+        // record filter, the label-word walk, the property-chain walk, the morsel bundles, the
+        // off-thread read view — picks the switch up with no further wiring. That is deliberate: a
+        // second copy of the polarity is a second thing to forget to update.
+        std::mem::replace(&mut self.snapshot.view, view)
+    }
+
+    fn begin_command(&mut self) {
+        // The store owns the counter; this only mirrors the id it just issued onto the read snapshot.
+        // Taking the returned value (rather than incrementing a local) is what keeps the two in step
+        // when several `RecordStoreGraph` instances run successive statements of one transaction.
+        let command = self.store.borrow_mut().begin_command(self.txn);
+        self.snapshot.command = command;
     }
 }

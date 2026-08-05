@@ -386,10 +386,7 @@ fn run_one(m: u64, reads: u64, arm: Arm) -> Run {
     // The read arm: the visible value of the last key written, through the same decision-polarity
     // path the query engine uses (`decision_scan_node_properties` → `visible_version`).
     let read_key = key_at(m - 1);
-    let snap = Snapshot {
-        owner: TxnId(next_txn),
-        ts: store.snapshot_ts(),
-    };
+    let snap = Snapshot::new(TxnId(next_txn), store.snapshot_ts());
     let visible_read = |s: &BenchStore| {
         let decided = s
             .decision_scan_node_properties(node, snap)

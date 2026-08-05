@@ -39,6 +39,7 @@
 pub mod catalog_rollback_undo;
 pub mod checker;
 pub mod cli;
+pub mod command_isolation;
 pub mod count_txn_undo;
 pub mod fault;
 pub mod faults;

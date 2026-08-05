@@ -738,6 +738,13 @@ pub fn estimate_cost(op: &PhysicalOp, stats: Option<&dyn Statistics>) -> CostEst
             CostEstimate::new(inner.rows, inner.cost)
         }
 
+        // Opening the next statement is likewise a pure barrier (`rmp` #972): it drains its input and
+        // bumps a per-transaction counter. Rows and cost pass through unchanged.
+        PhysicalOp::AdvanceCommand { input } => {
+            let inner = estimate_cost(input, stats);
+            CostEstimate::new(inner.rows, inner.cost)
+        }
+
         // UNWIND multiplies by an average list length; one tuple build per emitted element.
         PhysicalOp::Unwind { input, .. } => {
             let inner = estimate_cost(input, stats);

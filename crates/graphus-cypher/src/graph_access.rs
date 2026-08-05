@@ -38,6 +38,7 @@ use graphus_core::Value;
 use graphus_index::histogram::PropertyHistogram;
 use graphus_index::keycodec::encode_single;
 use graphus_index::kinds::DEFAULT_HISTOGRAM_BUCKETS;
+use graphus_txn::View;
 
 use crate::ast::RelDirection;
 
@@ -1247,6 +1248,52 @@ pub trait GraphAccess {
     fn take_read_tally(&self) -> crate::read_source::ReadCounts {
         crate::read_source::ReadCounts::ZERO
     }
+
+    // ---- statement-level isolation (`04 §5.1.4`, `rmp` #972) -------------------------------------
+
+    /// The MVCC **view** this seam currently serves its reads under.
+    ///
+    /// [`View::New`] is read-your-own-writes in full — everything the transaction has written,
+    /// including the statement running right now. [`View::Old`] hides the *current statement's* own
+    /// writes, which is what makes a scan immune to the rows the same statement is creating (the
+    /// Halloween problem) independently of any eagerness barrier the planner did or did not insert.
+    ///
+    /// The **default** is [`View::New`], which is what every seam without MVCC serves and what every
+    /// read in Graphus served before `rmp` #972: a seam with no versions has no "before this
+    /// statement" to show, so answering `New` is the honest answer rather than a stub.
+    fn read_view(&self) -> View {
+        View::New
+    }
+
+    /// Switches the view the **following** reads are taken under, returning the previous one so the
+    /// caller can restore it.
+    ///
+    /// Operators set this around their **own** graph accesses only — never around a child's `next()`
+    /// — and always restore it (see `Ctx::with_view` in [`crate::executor`]), so nesting is safe: a
+    /// `Filter` reading under `Old` may drive an `EXISTS { … }` sub-plan whose `Produce` reads under
+    /// `New` and hands `Old` back on the way out.
+    ///
+    /// The **default** is an ignored no-op returning [`View::New`]: a seam that cannot distinguish
+    /// the two views must not pretend it switched. This is deliberately *not* an error — an
+    /// MVCC-less seam is asked for `Old` on every scan and answering `New` is exactly right there,
+    /// because with no in-flight versions the two views coincide.
+    fn set_read_view(&mut self, view: View) -> View {
+        let _ = view;
+        View::New
+    }
+
+    /// Opens the **next statement** of this seam's transaction, advancing its `command_id`
+    /// (`04 §5.1.4`).
+    ///
+    /// Every delta the transaction writes from here on carries the new id, so a later read under
+    /// [`View::Old`] resolves against the state as it stood at this point. Called once when a cursor
+    /// opens, and once by [`AdvanceCommand`](crate::physical::PhysicalOp::AdvanceCommand) for a
+    /// `WITH` that follows a write — and at **no** other point: a statement that suspends and
+    /// resumes is still one statement, so advancing on resume would hide a `CREATE`'s already-applied
+    /// rows from its own later batches.
+    ///
+    /// The **default** is a no-op, correct for every seam that has no statement counter to advance.
+    fn begin_command(&mut self) {}
 }
 
 // =================================================================================================

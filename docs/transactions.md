@@ -122,6 +122,50 @@ predated it (a non-repeatable read), and an *uncommitted* one was visible to any
 defect, not a documented trade-off. Older label versions are now retained and every label read is
 resolved against the reader's own snapshot, exactly as a property read already was.
 
+### A statement is isolated from itself
+
+A transaction sees its own uncommitted work — that is what makes `CREATE (n) … SET n.x = 1` mean
+anything. But **a single statement does not see the changes that same statement is making.** Every
+statement of a transaction runs at its own point on an internal statement counter, and a read taken
+by a statement resolves against the state that statement started from.
+
+Without this, a statement that reads and writes the same pattern feeds itself. The classic case:
+
+```cypher
+MATCH (n:Person) CREATE (:Person)
+```
+
+Each created `:Person` is a node the `MATCH` is still walking, so the query would never end. With
+statement-level isolation it creates exactly one node per pre-existing `:Person` and stops. The same
+guarantee is what makes
+
+```cypher
+MATCH (n:Person) WHERE n.score = 1 SET n.score = n.score + 1
+```
+
+increment each person exactly once, whether or not an index on `:Person(score)` exists — the updated
+row cannot re-qualify for the predicate that selected it.
+
+This is the same guarantee PostgreSQL gives with `cmin`/`cmax` against a snapshot's command id, and
+that Memgraph gives with its `OLD`/`NEW` views. It is **not** the same as read-your-own-writes being
+switched off:
+
+| The statement… | Sees |
+| --- | --- |
+| reads a pattern it is itself creating, deleting, or updating (`MATCH`, `OPTIONAL MATCH`, expansions, `WHERE`, `UNWIND`) | the state the statement started from |
+| writes (`CREATE`, `SET`, `REMOVE`, `DELETE`, `FOREACH`, and `MERGE`'s match) | everything the transaction has done, including this statement |
+| projects a result (`RETURN`, `WITH`, aggregations, `ORDER BY`) | everything the transaction has done, including this statement |
+| runs after an earlier statement of the same transaction | everything that earlier statement did |
+
+So `MATCH (n) SET n.num = n.num + 1 RETURN n.num` returns the **new** value, while the `MATCH` that
+selected the rows was decided on the old one; and `MERGE` still matches what the very same statement
+created a moment earlier, which is what makes `UNWIND [...] AS x MERGE (:Movie {name: 'M'})` create
+one node rather than one per row.
+
+A `WITH` that follows a write starts a new statement, so the clauses after it see everything the
+clauses before it wrote. `RETURN` does not — it is the end of the statement, not a boundary inside
+it.
+
 ### What Snapshot Isolation for standalone reads implies
 
 Because a standalone read does not participate in serializability validation, it can observe the

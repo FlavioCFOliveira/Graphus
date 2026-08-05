@@ -199,10 +199,7 @@ fn main() {
             if armed { "ARMED" } else { "UNARMED" },
             if armed { tracked_nodes } else { 0 },
         );
-        let snapshot = Snapshot {
-            owner: TxnId(u64::MAX),
-            ts: Timestamp(u64::MAX),
-        };
+        let snapshot = Snapshot::new(TxnId(u64::MAX), Timestamp(u64::MAX));
 
         println!(
             "\n==== chain {} ====",

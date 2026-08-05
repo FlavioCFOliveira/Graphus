@@ -111,6 +111,7 @@ use std::sync::PoisonError;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use graphus_core::Value;
+use graphus_txn::View;
 
 use crate::counters::QueryCounters;
 use crate::graph_access::{
@@ -882,6 +883,24 @@ impl GraphAccess for ProfilingGraph<'_> {
         // wrapped seam measured. Nothing above it drains during a profiled statement — `tally()` is the
         // only drain — so forwarding cannot steal counts from the attribution path (`rmp` #991).
         self.inner.take_read_tally()
+    }
+
+    // ---- statement-level isolation (`04 §5.1.4`, `rmp` #972) -------------------------------------
+    //
+    // Delegated, all three. Inheriting the defaults would make a `PROFILE`d statement read under a
+    // different MVCC view than the same statement un-profiled — a plan whose measured rows describe a
+    // query nobody ran, which is the `rmp` #755 defect class.
+
+    fn read_view(&self) -> View {
+        self.inner.read_view()
+    }
+
+    fn set_read_view(&mut self, view: View) -> View {
+        self.inner.set_read_view(view)
+    }
+
+    fn begin_command(&mut self) {
+        self.inner.begin_command();
     }
 }
 

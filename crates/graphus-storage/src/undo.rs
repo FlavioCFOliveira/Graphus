@@ -236,9 +236,16 @@ pub struct UndoDelta {
     /// The two incidence actions only: `1` = start node, `2` = end node (see
     /// [`IncidentDirection`]). Zero otherwise.
     pub direction: u8,
-    /// The statement counter within the writing transaction (`04 §5.1.4`). Statement-level
-    /// isolation is task #972; the field is carried and round-tripped from this format version on
-    /// so no later build has to widen the record to gain it.
+    /// The statement counter within the writing transaction (`04 §5.1.4`) — a
+    /// [`graphus_core::CommandId`] as a raw `u32`, stamped by
+    /// `RecordStore::link_delta` from the transaction's own counter and **never** by the caller.
+    ///
+    /// It is what makes a statement isolated from itself: a read on
+    /// [`View::Old`](graphus_txn::View::Old) undoes every delta of the current statement, so a
+    /// statement cannot observe the rows it is itself producing (`rmp` #972). `0`
+    /// ([`CommandId::NONE`](graphus_core::CommandId::NONE)) means the delta was written outside any
+    /// statement — recovery, a maintenance pass, the catalog — and belongs to the transaction's
+    /// baseline, which no view undoes.
     pub command_id: u32,
     /// Physical id in `commit.store` of the writing transaction's slot. Never `0` on a live delta.
     pub commit_info: u64,
