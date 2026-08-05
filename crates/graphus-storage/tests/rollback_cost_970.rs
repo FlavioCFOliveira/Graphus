@@ -145,6 +145,25 @@ fn a_data_transactions_rollback_reloads_no_catalog() {
             live_before,
             "non-vacuity: the rollback must actually have undone the eight fresh nodes"
         );
+        // And that it undid the eight OVERWRITES too, not only the eight creations: the committed
+        // value is 7 and the aborted transaction wrote 9 over it.
+        let snapshot = graphus_txn::Snapshot {
+            owner: TxnId(999),
+            ts: s.snapshot_ts(),
+        };
+        for &id in ids.iter().skip(nodes / 2).take(WRITES) {
+            let decided = s
+                .decision_scan_node_properties(id, snapshot)
+                .expect("decided props");
+            let v = decided
+                .visible_version(key_ids[0])
+                .expect("the committed property is still there");
+            assert_eq!(
+                v.value_inline, 7,
+                "non-vacuity: the rollback must restore the committed value of node {id}, not leave \
+                 the aborted 9 in place"
+            );
+        }
     }
 }
 

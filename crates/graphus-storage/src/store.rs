@@ -5381,14 +5381,48 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                     .collect()
             })
             .unwrap_or_default();
-        for link in links.iter().rev() {
+        // Read every delta once, in link order, so the pass below can ask a question the reverse walk
+        // alone cannot answer: is this the transaction's OLDEST write of this key?
+        let mut deltas = Vec::with_capacity(links.len());
+        for link in links {
             let Some(delta) = self.read_delta(link.delta)? else {
                 return Err(GraphusError::Storage(format!(
                     "rollback of transaction {} reaches empty delta slot {} on {:?} {}",
                     txn.0, link.delta, link.kind, link.entity
                 )));
             };
-            self.apply_own_delta(link.kind, link.entity, delta, txn, &own_cells)?;
+            deltas.push(delta);
+        }
+        // The link index of the FIRST `SetProperty` this transaction wrote for each
+        // `(store, entity, key)`. Retiring the key's cell is legitimate on that delta and no other:
+        // it is the one whose "the key was absent" restores the state that predates the transaction.
+        //
+        // A later delta for the same key can carry the absent tag too — a `REMOVE` empties the cell
+        // **in place** and leaves it live (`D-property-removal`), so the next `SET` of that key finds
+        // it and links a second absent-valued delta. Retiring on that one (the newer, applied first)
+        // destroyed the cell the older delta still had a value to restore, and the rollback failed
+        // outright — which by the `rmp` #955 contract leaves the transaction open and takes the
+        // database to its degraded state. Pinned by
+        // `tests/abort_preserves_committed_state_970.rs::a_key_set_removed_and_set_again_rolls_back`.
+        let mut oldest_write: BTreeMap<(u8, u64, u32), usize> = BTreeMap::new();
+        for (i, (link, delta)) in links.iter().zip(&deltas).enumerate() {
+            if delta.action == UndoAction::SetProperty {
+                oldest_write
+                    .entry((link.kind as u8, link.entity, delta.token))
+                    .or_insert(i);
+            }
+        }
+        for (i, (link, delta)) in links.iter().zip(&deltas).enumerate().rev() {
+            let may_retire_cell = delta.action == UndoAction::SetProperty
+                && oldest_write[&(link.kind as u8, link.entity, delta.token)] == i;
+            self.apply_own_delta(
+                link.kind,
+                link.entity,
+                *delta,
+                txn,
+                &own_cells,
+                may_retire_cell,
+            )?;
         }
         Ok(())
     }
@@ -5405,9 +5439,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         delta: UndoDelta,
         txn: TxnId,
         own_cells: &BTreeSet<u64>,
+        may_retire_cell: bool,
     ) -> Result<()> {
         match delta.action {
-            UndoAction::SetProperty => self.undo_own_property(kind, entity, delta, txn, own_cells),
+            UndoAction::SetProperty => {
+                self.undo_own_property(kind, entity, delta, txn, own_cells, may_retire_cell)
+            }
             UndoAction::AddLabel => self.undo_own_label(entity, delta.token, true, txn),
             UndoAction::RemoveLabel => self.undo_own_label(entity, delta.token, false, txn),
             UndoAction::RemoveIncidentEdge => self.undo_own_incidence(entity, delta, txn),
@@ -5445,6 +5482,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         delta: UndoDelta,
         txn: TxnId,
         own_cells: &BTreeSet<u64>,
+        may_retire_cell: bool,
     ) -> Result<()> {
         let first_prop = self.first_prop_of(kind, entity)?;
         let Some((cell_id, mut cell)) =
@@ -5456,9 +5494,15 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 delta.token
             )));
         };
+        // `value_inline` is a tagged union's payload: an inline value, or a `strings.store` block id.
+        // Comparing the two payloads alone confuses them — an old INTEGER whose value happens to equal
+        // the current chain's head id read as "the same chain" and leaked it — so the tag decides
+        // whether the delta restores this very chain.
+        let restores_this_chain =
+            delta.type_tag & valenc::OVERFLOW_BIT != 0 && delta.value_inline == cell.value_inline;
         if cell.type_tag & valenc::OVERFLOW_BIT != 0
             && cell.value_inline != NULL_ID
-            && cell.value_inline != delta.value_inline
+            && !restores_this_chain
         {
             self.free_chain(txn, cell.value_inline)?;
         }
@@ -5470,7 +5514,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // aborted write. Safe to unlink because a property write takes the entity's write-conflict
         // check (`D-property-write-conflict`), so no other transaction can have prepended onto this
         // chain while this one held it.
-        if delta.type_tag == undo::TYPE_TAG_ABSENT && own_cells.contains(&cell_id) {
+        if delta.type_tag == undo::TYPE_TAG_ABSENT
+            && may_retire_cell
+            && own_cells.contains(&cell_id)
+        {
             return self.retire_own_prop_cell(kind, entity, cell_id, cell.next_prop, txn);
         }
         cell.type_tag = delta.type_tag;

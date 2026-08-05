@@ -795,12 +795,8 @@ mod tests {
         );
         assert!(
             !r.after.label_change_is_visible,
-            "the writer's label change must remain INVISIBLE across the fault"
-        );
-        assert!(
-            !r.after.label_change_is_visible,
-            "the un-undone label change must remain INVISIBLE: it never committed, so no snapshot may \
-             resolve to it"
+            "the writer's label change must remain INVISIBLE across the fault: it never committed, \
+             so no snapshot may resolve to it"
         );
         assert!(
             r.bystander_after.is_active,

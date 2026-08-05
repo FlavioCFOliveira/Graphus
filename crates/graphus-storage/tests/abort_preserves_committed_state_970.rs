@@ -312,3 +312,139 @@ fn aborting_a_reused_slot_leaves_the_committed_image_and_the_allocator_sound() {
         report.violations
     );
 }
+
+/// **Scenario 4 — one key written, removed and written again inside one transaction** (`rmp` #970
+/// regression, found by the storage audit of `0ac0418`).
+///
+/// The cell-retirement rule of [`undo_own_property`] rested on "a cell this transaction allocated
+/// carries at most one *the key was absent* delta". That is false: a `REMOVE` empties the cell in
+/// place and leaves it live, so the next `SET` of the same key finds it and links a **second**
+/// absent-valued delta. Applying the deltas newest-first then retired the cell on the newer one, and
+/// the older one — which still had a value to restore — found no cell and failed the whole rollback.
+///
+/// A failed rollback is not a local error: the transaction stays open by contract (`rmp` #955) and
+/// the server takes that database to its degraded state pending a restart. So this sequence, which is
+/// nothing more exotic than `SET` / `REMOVE` / `SET` of one property, took the database out of
+/// service.
+///
+/// **Non-vacuity.** The three deltas are asserted to exist before the rollback (the key reads back as
+/// the second value), and the committed image is compared across the abort as in every scenario
+/// above. Against the code this fixes, the `rollback` call itself returns `Err` and the test fails
+/// there, before any assertion.
+#[test]
+fn a_key_set_removed_and_set_again_rolls_back() {
+    let mut s = fresh();
+    let seed = TxnId(1);
+    s.begin(seed);
+    let k = s.intern_token(Namespace::PropKey, "k").expect("intern");
+    let other = s.intern_token(Namespace::PropKey, "other").expect("intern");
+    let (n, _) = s.create_node(seed).expect("node");
+    s.set_node_property_value(seed, n, other, &Value::Integer(1))
+        .expect("committed property");
+    s.commit(seed).expect("commit seed");
+
+    let observer = TxnId(9);
+    let before = committed_image(&s, observer);
+    assert!(
+        before.iter().any(|l| l.contains("props=[")),
+        "non-vacuity: the node carries a committed property to preserve: {before:?}"
+    );
+
+    let a = TxnId(2);
+    s.begin(a);
+    // (1) the key is absent -> a new cell, and an "absent" delta.
+    s.set_node_property_value(a, n, k, &Value::Integer(1))
+        .expect("set");
+    // (2) REMOVE empties that cell IN PLACE and leaves it live (`D-property-removal`).
+    assert!(
+        s.remove_node_property_value(a, n, k).expect("remove"),
+        "non-vacuity: the removal must actually have emptied a cell"
+    );
+    // (3) the key is absent again — in the same cell — so this links a SECOND absent delta.
+    s.set_node_property_value(a, n, k, &Value::String("x".repeat(4096)))
+        .expect("set again");
+
+    s.rollback(a).expect("the rollback must succeed");
+
+    assert_eq!(
+        committed_image(&s, observer),
+        before,
+        "rmp #970: the abort must leave the committed image untouched — the key was never committed"
+    );
+    let report = check_store(&mut s, &[]).expect("check");
+    assert!(
+        report.is_consistent(),
+        "store consistent after the abort: {:?}",
+        report.violations
+    );
+
+    // And the store is still usable: the same key can be written and committed afterwards.
+    let t = TxnId(3);
+    s.begin(t);
+    s.set_node_property_value(t, n, k, &Value::Integer(7))
+        .expect("set after the abort");
+    s.commit(t).expect("commit");
+    let report = check_store(&mut s, &[]).expect("check");
+    assert!(
+        report.is_consistent(),
+        "store consistent after the retry commits: {:?}",
+        report.violations
+    );
+}
+
+/// **Scenario 5 — an overflow chain whose head id collides numerically with the value it replaces**
+/// (`rmp` #970 regression, found by the storage audit of `0ac0418`).
+///
+/// A property cell's `value_inline` is a tagged union's payload: the value itself when it is inline,
+/// the `strings.store` block id when it overflows. The rule that frees the chain this transaction
+/// allocated — "free the cell's chain unless the delta is restoring that same chain" — compared the
+/// two payloads without consulting the tag, so an old INTEGER numerically equal to the new chain's
+/// head id read as "the same chain" and the blocks leaked for the life of the store.
+///
+/// **Non-vacuity.** The collision is constructed, not hoped for: the block id the next allocation
+/// will hand out is probed first and then written as the committed integer value, so the two payloads
+/// are equal by construction. The assertion is that the head id is handed out again after the abort —
+/// which it is not while the leak is present.
+#[test]
+fn aborting_an_overflow_write_frees_its_chain_even_when_the_ids_collide() {
+    let mut s = fresh();
+    let seed = TxnId(1);
+    s.begin(seed);
+    let k = s.intern_token(Namespace::PropKey, "k").expect("intern");
+    let (n, _) = s.create_node(seed).expect("node");
+    // Probe the block id the next overflow chain will be given, then hand it straight back.
+    let probe = s
+        .alloc_chain(seed, &vec![0u8; 4096])
+        .expect("probe a chain");
+    s.free_chain(seed, probe).expect("free the probe");
+    // The committed value is that very id, as an INTEGER — the collision.
+    s.set_node_property_value(seed, n, k, &Value::Integer(probe as i64))
+        .expect("committed integer");
+    s.commit(seed).expect("commit seed");
+
+    let a = TxnId(2);
+    s.begin(a);
+    s.set_node_property_value(a, n, k, &Value::String("x".repeat(4096)))
+        .expect("overwrite with an overflowed value");
+    s.rollback(a).expect("rollback");
+
+    // The chain the aborted write allocated must be back on the free list, so the next allocation is
+    // handed the same head id.
+    let t = TxnId(3);
+    s.begin(t);
+    let again = s.alloc_chain(t, &vec![0u8; 4096]).expect("allocate again");
+    s.free_chain(t, again).expect("tidy up");
+    s.commit(t).expect("commit");
+    assert_eq!(
+        again, probe,
+        "rmp #970: the abort must free the overflow chain it allocated even when the old value's \
+         payload equals the chain's head id ({probe})"
+    );
+
+    let report = check_store(&mut s, &[]).expect("check");
+    assert!(
+        report.is_consistent(),
+        "store consistent after the abort: {:?}",
+        report.violations
+    );
+}

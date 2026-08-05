@@ -60,6 +60,13 @@ pub struct ScenarioReport {
     pub fault: FaultKind,
     /// Total operations applied across all transactions before the fault.
     pub ops_applied: u64,
+    /// How many property writes the store **accepted** (`rmp` #970). A property write takes the
+    /// owning entity's write-conflict check, so an interleaved second writer is refused with a
+    /// retriable serialization failure and writes nothing. Counting the acceptances is what stops
+    /// that refusal from silently emptying the property axis of a scenario: `ops_applied` counts ops
+    /// *planned*, so without this a run in which every property write was refused would look exactly
+    /// like one in which they all landed.
+    pub props_accepted: u64,
     /// The acknowledged-commit ledger after the run.
     pub ledger: AckLedger,
     /// `Ok(())` if all invariants held, else the first failure.
@@ -147,6 +154,7 @@ struct Driver {
     prop_key: u32,
     next_txn: u64,
     ops_applied: u64,
+    props_accepted: u64,
 }
 
 impl Driver {
@@ -179,6 +187,7 @@ impl Driver {
             prop_key,
             next_txn: 2,
             ops_applied: 0,
+            props_accepted: 0,
         }
     }
 
@@ -250,6 +259,7 @@ impl Driver {
             seed: self.seed,
             fault: self.fault,
             ops_applied: self.ops_applied,
+            props_accepted: self.props_accepted,
             ledger: self.ledger.clone(),
             result,
             non_vacuous,
@@ -396,7 +406,7 @@ impl Driver {
                     .store
                     .add_node_property(tid, node, self.prop_key, PROP_TYPE_TAG, value)
                 {
-                    Ok(_pid) => {}
+                    Ok(_pid) => self.props_accepted += 1,
                     Err(graphus_core::GraphusError::Transaction(_)) => return,
                     Err(e) => panic!("add_node_property: {e:?}"),
                 }
@@ -967,12 +977,22 @@ mod tests {
     #[test]
     fn a_crash_scenario_passes_and_is_non_vacuous_for_some_seed() {
         let mut any_non_vacuous = false;
+        let mut props = 0u64;
         for seed in 1..=20u64 {
             let r = run_crash_scenario(seed);
             assert!(r.passed(), "seed {seed} failed: {:?}", r.result);
             any_non_vacuous |= r.non_vacuous;
+            props += r.props_accepted;
         }
         assert!(any_non_vacuous, "no seed produced a non-vacuous crash run");
+        // `rmp` #970: a property write is refused while another open transaction holds the entity, and
+        // a refusal writes nothing. Without this witness a sweep in which EVERY property write was
+        // refused would look identical to one in which they all landed — the property axis would be
+        // silently empty while `ops_applied` kept counting the ops it planned.
+        assert!(
+            props > 0,
+            "no property write was accepted across 20 seeds — the property axis is vacuous"
+        );
     }
 
     #[test]
