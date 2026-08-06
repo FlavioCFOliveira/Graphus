@@ -382,6 +382,38 @@ struct ActiveTxn {
     /// `NONE`, and `NONE` is below every real command, so no `OLD` view ever undoes it. A
     /// statement-driven transaction advances it once per statement and never within one.
     command: CommandId,
+    /// **`rmp` #966 — the undo-delta slab.** A half-open run `[next, end)` of freshly-allocated
+    /// `undo.store` physical ids, all inside **one** store page, from which
+    /// [`alloc_undo_id`](Self::alloc_undo_id) hands out deltas by a bare counter increment.
+    ///
+    /// This is the store-record form of Memgraph's `delta_container`, whose whole purpose is that a
+    /// transaction does not pay an allocation per delta
+    /// (`/data/refsrc/memgraph/src/storage/v2/delta_container.hpp:57-60`). Here the cost avoided is
+    /// [`alloc_id`](Self::alloc_id)'s per-id free-list probe and `ensure_store_page` growth check; the
+    /// locality gained matters more: a transaction's deltas land contiguously in one page, so its
+    /// chain writes dirty one page and its WAL patches all name that page.
+    ///
+    /// Purely in-memory and never persisted: it is refilled from the allocator on demand and dropped
+    /// with the transaction. An open slab's unconsumed tail is therefore *leaked* across a
+    /// close/crash — at most one page's worth of 56-byte slots (8 KiB) per transaction that held one,
+    /// and invisible to the consistency checker, which does not require an allocated id to be either
+    /// in use or free.
+    ///
+    /// **It lives on the transaction, not on the store (`rmp` #1011, layer 3 of #975).** It was a
+    /// `RecordStore` field until then, which was indistinguishable from correct under one writer and
+    /// wrong in two independent ways under N:
+    ///
+    /// 1. two writers would consume the **same** slab cursor and receive overlapping delta ids —
+    ///    silent corruption of the version chain the whole of sprint 96 is built on;
+    /// 2. one transaction's rollback cleared the shared slab, handing the next id of a run a *second*
+    ///    writer still believed it owned.
+    ///
+    /// Memgraph's `delta_container`, which the field's own docs cite as its model, is a member of
+    /// `Transaction` for exactly this reason
+    /// (`/data/refsrc/memgraph/src/storage/v2/transaction.hpp:234`). Per-transaction also restores the
+    /// locality claim the docs make: with a shared slab under N writers every writer's deltas land in
+    /// one page, so that page's frame latch becomes the contention point and every writer dirties it.
+    undo_slab: Option<(u64, u64)>,
     /// **`rmp` #972.** The entities this transaction created **in the current statement**, cleared
     /// whenever [`begin_command`](RecordStore::begin_command) opens the next one.
     ///
@@ -867,6 +899,36 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// the frontier here before freezing; [`rollback`](Self::rollback) restores it if the aborting
     /// transaction is this GC pass, and [`commit_prepare`](Self::commit_prepare) clears it. `None`
     /// outside a GC pass. Mirrors [`pending_gc_prune`](Self::pending_gc_prune)'s lifecycle.
+    ///
+    /// **Audited for `rmp` #1011 (layer 3 of #975) and deliberately left SHARED.** It looks like the
+    /// `undo_slab` — one `Option` keyed by a `TxnId`, so it structurally admits exactly one owner —
+    /// but the conclusion is the opposite, and the reason is worth stating so the next reader does not
+    /// re-open it. Both consumers are guarded on `sp_txn == txn`
+    /// ([`settle_committed_txn`](Self::settle_committed_txn) and [`rollback`](Self::rollback)), so a
+    /// transaction that is *not* the GC pass provably leaves it alone; and the one-owner limit is not
+    /// a constraint to remove, because **GC stays a single actor** under N writers. Making it
+    /// per-transaction would model a concurrency that the design does not have and does not want:
+    /// two simultaneous freeze-frontier savepoints would mean two simultaneous freeze sweeps racing
+    /// on `freeze_low`, which is the `rmp` #522 silent-data-loss shape, not a scalability win.
+    /// **`rmp` #1011 — the partly-consumed undo slabs a finished transaction handed back.**
+    ///
+    /// A slab is one `undo.store` page's worth of ids, owned by ONE transaction while it is open (see
+    /// [`ActiveTxn::undo_slab`]). Ownership is what buys page locality and what keeps two writers off
+    /// one cursor — but if the remainder died with the transaction, every short transaction would burn
+    /// a whole page, the page list would grow once per commit, and the per-commit catalog image would
+    /// grow with it. That is not hypothetical: it is exactly what
+    /// `graphus-cypher/tests/wal_amplification.rs` measured when the remainder was dropped —
+    /// 1.00 undo pages per commit, and the reading's own records fell below half the commit.
+    ///
+    /// So the remainder comes back here when the transaction ends, and the next
+    /// [`refill_undo_slab`](Self::refill_undo_slab) prefers it over growing the store. Sequential
+    /// transactions therefore reuse one page exactly as they did before the slab moved, while
+    /// concurrent ones still each hold their own.
+    ///
+    /// Bounded by [`MAX_SPARE_UNDO_SLABS`]: a spare is an optimisation, never a correctness
+    /// requirement, so dropping one past the cap costs at most that page's unused tail — the same
+    /// leak the field's predecessor already accepted, and now bounded rather than per-transaction.
+    spare_undo_slabs: Vec<(u64, u64)>,
     gc_freeze_low_savepoint: Option<(TxnId, [u64; STORE_COUNT])>,
     /// **`rmp` #588 (sprint-52 B1) — reader-safe physical-slot reuse.** A per-kind, in-memory overlay
     /// of GC-freed physical ids that [`alloc_id`](Self::alloc_id) must NOT hand back out **yet**,
@@ -894,22 +956,6 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// created. Surfaced by [`opened_format_version`](Self::opened_format_version) so a caller can
     /// see that an upgrade happened; the store itself always writes the current version.
     opened_format_version: u32,
-    /// **`rmp` #966 — the undo-delta slab.** A half-open run `[next, end)` of freshly-allocated
-    /// `undo.store` physical ids, all inside **one** store page, from which
-    /// [`alloc_undo_id`](Self::alloc_undo_id) hands out deltas by a bare counter increment.
-    ///
-    /// This is the store-record form of Memgraph's `delta_container`, whose whole purpose is that a
-    /// transaction does not pay an allocation per delta
-    /// (`/data/refsrc/memgraph/src/storage/v2/delta_container.hpp:57-60`). Here the cost avoided is
-    /// [`alloc_id`](Self::alloc_id)'s per-id free-list probe and `ensure_store_page` growth check; the
-    /// locality gained matters more: a transaction's deltas land contiguously in one page, so its
-    /// chain writes dirty one page and its WAL patches all name that page.
-    ///
-    /// Purely in-memory and never persisted: it is refilled from the allocator on demand and dropped
-    /// on rollback. An open slab's unconsumed tail is therefore *leaked* across a close/crash — at
-    /// most one page's worth of 56-byte slots (8 KiB) for the life of a store, and invisible to the
-    /// consistency checker, which does not require an allocated id to be either in use or free.
-    undo_slab: Option<(u64, u64)>,
     /// **`rmp` #966.** Entities whose undo chain has grown since the last GC pass and may therefore
     /// have become reclaimable: `(kind as u8, physical id)`. The GC chain sweep iterates exactly this
     /// set instead of scanning the record stores, mirroring the `rmp` #522 pending-tombstone design.
@@ -1006,6 +1052,14 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
 /// tunable per store via [`RecordStore::set_checkpoint_interval_bytes`].
 pub const DEFAULT_CHECKPOINT_INTERVAL_BYTES: u64 = 64 * 1024 * 1024;
 
+/// How many partly-consumed undo slabs the store keeps for reuse (`rmp` #1011).
+///
+/// One per concurrent writer is the useful number; the cap is the ceiling that keeps a burst of
+/// short transactions from parking pages indefinitely. Past it a remainder is simply dropped, which
+/// costs that page's unused tail and nothing else — a spare is an optimisation, never a correctness
+/// requirement.
+const MAX_SPARE_UNDO_SLABS: usize = 16;
+
 /// **`rmp` #809 — release-active freeze-frontier audit window.** How many physical ids of *each* MVCC
 /// store the always-on prune-soundness audit re-verifies per GC pass (see
 /// [`RecordStore::audit_freeze_frontier_window`]). It bounds the audit's per-pass cost to a fixed
@@ -1076,6 +1130,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             pending_empty_prop_cells: false,
             gc_full_scan_pending: true,
             gc_freeze_low_savepoint: None,
+            spare_undo_slabs: Vec::new(),
             // `rmp` #588: reader-safe slot-reuse overlay (in-memory; empty unless off-thread readers hold a slot).
             held_slots: std::array::from_fn(|_| HashMap::new()),
             reuse_barrier: None,
@@ -1083,7 +1138,6 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // `rmp` #966 undo-area state: all in-memory, all rebuilt from scratch every open. The
             // chain sweep's pending set is reseeded by the first pass's full scan
             // (`gc_full_scan_pending`), so a crash-recovered store reclaims its chains normally.
-            undo_slab: None,
             pending_undo_chains: std::collections::BTreeSet::new(),
             undo_orphan_slots_possible: false,
             statistics: Statistics::new(),
@@ -1217,6 +1271,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             pending_empty_prop_cells: false,
             gc_full_scan_pending: true,
             gc_freeze_low_savepoint: None,
+            spare_undo_slabs: Vec::new(),
             // `rmp` #588: reader-safe slot-reuse overlay (in-memory; empty unless off-thread readers hold a slot).
             held_slots: std::array::from_fn(|_| HashMap::new()),
             reuse_barrier: None,
@@ -1224,7 +1279,6 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // `rmp` #966 undo-area state: all in-memory, all rebuilt from scratch every open. The
             // chain sweep's pending set is reseeded by the first pass's full scan
             // (`gc_full_scan_pending`), so a crash-recovered store reclaims its chains normally.
-            undo_slab: None,
             pending_undo_chains: std::collections::BTreeSet::new(),
             undo_orphan_slots_possible: false,
             statistics: meta.statistics,
@@ -2828,7 +2882,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         {
             self.gc_freeze_low_savepoint = None;
         }
-        self.active.remove(&txn);
+        // Hand the unconsumed undo slab back before the entry that owns it is dropped (`rmp` #1011).
+        let slab = self.active.remove(&txn).and_then(|a| a.undo_slab);
+        self.return_undo_slab(slab);
     }
 
     /// Group-commit **HARDEN** (phase 2, `04 §4.2` / `rmp` #528): `fdatasync`s the WAL, making every
@@ -3229,7 +3285,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// (`/data/refsrc/memgraph/src/storage/v2/delta_container.hpp:57-60`): rather than allocating per
     /// delta, one page's worth of contiguous ids is claimed at a time and handed out by a counter
     /// increment. Reuse is still preferred over growth, so the store does not grow while reclaimed
-    /// slots are available. See [`undo_slab`](Self#structfield.undo_slab).
+    /// slots are available. The slab belongs to the TRANSACTION, not to the store (`rmp` #1011).
     ///
     /// # Errors
     /// Returns a storage error if the slab cannot be refilled (id-space exhaustion, or a failure
@@ -3239,11 +3295,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             self.note_popped_id(txn, StoreKind::Undo, id);
             return Ok(id);
         }
-        let (next, end) = match self.undo_slab {
+        let (next, end) = match self.active.get(&txn).and_then(|a| a.undo_slab) {
             Some((next, end)) if next < end => (next, end),
             _ => self.refill_undo_slab(txn)?,
         };
-        self.undo_slab = Some((next + 1, end));
+        self.active.entry(txn).or_default().undo_slab = Some((next + 1, end));
         Ok(next)
     }
 
@@ -3251,6 +3307,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// range. The slab never crosses a page boundary, so a transaction's deltas cluster in one page:
     /// one dirty page and one WAL-patch target for the whole chain-writing burst.
     fn refill_undo_slab(&mut self, txn: TxnId) -> Result<(u64, u64)> {
+        // Prefer a slab a finished transaction handed back over growing the store (`rmp` #1011). Its
+        // page is already mapped and already counted in the catalog's page list, so this costs no WAL
+        // and no page-list growth — which is the whole reason the pool exists.
+        if let Some((first, end)) = self.spare_undo_slabs.pop() {
+            self.active.entry(txn).or_default().undo_slab = Some((first, end));
+            return Ok((first, end));
+        }
         let rpp = paging::records_per_page(undo::UNDO_RECORD_SIZE) as u64;
         let first = self.store(StoreKind::Undo).alloc.high_water().max(1);
         let rel_page = first / rpp;
@@ -3279,8 +3342,26 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             self.store_mut(StoreKind::Undo).alloc = PhysicalAllocator::restore(first);
             return Err(e);
         }
-        self.undo_slab = Some((first, end));
+        self.active.entry(txn).or_default().undo_slab = Some((first, end));
         Ok((first, end))
+    }
+
+    /// Hands `txn`'s unconsumed undo slab back to the store for the next transaction (`rmp` #1011).
+    ///
+    /// Called at BOTH endings, because a slab is owned for the transaction's lifetime and neither
+    /// ending is special: a commit's remainder is as reusable as an abort's. The ids in it were never
+    /// written, so re-handing them out is safe — the same argument `refill_undo_slab` already makes
+    /// when it un-bumps the allocator on a mapping failure.
+    ///
+    /// A spent slab (`next >= end`) is not worth keeping, and the pool is capped
+    /// ([`MAX_SPARE_UNDO_SLABS`]) so a burst of short transactions cannot park pages without bound.
+    fn return_undo_slab(&mut self, slab: Option<(u64, u64)>) {
+        if let Some((next, end)) = slab
+            && next < end
+            && self.spare_undo_slabs.len() < MAX_SPARE_UNDO_SLABS
+        {
+            self.spare_undo_slabs.push((next, end));
+        }
     }
 
     /// The `commit.store` slot of `txn`, allocating and writing it on first use (`04 §5.1.3`).
@@ -6278,13 +6359,19 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             counts: aborted_counts,
             commit_slot: aborted_commit_slot,
             undo_links: aborted_undo_links,
+            undo_slab: aborted_undo_slab,
             ..
         } = self.active.remove(&txn).unwrap_or_default();
-        // The in-memory delta slab is dropped, never carried across a rollback (`rmp` #966): the
-        // catalog reload below resets this store's allocator to the durable image, so a slab cursor
-        // captured before it could hand out an id the allocator no longer considers taken. Dropping it
-        // costs at most one page of undo slots, and only on a transaction that actually aborted.
-        self.undo_slab = None;
+        // The remainder is as reusable after an abort as after a commit: none of its ids was ever
+        // written (`rmp` #1011). Handed back BEFORE the catalog reload below, whose allocator reset is
+        // exactly what made a SHARED cursor unsafe to keep — a slab of already-mapped ids is not.
+        self.return_undo_slab(aborted_undo_slab);
+        // The in-memory delta slab needs no explicit reset here (`rmp` #966, #1011): it now lives on
+        // the `ActiveTxn` the `self.active.remove(&txn)` above has already taken, so it drops with the
+        // transaction that owned it. That is also what makes dropping it SAFE, which it was not while
+        // the slab was a store field: the catalog reload below resets the allocator to the durable
+        // image, so clearing a SHARED cursor handed the next id of a run to a second writer that still
+        // believed it owned it.
         // Any catalog-only change this txn made has been discarded by the `reload_catalog` above (`rmp`
         // #529): clear the dirty flag so the NEXT transaction's read-only fast path is not forced onto
         // the durable path by this aborted transaction's un-persisted mutation. (A token this txn
@@ -9206,6 +9293,21 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Returns a storage error if `id`'s page is not allocated or the delta does not decode.
     pub fn read_delta_for_test(&self, id: u64) -> Result<Option<undo::UndoDelta>> {
         self.read_delta(id)
+    }
+
+    /// Walks entity `(kind, entity)`'s whole undo chain — an inspection accessor exposing the private
+    /// `undo_chain` so the per-transaction delta-slab test (`rmp` #1011) can assert which delta ids a
+    /// transaction was actually handed, rather than inferring ownership from what a read returns.
+    /// Behaviour-identical to the internal walk.
+    ///
+    /// # Errors
+    /// As the internal walk: a dangling link or a chain that does not terminate.
+    pub fn undo_chain_for_test(
+        &self,
+        kind: StoreKind,
+        entity: u64,
+    ) -> Result<Vec<(u64, undo::UndoDelta)>> {
+        self.undo_chain(kind, entity)
     }
 
     /// Reads the raw [`HeapBlock`] at `id` — an inspection accessor exposing the private `read_block`
