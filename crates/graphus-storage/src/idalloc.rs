@@ -14,6 +14,8 @@
 //! Physical id `0` is reserved as the null pointer (`04 §2.2`), so both the first real physical
 //! id and the first `ElementId` are `1`.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use graphus_core::{ElementId, GraphusError, Result};
 
 /// The reserved null physical id: `first_rel`/`first_prop`/`next_prop` etc. use it for "none"
@@ -195,9 +197,38 @@ impl FreeList {
 /// Deterministic and seedable: starting from `seed`, each allocation returns the seed and bumps
 /// it by one, so a test that seeds the same value gets the same id stream. The raw `u128` is the
 /// stored identity (text encoding deferred per `05 §8`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// # Lock-free, and why it is allowed to be (`rmp` #1012)
+///
+/// Every allocation is a `fetch_add`, so `N` writer threads may mint identities at once without a
+/// latch. That is sound because this counter owes **monotonicity, not total order**: an `ElementId`
+/// is an identity, never a position — nothing reads it to order two events, and no invariant relates
+/// one id to another. Two concurrent allocations may therefore be handed out in either order, as long
+/// as they are handed out *once each*, which is exactly what `fetch_add` guarantees and what a
+/// read-then-write does not.
+///
+/// The alternative was a `Mutex`, and it was rejected on the objective this sprint exists for: an
+/// identity is minted for **every node and every relationship created**, so a lock here would
+/// serialise the write path at its hottest point — reintroducing, one layer down, precisely the
+/// single-writer bottleneck the multi-writer work removes.
+///
+/// # The counter is 64-bit, and the identity stays 128-bit
+///
+/// Rust has no `AtomicU128`, so the live counter is an [`AtomicU64`] widened to `u128` on the way
+/// out. That narrows the *allocable* range, not the *type*: ids are handed out from `1..=u64::MAX`,
+/// which at a sustained billion identities per second is over five centuries of allocation, while
+/// `ElementId` remains the 128-bit value `04 §2.2` specifies and every stored, encoded and
+/// wire-visible identity is unchanged.
+///
+/// Both doors into the counter fail closed rather than truncating: a seed from the durable catalog
+/// above `u64::MAX` is refused ([`try_new`](Self::try_new)) instead of being wrapped into a value
+/// that would re-issue live identities, and exhaustion is refused instead of wrapping to the
+/// reserved `ElementId(0)`.
+#[derive(Debug)]
 pub struct ElementIdAllocator {
-    next: u128,
+    /// One past the largest identity handed out. Monotone by construction: it is only ever advanced,
+    /// by `fetch_add` here and by a compare-exchange max in [`observe`](Self::observe).
+    next: AtomicU64,
 }
 
 impl Default for ElementIdAllocator {
@@ -206,44 +237,105 @@ impl Default for ElementIdAllocator {
     }
 }
 
+impl Clone for ElementIdAllocator {
+    /// A snapshot of the counter's current value, not a shared handle. The only callers are the
+    /// catalog paths that copy a store's allocator state around; an allocator is never *shared* by
+    /// cloning it (the live one is shared by reference).
+    fn clone(&self) -> Self {
+        Self {
+            next: AtomicU64::new(self.next.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+impl PartialEq for ElementIdAllocator {
+    fn eq(&self, other: &Self) -> bool {
+        self.next.load(Ordering::Relaxed) == other.next.load(Ordering::Relaxed)
+    }
+}
+
+impl Eq for ElementIdAllocator {}
+
 impl ElementIdAllocator {
     /// A new allocator whose first id is `seed`.
     ///
     /// # Panics
-    /// Panics if `seed` is `0` (an `ElementId` of `0` would collide with "absent").
+    /// Panics if `seed` is `0` (an `ElementId` of `0` would collide with "absent") or if it exceeds
+    /// the allocable range (see [`try_new`](Self::try_new) for the fallible form every path that
+    /// reads a seed from durable state must use instead).
     #[must_use]
     pub fn new(seed: u128) -> Self {
-        assert!(seed != 0, "ElementId 0 is reserved as the absent id");
-        Self { next: seed }
+        Self::try_new(seed).expect("element-id seed within the allocable range")
+    }
+
+    /// A new allocator whose first id is `seed`, refusing a seed outside the allocable range.
+    ///
+    /// # Errors
+    /// Returns a storage error if `seed` is `0`, or above `u64::MAX`. The second is the case that
+    /// matters: a seed comes from the durable catalog, so a corrupt or adversarial one must not be
+    /// truncated into the live range — that would re-issue identities that already name committed
+    /// entities.
+    pub fn try_new(seed: u128) -> Result<Self> {
+        if seed == 0 {
+            return Err(GraphusError::Storage(
+                "element-id seed 0 is reserved as the absent id".to_owned(),
+            ));
+        }
+        let seed = u64::try_from(seed).map_err(|_| {
+            GraphusError::Storage(format!(
+                "element-id seed {seed} exceeds the allocable range (ceiling {})",
+                u64::MAX
+            ))
+        })?;
+        Ok(Self {
+            next: AtomicU64::new(seed),
+        })
     }
 
     /// The next id this allocator will hand out (one past the largest allocated so far).
     #[must_use]
-    pub fn peek(self) -> u128 {
-        self.next
+    pub fn peek(&self) -> u128 {
+        u128::from(self.next.load(Ordering::Relaxed))
     }
 
     /// Allocates the next [`ElementId`], advancing the counter. Never reused (`04 §2.2`).
     ///
+    /// Takes `&self`: `N` writers may allocate concurrently, each receiving a distinct identity. See
+    /// the type docs for why monotonicity alone is the right contract here.
+    ///
     /// # Errors
-    /// Returns a storage error if the 128-bit identity space is exhausted (`next == u128::MAX`). As
-    /// with [`PhysicalAllocator::alloc_fresh`], the release profile leaves `overflow-checks` off, so
-    /// an unchecked `self.next += 1` at the ceiling would WRAP to `0` and hand out the reserved
-    /// "absent" `ElementId(0)` as a live identity (`rmp` #452); `checked_add` fails closed instead.
-    pub fn alloc(&mut self) -> Result<ElementId> {
-        let id = ElementId(self.next);
-        self.next = self.next.checked_add(1).ok_or_else(|| {
-            GraphusError::Storage("element-id space exhausted: next id at u128::MAX".to_owned())
-        })?;
-        Ok(id)
+    /// Returns a storage error if the allocable range is exhausted. The release profile leaves
+    /// `overflow-checks` off, so an unchecked bump at the ceiling would WRAP to `0` and hand out the
+    /// reserved "absent" `ElementId(0)` as a live identity (`rmp` #452). `fetch_update` fails closed
+    /// instead, and it does so atomically — a check-then-add would let two threads at the ceiling
+    /// both pass the check.
+    pub fn alloc(&self) -> Result<ElementId> {
+        let id = self
+            .next
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .map_err(|_| {
+                GraphusError::Storage(format!(
+                    "element-id space exhausted: next id at the ceiling {}",
+                    u64::MAX
+                ))
+            })?;
+        Ok(ElementId(u128::from(id)))
     }
 
     /// Records that `id` has already been issued, so future allocations never collide with it
     /// (used when rebuilding from a scan of existing records).
-    pub fn observe(&mut self, id: ElementId) {
-        if id.0 >= self.next {
-            self.next = id.0 + 1;
-        }
+    ///
+    /// A saturating compare-exchange max, so it is safe against a concurrent [`alloc`](Self::alloc)
+    /// and against another `observe`: the counter only ever moves forwards, and a racing pair leaves
+    /// it at the larger of the two. An id outside the allocable range raises the counter to the
+    /// ceiling rather than wrapping, which makes the next `alloc` fail closed.
+    pub fn observe(&self, id: ElementId) {
+        let want = u64::try_from(id.0).unwrap_or(u64::MAX).saturating_add(1);
+        let _ = self
+            .next
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                (want > n).then_some(want)
+            });
     }
 }
 
@@ -315,17 +407,17 @@ mod tests {
 
     #[test]
     fn element_ids_are_seedable_and_never_repeat() {
-        let mut a = ElementIdAllocator::new(100);
+        let a = ElementIdAllocator::new(100);
         assert_eq!(a.alloc().unwrap(), ElementId(100));
         assert_eq!(a.alloc().unwrap(), ElementId(101));
         // Same seed -> same stream (reproducible).
-        let mut b = ElementIdAllocator::new(100);
+        let b = ElementIdAllocator::new(100);
         assert_eq!(b.alloc().unwrap(), ElementId(100));
     }
 
     #[test]
     fn element_id_observe_prevents_collision() {
-        let mut a = ElementIdAllocator::new(1);
+        let a = ElementIdAllocator::new(1);
         a.observe(ElementId(50));
         assert_eq!(a.alloc().unwrap(), ElementId(51));
     }
@@ -334,20 +426,85 @@ mod tests {
     /// the next `alloc` rather than wrap to `0` and hand out the reserved "absent" `ElementId(0)`.
     /// Same release-profile wrap hazard as the physical allocator above.
     #[test]
-    fn element_id_alloc_at_u128_max_ceiling_errors_instead_of_wrapping_to_absent() {
-        let mut a = ElementIdAllocator::new(u128::MAX);
-        let err = a.alloc();
+    fn element_id_alloc_at_the_ceiling_errors_instead_of_wrapping_to_absent() {
+        // One below the ceiling still allocates, and lands the counter ON it.
+        let a = ElementIdAllocator::new(u128::from(u64::MAX) - 1);
+        assert_eq!(a.alloc().unwrap(), ElementId(u128::from(u64::MAX) - 1));
+        assert_eq!(a.peek(), u128::from(u64::MAX));
+        // At the ceiling the counter can no longer advance, so the identity is refused rather than
+        // handed out with a wrapped counter behind it. The ceiling value itself is therefore never
+        // issued — conservative by one id, which is the direction that cannot collide.
         assert!(
-            err.is_err(),
-            "ElementId alloc at u128::MAX must fail closed, not wrap to the reserved absent id 0"
+            a.alloc().is_err(),
+            "alloc at the ceiling must fail closed, not wrap to the reserved absent id 0"
         );
-        assert_eq!(a.peek(), u128::MAX);
-        assert!(a.alloc().is_err());
-        assert_ne!(a.peek(), 0);
+        assert_eq!(
+            a.peek(),
+            u128::from(u64::MAX),
+            "a refused alloc must leave the counter exactly where it was, never wrapped to 0"
+        );
+    }
+
+    /// **A seed above the allocable range is refused, not truncated** (`rmp` #1012).
+    ///
+    /// The counter is a 64-bit atomic widened to `u128` on the way out, and the seed it is built from
+    /// comes off the durable catalog. Truncating an out-of-range seed would silently restart the
+    /// identity stream inside the live range and re-issue identities that already name committed
+    /// entities — a corruption, where refusing is merely an unopenable store that says why.
+    #[test]
+    fn an_element_id_seed_above_the_allocable_range_is_refused() {
+        let err = ElementIdAllocator::try_new(u128::from(u64::MAX) + 1);
+        assert!(err.is_err(), "an out-of-range seed must be refused");
+        assert!(
+            ElementIdAllocator::try_new(u128::from(u64::MAX)).is_ok(),
+            "the ceiling itself is in range"
+        );
+        assert!(ElementIdAllocator::try_new(0).is_err(), "0 is reserved");
+    }
+
+    /// **`N` threads never receive the same identity** (`rmp` #1012) — the property that lets the
+    /// allocator take `&self` at all. An `ElementId` names an entity, so a repeat is two entities
+    /// sharing one public identity: a duplicate the whole `04 §2.2` contract exists to forbid.
+    #[test]
+    fn concurrent_allocation_never_repeats_an_identity() {
+        use std::sync::Arc;
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 5_000;
+        let a = Arc::new(ElementIdAllocator::new(1));
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let a = Arc::clone(&a);
+                std::thread::spawn(move || {
+                    (0..PER_THREAD)
+                        .map(|_| a.alloc().expect("space is not exhausted").0)
+                        .collect::<Vec<u128>>()
+                })
+            })
+            .collect();
+
+        let mut all: Vec<u128> = handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("allocator thread panicked"))
+            .collect();
+        all.sort_unstable();
+        let total = THREADS * PER_THREAD;
+        assert_eq!(all.len(), total);
+        all.dedup();
+        assert_eq!(
+            all.len(),
+            total,
+            "two threads received the same ElementId: a public identity was issued twice"
+        );
+        assert_eq!(
+            a.peek(),
+            (total + 1) as u128,
+            "the counter must account for every identity handed out"
+        );
     }
 
     #[test]
-    #[should_panic(expected = "ElementId 0 is reserved")]
+    #[should_panic(expected = "element-id seed 0 is reserved")]
     fn element_id_seed_zero_is_rejected() {
         let _ = ElementIdAllocator::new(0);
     }

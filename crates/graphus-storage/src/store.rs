@@ -6904,8 +6904,17 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 self.catalog_dirty = true;
             }
         }
-        if pre_element_next > self.element_ids.peek() {
-            self.element_ids = ElementIdAllocator::new(pre_element_next);
+        // Raise the identity counter to its pre-rollback floor, atomically (`rmp` #1012). This was a
+        // read-then-replace — `if pre > peek() { element_ids = new(pre) }` — which is the same shape
+        // the page map's index claim had, and wrong for the same reason once a second writer exists:
+        // between the comparison and the replacement another writer can allocate, and the replacement
+        // would then discard its advance and re-hand-out an identity that already names a committed
+        // entity. `observe` is a compare-exchange max, so it can only ever move the counter forwards
+        // and a racing pair leaves it at the larger of the two — the identical discipline, and the
+        // identical `hw - 1` idiom, as the physical allocators floored immediately below.
+        if pre_element_next > 0 {
+            self.element_ids
+                .observe(graphus_core::ElementId(pre_element_next - 1));
         }
         // Floor each allocator at its pre-rollback high-water so a concurrent open txn's freshly
         // allocated (and possibly soon-committed) ids stay within the scanned range and are never
@@ -7119,7 +7128,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     fn reload_catalog(&mut self) -> Result<()> {
         self.catalog_reloads += 1;
         let (meta, meta_chain) = Self::read_meta(&self.pool)?;
-        self.element_ids = ElementIdAllocator::new(meta.element_id_next.max(1));
+        // `try_new`, not `new` (`rmp` #1012): this seed comes from the durable catalog, so a corrupt
+        // or adversarial one must fail the reload rather than panic the engine — and, above all, must
+        // never be truncated into the live range, which would re-issue identities that already name
+        // committed entities.
+        self.element_ids = ElementIdAllocator::try_new(meta.element_id_next.max(1))?;
         // The commit-timestamp oracle is a strictly-monotonic counter that only ever ADVANCES (at
         // commit) and must NEVER move backwards within a running process — a reissued timestamp could
         // collide with one a still-tracked committed transaction holds and confuse SSI's concurrency
