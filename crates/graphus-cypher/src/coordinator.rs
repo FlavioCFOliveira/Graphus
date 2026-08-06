@@ -61,7 +61,7 @@
 //! honest — including every raw read here that is deliberately correct, and why — is
 //! `tests/read_polarity_census.rs`.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::shared_cell::SharedCell;
 
@@ -868,10 +868,10 @@ use graphus_index::{Similarity, VectorIndexError};
 use graphus_io::BlockDevice;
 use graphus_storage::undo::{TYPE_TAG_ABSENT, UndoAction};
 use graphus_storage::{
-    CompositeIndexEntry, ConstraintEntry, ConstraintKind, ConstraintTypeDescriptor,
-    DecidedProperties, FulltextEntity, FulltextIndexEntry, GcPassReport, IndexState, Namespace,
-    PropRecord, RecordStore, RelCompositeIndexEntry, SpatialEntity, SpatialIndexEntry,
-    StoreReadView, SupersetProperties, TextIndexEntry, TokenSnapshot, VectorEntity,
+    CompositeIndexEntry, ConstraintEntry, ConstraintKind, ConstraintTypeDescriptor, DeadIndexKey,
+    DecidedProperties, FulltextEntity, FulltextIndexEntry, GcPassReport, IndexInterest, IndexState,
+    Namespace, PropRecord, RecordStore, RelCompositeIndexEntry, SpatialEntity, SpatialIndexEntry,
+    StoreKind, StoreReadView, SupersetProperties, TextIndexEntry, TokenSnapshot, VectorEntity,
     VectorIndexEntry, VectorSimilarity,
 };
 use graphus_txn::{
@@ -882,7 +882,7 @@ use graphus_wal::LogSink;
 use crate::catalog::IndexCatalog;
 use crate::constraint::{ConstraintViolation, ViolationEntity};
 use crate::executor::CancellationToken;
-use crate::index_set::{IndexSet, IndexWriter};
+use crate::index_set::{DeadKeyCollection, DeadKeyEvidence, IndexSet, IndexWriter};
 use crate::record_graph::RecordStoreGraph;
 use crate::schema_error::{
     constraint_name_in_use, equivalent_composite_index_exists, equivalent_constraint_exists,
@@ -1179,6 +1179,36 @@ const MAX_DEGRADED_RETRY_BACKOFF: u32 = 262_144;
 /// transient, and a permanently-faulting store then costs one bounded probe per backoff window rather
 /// than pinning the index on the slow path forever.
 const REFILL_FAULT_BLOCKER: TxnId = TxnId(u64::MAX);
+
+/// How many [`DeadIndexKey`]s one witness batch decides (`rmp` #992).
+///
+/// The witness is the only unbounded allocation on the reclamation path: one entry per distinct
+/// entity a batch names, each holding two `Vec`s and every DECODED value some index covers. A GC pass
+/// is not bounded in entities — a batched `DETACH DELETE`, a retention sweep or the tail of a bulk
+/// load reclaims them by the million, and the report budgets in `graphus_storage`
+/// (`MAX_DEAD_ENTITY_KEYS` is 1 Mi) cap the *keys*, not the bytes their witness costs. Deciding a
+/// slice at a time bounds the live witness to the batch instead of to the pass, which is what keeps
+/// this affordable on the smallest target this project supports rather than only on a server.
+///
+/// The size is a memory bound, not a throughput knob: bigger batches save only the re-read of an
+/// entity whose keys straddle two of them, and the GC emits an entity's keys together, so straddling
+/// is already the exception.
+const DEAD_KEY_EVIDENCE_BATCH: usize = 4096;
+
+/// Lifetime totals of the GC-driven index collection (`rmp` #992) — see
+/// [`TxnCoordinator::index_collection_totals`](TxnCoordinator#structfield.index_collection_totals).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IndexCollectionTotals {
+    /// Value-keyed B+-tree entries actually removed.
+    pub entries_removed: u64,
+    /// Entities whose entity-keyed postings were purged on physical reclamation.
+    pub entities_purged: u64,
+    /// Dead keys kept because a live version still warrants them, or because nothing proved
+    /// otherwise. Includes every key of an abandoned batch.
+    pub keys_retained: u64,
+    /// Batches abandoned whole by the concurrency gate. Nil while the engine has one writer.
+    pub abandonments: u64,
+}
 
 /// The drains to skip before the next poisoned-build resurrection attempt, given how many consecutive
 /// resurrections have already failed to complete (`rmp` task #733, B2). `2^(attempts-1)`, capped at
@@ -1567,6 +1597,17 @@ pub struct TxnCoordinator<D: BlockDevice, S: LogSink> {
     /// The current backoff width for
     /// [`vector_conflict_retry_skip`](Self#structfield.vector_conflict_retry_skip).
     vector_conflict_retry_backoff: u32,
+    /// What every GC-driven index collection has done over this coordinator's life (`rmp` #992) —
+    /// monotonic totals of [`DeadKeyCollection`], summed across passes.
+    ///
+    /// The pass report ([`GcPassReport::dead_index_keys`]) counts what the store **reported**, which
+    /// is a different question from what the index layer **did** with it: a mechanism that reports
+    /// thousands of dead keys and removes none of them looks identical, from the report alone, to one
+    /// that has nothing to collect. `keys_retained` climbing while `entries_removed` stays flat is the
+    /// signature of the re-check refusing everything, and `abandonments` is the concurrency gate in
+    /// [`collect_dead_index_keys`](Self::collect_dead_index_keys) firing — nil today, and the first
+    /// number to look at once the engine has more than one writer.
+    index_collection_totals: IndexCollectionTotals,
     /// Poisoned spatial builds — see [`poisoned_builds`](Self#structfield.poisoned_builds).
     poisoned_spatial_builds: Vec<PendingSpatialBuild>,
     /// How many builds have been poisoned over this coordinator's life (`rmp` task #733, M1) — monotonic.
@@ -1825,6 +1866,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             ft_poison_repair_skip: 0,
             ft_poison_repair_backoff: 1,
             ft_poison_repairs: 0,
+            index_collection_totals: IndexCollectionTotals::default(),
             vector_conflict_retry_skip: 0,
             vector_conflict_retry_backoff: 1,
             poisoned_spatial_builds: Vec::new(),
@@ -11196,6 +11238,10 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let watermark = self.gc_watermark();
         self.next_txn_id += 1;
         let gc_txn = TxnId(self.next_txn_id);
+        // `rmp` #992: tell the store what the derived indexes cover, so the pass reports the entries
+        // the versions it destroys leave behind. Re-derived on every pass rather than kept in step
+        // incrementally — a declaration that can drift is a declaration that will.
+        self.declare_index_interest();
         // ### The longest store borrow in the coordinator, and why it is sound (`rmp` #1010)
         //
         // This one guard spans `begin` → `gc`/`gc_freeze_only` → (`rollback` |`commit`), i.e. an
@@ -11234,11 +11280,247 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             Err(e) => {
                 // Best-effort undo of the partial pass so the store stays consistent for the caller.
                 let _ = store.rollback(gc_txn);
+                // `rmp` #992: drain and DISCARD. A rolled-back pass destroyed no version, so it
+                // warrants no removal — and draining unconditionally is what stops the queue from
+                // being attributed to the next pass.
+                drop(store.take_dead_index_keys());
                 return Err(e);
             }
         };
-        store.commit(gc_txn)?;
+        if let Err(e) = store.commit(gc_txn) {
+            // `rmp` #992: same disposal as the failed-pass arm above, and for the same reason. A pass
+            // whose commit failed made no reclamation durable, so it warrants no removal — and leaving
+            // the queue standing would offer it to whichever pass drains next.
+            drop(store.take_dead_index_keys());
+            return Err(e);
+        }
+        // `rmp` #992: only a COMMITTED pass hands its dead keys over — its reclamation is durable, so
+        // the versions really are gone. Taken while the borrow is still held; acted on after it is
+        // released, because the collection reads the store and then writes the index, and this engine
+        // never holds those two at once (`record_graph::reindex_node`'s two-phase discipline).
+        let dead = store.take_dead_index_keys();
+        drop(store);
+        let collected = self.collect_dead_index_keys(gc_txn, &dead);
+        let totals = &mut self.index_collection_totals;
+        totals.entries_removed += collected.entries_removed as u64;
+        totals.entities_purged += collected.entities_purged as u64;
+        totals.keys_retained += collected.keys_retained as u64;
+        totals.abandonments += u64::from(collected.abandoned);
         Ok(report)
+    }
+
+    /// Declares to the store what the derived indexes cover, for the GC pass about to run
+    /// (`rmp` #992). See [`graphus_storage::IndexInterest`].
+    ///
+    /// The property half is a real filter — it is what keeps a dead value's (possibly overflow-heap-
+    /// reading) decode from happening for a property no index covers.
+    ///
+    /// The label half is an unconditional `true` because the structure it gates is unconditional: this
+    /// engine always has a label index, covering every label there is.
+    ///
+    /// The entity half is **not** unconditional. A [`graphus_storage::DeadIndexKey::Entity`] can only
+    /// act on the entity-keyed kinds (full-text, spatial, text, vector, bitmap), so on a database with
+    /// none of them every reclaimed entity would spend part of the GC's bounded report budget on a key
+    /// that does nothing — crowding out exactly the property keys `rmp` #992 exists to collect.
+    fn declare_index_interest(&self) {
+        let interest = {
+            let index = self.index.borrow();
+            let mut prop_keys: HashSet<u32> = HashSet::new();
+            for (_, prop_key) in index.registered_node_properties() {
+                prop_keys.insert(prop_key);
+            }
+            for (_, prop_key) in index.registered_rel_properties() {
+                prop_keys.insert(prop_key);
+            }
+            IndexInterest::new(prop_keys, true, index.has_any_entity_keyed_index())
+        };
+        self.store.borrow_mut().set_index_interest(interest);
+    }
+
+    /// Applies one GC pass's [`DeadIndexKey`]s to the derived indexes (`rmp` #992, AC2), in two phases
+    /// that never overlap their borrows: **read the witness off the store, then act on the index.**
+    ///
+    /// Splitting it is not stylistic. The evidence is a superset-polarity store read
+    /// ([`DeadKeyEvidence`]) and the action is a tree mutation, so doing them in one pass would hold
+    /// the store and the index at the same time — the two-cell hold this engine deliberately does not
+    /// take anywhere on the write path.
+    ///
+    /// # The split is what CREATES the window, and what it is guarded by (`rmp` #992, slice 3)
+    ///
+    /// An earlier draft of this comment sold the split as *preparation* for the multi-writer layers.
+    /// That was exactly backwards and is worth stating plainly, because the sprint this task belongs
+    /// to exists to admit a second writer: reading the witness and acting on it under two separate
+    /// holds is a **time-of-check to time-of-use** window, and it is the one place in this mechanism
+    /// where the safe error direction flips. Concretely, with a concurrent writer:
+    ///
+    /// * the witness reads `in_use == false` for slot `X`; the writer allocates `X`, creates a node
+    ///   and indexes it; [`IndexSet::collect_dead_keys`] then purges the **new** node's entity-keyed
+    ///   postings — and those kinds are candidate-only, so a missing posting is a lost row;
+    /// * the witness reads no `30` for `n.age`; the writer sets `n.age = 30` and commits; the removal
+    ///   deletes the entry its committed version warrants.
+    ///
+    /// Today neither is reachable — the engine is one writer thread (`shared_cell`'s module note), so
+    /// nothing runs between the two phases. Rather than leave that as an unwritten assumption for the
+    /// layer that breaks it, two O(1) fail-closed checks stand in the gap, and **what each one
+    /// actually covers is stated exactly**, because a guard credited with more reach than it has is
+    /// worse than no guard:
+    ///
+    /// 1. the index is asked whether any transaction **other than** this pass has entries in flight
+    ///    ([`IndexSet::has_other_index_writer_in_flight`]), evaluated under the very hold that then
+    ///    performs the removals. This one is load-bearing: it covers the uncommitted writer whose
+    ///    entry a dead key names, for the whole duration of the removals;
+    /// 2. the store's commit high-water is compared across the witness. Under today's exclusive hold
+    ///    it *cannot* differ, so it is dormant by construction — it starts paying when the witness
+    ///    comes to be read under a shared hold that admits concurrent commits, which is exactly the
+    ///    change the multi-writer layers make.
+    ///
+    /// Either one abandons the whole collection, keeping every entry — always safe (a retained entry
+    /// is a false positive the seek's re-check drops), free under one writer, and visible via
+    /// [`DeadKeyCollection::abandoned`].
+    ///
+    /// **What they do NOT cover**, stated because the residue is the whole reason `rmp` #1022 exists:
+    /// a writer that commits in the instant between the store hold being released and the index hold
+    /// being taken has already drained its in-flight entries, so check 1 sees nothing and its
+    /// freshly-committed entry can still be removed. Closing that needs the decision and the removal
+    /// to be one indivisible step — a single ordered hold over both cells, or a removal made
+    /// conditional on the version stamp of the entry it deletes. That is `rmp` #1022, and it
+    /// **blocks** the layers that admit the second writer, so the residue cannot outlive the
+    /// assumption that makes it harmless.
+    fn collect_dead_index_keys(&self, gc_txn: TxnId, keys: &[DeadIndexKey]) -> DeadKeyCollection {
+        if keys.is_empty() {
+            return DeadKeyCollection::default();
+        }
+        let covered: HashSet<u32> = {
+            let index = self.index.borrow();
+            index
+                .registered_node_properties()
+                .into_iter()
+                .chain(index.registered_rel_properties())
+                .map(|(_, prop_key)| prop_key)
+                .collect()
+        };
+        let mut out = DeadKeyCollection::default();
+        // In batches, because the witness is the one unbounded allocation in this path: a batched
+        // `DETACH DELETE` reclaims entities by the million and each one contributes an entry holding
+        // two `Vec`s and its DECODED values. Deciding a slice at a time bounds the live witness to the
+        // batch rather than to the pass, at the cost of re-reading an entity whose keys straddle two
+        // batches — a read, never a wrong answer. The keys arrive grouped by entity (the GC emits an
+        // entity's whole chain together), so straddling is the exception.
+        for batch in keys.chunks(DEAD_KEY_EVIDENCE_BATCH) {
+            let (evidence, ts_before, ts_after) = {
+                let store = self.store.borrow();
+                let before = store.snapshot_ts();
+                let evidence = Self::read_dead_key_evidence(&store, batch, &covered);
+                let after = store.snapshot_ts();
+                (evidence, before, after)
+            };
+            let mut index = self.index.borrow_mut();
+            if ts_before != ts_after || index.has_other_index_writer_in_flight(gc_txn) {
+                out.abandoned = true;
+                out.keys_retained += batch.len();
+                continue;
+            }
+            let batch_out = index.collect_dead_keys(gc_txn, batch, &evidence);
+            out.entries_removed += batch_out.entries_removed;
+            out.entities_purged += batch_out.entities_purged;
+            out.keys_retained += batch_out.keys_retained;
+        }
+        out
+    }
+
+    /// Reads the superset-polarity witness for every entity `keys` names, once per entity
+    /// (`rmp` #992).
+    ///
+    /// One read per entity, not per key: a pass that rewrote the same property a thousand times emits
+    /// a thousand keys for one node, and they are all decided against the same store image.
+    ///
+    /// An entity whose read faults is simply **absent** from the map, which
+    /// [`IndexSet::collect_dead_keys`] treats as "cannot prove it dead" and retains. A read fault must
+    /// never turn a maintenance pass into a removal decision.
+    ///
+    /// # It filters BEFORE it decodes, like the emission side
+    ///
+    /// The scan is the **undecoded** `superset_scan_{node,rel}_properties`, and only candidates whose
+    /// key some index covers are then decoded. Decoding walks the overflow heap, so the decoded twin
+    /// (`superset_scan_*_property_values`, which decodes every candidate and lets the caller discard
+    /// the uncovered ones) charges a full heap walk per unindexed property of every entity a dead key
+    /// names — a 1 MB `description` on a node whose `age` was rewritten, read and allocated for
+    /// nothing. Filtering only the *retained* witness bounds the memory but not that transient cost;
+    /// `RecordStore::note_dead_index_keys_of_reclaim` filters first for exactly this reason, and the
+    /// two sides of the mechanism must not disagree about it.
+    fn read_dead_key_evidence(
+        store: &RecordStore<D, S>,
+        keys: &[DeadIndexKey],
+        covered: &HashSet<u32>,
+    ) -> HashMap<(StoreKind, u64), DeadKeyEvidence> {
+        let mut out: HashMap<(StoreKind, u64), DeadKeyEvidence> = HashMap::new();
+        // The covered candidates of one entity's superset scan, decoded and nothing else. `None` if
+        // ANY of them failed to decode, and that is the whole point of returning an `Option`: a
+        // witness with a value missing is not a smaller witness, it is a WRONG one — it says "no
+        // version holds this key" about a version that does, which is the one error that removes a
+        // live entry. A partial witness is therefore discarded exactly like an absent one.
+        let covered_values = |chain: &graphus_storage::SupersetProperties| {
+            let wanted: Vec<(u32, u8, u64)> = chain
+                .candidates()
+                .filter(|c| covered.contains(&c.key))
+                .map(|c| (c.key, c.type_tag, c.value_inline))
+                .collect();
+            let mut decoded = Vec::with_capacity(wanted.len());
+            for (key, type_tag, value_inline) in wanted {
+                let value = store.decode_property_value(type_tag, value_inline).ok()?;
+                decoded.push((key, value));
+            }
+            Some(decoded)
+        };
+        for key in keys {
+            let (kind, entity) = match key {
+                DeadIndexKey::Property { kind, entity, .. }
+                | DeadIndexKey::Entity { kind, entity } => (*kind, *entity),
+                DeadIndexKey::Label { node, .. } => (StoreKind::Node, *node),
+            };
+            if out.contains_key(&(kind, entity)) {
+                continue;
+            }
+            let evidence = match kind {
+                StoreKind::Node => {
+                    let Ok(node) = store.node(entity) else {
+                        continue;
+                    };
+                    let Ok(chain) = store.superset_scan_node_properties(entity) else {
+                        continue;
+                    };
+                    let Some(property_versions) = covered_values(&chain) else {
+                        continue;
+                    };
+                    let Ok(labels) = store.node_label_superset(entity) else {
+                        continue;
+                    };
+                    DeadKeyEvidence {
+                        property_versions,
+                        labels,
+                        in_use: node.mvcc.in_use(),
+                    }
+                }
+                StoreKind::Rel => {
+                    let Ok(rel) = store.rel(entity) else { continue };
+                    let Ok(chain) = store.superset_scan_rel_properties(entity) else {
+                        continue;
+                    };
+                    let Some(property_versions) = covered_values(&chain) else {
+                        continue;
+                    };
+                    DeadKeyEvidence {
+                        property_versions,
+                        labels: Vec::new(),
+                        in_use: rel.mvcc.in_use(),
+                    }
+                }
+                // No other store kind owns a derived-index entry.
+                _ => continue,
+            };
+            out.insert((kind, entity), evidence);
+        }
+        out
     }
 
     /// Drives a full **maintenance checkpoint** (`rmp` #305): a reader-safe GC pass followed by a
@@ -11291,6 +11573,28 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// space leak, no premature reuse. Forwards to [`RecordStore::release_held`].
     pub fn release_reusable_slots(&self, oldest_open_ticket: u64) {
         self.store.borrow_mut().release_held(oldest_open_ticket);
+    }
+
+    /// **`rmp` #992** (observability): how many entries the value-keyed derived indexes hold in total
+    /// — the label index, the node- and relationship-property indexes, and the composite indexes.
+    ///
+    /// These structures are in-memory, so this is the direct measure of the RAM they cost (the `rmp`
+    /// #305/#313 resource class), and it is the number the `rmp` #992 collection keeps **flat** under a
+    /// rewrite churn instead of letting it grow with the version count. Published by the server's
+    /// maintenance cadence alongside the GC report; `O(entries)`, so never on a query path. See
+    /// [`IndexSet::derived_entry_count`].
+    #[must_use]
+    pub fn derived_index_entries(&self) -> usize {
+        self.index.borrow_mut().derived_entry_count()
+    }
+
+    /// **`rmp` #992** (observability): what every GC-driven index collection has done over this
+    /// coordinator's life. See
+    /// [`index_collection_totals`](Self#structfield.index_collection_totals) for how to read it —
+    /// in particular why the pass report's `dead_index_keys` does not answer the same question.
+    #[must_use]
+    pub fn index_collection_totals(&self) -> IndexCollectionTotals {
+        self.index_collection_totals
     }
 
     /// **`rmp` #588** (observability): physical slots currently shadow-held from reuse (see
@@ -13293,6 +13597,453 @@ mod index_entry_rollback_wiring_992 {
                 .len(),
             1,
             "an unrelated rollback removed a committed transaction's entry"
+        );
+    }
+}
+
+/// **The version GC collects the derived-index entries dead versions leave behind** (`rmp` #992,
+/// AC2), driven through the real [`TxnCoordinator`].
+///
+/// These live inline for the same reason the rollback-wiring module above does: what `rmp` #992
+/// changes is the index's **content**, and the coordinator's index handle is private. The headline
+/// test is the acceptance criterion itself — index size against the number of versions of a rewritten
+/// key — measured before and after the pass rather than asserted qualitatively.
+#[cfg(test)]
+mod index_gc_collection_992 {
+    use graphus_core::Value;
+    use graphus_io::MemBlockDevice;
+    use graphus_storage::{Namespace, RecordStore};
+    use graphus_wal::{MemLogSink, WalManager};
+
+    use crate::binding::{Parameters, bind_parameters};
+    use crate::catalog::IndexCatalog;
+    use crate::coordinator::TxnCoordinator;
+    use crate::executor::execute;
+    use crate::lexer::tokenize;
+    use crate::lower::lower;
+    use crate::parser::parse_tokens;
+    use crate::physical::plan_physical;
+    use crate::semantics::analyze;
+
+    type Coord = TxnCoordinator<MemBlockDevice, MemLogSink>;
+
+    fn fresh_coord() -> Coord {
+        let device = MemBlockDevice::new(0);
+        let wal = WalManager::create(MemLogSink::new()).expect("create wal");
+        let store: RecordStore<MemBlockDevice, MemLogSink> =
+            RecordStore::create(device, wal, 256, 1).expect("create store");
+        TxnCoordinator::new(store)
+    }
+
+    /// Runs `src` in its own committed transaction.
+    fn commit_stmt(coord: &mut Coord, src: &str) {
+        let txn = coord.begin_serializable();
+        run_stmt(coord, txn, src);
+        coord.commit(txn).expect("commit");
+    }
+
+    fn run_stmt(coord: &Coord, txn: graphus_core::TxnId, src: &str) {
+        let toks = tokenize(src).expect("lex");
+        let ast = parse_tokens(&toks, src).expect("parse");
+        let validated = analyze(&ast).expect("analyze");
+        let plan = plan_physical(&lower(&validated), &IndexCatalog::empty());
+        let bound = bind_parameters(&plan, &Parameters::new()).expect("bind");
+        let mut graph = coord.statement(txn).expect("statement");
+        {
+            let mut cursor = execute(&plan, &bound, &mut graph).expect("open cursor");
+            cursor.collect_all().expect("collect");
+        }
+        assert!(graph.take_error().is_none(), "captured error in: {src}");
+    }
+
+    fn tokens(coord: &Coord, label: &str, prop: &str) -> (u32, u32) {
+        let store = coord.store.borrow();
+        (
+            store
+                .token_id(Namespace::Label, label)
+                .expect("label token"),
+            store
+                .token_id(Namespace::PropKey, prop)
+                .expect("prop token"),
+        )
+    }
+
+    /// How many entries the `(label, prop)` node-property index holds right now.
+    fn entries(coord: &Coord, label: u32, prop: u32) -> usize {
+        coord
+            .index
+            .borrow_mut()
+            .node_property_entry_count(label, prop)
+            .expect("the index is registered")
+    }
+
+    fn index_offers(coord: &Coord, label: u32, prop: u32, value: i64, id: u64) -> bool {
+        coord
+            .index
+            .borrow_mut()
+            .seek_node_property_eq(label, prop, &Value::Integer(value))
+            .expect("the index is registered, so the seek must not decline")
+            .contains(&id)
+    }
+
+    /// **The acceptance criterion, measured** (`rmp` #992, AC2): rewriting one indexed key `N` times
+    /// grows the index by `N`, and a GC pass takes it back to **one** entry — the value in place.
+    ///
+    /// The measurement is the point. "The index stops growing with the version count" is a claim about
+    /// a number, so the test records the number before the pass (which must be `N + 1`, or the growth
+    /// this task removes was never reproduced) and after it (which must be `1`, independent of `N`).
+    /// Running it at two values of `N` is what turns "it shrank" into "it no longer depends on `N`".
+    #[test]
+    fn the_index_stops_growing_with_the_number_of_versions_of_a_rewritten_key() {
+        for versions in [8usize, 64] {
+            let mut coord = fresh_coord();
+            commit_stmt(&mut coord, "CREATE (:Person {name: 'p', age: 0})");
+            coord
+                .create_node_property_index("Person", "age")
+                .expect("create index");
+            let (l, k) = tokens(&coord, "Person", "age");
+
+            for v in 1..=versions {
+                commit_stmt(
+                    &mut coord,
+                    &format!("MATCH (n:Person) SET n.age = {v} RETURN n"),
+                );
+            }
+
+            let before = entries(&coord, l, k);
+            assert_eq!(
+                before,
+                versions + 1,
+                "PRECONDITION: the defect must be reproduced first — {versions} rewrites over the \
+                 initial value must leave {} entries, one per distinct value ever written",
+                versions + 1
+            );
+
+            let report = coord.gc().expect("gc pass");
+            assert!(
+                report.dead_index_keys > 0,
+                "NON-VACUITY: the pass must have reported dead keys, or nothing below exercises the \
+                 collection at all"
+            );
+
+            let after = entries(&coord, l, k);
+            assert_eq!(
+                after, 1,
+                "after GC the index must hold exactly the value in place, independent of the \
+                 {versions} versions that preceded it (held {before} before the pass)"
+            );
+            assert!(
+                index_offers(&coord, l, k, versions as i64, 1),
+                "the surviving entry must be the LIVE value, not an arbitrary one"
+            );
+        }
+    }
+
+    /// **The re-check has teeth**: a value an older version stops holding but the **live** version
+    /// still holds is not collected.
+    ///
+    /// `SET age = 31` then `SET age = 30` kills a version holding `30` while `30` is exactly what the
+    /// node still has. Removing it on the strength of the dead key alone would delete a live row's
+    /// only entry — a false negative for every future seek, which no re-check can resurrect. This is
+    /// the case the superset-polarity witness exists for.
+    #[test]
+    fn a_value_the_live_version_still_holds_is_never_collected() {
+        let mut coord = fresh_coord();
+        commit_stmt(&mut coord, "CREATE (:Person {age: 30})");
+        coord
+            .create_node_property_index("Person", "age")
+            .expect("create index");
+        let (l, k) = tokens(&coord, "Person", "age");
+
+        commit_stmt(&mut coord, "MATCH (n:Person) SET n.age = 31 RETURN n");
+        commit_stmt(&mut coord, "MATCH (n:Person) SET n.age = 30 RETURN n");
+
+        let report = coord.gc().expect("gc pass");
+        assert!(
+            report.dead_index_keys > 0,
+            "NON-VACUITY: the pass must report the dead `30` and `31` versions"
+        );
+
+        assert!(
+            index_offers(&coord, l, k, 30, 1),
+            "the LIVE value's entry was collected: a dead version held `30`, but so does the node"
+        );
+        assert!(
+            !index_offers(&coord, l, k, 31, 1),
+            "the genuinely dead `31` entry survived, so the collection did nothing"
+        );
+        assert_eq!(
+            entries(&coord, l, k),
+            1,
+            "exactly one entry must remain — the live value"
+        );
+    }
+
+    /// **An open reader stops the collection.** The GC watermark is the oldest open snapshot, so a
+    /// version a live reader can still reconstruct is not reclaimed — and its index entry therefore
+    /// stays. Without this the collection would be a *destruction* path racing live readers.
+    #[test]
+    fn an_open_reader_keeps_the_versions_and_their_entries() {
+        let mut coord = fresh_coord();
+        commit_stmt(&mut coord, "CREATE (:Person {age: 30})");
+        coord
+            .create_node_property_index("Person", "age")
+            .expect("create index");
+        let (l, k) = tokens(&coord, "Person", "age");
+
+        let reader = coord.begin_serializable();
+        commit_stmt(&mut coord, "MATCH (n:Person) SET n.age = 31 RETURN n");
+        assert_eq!(
+            entries(&coord, l, k),
+            2,
+            "precondition: two versions indexed"
+        );
+
+        let pinned = coord.gc().expect("gc while the reader is open");
+        assert_eq!(
+            pinned.dead_index_keys, 0,
+            "a version the open reader can still reconstruct must not be reported dead"
+        );
+        assert_eq!(
+            entries(&coord, l, k),
+            2,
+            "the open reader's version lost its index entry"
+        );
+
+        coord.rollback(reader).expect("reader retires");
+        coord.gc().expect("gc after the reader retires");
+        assert_eq!(
+            entries(&coord, l, k),
+            1,
+            "once the reader is gone the dead version's entry must be collected"
+        );
+    }
+
+    /// **A reclaimed node leaves nothing behind**: its label entry and its property entries go with
+    /// the record.
+    ///
+    /// A `DELETE` only tombstones, so the entries stay while an older snapshot can still see the node
+    /// — they are false positives the re-check drops. Physical reclamation is different: the slot goes
+    /// back on the free list and the next allocation gives that id to a **different** entity, at which
+    /// point a leftover entry stops being filterable.
+    #[test]
+    fn a_reclaimed_node_leaves_no_entry_in_the_index() {
+        let mut coord = fresh_coord();
+        commit_stmt(&mut coord, "CREATE (:Person {age: 30})");
+        coord
+            .create_node_property_index("Person", "age")
+            .expect("create index");
+        let (l, k) = tokens(&coord, "Person", "age");
+        assert_eq!(
+            entries(&coord, l, k),
+            1,
+            "precondition: the node is indexed"
+        );
+        let labels_before = coord.index.borrow_mut().label_entry_count();
+        assert!(labels_before > 0, "precondition: the label entry exists");
+
+        commit_stmt(&mut coord, "MATCH (n:Person) DELETE n");
+        assert_eq!(
+            entries(&coord, l, k),
+            1,
+            "PRECONDITION: a tombstone alone must NOT remove the entry — if it did, this test would \
+             be measuring the delete path rather than the reclamation path"
+        );
+
+        let report = coord.gc().expect("gc pass");
+        assert!(
+            report.reclaimed > 0,
+            "NON-VACUITY: the pass must have physically reclaimed the node"
+        );
+        assert_eq!(
+            entries(&coord, l, k),
+            0,
+            "the reclaimed node's property entry survived its record"
+        );
+        assert_eq!(
+            coord.index.borrow_mut().label_entry_count(),
+            labels_before - 1,
+            "the reclaimed node's label entry survived its record"
+        );
+    }
+
+    /// **A removed label takes its index entries with it** — both the `(label, node)` entry and the
+    /// `(label, prop, value, node)` entries filed under it, while the node and the property live on.
+    #[test]
+    fn a_removed_label_takes_its_index_entries_with_it() {
+        let mut coord = fresh_coord();
+        commit_stmt(&mut coord, "CREATE (:Person:Staff {age: 30})");
+        coord
+            .create_node_property_index("Staff", "age")
+            .expect("create index");
+        let (staff, k) = tokens(&coord, "Staff", "age");
+        assert_eq!(
+            entries(&coord, staff, k),
+            1,
+            "precondition: indexed under :Staff"
+        );
+
+        commit_stmt(&mut coord, "MATCH (n:Staff) REMOVE n:Staff RETURN n");
+        assert_eq!(
+            entries(&coord, staff, k),
+            1,
+            "PRECONDITION: the write path only inserts, so the stale entry must still be there"
+        );
+
+        let report = coord.gc().expect("gc pass");
+        assert!(
+            report.dead_index_keys > 0,
+            "NON-VACUITY: the freed `AddLabel` delta must be reported"
+        );
+        assert_eq!(
+            entries(&coord, staff, k),
+            0,
+            "the `(:Staff).age` entry survived the label removal"
+        );
+        assert!(
+            !coord.index.borrow_mut().seek_label(staff).contains(&1),
+            "the `(:Staff, n)` label entry survived the label removal"
+        );
+        // The node itself is untouched: it still exists, still has `age`, and still has `:Person`.
+        let (person, _) = tokens(&coord, "Person", "age");
+        assert!(
+            coord.index.borrow_mut().seek_label(person).contains(&1),
+            "the label the node KEPT was collected"
+        );
+    }
+
+    /// **An UNCOMMITTED writer's value is never collected** — the case the open-reader test does not
+    /// cover, and the one where the two halves of the safety argument have to hold together.
+    ///
+    /// A writer that has set `age = 31` and not committed is protected twice over, and neither guard
+    /// is visible from the other's side: the version GC frees an entity's undo chain only when EVERY
+    /// delta on it is dead, so an in-flight delta keeps the whole chain — including the historical
+    /// `30` — from being reported at all; and the witness is a superset scan, which reads through an
+    /// open writer's delta rather than around it. Belt and braces, deliberately, because this is the
+    /// interleaving the multi-writer layers will multiply.
+    #[test]
+    fn an_uncommitted_writers_value_is_never_collected() {
+        let mut coord = fresh_coord();
+        commit_stmt(&mut coord, "CREATE (:Person {age: 30})");
+        coord
+            .create_node_property_index("Person", "age")
+            .expect("create index");
+        let (l, k) = tokens(&coord, "Person", "age");
+
+        let writer = coord.begin_serializable();
+        run_stmt(&coord, writer, "MATCH (n:Person) SET n.age = 31 RETURN n");
+        assert_eq!(
+            entries(&coord, l, k),
+            2,
+            "PRECONDITION: the uncommitted write is already in the tree — the index is a candidate \
+             structure and indexes eagerly, which is exactly why the collection must be careful here"
+        );
+
+        let report = coord.gc().expect("gc with an uncommitted writer open");
+        assert_eq!(
+            report.dead_index_keys, 0,
+            "an entity with an in-flight delta on its chain must report nothing: the chain is freed \
+             all-or-nothing, and this one is not all dead"
+        );
+        assert_eq!(
+            entries(&coord, l, k),
+            2,
+            "neither the committed `30` nor the uncommitted `31` may be collected"
+        );
+
+        // And the writer can still commit and be found through the index it would have lost.
+        coord.commit(writer).expect("commit the writer");
+        assert!(
+            index_offers(&coord, l, k, 31, 1),
+            "the committed value's entry was collected while it was still uncommitted"
+        );
+    }
+
+    /// **The fan-out reaches every label partition the entity is filed under.** A dead key names a
+    /// property, never the label it was indexed beneath, and `reindex_node` files one entry per
+    /// covered label the node carries — so a collection that stopped at the first partition would
+    /// leave the others growing with the version count, invisibly to any single-label test.
+    #[test]
+    fn a_dead_value_is_collected_from_every_label_partition_it_was_filed_under() {
+        let mut coord = fresh_coord();
+        commit_stmt(&mut coord, "CREATE (:Person:Staff {age: 0})");
+        coord
+            .create_node_property_index("Person", "age")
+            .expect("create index on :Person");
+        coord
+            .create_node_property_index("Staff", "age")
+            .expect("create index on :Staff");
+        let (person, k) = tokens(&coord, "Person", "age");
+        let (staff, _) = tokens(&coord, "Staff", "age");
+
+        for v in 1..=6 {
+            commit_stmt(
+                &mut coord,
+                &format!("MATCH (n:Person) SET n.age = {v} RETURN n"),
+            );
+        }
+        assert_eq!(entries(&coord, person, k), 7, "PRECONDITION: :Person grew");
+        assert_eq!(entries(&coord, staff, k), 7, "PRECONDITION: :Staff grew");
+
+        coord.gc().expect("gc pass");
+
+        assert_eq!(entries(&coord, person, k), 1, "the :Person partition");
+        assert_eq!(
+            entries(&coord, staff, k),
+            1,
+            "the :Staff partition was left growing — the fan-out stopped at the first match"
+        );
+        assert!(index_offers(&coord, person, k, 6, 1));
+        assert!(index_offers(&coord, staff, k, 6, 1));
+    }
+
+    /// **A relationship-property index is collected the same way** — the mirror of the headline test
+    /// over the relationship dimension, so the `StoreKind::Rel` arm is not carried by inspection.
+    #[test]
+    fn a_rewritten_relationship_property_stops_growing_the_index() {
+        let mut coord = fresh_coord();
+        commit_stmt(&mut coord, "CREATE (:P)-[:RATED {score: 0}]->(:P)");
+        coord
+            .create_rel_property_index_named(None, "RATED", "score", false)
+            .expect("create index");
+        let store_tokens = {
+            let store = coord.store.borrow();
+            (
+                store
+                    .token_id(Namespace::RelType, "RATED")
+                    .expect("type token"),
+                store
+                    .token_id(Namespace::PropKey, "score")
+                    .expect("prop token"),
+            )
+        };
+        let (t, k) = store_tokens;
+
+        for v in 1..=8 {
+            commit_stmt(
+                &mut coord,
+                &format!("MATCH ()-[r:RATED]->() SET r.score = {v} RETURN r"),
+            );
+        }
+        assert_eq!(
+            coord
+                .index
+                .borrow_mut()
+                .rel_property_entry_count(t, k)
+                .expect("registered"),
+            9,
+            "PRECONDITION: nine distinct values must be indexed"
+        );
+
+        coord.gc().expect("gc pass");
+        assert_eq!(
+            coord
+                .index
+                .borrow_mut()
+                .rel_property_entry_count(t, k)
+                .expect("registered"),
+            1,
+            "the relationship-property index still grows with the version count"
         );
     }
 }

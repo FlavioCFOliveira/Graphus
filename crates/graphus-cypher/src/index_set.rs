@@ -50,6 +50,7 @@ use graphus_bufpool::BufferPool;
 use graphus_core::{Timestamp, TxnId, Value};
 use graphus_index::bitmap::{self, BitmapIndex};
 use graphus_index::fulltext::{Analyzer, InvertedIndex, MatchSemantics};
+use graphus_index::keycodec;
 use graphus_index::recovery::SharedWal;
 use graphus_index::spatial::SpatialIndex;
 use graphus_index::text::TrigramIndex;
@@ -59,7 +60,9 @@ use graphus_index::{
     VectorIndexError,
 };
 use graphus_io::MemBlockDevice;
-use graphus_storage::{ConstraintKind, ConstraintTypeDescriptor, IndexState};
+use graphus_storage::{
+    ConstraintKind, ConstraintTypeDescriptor, DeadIndexKey, IndexState, StoreKind,
+};
 use graphus_wal::{DiscardingLogSink, WalManager};
 
 /// One node-property RANGE seek to pre-run for an off-thread reader (`rmp` task #768):
@@ -199,6 +202,103 @@ impl IndexUndoLog {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+}
+
+/// Everything one entity's [`DeadIndexKey`]s are decided against (`rmp` #992) — read off the store by
+/// the caller, in **superset polarity**, after the GC pass that produced the keys has committed.
+///
+/// # Why superset polarity, and why nothing else will do
+///
+/// The question a removal must answer is "does **any** version still warrant this entry?", and a
+/// candidate structure owes an answer that is a superset of every snapshot's (`04 §5.3`). A
+/// decision-polarity read answers a different question — "what does *one* snapshot see?" — and using
+/// it here would remove entries another snapshot still needs, which is a lost row no re-check can
+/// resurrect (the `rmp` #765/#766 defect class, mirrored). Two concrete cases make this more than a
+/// formality:
+///
+/// * `SET n.age = 31` then `SET n.age = 30` kills a version holding `30` **while the value in place
+///   is still `30`**, so the key that just died names the key that is live;
+/// * an open, uncommitted writer may have written the same value back, and its version is invisible
+///   to every decision read.
+///
+/// `RecordStore::superset_scan_{node,rel}_property_values` and `RecordStore::node_label_superset` are
+/// exactly those supersets: the live cells / live bitmap **plus** everything the entity's undo chain
+/// can still reconstruct.
+///
+/// An entity with **no** evidence at all (its store read faulted) has every one of its keys retained.
+/// Failing to prove an entry dead is not the same as proving it alive, and only one of those two
+/// error directions loses data.
+///
+/// # What this re-check does NOT protect against, stated plainly
+///
+/// The witness is read **after** the GC pass committed, so it is a superset of *what survived that
+/// pass* — which equals "what any live snapshot can observe" **only while the GC watermark is
+/// correct**. If a watermark defect ever freed a version a live reader still needs, the same defect
+/// would remove that value from this witness and the entry would be destroyed.
+///
+/// That is inherent, not an oversight: reading the witness *before* the pass would make every key
+/// look warranted and the whole mechanism a no-op. So the re-check covers the `a → b → a` class
+/// completely and the watermark class not at all, and it must not be mistaken for a safety net over
+/// the latter — the guards there are `TxnCoordinator::gc_watermark` and its own DST teeth
+/// (`graphus-dst`'s `gc_watermark_teeth`, `reader_pin_reclaim_floor_teeth`), which is where the
+/// `rmp` #220 and #522 classes are actually held.
+#[derive(Debug, Clone, Default)]
+pub struct DeadKeyEvidence {
+    /// Every `(prop_key, value)` any not-yet-reclaimed version of the entity holds.
+    pub property_versions: Vec<(u32, Value)>,
+    /// Every label any not-yet-reclaimed version of the node carries. Empty for a relationship.
+    pub labels: Vec<u32>,
+    /// Whether the entity's record slot is still in use at all.
+    ///
+    /// `false` only once the slot has been physically reclaimed, and it **overrides** the two fields
+    /// above rather than merely complementing them: a store frees a slot by clearing its flag, not by
+    /// erasing its body, so a reclaimed node's `labels` word still reads as its last live label set.
+    /// A slot that is not in use warrants nothing, and its body must not be consulted.
+    pub in_use: bool,
+}
+
+/// What one [`IndexSet::collect_dead_keys`] call did (`rmp` #992).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeadKeyCollection {
+    /// Value-keyed B+-tree entries actually present and removed (the label index, the node-property
+    /// indexes and the relationship-property indexes).
+    pub entries_removed: usize,
+    /// Entities whose entity-keyed postings (full-text, spatial, text, vector, bitmap) were purged
+    /// because the entity itself was physically reclaimed.
+    pub entities_purged: usize,
+    /// Keys **retained** because a live version still warrants them, or because the store could not
+    /// prove otherwise. A test of the re-check that does not assert on this number is not testing the
+    /// re-check.
+    pub keys_retained: usize,
+    /// Whether at least one batch was **abandoned whole** because the engine could not prove the
+    /// witness was still current — the concurrency gate in `TxnCoordinator::collect_dead_index_keys`,
+    /// which see. Every key in an abandoned batch is counted into `keys_retained`.
+    ///
+    /// Always `false` while the engine has one writer thread. Once it has several, a persistently
+    /// `true` value means the collection is *running but not collecting*, which the entry census
+    /// alone would show only as a footprint that stopped falling.
+    pub abandoned: bool,
+}
+
+/// Whether two values occupy the **same key** in a value-keyed derived index (`rmp` #992).
+///
+/// The comparison that authorises a removal has to be the tree's own, not [`Value`]'s. The two differ
+/// in both directions and each difference is a defect if taken the wrong way:
+///
+/// * the index key appends a numeric-type tie-break, so `Integer(30)` and `Float(30.0)` are Cypher-
+///   equal but occupy **different** keys — removing on `Value` equality would delete a live entry;
+/// * the key is *coarsening* for a few classes (a `Duration` is ordered by an approximate length,
+///   `rmp` #894), so two unequal values can share **one** key — removing on `Value` inequality would
+///   delete an entry a live value still occupies.
+///
+/// Encoding both sides and comparing the bytes is the only test that matches what
+/// `PropertyIndex::remove` will actually delete. An unindexable value has no key at all and therefore
+/// neither occupies an entry nor warrants one, so it compares equal to nothing.
+fn same_index_key(a: &Value, b: &Value) -> bool {
+    match (keycodec::encode_single(a), keycodec::encode_single(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
     }
 }
 
@@ -484,6 +584,22 @@ pub struct IndexSet {
     /// (`ft_spatial_inflight` non-empty) or the index was left potentially-stale by a rolled-back
     /// mutator (`ft_spatial_poisoned`); otherwise it is this committed value. See those fields and the
     /// marker methods for the full correctness argument.
+    ///
+    /// # Audited and KEPT by `rmp` #992 (AC3), and what would retire it
+    ///
+    /// This field and its three companions ([`ft_spatial_inflight`](Self#structfield.ft_spatial_inflight),
+    /// [`ft_spatial_removers`](Self#structfield.ft_spatial_removers),
+    /// [`ft_spatial_poisoned`](Self#structfield.ft_spatial_poisoned)) exist for **one** reason: the
+    /// write path of these index kinds is *destructive per entry*, so a rewrite drops the old posting
+    /// at the instant of the write and opens the hole above. Giving index entries a transaction
+    /// (slice 1) and collecting the entries of dead versions (slice 2) does not fill a hole — those
+    /// close the opposite polarity, the leftover — so none of the four is retired by `rmp` #992.
+    ///
+    /// What retires all four **together** is making that write path purely additive: a write only
+    /// unions the new state in, and the only remover becomes the GC-driven
+    /// [`collect_dead_keys`](Self::collect_dead_keys), which removes solely under the GC watermark.
+    /// Then the hole cannot form. That is `rmp` #1021, and it is reachable only because slice 2
+    /// supplied the missing remover; `04 §6.3.3` carries the gate-by-gate audit.
     ft_spatial_trustworthy_from: Timestamp,
     /// The set of **currently-open transactions** that have at least one *uncommitted* structural
     /// full-text/spatial mutation in the index (`rmp` task #467). While this set is non-empty the
@@ -1516,14 +1632,19 @@ impl IndexSet {
     /// only at the refill INSTANT. The record's bitmap can change BACK afterwards (a rollback restores
     /// it), and the re-check would then have ACCEPTED the very entry the refill dropped.
     ///
-    /// The cost of retaining: nothing prunes a label entry whose node was since deleted or relabelled.
-    /// That is not a new leak — this tree has **never** removed an entry (there is no `remove_label` on
-    /// `IndexSet`; it is stale-retaining by design, see
-    /// [`rebuilt_trees_trustworthy_from`](Self#structfield.rebuilt_trees_trustworthy_from)), and
-    /// `clear` was only ever an incidental reclaim, one that was never sound. Entries are still
-    /// reclaimed wholesale when the process
-    /// re-opens the store (a fresh `IndexSet`). A correctness-preserving prune would have to know that
-    /// no in-flight transaction could roll a label back, which nothing here can establish.
+    /// The cost of retaining, and **who is allowed to pay it** (`rmp` #992). This paragraph used to say
+    /// the tree had "never removed an entry" and that a correctness-preserving prune "would have to know
+    /// that no in-flight transaction could roll a label back, which nothing here can establish". Both
+    /// are now out of date, and the second is the interesting one: something *can* establish it — the
+    /// **GC watermark**. [`collect_dead_keys`](Self::collect_dead_keys) prunes a `(label, node)` entry
+    /// only after the version GC has freed the `AddLabel` delta that could restore the membership,
+    /// which by definition means no snapshot — in flight or otherwise — can still see the node with
+    /// that label; and it re-reads the node's label superset before removing anything. That is exactly
+    /// the knowledge `clear` never had, which is why a *wipe-and-refill* here was unsound while a
+    /// *watermark-gated* prune is not.
+    ///
+    /// What has not changed is that `clear` itself must not reclaim: it destroys entries on no evidence
+    /// at all, which is the defect this whole doc-comment records.
     pub fn clear(&mut self) {
         // The caller (a rebuild) is about to refill the label index from the store, so it becomes
         // trustworthy again — unless that rebuild fails, in which case `fail_closed` marks it unusable
@@ -2192,6 +2313,80 @@ impl IndexSet {
         tokens
     }
 
+    /// How many entries the node-property index over `(label_token, prop_key)` currently holds, or
+    /// [`None`] if no such index is registered (`rmp` #992).
+    ///
+    /// **Index size, not cardinality.** The trees are multi-entry: one entry per
+    /// `(value, entity)` pair, so a key rewritten `N` times contributes up to `N` entries until the GC
+    /// collects the dead ones. That is exactly what makes this the measurement AC2 asks for — "the
+    /// index stops growing with the number of versions of a rewritten key" is a statement about this
+    /// number and nothing else. It is `O(entries)`, so it belongs on an explicit call and not on a hot
+    /// path.
+    #[must_use]
+    pub fn node_property_entry_count(&mut self, label_token: u32, prop_key: u32) -> Option<usize> {
+        let np = self.node_props.get_mut(&(label_token, prop_key))?;
+        Some(Self::tree_entry_count(np.index.tree_mut()))
+    }
+
+    /// How many entries the relationship-property index over `(type_token, prop_key)` currently holds,
+    /// or [`None`] if no such index is registered. See
+    /// [`node_property_entry_count`](Self::node_property_entry_count).
+    #[must_use]
+    pub fn rel_property_entry_count(&mut self, type_token: u32, prop_key: u32) -> Option<usize> {
+        let rp = self.rel_props.get_mut(&(type_token, prop_key))?;
+        Some(Self::tree_entry_count(rp.index.tree_mut()))
+    }
+
+    /// How many `(label, node)` entries the label index currently holds (`rmp` #992).
+    #[must_use]
+    pub fn label_entry_count(&mut self) -> usize {
+        Self::tree_entry_count(self.labels.tree_mut())
+    }
+
+    /// How many entries **all** the value-keyed derived indexes hold together: the label index, every
+    /// node- and relationship-property index, and every composite index (`rmp` #992).
+    ///
+    /// These structures are in-memory, so this number is the direct measure of the RAM they cost — the
+    /// resource class `rmp` #305/#313 exists for. `O(entries)`, so it belongs on the maintenance
+    /// cadence and never on a query path.
+    ///
+    /// Since `rmp` #992 it stays **flat** under a rewrite churn instead of growing with the version
+    /// count — **except** for the composite trees, which that task deliberately does not collect and
+    /// which are counted here anyway. Excluding them would make the number look better than the engine
+    /// is; a footprint metric that hides a known growth term is worse than no metric.
+    ///
+    /// The entity-keyed kinds (full-text, spatial, text, vector, bitmap) are not counted: they hold one
+    /// posting per entity, not per value, so they do not participate in the growth this measures.
+    #[must_use]
+    pub fn derived_entry_count(&mut self) -> usize {
+        let mut total = Self::tree_entry_count(self.labels.tree_mut());
+        for np in self.node_props.values_mut() {
+            total += Self::tree_entry_count(np.index.tree_mut());
+        }
+        for rp in self.rel_props.values_mut() {
+            total += Self::tree_entry_count(rp.index.tree_mut());
+        }
+        for idx in self.composite.values_mut() {
+            total += Self::tree_entry_count(idx.tree_mut());
+        }
+        for idx in self.rel_composite.values_mut() {
+            total += Self::tree_entry_count(idx.tree_mut());
+        }
+        total
+    }
+
+    /// A backing tree's live entry count, in `O(1)` — the tree maintains it on the insert/delete
+    /// branches that already know the answer (`BTree::live_entry_count`, `rmp` #992).
+    ///
+    /// It used to stream the whole keyspace. That made every publication of the footprint gauge
+    /// `O(entries)` on a structure holding one entry per `(label, node)` pair, i.e. it walked the
+    /// whole graph once per maintenance tick to report how big the index was — measuring a leak by
+    /// paying for it. The counter is exact by construction and asserted against a full scan in the
+    /// tree's own tests.
+    fn tree_entry_count(tree: &mut BTree<Dev, Sink>) -> usize {
+        tree.live_entry_count()
+    }
+
     /// The registered node-property index keys `(label_token, prop_key)` in **any** state, ascending
     /// and de-duplicated.
     ///
@@ -2567,10 +2762,17 @@ impl IndexSet {
     ///
     /// # GATE 3, and why "append-only" was not enough (`rmp` #755 / #765)
     ///
-    /// The memo's soundness rests on `node_props` being append-only, so that a *stale* entry — the one a
-    /// reader whose snapshot predates a value change still depends on — survives to be captured. That is
-    /// true of the **per-entry** surface: [`insert_node_property`](Self::insert_node_property) is the only
-    /// per-entry mutation and there is no `remove_node_property`.
+    /// The memo's soundness rests on a *stale* entry — the one a reader whose snapshot predates a value
+    /// change still depends on — surviving to be captured.
+    ///
+    /// The **per-entry** surface honours that, though no longer by being append-only: since `rmp` #992
+    /// two paths do remove an entry, and both are snapshot-safe by construction. A rollback
+    /// ([`undo_entries`](Self::undo_entries)) removes only keys the aborting transaction *created*, so
+    /// never one a committed version warrants. The GC collection
+    /// ([`collect_dead_keys`](Self::collect_dead_keys)) removes a key only when a superset-polarity read
+    /// shows nothing occupying it — and a value a live reader can see is either in place or behind a
+    /// delta the GC watermark forbids freeing while that reader is open, so it is always in that
+    /// witness. `read_source`'s memo argument states the derivation in full.
     ///
     /// It is **not true of the tree**. [`clear`](Self::clear) — driven by `TxnCoordinator::rebuild_index`
     /// from any index/constraint DDL, and from the degraded-rebuild retry — destroys **every**
@@ -2688,9 +2890,10 @@ impl IndexSet {
     /// twin of [`capture_node_property_eq`](Self::capture_node_property_eq).
     ///
     /// Each request is `(label_token, property_tokens, values)`, the composite index's full ordered key
-    /// and the per-key seek values (both statically knowable). Composite indexes are the same append-only
-    /// node-property tree class as equality (`clear`-and-refill rebuild, no per-entry removal), so they
-    /// ride the same rebuild watermark (`rmp` #765). Per request the index must be registered
+    /// and the per-key seek values (both statically knowable). Composite indexes are the same tree class
+    /// as equality (`clear`-and-refill rebuild), so they ride the same rebuild watermark (`rmp` #765) —
+    /// and they are the one class `rmp` #992's GC collection still does not touch at all, a composite
+    /// key being a tuple no single-property report can reconstruct. Per request the index must be registered
     /// ([`has_composite`](Self::has_composite)); a `List` element the index cannot key is skipped.
     #[must_use]
     pub fn capture_node_property_composite(
@@ -3283,6 +3486,23 @@ impl IndexSet {
         }
         if removed {
             self.ft_spatial_removed_dirty = true;
+        }
+    }
+
+    /// Removes `rel_id` from the relationship full-text index named `name` — the relationship twin of
+    /// [`remove_fulltext_document`](Self::remove_fulltext_document), with the same dirty-flag
+    /// discipline. A no-op if no such index is registered, or if the relationship had no posting.
+    ///
+    /// Added for the `rmp` #992 entity purge ([`collect_dead_keys`](Self::collect_dead_keys)): until
+    /// then the only way to drop a relationship's full-text posting was
+    /// [`reindex_fulltext_rel`](Self::reindex_fulltext_rel), which needs the relationship's type and
+    /// text — neither of which exists once the record has been reclaimed.
+    pub fn remove_fulltext_rel_document(&mut self, name: &str, rel_id: u64) {
+        if let Some(ft) = self.fulltext_rel.get_mut(name) {
+            if ft.index.remove_document(rel_id) {
+                self.ft_spatial_dirty = true;
+                self.ft_spatial_removed_dirty = true;
+            }
         }
     }
 
@@ -4888,6 +5108,327 @@ impl IndexSet {
         removed
     }
 
+    // ============================================================================================
+    // GC-driven collection of the entries dead versions leave behind (`rmp` #992, AC2)
+    // ============================================================================================
+    //
+    // Slice 1 gave an entry an owner, so a rollback could take back what a transaction created. That
+    // left the other end open: [`crate::record_graph`]'s `reindex_node` re-indexes the entity's whole
+    // current state on every write and only ever INSERTS, so `SET n.age = 31` over `age = 30` leaves
+    // `(age, 30, n)` in the tree for ever. The index grew with the number of versions of a rewritten
+    // key — exactly what `04 §6.3` promises it does not.
+    //
+    // The reclaimer is the version GC, because it is the component that already knows the one fact
+    // that matters: **when a version stops existing**. It reports what it destroyed
+    // ([`DeadIndexKey`]); this module decides what that means for the trees, and removes nothing it
+    // cannot prove is unwarranted.
+
+    /// Removes the derived-index entries `keys` names — but only those `evidence` proves **no live
+    /// version warrants** (`rmp` #992, AC2). Returns what it did, including what it deliberately kept.
+    ///
+    /// `txn` is the GC pass's own transaction id, so the backing trees' records name the writer that
+    /// made the removal, exactly as [`undo_entries`](Self::undo_entries) does for a rollback.
+    ///
+    /// # The re-check is the correctness rule, and it lives here
+    ///
+    /// A [`DeadIndexKey`] says *a* version died, never that *every* version did — see its docs for the
+    /// `a → b → a` case that makes the difference. This method is therefore the only door to a removal,
+    /// and it cannot be opened without the [`DeadKeyEvidence`] that authorises it: there is no variant
+    /// of it that removes on the key alone. Anything the evidence does not cover is retained.
+    ///
+    /// # What it does not touch, and why
+    ///
+    /// **Composite indexes**, and the exemption is weaker than it looks. A composite key is the
+    /// *tuple* `(v1, …, vk)` in declared order, and a dead key names one property. From "`n.age` no
+    /// longer holds `30` in some version" nothing can be said about which tuples the index filed for
+    /// `n`, because the other fields' values at that version are not recoverable from this key — and
+    /// guessing them would delete live entries. So the composite trees keep growing with the version
+    /// count.
+    ///
+    /// For a **rewritten** key that is a plain retention residual: false positives the seek's
+    /// per-candidate re-check drops. For a **reclaimed** entity it is not, and the argument must not
+    /// be borrowed from the first case: once the slot is recycled the leftover tuple names a
+    /// *different* logical entity, which is precisely the hazard
+    /// [`DeadIndexKey::Entity`](graphus_storage::DeadIndexKey::Entity) exists to close for the
+    /// entity-keyed kinds — and the composite trees are the candidate source the NODE KEY / REL KEY
+    /// duplicate checks read (`rmp` #683 / #765). Closing it needs a removal addressed by entity id
+    /// rather than by value, which the composite trees do not offer; that is tracked as its own task
+    /// rather than improvised here.
+    pub fn collect_dead_keys(
+        &mut self,
+        txn: TxnId,
+        keys: &[DeadIndexKey],
+        evidence: &HashMap<(StoreKind, u64), DeadKeyEvidence>,
+    ) -> DeadKeyCollection {
+        let mut out = DeadKeyCollection::default();
+        // `rmp` #803 — SAVE and RESTORE, rather than clear at both ends.
+        //
+        // The lesson `record_graph::reindex_node` records is "a statement can only ever be charged with
+        // dirt IT raised", and this pass owes it in both directions: the dirt it raises must not be
+        // charged to anyone (see the restore at the exit), and dirt somebody else raised and has not yet
+        // consumed must not be swallowed HERE. An earlier cut cleared at the top for that second reason
+        // and claimed it "fails closed instead of open" — which is backwards, and worth stating because
+        // the claim is the kind that outlives its code. Clearing a dirty flag can only ever REDUCE
+        // poisoning, so it fails OPEN: if any path ever leaked a genuine remove/replace across a command
+        // boundary — the exact regression #803 fixed at six drivers — a clear here would discard it,
+        // `rollback_ft_spatial_marker` would not poison, and the #756 false negative the poison exists
+        // to contain would go through.
+        //
+        // Carrying the flags across instead is what actually fails closed: whatever was raised before
+        // this pass is still raised after it, and only what this pass raised is dropped. Today the flags
+        // are provably clean here anyway (the statement seam consumes them at each write, and GC runs
+        // between commands), so this costs two bools and buys the property the comment used to assert.
+        let carried_dirty = (self.ft_spatial_dirty, self.ft_spatial_removed_dirty);
+        self.clear_ft_spatial_dirty();
+        for key in keys {
+            match key {
+                DeadIndexKey::Property {
+                    kind,
+                    entity,
+                    key,
+                    value,
+                } => {
+                    self.collect_dead_property(txn, *kind, *entity, *key, value, evidence, &mut out)
+                }
+                DeadIndexKey::Label { node, label } => {
+                    self.collect_dead_label(txn, *node, *label, evidence, &mut out);
+                }
+                DeadIndexKey::Entity { kind, entity } => {
+                    self.collect_dead_entity(*kind, *entity, evidence, &mut out);
+                }
+            }
+        }
+        {
+            // `rmp` #803: the entity-keyed removals above raise the GLOBAL `ft_spatial_*_dirty` flags,
+            // which the statement seam converts into "this transaction mutated a covered posting" and
+            // whose rollback poisons the freshness marker DB-wide. A GC purge must not be chargeable to
+            // anybody: it runs on its own committed transaction, after the reclamation is irreversible,
+            // and it removes postings **no snapshot can warrant** — so it can never produce the false
+            // negative the poison exists to contain. Discarding the residue is therefore the
+            // semantically correct disposal, not merely the convenient one, and it is the same one
+            // `clear_ft_spatial_dirty` is documented for on the build path.
+            //
+            // Restoring what was carried in — rather than clearing outright, and unconditionally rather
+            // than only when something was purged — is what keeps that disposal from also swallowing a
+            // mutator's un-consumed dirt. Doing it structurally, at the single exit, is the lesson of
+            // #803 itself.
+            self.ft_spatial_dirty = carried_dirty.0;
+            self.ft_spatial_removed_dirty = carried_dirty.1;
+        }
+        out
+    }
+
+    /// One [`DeadIndexKey::Property`]: remove `(key, value) -> entity` from every value-keyed index
+    /// registered for `key`, unless a live version of the entity still occupies that index key.
+    ///
+    /// The removal fans out over **every** label (resp. relationship type) partition registered for
+    /// `key`, because a dead key does not say which one the entry was filed under — `reindex_node`
+    /// inserts one entry per covered label the entity carries. Removal is keyed on the exact
+    /// `(prop_key, value, entity)` triple, so a fan-out to a partition that never held the entry is a
+    /// no-op, and one that held it is precisely the entry to drop.
+    #[allow(clippy::too_many_arguments)]
+    fn collect_dead_property(
+        &mut self,
+        txn: TxnId,
+        kind: StoreKind,
+        entity: u64,
+        key: u32,
+        value: &Value,
+        evidence: &HashMap<(StoreKind, u64), DeadKeyEvidence>,
+        out: &mut DeadKeyCollection,
+    ) {
+        // An unindexable value never produced an entry, so there is nothing to remove and nothing to
+        // retain — it is not a decision at all.
+        if keycodec::encode_single(value).is_err() {
+            return;
+        }
+        let Some(ev) = evidence.get(&(kind, entity)) else {
+            out.keys_retained += 1;
+            return;
+        };
+        // A slot that is no longer in use warrants nothing at all, and its record body must not be
+        // consulted — see [`DeadKeyEvidence::in_use`].
+        if ev.in_use
+            && ev
+                .property_versions
+                .iter()
+                .any(|(k, v)| *k == key && same_index_key(v, value))
+        {
+            out.keys_retained += 1;
+            return;
+        }
+        // An in-memory B+-tree removal cannot fail in practice; if it did, the entry simply stays,
+        // which is the safe direction (a false positive the seek's re-check drops).
+        match kind {
+            StoreKind::Node => {
+                for ((_, prop), np) in self.node_props.iter_mut() {
+                    if *prop == key && np.index.remove(txn, key, value, entity).unwrap_or(false) {
+                        out.entries_removed += 1;
+                    }
+                }
+            }
+            StoreKind::Rel => {
+                for ((_, prop), rp) in self.rel_props.iter_mut() {
+                    if *prop == key && rp.index.remove(txn, key, value, entity).unwrap_or(false) {
+                        out.entries_removed += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// One [`DeadIndexKey::Label`]: the node stopped carrying `label` and no surviving version
+    /// restores it, so both the `(label, node)` entry **and** every `(label, prop, value, node)` entry
+    /// filed under that label go.
+    ///
+    /// The property entries are removed for the values the node **still holds**, which is not a
+    /// contradiction: the values are alive, the *label partition* they were filed under is not. Values
+    /// the node no longer holds are reached by their own [`DeadIndexKey::Property`], emitted by the
+    /// same GC pass that freed the version carrying them.
+    fn collect_dead_label(
+        &mut self,
+        txn: TxnId,
+        node: u64,
+        label: u32,
+        evidence: &HashMap<(StoreKind, u64), DeadKeyEvidence>,
+        out: &mut DeadKeyCollection,
+    ) {
+        let Some(ev) = evidence.get(&(StoreKind::Node, node)) else {
+            out.keys_retained += 1;
+            return;
+        };
+        // The `in_use` gate is load-bearing here and not merely symmetric with the property path.
+        // `RecordStore::reclaim_node` clears the MVCC header and the property-chain head of a
+        // reclaimed record but deliberately leaves the rest of the **body** standing (the
+        // free-a-slot-by-its-flag discipline every store follows), so a freed node's label word still
+        // reads as its last live label set. Consulting it would keep the entries of every node the GC
+        // has just reclaimed — measured: the first cut of this method retained exactly those, and
+        // `a_reclaimed_node_leaves_no_entry_in_the_index` is the test that found it.
+        if ev.in_use && ev.labels.contains(&label) {
+            out.keys_retained += 1;
+            return;
+        }
+        if self.labels.remove(txn, label, node).unwrap_or(false) {
+            out.entries_removed += 1;
+        }
+        for (&(lt, prop), np) in self.node_props.iter_mut() {
+            if lt != label {
+                continue;
+            }
+            for (k, v) in &ev.property_versions {
+                if *k == prop && np.index.remove(txn, prop, v, node).unwrap_or(false) {
+                    out.entries_removed += 1;
+                }
+            }
+        }
+    }
+
+    /// Whether any transaction **other than** `txn` currently holds uncommitted index entries
+    /// (`rmp` #992, slice 3) — i.e. whether an index writer is in flight alongside this one.
+    ///
+    /// The undo log is populated the moment a transaction creates an entry and drained only when it
+    /// commits or rolls back, so a non-empty entry under another id is exactly the shape of "somebody
+    /// is writing the index right now". `TxnCoordinator::collect_dead_index_keys` asks this before it
+    /// removes anything, because its witness was read under a different hold: an uncommitted writer
+    /// can have created the very entry a dead key names, and the removal would then delete an entry
+    /// that writer's commit makes committed.
+    ///
+    /// Always `false` while the engine runs one writer thread. It is a guard for the layers that
+    /// change that, and it is deliberately coarse — it abandons the collection rather than reasoning
+    /// about which entries overlap — because the cheap answer is the safe one and the collection is a
+    /// maintenance task that loses nothing by running later.
+    #[must_use]
+    pub fn has_other_index_writer_in_flight(&self, txn: TxnId) -> bool {
+        self.txn_index_undo.keys().any(|t| *t != txn)
+    }
+
+    /// Whether this set holds any **entity-keyed** index at all — full-text, spatial, text, vector or
+    /// value-bitmap (`rmp` #992).
+    ///
+    /// These are the only kinds a [`DeadIndexKey::Entity`] can act on, so a database with none of them
+    /// should not have reclaimed entities reported at all: every such key would consume part of the
+    /// GC's report budget to do nothing, crowding out the property keys that budget exists for (see
+    /// `graphus_storage`'s `MAX_DEAD_PROPERTY_KEYS`). The coordinator asks this before declaring its
+    /// `IndexInterest`.
+    #[must_use]
+    pub fn has_any_entity_keyed_index(&self) -> bool {
+        !self.fulltext.is_empty()
+            || !self.fulltext_rel.is_empty()
+            || !self.spatial.is_empty()
+            || !self.spatial_rel.is_empty()
+            || !self.text.is_empty()
+            || !self.vector.is_empty()
+            || !self.vector_rel.is_empty()
+            || !self.bitmap.is_empty()
+    }
+
+    /// One [`DeadIndexKey::Entity`]: the record slot was physically reclaimed, so every **entity-keyed**
+    /// posting naming it is purged.
+    ///
+    /// These are the index kinds that hold one posting per entity rather than one per value — full-text,
+    /// spatial, text, vector and the value bitmaps — and they are unreachable from a value key because
+    /// their removal APIs take an id, not a value. Reclamation is also the point at which a leftover
+    /// posting stops being a harmless false positive: the slot is on the free list, so the next
+    /// allocation gives that id to a **different logical entity**, and a posting that outlives the
+    /// reuse names the wrong one.
+    ///
+    /// The value-keyed trees are not purged here. They are covered by the
+    /// [`Property`](DeadIndexKey::Property) and [`Label`](DeadIndexKey::Label) keys the same
+    /// reclamation emits for the entity's current values and labels, plus the ones its undo chain
+    /// emits for the historical ones.
+    fn collect_dead_entity(
+        &mut self,
+        kind: StoreKind,
+        entity: u64,
+        evidence: &HashMap<(StoreKind, u64), DeadKeyEvidence>,
+        out: &mut DeadKeyCollection,
+    ) {
+        let Some(ev) = evidence.get(&(kind, entity)) else {
+            out.keys_retained += 1;
+            return;
+        };
+        // Still in use means the slot was re-used between the pass and this re-check, or the pass's
+        // reclamation was undone. Either way the id now names something live: keep everything.
+        if ev.in_use {
+            out.keys_retained += 1;
+            return;
+        }
+        match kind {
+            StoreKind::Node => {
+                for name in self.registered_fulltext() {
+                    self.remove_fulltext_document(&name, entity);
+                }
+                for (label, prop) in self.registered_spatial() {
+                    self.remove_spatial_point(label, prop, entity);
+                }
+                for (label, prop) in self.registered_text() {
+                    self.remove_text(label, prop, entity);
+                }
+                for (label, prop) in self.registered_vector() {
+                    self.remove_vector(label, prop, entity);
+                }
+                self.remove_node_from_all_bitmaps(entity);
+            }
+            StoreKind::Rel => {
+                for name in self.registered_fulltext_rel() {
+                    self.remove_fulltext_rel_document(&name, entity);
+                }
+                for (ty, prop) in self.registered_spatial_rel() {
+                    self.remove_spatial_rel_point(ty, prop, entity);
+                }
+                for (ty, prop) in self.registered_vector_rel() {
+                    self.remove_vector_rel(ty, prop, entity);
+                }
+            }
+            _ => {
+                out.keys_retained += 1;
+                return;
+            }
+        }
+        out.entities_purged += 1;
+    }
+
     /// Candidate node ids whose `(label_token, prop_key)` value equals `value`, ascending. `None` if
     /// no bitmap index is registered for the column; otherwise the membership-exact set (the caller
     /// still re-checks MVCC visibility + the exact predicate, per the candidate contract).
@@ -5012,6 +5553,120 @@ mod tests {
 
     fn s(v: &str) -> Value {
         Value::String(v.to_owned())
+    }
+
+    /// **A collection pass carries somebody else's un-consumed dirt across** (`rmp` #992 / #803).
+    ///
+    /// The `ft_spatial_*_dirty` flags are how a statement seam learns that a transaction removed or
+    /// replaced a covered posting, and that is what makes its rollback poison the freshness marker —
+    /// the `rmp` #756 false negative the poison exists to contain. A GC collection must dispose of the
+    /// dirt IT raises (it is chargeable to nobody) without swallowing dirt raised before it: clearing
+    /// outright fails OPEN, and the flags are single global bools, so nothing else would notice.
+    ///
+    /// The pass here is deliberately a no-op one (no keys), so what it asserts is the bracket alone.
+    #[test]
+    fn a_collection_pass_does_not_swallow_dirt_it_did_not_raise() {
+        let mut set = IndexSet::new();
+        set.register_fulltext(
+            "ft",
+            vec![1],
+            vec![2],
+            Analyzer::Standard,
+            IndexState::Online,
+        );
+        set.index_fulltext_document("ft", 1, &["hello".to_owned(), "world".to_owned()]);
+        // A genuine remove: exactly the shape whose rollback must poison.
+        set.remove_fulltext_document("ft", 1);
+        assert!(
+            set.ft_spatial_dirty && set.ft_spatial_removed_dirty,
+            "precondition: a removal raises both flags"
+        );
+
+        let collection = set.collect_dead_keys(TxnId(9), &[], &HashMap::new());
+
+        assert_eq!(
+            collection,
+            DeadKeyCollection::default(),
+            "a no-key pass does nothing"
+        );
+        assert!(
+            set.ft_spatial_dirty && set.ft_spatial_removed_dirty,
+            "the collection swallowed a mutator's un-consumed dirt: its rollback would no longer \
+             poison the freshness marker, which is the `rmp` #756 false negative"
+        );
+    }
+
+    /// The mirror: whatever the pass **itself** raises is dropped, because a GC purge is chargeable to
+    /// nobody — it runs on its own committed transaction, after the reclamation is irreversible.
+    #[test]
+    fn a_collection_pass_discards_the_dirt_it_raised_itself() {
+        let mut set = IndexSet::new();
+        set.register_fulltext(
+            "ft",
+            vec![1],
+            vec![2],
+            Analyzer::Standard,
+            IndexState::Online,
+        );
+        set.index_fulltext_document("ft", 1, &["hello".to_owned(), "world".to_owned()]);
+        set.clear_ft_spatial_dirty();
+        assert!(!set.ft_spatial_dirty, "precondition: nothing is raised");
+
+        let mut evidence = HashMap::new();
+        evidence.insert(
+            (StoreKind::Node, 1u64),
+            DeadKeyEvidence {
+                property_versions: Vec::new(),
+                labels: Vec::new(),
+                in_use: false,
+            },
+        );
+        let collection = set.collect_dead_keys(
+            TxnId(9),
+            &[DeadIndexKey::Entity {
+                kind: StoreKind::Node,
+                entity: 1,
+            }],
+            &evidence,
+        );
+
+        assert_eq!(
+            collection.entities_purged, 1,
+            "the purge must have happened"
+        );
+        assert!(
+            !set.ft_spatial_dirty && !set.ft_spatial_removed_dirty,
+            "the pass's own residue must not be chargeable to the next statement"
+        );
+    }
+
+    /// **The concurrency gate sees an in-flight index writer** (`rmp` #992, slice 3). This is the
+    /// predicate `TxnCoordinator::collect_dead_index_keys` abandons a batch on; it must not confuse
+    /// the collecting transaction's own entries with somebody else's.
+    #[test]
+    fn an_in_flight_index_writer_is_visible_to_the_collection_gate() {
+        let mut set = IndexSet::new();
+        set.register_node_property(1, 2);
+        assert!(
+            !set.has_other_index_writer_in_flight(TxnId(9)),
+            "an idle set has no writer in flight"
+        );
+
+        set.insert_node_property(IndexWriter::Txn(TxnId(4)), 1, 2, &Value::Integer(10), 42);
+        assert!(
+            set.has_other_index_writer_in_flight(TxnId(9)),
+            "an uncommitted writer's entries must be visible to the gate"
+        );
+        assert!(
+            !set.has_other_index_writer_in_flight(TxnId(4)),
+            "a transaction is never its OWN concurrent writer"
+        );
+
+        drop(set.take_txn_entries(TxnId(4)));
+        assert!(
+            !set.has_other_index_writer_in_flight(TxnId(9)),
+            "once the writer resolves, the gate reopens"
+        );
     }
 
     #[test]

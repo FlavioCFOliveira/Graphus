@@ -161,6 +161,17 @@ struct PerDbCounters {
     /// the engine) purely so that publishing needs no new parameter on the engine's already
     /// 20-argument command path — `&Metrics` and `db` are threaded to every publish site already.
     wal_offset_last: AtomicU64,
+    /// The value this database last contributed to the server-wide `graphus_derived_index_entries`
+    /// gauge (`rmp` #992), so a republish folds only the signed change. Single-writer (the engine
+    /// thread), like every other per-database counter here.
+    derived_index_entries_last: AtomicU64,
+    /// The index-collection lifetime totals this database last published (`rmp` #992), so each
+    /// republish folds only the increment. The coordinator's totals are monotonic, so these only ever
+    /// rise — but they still need a baseline, because the server-wide counters aggregate several
+    /// databases and a plain `store` would report whichever engine published last.
+    index_entries_collected_last: AtomicU64,
+    index_keys_retained_last: AtomicU64,
+    index_collections_abandoned_last: AtomicU64,
 }
 
 impl PerDbCounters {
@@ -173,6 +184,10 @@ impl PerDbCounters {
             slow_queries: AtomicU64::new(0),
             wal_bytes_written: AtomicU64::new(0),
             wal_offset_last: AtomicU64::new(0),
+            derived_index_entries_last: AtomicU64::new(0),
+            index_entries_collected_last: AtomicU64::new(0),
+            index_keys_retained_last: AtomicU64::new(0),
+            index_collections_abandoned_last: AtomicU64::new(0),
         }
     }
 
@@ -267,6 +282,28 @@ pub struct Metrics {
     maintenance_versions_reclaimed: AtomicU64,
     /// Cumulative committed MVCC stamps frozen (settled to `Committed(ts)`) by maintenance GC passes.
     maintenance_stamps_frozen: AtomicU64,
+    /// Entries held by the **value-keyed derived indexes**, summed across every database engine (a
+    /// gauge, `rmp` #992). Published additively by each engine's maintenance cadence.
+    ///
+    /// The derived indexes are in-memory, so this is the RAM they cost (`rmp` #305/#313), and it is the
+    /// number `rmp` #992's GC-driven collection holds down: before it, rewriting one indexed property
+    /// `N` times left `N` entries behind for ever, so a gauge climbing under a steady write workload
+    /// with no growth in the data is the signature of that leak returning.
+    ///
+    /// **It is not flat on a database holding a COMPOSITE index.** The count spans the label,
+    /// node-property, relationship-property **and composite** trees, and `rmp` #992 deliberately does
+    /// not collect the composite ones (a composite key is a tuple no single-property report can
+    /// reconstruct). Composite trees therefore still grow with the version count, and this gauge
+    /// honestly shows it — which is the point of counting them rather than quietly excluding them.
+    derived_index_entries: AtomicU64,
+    /// Derived-index entries the GC-driven collection has removed, server-wide (`rmp` #992). See
+    /// [`publish_index_collection_for`](Self::publish_index_collection_for) for why the three
+    /// collection counters exist alongside the footprint gauge.
+    index_entries_collected: AtomicU64,
+    /// Dead keys the re-check **kept**, server-wide (`rmp` #992).
+    index_keys_retained: AtomicU64,
+    /// Collection batches abandoned by the concurrency gate, server-wide (`rmp` #992).
+    index_collections_abandoned: AtomicU64,
     /// Cumulative background maintenance checkpoints that **failed** (`rmp` #394). A persistently
     /// rising value means reclamation has stalled — RAM (the WAL tail), disk (sealed segments) and
     /// version slots stop being reclaimed while writes accrue, a slow-motion OOM. Engine-thread-only
@@ -464,6 +501,10 @@ impl Metrics {
             maintenance_checkpoints: AtomicU64::new(0),
             maintenance_versions_reclaimed: AtomicU64::new(0),
             maintenance_stamps_frozen: AtomicU64::new(0),
+            derived_index_entries: AtomicU64::new(0),
+            index_entries_collected: AtomicU64::new(0),
+            index_keys_retained: AtomicU64::new(0),
+            index_collections_abandoned: AtomicU64::new(0),
             maintenance_failures: AtomicU64::new(0),
             index_fail_closed: AtomicU64::new(0),
             vector_index_conflicts: AtomicU64::new(0),
@@ -971,6 +1012,98 @@ impl Metrics {
         self.wal_bytes_written.fetch_add(delta, Ordering::Relaxed);
     }
 
+    /// Publishes `entries` as this database's contribution to the server-wide
+    /// `graphus_derived_index_entries` gauge (`rmp` #992) — the number of entries its in-memory
+    /// value-keyed derived indexes hold.
+    ///
+    /// Additive, for the reason `rmp` #418 established: with `N` database engines sharing one gauge, a
+    /// last-writer-wins `store` would report whichever engine published last instead of the fleet
+    /// total. The per-database "last published" baseline lives in [`PerDbCounters`] rather than in the
+    /// engine, which is sound because each database's slot has exactly one writer (its engine thread),
+    /// so the read-modify-write below is race-free without a CAS — the same discipline
+    /// [`publish_wal_bytes_for`](Self::publish_wal_bytes_for) documents.
+    ///
+    /// Called from the maintenance cadence, never from a query path: the census behind `entries` is
+    /// `O(entries)`.
+    pub fn publish_derived_index_entries_for(&self, db: &str, entries: u64) {
+        let c = self.per_db_entry(db);
+        let last = c.derived_index_entries_last.load(Ordering::Relaxed);
+        if entries == last {
+            return;
+        }
+        c.derived_index_entries_last
+            .store(entries, Ordering::Relaxed);
+        let delta = (i128::from(entries) - i128::from(last))
+            .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+        add_delta(&self.derived_index_entries, delta);
+    }
+
+    /// The current server-wide derived-index entry gauge (`rmp` #992) — observability / tests.
+    #[must_use]
+    pub fn derived_index_entries(&self) -> u64 {
+        self.derived_index_entries.load(Ordering::Relaxed)
+    }
+
+    /// Publishes this database's lifetime index-collection totals (`rmp` #992): entries the GC-driven
+    /// collection actually removed, dead keys it kept, and batches it abandoned.
+    ///
+    /// The three answer questions the GC report cannot. `graphus_derived_index_entries` says how big
+    /// the indexes are and `GcPassReport::dead_index_keys` says how many dead keys the store
+    /// *reported* — neither says what the index layer **did**, so a collection that reports thousands
+    /// of keys and removes none of them is indistinguishable, from those two alone, from one with
+    /// nothing to collect. Retained climbing while collected stays flat is the re-check refusing
+    /// everything; abandoned rising is the concurrency gate firing, which is nil until the engine has
+    /// more than one writer.
+    ///
+    /// Additive with a per-database baseline, for the reason `rmp` #418 established and
+    /// [`publish_wal_bytes_for`](Self::publish_wal_bytes_for) documents.
+    pub fn publish_index_collection_for(
+        &self,
+        db: &str,
+        collected: u64,
+        retained: u64,
+        abandoned: u64,
+    ) {
+        let c = self.per_db_entry(db);
+        for (value, last, total) in [
+            (
+                collected,
+                &c.index_entries_collected_last,
+                &self.index_entries_collected,
+            ),
+            (
+                retained,
+                &c.index_keys_retained_last,
+                &self.index_keys_retained,
+            ),
+            (
+                abandoned,
+                &c.index_collections_abandoned_last,
+                &self.index_collections_abandoned,
+            ),
+        ] {
+            let previous = last.load(Ordering::Relaxed);
+            if value == previous {
+                continue;
+            }
+            last.store(value, Ordering::Relaxed);
+            let delta = (i128::from(value) - i128::from(previous))
+                .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+            add_delta(total, delta);
+        }
+    }
+
+    /// The server-wide index-collection totals `(collected, retained, abandoned)` (`rmp` #992) —
+    /// observability / tests.
+    #[must_use]
+    pub fn index_collection_totals(&self) -> (u64, u64, u64) {
+        (
+            self.index_entries_collected.load(Ordering::Relaxed),
+            self.index_keys_retained.load(Ordering::Relaxed),
+            self.index_collections_abandoned.load(Ordering::Relaxed),
+        )
+    }
+
     /// The cumulative WAL bytes this process has made durable across every database (`rmp` #745).
     /// Test/inspection accessor for [`publish_wal_bytes_for`](Self::publish_wal_bytes_for)'s aggregate.
     #[must_use]
@@ -1097,6 +1230,30 @@ impl Metrics {
             "graphus_maintenance_failures_total",
             "Background maintenance checkpoints that failed (reclamation stalled — rmp #394).",
             self.maintenance_failures.load(Ordering::Relaxed),
+        );
+        gauge(
+            &mut out,
+            "graphus_derived_index_entries",
+            "Entries held by the in-memory value-keyed derived indexes (rmp #992).",
+            self.derived_index_entries.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "graphus_index_entries_collected_total",
+            "Derived-index entries removed by the GC-driven collection (rmp #992).",
+            self.index_entries_collected.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "graphus_index_dead_keys_retained_total",
+            "Dead index keys the collection's re-check kept (rmp #992).",
+            self.index_keys_retained.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "graphus_index_collections_abandoned_total",
+            "Index-collection batches abandoned by the concurrency gate (rmp #992).",
+            self.index_collections_abandoned.load(Ordering::Relaxed),
         );
         counter(
             &mut out,

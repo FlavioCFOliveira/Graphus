@@ -1425,30 +1425,124 @@ visibility against the reader's snapshot. This keeps indexes single-structure wh
 serializable. Index **range reads register SIREAD/predicate markers** (§5.4) so phantoms are caught
 by SSI.
 
-**Correction (2026-08-06): two claims this section made are not true of the engine, and are tracked
-by `rmp` #992.** It said "the old entry is removed lazily by GC once the old version is dead (§5.5)"
-and that this "avoids index bloat proportional to version count". Verified against the code:
+#### 6.3.1 An index entry belongs to a transaction (`rmp` #992, slice 1)
 
-- **Nothing removes an index entry.** The removal primitives exist and are implemented —
-  `TokenIndex::remove`, `PropertyIndex::remove`, `CompositeIndex::remove`,
-  `RelPropertyIndex::remove`, all over `BTree::delete` — but outside the index crate's own tests
-  their only consumer is the uniqueness-constraint tree. The engine never calls them. The capability
-  is built and unreachable.
-- **The GC pass never touches the index set.** §5.5 reclaims record versions, undo deltas and commit
-  slots; the derived indexes are not in its scope.
-- **So the index does grow with the version count**, and deliberately so on the population side: a
-  refill indexes *every* property version with no visibility filter, because a candidate structure
-  owes the **superset** polarity of §5.3 — a per-candidate re-check can remove a candidate but can
-  never resurrect one. That polarity is correct and stays; what is missing is the reclamation on the
-  other end.
+An index write names its writer. The polarity is in the type — `IndexWriter::{Txn(TxnId),
+Population}` — because the two families of writer carry opposite *obligations*, not merely different
+values:
 
-A further consequence worth stating, because it is what makes the gap load-bearing rather than
-cosmetic: an index write today carries a **fixed, never-committed transaction id**, so an index entry
-belongs to no transaction, is not undone by that transaction's rollback, and has no version. Every
-correctness guarantee therefore rests on candidate-plus-re-check, propped up by a family of global
-freshness, rebuild-watermark and poison gates (`rmp` #467, #733, #755, #765, #803) — each one a
-compensation for the index not being MVCC-native. `rmp` #992 is the task that gives index entries a
-transaction and a version, wires the reclamation, and retires or justifies each of those gates.
+- a **transactional** entry is part of that transaction's atomic unit of work, so a rollback removes
+  the entries the transaction **created**;
+- a **population** entry belongs to an index build, belongs to no transaction, and is never undone —
+  a build deliberately indexes every not-yet-reclaimed version with no visibility filter, because a
+  candidate structure owes the **superset** polarity of §5.3: a per-candidate re-check can remove a
+  candidate but can never resurrect one.
+
+Only entries the backing tree reports as *newly created* are logged for the rollback, because a write
+re-indexes the entity's whole current state and would otherwise take back an entry a **committed**
+version warrants. That guard holds only while the tree is complete with respect to committed state,
+so any population write invalidates every open transaction's log.
+
+#### 6.3.2 A dead version's entries are reclaimed (`rmp` #992, slice 2)
+
+The old entry **is** removed once the version that warranted it is dead, so an index no longer grows
+with the number of versions of a rewritten key. The reclaimer is the §5.5 version GC, because it is
+the component that already knows when a version stops existing:
+
+1. **The GC reports what it destroyed.** Freeing an entity's undo chain reports each `SetProperty`
+   delta's old value and each `AddLabel` delta's label; physically reclaiming an entity reports the
+   entity itself plus every label and value it still held. Nothing is reported outside the property
+   keys the index layer declares an interest in, so a dead value belonging to no index is never even
+   decoded (decoding can mean an overflow-heap read).
+2. **The index layer re-checks before it removes.** A reported key says *a* version died, not that
+   *every* version did — `SET n.age = 31` then `SET n.age = 30` kills a version holding `30` while
+   `30` is exactly what the entity still has. So a removal happens only when a **superset-polarity**
+   read of the entity (its live cells and every value its undo chain can still reconstruct; its live
+   bitmap and every label an `AddLabel` delta could restore) shows nothing occupying that index key.
+   The comparison is made on the **encoded index key**, not on value equality, because the two differ
+   in both directions: `Integer(30)` and `Float(30.0)` are Cypher-equal but occupy different keys,
+   and two different `Duration`s can share one.
+3. **The error directions are not symmetric, and every judgement resolves the safe way.** An entry
+   removed too eagerly is a committed row lost from every future seek; an entry left behind is a
+   false positive the re-check drops. So a read fault, a missing witness, a full report queue and an
+   uncertain slot all retain.
+
+Physical reclamation is also the point at which a leftover entry stops being harmless: the slot
+returns to the free list and the next allocation gives that id to a different logical entity. The
+entity-keyed index kinds (full-text, spatial, text, vector, bitmap), which hold one posting per
+entity rather than one per value and cannot be addressed by a value key, are purged there.
+
+**The witness is read under one hold and acted on under another, and that split is guarded.** Reading
+the store and mutating the trees are two separate holds — the engine takes no two-cell hold on the
+write path — so between them lies a time-of-check-to-time-of-use window. It is empty while the engine
+has a single writer thread, and this sprint exists to end that, so the window is gated rather than
+assumed away: the index is asked whether any transaction other than the collecting one has entries in
+flight — evaluated under the hold that then performs the removals — and the store's commit high-water
+is compared across the witness, which is dormant under today's exclusive hold and starts paying under
+a shared one. Either abandons the whole batch, keeping every entry: always safe, free under one
+writer, and visible as `graphus_index_collections_abandoned_total`. The residue they do **not** cover
+is a writer committing in the instant between the two holds, which has already drained its in-flight
+entries; closing that needs the decision and the removal to be indivisible, and is `rmp` #1022 —
+which **blocks** the layers that admit the second writer, so the residue cannot outlive the
+assumption that makes it harmless. The keys are decided in
+batches for an unrelated reason: the witness holds decoded values per entity, and a pass that
+reclaims entities by the million must not hold a witness proportional to the pass.
+
+**Not yet reclaimed: composite indexes.** A composite key is the tuple `(v1, …, vk)` in declared
+order, and a reported key names one property; the other fields' values at that version are not
+recoverable from it, and guessing them would delete live entries. The composite trees therefore still
+grow with the version count. That is a bounded *retention* residual — false positives the re-check
+drops — never a destruction one.
+
+**Historical note (2026-08-06).** Before `rmp` #992 this section claimed both of the above and
+neither was true: nothing removed an index entry (the removal primitives existed but the engine never
+called them, and the GC pass did not touch the index set), and an index write carried a fixed,
+never-committed transaction id, so an entry belonged to no transaction and survived its rollback.
+Every correctness guarantee rested on candidate-plus-re-check propped up by a family of global
+freshness, rebuild-watermark and poison gates (`rmp` #467, #733, #755, #765, #803), each — so the
+premise went — a compensation for the index not being MVCC-native. Slices 1 and 2 close the two halves
+above; §6.3.3 audits that premise gate by gate and finds it only half true.
+
+#### 6.3.3 The nine global gates, audited one by one (`rmp` #992, slice 3)
+
+`rmp` #992's measure of success is not that a mechanism was added but that the **compensations for its
+absence go away**: each of the nine global gates the derived-index layer carries must be removed, or
+justified in writing. This is that audit, taken after slices 1 and 2 were in place.
+
+**The premise it was opened under is half false, and the correction is the useful part.** Four of the
+nine (`labels_usable`, `rebuild_gap`, `wipe_generation`, `degraded`, all `rmp` #733) do not compensate
+for the absence of MVCC at all. They answer a **read fault**: a store read that failed while a build or
+a refill was filling a tree, leaving it incomplete and trusted. A perfectly MVCC-native index has the
+same exposure — versioning a tree does not make the disk under it readable — so these are not a debt
+this task can pay off, and a design that retired them would be strictly worse. They are **kept by
+design**, not tolerated.
+
+The other five are genuine compensations, and none of them is retired by slices 1 and 2, for a reason
+worth stating precisely rather than in aggregate:
+
+| Gate | Compensates | Verdict |
+| --- | --- | --- |
+| `rebuilt_trees_trustworthy_from` (#755/#765) | A `clear`-and-refill rebuild destroys entries an older reader is still entitled to. | **Kept.** Orthogonal to slices 1–2: those remove an entry only when the GC watermark proves no snapshot can want it, whereas a rebuild's wipe is gated by nothing at all. What would retire it is a **non-destructive rebuild** — fill the replacement tree beside the live one and swap — never a finer removal rule. |
+| `ft_spatial_trustworthy_from` (#467) | Full-text/spatial hold only the newest state, so a committed replace strips the old posting an older reader needs. | **Kept.** This is the *opposite* polarity to the one #992 fixes: a hole, not a leftover. Nothing about giving entries an owner or collecting dead ones fills a hole. |
+| `ft_spatial_inflight` (#467) | The same hole while the replace is still uncommitted. | **Kept**, for the same reason. |
+| `ft_spatial_removers` (#756) | Discriminates a rolled-back *remove/replace* (which leaves a hole) from a rolled-back *insert* (which leaves a filterable false positive). | **Kept.** Slice 1 removes an aborting transaction's *created* entries — the second case. The first case is what this gate is for and slice 1 cannot describe it: a log of created entries does not describe an absence. |
+| `ft_spatial_poisoned` (#467/#756/#803) | The hole a rolled-back remover actually left. | **Kept**, as the enforcement arm of the row above. |
+
+**What would retire the last four, together.** They exist because the entity-keyed indexes are
+*destructive per entry* on the write path: a rewrite drops the old posting as the write happens, which
+is the one thing a candidate structure owing the superset polarity of §5.3 must never do. Make that
+write path **purely additive** — a write only ever unions the new state in, and the *only* remover is
+the GC-driven collection of §6.3.2 — and the hole cannot form, so all four gates lose their subject at
+once. That is what "MVCC-native index" means for these kinds, and it is now reachable precisely because
+slice 2 supplied the missing remover.
+
+The primitive already exists for two of them and is used on the build path today, which is the same
+superset argument: `SpatialIndex::merge_point` (`rmp` #779) and `TrigramIndex::merge_value` (`rmp`
+#773) union a version in without dropping any. Full-text has no such method yet (`index_document` is
+last-wins); the value bitmaps need only stop removing; and the vector index is the hard case, since
+HNSW is id-keyed — one vector per id — so retaining two versions of one entity needs a level of
+indirection the others do not. That asymmetry, not the principle, is why this is tracked as its own
+task rather than folded in here.
 
 ### 6.4 Crash recovery of indexes
 

@@ -46,20 +46,31 @@
 //!
 //! - The index APIs ([`kinds`]) return record ids ([`u64`] physical ids). They never filter by
 //!   visibility — that is the transaction layer's job.
-//! - When a new record version is created the txn layer inserts an index entry. **The old entry is
-//!   not removed.** This crate provides `insert` *and* `delete` primitives — `TokenIndex::remove`,
-//!   `PropertyIndex::remove`, `CompositeIndex::remove`, `RelPropertyIndex::remove`, all over
-//!   [`BTree::delete`] — but outside this crate's own tests their only consumer is the
-//!   uniqueness-constraint tree: **the transaction layer does not drive them**, and the GC pass does
-//!   not touch the index set at all.
+//! - When a new record version is created the txn layer inserts an index entry, and the old entry is
+//!   removed once the version that warranted it is dead (`rmp` #992). This crate provides the
+//!   `insert` *and* `delete` primitives — `TokenIndex::remove`, `PropertyIndex::remove`,
+//!   `CompositeIndex::remove`, `RelPropertyIndex::remove`, all over [`BTree::delete`]; the drivers
+//!   are `graphus_cypher::IndexSet`'s rollback (`undo_entries`, for the entries a transaction
+//!   created) and its GC-driven collection (`collect_dead_keys`, for the entries dead versions leave
+//!   behind), plus the uniqueness-constraint tree.
 //!
-//!   This doc-comment claimed the opposite until 2026-08-06 ("removed lazily by GC once the old
-//!   version is dead"), as did `04 §6.3`; both are corrected, and closing the gap is `rmp` #992.
-//!   Until then an index grows with the number of versions of a rewritten key, and — deliberately,
-//!   on the population side — a refill indexes *every* property version with no visibility filter,
-//!   because a candidate structure owes the **superset** polarity: a per-candidate re-check can
-//!   remove a candidate but can never resurrect one. That half is correct and stays; what is missing
-//!   is the reclamation on the other end.
+//!   **This crate never decides *whether* an entry may go.** A removal is authorised one layer up, by
+//!   a superset-polarity re-check against the store, because a dead version is not the same thing as
+//!   a dead entry: `SET n.age = 31` then `SET n.age = 30` kills a version holding `30` while `30` is
+//!   exactly what the entity still has. What this crate owes that decision is
+//!   [`keycodec::encode_single`], the *same* key function [`kinds::PropertyIndex::remove`] deletes
+//!   on — value equality is the wrong test in both directions (`Integer(30)` and `Float(30.0)` are
+//!   Cypher-equal but occupy different keys; two different `Duration`s can share one).
+//!
+//!   The **population** side is unchanged and deliberately asymmetric: a refill indexes *every*
+//!   property version with no visibility filter, because a candidate structure owes the **superset**
+//!   polarity — a per-candidate re-check can remove a candidate but can never resurrect one.
+//!
+//!   Until 2026-08-06 this doc-comment claimed the removal already happened when in fact nothing in
+//!   the engine called these primitives at all; `04 §6.3` carried the same false claim. Both were
+//!   corrected, and `rmp` #992 then made the claim true. **Composite indexes are the one exception
+//!   that remains**: a composite key is a tuple, and a report naming one property cannot reconstruct
+//!   it, so those trees still grow with the version count.
 //! - **SIREAD / predicate-marker registration** for index range reads (so SSI catches phantoms,
 //!   `04 §5.4`, §6.3) happens in the transaction layer. `graphus-txn` currently operates over its
 //!   own `VersionedStore` abstraction (the §12 representation spike is still open),

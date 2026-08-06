@@ -131,7 +131,9 @@ pub const STORE_COUNT: usize = 6;
 /// of `05 §7`, so the freeze sweep, the tombstone reclamation and the version-visibility rules apply
 /// to them and to nothing else. The undo area's records are pure storage — framed, checksummed,
 /// WAL-logged and recovered exactly like any other page, but never version-stamped.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// `Hash` (`rmp` #992): a `(StoreKind, physical id)` pair is the natural key for per-entity bookkeeping
+// outside this crate — the derived-index layer groups a GC pass's dead keys by entity that way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StoreKind {
     /// The node store (`nodes.store`).
     Node = 0,
@@ -615,7 +617,163 @@ pub struct GcPassReport {
     /// log), or `None` when `freeze_violations == 0`. The storage crate carries no logger, so it surfaces
     /// the offending store/id/stamps here for the server maintenance loop to log.
     pub first_freeze_violation: Option<FreezeFrontierViolation>,
+    /// **`rmp` #992.** How many [`DeadIndexKey`]s this pass collected for the derived-index layer —
+    /// i.e. how many index entries the reclamation it just performed may have orphaned.
+    ///
+    /// The keys themselves are drained separately by
+    /// [`take_dead_index_keys`](RecordStore::take_dead_index_keys), so this report stays a `Copy`
+    /// observability record; see that method for why the queue is not a field here. `0` on a store
+    /// with no declared [`IndexInterest`], which is every store the derived-index layer does not
+    /// drive (the bulk importer, the storage crate's own tests).
+    pub dead_index_keys: usize,
+    /// **`rmp` #992.** Dead keys this pass found but could **not** report — dropped at a per-shape
+    /// budget ([`MAX_DEAD_PROPERTY_KEYS`]), or lost to a store read that faulted.
+    ///
+    /// Each one is an index entry left in a tree that nothing warrants: harmless to a query (the
+    /// seek's per-candidate re-check drops it) but never reclaimed either, so a persistently non-zero
+    /// value means the derived indexes are growing again for a reason the entry census alone cannot
+    /// explain. Normally `0`.
+    pub dead_index_keys_dropped: usize,
 }
+
+/// A derived-index entry the version GC has just made **unwarranted** (`rmp` #992).
+///
+/// The record store knows nothing about derived indexes, and this type does not change that: it names
+/// a *fact about the store* — a version died — in the vocabulary an index layer can act on. Which
+/// trees hold a matching entry, and whether one may be removed, is decided entirely by the caller
+/// (`graphus_cypher::IndexSet::collect_dead_keys`), which re-checks every key against the store before
+/// it removes anything.
+///
+/// # Why a key is a hint and never an order
+///
+/// A key is emitted the moment *one* version stops warranting an entry, which is not the same as *no*
+/// version warranting it: `SET n.age = 31` followed by `SET n.age = 30` kills a version holding `30`
+/// while the value in place is still `30`. Emitting is therefore deliberately over-approximate and the
+/// consumer's re-check is what makes removal sound. The two error directions are not symmetric — an
+/// entry removed too eagerly is a **lost row** for every future seek, an entry left behind is a false
+/// positive the seek's per-candidate re-check drops — so every judgement call in the emission path
+/// resolves towards *not* removing.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DeadIndexKey {
+    /// A property version the GC reclaimed: `(entity, key)` no longer holds `value` **in that
+    /// version**. Emitted from the [`UndoAction::SetProperty`] delta that carried the old value, and
+    /// from the current cells of an entity being physically reclaimed.
+    Property {
+        /// Which entity store the owner lives in ([`StoreKind::Node`] or [`StoreKind::Rel`]).
+        kind: StoreKind,
+        /// The owner's physical id.
+        entity: u64,
+        /// The property-key token.
+        key: u32,
+        /// The value that version held.
+        value: graphus_core::Value,
+    },
+    /// A label membership the GC reclaimed: `node` no longer carries `label` **in that version**.
+    /// Emitted from the [`UndoAction::AddLabel`] delta that would have restored it, and from the live
+    /// bitmap of a node being physically reclaimed.
+    Label {
+        /// The node's physical id.
+        node: u64,
+        /// The `Label`-namespace token id.
+        label: u32,
+    },
+    /// An entity the GC **physically reclaimed**: its slot is back on the free list, so nothing —
+    /// committed, in flight or aborted — warrants any derived-index entry naming it.
+    ///
+    /// This is the strongest of the three and the only one that reaches the entity-keyed index kinds
+    /// (full-text, spatial, text, vector, bitmap), which hold one posting per entity rather than one
+    /// per value and therefore cannot be addressed by a value key. It is also the point at which a
+    /// leftover posting stops being a harmless false positive: once the slot is recycled the posting
+    /// names a *different* logical entity, which is the hazard `rmp` #756's marker and the #588 reuse
+    /// barrier exist to contain.
+    Entity {
+        /// Which entity store the reclaimed record lived in.
+        kind: StoreKind,
+        /// The reclaimed physical id.
+        entity: u64,
+    },
+}
+
+/// What the derived-index layer wants the GC to report (`rmp` #992) — the store's half of the
+/// [`DeadIndexKey`] contract.
+///
+/// The record store has no way to know which properties or labels any index covers, so it is told,
+/// once per GC pass, and reports nothing outside that declaration. This is not only an optimisation:
+/// decoding a dead property value can mean **reading the overflow heap**, so an undeclared key must
+/// never be decoded at all. A store nobody declares interest on (the default) does exactly what it did
+/// before this task: it collects nothing and allocates nothing.
+///
+/// The whole declaration is replaced on every pass rather than mutated, so it cannot drift out of step
+/// with the index set it was derived from.
+#[derive(Debug, Clone, Default)]
+pub struct IndexInterest {
+    /// Property-key tokens some value-keyed derived index covers. A dead property value whose key is
+    /// outside this set is never decoded and never reported — which is the whole point, since decoding
+    /// can mean an overflow-heap read.
+    prop_keys: HashSet<u32>,
+    /// Whether the caller holds a **label** index at all.
+    ///
+    /// A boolean rather than a token set, because that is the truth about this engine: labels are not
+    /// *declared* the way properties are — `graphus_cypher`'s label index is unconditional and covers
+    /// every label there is — so a per-token declaration could only ever say "all of them", at the cost
+    /// of an `O(entries)` tree scan per pass to enumerate them. Reporting a dead label costs one push
+    /// and **no decode**, so there is nothing finer to buy.
+    labels: bool,
+    /// Whether physically reclaimed entities should be reported at all
+    /// ([`DeadIndexKey::Entity`]). Set by a caller that owns entity-keyed index kinds.
+    entities: bool,
+}
+
+impl IndexInterest {
+    /// Declares interest in `prop_keys`, in dead labels when `labels` is set, and in every physically
+    /// reclaimed entity when `entities` is set.
+    #[must_use]
+    pub fn new(prop_keys: HashSet<u32>, labels: bool, entities: bool) -> Self {
+        Self {
+            prop_keys,
+            labels,
+            entities,
+        }
+    }
+
+    /// Whether this declaration asks for nothing at all — the default, and the state that makes the
+    /// whole collection path free.
+    #[must_use]
+    fn is_idle(&self) -> bool {
+        self.prop_keys.is_empty() && !self.labels && !self.entities
+    }
+}
+
+/// How many **value-carrying** [`DeadIndexKey::Property`] keys one GC pass may collect (`rmp` #992).
+///
+/// A `Property` key holds a cloned [`graphus_core::Value`] — for a string property, the whole string —
+/// so it is the same growth class as `graphus_cypher`'s `MAX_TXN_UNDO_ENTRIES`, and is bounded for the
+/// same reason. Dropping keys is safe in exactly the way that one is: every key is an independent
+/// hint, so honouring a subset removes a subset of the orphaned entries and leaves the rest in the
+/// tree — false positives the seek's re-check drops, i.e. precisely the pre-#992 behaviour. What is
+/// lost is *precision*, never correctness.
+///
+/// # Why the budget is split by key shape, and not one queue with one cap
+///
+/// [`gc_inner`](RecordStore::gc_inner) emits in phase order: entity reclamation (Phases A and C)
+/// first, the undo-chain sweep (Phase F) **last**. A single shared cap is therefore not neutral — it
+/// is systematically biased *against* the rewritten-property keys, which are the entire point of this
+/// task. A maintenance window that reclaims more entities than the cap (a batched `DETACH DELETE`, a
+/// retention sweep, the tail of a bulk load — all shapes this repo runs at 1M scale) would fill the
+/// queue before Phase F emitted anything, and the value-keyed indexes would go on growing with the
+/// version count exactly as they did before #992, silently and on every window.
+///
+/// Splitting it removes the coupling: the shapes cannot starve each other, and the cheap shapes
+/// ([`Label`](DeadIndexKey::Label) / [`Entity`](DeadIndexKey::Entity), which carry no `Value` and cost
+/// ~24 bytes) get their own, much larger allowance rather than competing for the expensive one's.
+const MAX_DEAD_PROPERTY_KEYS: usize = 64 * 1024;
+
+/// How many **valueless** [`DeadIndexKey`]s (`Label` / `Entity`) one GC pass may collect (`rmp` #992).
+///
+/// These carry no cloned value, so the bound is on the `Vec` alone and can be far more generous than
+/// [`MAX_DEAD_PROPERTY_KEYS`]. It exists so a pathological pass cannot grow the queue without limit,
+/// not because the shape is expensive. See that constant for why the two budgets are separate.
+const MAX_DEAD_ENTITY_KEYS: usize = 1024 * 1024;
 
 /// What one property-chain sweep did, per owner and in total (`rmp` #967).
 ///
@@ -968,6 +1126,23 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// which also strands that transaction's commit slot. The next full GC pass resolves it with a
     /// reference sweep over `undo.store`; until then the slot is a bounded leak, never a hazard.
     undo_orphan_slots_possible: bool,
+    /// **`rmp` #992.** What the derived-index layer asked this store to report about the versions its
+    /// GC reclaims. Empty by default, replaced wholesale before each pass by the caller that owns the
+    /// indexes; see [`IndexInterest`].
+    index_interest: IndexInterest,
+    /// **`rmp` #992.** The [`DeadIndexKey`]s the current GC pass has collected, cleared at the start of
+    /// every pass and drained by [`take_dead_index_keys`](Self::take_dead_index_keys). Always empty
+    /// while `index_interest.is_idle()`.
+    dead_index_keys: Vec<DeadIndexKey>,
+    /// **`rmp` #992.** How many of `dead_index_keys` are the value-carrying
+    /// [`Property`](DeadIndexKey::Property) shape, so the two shapes can be budgeted separately (see
+    /// [`MAX_DEAD_PROPERTY_KEYS`]). Kept as a counter rather than recomputed, because it is consulted
+    /// on every push.
+    dead_property_keys: usize,
+    /// **`rmp` #992.** Dead keys this pass could NOT report: dropped at a shape's budget, or lost to a
+    /// store read that faulted. Non-zero means some orphaned index entries were left behind — safe,
+    /// but it is the only signal that distinguishes that from having found nothing to collect.
+    dead_index_keys_dropped: usize,
     /// Exact, persisted live-record cardinalities for the planner's cardinality estimator
     /// (`rmp` task #79): per-label node counts and per-relationship-type counts. Part of the durable
     /// catalog ([`Meta`]) — mutated incrementally on the committed transitions that change a record's
@@ -1140,6 +1315,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // (`gc_full_scan_pending`), so a crash-recovered store reclaims its chains normally.
             pending_undo_chains: std::collections::BTreeSet::new(),
             undo_orphan_slots_possible: false,
+            // `rmp` #992: nothing is reported until a derived-index layer declares what it covers.
+            index_interest: IndexInterest::default(),
+            dead_index_keys: Vec::new(),
+            dead_property_keys: 0,
+            dead_index_keys_dropped: 0,
             statistics: Statistics::new(),
             checkpoint_interval_bytes: DEFAULT_CHECKPOINT_INTERVAL_BYTES,
             wal_segment_sizing_adaptive: true,
@@ -1281,6 +1461,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // (`gc_full_scan_pending`), so a crash-recovered store reclaims its chains normally.
             pending_undo_chains: std::collections::BTreeSet::new(),
             undo_orphan_slots_possible: false,
+            // `rmp` #992: nothing is reported until a derived-index layer declares what it covers.
+            index_interest: IndexInterest::default(),
+            dead_index_keys: Vec::new(),
+            dead_property_keys: 0,
+            dead_index_keys_dropped: 0,
             statistics: meta.statistics,
             checkpoint_interval_bytes: DEFAULT_CHECKPOINT_INTERVAL_BYTES,
             wal_segment_sizing_adaptive: true,
@@ -3562,6 +3747,210 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         read_view::undo_chain(&self.pool, &self.stores, kind, entity)
     }
 
+    // ------------- derived-index reclamation reporting (`rmp` #992) -------------
+    //
+    // The record store owns no index and gains none here. What it gains is the ability to say, in its
+    // own vocabulary, *which versions it just destroyed* — the fact a derived index needs in order to
+    // stop growing with the version count. See [`DeadIndexKey`] and [`IndexInterest`].
+
+    /// Declares what the derived-index layer covers, for the GC passes that follow (`rmp` #992).
+    ///
+    /// Replaces the whole declaration. A caller that owns derived indexes re-derives it from its index
+    /// set before every pass, so it can never drift out of step with the trees it describes; a caller
+    /// that owns none never calls this and pays nothing (see [`IndexInterest`]).
+    pub fn set_index_interest(&mut self, interest: IndexInterest) {
+        self.index_interest = interest;
+    }
+
+    /// Drains the [`DeadIndexKey`]s the last GC pass collected (`rmp` #992).
+    ///
+    /// **Draining, not borrowing**, and for the same reason
+    /// `graphus_cypher::IndexSet::take_txn_entries` drains: the queue must be consumed exactly once,
+    /// and a caller that takes it and then fails has still freed it. A caller whose GC pass rolled back
+    /// must take the keys and **discard** them — a rolled-back pass destroyed no version, so it
+    /// warrants no removal.
+    ///
+    /// The queue lives here rather than in [`GcPassReport`] because that report is a `Copy`
+    /// observability record several callers compare and clone; a `Vec<Value>` field would cost it
+    /// `Copy` and make its `Eq` meaningless. [`GcPassReport::dead_index_keys`] carries the count.
+    #[must_use]
+    pub fn take_dead_index_keys(&mut self) -> Vec<DeadIndexKey> {
+        self.dead_property_keys = 0;
+        std::mem::take(&mut self.dead_index_keys)
+    }
+
+    /// Queues one dead key, up to that key **shape's** own budget
+    /// ([`MAX_DEAD_PROPERTY_KEYS`] / [`MAX_DEAD_ENTITY_KEYS`] — see the first for why they are
+    /// separate). Beyond the budget the key is dropped, which leaves its index entry in place: the
+    /// safe direction, but a *silent* loss of precision, so every drop is counted into
+    /// [`GcPassReport::dead_index_keys_dropped`].
+    fn push_dead_index_key(&mut self, key: DeadIndexKey) {
+        let (used, budget) = match key {
+            DeadIndexKey::Property { .. } => (self.dead_property_keys, MAX_DEAD_PROPERTY_KEYS),
+            DeadIndexKey::Label { .. } | DeadIndexKey::Entity { .. } => (
+                self.dead_index_keys.len() - self.dead_property_keys,
+                MAX_DEAD_ENTITY_KEYS,
+            ),
+        };
+        if used >= budget {
+            self.dead_index_keys_dropped += 1;
+            return;
+        }
+        if matches!(key, DeadIndexKey::Property { .. }) {
+            self.dead_property_keys += 1;
+        }
+        self.dead_index_keys.push(key);
+    }
+
+    /// Records that this pass could not report a dead key it would otherwise have reported — a store
+    /// read that faulted (`rmp` #992). Counted rather than logged because the storage crate carries no
+    /// logger, and counted at all because the consequence is *invisible*: the orphaned entry simply
+    /// stays in the tree, and only this number distinguishes "nothing was orphaned" from "we could not
+    /// tell".
+    fn note_dead_index_key_unreported(&mut self) {
+        self.dead_index_keys_dropped += 1;
+    }
+
+    /// Reports the derived-index entries `delta` was the last warrant for, as its chain is freed
+    /// (`rmp` #992). Must be called **before** [`free_delta`](Self::free_delta), which frees a
+    /// `SetProperty` delta's overflow chain.
+    ///
+    /// Three deliberate silences:
+    ///
+    /// * **A corpse delta reports nothing.** Its transaction aborted, so the value it names is the one
+    ///   the rollback *restored* — it is live in the cell, not dead. (Slice 1 of `rmp` #992 removes an
+    ///   aborted transaction's own entries at rollback; nothing is owed here.) The gate is the delta's
+    ///   own `in_use` bit and deliberately **not** its commit slot's, even though
+    ///   [`delta_is_dead`](Self::delta_is_dead) also treats a live delta with a corpse slot as dead:
+    ///   that shape names a rolled-back write's old value, which the rollback restored into the cell,
+    ///   so reporting it is a false positive the consumer's re-check drops. Reading the slot to
+    ///   suppress it would cost a record read per delta and buy no correctness.
+    /// * **[`UndoAction::RemoveLabel`] reports nothing.** That delta restores a label's *absence*, so
+    ///   the transaction ADDED the label; freeing the delta makes the addition permanent and the index
+    ///   entry is warranted. Its mirror [`UndoAction::AddLabel`] is the one that reports, because it
+    ///   restores a membership that a removal ended.
+    /// * **A `SetProperty` whose old value was [`TYPE_TAG_ABSENT`](crate::undo::TYPE_TAG_ABSENT)
+    ///   reports nothing.** There was no previous value, so no entry was ever made for one.
+    ///
+    /// A value that fails to decode is skipped rather than propagated: the decode reads the overflow
+    /// heap, and a transient read fault must not fail a maintenance pass. Not reporting a key leaves
+    /// its entry in the tree, which is the direction that cannot lose a row.
+    fn note_dead_index_keys_of_delta(&mut self, kind: StoreKind, entity: u64, delta: UndoDelta) {
+        if self.index_interest.is_idle() || !delta.in_use() {
+            return;
+        }
+        // A `SetProperty` delta always anchors on the OWNING entity (`link_set_property` asserts it),
+        // and a label belongs to a node. Any other owner kind carries no derived-index meaning.
+        match delta.action {
+            UndoAction::SetProperty
+                if matches!(kind, StoreKind::Node | StoreKind::Rel)
+                    && delta.type_tag != undo::TYPE_TAG_ABSENT
+                    && self.index_interest.prop_keys.contains(&delta.token) =>
+            {
+                let Ok(value) = self.decode_property_value(delta.type_tag, delta.value_inline)
+                else {
+                    self.note_dead_index_key_unreported();
+                    return;
+                };
+                self.push_dead_index_key(DeadIndexKey::Property {
+                    kind,
+                    entity,
+                    key: delta.token,
+                    value,
+                });
+            }
+            UndoAction::AddLabel if kind == StoreKind::Node && self.index_interest.labels => {
+                self.push_dead_index_key(DeadIndexKey::Label {
+                    node: entity,
+                    label: delta.token,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// Reports every derived-index entry that entity `(kind, entity)`'s **physical reclamation** makes
+    /// unwarranted (`rmp` #992). Must be called at the top of
+    /// [`reclaim_node`](Self::reclaim_node) / [`reclaim_rel`](Self::reclaim_rel) — before the property
+    /// chain is freed and before the record is cleared, while the entity's state is still readable.
+    ///
+    /// Reclamation is the one moment at which *everything* about an entity dies at once, so this
+    /// reports all three key shapes: the entity itself (which is what reaches the entity-keyed index
+    /// kinds), each label it still carries, and each value **any** of its versions holds — the read is
+    /// the superset scan, so it already spans the entity's undo history as well as its live cells.
+    ///
+    /// [`note_dead_index_keys_of_delta`](Self::note_dead_index_keys_of_delta) then reports those
+    /// historical values a second time as this same reclamation frees the chain. The overlap is
+    /// deliberate rather than tidied away: a removal is idempotent (the second one finds nothing and
+    /// is not counted), and the two paths cover each other if either ever narrows.
+    ///
+    /// # It filters BEFORE it decodes
+    ///
+    /// The scan is the **undecoded** [`superset_scan_node_properties`](Self::superset_scan_node_properties)
+    /// / [`superset_scan_rel_properties`](Self::superset_scan_rel_properties), and only candidates whose
+    /// key the [`IndexInterest`] covers are decoded. That is not a micro-optimisation: decoding walks
+    /// the overflow heap, so the decoded twin would make a mass delete of `N` entities with `M`
+    /// properties perform `N × M` heap walks **inside the GC transaction**, under a store borrow the
+    /// coordinator documents as spanning an `fdatasync`. Reclamation previously read chain structure
+    /// only, and this keeps the added cost proportional to what is actually indexed.
+    ///
+    /// Read faults are swallowed for the reason given on the delta path — a maintenance pass must not
+    /// fail, and a key not reported is an entry left in the tree — but each one is counted, because
+    /// otherwise the retention it causes is completely invisible.
+    fn note_dead_index_keys_of_reclaim(&mut self, kind: StoreKind, entity: u64) {
+        if self.index_interest.is_idle() {
+            return;
+        }
+        if self.index_interest.entities {
+            self.push_dead_index_key(DeadIndexKey::Entity { kind, entity });
+        }
+        if kind == StoreKind::Node && self.index_interest.labels {
+            // The live bitmap, not the superset: a label only some *older* version carried is already
+            // reported by that version's `AddLabel` delta, which this reclamation frees.
+            match self.node_labels(entity) {
+                Ok(labels) => {
+                    for label in labels {
+                        self.push_dead_index_key(DeadIndexKey::Label {
+                            node: entity,
+                            label,
+                        });
+                    }
+                }
+                // An overflow-form bitmap (`rmp` #39) cannot be enumerated by this build, so this
+                // node's label entries stay behind — and its slot is about to be recycled, so they
+                // will name a different node. Counted so that is at least observable.
+                Err(_) => self.note_dead_index_key_unreported(),
+            }
+        }
+        if !self.index_interest.prop_keys.is_empty() {
+            let scanned = match kind {
+                StoreKind::Node => self.superset_scan_node_properties(entity),
+                StoreKind::Rel => self.superset_scan_rel_properties(entity),
+                _ => return,
+            };
+            let Ok(chain) = scanned else {
+                self.note_dead_index_key_unreported();
+                return;
+            };
+            let covered: Vec<(u32, u8, u64)> = chain
+                .candidates()
+                .filter(|c| self.index_interest.prop_keys.contains(&c.key))
+                .map(|c| (c.key, c.type_tag, c.value_inline))
+                .collect();
+            for (key, type_tag, value_inline) in covered {
+                match self.decode_property_value(type_tag, value_inline) {
+                    Ok(value) => self.push_dead_index_key(DeadIndexKey::Property {
+                        kind,
+                        entity,
+                        key,
+                        value,
+                    }),
+                    Err(_) => self.note_dead_index_key_unreported(),
+                }
+            }
+        }
+    }
+
     /// Detaches entity `(kind, entity)`'s **whole** undo chain under `txn` and reclaims every delta on
     /// it, returning how many deltas were freed.
     ///
@@ -3576,6 +3965,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         let chain = self.undo_chain(kind, entity)?;
         if chain.is_empty() {
             return Ok(0);
+        }
+        // `rmp` #992: the versions on this chain are about to stop existing, so report the derived-index
+        // entries they were the last warrant for. BEFORE `free_delta`, which frees a `SetProperty`
+        // delta's overflow chain and would leave the value undecodable.
+        for &(_, delta) in &chain {
+            self.note_dead_index_keys_of_delta(kind, entity, delta);
         }
         // A physical pre-image undo, deliberately, and the only chain-head write that keeps one:
         // see the section note on `write_field_redo_only`. Safe because a GC pass is a single
@@ -4416,6 +4811,17 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// the in-memory gate stays cleared, so the next sweep is deferred to the following post-open full
     /// pass. That is a bounded space leak and never a correctness problem: an orphan is unreachable by
     /// construction, so nothing resolves through it either way.
+    ///
+    /// # It reports no [`DeadIndexKey`] (`rmp` #992), deliberately
+    ///
+    /// Every delta this sweep frees belongs to a transaction that **aborted or crashed**, so it never
+    /// ended a committed version's life: the value it carries is the one the rollback restored, and it
+    /// is live. Slice 1 of `rmp` #992 already removes an aborting transaction's own index entries, and
+    /// a crash reconstructs the derived indexes from the store on the next `open` (they are in-memory
+    /// and never durable). The same holds for [`reclaim_aborted_undo`](Self::reclaim_aborted_undo),
+    /// the live-rollback path that frees deltas through the same
+    /// [`free_orphan_slot`](Self::free_orphan_slot) rather than through
+    /// [`free_undo_chain`](Self::free_undo_chain), which is where reporting lives.
     fn gc_sweep_undo_orphans(
         &mut self,
         txn: TxnId,
@@ -4956,6 +5362,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         let mut reclaimed = 0usize;
         let mut undo_deltas_reclaimed = 0usize;
 
+        // `rmp` #992: the dead-key queue describes exactly THIS pass, so a previous pass's leftovers
+        // (a caller that never drained, or one whose pass rolled back) must not be attributed to it.
+        self.dead_index_keys.clear();
+        self.dead_property_keys = 0;
+        self.dead_index_keys_dropped = 0;
+
         // `rmp` #522: snapshot the freeze frontier BEFORE the freeze sweep advances it, so a rollback of
         // this GC pass (whose WAL undo restores the stamps it froze) can restore the frontier and not
         // strand those now-un-frozen stamps below it. Cleared at this pass's commit. No other transaction
@@ -5126,6 +5538,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 freeze_scanned,
                 freeze_violations: 0,
                 first_freeze_violation: None,
+                dead_index_keys: self.dead_index_keys.len(),
+                dead_index_keys_dropped: self.dead_index_keys_dropped,
             })
         } else {
             // `rmp` #809 fail-closed response: a committed stamp is stranded unfrozen below the frontier,
@@ -5144,6 +5558,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 freeze_scanned,
                 freeze_violations,
                 first_freeze_violation,
+                dead_index_keys: self.dead_index_keys.len(),
+                dead_index_keys_dropped: self.dead_index_keys_dropped,
             })
         }
     }
@@ -6962,6 +7378,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// leak), clears the record, and returns its physical id to the free list (`04 §2.7`). This is
     /// the old single-version delete body, now gated behind the MVCC tombstone + GC watermark.
     fn reclaim_node(&mut self, txn: TxnId, id: u64) -> Result<()> {
+        // `rmp` #992: report the derived-index entries this reclamation orphans, FIRST — the node's
+        // labels and property values are still readable here and are gone three statements down.
+        self.note_dead_index_keys_of_reclaim(StoreKind::Node, id);
         // Free the node's property chain first so a reclaimed node leaves nothing live behind (the
         // executor no longer clears it eagerly — the tombstone defers everything to here). Uses the
         // entity-agnostic chain free (not `clear_node_properties`, whose live-version precondition
@@ -7623,6 +8042,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// behind the MVCC tombstone + GC watermark — it preserves the no-leak invariant the regression
     /// tests assert via [`heap_block_usage`](Self::heap_block_usage) and the consistency checker.
     fn reclaim_rel(&mut self, txn: TxnId, id: u64) -> Result<()> {
+        // `rmp` #992: as in [`reclaim_node`](Self::reclaim_node), report before anything is freed.
+        self.note_dead_index_keys_of_reclaim(StoreKind::Rel, id);
         let rel = self.read_rel(id)?;
         // Free the relationship's property chain first (records + overflow chains), so a reclaimed
         // relationship leaves nothing live behind (`rmp` task #44; no leak). This walks and frees the

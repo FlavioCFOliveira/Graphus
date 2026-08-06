@@ -518,10 +518,24 @@ impl<D: BlockDevice, S: LogSink> StoreReadSource for ReadViewSource<'_, D, S> {
 /// be visible at `T` with value `v`. Its writer `A` has `commit_ts(A) <= T <= W`, and `reindex_node`
 /// inserts `(v, n)` **during** `A`'s statement — before `A` commits, hence before `W`. So `(v, n)` is
 /// present at `W`: the capture cannot miss a row the reader must return. Entries from uncommitted
-/// transactions (`EPHEMERAL_TXN`) are merely *extra*, and the per-candidate re-check can only ever
-/// REMOVE. The argument needs the node-property index to be **append-only per entry**, which it is:
-/// `insert_node_property` is its only per-entry mutation and there is no `remove_node_property`
-/// (a value change leaves the stale entry behind — which is exactly why the seek re-checks and dedups).
+/// transactions are merely *extra*, and the per-candidate re-check can only ever REMOVE.
+///
+/// **The index is no longer append-only per entry, and this argument was re-derived under that**
+/// (`rmp` #992). It used to say the node-property index has no per-entry removal at all; two now
+/// exist — a rolled-back transaction removes the entries it *created* (`IndexSet::undo_entries`) and
+/// the version GC removes the entries dead versions leave behind (`IndexSet::collect_dead_keys`).
+/// Neither can take `(v, n)` away from the reader above:
+///
+/// * the rollback removes only keys the aborting transaction created, i.e. keys absent before it ran,
+///   so no key a committed `A` warrants is in its log;
+/// * the collection removes a key only when a superset-polarity read of `n` — its live cells plus
+///   everything its undo chain can still reconstruct — shows nothing occupying that key. `v` is
+///   visible at `T`, so it is either the value in place or behind a delta committed after `T`; and
+///   `T >= watermark` for as long as this reader is open, so the GC cannot have freed that delta.
+///   Either way `v` is in the witness and the entry is retained.
+///
+/// So the property the argument actually needs is not "append-only" but **"nothing removes an entry a
+/// live snapshot warrants"**, which is what both removal paths are built to guarantee.
 ///
 /// The capture is also **atomic** with respect to index mutation: it and every index write run on the
 /// same serial engine thread, so it can never observe a half-applied `reindex_node`.
@@ -532,7 +546,9 @@ impl<D: BlockDevice, S: LogSink> StoreReadSource for ReadViewSource<'_, D, S> {
 /// * a **degraded / fail-closed** index — its trees have been wiped, so it is a subset (`rmp` #733);
 /// * the **destructive** index classes (full-text / spatial / text / vector / bitmap) — they
 ///   re-index wholesale via `remove_*` + re-insert, so a reader whose snapshot predates the rewrite
-///   sees a subset (`rmp` #467). Only the append-only node-property class is captured here.
+///   sees a subset (`rmp` #467). Only the node-property class is captured here; its two removal paths
+///   (`rmp` #992) are snapshot-safe, as the argument above derives, which is what keeps it on this
+///   side of the line while the wholesale kinds stay off it.
 ///
 /// [`Self::get`] returning `None` means "not captured" and MUST be treated by the caller as
 /// **decline → exact scan fallback**, never as "no rows" (`rmp` #680/#738).

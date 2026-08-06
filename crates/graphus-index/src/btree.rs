@@ -161,6 +161,25 @@ pub struct BTree<D: BlockDevice, S: LogSink> {
     /// bounds-checked `try_*` accessors for every actual field read. See [`Self::validate_cached`] for
     /// the no-stale-skip argument and the SEC-207 sign-off.
     validated: HashSet<(PageId, Lsn)>,
+    /// Live entries in this tree — maintained incrementally, never scanned (`rmp` #992).
+    ///
+    /// The derived indexes are in-memory, so their entry count *is* the RAM they cost, and `rmp` #992
+    /// made it a published gauge: it is the number the GC-driven collection holds down, and a gauge
+    /// climbing under a steady write workload is the signature of that collection regressing. The
+    /// obvious implementation — stream the keyspace and count — is `O(entries)` **per maintenance
+    /// tick**, on a structure with one entry per `(label, node)` pair; measuring a leak by walking it
+    /// every time is the wrong trade at any store size.
+    ///
+    /// It lives here rather than one layer up because this is the single door every entry passes
+    /// through, in both directions: [`insert_reporting_created`](Self::insert_reporting_created)
+    /// already computes whether the entry was new, and [`delete`](Self::delete) whether one was
+    /// present, so the count costs an increment on a branch that already exists. Kept as `usize` and
+    /// saturating, so a hypothetical accounting slip can never underflow into a nonsense gauge.
+    ///
+    /// It counts the **live logical entries of this run**. A tree re-opened over an existing image
+    /// starts at zero and is refilled by the rebuild that opens it, which is how these trees are
+    /// always populated (they are derived and never durable across a restart).
+    live_entries: usize,
 }
 
 /// Upper bound on the validated-bit cache before it is cleared wholesale. The cache is a pure
@@ -188,6 +207,7 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
             root: None,
             max_page: page_id.0,
             validated: HashSet::new(),
+            live_entries: 0,
             #[cfg(test)]
             validate_cache_enabled: true,
         };
@@ -277,6 +297,7 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
             root,
             max_page: base.0,
             validated: HashSet::new(),
+            live_entries: 0,
             #[cfg(test)]
             validate_cache_enabled: true,
         };
@@ -783,7 +804,18 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
         if let Some(split) = split {
             self.grow_root(txn, root, split)?;
         }
+        // `rmp` #992: the census, maintained where the answer is already known. See `live_entries`.
+        if created {
+            self.live_entries += 1;
+        }
         Ok(created)
+    }
+
+    /// Live entries in this tree, in `O(1)` (`rmp` #992). See
+    /// [`live_entries`](Self#structfield.live_entries) for what it counts and why it is not a scan.
+    #[must_use]
+    pub fn live_entry_count(&self) -> usize {
+        self.live_entries
     }
 
     /// Removes the entry for `key` under `txn`, returning `true` if it was present. WAL-logged.
@@ -846,6 +878,11 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
         if emptied && leaf != root {
             self.reclaim_empty_leaf(txn, leaf, key)?;
         }
+        // `rmp` #992: counted only past the `present` check above, so a delete of an absent key —
+        // which the collection issues by design, fanning one dead key out over every partition
+        // registered for its property — moves nothing. Saturating because a census that underflows
+        // would publish a nonsense gauge rather than fail.
+        self.live_entries = self.live_entries.saturating_sub(1);
         Ok(true)
     }
 
@@ -1882,6 +1919,62 @@ mod tests {
         let mut p = [0u8; PAGE_SIZE];
         p[OFF_PAGE_TYPE] = PAGE_TYPE_BTREE_META;
         assert_eq!(page::page_type(&p), PAGE_TYPE_BTREE_META);
+    }
+
+    /// **The `O(1)` census never drifts from the truth** (`rmp` #992).
+    ///
+    /// `live_entry_count` replaced a full keyspace scan, so its whole value rests on being *exactly*
+    /// what that scan would have returned. This asserts it against the scan after every operation of a
+    /// churn that exercises each branch the counter has: a create, a replace of a present key (which
+    /// must NOT count), a delete of a present key, a delete of an absent key (which must not count —
+    /// the collection issues those by design, fanning one dead key over every registered partition),
+    /// and enough volume to split leaves and drive the whole-page reclamation path.
+    #[test]
+    fn the_live_entry_census_equals_a_full_scan_after_every_operation() {
+        let mut t = fresh();
+        let txn = TxnId(1);
+        t.with_wal(|w| {
+            w.begin(txn);
+        });
+        let scan = |t: &mut BTree<MemBlockDevice, MemLogSink>| {
+            let mut n = 0usize;
+            t.scan_all_for_each(|_, _| n += 1).unwrap();
+            n
+        };
+        let key = |i: usize| format!("k{i:06}").into_bytes();
+
+        for i in 0..256 {
+            t.insert(txn, &key(i), b"v").unwrap();
+            assert_eq!(t.live_entry_count(), scan(&mut t), "after insert {i}");
+        }
+        // A replace is not a new entry.
+        for i in (0..256).step_by(7) {
+            assert!(!t.insert_reporting_created(txn, &key(i), b"w").unwrap());
+            assert_eq!(t.live_entry_count(), scan(&mut t), "after replace {i}");
+        }
+        // A delete of an absent key must move nothing.
+        for i in 1000..1010 {
+            assert!(!t.delete(txn, &key(i)).unwrap());
+            assert_eq!(
+                t.live_entry_count(),
+                scan(&mut t),
+                "after absent delete {i}"
+            );
+        }
+        for i in (0..256).step_by(2) {
+            assert!(t.delete(txn, &key(i)).unwrap());
+            assert_eq!(t.live_entry_count(), scan(&mut t), "after delete {i}");
+        }
+        // Re-inserting a deleted key counts again.
+        for i in (0..256).step_by(2) {
+            assert!(t.insert_reporting_created(txn, &key(i), b"v").unwrap());
+            assert_eq!(t.live_entry_count(), scan(&mut t), "after re-insert {i}");
+        }
+        for i in 0..256 {
+            t.delete(txn, &key(i)).unwrap();
+        }
+        assert_eq!(t.live_entry_count(), 0, "an emptied tree censuses zero");
+        assert_eq!(scan(&mut t), 0);
     }
 
     #[test]

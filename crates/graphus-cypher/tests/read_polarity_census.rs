@@ -396,6 +396,49 @@ fn the_constraint_value_resolvers_read_through_a_snapshot() {
     }
 }
 
+/// **The reclamation witness reads the superset on BOTH axes** (`rmp` #992).
+///
+/// `read_dead_key_evidence` is the read that authorises the GC-driven removal of a derived-index
+/// entry, and it is the mirror image of a refill: a refill that reads a subset **omits** an entry, a
+/// witness that reads a subset **removes** one. Both lose a row no seek can resurrect, so the polarity
+/// requirement is identical and belongs in this census.
+///
+/// Both axes are asserted because the two failure modes are independent: a decision-polarity property
+/// read would destroy the entry of a value only an older snapshot sees, and the live label word would
+/// destroy the label entries of a node whose `REMOVE n:L` an open writer may still roll back.
+#[test]
+fn the_reclamation_witness_reads_the_superset_on_both_axes() {
+    let body = method_body(COORDINATOR, "read_dead_key_evidence");
+    // The UNDECODED scans, which is what the witness reads since the covered-keys filter moved ahead
+    // of the decode (decoding walks the overflow heap, so the decoded twin charges a full heap walk
+    // per unindexed property of every entity a dead key names). Both members of the family are
+    // superset-polarity; what this census fixes is that the read is a `superset_scan_*` at all.
+    assert!(
+        code_hits(&body, "superset_scan_node_properties") >= 1
+            && code_hits(&body, "superset_scan_rel_properties") >= 1,
+        "`read_dead_key_evidence` decides whether an index entry may be DESTROYED, so its property          read must be the superset — the live cells PLUS everything the undo chain can still          reconstruct. A decision-polarity read here removes the entry of a value an older snapshot          still sees (`rmp` #992)",
+    );
+    assert!(
+        code_hits(&body, "node_label_superset") >= 1,
+        "`read_dead_key_evidence`'s label gate must be `node_label_superset`, for the same reason          every refill's is (`rmp` #904): the live word is a SUBSET while an uncommitted `REMOVE n:L`          is open, and here that subset would DELETE the label entries instead of merely omitting them",
+    );
+    assert_eq!(
+        code_hits(&body, ".node_labels("),
+        0,
+        "`read_dead_key_evidence` must not read the live label word",
+    );
+    for decision in DECISION_POLARITY_FNS
+        .iter()
+        .chain(CURRENT_IMAGE_PROPERTY_READS.iter())
+    {
+        assert_eq!(
+            code_hits(&body, decision),
+            0,
+            "`read_dead_key_evidence` must not narrow its witness through `{decision}`",
+        );
+    }
+}
+
 /// **THE `rmp` #904 SHAPE, as a check.** Every per-node index refill gates membership on the
 /// live-OR-retained label superset, never on the live word. Gating on the live word writes a SUBSET
 /// while an uncommitted `REMOVE n:L` is open, and a seek's re-check can never resurrect the candidate

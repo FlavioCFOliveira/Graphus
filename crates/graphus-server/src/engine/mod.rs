@@ -45,7 +45,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use graphus_core::error::{GraphusError, Result};
-use graphus_cypher::{IndexBuildTotals, TxnCoordinator};
+use graphus_cypher::{IndexBuildTotals, IndexCollectionTotals, TxnCoordinator};
 use graphus_io::BlockDevice;
 use graphus_storage::{GcPassReport, RecordStore};
 use graphus_txn::IsolationLevel;
@@ -610,6 +610,12 @@ impl Drop for ActiveTxnGauge {
                 .add_ssi_tracked_delta(-(i64::try_from(self.last_ssi).unwrap_or(i64::MAX)));
             self.last_ssi = 0;
         }
+        // `rmp` #992: withdraw this database's derived-index footprint too. Its trees are in-memory and
+        // die with the engine, so a `STOP`/`DROP DATABASE` that left the last published count standing
+        // would inflate the server-wide GAUGE for ever — the failure mode a monotone counter like
+        // `wal_bytes_written` is immune to and a gauge is not. Publishing `0` folds in exactly `-last`.
+        self.metrics
+            .publish_derived_index_entries_for(&self.db_name, 0);
     }
 }
 
@@ -1598,6 +1604,12 @@ fn maybe_run_maintenance<D: BlockDevice, S: LogSink>(
             // committed stamp stranded unfrozen (the pass already skipped the prune fail-closed, so no
             // data was lost — this makes the regression observable). Zero on every healthy pass.
             note_freeze_frontier_violations(metrics, &report, db);
+            // `rmp` #992: republish this database's derived-index footprint. The pass has just
+            // collected the entries its reclaimed versions orphaned, so this is the point at which the
+            // number is meaningful — and a gauge that climbs under a steady write workload with no
+            // growth in the data is the signature of that collection regressing.
+            metrics.publish_derived_index_entries_for(db, coord.derived_index_entries() as u64);
+            publish_index_collection(metrics, db, &coord.index_collection_totals());
             maintenance_degraded.clear();
             *consecutive_failures = 0;
         }
@@ -1935,6 +1947,18 @@ fn record_maintenance_failure(
             "background maintenance checkpoint failed (will retry): {err}"
         );
     }
+}
+
+/// Publishes a coordinator's lifetime index-collection totals (`rmp` #992). Both maintenance paths —
+/// the background cadence and an operator `CHECKPOINT DATABASE` — run the same GC pass, so both
+/// publish the same three numbers; this keeps that from being two copies of the same conversion.
+fn publish_index_collection(metrics: &Metrics, db: &str, totals: &IndexCollectionTotals) {
+    metrics.publish_index_collection_for(
+        db,
+        totals.entries_removed + totals.entities_purged,
+        totals.keys_retained,
+        totals.abandonments,
+    );
 }
 
 /// Raises the `rmp` #809 durability alert for a GC report whose release-active freeze-frontier audit
@@ -3537,6 +3561,10 @@ fn handle_checkpoint<D: BlockDevice, S: LogSink>(
     // must raise the same freeze-frontier durability alert (the pass already skipped the prune fail-closed
     // if it fired). No-op on the healthy path.
     note_freeze_frontier_violations(metrics, &report, db);
+    // `rmp` #992: an operator `CHECKPOINT DATABASE` runs the same pass, so it republishes the same
+    // derived-index footprint gauge as the background cadence.
+    metrics.publish_derived_index_entries_for(db, coordinator.derived_index_entries() as u64);
+    publish_index_collection(metrics, db, &coordinator.index_collection_totals());
     Ok(CheckpointReply {
         reclaimed: report.reclaimed,
         frozen: report.frozen,

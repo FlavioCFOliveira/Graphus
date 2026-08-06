@@ -172,7 +172,8 @@ pub use catalog::{
 pub use constraint::{CONSTRAINT_VIOLATION_PREFIX, ConstraintViolation};
 pub use coordinator::{
     ConstraintInfo, CoordinatorStatistics, FulltextIndexListing, IndexBuildProgress,
-    IndexBuildTotals, ReadTaskInputs, TxnCoordinator, VectorIndexListing, auto_index_name,
+    IndexBuildTotals, IndexCollectionTotals, ReadTaskInputs, TxnCoordinator, VectorIndexListing,
+    auto_index_name,
 };
 pub use cost::{CostEstimate, estimate_cost};
 pub use counters::QueryCounters;

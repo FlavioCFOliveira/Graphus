@@ -139,8 +139,8 @@ pub use scan_polarity::{
     SupersetProperties,
 };
 pub use store::{
-    DEFAULT_CHECKPOINT_INTERVAL_BYTES, DirectionalRelCounts, FreezeFrontierViolation, GcPassReport,
-    META_PAGE, RecordStore, STORE_COUNT, StoreKind,
+    DEFAULT_CHECKPOINT_INTERVAL_BYTES, DeadIndexKey, DirectionalRelCounts, FreezeFrontierViolation,
+    GcPassReport, IndexInterest, META_PAGE, RecordStore, STORE_COUNT, StoreKind,
 };
 pub use tokens::{Namespace, TokenSnapshot, TokenStore};
 /// The undo area (`05-storage-format.md` §12, `rmp` #966): the delta record that carries the inverse
