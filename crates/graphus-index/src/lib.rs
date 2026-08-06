@@ -46,9 +46,20 @@
 //!
 //! - The index APIs ([`kinds`]) return record ids ([`u64`] physical ids). They never filter by
 //!   visibility — that is the transaction layer's job.
-//! - When a new record version is created the txn layer inserts an index entry; the old entry is
-//!   removed lazily by GC once the old version is dead (`04 §6.3`, `05 §5`). This crate provides
-//!   the `insert`/`delete` primitives the txn layer drives.
+//! - When a new record version is created the txn layer inserts an index entry. **The old entry is
+//!   not removed.** This crate provides `insert` *and* `delete` primitives — `TokenIndex::remove`,
+//!   `PropertyIndex::remove`, `CompositeIndex::remove`, `RelPropertyIndex::remove`, all over
+//!   [`BTree::delete`] — but outside this crate's own tests their only consumer is the
+//!   uniqueness-constraint tree: **the transaction layer does not drive them**, and the GC pass does
+//!   not touch the index set at all.
+//!
+//!   This doc-comment claimed the opposite until 2026-08-06 ("removed lazily by GC once the old
+//!   version is dead"), as did `04 §6.3`; both are corrected, and closing the gap is `rmp` #992.
+//!   Until then an index grows with the number of versions of a rewritten key, and — deliberately,
+//!   on the population side — a refill indexes *every* property version with no visibility filter,
+//!   because a candidate structure owes the **superset** polarity: a per-candidate re-check can
+//!   remove a candidate but can never resurrect one. That half is correct and stays; what is missing
+//!   is the reclamation on the other end.
 //! - **SIREAD / predicate-marker registration** for index range reads (so SSI catches phantoms,
 //!   `04 §5.4`, §6.3) happens in the transaction layer. `graphus-txn` currently operates over its
 //!   own `VersionedStore` abstraction (the §12 representation spike is still open),

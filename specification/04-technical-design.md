@@ -1421,10 +1421,34 @@ module (§11).
 
 Indexes are **not separately versioned**; they point at records and **defer visibility to the
 record's MVCC header**. An index lookup returns candidate record ids; the txn layer filters by
-visibility against the reader's snapshot. Inserts add an index entry when a new version is created;
-the old entry is removed lazily by GC once the old version is dead (§5.5). This keeps indexes
-single-structure while remaining serializable, and avoids index bloat proportional to version count.
-Index **range reads register SIREAD/predicate markers** (§5.4) so phantoms are caught by SSI.
+visibility against the reader's snapshot. This keeps indexes single-structure while remaining
+serializable. Index **range reads register SIREAD/predicate markers** (§5.4) so phantoms are caught
+by SSI.
+
+**Correction (2026-08-06): two claims this section made are not true of the engine, and are tracked
+by `rmp` #992.** It said "the old entry is removed lazily by GC once the old version is dead (§5.5)"
+and that this "avoids index bloat proportional to version count". Verified against the code:
+
+- **Nothing removes an index entry.** The removal primitives exist and are implemented —
+  `TokenIndex::remove`, `PropertyIndex::remove`, `CompositeIndex::remove`,
+  `RelPropertyIndex::remove`, all over `BTree::delete` — but outside the index crate's own tests
+  their only consumer is the uniqueness-constraint tree. The engine never calls them. The capability
+  is built and unreachable.
+- **The GC pass never touches the index set.** §5.5 reclaims record versions, undo deltas and commit
+  slots; the derived indexes are not in its scope.
+- **So the index does grow with the version count**, and deliberately so on the population side: a
+  refill indexes *every* property version with no visibility filter, because a candidate structure
+  owes the **superset** polarity of §5.3 — a per-candidate re-check can remove a candidate but can
+  never resurrect one. That polarity is correct and stays; what is missing is the reclamation on the
+  other end.
+
+A further consequence worth stating, because it is what makes the gap load-bearing rather than
+cosmetic: an index write today carries a **fixed, never-committed transaction id**, so an index entry
+belongs to no transaction, is not undone by that transaction's rollback, and has no version. Every
+correctness guarantee therefore rests on candidate-plus-re-check, propped up by a family of global
+freshness, rebuild-watermark and poison gates (`rmp` #467, #733, #755, #765, #803) — each one a
+compensation for the index not being MVCC-native. `rmp` #992 is the task that gives index entries a
+transaction and a version, wires the reclamation, and retires or justifies each of those gates.
 
 ### 6.4 Crash recovery of indexes
 

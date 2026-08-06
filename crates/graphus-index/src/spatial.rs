@@ -204,7 +204,7 @@ impl SpatialIndex {
     ///
     /// Returns whether this call actually **dropped** anything the grid was holding — the node was
     /// present before AND its entries were not already exactly this one point. A brand-new node (a pure
-    /// insert) and an *unchanged* re-index (e.g. the wholesale [`reindex_node`](crate::record_graph) a
+    /// insert) and an *unchanged* re-index (e.g. the wholesale `graphus_cypher::record_graph`'s `reindex_node` a
     /// write of an UNRELATED property triggers, re-inserting the same point) both return `false`;
     /// a real move returns `true`, and so does collapsing a multi-entry node, because the entries it
     /// discards are versions an older snapshot may still need.

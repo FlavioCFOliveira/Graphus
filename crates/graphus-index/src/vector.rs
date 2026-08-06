@@ -427,7 +427,7 @@ impl VectorIndex {
     ///
     /// Returns whether the embedding actually **changed** — `id` was present before AND its new
     /// (prepared) vector differs from the old. A brand-new `id` (a pure insert) and an *unchanged*
-    /// re-index (e.g. the wholesale [`reindex_node`](crate::record_graph) a write of an UNRELATED
+    /// re-index (e.g. the wholesale `graphus_cypher::record_graph`'s `reindex_node` a write of an UNRELATED
     /// property triggers, re-inserting the same embedding) both return `Ok(false)`. The shared full-text/
     /// spatial freshness-marker machinery (`rmp` task #756) uses this to poison the marker on rollback
     /// ONLY for a real change: a rolled-back change can drop a still-committed node from the graph (a

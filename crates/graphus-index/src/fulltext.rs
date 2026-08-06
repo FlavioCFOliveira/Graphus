@@ -330,7 +330,7 @@ impl InvertedIndex {
     /// Returns whether the node's document actually **changed** — it was present before AND its new
     /// distinct-term set differs from the old (an update to different text, or an update-to-empty
     /// removal). A brand-new node (a pure insert) and an *unchanged* re-index (e.g. the wholesale
-    /// [`reindex_node`](crate::record_graph) a write of an UNRELATED property triggers) both return
+    /// `graphus_cypher::record_graph`'s `reindex_node`, which a write of an UNRELATED property triggers) both return
     /// `false`. The full-text/spatial freshness-marker machinery (`rmp` task #756) uses this to poison
     /// the marker on rollback ONLY for a real change: a rolled-back change can leave a still-committed
     /// node dropped from a posting it should occupy (a false negative the query-time re-check cannot

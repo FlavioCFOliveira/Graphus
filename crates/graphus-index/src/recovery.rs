@@ -31,7 +31,7 @@ use graphus_wal::{ApplyTarget, LogSink, RecoveryReport, WalManager, recover};
 /// been `Arc<Mutex<…>>` since `rmp` #337).
 ///
 /// It was `Rc<RefCell<…>>` until `rmp` #1009 (layer 1 of #975) — the last thing keeping
-/// [`IndexSet`](crate::IndexSet), and through it the whole `TxnCoordinator`, off `Send`. The storage
+/// `graphus_cypher::IndexSet`, and through it the whole `TxnCoordinator`, off `Send`. The storage
 /// twin had already made this move; this is the unfinished half of it, not a new design.
 pub struct SharedWal<S: LogSink> {
     inner: Arc<Mutex<WalManager<S>>>,
