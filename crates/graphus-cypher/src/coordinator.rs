@@ -882,7 +882,7 @@ use graphus_wal::LogSink;
 use crate::catalog::IndexCatalog;
 use crate::constraint::{ConstraintViolation, ViolationEntity};
 use crate::executor::CancellationToken;
-use crate::index_set::IndexSet;
+use crate::index_set::{IndexSet, IndexWriter};
 use crate::record_graph::RecordStoreGraph;
 use crate::schema_error::{
     constraint_name_in_use, equivalent_composite_index_exists, equivalent_constraint_exists,
@@ -3008,7 +3008,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 // that missing candidate makes the write path's duplicate check ADMIT A COMMITTED
                 // DUPLICATE (`rmp` #765 / #683).
                 for tuple in composite_candidate_tuples(&per_key, &registry) {
-                    idx.insert_composite(*label_token, property_tokens, &tuple, id);
+                    idx.insert_composite(
+                        IndexWriter::Population,
+                        *label_token,
+                        property_tokens,
+                        &tuple,
+                        id,
+                    );
                 }
             }
         }
@@ -3107,12 +3113,12 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
 
         let mut index = index.borrow_mut();
         for &lt in &label_tokens {
-            index.insert_label(lt, id);
+            index.insert_label(IndexWriter::Population, lt, id);
         }
         for (prop_key, value) in &values {
             for &lt in &label_tokens {
                 if index.has_node_property(lt, *prop_key) {
-                    index.insert_node_property(lt, *prop_key, value, id);
+                    index.insert_node_property(IndexWriter::Population, lt, *prop_key, value, id);
                 }
             }
         }
@@ -3183,7 +3189,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
 
         let mut index = index.borrow_mut();
         for (prop_key, value) in &values {
-            index.insert_rel_property(type_token, *prop_key, value, id);
+            index.insert_rel_property(IndexWriter::Population, type_token, *prop_key, value, id);
         }
     }
 
@@ -3299,7 +3305,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 // One tuple per observable view — the construction of `composite_candidate_tuples`,
                 // applied to the relationship tree (`rmp` task #766).
                 for tuple in composite_candidate_tuples(&per_key, &registry) {
-                    idx.insert_rel_composite(type_token, property_tokens, &tuple, id);
+                    idx.insert_rel_composite(
+                        IndexWriter::Population,
+                        type_token,
+                        property_tokens,
+                        &tuple,
+                        id,
+                    );
                 }
             }
         }
@@ -9100,10 +9112,18 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // restart cleared it.
         //
         // A full rebuild is the CORRECT repair, not merely the available one: the poison means a
-        // rolled-back writer may have removed a posting the index never re-inserted (index maintenance
-        // is eager at write time and rollback does not undo it), so the in-memory index can be MISSING
-        // a committed posting — a false negative no re-check can resurrect. Only re-deriving from the
-        // committed store can prove otherwise.
+        // rolled-back writer may have removed a posting the index never re-inserted, so the in-memory
+        // index can be MISSING a committed posting — a false negative no re-check can resurrect. Only
+        // re-deriving from the committed store can prove otherwise.
+        //
+        // Why that is still true after `rmp` #992. #992 gave every derived-index entry an owner, so a
+        // rollback now undoes the entries its transaction created — but only for the five B+-tree-backed
+        // kinds (label, node/relationship property, node/relationship composite), which are
+        // append-only and whose rolled-back residue is therefore an extra entry. The full-text inverted
+        // index and the spatial grid hold only the LATEST state: a write REPLACES or REMOVES a posting,
+        // so a rolled-back mutator leaves a hole rather than a surplus, and a hole is the one thing an
+        // undo log of "entries this transaction created" does not describe. Repairing that needs the
+        // committed store, which is what this does. Do not read #992 as having retired this gate.
         //
         // SPIN SAFETY: unlike `has_pending_index_builds` — which callers SPIN on, and which is why
         // `rmp` #780 refused to widen it — this function is never called inside a loop. Its three
@@ -10914,6 +10934,9 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // maintained bitmap already reflects the now-committed writes, so there is nothing to re-derive
         // — only the bookkeeping is freed (a no-op unless a bitmap index was touched).
         self.index.borrow_mut().forget_dirty_bitmap_nodes(txn);
+        // Drop this txn's derived-index undo log too (`rmp` #992): on commit its entries describe
+        // committed writes and must stay, so only the bookkeeping is freed.
+        self.index.borrow_mut().forget_txn_entries(txn);
         self.active.remove(&txn);
         Ok(commit_ts)
     }
@@ -10979,6 +11002,9 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // — so this ordering must not move.
         self.ssi.borrow_mut().record_commit(txn, commit_ts);
         self.index.borrow_mut().forget_dirty_bitmap_nodes(txn);
+        // And this txn's derived-index undo log (`rmp` #992): its entries describe writes that are now
+        // committed, so they must stay. A no-op unless an index covered something it wrote.
+        self.index.borrow_mut().forget_txn_entries(txn);
         self.active.remove(&txn);
         Ok((commit_ts, commit_lsn))
     }
@@ -11576,6 +11602,17 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// re-derivation is skipped: the bitmap may be momentarily stale, but it is in-memory, has no
     /// planner consumer yet, and is fully resynced by the next open-time rebuild — never a durability or
     /// committed-data concern.
+    ///
+    /// # Derived-index entry rollback (`rmp` #992)
+    ///
+    /// The B+-tree-backed derived indexes (label, node/relationship property, node/relationship
+    /// composite) are maintained eagerly at write time too, and until now nothing undid them: a
+    /// rolled-back `CREATE` left the index advertising a candidate whose write never happened. Each
+    /// entry now belongs to the transaction that created it ([`IndexWriter`]), so this path removes
+    /// exactly the entries `txn` created — drained up front like the bitmap set, applied only after a
+    /// successful undo. Unlike the bitmap these trees are a candidate SUPERSET, so a leftover entry is
+    /// merely imprecise while removing the wrong one would lose a committed row; that is why only
+    /// *created* entries are logged and why a build's entries are never touched.
     fn abort(&mut self, txn: TxnId) -> Result<()> {
         /// Drop guard that frees the pure in-memory transaction state. Runs on normal return **and** on
         /// unwind, so a panicking store undo can never leak the SSI markers or the `active` entry.
@@ -11611,6 +11648,10 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // cannot leak it. The set is complete (statement maintenance has finished by abort time) and the
         // undo never grows it, so draining now loses nothing. Re-derivation runs AFTER a successful undo.
         let dirty_bitmap_nodes = self.index.borrow_mut().take_dirty_bitmap_nodes(txn);
+        // And this txn's derived-index undo log (`rmp` #992), drained here for the same reason: the
+        // per-transaction bookkeeping is freed unconditionally, so a failing or panicking undo cannot
+        // strand it. It is APPLIED below, and only if the durable undo succeeded.
+        let index_undo = self.index.borrow_mut().take_txn_entries(txn);
 
         let cleanup = Cleanup {
             ssi: &self.ssi,
@@ -11630,6 +11671,16 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // value is back in the store, so this restores the bitmap to its committed membership. No-op
         // unless a bitmap index is declared (`dirty_bitmap_nodes` is then empty).
         if undo.is_ok() {
+            // Remove the derived-index entries this transaction CREATED (`rmp` #992). Only entries it
+            // created are in the log — a re-insert over an already-present key is never recorded — so
+            // this restores the trees to exactly what they held before the transaction ran, and cannot
+            // destroy an entry a committed version warrants.
+            //
+            // Gated on a successful undo for the same reason the bitmap re-derivation below is: a
+            // failed or panicked undo leaves the store half-reverted, so the record may still carry the
+            // value the entry describes. Leaving the entries then is the safe direction — a stale entry
+            // is a false positive the per-candidate re-check drops, never a row lost.
+            self.index.borrow_mut().undo_entries(index_undo);
             for node in dirty_bitmap_nodes {
                 self.rederive_node_bitmap(node);
             }
@@ -13040,6 +13091,208 @@ mod ft_spatial_statement_scope_803 {
              dirty flags, was recorded as a full-text/spatial REMOVER, and its abort then poisoned the \
              DB-wide freshness marker — permanently degrading every TEXT, FULLTEXT and SPATIAL index \
              in the database. The statement seam must discard residue before doing any work."
+        );
+    }
+}
+
+#[cfg(test)]
+mod index_entry_rollback_wiring_992 {
+    use graphus_core::Value;
+    use graphus_io::MemBlockDevice;
+    use graphus_storage::{Namespace, RecordStore};
+    use graphus_wal::{MemLogSink, WalManager};
+
+    use crate::binding::{Parameters, bind_parameters};
+    use crate::catalog::IndexCatalog;
+    use crate::coordinator::TxnCoordinator;
+    use crate::executor::execute;
+    use crate::lexer::tokenize;
+    use crate::lower::lower;
+    use crate::parser::parse_tokens;
+    use crate::physical::plan_physical;
+    use crate::semantics::analyze;
+
+    type Coord = TxnCoordinator<MemBlockDevice, MemLogSink>;
+
+    fn fresh_coord() -> Coord {
+        let device = MemBlockDevice::new(0);
+        let wal = WalManager::create(MemLogSink::new()).expect("create wal");
+        let store: RecordStore<MemBlockDevice, MemLogSink> =
+            RecordStore::create(device, wal, 256, 1).expect("create store");
+        TxnCoordinator::new(store)
+    }
+
+    fn run_stmt(coord: &Coord, txn: graphus_core::TxnId, src: &str) {
+        let toks = tokenize(src).expect("lex");
+        let ast = parse_tokens(&toks, src).expect("parse");
+        let validated = analyze(&ast).expect("analyze");
+        let plan = plan_physical(&lower(&validated), &IndexCatalog::empty());
+        let bound = bind_parameters(&plan, &Parameters::new()).expect("bind");
+        let mut graph = coord.statement(txn).expect("statement");
+        {
+            let mut cursor = execute(&plan, &bound, &mut graph).expect("open cursor");
+            cursor.collect_all().expect("collect");
+        }
+        assert!(graph.take_error().is_none(), "captured error in: {src}");
+    }
+
+    /// Whether the coordinator's derived index currently offers `id` as a candidate for
+    /// `(:Person).age = value`. Reaches the coordinator's **private** index handle, which is the whole
+    /// reason this test lives inline instead of in `tests/index_mvcc_rollback_992.rs`: the effect of
+    /// `rmp` #992 is on the index's *content*, and no query can observe it — every consumer re-checks
+    /// each candidate against its own MVCC snapshot, so a leftover entry is a false positive that gets
+    /// filtered either way.
+    fn index_offers(coord: &Coord, label: u32, prop: u32, value: i64, id: u64) -> bool {
+        coord
+            .index
+            .borrow_mut()
+            .seek_node_property_eq(label, prop, &Value::Integer(value))
+            .expect("the index is registered, so the seek must not decline")
+            .contains(&id)
+    }
+
+    fn tokens(coord: &Coord) -> (u32, u32) {
+        let store = coord.store.borrow();
+        (
+            store
+                .token_id(Namespace::Label, "Person")
+                .expect("label token"),
+            store
+                .token_id(Namespace::PropKey, "age")
+                .expect("prop token"),
+        )
+    }
+
+    /// **`TxnCoordinator::rollback` really performs the index-entry undo** (`rmp` #992, AC1).
+    ///
+    /// `tests/index_mvcc_rollback_992.rs` proves the mechanism over the same statement seam the
+    /// coordinator builds; this proves the coordinator is *wired* to it — that `abort` drains the
+    /// transaction's log and applies it, rather than the two `IndexSet` methods sitting there with no
+    /// production caller, which is exactly the state the four `remove` APIs were in before this task.
+    #[test]
+    fn rollback_removes_the_index_entries_the_transaction_created() {
+        let mut coord = fresh_coord();
+        let seed = coord.begin_serializable();
+        run_stmt(&coord, seed, "CREATE (:Person {age: 30})");
+        coord.commit(seed).expect("seed commits");
+        coord
+            .create_node_property_index("Person", "age")
+            .expect("create index");
+        let (l, k) = tokens(&coord);
+
+        // A transaction whose CREATE the index picks up eagerly, at write time.
+        let writer = coord.begin_serializable();
+        run_stmt(&coord, writer, "CREATE (:Person {age: 41})");
+        let ghost = coord
+            .index
+            .borrow_mut()
+            .seek_node_property_eq(l, k, &Value::Integer(41))
+            .expect("registered")
+            .first()
+            .copied()
+            .expect("precondition: the open write must be indexed, or there is nothing to undo");
+
+        coord.rollback(writer).expect("rollback");
+
+        assert!(
+            !index_offers(&coord, l, k, 41, ghost),
+            "the coordinator's rollback did not undo the index entry the transaction created"
+        );
+        // ... and the committed row's entry, which the same transaction never created, is untouched.
+        let survivor = coord
+            .index
+            .borrow_mut()
+            .seek_node_property_eq(l, k, &Value::Integer(30))
+            .expect("registered");
+        assert_eq!(
+            survivor.len(),
+            1,
+            "the committed `age = 30` entry must survive the rollback"
+        );
+    }
+
+    /// **An index DDL between the write and the rollback RETAINS the entry** — measured, because a
+    /// neighbouring test's premise depends on it.
+    ///
+    /// `tests/index_rebuild_label.rs::a_rolled_back_create_is_not_resurrected_by_a_retained_label_entry`
+    /// is built on the label entry surviving the rollback so the query-path re-check has something to
+    /// reject. `rmp` #992 could have inverted that premise silently and left the test passing while
+    /// testing nothing. It does not: the DDL drives `rebuild_index` -> `IndexSet::clear`, which drops
+    /// every open transaction's undo log, so the rollback afterwards removes nothing and the entry is
+    /// retained exactly as before. This pins the mechanism that keeps that test meaningful.
+    #[test]
+    fn an_index_ddl_between_the_write_and_the_rollback_retains_the_entry() {
+        let mut coord = fresh_coord();
+        let seed = coord.begin_serializable();
+        run_stmt(&coord, seed, "CREATE (:Person {age: 30})");
+        coord.commit(seed).expect("seed commits");
+        coord
+            .create_node_property_index("Person", "age")
+            .expect("create index");
+        let (l, k) = tokens(&coord);
+
+        let writer = coord.begin_serializable();
+        run_stmt(&coord, writer, "CREATE (:Person {age: 41})");
+        let ghost = coord
+            .index
+            .borrow_mut()
+            .seek_node_property_eq(l, k, &Value::Integer(41))
+            .expect("registered")
+            .first()
+            .copied()
+            .expect("precondition: the open write is indexed");
+
+        // The production route to a full `clear` + rebuild, on an unrelated index.
+        coord
+            .create_point_rel_index("widget_at", "WIDGET", "at", false)
+            .expect("unrelated index DDL");
+        coord.rollback(writer).expect("rollback");
+
+        assert!(
+            index_offers(&coord, l, k, 41, ghost),
+            "an intervening rebuild must leave the entry RETAINED — a log taken before the wipe \
+             names keys the refill re-creates from COMMITTED versions, so replaying it could only \
+             destroy committed state. Retention is the safe direction and the pre-#992 behaviour."
+        );
+    }
+
+    /// The commit half of the wiring: `TxnCoordinator::commit` frees the bookkeeping and undoes
+    /// nothing, so a later unrelated rollback cannot reach a committed transaction's entries.
+    #[test]
+    fn commit_keeps_the_index_entries_and_frees_the_log() {
+        let mut coord = fresh_coord();
+        let seed = coord.begin_serializable();
+        run_stmt(&coord, seed, "CREATE (:Person {age: 30})");
+        coord.commit(seed).expect("seed commits");
+        coord
+            .create_node_property_index("Person", "age")
+            .expect("create index");
+        let (l, k) = tokens(&coord);
+
+        let writer = coord.begin_serializable();
+        run_stmt(&coord, writer, "CREATE (:Person {age: 41})");
+        coord.commit(writer).expect("commit");
+
+        let after = coord
+            .index
+            .borrow_mut()
+            .seek_node_property_eq(l, k, &Value::Integer(41))
+            .expect("registered");
+        assert_eq!(after.len(), 1, "a committed write's entry must survive");
+
+        // An unrelated rollback afterwards must not disturb it.
+        let other = coord.begin_serializable();
+        run_stmt(&coord, other, "CREATE (:Person {age: 7})");
+        coord.rollback(other).expect("rollback");
+        assert_eq!(
+            coord
+                .index
+                .borrow_mut()
+                .seek_node_property_eq(l, k, &Value::Integer(41))
+                .expect("registered")
+                .len(),
+            1,
+            "an unrelated rollback removed a committed transaction's entry"
         );
     }
 }

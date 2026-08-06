@@ -36,7 +36,7 @@ use graphus_cypher::catalog::IndexCatalog;
 use graphus_cypher::coordinator::TxnCoordinator;
 use graphus_cypher::executor::execute;
 use graphus_cypher::graph_access::GraphAccess;
-use graphus_cypher::index_set::IndexSet;
+use graphus_cypher::index_set::{IndexSet, IndexWriter};
 use graphus_cypher::lexer::tokenize;
 use graphus_cypher::lower::lower;
 use graphus_cypher::morsel::{
@@ -271,7 +271,7 @@ impl Coordinated {
             for id in node_ids {
                 if let Ok(labels) = store.node_labels(id) {
                     for token in labels {
-                        idx.insert_label(token, id);
+                        idx.insert_label(IndexWriter::Population, token, id);
                     }
                 }
             }

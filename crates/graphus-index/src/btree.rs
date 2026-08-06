@@ -49,6 +49,14 @@ use crate::node::{
 };
 use crate::recovery::{SharedWal, encode_patch};
 
+/// A node split an insert produced: the separator key pushed up into the parent, and the new right
+/// page it separates.
+type Split = (Vec<u8>, PageId);
+
+/// The outcome of one insert descent (`rmp` #992): whether the key was newly **created** (as opposed
+/// to an already-present key being replaced), and the [`Split`] the caller must absorb, if any.
+type InsertOutcome = (bool, Option<Split>);
+
 /// Offset of the meta payload (root page id) within the meta page.
 const META_ROOT_OFF: usize = HEADER_SIZE; // u64 root page id (0 = no root yet)
 const META_VERSION_OFF: usize = HEADER_SIZE + 8; // u32 format version
@@ -737,14 +745,45 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
     /// Propagates a buffer-pool or WAL failure, or [`GraphusError::Storage`] if a single
     /// `(key, value)` is too large to ever fit a leaf.
     pub fn insert(&mut self, txn: TxnId, key: &[u8], value: &[u8]) -> Result<()> {
+        self.insert_reporting_created(txn, key, value).map(|_| ())
+    }
+
+    /// [`insert`](Self::insert), additionally reporting whether the key was **newly created**
+    /// (`true`) or an **already-present** key was replaced (`false`).
+    ///
+    /// # Why this distinction is load-bearing (`rmp` #992)
+    ///
+    /// The derived-index layer undoes a rolled-back transaction's index entries by removing them
+    /// again. That is only sound for entries the transaction actually **created**: the index keys are
+    /// record-scoped and multi-entry, so re-inserting a key that is already present is a *no-op on
+    /// content* — and it happens constantly, because a write re-indexes every current label and
+    /// every current property of the record, not only the ones the statement changed. Undoing such a
+    /// replace would delete an entry that a **committed** version still warrants, turning a rollback
+    /// into silent committed-row loss on the seek path. So the undo log records only what this
+    /// return value reports as created.
+    ///
+    /// # Cost
+    ///
+    /// Free: the answer is a binary search over the destination leaf, which the descent has already
+    /// fetched, pinned and validated. No extra page fetch and no second descent.
+    ///
+    /// # Errors
+    /// As [`insert`](Self::insert).
+    pub fn insert_reporting_created(
+        &mut self,
+        txn: TxnId,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<bool> {
         let root = match self.root {
             Some(r) => r,
             None => self.create_root(txn)?,
         };
-        match self.insert_descend(txn, root, key, value)? {
-            None => Ok(()),
-            Some(split) => self.grow_root(txn, root, split),
+        let (created, split) = self.insert_descend(txn, root, key, value)?;
+        if let Some(split) = split {
+            self.grow_root(txn, root, split)?;
         }
+        Ok(created)
     }
 
     /// Removes the entry for `key` under `txn`, returning `true` if it was present. WAL-logged.
@@ -812,13 +851,16 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
 
     /// Recursive insert. Returns `Some((sep_key, right_page))` if `node` split and the parent must
     /// absorb the separator.
+    /// Descends to `key`'s leaf and inserts there, returning `(created, split)`: whether the key was
+    /// absent before this call (see [`insert_reporting_created`](Self::insert_reporting_created)) and
+    /// the separator/right-page a full leaf split produced, if any.
     fn insert_descend(
         &mut self,
         txn: TxnId,
         node: PageId,
         key: &[u8],
         value: &[u8],
-    ) -> Result<Option<(Vec<u8>, PageId)>> {
+    ) -> Result<InsertOutcome> {
         let f = self.pool.fetch(node)?;
         // SEC-206: validate the node before any slot access (read of cells on the leaf path, or
         // `child_for` on the internal path). The write descent does not go through the validating
@@ -831,6 +873,10 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
         let is_leaf = NodeView::new(self.pool.page(f)).is_leaf();
 
         if is_leaf {
+            // Answer "was this key already here?" while the destination leaf is still pinned and
+            // validated (`rmp` #992). Both continuations below — the in-place insert and the split —
+            // preserve replace semantics, so this one probe decides it for either path.
+            let created = NodeView::new(self.pool.page(f)).find_exact(key).is_none();
             let mut scratch = self.payload_copy(f);
             let fits = {
                 let mut n = NodeMut::new(&mut scratch);
@@ -839,11 +885,13 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
             if fits {
                 self.log_and_apply_payload(txn, node, f, &scratch)?;
                 self.pool.unpin(f);
-                return Ok(None);
+                return Ok((created, None));
             }
             // Overflow: split this leaf.
             self.pool.unpin(f);
-            return self.split_leaf(txn, node, key, value).map(Some);
+            return self
+                .split_leaf(txn, node, key, value)
+                .map(|split| (created, Some(split)));
         }
 
         // Internal: route to the child, recurse, then possibly absorb a child split.
@@ -854,8 +902,9 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
                 "B+-tree internal node has a null child pointer".to_owned(),
             ));
         }
-        let Some((sep, right)) = self.insert_descend(txn, PageId(child), key, value)? else {
-            return Ok(None);
+        let (created, child_split) = self.insert_descend(txn, PageId(child), key, value)?;
+        let Some((sep, right)) = child_split else {
+            return Ok((created, None));
         };
         // Insert the separator into this internal node.
         let f = self.pool.fetch(node)?;
@@ -867,10 +916,11 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
         if fits {
             self.log_and_apply_payload(txn, node, f, &scratch)?;
             self.pool.unpin(f);
-            return Ok(None);
+            return Ok((created, None));
         }
         self.pool.unpin(f);
-        self.split_internal(txn, node, &sep, right).map(Some)
+        self.split_internal(txn, node, &sep, right)
+            .map(|split| (created, Some(split)))
     }
 
     /// Splits a full leaf `node` while inserting `(key, value)`, returning the median separator and

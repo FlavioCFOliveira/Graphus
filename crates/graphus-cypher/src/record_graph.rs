@@ -245,7 +245,7 @@ use crate::graph_access::{
     CompositeSeekHits, DeletedEntity, ExpandDirection, GraphAccess, Incident, IndexSeekHits,
     KeyValues, NodeId, RelData, RelId, ScanFilter, ScannedRel, VectorQueryResult,
 };
-use crate::index_set::{ConstraintRule, IndexSet};
+use crate::index_set::{ConstraintRule, IndexSet, IndexWriter};
 use crate::read_source::{self, LiveSource, ReadSink, VisCtx};
 use crate::snapshot::{GraphSnapshot, SnapshotSpec};
 
@@ -1955,6 +1955,11 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         let Some(index) = &self.index else {
             return; // standalone path: no derived index to maintain.
         };
+        // Every entry this pass makes belongs to THIS transaction (`rmp` #992): if it rolls back, the
+        // entries it created are removed again, so the index stops advertising a candidate whose write
+        // never happened. The opposite polarity (`IndexWriter::Population`) belongs to an index build
+        // and is never undone.
+        let writer = IndexWriter::Txn(self.txn);
 
         // --- read the node's current labels (store borrow, released before touching the index) ---
         // Read-only: `node_labels` is `&self` (`rmp` #337 Slice 2), so a shared borrow suffices.
@@ -2053,12 +2058,12 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // fixed at source too, but that fix is now defence in depth rather than the only guard.
         index.clear_ft_spatial_dirty();
         for &lt in &label_tokens {
-            index.insert_label(lt, node.0);
+            index.insert_label(writer, lt, node.0);
         }
         for (prop_key, value) in &resolved_props {
             for &lt in &label_tokens {
                 if index.has_node_property(lt, *prop_key) {
-                    index.insert_node_property(lt, *prop_key, value, node.0);
+                    index.insert_node_property(writer, lt, *prop_key, value, node.0);
                 }
             }
         }
@@ -2196,7 +2201,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                 }
             }
             if complete {
-                index.insert_composite(label_token, &property_tokens, &tuple, node.0);
+                index.insert_composite(writer, label_token, &property_tokens, &tuple, node.0);
             }
         }
 
@@ -2245,6 +2250,9 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         let Some(index) = &self.index else {
             return; // standalone path: no derived index to maintain.
         };
+        // As `reindex_node`: these entries belong to this transaction and roll back with it
+        // (`rmp` #992).
+        let writer = IndexWriter::Txn(self.txn);
         // O(1) gate: nothing to maintain unless at least one relationship-property OR relationship
         // composite OR relationship full-text OR relationship spatial OR relationship vector index is
         // declared.
@@ -2338,7 +2346,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         if has_rel_prop {
             for (prop_key, value) in &resolved {
                 if index.has_rel_property(type_token, *prop_key) {
-                    index.insert_rel_property(type_token, *prop_key, value, rel.0);
+                    index.insert_rel_property(writer, type_token, *prop_key, value, rel.0);
                 }
             }
         }
@@ -2372,7 +2380,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                     }
                 }
                 if complete {
-                    index.insert_rel_composite(type_token, &property_tokens, &tuple, rel.0);
+                    index.insert_rel_composite(writer, type_token, &property_tokens, &tuple, rel.0);
                 }
             }
         }

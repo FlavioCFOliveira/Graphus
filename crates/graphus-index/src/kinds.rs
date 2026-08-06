@@ -94,11 +94,15 @@ impl<D: BlockDevice, S: LogSink> TokenIndex<D, S> {
 
     /// Records that element `element_id` carries `token` (label/reltype), under `txn`.
     ///
+    /// Returns whether the entry was **newly created** (`false` when it was already present — see
+    /// [`BTree::insert_reporting_created`], which the derived-index undo log depends on, `rmp` #992).
+    ///
     /// # Errors
     /// Propagates a B+-tree/WAL failure.
-    pub fn insert(&mut self, txn: TxnId, token: u32, element_id: u64) -> Result<()> {
+    pub fn insert(&mut self, txn: TxnId, token: u32, element_id: u64) -> Result<bool> {
         let k = Self::key(token, element_id);
-        self.tree.insert(txn, &k, &rid_payload(element_id))
+        self.tree
+            .insert_reporting_created(txn, &k, &rid_payload(element_id))
     }
 
     /// Removes the `(token, element_id)` entry under `txn`, returning whether it was present.
@@ -159,13 +163,17 @@ impl<D: BlockDevice, S: LogSink> PropertyIndex<D, S> {
 
     /// Inserts `(token, value) -> rid` under `txn`. The `value` is encoded order-preservingly.
     ///
+    /// Returns whether the entry was **newly created** (`false` when it was already present — see
+    /// [`BTree::insert_reporting_created`], which the derived-index undo log depends on, `rmp` #992).
+    ///
     /// # Errors
     /// Returns [`KeyEncodeError`] (wrapped) for an unindexable value (e.g. `Null` — treated as
     /// absent), else propagates a B+-tree/WAL failure.
-    pub fn insert(&mut self, txn: TxnId, token: u32, value: &Value, rid: u64) -> Result<()> {
+    pub fn insert(&mut self, txn: TxnId, token: u32, value: &Value, rid: u64) -> Result<bool> {
         let tail = encode_or_storage_err(value)?;
         let k = token_value_id_key(token, &tail, rid);
-        self.tree.insert(txn, &k, &rid_payload(rid))
+        self.tree
+            .insert_reporting_created(txn, &k, &rid_payload(rid))
     }
 
     /// Removes `(token, value) -> rid` under `txn`, returning whether it was present.
@@ -366,12 +374,16 @@ impl<D: BlockDevice, S: LogSink> CompositeIndex<D, S> {
 
     /// Inserts `(token, values) -> rid` under `txn`.
     ///
+    /// Returns whether the entry was **newly created** (`false` when it was already present — see
+    /// [`BTree::insert_reporting_created`], which the derived-index undo log depends on, `rmp` #992).
+    ///
     /// # Errors
     /// Returns a storage error if `values.len() != arity`; propagates encoding / B+-tree failures.
-    pub fn insert(&mut self, txn: TxnId, token: u32, values: &[Value], rid: u64) -> Result<()> {
+    pub fn insert(&mut self, txn: TxnId, token: u32, values: &[Value], rid: u64) -> Result<bool> {
         self.check_arity(values.len())?;
         let k = self.key(token, values, rid)?;
-        self.tree.insert(txn, &k, &rid_payload(rid))
+        self.tree
+            .insert_reporting_created(txn, &k, &rid_payload(rid))
     }
 
     /// Removes `(token, values) -> rid` under `txn`, returning whether it was present.
@@ -476,11 +488,12 @@ impl<D: BlockDevice, S: LogSink> RelPropertyIndex<D, S> {
         self.inner.tree_mut()
     }
 
-    /// Inserts `(reltype, value) -> rel_id` under `txn`.
+    /// Inserts `(reltype, value) -> rel_id` under `txn`, reporting whether the entry was **newly
+    /// created** (`rmp` #992).
     ///
     /// # Errors
     /// See [`PropertyIndex::insert`].
-    pub fn insert(&mut self, txn: TxnId, reltype: u32, value: &Value, rel_id: u64) -> Result<()> {
+    pub fn insert(&mut self, txn: TxnId, reltype: u32, value: &Value, rel_id: u64) -> Result<bool> {
         self.inner.insert(txn, reltype, value, rel_id)
     }
 

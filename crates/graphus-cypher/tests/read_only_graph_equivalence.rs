@@ -39,7 +39,7 @@ use graphus_cypher::graph_access::{
     DeletedEntity, ExpandDirection, GraphAccess, IndexSeekHits, KeyValues, NodeId, RelData, RelId,
     ScannedRel,
 };
-use graphus_cypher::index_set::IndexSet;
+use graphus_cypher::index_set::{IndexSet, IndexWriter};
 use graphus_cypher::read_only_graph::ReadOnlyGraph;
 use graphus_cypher::read_source::rel_ssi_key;
 use graphus_cypher::record_graph::RecordStoreGraph;
@@ -239,7 +239,7 @@ fn populate_label_index(store: &Store, index: &SharedCell<IndexSet>) {
     for id in node_ids {
         if let Ok(labels) = store.node_labels(id) {
             for token in labels {
-                idx.insert_label(token, id);
+                idx.insert_label(IndexWriter::Population, token, id);
             }
         }
     }
@@ -1179,6 +1179,7 @@ fn off_thread_index_seek_equals_inline_seek_and_scan_across_snapshots() {
         idx.register_node_property_with_state(l_person, k_email, IndexState::Online);
         for (i, email) in emails.iter().enumerate() {
             idx.insert_node_property(
+                IndexWriter::Population,
                 l_person,
                 k_email,
                 &Value::String((*email).to_owned()),
@@ -1209,12 +1210,14 @@ fn off_thread_index_seek_equals_inline_seek_and_scan_across_snapshots() {
         // The writer's index maintenance: append the two new entries (`reindex_node` never removes).
         let mut idx = coord.index.borrow_mut();
         idx.insert_node_property(
+            IndexWriter::Population,
             l_person,
             k_email,
             &Value::String("zz@x.io".to_owned()),
             ids[0],
         );
         idx.insert_node_property(
+            IndexWriter::Population,
             l_person,
             k_email,
             &Value::String("a@x.io".to_owned()),
@@ -1402,8 +1405,15 @@ fn off_thread_range_composite_text_seeks_equal_inline_rows_and_ssi_footprint() {
         idx.register_composite(l_person, vec![k_dept, k_team]);
         idx.register_text(l_person, k_bio, IndexState::Online);
         for (i, &id) in ids.iter().enumerate() {
-            idx.insert_node_property(l_person, k_age, &Value::Integer(i as i64), id);
+            idx.insert_node_property(
+                IndexWriter::Population,
+                l_person,
+                k_age,
+                &Value::Integer(i as i64),
+                id,
+            );
             idx.insert_composite(
+                IndexWriter::Population,
                 l_person,
                 &[k_dept, k_team],
                 &[
@@ -1634,8 +1644,15 @@ fn off_thread_rel_seeks_equal_inline_rows_and_ssi_footprint() {
         idx.register_rel_property_with_state(t_likes, k_n, IndexState::Online);
         idx.register_rel_composite(t_likes, vec![k_acct, k_cur]);
         for (i, &r) in ids.iter().enumerate() {
-            idx.insert_rel_property(t_likes, k_n, &Value::Integer(i as i64), r);
+            idx.insert_rel_property(
+                IndexWriter::Population,
+                t_likes,
+                k_n,
+                &Value::Integer(i as i64),
+                r,
+            );
             idx.insert_rel_composite(
+                IndexWriter::Population,
                 t_likes,
                 &[k_acct, k_cur],
                 &[

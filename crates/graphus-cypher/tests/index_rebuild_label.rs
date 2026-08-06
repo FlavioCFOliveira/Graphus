@@ -246,6 +246,18 @@ fn an_unrelated_index_ddl_does_not_resurrect_a_label_a_committed_writer_removed(
 /// red (measured: with both off, `MATCH (n:Person)` returned 2, the scan 1 — the ghost resurrected);
 /// disabling either alone leaves the other to catch it. This is precisely the safety the #771 fix
 /// leans on: retaining entries is sound only because the consumer re-validates every candidate.
+///
+/// # Why the entry is still RETAINED after `rmp` #992
+///
+/// #992 gave every index entry an owner, so a rollback now removes the entries its transaction
+/// created — which would have inverted this test's premise and left it passing while testing
+/// nothing. It does not, and the reason is the unrelated index DDL in the middle: that DDL drives
+/// `rebuild_index` -> `IndexSet::clear`, which drops every open transaction's undo log, because a log
+/// taken before a wipe names keys the refill re-creates from COMMITTED versions and replaying it
+/// could only destroy committed state. So the rollback here removes nothing and the ghost entry is
+/// retained, exactly as this test needs. That mechanism is pinned directly by
+/// `coordinator::index_entry_rollback_wiring_992::an_index_ddl_between_the_write_and_the_rollback_retains_the_entry`;
+/// if it ever changes, this test's premise must be re-established rather than assumed.
 #[test]
 fn a_rolled_back_create_is_not_resurrected_by_a_retained_label_entry() {
     let mut coord = fresh_coord();

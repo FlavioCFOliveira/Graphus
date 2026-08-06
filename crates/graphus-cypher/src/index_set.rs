@@ -12,10 +12,18 @@
 //! Every backing tree lives over an **in-memory** device ([`MemBlockDevice`]) and a non-retaining log
 //! sink ([`DiscardingLogSink`]): the index set is rebuilt from the record store on open and is never
 //! recovered after a crash, so there is no durability requirement here — the sink discards every WAL
-//! record body it is handed, eliminating the retained-WAL `Vec` (`rmp` #321/#313). Consequently the
-//! internal
-//! WAL transaction id is irrelevant — every op uses a fixed [`TxnId`]`(1)`; the buffer pool applies
-//! each mutation to its in-memory page immediately, so reads observe writes without a commit.
+//! record body it is handed, eliminating the retained-WAL `Vec` (`rmp` #321/#313). The buffer pool
+//! applies each mutation to its in-memory page immediately, so reads observe writes without a commit,
+//! and the backing tree's own WAL transaction id carries no durability meaning.
+//!
+//! # An entry belongs to the transaction that made it (`rmp` #992)
+//!
+//! It does carry an **ownership** meaning. Every per-entry write declares an [`IndexWriter`]: either
+//! the open transaction whose statement made it, or [`IndexWriter::Population`] for an index build.
+//! A transaction's entries are part of its atomic unit of work — a rollback removes the ones it
+//! created ([`IndexSet::undo_entries`]) — while a build's entries belong to no transaction and are
+//! never undone. Before this the writes ran under a fixed, never-committed id and a rollback undid
+//! nothing, so the trees could advertise a candidate whose write never happened.
 //!
 //! # Candidates, not answers
 //!
@@ -83,14 +91,145 @@ type Dev = MemBlockDevice;
 /// (measured `2.14s → 0.93s`, 2.3x, on a 53k-node build).
 type Sink = DiscardingLogSink;
 
-/// The fixed transaction id used for every backing-tree op. The WAL is ephemeral and never
-/// recovered, so the id carries no meaning; the buffer pool applies each mutation in-memory
-/// immediately, so reads see writes without a commit.
-const EPHEMERAL_TXN: TxnId = TxnId(1);
+/// The transaction id every **population** backing-tree op runs under. The WAL is ephemeral and never
+/// recovered, so the id carries no durability meaning; the buffer pool applies each mutation in-memory
+/// immediately, so reads see writes without a commit. A population write belongs to no transaction
+/// (see [`IndexWriter::Population`]), so it needs a reserved id rather than a real one.
+const POPULATION_TXN: TxnId = TxnId(1);
+
+/// **Who owns a derived-index entry** — the polarity every per-entry write into an [`IndexSet`] must
+/// declare (`rmp` #992).
+///
+/// The two families of writer have opposite obligations, and confusing them is a correctness defect in
+/// either direction, so the choice is made in the **type system** rather than by convention — the same
+/// reason [`graphus_storage::scan_polarity`] separates a superset scan from a decision scan.
+///
+/// * [`Txn`](Self::Txn) — the entry is part of a transaction's atomic unit of work. It was created by
+///   a statement of that transaction and is **undone if the transaction rolls back**
+///   ([`IndexSet::undo_entries`]), so the index stops advertising a candidate whose write never
+///   happened.
+/// * [`Population`](Self::Population) — the entry belongs to an index **build or rebuild**, which
+///   deliberately indexes every not-yet-GC'd version with **no visibility filter** (`rmp` #766). It
+///   belongs to no transaction and is **never undone**: that superset is precisely what lets a seek's
+///   per-candidate re-check remove a false positive without ever having to resurrect a missing row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexWriter {
+    /// The entry belongs to this open transaction and is rolled back with it.
+    Txn(TxnId),
+    /// The entry belongs to an index build; it belongs to no transaction and is never rolled back.
+    Population,
+}
+
+impl IndexWriter {
+    /// The id handed to the backing tree's ephemeral WAL. A real transaction uses its own id (so the
+    /// tree's records name the writer that made them); a population write uses [`POPULATION_TXN`].
+    const fn tree_txn(self) -> TxnId {
+        match self {
+            Self::Txn(txn) => txn,
+            Self::Population => POPULATION_TXN,
+        }
+    }
+}
+
+/// One derived-index entry a transaction **created**, held so a rollback can remove it again
+/// (`rmp` #992). Private: the coordinator moves an opaque [`IndexUndoLog`] around and never inspects
+/// one, so the shape of an entry stays an implementation detail of this module.
+#[derive(Clone, Debug)]
+enum IndexUndoEntry {
+    /// A `(label_token, node_id)` entry in the label [`TokenIndex`].
+    Label { label_token: u32, node_id: u64 },
+    /// A `(label_token, prop_key) -> (value, node_id)` entry in a node [`PropertyIndex`].
+    NodeProperty {
+        label_token: u32,
+        prop_key: u32,
+        value: Value,
+        node_id: u64,
+    },
+    /// A `(label_token, property_tokens) -> (values, node_id)` entry in a node [`CompositeIndex`].
+    NodeComposite {
+        label_token: u32,
+        property_tokens: Vec<u32>,
+        values: Vec<Value>,
+        node_id: u64,
+    },
+    /// A `(type_token, prop_key) -> (value, rel_id)` entry in a [`RelPropertyIndex`].
+    RelProperty {
+        type_token: u32,
+        prop_key: u32,
+        value: Value,
+        rel_id: u64,
+    },
+    /// A `(type_token, property_tokens) -> (values, rel_id)` entry in a relationship
+    /// [`CompositeIndex`].
+    RelComposite {
+        type_token: u32,
+        property_tokens: Vec<u32>,
+        values: Vec<Value>,
+        rel_id: u64,
+    },
+}
+
+/// The derived-index entries one transaction created, **drained** out of the [`IndexSet`] so they can
+/// be replayed (or dropped) by the coordinator's abort path (`rmp` #992).
+///
+/// Draining before the durable undo — and holding the result in a local — is the same leak-safety
+/// discipline [`IndexSet::take_dirty_bitmap_nodes`] follows: the per-transaction bookkeeping is freed
+/// unconditionally, so a failing or panicking store undo can never strand it. Applying it is a
+/// separate, deliberate step ([`IndexSet::undo_entries`]).
+/// Deliberately **not** [`Default`]: a log is only ever minted by
+/// [`IndexSet::take_txn_entries`] for a transaction that exists, and a default-constructed one would
+/// have to invent a transaction id it does not own.
+#[derive(Debug)]
+pub struct IndexUndoLog {
+    /// The transaction the entries belong to. Carried so the removals run under the same writer that
+    /// made the inserts, rather than under an anonymous id — the entry's owner is the whole point.
+    txn: TxnId,
+    entries: Vec<IndexUndoEntry>,
+}
+
+impl IndexUndoLog {
+    /// How many entries this transaction created and this log would remove.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the transaction created no derived-index entry at all — the overwhelmingly common
+    /// case, and one that costs nothing to carry.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
 
 /// Buffer-pool capacity (in frames) for each backing tree. Generous enough that a derived index of
 /// a modestly sized store stays resident; the pool spills to the in-memory device otherwise.
 const POOL_FRAMES: usize = 64;
+
+/// How many derived-index entries one open transaction may log for rollback before the log is
+/// recycled (`rmp` #992).
+///
+/// # Why a bound exists at all
+///
+/// The log is proportional to (entities written x covered labels x indexed properties), and an entry
+/// owns a cloned property [`Value`] — for a string property, the whole string. That is *not* the same
+/// shape as the engine's other per-transaction state, and assuming it was would have been wrong: the
+/// MVCC undo chain is a paged `FixedStore` bounded by the buffer pool, not resident memory, and
+/// [`IndexSet::note_bitmap_dirty`]'s set holds deduplicated `u64`s. So an unbounded log would be a
+/// genuinely new growth class, and this engine has already paid for one (`rmp` #313 / #595).
+///
+/// # Why recycling the log is sound
+///
+/// Every entry is independently removable — it names a key its transaction created, which no
+/// committed version warrants — so undoing a *subset* is exactly as correct as undoing all of it. The
+/// entries dropped here simply stay in the tree on rollback: a stale entry is a false positive the
+/// per-candidate re-check drops, which is the safe direction and precisely the pre-#992 behaviour.
+/// Peak memory is therefore bounded at this many entries per open transaction while correctness is
+/// unaffected, and only the *precision* of a very large transaction's rollback degrades.
+///
+/// `65_536` entries is roughly 4-8 MiB per open transaction for small values — far above any
+/// interactive transaction, and low enough that a bulk load cannot make the log a headline cost.
+const MAX_TXN_UNDO_ENTRIES: usize = 64 * 1024;
 
 /// Builds a fresh, empty in-memory [`BTree`] with its own throwaway WAL.
 ///
@@ -270,6 +409,56 @@ pub struct IndexSet {
     /// since a bitmap index is opt-in), so this costs nothing unless a bitmap index is declared and a
     /// covered node is written.
     dirty_bitmap_nodes: HashMap<TxnId, BTreeSet<u64>>,
+    /// **Per-transaction log of the derived-index entries that transaction CREATED** (`rmp` #992) —
+    /// what makes an index write belong to the transaction that made it instead of to a fixed,
+    /// never-committed id.
+    ///
+    /// Drained by [`take_txn_entries`](Self::take_txn_entries) on abort (replayed in reverse by
+    /// [`undo_entries`](Self::undo_entries)) and by
+    /// [`forget_txn_entries`](Self::forget_txn_entries) on commit. Empty for every transaction that
+    /// wrote nothing an index covers — which is most of them — so it costs nothing unless an index is
+    /// declared and a covered entity is written.
+    ///
+    /// # Only CREATED entries, never replaced ones
+    ///
+    /// An entry is logged only when the backing tree reports the key as newly created
+    /// ([`graphus_index::BTree::insert_reporting_created`]). This is not an optimisation, it is the
+    /// correctness condition. A write re-indexes **every** current label and **every** current
+    /// property of the entity, not just the ones the statement changed, so `SET n.name = 'y'`
+    /// re-inserts the untouched `(age, 30, n)` entry a *committed* version put there. Undoing that
+    /// replace would delete a committed entry and a seek would silently lose a committed row — the
+    /// `rmp` #738 class.
+    ///
+    /// Every key here is **record-scoped** (`(label_token, node_id)`, or `(token, values…, rid)`), so
+    /// only another writer of the *same* record could make the key required, and
+    /// `RecordStore::ensure_no_conflicting_writer` refuses one (`rmp` #971). Note precisely where
+    /// that exclusion comes from: the `rmp` #969 incidence relaxation *does* let two transactions be
+    /// open on the same node, and what keeps it out of this path is that an edge write does not
+    /// reindex its endpoints — every caller of `RecordStoreGraph::reindex_node` is a node mutation
+    /// that took the conflict check first. **If an edge write ever starts reindexing endpoint nodes,
+    /// this argument has to be re-made rather than inherited.**
+    ///
+    /// # Three per-transaction structures, three disposal policies — on purpose
+    ///
+    /// [`dirty_bitmap_nodes`](Self#structfield.dirty_bitmap_nodes) survives
+    /// [`clear`](Self::clear) and this does not, and the inconsistency is load-bearing rather than an
+    /// oversight. That one is a **repair** list over a membership-exact index, so dropping it strands
+    /// a repair and loses information. This is a **destruction** list over a candidate superset, so
+    /// dropping it is the conservative act: the entries stay and the re-check filters them. Opposite
+    /// polarities, opposite safe defaults.
+    ///
+    /// # A population write invalidates every open log
+    ///
+    /// The premise above — key absent before the insert ⇒ no committed version warrants it — holds
+    /// only while the tree is not *incomplete* with respect to committed state. An index build makes
+    /// it incomplete by construction: a writer can create a key the half-built tree does not have
+    /// yet, and the build then re-creates that same key from a **committed** version. Undoing it
+    /// afterwards would delete the committed one. So any [`IndexWriter::Population`] write clears
+    /// every open transaction's log (and so do [`clear`](Self::clear) and
+    /// [`fail_closed`](Self::fail_closed)). Those transactions then simply leave their entries behind
+    /// on rollback — a stale entry is a false positive the re-check drops, which is the safe
+    /// direction and exactly the pre-`rmp` #992 behaviour.
+    txn_index_undo: HashMap<TxnId, Vec<IndexUndoEntry>>,
     /// The cross-snapshot freshness marker for the **full-text + spatial** indexes (`rmp` task #467).
     ///
     /// # The problem this closes
@@ -849,6 +1038,7 @@ impl IndexSet {
             bitmap: HashMap::new(),
             bitmap_declared: BTreeSet::new(),
             dirty_bitmap_nodes: HashMap::new(),
+            txn_index_undo: HashMap::new(),
             // A fresh label index is consistent with a fresh (empty) store, so it is usable; only a
             // failed rebuild makes it untrustworthy (`rmp` task #733).
             labels_usable: true,
@@ -1063,12 +1253,13 @@ impl IndexSet {
     /// indexed (and is therefore not a uniqueness candidate, matching the node-key existence rule).
     pub fn insert_composite(
         &mut self,
+        writer: IndexWriter,
         label_token: u32,
         property_tokens: &[u32],
         values: &[Value],
         node_id: u64,
     ) {
-        if let Some(idx) = self
+        let created = if let Some(idx) = self
             .composite
             .get_mut(&(label_token, property_tokens.to_vec()))
         {
@@ -1076,8 +1267,17 @@ impl IndexSet {
             // full tuple, so any fixed token is sufficient). An in-memory composite op cannot fail in
             // practice; a failure leaves the entry absent (the caller re-checks via a scan fallback,
             // degrading to correctness, never to a wrong answer).
-            let _ = idx.insert(EPHEMERAL_TXN, label_token, values, node_id);
-        }
+            idx.insert(writer.tree_txn(), label_token, values, node_id)
+                .unwrap_or(false)
+        } else {
+            return; // no such index ⇒ nothing was written ⇒ nothing to own or invalidate.
+        };
+        self.note_entry(writer, created, || IndexUndoEntry::NodeComposite {
+            label_token,
+            property_tokens: property_tokens.to_vec(),
+            values: values.to_vec(),
+            node_id,
+        });
     }
 
     /// Candidate node ids whose composite tuple for `(label_token, property_tokens)` equals `values`,
@@ -1169,12 +1369,13 @@ impl IndexSet {
     /// covered property is not indexed for that key (matching the node composite rule).
     pub fn insert_rel_composite(
         &mut self,
+        writer: IndexWriter,
         type_token: u32,
         property_tokens: &[u32],
         values: &[Value],
         rel_id: u64,
     ) {
-        if let Some(idx) = self
+        let created = if let Some(idx) = self
             .rel_composite
             .get_mut(&(type_token, property_tokens.to_vec()))
         {
@@ -1182,8 +1383,17 @@ impl IndexSet {
             // tuple, so any fixed token is sufficient). An in-memory composite op cannot fail in
             // practice; a failure leaves the entry absent (the caller re-checks via a scan fallback,
             // degrading to correctness, never to a wrong answer).
-            let _ = idx.insert(EPHEMERAL_TXN, type_token, values, rel_id);
-        }
+            idx.insert(writer.tree_txn(), type_token, values, rel_id)
+                .unwrap_or(false)
+        } else {
+            return; // no such index ⇒ nothing was written ⇒ nothing to own or invalidate.
+        };
+        self.note_entry(writer, created, || IndexUndoEntry::RelComposite {
+            type_token,
+            property_tokens: property_tokens.to_vec(),
+            values: values.to_vec(),
+            rel_id,
+        });
     }
 
     /// Candidate relationship ids whose composite tuple for `(type_token, property_tokens)` equals
@@ -1417,6 +1627,16 @@ impl IndexSet {
         // rebuild. Retaining costs one `BTreeSet` per open writer and cannot leak a stale txn id: every
         // transaction's entry is removed by its own `commit` (`forget_dirty_bitmap_nodes`) or `abort`
         // (`take_dirty_bitmap_nodes`), neither of which this touches.
+        //
+        // The per-txn INDEX-ENTRY undo logs (`rmp` #992) go the OTHER way, and the asymmetry is the
+        // whole point of the two structures. The bitmap is membership-EXACT, so an abort must repair
+        // it and dropping the tracking strands the repair. These trees are a candidate SUPERSET, so an
+        // abort that repairs nothing is merely imprecise, while an abort that removes the wrong entry
+        // is a committed row lost. A log taken before this wipe names keys the refill is about to
+        // re-create from COMMITTED versions (`index_one_node` indexes every version in the chain,
+        // `rmp` #766), so replaying it afterwards would delete exactly those. Drop it: the rolled-back
+        // entries stay, the re-check drops them, and that is the pre-#992 behaviour.
+        self.invalidate_txn_undo();
     }
 
     /// **Fail-closed**: makes every derived index unusable for reads after a rebuild could not be
@@ -1505,6 +1725,10 @@ impl IndexSet {
         // (`rmp` task #733, M2). The next successful rebuild re-registers and repopulates them.
         self.bitmap.clear();
         self.dirty_bitmap_nodes.clear();
+        // Every per-txn index-entry undo log too (`rmp` #992): the trees they describe have just been
+        // recreated or unregistered, so the keys they name no longer mean what they meant when they
+        // were logged. Replaying one could only remove an entry a later repair put back.
+        self.invalidate_txn_undo();
         // And force every latest-state reader onto the scan path too (`rmp` #467's poison).
         self.poison_ft_spatial_marker();
         // Discard the TRANSIENT attribution flags too (`rmp` task #803). A fail-closed is the
@@ -1746,22 +1970,52 @@ impl IndexSet {
     ///
     /// `tests/label_tree_765_reaudit_767.rs` fires on entry destruction (verified by mutation), and
     /// `tests/index_rebuild_label.rs` covers the #771 direction.
-    pub fn insert_label(&mut self, label_token: u32, node_id: u64) {
+    ///
+    /// # The ONE removal this rule admits (`rmp` #992)
+    ///
+    /// A transaction's rollback removes the entries **that transaction created** — and only those. It
+    /// is not the case the two arguments above forbid, and the difference is not a matter of degree:
+    ///
+    /// * both arguments are about a wholesale **clear + refill**, whose refill reads the LIVE store
+    ///   and therefore writes a SUBSET of what some reader still needs. A rollback removes a set it
+    ///   enumerated *itself*, entry by entry, and touches nothing it did not put there.
+    /// * a removed entry here was **created** by the rolling-back transaction, so it was absent
+    ///   before that transaction ran and no committed version of the node warranted it. The
+    ///   re-insert of an entry a committed version already put there reports "not created" and is
+    ///   never logged, so `SET n.name = 'y'` — which re-inserts every current label of `n` — cannot
+    ///   cause `(L, n)` to be removed when `n` is committed with `:L`.
+    /// * the case where "absent before" would NOT imply "no committed version warrants it" is a
+    ///   half-built tree, and [`IndexWriter::Population`] writes invalidate every open transaction's
+    ///   log precisely for that reason (see [`txn_index_undo`](Self#structfield.txn_index_undo)).
+    ///
+    /// The post-condition is the one the arguments above demand: after the rollback the tree holds
+    /// exactly what it held before the transaction started, which is a superset of committed state
+    /// whenever it was one beforehand.
+    pub fn insert_label(&mut self, writer: IndexWriter, label_token: u32, node_id: u64) {
         // in-memory index: a BTree op cannot fail in practice; an insert failure leaves the entry
         // simply absent (the caller re-checks, so a missing candidate degrades to a full scan, never
         // to a wrong answer).
-        let _ = self.labels.insert(EPHEMERAL_TXN, label_token, node_id);
+        let created = self
+            .labels
+            .insert(writer.tree_txn(), label_token, node_id)
+            .unwrap_or(false);
+        self.note_entry(writer, created, || IndexUndoEntry::Label {
+            label_token,
+            node_id,
+        });
     }
 
     /// Records that node `node_id` has `value` for the `(label_token, prop_key)` index, if such an
     /// index is registered (else a no-op).
     pub fn insert_node_property(
         &mut self,
+        writer: IndexWriter,
         label_token: u32,
         prop_key: u32,
         value: &Value,
         node_id: u64,
     ) {
+        let mut created = false;
         if let Some(np) = self.node_props.get_mut(&(label_token, prop_key)) {
             // in-memory index: a BTree op cannot fail in practice. A `Null` value is unindexable
             // (`PropertyIndex::insert` errors) and is correctly skipped — `Null` properties are
@@ -1772,15 +2026,20 @@ impl IndexSet {
             // A **non-null** refusal is different and must be REMEMBERED (`rmp` task #879): the tree
             // is now a strict subset of the nodes carrying the property, which invalidates the
             // whole-index existence scan. See [`NodePropertyIndex::unindexable_values`].
-            if np
-                .index
-                .insert(EPHEMERAL_TXN, prop_key, value, node_id)
-                .is_err()
-                && !matches!(value, Value::Null)
-            {
-                np.unindexable_values = true;
+            match np.index.insert(writer.tree_txn(), prop_key, value, node_id) {
+                Ok(is_new) => created = is_new,
+                Err(_) if !matches!(value, Value::Null) => np.unindexable_values = true,
+                Err(_) => {}
             }
+        } else {
+            return; // no such index ⇒ nothing was written ⇒ nothing to own or invalidate.
         }
+        self.note_entry(writer, created, || IndexUndoEntry::NodeProperty {
+            label_token,
+            prop_key,
+            value: value.clone(),
+            node_id,
+        });
     }
 
     /// Whether this node-property index holds an entry for **every** node that carries a non-null
@@ -2045,12 +2304,13 @@ impl IndexSet {
     /// skipped — a `Null` property is absent for index purposes, matching the node-property handling.
     pub fn insert_rel_property(
         &mut self,
+        writer: IndexWriter,
         type_token: u32,
         prop_key: u32,
         value: &Value,
         rel_id: u64,
     ) {
-        if let Some(rp) = self.rel_props.get_mut(&(type_token, prop_key)) {
+        let created = if let Some(rp) = self.rel_props.get_mut(&(type_token, prop_key)) {
             // The `let _ =` is tolerated because this is a purely in-memory BTree insert with no I/O:
             // it cannot fail in practice.
             //
@@ -2061,8 +2321,18 @@ impl IndexSet {
             // `rel_unique_conflict`) a uniqueness check that reports "no duplicate" — the `rmp`
             // #738 class. There is no "degrades to a full scan" fallback on this path; do not
             // reintroduce that claim.
-            let _ = rp.index.insert(EPHEMERAL_TXN, prop_key, value, rel_id);
-        }
+            rp.index
+                .insert(writer.tree_txn(), prop_key, value, rel_id)
+                .unwrap_or(false)
+        } else {
+            return; // no such index ⇒ nothing was written ⇒ nothing to own or invalidate.
+        };
+        self.note_entry(writer, created, || IndexUndoEntry::RelProperty {
+            type_token,
+            prop_key,
+            value: value.clone(),
+            rel_id,
+        });
     }
 
     /// Candidate relationship ids for `(type_token, prop_key) == value`, ascending (`rmp` task #646).
@@ -4471,6 +4741,153 @@ impl IndexSet {
         self.dirty_bitmap_nodes.remove(&txn);
     }
 
+    /// Records `entry` in `writer`'s undo log when the backing tree reported the key as newly
+    /// **created**, and invalidates every open log when the write belongs to a **population** pass
+    /// (`rmp` #992).
+    ///
+    /// This is the single door every per-entry index write leaves through, so both obligations of
+    /// [`IndexWriter`] are discharged structurally instead of being remembered at five call sites.
+    /// `entry` is a closure so the (cloning) undo record is only built when it will actually be kept.
+    fn note_entry(
+        &mut self,
+        writer: IndexWriter,
+        created: bool,
+        entry: impl FnOnce() -> IndexUndoEntry,
+    ) {
+        match writer {
+            IndexWriter::Txn(txn) if created => {
+                let log = self.txn_index_undo.entry(txn).or_default();
+                // Recycle rather than grow without bound (see `MAX_TXN_UNDO_ENTRIES`). Undoing a
+                // subset is as correct as undoing all of it, because every entry is independently
+                // removable; the dropped ones just stay in the tree, which is the safe direction.
+                if log.len() >= MAX_TXN_UNDO_ENTRIES {
+                    log.clear();
+                }
+                log.push(entry());
+            }
+            IndexWriter::Txn(_) => {}
+            // A build re-derives the tree from the store, so it can re-create a key some open
+            // transaction believes it created — from a COMMITTED version. Undoing that later would
+            // delete committed state, so no open transaction may subtract from a tree a build has
+            // written into. See `txn_index_undo` for the full argument.
+            IndexWriter::Population => self.invalidate_txn_undo(),
+        }
+    }
+
+    /// Drops every open transaction's undo log (`rmp` #992). Those transactions then leave their
+    /// index entries behind on rollback, which is the safe direction: a stale entry is a false
+    /// positive the per-candidate re-check drops, and it is exactly the pre-#992 behaviour.
+    ///
+    /// The `is_empty` guard keeps this genuinely free on the hot population path — `HashMap::clear`
+    /// walks the table's capacity even when it holds nothing.
+    fn invalidate_txn_undo(&mut self) {
+        if !self.txn_index_undo.is_empty() {
+            self.txn_index_undo.clear();
+        }
+    }
+
+    /// Removes and returns the derived-index entries transaction `txn` **created** (`rmp` #992),
+    /// draining the log so a later commit/abort of the same id cannot double-process it. Empty (and
+    /// allocation-free) for a transaction that created none.
+    ///
+    /// This is the **abort** path's first step, taken *before* the durable undo so the per-transaction
+    /// bookkeeping is freed unconditionally — the same leak-safety discipline
+    /// [`take_dirty_bitmap_nodes`](Self::take_dirty_bitmap_nodes) follows. Applying the log is the
+    /// separate, deliberate [`undo_entries`](Self::undo_entries).
+    #[must_use]
+    pub fn take_txn_entries(&mut self, txn: TxnId) -> IndexUndoLog {
+        IndexUndoLog {
+            txn,
+            entries: self.txn_index_undo.remove(&txn).unwrap_or_default(),
+        }
+    }
+
+    /// Drops `txn`'s undo log without acting on it (`rmp` #992) — the **commit** path, where the
+    /// eagerly-maintained entries describe writes that are now committed and must stay. A no-op for a
+    /// transaction that created no entry.
+    pub fn forget_txn_entries(&mut self, txn: TxnId) {
+        self.txn_index_undo.remove(&txn);
+    }
+
+    /// Replays `log` in **reverse** insertion order, removing each entry from its index, and returns
+    /// how many were actually present and removed (`rmp` #992). The rollback half of
+    /// [`take_txn_entries`](Self::take_txn_entries).
+    ///
+    /// After this the trees hold exactly what they held before the rolled-back transaction ran: every
+    /// entry here was created by it (a re-insert over an already-present key is never logged), and no
+    /// other writer of the same entity could have been open at the time
+    /// (`RecordStore::ensure_chain_head_unheld`, `rmp` #971). An index that has since been dropped or
+    /// unregistered simply has nothing to remove.
+    ///
+    /// Reverse order is the canonical undo direction. It is not load-bearing here — the logged keys of
+    /// one transaction are distinct, so any order removes the same set — but replaying an undo log
+    /// forwards is the kind of detail that stops being harmless the moment the log gains an entry
+    /// whose effect is not independent.
+    pub fn undo_entries(&mut self, log: IndexUndoLog) -> usize {
+        let mut removed = 0usize;
+        // The removals run under the rolling-back transaction's own id: undoing an entry is still a
+        // write by that transaction, and the whole point of `rmp` #992 is that the tree's records name
+        // the writer that made them.
+        let txn = log.txn;
+        for entry in log.entries.into_iter().rev() {
+            // A failure here is an in-memory B+-tree fault, which cannot happen in practice; the entry
+            // then simply stays, which is the safe direction (a false positive the re-check drops).
+            let gone = match entry {
+                IndexUndoEntry::Label {
+                    label_token,
+                    node_id,
+                } => self
+                    .labels
+                    .remove(txn, label_token, node_id)
+                    .unwrap_or(false),
+                IndexUndoEntry::NodeProperty {
+                    label_token,
+                    prop_key,
+                    value,
+                    node_id,
+                } => self
+                    .node_props
+                    .get_mut(&(label_token, prop_key))
+                    .and_then(|np| np.index.remove(txn, prop_key, &value, node_id).ok())
+                    .unwrap_or(false),
+                IndexUndoEntry::NodeComposite {
+                    label_token,
+                    property_tokens,
+                    values,
+                    node_id,
+                } => self
+                    .composite
+                    .get_mut(&(label_token, property_tokens))
+                    .and_then(|idx| idx.remove(txn, label_token, &values, node_id).ok())
+                    .unwrap_or(false),
+                IndexUndoEntry::RelProperty {
+                    type_token,
+                    prop_key,
+                    value,
+                    rel_id,
+                } => self
+                    .rel_props
+                    .get_mut(&(type_token, prop_key))
+                    .and_then(|rp| rp.index.remove(txn, prop_key, &value, rel_id).ok())
+                    .unwrap_or(false),
+                IndexUndoEntry::RelComposite {
+                    type_token,
+                    property_tokens,
+                    values,
+                    rel_id,
+                } => self
+                    .rel_composite
+                    .get_mut(&(type_token, property_tokens))
+                    .and_then(|idx| idx.remove(txn, type_token, &values, rel_id).ok())
+                    .unwrap_or(false),
+            };
+            if gone {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
     /// Candidate node ids whose `(label_token, prop_key)` value equals `value`, ascending. `None` if
     /// no bitmap index is registered for the column; otherwise the membership-exact set (the caller
     /// still re-checks MVCC visibility + the exact predicate, per the candidate contract).
@@ -4600,9 +5017,9 @@ mod tests {
     #[test]
     fn label_insert_then_seek_returns_inserted_ids_ascending() {
         let mut set = IndexSet::new();
-        set.insert_label(7, 100);
-        set.insert_label(7, 50);
-        set.insert_label(9, 200); // different label token
+        set.insert_label(IndexWriter::Population, 7, 100);
+        set.insert_label(IndexWriter::Population, 7, 50);
+        set.insert_label(IndexWriter::Population, 9, 200); // different label token
 
         assert_eq!(set.seek_label(7), vec![50, 100]);
         assert_eq!(set.seek_label(9), vec![200]);
@@ -4616,7 +5033,7 @@ mod tests {
         set.register_node_property(1, 2);
         assert!(set.has_node_property(1, 2));
         // Idempotent: registering again does not panic or wipe state.
-        set.insert_node_property(1, 2, &Value::Integer(10), 42);
+        set.insert_node_property(IndexWriter::Population, 1, 2, &Value::Integer(10), 42);
         set.register_node_property(1, 2);
         assert_eq!(
             set.seek_node_property_eq(1, 2, &Value::Integer(10)),
@@ -4628,9 +5045,9 @@ mod tests {
     fn node_property_eq_returns_matches_and_none_when_unregistered() {
         let mut set = IndexSet::new();
         set.register_node_property(1, 2);
-        set.insert_node_property(1, 2, &Value::Integer(10), 1000);
-        set.insert_node_property(1, 2, &Value::Integer(10), 1001); // same value, two ids
-        set.insert_node_property(1, 2, &Value::Integer(20), 1002);
+        set.insert_node_property(IndexWriter::Population, 1, 2, &Value::Integer(10), 1000);
+        set.insert_node_property(IndexWriter::Population, 1, 2, &Value::Integer(10), 1001); // same value, two ids
+        set.insert_node_property(IndexWriter::Population, 1, 2, &Value::Integer(20), 1002);
 
         let mut got = set
             .seek_node_property_eq(1, 2, &Value::Integer(10))
@@ -4677,8 +5094,20 @@ mod tests {
         let base: i64 = 1 << 54;
         let mut set = IndexSet::new();
         set.register_node_property(1, 2);
-        set.insert_node_property(1, 2, &Value::Integer(base + 3), 100);
-        set.insert_node_property(1, 2, &Value::Integer(base + 5), 101);
+        set.insert_node_property(
+            IndexWriter::Population,
+            1,
+            2,
+            &Value::Integer(base + 3),
+            100,
+        );
+        set.insert_node_property(
+            IndexWriter::Population,
+            1,
+            2,
+            &Value::Integer(base + 5),
+            101,
+        );
 
         let got = set
             .seek_node_property_range(
@@ -4699,9 +5128,9 @@ mod tests {
         let p53f = p53 as f64;
         let mut set = IndexSet::new();
         set.register_node_property(1, 2);
-        set.insert_node_property(1, 2, &Value::Float(p53f), 200);
-        set.insert_node_property(1, 2, &Value::Integer(p53), 201);
-        set.insert_node_property(1, 2, &Value::Integer(p53 + 1), 202);
+        set.insert_node_property(IndexWriter::Population, 1, 2, &Value::Float(p53f), 200);
+        set.insert_node_property(IndexWriter::Population, 1, 2, &Value::Integer(p53), 201);
+        set.insert_node_property(IndexWriter::Population, 1, 2, &Value::Integer(p53 + 1), 202);
 
         let got = set
             .seek_node_property_range(
@@ -4745,8 +5174,8 @@ mod tests {
         // ...and the tight range really is tight: `< 9` excludes 9 itself.
         let mut set = IndexSet::new();
         set.register_node_property(1, 2);
-        set.insert_node_property(1, 2, &Value::Integer(8), 300);
-        set.insert_node_property(1, 2, &Value::Integer(9), 301);
+        set.insert_node_property(IndexWriter::Population, 1, 2, &Value::Integer(8), 300);
+        set.insert_node_property(IndexWriter::Population, 1, 2, &Value::Integer(9), 301);
         let got = set
             .seek_node_property_range(
                 1,
@@ -4762,7 +5191,7 @@ mod tests {
     fn insert_node_property_on_unregistered_is_noop() {
         let mut set = IndexSet::new();
         // No register call: insert is a silent no-op and the pair stays unregistered.
-        set.insert_node_property(1, 2, &Value::Integer(10), 42);
+        set.insert_node_property(IndexWriter::Population, 1, 2, &Value::Integer(10), 42);
         assert!(!set.has_node_property(1, 2));
         assert_eq!(set.seek_node_property_eq(1, 2, &Value::Integer(10)), None);
     }
@@ -4772,7 +5201,7 @@ mod tests {
         let mut set = IndexSet::new();
         set.register_node_property(1, 2);
         // Null is unindexable; the insert is a no-op and does not panic.
-        set.insert_node_property(1, 2, &Value::Null, 7);
+        set.insert_node_property(IndexWriter::Population, 1, 2, &Value::Null, 7);
         // A seek whose bound is unindexable DECLINES (`None`) so the caller takes the exact scan
         // fallback, rather than returning `Some(vec![])` (`rmp` #680; see [`is_index_encodable`]). For a
         // `Null` bound this is still correct AND yields the same result: `= null` is `NULL` for every
@@ -4830,11 +5259,11 @@ mod tests {
     fn range_returns_superset_of_in_range_ids() {
         let mut set = IndexSet::new();
         set.register_node_property(1, 2);
-        set.insert_node_property(1, 2, &Value::Integer(-5), 100);
-        set.insert_node_property(1, 2, &Value::Integer(0), 101);
-        set.insert_node_property(1, 2, &Value::Integer(10), 102);
-        set.insert_node_property(1, 2, &Value::Integer(10), 103); // two ids share value 10
-        set.insert_node_property(1, 2, &Value::Integer(20), 104);
+        set.insert_node_property(IndexWriter::Population, 1, 2, &Value::Integer(-5), 100);
+        set.insert_node_property(IndexWriter::Population, 1, 2, &Value::Integer(0), 101);
+        set.insert_node_property(IndexWriter::Population, 1, 2, &Value::Integer(10), 102);
+        set.insert_node_property(IndexWriter::Population, 1, 2, &Value::Integer(10), 103); // two ids share value 10
+        set.insert_node_property(IndexWriter::Population, 1, 2, &Value::Integer(20), 104);
 
         // Helper: a result must be a superset of `expected` (every expected id present), and may
         // contain extras (caller re-checks). It must NEVER be a subset.
@@ -4911,8 +5340,8 @@ mod tests {
         // class that an integer-floor lower bound would have missed.
         let mut set = IndexSet::new();
         set.register_node_property(1, 2);
-        set.insert_node_property(1, 2, &s("alice"), 1);
-        set.insert_node_property(1, 2, &s("bob"), 2);
+        set.insert_node_property(IndexWriter::Population, 1, 2, &s("alice"), 1);
+        set.insert_node_property(IndexWriter::Population, 1, 2, &s("bob"), 2);
 
         let r = set
             .seek_node_property_range(1, 2, None, Some((&s("zzz"), false)))
@@ -4927,8 +5356,8 @@ mod tests {
     fn clear_empties_the_property_indexes_but_retains_the_label_tree() {
         let mut set = IndexSet::new();
         set.register_node_property(1, 2);
-        set.insert_label(7, 100);
-        set.insert_node_property(1, 2, &Value::Integer(10), 42);
+        set.insert_label(IndexWriter::Population, 7, 100);
+        set.insert_node_property(IndexWriter::Population, 1, 2, &Value::Integer(10), 42);
         assert_eq!(set.seek_label(7), vec![100]);
         assert_eq!(
             set.seek_node_property_eq(1, 2, &Value::Integer(10)),
@@ -4956,8 +5385,8 @@ mod tests {
         );
 
         // Re-insert after clear works, and a retained label entry does not block a new one.
-        set.insert_label(7, 200);
-        set.insert_node_property(1, 2, &Value::Integer(10), 99);
+        set.insert_label(IndexWriter::Population, 7, 200);
+        set.insert_node_property(IndexWriter::Population, 1, 2, &Value::Integer(10), 99);
         assert_eq!(set.seek_label(7), vec![100, 200]);
         assert_eq!(
             set.seek_node_property_eq(1, 2, &Value::Integer(10)),
@@ -4969,9 +5398,9 @@ mod tests {
     fn indexed_label_tokens_lists_nonempty_tokens_sorted_deduped() {
         let mut set = IndexSet::new();
         assert_eq!(set.indexed_label_tokens(), Vec::<u32>::new());
-        set.insert_label(9, 1);
-        set.insert_label(7, 2);
-        set.insert_label(7, 3); // duplicate token, distinct node
+        set.insert_label(IndexWriter::Population, 9, 1);
+        set.insert_label(IndexWriter::Population, 7, 2);
+        set.insert_label(IndexWriter::Population, 7, 3); // duplicate token, distinct node
         let tokens = set.indexed_label_tokens();
         assert_eq!(tokens, vec![7, 9]);
     }
@@ -5016,7 +5445,7 @@ mod tests {
 
         // A Populating index still maintains entries and answers a *direct* seek (the candidate-set
         // model is intact) — it is merely withheld from the planner's catalog.
-        set.insert_node_property(3, 4, &Value::Integer(7), 100);
+        set.insert_node_property(IndexWriter::Population, 3, 4, &Value::Integer(7), 100);
         assert_eq!(
             set.seek_node_property_eq(3, 4, &Value::Integer(7)),
             Some(vec![100])
@@ -5032,7 +5461,7 @@ mod tests {
     fn register_with_state_is_idempotent_and_updates_state() {
         let mut set = IndexSet::new();
         set.register_node_property_with_state(1, 2, IndexState::Populating);
-        set.insert_node_property(1, 2, &Value::Integer(5), 9);
+        set.insert_node_property(IndexWriter::Population, 1, 2, &Value::Integer(5), 9);
         assert_eq!(set.node_property_state(1, 2), Some(IndexState::Populating));
         // Re-registering Online keeps the entries (idempotent on the backing tree) but promotes state.
         set.register_node_property_with_state(1, 2, IndexState::Online);
@@ -5048,7 +5477,7 @@ mod tests {
     fn unregister_drops_index_and_entries() {
         let mut set = IndexSet::new();
         set.register_node_property_with_state(1, 2, IndexState::Populating);
-        set.insert_node_property(1, 2, &Value::Integer(5), 9);
+        set.insert_node_property(IndexWriter::Population, 1, 2, &Value::Integer(5), 9);
         assert!(set.has_node_property(1, 2));
 
         // Unregister: the pair is gone from every registry and answers no seek.
@@ -5070,7 +5499,7 @@ mod tests {
     fn clear_preserves_registered_set_and_state() {
         let mut set = IndexSet::new();
         set.register_node_property_with_state(1, 2, IndexState::Populating);
-        set.insert_node_property(1, 2, &Value::Integer(5), 9);
+        set.insert_node_property(IndexWriter::Population, 1, 2, &Value::Integer(5), 9);
         set.clear();
         // The registered set and its state survive a clear (only the entries are wiped).
         assert_eq!(set.node_property_state(1, 2), Some(IndexState::Populating));
@@ -5152,9 +5581,9 @@ mod tests {
         // Two nodes share the same composite tuple; a third differs in the second field.
         let tuple_a = [Value::Integer(7), Value::String("x".to_owned())];
         let tuple_b = [Value::Integer(7), Value::String("y".to_owned())];
-        set.insert_composite(1, &[10, 11], &tuple_a, 100);
-        set.insert_composite(1, &[10, 11], &tuple_a, 101);
-        set.insert_composite(1, &[10, 11], &tuple_b, 102);
+        set.insert_composite(IndexWriter::Population, 1, &[10, 11], &tuple_a, 100);
+        set.insert_composite(IndexWriter::Population, 1, &[10, 11], &tuple_a, 101);
+        set.insert_composite(IndexWriter::Population, 1, &[10, 11], &tuple_b, 102);
 
         let mut hits = set.seek_composite_eq(1, &[10, 11], &tuple_a).unwrap();
         hits.sort_unstable();
@@ -5556,7 +5985,7 @@ mod tests {
         set.register_composite(1, vec![5, 6]);
         set.register_rel_composite(2, vec![5, 6]);
         set.register_bitmap(1, 8);
-        set.insert_label(1, 100);
+        set.insert_label(IndexWriter::Population, 1, 100);
         assert!(set.labels_usable());
 
         set.fail_closed();
@@ -5955,7 +6384,7 @@ mod tests {
     fn rmp769_rel_capture_declines_for_a_reader_older_than_the_rebuild() {
         let mut set = IndexSet::new();
         set.register_rel_property_with_state(1, 5, IndexState::Online);
-        set.insert_rel_property(1, 5, &Value::Integer(7), 100);
+        set.insert_rel_property(IndexWriter::Population, 1, 5, &Value::Integer(7), 100);
         // A rebuild wiped + newest-wins-refilled every tree; stamp its high-water at ts 10.
         set.note_trees_rebuilt(Timestamp(10));
 

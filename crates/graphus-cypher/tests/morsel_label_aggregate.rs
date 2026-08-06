@@ -29,7 +29,7 @@ use graphus_cypher::shared_cell::SharedCell;
 use graphus_core::{TxnId, Value};
 use graphus_cypher::authorized_graph::{AuthorizedGraph, PrivilegeOracle};
 use graphus_cypher::graph_access::GraphAccess;
-use graphus_cypher::index_set::IndexSet;
+use graphus_cypher::index_set::{IndexSet, IndexWriter};
 use graphus_cypher::morsel::{MorselLabelScan, MorselReadOutcome};
 use graphus_cypher::record_graph::RecordStoreGraph;
 use graphus_io::MemBlockDevice;
@@ -71,7 +71,7 @@ impl Coordinated {
             for id in node_ids {
                 if let Ok(labels) = store.node_labels(id) {
                     for token in labels {
-                        idx.insert_label(token, id);
+                        idx.insert_label(IndexWriter::Population, token, id);
                     }
                 }
             }
