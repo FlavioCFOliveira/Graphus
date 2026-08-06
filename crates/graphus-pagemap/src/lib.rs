@@ -88,10 +88,11 @@
 //! **this fix would silently break.** #479 introduced eager mapping for a different reason (keeping
 //! `high_water <= addressable capacity` true at all times); #721 now depends on it too.
 //!
-//! Entries are `AtomicU64` (a [`PageId`] is a `u64` newtype), so the writer mutates a chunk it shares
-//! with readers with no `unsafe` — the crate is `#![forbid(unsafe_code)]`. Appending is nevertheless
-//! gated behind the non-`Clone` [`PageMapWriter`] token, so the borrow checker still enforces the
-//! single-writer contract exactly as it did for the old `Vec<PageId>`.
+//! Entries are `AtomicU64` (a [`PageId`] is a `u64` newtype), so a writer mutates a chunk it shares
+//! with readers with no `unsafe` — the crate is `#![forbid(unsafe_code)]`. Appending is gated behind
+//! the non-`Clone` [`PageMapWriter`] token, which says *who* may append; since `rmp` #1012 it no
+//! longer says *how many at once*, because the index is claimed by `compare_exchange` rather than by
+//! a read-then-write. `N` producers may append concurrently while every reader stays wait-free.
 
 #![forbid(unsafe_code)]
 
@@ -105,7 +106,7 @@ use graphus_core::error::{GraphusError, Result};
 
 // The atomics come from the `loom` seam so this structure can be MODEL-CHECKED, not merely tested on
 // an x86-TSO box where a missing `Acquire` is invisible. See `crate::sync`.
-use crate::sync::{AtomicU64, AtomicUsize, Ordering};
+use crate::sync::{AtomicU64, AtomicUsize, Ordering, spin_once};
 
 /// `log2` of the first chunk's entry count. Chunk `k` holds `1 << (CHUNK0_LOG2 + k)` entries, so the
 /// allocated capacity is at most ~2x the used length — exactly a `Vec`'s doubling behaviour — while a
@@ -185,6 +186,24 @@ pub struct PageMap {
     /// read only through a happens-before edge established here, which is why the entries themselves
     /// need no ordering of their own (see [`PageMapWriter::push`] / [`PageMap::get`]).
     len: AtomicUsize,
+    /// Padding that isolates the producers' contended word from the readers' hot one (`rmp` #1012).
+    ///
+    /// `reserved` below is RMW'd by **every** producer on every append, including on a failed
+    /// `compare_exchange`. `len` above is loaded by every reader core on every record lookup. Sharing
+    /// a line would make each reservation attempt invalidate the line the whole reader pool is reading
+    /// — the same Shared-to-Modified regression `_pad` exists to prevent for the `Arc` refcount, with
+    /// a contention source that grows with the writer count rather than the reader count.
+    _pad2: CacheLinePad,
+    /// The **reservation** counter: the next index to hand out (`rmp` #1012).
+    ///
+    /// Distinct from `len`, and the distinction is the whole design. A producer claims an index here
+    /// (atomically, so no two producers can ever hold the same one) and only then writes its entry;
+    /// `len` — the readers' gate — is advanced afterwards, in index order, so it never admits an index
+    /// whose entry has not been written. Collapsing the two into one counter would publish a slot the
+    /// instant it was claimed, i.e. hand readers an index whose entry is still a zero.
+    ///
+    /// `reserved >= len` always, and they meet whenever no append is in flight.
+    reserved: AtomicUsize,
 }
 
 /// A cache line's worth of padding (64 bytes covers x86-64 and aarch64; Apple Silicon's 128-byte
@@ -208,21 +227,29 @@ const _: () = {
 };
 
 /// The **sole** means of appending to a [`PageMap`] (`rmp` #721): a non-`Clone`, non-`Copy` token
-/// owned by the store's `FixedStore`, whose [`push`](Self::push) takes `&mut self`.
+/// owned by the store's `FixedStore`, whose [`push`](Self::push) takes `&self` and is safe to call
+/// from any number of threads at once (`rmp` #1012).
 ///
-/// # Why the token exists
+/// # Why the token exists, and what changed
 ///
-/// The map must be mutated *through a shared `Arc`* (readers hold handles on it while it grows), so
-/// its entries are atomics and its `push` could physically have taken `&self`. It deliberately does
-/// not. A `&self` `push` on a type that readers hold an `Arc` to would make a second concurrent pusher
-/// a mere `pub(crate)` call away — and two racing `push`es both claim the same index, so **one device
-/// page silently vanishes from the map**. `FixedStore::to_meta` serialises the live map into the
-/// durable catalog, so that loss would propagate to disk and leave committed records on an
-/// unaddressable page: a durability breach, not a transient read error.
+/// The token separates *who may append* from *how many may append at once*. It still answers the
+/// first: readers hold `Arc<PageMap>` and have no mutating API at all, so an append is reachable only
+/// from a component the store handed the token to.
 ///
-/// Routing every append through a `&mut` token restores exactly the compile-time guarantee the old
-/// `Vec<PageId>` got for free from the borrow checker: you cannot append without unique access to the
-/// store, and readers — who hold `Arc<PageMap>`, never the token — have no mutating API at all.
+/// What it no longer answers is the second, and the reason is worth stating precisely because the
+/// previous version of this comment argued the exact opposite. Under `rmp` #721 `push` took
+/// `&mut self`, and the justification was that "two racing `push`es both claim the same index, so one
+/// device page silently vanishes from the map" — a durability breach, since `FixedStore::to_meta`
+/// serialises the live map into the durable catalog. That reasoning was correct about the **defect**
+/// and wrong about the **remedy**: `&mut self` did not make concurrent appends safe, it made them
+/// impossible, and with them any second writer thread. The defect was never concurrency; it was that
+/// the index was claimed by a non-atomic read-then-write.
+///
+/// `rmp` #1012 fixes the claim instead of forbidding the caller: an index is reserved by
+/// `compare_exchange`, so no two producers can hold the same one, and publication advances in index
+/// order so `len` never admits a slot that has not been written. See [`push`](Self::push) for the
+/// three phases. The guarantee is now stronger than the borrow checker's was — it holds for `N`
+/// producers rather than assuming there is only ever one.
 pub struct PageMapWriter {
     map: Arc<PageMap>,
 }
@@ -236,6 +263,8 @@ impl PageMapWriter {
                 chunks: [const { OnceLock::new() }; MAX_CHUNKS],
                 _pad: CacheLinePad([0; 64]),
                 len: AtomicUsize::new(0),
+                _pad2: CacheLinePad([0; 64]),
+                reserved: AtomicUsize::new(0),
             }),
         }
     }
@@ -245,7 +274,7 @@ impl PageMapWriter {
     /// # Errors
     /// Returns a storage error if the list is longer than the map can address ([`MAX_ENTRIES`]).
     pub fn from_pages(pages: impl IntoIterator<Item = PageId>) -> Result<Self> {
-        let mut w = Self::new();
+        let w = Self::new();
         for p in pages {
             w.push(p)?;
         }
@@ -261,20 +290,62 @@ impl PageMapWriter {
 
     /// Appends `page` as the next store-relative page, publishing it to every reader.
     ///
-    /// `&mut self` is the single-writer enforcement: see [`PageMapWriter`].
+    /// **Safe to call from any number of threads at once** (`rmp` #1012), which is the change this
+    /// method exists to carry: see [`PageMapWriter`] for what replaced the old `&mut self` guarantee
+    /// and why the replacement is stronger rather than merely looser.
+    ///
+    /// # The three phases, and why they cannot be two
+    ///
+    /// 1. **Reserve** an index by `compare_exchange` on `reserved`. Atomic, so no two producers can
+    ///    ever hold the same index — which is the defect this replaces, where two `push`es both read
+    ///    the same `len` and one device page silently vanished from the map.
+    /// 2. **Write** the entry into the reserved slot. Nobody else can hold that slot, so this needs no
+    ///    ordering of its own beyond being sequenced before phase 3.
+    /// 3. **Publish** by advancing `len` from exactly `i` to `i + 1`, waiting for any producer that
+    ///    reserved an earlier index to publish first.
+    ///
+    /// Phases 1 and 3 cannot be the same step. A single counter that both reserved and published would
+    /// admit the reader the instant the index was claimed — before phase 2 wrote anything — so a reader
+    /// would resolve a store-relative page to device page **zero**. Nor can phase 3 skip the ordering:
+    /// `len` is a single count, not a bitmap, so publishing `i + 1` while `i - 1` is still unwritten
+    /// would admit that hole too. Waiting is bounded by the producers already ahead in the queue, and
+    /// each of them is a handful of instructions from publishing.
+    ///
+    /// # Why the ceiling check is INSIDE the reservation loop
+    ///
+    /// A `fetch_add` would be cheaper but cannot check and claim in one step: `N` producers arriving at
+    /// the ceiling together would each push the counter past [`MAX_ENTRIES`] before any of them looked,
+    /// and `split`'s shifts would then be handed an out-of-range index. The `compare_exchange` makes
+    /// "the index is in range and it is now mine" a single indivisible decision.
     ///
     /// # Errors
     /// Returns a storage error if the map is already at its addressable ceiling ([`MAX_ENTRIES`]).
-    pub fn push(&mut self, page: PageId) -> Result<()> {
-        // Sole writer: a `Relaxed` load of our own last store is exact (a thread always reads its own
-        // most recent store to a location — coherence).
-        let i = self.map.len.load(Ordering::Relaxed);
-        // Fail closed BEFORE the index arithmetic, so `split`'s shifts can never overflow.
-        if i >= MAX_ENTRIES {
-            return Err(GraphusError::Storage(format!(
-                "store page map is full: cannot map page index {i} (ceiling {MAX_ENTRIES} pages)"
-            )));
+    pub fn push(&self, page: PageId) -> Result<()> {
+        // PHASE 1 — reserve. `Relaxed` on both sides: this counter orders nothing by itself; the
+        // structure's one synchronisation edge is the `Release` in phase 3, and the entry write in
+        // phase 2 is sequenced between them.
+        let mut i = self.map.reserved.load(Ordering::Relaxed);
+        loop {
+            // Fail closed BEFORE the index is claimed, so `split`'s shifts can never overflow and a
+            // failed append leaves the counter exactly where a successful one would not have moved it.
+            if i >= MAX_ENTRIES {
+                return Err(GraphusError::Storage(format!(
+                    "store page map is full: cannot map page index {i} (ceiling {MAX_ENTRIES} pages)"
+                )));
+            }
+            match self.map.reserved.compare_exchange_weak(
+                i,
+                i + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                // Somebody else claimed it; `compare_exchange_weak` hands back what is actually there,
+                // so the retry costs no extra load. A spurious failure retries the same index.
+                Err(actual) => i = actual,
+            }
         }
+        // PHASE 2 — write the entry into the slot that is now exclusively ours.
         let (k, off) = split(i);
         // Install the chunk on first use. `OnceLock::get_or_init` publishes the (zero-filled) chunk
         // with `Release` and reads it back with `Acquire`, so a reader that reaches it below sees a
@@ -296,8 +367,22 @@ impl PageMapWriter {
         // `PageMap::get`, which loads `len` with `Acquire` first. Any future reader path that touches an
         // entry without passing that gate MUST restore an ordering here.
         chunk[off].store(page.0, Ordering::Relaxed);
-        // THE PUBLICATION — the one and only synchronisation edge in this structure.
-        self.map.len.store(i + 1, Ordering::Release);
+        // PHASE 3 — THE PUBLICATION, the one and only synchronisation edge in this structure, and now
+        // also the point that keeps `len` a contiguous prefix. `Release` on success carries phase 2's
+        // entry write (and the chunk install) to every reader that `Acquire`-loads this `len`; the
+        // failure ordering is `Relaxed` because a failed attempt publishes nothing and its retry
+        // re-reads through the next attempt anyway.
+        while self
+            .map
+            .len
+            .compare_exchange_weak(i, i + 1, Ordering::Release, Ordering::Relaxed)
+            .is_err()
+        {
+            // A producer holding an earlier index has not published yet. Bounded: every one of them is
+            // a few instructions from its own phase 3, and none can block on us — the wait is strictly
+            // backwards in index order, so it is a queue and never a cycle.
+            spin_once();
+        }
         Ok(())
     }
 }
@@ -435,7 +520,7 @@ mod tests {
 
     #[test]
     fn push_get_len_round_trip_across_many_chunks() {
-        let mut m = PageMapWriter::new();
+        let m = PageMapWriter::new();
         assert!(m.is_empty());
         assert_eq!(m.get(0), None);
         const N: usize = 100_000;
@@ -469,7 +554,7 @@ mod tests {
     #[test]
     fn concurrent_readers_never_miss_a_published_entry() {
         const N: usize = 50_000;
-        let mut w = PageMapWriter::new();
+        let w = PageMapWriter::new();
         let m = w.reader();
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -507,5 +592,55 @@ mod tests {
         }
         assert!(any_saw_growth, "the readers never observed the map at all");
         assert_eq!(w.len(), N);
+    }
+
+    /// **N real threads append at once and not one page is lost** (`rmp` #1012).
+    ///
+    /// The `loom` model proves the property over every interleaving the memory model permits; this
+    /// proves it over the ones this machine actually produces, at a volume no model checker could
+    /// explore. Both are needed and neither substitutes for the other: loom would pass a version that
+    /// is correct but livelocks under real contention, and a real-thread test on x86-TSO would pass a
+    /// version whose ordering is wrong on aarch64.
+    ///
+    /// The assertion is on the multiset of mapped pages, because that is what durability rests on:
+    /// `FixedStore::to_meta` serialises this map into the catalog, so a page appearing twice — or not
+    /// at all — puts committed records on an unaddressable page. Each producer writes a disjoint,
+    /// self-identifying range, so a duplicate or a gap names the producer that lost it.
+    #[test]
+    fn many_producers_append_concurrently_without_losing_a_page() {
+        const PRODUCERS: u64 = 8;
+        const PER_PRODUCER: u64 = 2_000;
+        let w = Arc::new(PageMapWriter::new());
+
+        let producers: Vec<_> = (0..PRODUCERS)
+            .map(|p| {
+                let w = Arc::clone(&w);
+                std::thread::spawn(move || {
+                    for k in 0..PER_PRODUCER {
+                        // Disjoint per producer and never zero, so a gap or a repeat is attributable.
+                        w.push(PageId(p * PER_PRODUCER + k + 1)).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in producers {
+            t.join().expect("producer thread panicked");
+        }
+
+        let total = (PRODUCERS * PER_PRODUCER) as usize;
+        assert_eq!(
+            w.len(),
+            total,
+            "the published length must account for every append: a short length means an index was \
+             claimed twice and a device page vanished from the map"
+        );
+        let mut seen: Vec<u64> = w.iter().map(|p| p.0).collect();
+        seen.sort_unstable();
+        let expected: Vec<u64> = (1..=(PRODUCERS * PER_PRODUCER)).collect();
+        assert_eq!(
+            seen, expected,
+            "every page must be mapped exactly once — no duplicate (two producers on one index) and \
+             no gap (an entry published but never written)"
+        );
     }
 }

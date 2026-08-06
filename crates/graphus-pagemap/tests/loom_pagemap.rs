@@ -45,7 +45,7 @@ use graphus_pagemap::PageMapWriter;
 #[test]
 fn a_published_entry_is_always_visible_to_a_concurrent_reader() {
     loom::model(|| {
-        let mut w = PageMapWriter::new();
+        let w = PageMapWriter::new();
         // Pre-publish one entry so the chunk is installed before the threads start: this isolates the
         // `len` edge, which is what the model is for.
         w.push(PageId(1)).unwrap();
@@ -89,7 +89,7 @@ fn a_published_entry_is_always_visible_to_a_concurrent_reader() {
 #[test]
 fn a_published_entry_in_a_freshly_installed_chunk_is_visible() {
     loom::model(|| {
-        let mut w = PageMapWriter::new();
+        let w = PageMapWriter::new();
         let map = w.reader();
 
         let reader = loom::thread::spawn(move || {
@@ -119,7 +119,7 @@ fn a_published_entry_in_a_freshly_installed_chunk_is_visible() {
 #[test]
 fn two_concurrent_readers_agree_with_the_writer() {
     loom::model(|| {
-        let mut w = PageMapWriter::new();
+        let w = PageMapWriter::new();
         w.push(PageId(1)).unwrap();
 
         let readers: Vec<_> = (0..2)
@@ -149,5 +149,83 @@ fn two_concurrent_readers_agree_with_the_writer() {
                 "a reader must see at least the pre-published entry"
             );
         }
+    });
+}
+
+/// **N producers never claim the same index** (`rmp` #1012) — the model that certifies the multi-writer
+/// append, and the one this whole layer exists for.
+///
+/// Two producers append concurrently. The property is stated on the OUTCOME rather than on the
+/// mechanism, because that is what a store's durability actually depends on: after both have returned,
+/// the map must hold **both** pages, each exactly once. A lost page here is not a transient read error
+/// — `FixedStore::to_meta` serialises the live map into the durable catalog, so it would leave
+/// committed records on a page nothing can address.
+///
+/// # This is the test the old `&mut self` could not have
+///
+/// Before `rmp` #1012 the signature made this model uncompilable: two threads cannot hold `&mut` to one
+/// writer. The defect it guards was therefore unreachable *and* unprovable — the borrow checker hid it
+/// rather than fixing it. Reinstating the old body (`let i = len.load(); … len.store(i + 1)`) makes
+/// loom fail here within a handful of interleavings: both producers read the same `i`, both write the
+/// same slot, and the map ends up holding one page twice and the other never.
+#[test]
+fn two_producers_never_claim_the_same_index() {
+    loom::model(|| {
+        let w = std::sync::Arc::new(PageMapWriter::new());
+
+        let a = {
+            let w = std::sync::Arc::clone(&w);
+            loom::thread::spawn(move || w.push(PageId(10)).unwrap())
+        };
+        let b = {
+            let w = std::sync::Arc::clone(&w);
+            loom::thread::spawn(move || w.push(PageId(20)).unwrap())
+        };
+        a.join().unwrap();
+        b.join().unwrap();
+
+        assert_eq!(w.len(), 2, "both appends must be published, not one");
+        let mut seen: Vec<u64> = (0..w.len())
+            .map(|i| w.get(i).expect("a published index must resolve").0)
+            .collect();
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            vec![10, 20],
+            "each producer's page must appear exactly once: a repeated value means two producers \
+             claimed one index and a device page vanished from the map"
+        );
+    });
+}
+
+/// **A published index always resolves, even while another producer is mid-append** (`rmp` #1012).
+///
+/// The companion to the model above, over the reader. Reserving an index and publishing it are two
+/// separate counters precisely so that a reader never sees an index whose entry is still a zero; this
+/// checks that separation under a real interleaving. Collapsing `reserved` and `len` into one counter
+/// makes loom fail here with a resolved device page of `0` — the metadata page.
+#[test]
+fn a_reader_never_observes_a_reserved_but_unwritten_index() {
+    loom::model(|| {
+        let w = std::sync::Arc::new(PageMapWriter::new());
+        let map = w.reader();
+
+        let producer = {
+            let w = std::sync::Arc::clone(&w);
+            loom::thread::spawn(move || w.push(PageId(7)).unwrap())
+        };
+        let reader = loom::thread::spawn(move || {
+            let len = map.len();
+            for i in 0..len {
+                assert_eq!(
+                    map.get(i).expect("a published index must resolve").0,
+                    7,
+                    "the reader observed a published index whose entry was never written"
+                );
+            }
+        });
+
+        producer.join().unwrap();
+        reader.join().unwrap();
     });
 }

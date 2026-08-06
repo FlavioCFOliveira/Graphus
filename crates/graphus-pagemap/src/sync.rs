@@ -47,3 +47,25 @@ pub(crate) use loom::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 #[cfg(not(loom))]
 pub(crate) use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+/// One turn of a bounded spin — the publication wait in `PageMapWriter::push` (`rmp` #1012).
+///
+/// The seam matters here as much as the atomics do, and for a reason specific to a *waiting* loop.
+/// Under `loom` a spin that never yields is not merely slow: every thread runs on one OS thread under
+/// a cooperative scheduler, so a producer spinning for a predecessor that the scheduler has not run
+/// **cannot make progress**, and the model deadlocks instead of exploring. `loom::thread::yield_now`
+/// is the explicit "another thread may run now" point that lets the checker interleave the wait.
+///
+/// In production the same call site wants the opposite: no scheduler involvement at all, just the
+/// CPU's spin hint (`pause` / `yield`), which keeps the wait cheap for the handful of instructions a
+/// predecessor needs to publish.
+#[cfg(loom)]
+pub(crate) fn spin_once() {
+    loom::thread::yield_now();
+}
+
+/// See the `loom` twin above.
+#[cfg(not(loom))]
+pub(crate) fn spin_once() {
+    std::hint::spin_loop();
+}
