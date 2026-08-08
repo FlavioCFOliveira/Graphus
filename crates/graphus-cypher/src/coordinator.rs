@@ -3046,7 +3046,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 }
             }
             // The registry resolves lazily-stamped commits (see `visible_instant_range`).
-            (labels, props, store.commit_registry().clone())
+            (labels, props, store.commit_registry_snapshot())
         };
 
         let mut idx = index.borrow_mut();
@@ -3347,7 +3347,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 }
             }
             // The registry resolves lazily-stamped commits (see `visible_instant_range`).
-            (out, store.commit_registry().clone())
+            (out, store.commit_registry_snapshot())
         };
 
         let mut idx = index.borrow_mut();
@@ -8485,7 +8485,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             snapshot.with_view(graphus_txn::View::New),
             created_ts,
             expired_ts,
-            store.commit_registry(),
+            &store.commit_registry_snapshot(),
         )
     }
 
@@ -10645,7 +10645,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             view: store.read_view(),
             tokens: store.token_snapshot(),
             snapshot,
-            registry: store.commit_registry().clone(),
+            registry: store.commit_registry_snapshot(),
             buffer: SsiReadBuffer::new(txn),
             // `rmp` #546: capture the full-text catalogue so an off-thread `db.index.fulltext.
             // queryNodes` resolves the index by name and recomputes matches from this snapshot. Small

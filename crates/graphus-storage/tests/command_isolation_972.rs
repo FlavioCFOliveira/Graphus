@@ -377,7 +377,7 @@ fn a_node_created_by_an_earlier_statement_has_its_labels_versioned() {
 #[test]
 fn a_node_created_by_this_statement_does_not_exist_to_its_own_old_view() {
     let mut s = fresh();
-    let registry = s.commit_registry().clone();
+    let registry = s.commit_registry_snapshot();
 
     let t = TxnId(1);
     s.begin(t);
@@ -408,7 +408,7 @@ fn a_node_created_by_this_statement_does_not_exist_to_its_own_old_view() {
 fn a_node_deleted_by_this_statement_still_exists_to_its_own_old_view() {
     let mut s = fresh();
     let n = seed_committed_node(&mut s, 1, 10);
-    let registry = s.commit_registry().clone();
+    let registry = s.commit_registry_snapshot();
 
     let t = TxnId(2);
     s.begin(t);
@@ -437,7 +437,7 @@ fn a_node_deleted_by_this_statement_still_exists_to_its_own_old_view() {
 #[test]
 fn a_node_created_and_deleted_in_one_statement_is_absent_under_both_views() {
     let mut s = fresh();
-    let registry = s.commit_registry().clone();
+    let registry = s.commit_registry_snapshot();
 
     let t = TxnId(1);
     s.begin(t);
@@ -468,7 +468,7 @@ fn a_node_created_and_deleted_in_one_statement_is_absent_under_both_views() {
 fn neither_view_changes_what_another_transaction_sees() {
     let mut s = fresh();
     let n = seed_committed_node(&mut s, 1, 10);
-    let registry = s.commit_registry().clone();
+    let registry = s.commit_registry_snapshot();
 
     let writer = TxnId(2);
     s.begin(writer);
@@ -561,7 +561,7 @@ fn a_statementless_write_survives_a_later_statements_old_view() {
 #[test]
 fn the_default_view_is_exactly_read_your_own_writes() {
     let mut s = fresh();
-    let registry = s.commit_registry().clone();
+    let registry = s.commit_registry_snapshot();
     let n = seed_committed_node(&mut s, 1, 10);
 
     let t = TxnId(2);

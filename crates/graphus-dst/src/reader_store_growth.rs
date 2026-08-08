@@ -172,7 +172,7 @@ pub fn run_reader_vs_store_growth(seed: u64) -> ReaderGrowthReport {
     let view = s.read_view();
     // A reader ticket distinct from every writer below.
     let reader_snapshot = Snapshot::new(TxnId(u64::MAX), s.snapshot_ts());
-    let registry = s.commit_registry().clone();
+    let registry = s.commit_registry_snapshot();
     let pages_before = s.store_page_count();
 
     // The survivors as the reader must still see them, and the id watermark that separates

@@ -27,8 +27,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use graphus_bufpool::ConcurrentBufferPool;
 use graphus_bufpool::page::{self, HEADER_SIZE};
@@ -400,6 +400,111 @@ impl StorePages for [FixedStore; STORE_COUNT] {
 
     fn mapped_page_count(&self, kind: StoreKind) -> u64 {
         self[kind as usize].device_pages.len() as u64
+    }
+}
+
+/// The active-transaction table, **sharded by `TxnId`** (`rmp` #1013, layer 5a of #975).
+///
+/// # Why sharded, and why interior mutability
+///
+/// This is the hottest shared scalar on the write path: every begin, every command boundary, every
+/// version stamp, every free and every commit touches it. Layer 5a's job is to let the methods that
+/// touch *only* this table take `&self`, so the exclusive `&mut RecordStore` stops being the thing
+/// that serialises them — and the compiler, not a comment, is what says a method qualified.
+///
+/// One `Mutex` around the whole map would have achieved the signature change and none of the point:
+/// every writer would still queue on one lock at its hottest call site. Sharding by `TxnId` means two
+/// transactions collide only when their ids hash to the same shard, which for `SHARDS` shards is the
+/// birthday-problem tail rather than the common case. The shard count is a power of two so the index
+/// is a mask, and it matches the buffer pool's page-table discipline (`rmp` #159), which is the
+/// in-house precedent rather than a number picked for its own sake.
+///
+/// # What it deliberately does NOT give
+///
+/// A shard is a hold over **one** transaction's entry, not over the table. Any operation that must
+/// see the table as a whole — "is any other transaction holding pending DDL?", "which commit slots are
+/// live?" — takes every shard in **index order**, which is what keeps two such scans from deadlocking
+/// against each other. Those are maintenance-frequency questions, not per-statement ones, so paying a
+/// full sweep for them is the right trade; a scan that ran per statement would want a different
+/// structure entirely.
+#[derive(Debug, Default)]
+struct ActiveTable {
+    shards: [Mutex<HashMap<TxnId, ActiveTxn>>; ACTIVE_SHARDS],
+}
+
+/// Shards in [`ActiveTable`]. A power of two, so the shard index is a mask rather than a modulo.
+const ACTIVE_SHARDS: usize = 16;
+
+impl ActiveTable {
+    /// The shard `txn` lives in. Multiplicative hash, because `TxnId`s are handed out consecutively
+    /// and the low bits alone would put every concurrent transaction of a burst in adjacent shards.
+    fn shard_of(txn: TxnId) -> usize {
+        (txn.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize & (ACTIVE_SHARDS - 1)
+    }
+
+    fn shard(&self, txn: TxnId) -> MutexGuard<'_, HashMap<TxnId, ActiveTxn>> {
+        self.shards[Self::shard_of(txn)]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Runs `f` over `txn`'s entry, creating it if absent — the `entry().or_default()` shape.
+    fn with_entry<R>(&self, txn: TxnId, f: impl FnOnce(&mut ActiveTxn) -> R) -> R {
+        f(self.shard(txn).entry(txn).or_default())
+    }
+
+    /// Runs `f` over `txn`'s entry **only if it already exists** — the `get_mut` shape. Returns `None`
+    /// when there is no entry, which several call sites depend on: inserting one there would make a
+    /// read-only transaction look like a writer.
+    fn with_existing<R>(&self, txn: TxnId, f: impl FnOnce(&mut ActiveTxn) -> R) -> Option<R> {
+        self.shard(txn).get_mut(&txn).map(f)
+    }
+
+    /// Reads `txn`'s entry without creating one.
+    fn with<R>(&self, txn: TxnId, f: impl FnOnce(&ActiveTxn) -> R) -> Option<R> {
+        self.shard(txn).get(&txn).map(f)
+    }
+
+    fn insert(&self, txn: TxnId, entry: ActiveTxn) -> Option<ActiveTxn> {
+        self.shard(txn).insert(txn, entry)
+    }
+
+    fn remove(&self, txn: TxnId) -> Option<ActiveTxn> {
+        self.shard(txn).remove(&txn)
+    }
+
+    fn contains_key(&self, txn: TxnId) -> bool {
+        self.shard(txn).contains_key(&txn)
+    }
+
+    /// Runs `f` over every entry, mutably, shards taken in index order — the whole-table twin of
+    /// [`with_existing`](Self::with_existing). Same maintenance-frequency caveat as
+    /// [`fold_all`](Self::fold_all).
+    fn for_each_mut(&self, mut f: impl FnMut(&mut ActiveTxn)) {
+        for shard in &self.shards {
+            let mut guard = shard
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for entry in guard.values_mut() {
+                f(entry);
+            }
+        }
+    }
+
+    /// Folds `f` over every entry in the table, taking the shards in **index order** so two concurrent
+    /// sweeps cannot deadlock against each other. See the type docs on why a whole-table view is a
+    /// maintenance operation and not a per-statement one.
+    fn fold_all<R>(&self, init: R, mut f: impl FnMut(R, TxnId, &ActiveTxn) -> R) -> R {
+        let mut acc = init;
+        for shard in &self.shards {
+            let guard = shard
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (txn, entry) in guard.iter() {
+                acc = f(acc, *txn, entry);
+            }
+        }
+        acc
     }
 }
 
@@ -1022,7 +1127,7 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     durable_write_commit_ts_hw: u64,
     /// Per-open-transaction version-stamp bookkeeping, consumed at [`commit`](Self::commit) to
     /// settle in-flight headers to the commit timestamp (`04 §5.2`).
-    active: HashMap<TxnId, ActiveTxn>,
+    active: ActiveTable,
     /// Set whenever a **catalog-only** mutation (one that changes durable [`Meta`] state *without*
     /// logging a WAL data record) has run since the last checkpoint — token interning
     /// ([`intern_token`](Self::intern_token)) and the histogram / index / full-text / spatial /
@@ -1077,7 +1182,10 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// GC-time header freezing (`rmp` task #59): a [`gc`](Self::gc) pass rewrites every in-flight
     /// stamp of a committed writer to its `Committed(ts)` form and, once that freeze is durable
     /// (the GC transaction commits), forgets the now-unreferenced writers from this table.
-    commit_registry: CommitRegistry,
+    /// Behind an `RwLock` since `rmp` #1013: **read-mostly by construction** — every visibility
+    /// decision reads it, and only a commit writes. A `Mutex` would have serialised readers against
+    /// each other for no reason; the whole point of layer 5a is that the hot read path stops queueing.
+    commit_registry: RwLock<CommitRegistry>,
     /// MVCC version history for the node **label bitmap** (`rmp` task #767).
     ///
     /// The label word is mutated IN PLACE inside the node record, so — unlike a property, which is a
@@ -1425,13 +1533,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // empty/zero (`rmp` #813): a read before the first write mints `"<db>:0"`.
             pending_write_commits: VecDeque::new(),
             durable_write_commit_ts_hw: 0,
-            active: HashMap::new(),
+            active: ActiveTable::default(),
             catalog_dirty: false,
             catalog_reloads: 0,
             schema_seq: 0,
             schema_last_seq: HashMap::default(),
             meta_chain: Vec::new(),
-            commit_registry: CommitRegistry::new(),
+            commit_registry: RwLock::new(CommitRegistry::new()),
             pending_gc_prune: None,
             // `rmp` #522 incremental-GC state (pure in-memory; rebuilt from scratch every open). The
             // freeze frontier starts at `1` so the first pass fully settles every pre-existing on-disk
@@ -1575,13 +1683,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // over-estimate — still durable, still monotonic.)
             pending_write_commits: VecDeque::new(),
             durable_write_commit_ts_hw: meta.commit_ts_hw,
-            active: HashMap::new(),
+            active: ActiveTable::default(),
             catalog_dirty: false,
             catalog_reloads: 0,
             schema_seq: 0,
             schema_last_seq: HashMap::default(),
             meta_chain,
-            commit_registry,
+            commit_registry: RwLock::new(commit_registry),
             pending_gc_prune: None,
             // `rmp` #522 incremental-GC state (pure in-memory; rebuilt from scratch every open). The
             // freeze frontier starts at `1` so the first pass fully settles every pre-existing on-disk
@@ -2533,13 +2641,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// live-referenced corpse (`rmp` #581). Mirrors the `SYSTEM_TXN` guard of
     /// [`note_created`](Self::note_created) / [`free_push`](Self::free_push): the system transaction
     /// never pops-then-aborts and is never rolled back.
-    fn note_popped_id(&mut self, txn: TxnId, kind: StoreKind, id: u64) {
+    fn note_popped_id(&self, txn: TxnId, kind: StoreKind, id: u64) {
         if txn != SYSTEM_TXN {
             self.active
-                .entry(txn)
-                .or_default()
-                .popped_ids
-                .push((kind, id));
+                .with_entry(txn, |a| a.popped_ids.push((kind, id)));
         }
     }
 
@@ -2646,8 +2751,19 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// `TxnId` until a [`gc`](Self::gc) pass freezes it to `Committed(ts)` and prunes the entry
     /// (`rmp` task #59). Borrowed read-only; the store owns the table.
     #[must_use]
-    pub fn commit_registry(&self) -> &CommitRegistry {
-        &self.commit_registry
+    pub fn commit_registry_snapshot(&self) -> CommitRegistry {
+        self.commit_registry().clone()
+    }
+
+    /// A read guard over the registry — the shape the hot visibility path needs (`rmp` #1013). Cloning
+    /// it per decision would be absurd on a path taken once per record; callers that must hold a value
+    /// across a mutation of the store take [`commit_registry_snapshot`](Self::commit_registry_snapshot)
+    /// instead, and pay the copy knowingly.
+    #[must_use]
+    pub fn commit_registry(&self) -> std::sync::RwLockReadGuard<'_, CommitRegistry> {
+        self.commit_registry
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Whether `txn` is a **live, unresolved** transaction of this store: it has
@@ -2674,7 +2790,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
 
     #[must_use]
     pub fn is_txn_active(&self, txn: TxnId) -> bool {
-        self.active.contains_key(&txn)
+        self.active.contains_key(txn)
     }
 
     /// How many **live label deltas** the undo area currently holds, and how many of them belong to
@@ -2781,13 +2897,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// predicate marker (`rmp` task #903) — see the caller for the full scenario.
     #[must_use]
     pub fn uncommitted_data_writer(&self) -> Option<TxnId> {
-        self.active
-            .iter()
-            .filter(|(_, a)| {
-                !a.created.is_empty() || !a.expired.is_empty() || !a.undo_links.is_empty()
-            })
-            .map(|(txn, _)| *txn)
-            .min()
+        self.active.fold_all(None, |acc: Option<TxnId>, txn, a| {
+            if a.created.is_empty() && a.expired.is_empty() && a.undo_links.is_empty() {
+                return acc;
+            }
+            Some(acc.map_or(txn, |cur| cur.min(txn)))
+        })
     }
 
     /// Opens transaction `txn`'s MVCC version-stamp bookkeeping. The WAL `BEGIN` is **lazy** (`rmp`
@@ -2804,7 +2919,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// ([`WalManager::oldest_active_first_lsn`]) are likewise driven by the *earliest logged record*,
     /// so a transaction that logs nothing correctly contributes no floor (it has no undo chain to
     /// protect).
-    pub fn begin(&mut self, txn: TxnId) {
+    pub fn begin(&self, txn: TxnId) {
         self.active.insert(txn, ActiveTxn::default());
     }
 
@@ -2821,13 +2936,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Calling it for a transaction the store has never seen begin registers one, so a caller that
     /// drives the store directly (the standalone seam, recovery tooling) needs no separate
     /// [`begin`](Self::begin).
-    pub fn begin_command(&mut self, txn: TxnId) -> CommandId {
-        let entry = self.active.entry(txn).or_default();
-        entry.command = entry.command.next();
-        // The previous statement's creations are no longer "created by the current statement", which
-        // is what re-arms the label creator gate correctly for the new one.
-        entry.created_this_command.clear();
-        entry.command
+    pub fn begin_command(&self, txn: TxnId) -> CommandId {
+        self.active.with_entry(txn, |entry| {
+            entry.command = entry.command.next();
+            // The previous statement's creations are no longer "created by the current statement",
+            // which is what re-arms the label creator gate correctly for the new one.
+            entry.created_this_command.clear();
+            entry.command
+        })
     }
 
     /// The statement `txn` is currently executing, or [`CommandId::NONE`] if it has opened none.
@@ -2838,8 +2954,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     #[must_use]
     pub fn command_of(&self, txn: TxnId) -> CommandId {
         self.active
-            .get(&txn)
-            .map_or(CommandId::NONE, |active| active.command)
+            .with(txn, |active| active.command)
+            .unwrap_or(CommandId::NONE)
     }
 
     /// The current MVCC read snapshot timestamp (`04 §5.2`): the largest commit timestamp issued so
@@ -3135,7 +3251,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // Nothing fallible remains, so the bookkeeping can go (`rmp` #866 / #955). A transaction on
             // this path wrote no record, so its count delta is empty and there is nothing to withdraw.
             debug_assert!(
-                self.active.get(&txn).is_none_or(|a| a.counts.is_empty()),
+                self.active
+                    .with(txn, |a| a.counts.is_empty())
+                    .unwrap_or(true),
                 "the `rmp` #529 read-only fast path must never hold a count delta: a counter mutation \
                  implies a record write, which implies WAL activity"
             );
@@ -3154,8 +3272,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             wrote_durable
                 || self
                     .active
-                    .get(&txn)
-                    .is_none_or(|a| a.commit_slot.is_none()),
+                    .with(txn, |a| a.commit_slot.is_none())
+                    .unwrap_or(true),
             "a transaction that owns a commit slot has written a record, so it must be WAL-active"
         );
         self.checkpoint_meta(txn, false)?;
@@ -3204,7 +3322,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // reader resolving a delta through the registry. Yielding here is what lets a scheduled
         // reader observe the durable-but-not-yet-visible state the line above created.
         sched::yield_at(YieldSite::CommitRegistryRecord, ResourceId::txn(txn.0));
-        self.commit_registry.record_commit(txn, commit_ts);
+        self.commit_registry
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record_commit(txn, commit_ts);
         // Releases the active-set entry — and with it this transaction's count delta and schema undo log
         // (`rmp` #866). This must happen before `open_txn_holds_pending_ddl()` below, which asks whether
         // any *other* open transaction still holds unpersisted DDL and would otherwise count this one's.
@@ -3245,7 +3366,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 .take()
                 .expect("is_gc_prune ⇒ Some(gc_txn == txn)");
             for writer in pending.writers {
-                self.commit_registry.forget(writer);
+                self.commit_registry
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .forget(writer);
                 // The writer's versions are now frozen (commit-ts stamps on disk): its commit record
                 // is no longer needed to resolve any stamp, so it stops flooring WAL reclamation.
                 self.unfrozen_commit_lsn.remove(&writer);
@@ -3286,7 +3410,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             self.gc_freeze_low_savepoint = None;
         }
         // Hand the unconsumed undo slab back before the entry that owns it is dropped (`rmp` #1011).
-        let slab = self.active.remove(&txn).and_then(|a| a.undo_slab);
+        let slab = self.active.remove(txn).and_then(|a| a.undo_slab);
         self.return_undo_slab(slab);
     }
 
@@ -3703,11 +3827,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             self.note_popped_id(txn, StoreKind::Undo, id);
             return Ok(id);
         }
-        let (next, end) = match self.active.get(&txn).and_then(|a| a.undo_slab) {
+        let (next, end) = match self.active.with(txn, |a| a.undo_slab).flatten() {
             Some((next, end)) if next < end => (next, end),
             _ => self.refill_undo_slab(txn)?,
         };
-        self.active.entry(txn).or_default().undo_slab = Some((next + 1, end));
+        self.active
+            .with_entry(txn, |a| a.undo_slab = Some((next + 1, end)));
         Ok(next)
     }
 
@@ -3719,7 +3844,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // page is already mapped and already counted in the catalog's page list, so this costs no WAL
         // and no page-list growth — which is the whole reason the pool exists.
         if let Some((first, end)) = self.spare_undo_slabs.pop() {
-            self.active.entry(txn).or_default().undo_slab = Some((first, end));
+            self.active
+                .with_entry(txn, |a| a.undo_slab = Some((first, end)));
             return Ok((first, end));
         }
         let rpp = paging::records_per_page(undo::UNDO_RECORD_SIZE) as u64;
@@ -3766,7 +3892,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 .unbump_run(first, end);
             return Err(e);
         }
-        self.active.entry(txn).or_default().undo_slab = Some((first, end));
+        self.active
+            .with_entry(txn, |a| a.undo_slab = Some((first, end)));
         Ok((first, end))
     }
 
@@ -3798,7 +3925,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// # Errors
     /// Returns a storage error if the slot cannot be allocated or written.
     fn commit_slot_for(&mut self, txn: TxnId) -> Result<u64> {
-        if let Some(id) = self.active.get(&txn).and_then(|a| a.commit_slot) {
+        if let Some(id) = self.active.with(txn, |a| a.commit_slot).flatten() {
             return Ok(id);
         }
         let id = self.alloc_id(StoreKind::Commit, txn)?;
@@ -3809,7 +3936,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // delta that survived the abort as a corpse can still be attributed to the transaction that
         // failed to commit.
         self.write_undo_area_create(StoreKind::Commit, id, &buf, undo::COMMIT_OFF_FLAGS, txn)?;
-        self.active.entry(txn).or_default().commit_slot = Some(id);
+        self.active.with_entry(txn, |a| a.commit_slot = Some(id));
         Ok(id)
     }
 
@@ -3872,15 +3999,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // GC could observe an `undo_ptr` pointing at a slot that is not yet a valid delta.
         self.write_undo_area_create(StoreKind::Undo, id, &buf, undo::UNDO_OFF_FLAGS, txn)?;
         self.write_chain_head(kind, entity, MVCC_OFF_UNDO_PTR, id, txn)?;
-        self.active
-            .entry(txn)
-            .or_default()
-            .undo_links
-            .push(UndoLink {
+        self.active.with_entry(txn, |a| {
+            a.undo_links.push(UndoLink {
                 kind,
                 entity,
                 delta: id,
             });
+        });
         // The chain just grew, so it becomes a candidate for the GC chain sweep (`rmp` #522's
         // pending-set design, applied to chains): the sweep iterates this set instead of scanning.
         self.pending_undo_chains.insert((kind as u8, entity));
@@ -3953,13 +4078,16 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// # Errors
     /// Returns a storage error if either word cannot be written.
     fn publish_commit_slot(&mut self, txn: TxnId, commit_ts: Timestamp) -> Result<()> {
-        let Some(active) = self.active.get(&txn) else {
+        // Slot and count read together under one shard hold: they are two halves of one answer.
+        let Some((slot, count)) = self
+            .active
+            .with(txn, |a| {
+                a.commit_slot.map(|s| (s, a.undo_links.len() as u64))
+            })
+            .flatten()
+        else {
             return Ok(());
         };
-        let Some(slot) = active.commit_slot else {
-            return Ok(());
-        };
-        let count = active.undo_links.len() as u64;
         self.patch_commit_slot_word(slot, undo::COMMIT_OFF_DELTA_COUNT, count, txn)?;
         self.patch_commit_slot_word(
             slot,
@@ -4520,10 +4648,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // tests "created by this **statement**", which is the exact condition under which no view of
         // any statement can ask what the node's labels were before.
         if VersionStamp::from_raw(creator) == VersionStamp::InFlight(txn)
-            && self.active.get(&txn).is_some_and(|a| {
-                a.created_this_command
-                    .contains(&(StoreKind::Node as u8, id))
-            })
+            && self
+                .active
+                .with(txn, |a| {
+                    a.created_this_command
+                        .contains(&(StoreKind::Node as u8, id))
+                })
+                .unwrap_or(false)
         {
             return Ok(());
         }
@@ -4778,15 +4909,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         let mut buf = [0u8; undo::UNDO_RECORD_SIZE];
         UndoDelta::new(UndoAction::DeleteObject, slot, command.0, NULL_ID).encode(&mut buf);
         self.write_undo_area_create(StoreKind::Undo, delta_id, &buf, undo::UNDO_OFF_FLAGS, txn)?;
-        self.active
-            .entry(txn)
-            .or_default()
-            .undo_links
-            .push(UndoLink {
+        self.active.with_entry(txn, |a| {
+            a.undo_links.push(UndoLink {
                 kind,
                 entity: id,
                 delta: delta_id,
             });
+        });
         self.pending_undo_chains.insert((kind as u8, id));
         Ok(delta_id)
     }
@@ -5130,7 +5259,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             }
         }
         let open: std::collections::BTreeSet<u64> =
-            self.active.values().filter_map(|a| a.commit_slot).collect();
+            self.active
+                .fold_all(std::collections::BTreeSet::new(), |mut acc, _, a| {
+                    if let Some(slot) = a.commit_slot {
+                        acc.insert(slot);
+                    }
+                    acc
+                });
         let commit_hw = self.store(StoreKind::Commit).alloc.high_water();
         // This loop DOES free commit slots as it goes, and the snapshot is still exact — worth stating
         // so it is not "fixed" into a per-id probe again. Each iteration frees at most its own `id`,
@@ -5292,11 +5427,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // reused id lands below it). Recorded even for `SYSTEM_TXN` so a system-created record is frozen.
         self.lower_freeze_low(kind, id);
         if txn != SYSTEM_TXN {
-            let active = self.active.entry(txn).or_default();
-            active.created.push((kind, id));
-            // `rmp` #972: and remember it for the CURRENT statement, which is what
-            // [`link_label_deltas`](Self::link_label_deltas)'s creator gate is allowed to test.
-            active.created_this_command.insert((kind as u8, id));
+            self.active.with_entry(txn, |active| {
+                active.created.push((kind, id));
+                // `rmp` #972: and remember it for the CURRENT statement, which is what
+                // [`link_label_deltas`](Self::link_label_deltas)'s creator gate is allowed to test.
+                active.created_this_command.insert((kind as u8, id));
+            });
         }
     }
 
@@ -5318,7 +5454,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.lower_freeze_low(kind, id);
         self.pending_tombstones[kind as usize].insert(id);
         if txn != SYSTEM_TXN {
-            self.active.entry(txn).or_default().expired.push((kind, id));
+            self.active.with_entry(txn, |a| a.expired.push((kind, id)));
         }
     }
 
@@ -5345,7 +5481,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// **inside** the hold that pushes — see [`AllocGuard::push_free_if_absent`]. Callers that used to
     /// test first and push later must pass their test's outcome *through* this, not around it: a
     /// declined push means somebody else got there, which is not an error.
-    fn free_push(&mut self, kind: StoreKind, id: u64, txn: TxnId) -> bool {
+    fn free_push(&self, kind: StoreKind, id: u64, txn: TxnId) -> bool {
         // `rmp` #973 coverage point: the instant a slot becomes reusable. Paired with the `rmp` #588
         // shadow-hold inside `push_free_shadow_held`, this is where a reader that predates the free
         // races slot recycling, so an interleaving that reaches it is worth being able to replay.
@@ -5370,10 +5506,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         }
         if txn != SYSTEM_TXN {
             self.active
-                .entry(txn)
-                .or_default()
-                .freed_ids
-                .push((kind, id));
+                .with_entry(txn, |a| a.freed_ids.push((kind, id)));
         }
         true
     }
@@ -5429,9 +5562,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         );
         let delta = if increment { 1 } else { -1 };
         self.statistics.apply_count_delta(key, delta);
-        if let Some(active) = self.active.get_mut(&txn) {
+        self.active.with_existing(txn, |active| {
             active.counts.record(key, delta);
-        }
+        });
     }
 
     /// Whether the live counters currently equal the **committed** image — i.e. no open transaction
@@ -5459,7 +5592,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// declines to serve a predicate (`rmp` #738: decline, never return a wrong-but-close answer).
     #[must_use]
     pub fn counts_match_committed_image(&self) -> bool {
-        self.active.values().all(|a| a.counts.is_empty())
+        self.active
+            .fold_all(true, |acc, _, a| acc && a.counts.is_empty())
     }
 
     /// **`rmp` #588.** Sets (or clears) the reuse barrier stamped onto GC-pass frees. The engine brackets
@@ -5528,13 +5662,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         if txn == SYSTEM_TXN {
             return;
         }
-        if let Some(a) = self.active.get_mut(&txn)
-            && a.popped_ids
+        self.active.with_existing(txn, |a| {
+            if a.popped_ids
                 .iter()
                 .any(|&(k, id)| k == StoreKind::Prop && id == pid)
-        {
-            a.popped_prop_owners.push((pid, owner_kind, owner_id));
-        }
+            {
+                a.popped_prop_owners.push((pid, owner_kind, owner_id));
+            }
+        });
     }
 
     /// Whether `mvcc` is a **live version**: its slot is in use and it carries no expiry tombstone
@@ -5815,7 +5950,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // sweep froze the rest), so each becomes forgettable the moment the freeze is durable — i.e.
             // when `txn` commits. The GC transaction itself, and any transaction that commits between
             // here and that commit, is not in this set and is pruned by a later pass.
-            let writers = self.commit_registry.committed_writers();
+            let writers = self
+                .commit_registry
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .committed_writers();
             let prune_scheduled = writers.len();
             self.pending_gc_prune = Some(PendingGcPrune {
                 gc_txn: txn,
@@ -5950,7 +6089,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// writer's stamps are reverted by its rollback's WAL undo, never frozen).
     fn frozen_word(&self, word: u64) -> Option<u64> {
         match VersionStamp::from_raw(word) {
-            VersionStamp::InFlight(writer) => match self.commit_registry.outcome(writer) {
+            VersionStamp::InFlight(writer) => match self
+                .commit_registry
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .outcome(writer)
+            {
                 TxnOutcome::Committed(ts) => Some(VersionStamp::committed(ts)),
                 TxnOutcome::InFlight | TxnOutcome::Aborted => None,
             },
@@ -6029,7 +6173,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // Schedule the same Active/Recent Transaction Table prune `gc` does: the sweep rewrote every
         // committed writer's on-disk in-flight stamps, so each becomes forgettable once this freeze is
         // durable (when `txn` commits). Mirrors `gc`'s prune scheduling so the table stays bounded.
-        let writers = self.commit_registry.committed_writers();
+        let writers = self
+            .commit_registry
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .committed_writers();
         let prune_scheduled = writers.len();
         if prune_scheduled > 0 {
             self.pending_gc_prune = Some(PendingGcPrune {
@@ -6190,8 +6338,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 self.pending_tombstones[kind as usize].remove(&id);
                 continue;
             }
-            let reclaimable = Self::is_reclaimable(mvcc, watermark, &self.commit_registry)
-                && (kind != StoreKind::Node || !self.has_live_incident_rels(id)?);
+            let reclaimable = Self::is_reclaimable(
+                mvcc,
+                watermark,
+                &self
+                    .commit_registry
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ) && (kind != StoreKind::Node || !self.has_live_incident_rels(id)?);
             if reclaimable {
                 match kind {
                     StoreKind::Rel => self.reclaim_rel(txn, id)?,
@@ -6324,8 +6478,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // [`undo_own_property`](Self::undo_own_property).
         let own_cells: BTreeSet<u64> = self
             .active
-            .get(&txn)
-            .map(|a| {
+            .with(txn, |a| {
                 a.created
                     .iter()
                     .filter(|(k, _)| *k == StoreKind::Prop)
@@ -6788,7 +6941,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// # Panics
     /// Panics if the WAL `fdatasync` fails (`04 §4.9`).
     pub fn rollback(&mut self, txn: TxnId) -> Result<()> {
-        match self.active.get(&txn).and_then(|a| a.commit_slot) {
+        match self.active.with(txn, |a| a.commit_slot).flatten() {
             Some(slot) => self.rollback_logical(txn, slot),
             None => self.rollback_physical(txn),
         }
@@ -6840,8 +6993,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // ------------------------------------------------------------------------------------------
         let links: Vec<UndoLink> = self
             .active
-            .get(&txn)
-            .map(|a| a.undo_links.clone())
+            .with(txn, |a| a.undo_links.clone())
             .unwrap_or_default();
         self.apply_own_deltas(txn, &links)?;
         self.detach_own_deltas(txn, &links, slot)?;
@@ -6857,7 +7009,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             schema_undo,
             counts,
             ..
-        } = self.active.remove(&txn).unwrap_or_default();
+        } = self.active.remove(txn).unwrap_or_default();
         // The counts twin of the delta replay: this transaction's own increments and decrements,
         // withdrawn from the live counters. Commutative and exactly invertible, so order is
         // irrelevant and no image of the counters is needed (`rmp` #866).
@@ -6872,7 +7024,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 schema_last_seq,
                 ..
             } = self;
-            Self::apply_schema_undo(statistics, schema_last_seq, active, &schema_undo);
+            Self::apply_schema_undo(statistics, schema_last_seq, &*active, &schema_undo);
             self.catalog_dirty = true;
         }
         Ok(())
@@ -6915,8 +7067,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // that needs to know, before the undo runs, whether this transaction holds DDL of its own.
         let holds_schema_undo = self
             .active
-            .get(&txn)
-            .is_some_and(|a| !a.schema_undo.is_empty());
+            .with(txn, |a| !a.schema_undo.is_empty())
+            .unwrap_or(false);
         // The free lists are NOT snapshotted (`rmp` #1023). They used to be, because `reload_catalog`
         // reset them to the durable image and the pre-rollback snapshot had to be restored on top —
         // and restoring a snapshot taken before the WAL undo is what silently reverted a concurrent
@@ -6986,8 +7138,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // is the only thing that removes it. (`committed_statistics` stops new checkpoints from
         // capturing pending DDL; this keeps the rollback correct regardless.) A transaction with no
         // catalog DDL and no concurrent transaction still clones nothing — the common path is unchanged.
-        let pre_statistics = (self.active.keys().any(|t| *t != txn) || holds_schema_undo)
-            .then(|| self.statistics.clone());
+        let another_txn_open = self.active.fold_all(false, |acc, t, _| acc || t != txn);
+        let pre_statistics =
+            (another_txn_open || holds_schema_undo).then(|| self.statistics.clone());
         // ------------------------------------------------------------------------------------------
         // FALLIBLE SECTION (`rmp` #955). Everything from here to `reload_catalog` can fail — with an
         // `Err` from the pool/catalog, or by unwinding out of the WAL `fdatasync` panic. NOTHING in it
@@ -7062,13 +7215,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             undo_links: aborted_undo_links,
             undo_slab: aborted_undo_slab,
             ..
-        } = self.active.remove(&txn).unwrap_or_default();
+        } = self.active.remove(txn).unwrap_or_default();
         // The remainder is as reusable after an abort as after a commit: none of its ids was ever
         // written (`rmp` #1011). Handed back BEFORE the catalog reload below, whose allocator reset is
         // exactly what made a SHARED cursor unsafe to keep — a slab of already-mapped ids is not.
         self.return_undo_slab(aborted_undo_slab);
         // The in-memory delta slab needs no explicit reset here (`rmp` #966, #1011): it now lives on
-        // the `ActiveTxn` the `self.active.remove(&txn)` above has already taken, so it drops with the
+        // the `ActiveTxn` the `self.active.remove(txn)` above has already taken, so it drops with the
         // transaction that owned it. That is also what makes dropping it SAFE, which it was not while
         // the slab was a store field: the catalog reload below resets the allocator to the durable
         // image, so clearing a SHARED cursor handed the next id of a run to a second writer that still
@@ -8803,6 +8956,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 && !owner_has_chain
                 && self
                     .commit_registry
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .resolve_commit_ts(prop.mvcc.created_ts)
                     .is_some_and(|ts| ts <= watermark);
             // A dead-link property **corpse** (`rmp` #172): a `!in_use` record not on the free list,
@@ -10492,8 +10647,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             let mut probe_seq = self.schema_last_seq.clone();
             // Every entry just recorded IS its own entry's last writer, so all of them fire and the
             // splice target is never touched — a scratch map keeps the real logs out of the probe.
-            let mut probe_live = HashMap::new();
-            Self::apply_schema_undo(&mut probe, &mut probe_seq, &mut probe_live, &entries);
+            let probe_live = ActiveTable::default();
+            Self::apply_schema_undo(&mut probe, &mut probe_seq, &probe_live, &entries);
             debug_assert!(
                 probe.schema_eq(&before) && probe_seq == before_seq,
                 "catalog undo over {keys:?} is not a faithful inverse of the mutation"
@@ -10505,9 +10660,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // and — since nothing will ever commit or roll it back — its phantom entry would suppress the
         // catalog checkpoint forever (`committed_statistics`). Recording nothing is the lesser failure,
         // and the debug assertion above turns any such call site into a failing test.
-        if let Some(active) = self.active.get_mut(&txn) {
+        self.active.with_existing(txn, |active| {
             active.schema_undo.extend(entries);
-        }
+        });
         self.catalog_dirty = true;
     }
 
@@ -10536,7 +10691,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     fn apply_schema_undo(
         stats: &mut Statistics,
         last_seq: &mut HashMap<SchemaKey, u64>,
-        live: &mut HashMap<TxnId, ActiveTxn>,
+        live: &ActiveTable,
         undo: &[SchemaUndo],
     ) {
         // One transaction's log is appended in ascending `seq`, so reverse iteration IS descending
@@ -10555,8 +10710,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///
     /// A successor inherits `dead`'s own predecessor link, which is by construction a state `dead`
     /// itself observed — so the chain stays rooted wherever it was rooted before `dead` joined it.
-    fn splice_schema_predecessor(live: &mut HashMap<TxnId, ActiveTxn>, dead: &SchemaUndo) {
-        for active in live.values_mut() {
+    fn splice_schema_predecessor(live: &ActiveTable, dead: &SchemaUndo) {
+        live.for_each_mut(|active| {
             for successor in &mut active.schema_undo {
                 if successor.prev_seq == dead.seq {
                     // Generations are globally unique and each belongs to exactly one entry, so
@@ -10570,7 +10725,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                     successor.prev_seq = dead.prev_seq;
                 }
             }
-        }
+        });
     }
 
     /// Restores one [`SchemaUndo`] entry, **iff** its transaction is still the entry's last writer
@@ -10661,29 +10816,26 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // order is deterministic without sorting. That determinism is load-bearing twice over: the
         // value is written into a DURABLE catalog, and an order-dependent one would also break DST
         // reproducibility. The schema half below cannot make the same argument and sorts by `seq`.
-        for (txn, active) in &self.active {
-            if *txn == committing {
-                continue;
+        self.active.fold_all((), |(), txn, active| {
+            if txn != committing {
+                active.counts.withdraw_from(&mut committed);
             }
-            active.counts.withdraw_from(&mut committed);
-        }
+        });
         // Schema half (`rmp` #734).
-        if self
-            .active
-            .iter()
-            .all(|(txn, a)| *txn == committing || a.schema_undo.is_empty())
-        {
+        if self.active.fold_all(true, |acc, txn, a| {
+            acc && (txn == committing || a.schema_undo.is_empty())
+        }) {
             return committed;
         }
         // Merge every open transaction's undo log and replay it in reverse GLOBAL order. Sorting by
         // the store-global `seq` is also what makes the result deterministic: `active` is a HashMap,
         // so its iteration order is not stable, but `seq` is unique and totally ordered.
-        let mut pending: Vec<&SchemaUndo> = self
-            .active
-            .iter()
-            .filter(|(txn, _)| **txn != committing)
-            .flat_map(|(_, a)| a.schema_undo.iter())
-            .collect();
+        let mut pending: Vec<SchemaUndo> = self.active.fold_all(Vec::new(), |mut acc, txn, a| {
+            if txn != committing {
+                acc.extend(a.schema_undo.iter().cloned());
+            }
+            acc
+        });
         pending.sort_unstable_by_key(|e| std::cmp::Reverse(e.seq));
         // A scratch copy of the generations: this is a read-only view of the catalog, so the store's
         // own witness map must survive it untouched.
@@ -10694,7 +10846,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // its active-set slot. Its value is therefore the committed one, which is exactly what
             // declining leaves in place. Every link that is still live is present in `pending` (a
             // rollback splices out the ones that are not), so live chains unwind here without gaps.
-            Self::undo_schema_entry(&mut committed, &mut last_seq, entry);
+            Self::undo_schema_entry(&mut committed, &mut last_seq, &entry);
         }
         committed
     }
@@ -10706,7 +10858,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// it while another transaction's DDL is still unpersisted would let that transaction's own commit
     /// take the `rmp` #529 read-only fast path and silently drop its committed DDL.
     fn open_txn_holds_pending_ddl(&self) -> bool {
-        self.active.values().any(|a| !a.schema_undo.is_empty())
+        self.active
+            .fold_all(false, |acc, _, a| acc || !a.schema_undo.is_empty())
     }
 
     /// Records (or replaces) the opaque value histogram for the node-label property

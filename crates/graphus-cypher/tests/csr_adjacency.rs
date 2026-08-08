@@ -127,7 +127,7 @@ fn build_multigraph() -> (Store, u64, usize) {
 
 fn ctx_for(s: &Store) -> (graphus_txn::CommitRegistry, Snapshot) {
     (
-        s.commit_registry().clone(),
+        s.commit_registry_snapshot(),
         Snapshot::new(TxnId(99), s.snapshot_ts()),
     )
 }

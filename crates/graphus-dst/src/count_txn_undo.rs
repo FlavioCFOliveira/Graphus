@@ -238,7 +238,7 @@ impl Counters {
         // A reader ticket distinct from every writer, so no in-flight write is ever visible as
         // "our own" (the same device `reader_store_growth` uses).
         let snapshot = Snapshot::new(TxnId(u64::MAX), store.snapshot_ts());
-        let registry = store.commit_registry().clone();
+        let registry = store.commit_registry_snapshot();
         let mut out = Self::default();
         let mut visible_node = BTreeMap::new();
         for id in store.scan_node_ids().expect("scan nodes") {

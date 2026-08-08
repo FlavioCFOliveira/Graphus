@@ -49,7 +49,7 @@ fn committed_image(s: &Store, observer: TxnId) -> Vec<String> {
     let snapshot = Snapshot::new(observer, s.snapshot_ts());
     let registry = s.commit_registry();
     let visible = |mvcc: graphus_storage::MvccHeader| {
-        mvcc.in_use() && is_visible(snapshot, mvcc.created_ts, mvcc.expired_ts, registry)
+        mvcc.in_use() && is_visible(snapshot, mvcc.created_ts, mvcc.expired_ts, &registry)
     };
 
     let mut out = Vec::new();

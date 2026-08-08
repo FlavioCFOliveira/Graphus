@@ -184,7 +184,7 @@ fn typed_expand_skips_nonmatching_reads_and_marks() {
     }
     s.commit(txn).unwrap();
 
-    let registry = s.commit_registry().clone();
+    let registry = s.commit_registry_snapshot();
     let ctx = VisCtx {
         snapshot: Snapshot::new(TxnId(99), s.snapshot_ts()),
         registry: &registry,
@@ -255,7 +255,7 @@ fn untyped_expand_marks_and_returns_all() {
     }
     s.commit(txn).unwrap();
 
-    let registry = s.commit_registry().clone();
+    let registry = s.commit_registry_snapshot();
     let ctx = VisCtx {
         snapshot: Snapshot::new(TxnId(99), s.snapshot_ts()),
         registry: &registry,

@@ -413,7 +413,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // resolve an on-disk in-flight stamp to its commit timestamp through this. A later commit is
         // correctly excluded whether or not this snapshot captured it (visibility filters by `ts`),
         // and own in-flight writes are visible via the owner rule, not the table.
-        let registry = store.commit_registry().clone();
+        let registry = store.commit_registry_snapshot();
         Self {
             store: SharedCell::new(store),
             txn,
@@ -467,7 +467,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // (`rmp` task #49). Cloning at attach is consistent with snapshot isolation: a transaction
         // that commits later is excluded by the `ts` filter regardless, and this statement's own
         // in-flight writes resolve via the owner rule.
-        let registry = store.borrow().commit_registry().clone();
+        let registry = store.borrow().commit_registry_snapshot();
         // **`rmp` #972.** The statement counter's single source of truth is the `RecordStore`, never a
         // copy held by the coordinator: one explicit transaction runs many statements over many
         // `RecordStoreGraph` instances, and each new instance must pick the counter up where the
@@ -941,7 +941,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     /// (`04 §5.3`). Primarily an MVCC-visibility testing seam.
     pub fn begin_at_snapshot(mut store: RecordStore<D, S>, txn: TxnId, ts: Timestamp) -> Self {
         store.begin(txn);
-        let registry = store.commit_registry().clone();
+        let registry = store.commit_registry_snapshot();
         let snapshot = snapshot_at_current_command(&store, txn, ts);
         Self {
             store: SharedCell::new(store),
