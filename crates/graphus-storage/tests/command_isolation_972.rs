@@ -112,7 +112,7 @@ fn seed_committed_node(s: &mut Store, txn: u64, value: i64) -> u64 {
 /// view ever undoes such a write.
 #[test]
 fn the_command_counter_is_per_transaction_and_advances_once_per_statement() {
-    let mut s = fresh();
+    let s = fresh();
     let (a, b) = (TxnId(1), TxnId(2));
     s.begin(a);
     s.begin(b);

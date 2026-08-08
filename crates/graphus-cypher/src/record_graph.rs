@@ -403,7 +403,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     /// The caller owns the transaction lifecycle: after running the query it calls
     /// [`commit`](Self::commit) (to make the writes durable) or [`rollback`](Self::rollback) (to
     /// undo them), and should first check [`take_error`](Self::take_error).
-    pub fn begin(mut store: RecordStore<D, S>, txn: TxnId) -> Self {
+    pub fn begin(store: RecordStore<D, S>, txn: TxnId) -> Self {
         // The snapshot timestamp is the store's latest commit (`04 §5.2`): this query sees exactly
         // what has committed so far, plus its own writes. Reads on a database that has changed since
         // this begin therefore stay on this consistent snapshot.
@@ -939,7 +939,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     /// is modelled over the single-threaded store: choosing `ts` below a record's commit timestamp
     /// makes that record invisible, exactly as a concurrent older reader would experience it
     /// (`04 §5.3`). Primarily an MVCC-visibility testing seam.
-    pub fn begin_at_snapshot(mut store: RecordStore<D, S>, txn: TxnId, ts: Timestamp) -> Self {
+    pub fn begin_at_snapshot(store: RecordStore<D, S>, txn: TxnId, ts: Timestamp) -> Self {
         store.begin(txn);
         let registry = store.commit_registry_snapshot();
         let snapshot = snapshot_at_current_command(&store, txn, ts);

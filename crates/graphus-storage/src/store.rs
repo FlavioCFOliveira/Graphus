@@ -1220,7 +1220,14 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// `xmin`/`xmax` in-flight stamp at `id`) and RAISED by the freeze sweep to the smallest id in the
     /// range still bearing an in-flight-writer stamp (or `high_water` if none). Initialised to `1` on
     /// open, so the first pass is a full freeze that settles every pre-existing on-disk stamp.
-    freeze_low: [u64; STORE_COUNT],
+    /// `AtomicU64` since `rmp` #1014, and the atomic is the CORRECTION, not a way to change a
+    /// signature. The operation the semantics already asks for is "lower it if the new value is
+    /// smaller", and expressed as read-compare-write that is a lost update: two writers appending
+    /// records below the frontier both read the old value, both decide, and the later store discards
+    /// the earlier descent. A frontier that failed to descend means the freeze sweep never revisits
+    /// those ids, so a committed writer's stamp stays in-flight for ever — the `rmp` #522
+    /// silent-data-loss shape. `fetch_min` is that operation, and it cannot lose an update.
+    freeze_low: [AtomicU64; STORE_COUNT],
     /// **`rmp` #809 — release-active freeze-frontier audit cursor.** Per-kind resume id for the bounded
     /// rotating-window audit ([`audit_freeze_frontier_window`](Self::audit_freeze_frontier_window)) that
     /// runs on every GC pass in an ordinary release build. Each pass scans `[freeze_audit_from[kind],
@@ -1545,7 +1552,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // freeze frontier starts at `1` so the first pass fully settles every pre-existing on-disk
             // stamp; `gc_full_scan_pending` forces that first pass to also do the full corpse/property
             // sweep for anything a fresh process has no in-memory record of.
-            freeze_low: [1; STORE_COUNT],
+            freeze_low: std::array::from_fn(|_| AtomicU64::new(1)),
             // `rmp` #809: the release-active freeze-frontier audit starts each store's rotating window
             // at id 1 (pure in-memory; rebuilt every open, so the on-disk format is unchanged).
             freeze_audit_from: [1; STORE_COUNT],
@@ -1695,7 +1702,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // freeze frontier starts at `1` so the first pass fully settles every pre-existing on-disk
             // stamp; `gc_full_scan_pending` forces that first pass to also do the full corpse/property
             // sweep for anything a fresh process has no in-memory record of.
-            freeze_low: [1; STORE_COUNT],
+            freeze_low: std::array::from_fn(|_| AtomicU64::new(1)),
             // `rmp` #809: the release-active freeze-frontier audit starts each store's rotating window
             // at id 1 (pure in-memory; rebuilt every open, so the on-disk format is unchanged).
             freeze_audit_from: [1; STORE_COUNT],
@@ -2759,7 +2766,6 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// it per decision would be absurd on a path taken once per record; callers that must hold a value
     /// across a mutation of the store take [`commit_registry_snapshot`](Self::commit_registry_snapshot)
     /// instead, and pay the copy knowingly.
-    #[must_use]
     pub fn commit_registry(&self) -> std::sync::RwLockReadGuard<'_, CommitRegistry> {
         self.commit_registry
             .read()
@@ -5438,11 +5444,21 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
 
     /// Lowers the `rmp` #522 freeze frontier for `kind` to cover `id` (a no-op if `id` is already at or
     /// above it). See [`freeze_low`](Self::freeze_low).
-    fn lower_freeze_low(&mut self, kind: StoreKind, id: u64) {
-        let slot = &mut self.freeze_low[kind as usize];
-        if id < *slot {
-            *slot = id;
-        }
+    #[cfg(test)]
+    pub(crate) fn freeze_frontier(&self, kind: StoreKind) -> u64 {
+        self.freeze_low[kind as usize].load(Ordering::Acquire)
+    }
+
+    /// Lowers the `rmp` #522 freeze frontier for `kind` to cover `id`. Takes `&self` since `rmp` #1014.
+    #[cfg(test)]
+    pub(crate) fn lower_freeze_frontier(&self, kind: StoreKind, id: u64) {
+        self.lower_freeze_low(kind, id);
+    }
+
+    fn lower_freeze_low(&self, kind: StoreKind, id: u64) {
+        // `fetch_min`, not read-compare-write: see the field's documentation for the lost update the
+        // latter admits and the `rmp` #522 stamp it strands.
+        self.freeze_low[kind as usize].fetch_min(id, Ordering::AcqRel);
     }
 
     /// Records that `txn` tombstoned (expired) record `id` in `kind`'s store, so `commit` can settle
@@ -5799,7 +5815,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // strand those now-un-frozen stamps below it. Cleared at this pass's commit. No other transaction
         // runs between here and this pass's commit/rollback (the single engine thread holds the store), so
         // the savepoint's frontier is exactly the pre-freeze value.
-        self.gc_freeze_low_savepoint = Some((txn, self.freeze_low));
+        self.gc_freeze_low_savepoint = Some((
+            txn,
+            std::array::from_fn(|i| self.freeze_low[i].load(Ordering::Acquire)),
+        ));
 
         // `rmp` #563: heartbeat the drain-progress beacon across every phase of this GC pass so a
         // `STOP DATABASE` that races it sees a *progressing* engine and waits rather than force-detaching.
@@ -6242,7 +6261,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         txn: TxnId,
         kind: StoreKind,
     ) -> Result<(usize, u64)> {
-        let from = self.freeze_low[kind as usize];
+        let from = self.freeze_low[kind as usize].load(Ordering::Acquire);
         let high_water = self.store(kind).alloc.high_water();
         let scanned = high_water.saturating_sub(from.max(1));
         let in_use = read_view::scan_in_use_mvcc_from(&self.pool, &self.stores, kind, from)?;
@@ -6274,7 +6293,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 self.bump_drain_progress();
             }
         }
-        self.freeze_low[kind as usize] = new_low;
+        // The sweep ADVANCES the frontier, which `fetch_min` cannot express (it only lowers). A plain
+        // store is right here and not a lost update in waiting: `new_low` was computed from a scan of
+        // `[from, high_water)` under this pass's hold, and any concurrent `lower_freeze_low` naming an
+        // id below it re-lowers the frontier afterwards by `fetch_min`. The order of the two is
+        // immaterial — a frontier that ends lower than necessary costs a re-scan, never a missed stamp.
+        self.freeze_low[kind as usize].store(new_low, Ordering::Release);
         Ok((frozen, scanned))
     }
 
@@ -7254,7 +7278,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         if let Some((sp_txn, saved)) = self.gc_freeze_low_savepoint
             && sp_txn == txn
         {
-            self.freeze_low = saved;
+            for (slot, v) in self.freeze_low.iter().zip(saved) {
+                slot.store(v, Ordering::Release);
+            }
             self.gc_freeze_low_savepoint = None;
         }
         self.tokens = pre_tokens;
@@ -13403,7 +13429,9 @@ mod tests {
 
         // Force a FULL-scan GC pass at the SAME watermark: reset the freeze frontier and the full-scan
         // flag (the child test module reaches the private incremental-GC state directly).
-        s.freeze_low = [1; STORE_COUNT];
+        for slot in &s.freeze_low {
+            slot.store(1, Ordering::Release);
+        }
         s.gc_full_scan_pending = true;
         let wm = s.snapshot_ts();
         s.begin(TxnId(next));
@@ -13483,12 +13511,16 @@ mod tests {
 
         // Model the #522 stranding: raise the freeze frontier PAST the node, so the (frontier-bounded)
         // incremental freeze sweep would skip it, leaving the committed stamp unfrozen forever.
-        s.freeze_low[StoreKind::Node as usize] = nid + 1;
+        s.freeze_low[StoreKind::Node as usize].store(nid + 1, Ordering::Release);
         // Prove the frontier-bounded sweep really does MISS it (it scans only `[freeze_low, high_water)`).
-        let (missed, _) =
-            read_view::scan_in_use_mvcc_from(&s.pool, &s.stores, StoreKind::Node, s.freeze_low[0])
-                .map(|v| (v.iter().any(|&(id, _)| id == nid), v))
-                .unwrap();
+        let (missed, _) = read_view::scan_in_use_mvcc_from(
+            &s.pool,
+            &s.stores,
+            StoreKind::Node,
+            s.freeze_low[0].load(Ordering::Acquire),
+        )
+        .map(|v| (v.iter().any(|&(id, _)| id == nid), v))
+        .unwrap();
         assert!(
             !missed,
             "the frontier-bounded sweep must skip the stranded node — that is what makes it invisible \
@@ -13513,7 +13545,7 @@ mod tests {
 
         // Now settle the stamp properly (a real full freeze) and re-audit: it must go SILENT. Reset the
         // frontier so the sweep actually visits the node, then freeze under a fresh GC-style txn.
-        s.freeze_low[StoreKind::Node as usize] = 1;
+        s.freeze_low[StoreKind::Node as usize].store(1, Ordering::Release);
         let g = TxnId(2);
         s.begin(g);
         let (frozen, _) = s
@@ -13564,7 +13596,7 @@ mod tests {
         s.begin(t);
         let (nid2, _) = s.create_node(t).unwrap();
         s.commit(t).unwrap();
-        s.freeze_low[StoreKind::Node as usize] = nid2 + 1;
+        s.freeze_low[StoreKind::Node as usize].store(nid2 + 1, Ordering::Release);
         // Aim the audit window at the node store so this pass definitely covers the stranded id.
         s.freeze_audit_from = [1; STORE_COUNT];
 
@@ -14782,5 +14814,87 @@ mod tests {
                 "an isolated commit still performs exactly one fdatasync"
             );
         }
+    }
+
+    /// **Two concurrent descents of the freeze frontier cannot lose one another** (`rmp` #1014, AC2).
+    ///
+    /// The frontier's operation is "lower it if the new value is smaller", and written as
+    /// read-compare-write that is a lost update: two writers appending records below the frontier both
+    /// read the old value, both decide to lower, and the later store discards the earlier descent. The
+    /// consequence is not a slow sweep — the freeze sweep visits only `[freeze_low, high_water)`, so a
+    /// frontier that failed to descend means those ids are never revisited and a committed writer's
+    /// stamp stays in-flight for ever. That is the `rmp` #522 silent-data-loss shape.
+    ///
+    /// `fetch_min` is that operation and cannot lose an update.
+    ///
+    /// # This test does NOT falsify the defect, and says so (`rmp` #1014)
+    ///
+    /// Stated plainly because a test credited with more than it proves is worse than no test. With
+    /// `fetch_min` replaced by `if id < load { store(id) }`, this **still passes**: three drafts were
+    /// tried — synchronised descents from opposite ends, a monotonicity observer, and the round-based
+    /// re-arm below — and none reproduced the lost update on x86, whose TSO makes the load-then-store
+    /// window vanishingly narrow. That is the same reason the page map's multi-producer claim needed
+    /// `loom` rather than threads (`rmp` #1012): a green thread test on x86 is not evidence about an
+    /// atomic protocol.
+    ///
+    /// What this test is, then, is a **behavioural regression guard** — the frontier ends at the
+    /// smallest id anybody proposed, under real contention — not a proof of the mechanism. The proof
+    /// belongs with the `loom` model this task's chain-head compare-and-swap also requires, and which
+    /// must live in a leaf crate because `--cfg loom` is a global rustflag. `fetch_min` is adopted
+    /// here on the strength of it being the operation the semantics names, not on this test.
+    #[test]
+    fn concurrent_descents_of_the_freeze_frontier_are_never_lost_1014() {
+        use std::sync::Arc;
+
+        use std::sync::Barrier;
+
+        /// Rounds. Each one re-arms the frontier high and races the same two proposals, so the
+        /// load-then-store window a read-compare-write opens is retried rather than existing only at
+        /// start-up (which is what made an earlier single-race draft of this test pass under the
+        /// defect).
+        const ROUNDS: usize = 5_000;
+        const HIGH: u64 = 1_000_000;
+
+        let s = Arc::new(fresh());
+        let gate = Arc::new(Barrier::new(2));
+        let rises = Arc::new(AtomicU64::new(0));
+
+        // The descender: proposes a value far above the winner's, but below the re-armed frontier, so
+        // its store is a legitimate descent from what it read — and, under read-compare-write, lands
+        // on top of the winner's `1` whenever the winner slips in between its load and its store.
+        let descender = {
+            let s = Arc::clone(&s);
+            let gate = Arc::clone(&gate);
+            std::thread::spawn(move || {
+                for _ in 0..ROUNDS {
+                    gate.wait();
+                    s.lower_freeze_frontier(StoreKind::Node, HIGH - 1);
+                }
+            })
+        };
+
+        for _ in 0..ROUNDS {
+            // Re-arm above both proposals. Written directly: `lower_freeze_frontier` only descends.
+            s.freeze_low[StoreKind::Node as usize].store(HIGH, Ordering::Release);
+            gate.wait();
+            s.lower_freeze_frontier(StoreKind::Node, 1);
+            // Both proposals are in; the frontier must be the smaller of them. Anything else is a
+            // descent that was overwritten by a larger one.
+            if s.freeze_frontier(StoreKind::Node) != 1 {
+                rises.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        descender.join().expect("descender thread panicked");
+
+        // THE property. An id below the frontier is one the freeze sweep will never revisit, so a
+        // frontier left above the smallest proposal has forfeited that range — and a committed
+        // writer's stamp in it stays in-flight for ever (`rmp` #522).
+        assert_eq!(
+            rises.load(Ordering::Relaxed),
+            0,
+            "in {ROUNDS} rounds the frontier ended above the smallest id proposed {} time(s): a \
+             concurrent descent was overwritten by a larger one (`rmp` #1014)",
+            rises.load(Ordering::Relaxed)
+        );
     }
 }

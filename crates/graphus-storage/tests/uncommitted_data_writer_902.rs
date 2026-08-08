@@ -46,7 +46,7 @@ fn a_store_with_no_open_transaction_has_no_uncommitted_writer() {
 
 #[test]
 fn an_open_transaction_that_has_written_nothing_is_not_a_writer() {
-    let mut store = fresh();
+    let store = fresh();
     store.begin(TxnId(7));
     assert_eq!(
         store.uncommitted_data_writer(),
