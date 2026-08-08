@@ -32,7 +32,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use graphus_core::{ElementId, GraphusError, Result};
 
@@ -346,9 +346,55 @@ struct AllocState {
     /// durable free list but must NOT be handed out until every off-thread reader that predates the
     /// free has retired.
     held: HashMap<u64, u64>,
-    /// The barrier stamped onto each free while a bracketed GC pass runs; `None` outside one, when a
-    /// freed slot is immediately reusable.
-    reuse_barrier: Option<u64>,
+}
+
+/// The reuse barrier stamped onto every free while a bracketed GC pass runs (`rmp` #588), shared by
+/// all six stores as **one** atomic (`rmp` #1025).
+///
+/// # Why one value and not six
+///
+/// Layer 4 gave each store its own copy, to buy the read-and-act atomicity that matters: `free_push`
+/// reads the barrier and stamps the overlay in the same hold. That part was right. What it also
+/// created was an *arming* race, because six copies are armed one latch at a time
+/// (`RecordStore::set_reuse_barrier` loops over the stores). A free landing on store 5 after store 0
+/// is armed and before store 5 is armed is **not stamped** — so the slot is immediately reusable, a
+/// writer takes it, and an off-thread reader that predates the free and is mid-walk through that slot
+/// reads a stranger's record. That is the ACID Isolation violation `rmp` #588 exists to close,
+/// re-opened by the replication that was meant to make it safe.
+///
+/// One atomic gives what six copies structurally cannot: a **single linearisation point**. Every free
+/// either precedes the arming — and legitimately goes unstamped, because the GC pass had not begun —
+/// or follows it and is stamped. There is no third case. The read-and-act atomicity is untouched: the
+/// load happens *inside* the store's hold, immediately before the stamp and the listing.
+///
+/// # The encoding, and why it is not the barrier itself
+///
+/// Stored as `barrier + 1`, with `0` meaning *not armed*. The barrier is an engine ticket and `0` is
+/// a legal ticket value, so using it as the sentinel would silently read a genuine barrier of `0` as
+/// "no GC pass running" and skip the hold. Arming at `u64::MAX` saturates rather than wrapping: that
+/// errs towards holding slots longer, which costs space, where the other direction costs correctness.
+#[derive(Debug, Default)]
+pub struct SharedReuseBarrier(AtomicU64);
+
+impl SharedReuseBarrier {
+    /// Arms (or, with `None`, disarms) the barrier for every store at once.
+    fn set(&self, barrier: Option<u64>) {
+        let encoded = match barrier {
+            None => 0,
+            // Fail-closed on the ceiling: saturating keeps a barrier armed (slots held longer),
+            // whereas wrapping would encode `u64::MAX` as `0` and disarm the hold entirely.
+            Some(b) => b.saturating_add(1),
+        };
+        self.0.store(encoded, Ordering::Release);
+    }
+
+    /// The barrier to stamp onto a free happening now, or `None` outside a bracketed GC pass.
+    fn get(&self) -> Option<u64> {
+        match self.0.load(Ordering::Acquire) {
+            0 => None,
+            encoded => Some(encoded - 1),
+        }
+    }
 }
 
 /// One store's complete physical-id allocation state, and the latch that covers it (`rmp` #1012).
@@ -385,6 +431,9 @@ struct AllocState {
 pub struct StoreAllocator {
     alloc: PhysicalAllocator,
     state: Mutex<AllocState>,
+    /// The `rmp` #588 reuse barrier, shared with the other five stores (`rmp` #1025). Read inside
+    /// this store's hold, armed globally in one atomic store. See [`SharedReuseBarrier`].
+    barrier: Arc<SharedReuseBarrier>,
 }
 
 impl Default for StoreAllocator {
@@ -400,6 +449,19 @@ impl StoreAllocator {
         Self {
             alloc: PhysicalAllocator::new(),
             state: Mutex::new(AllocState::default()),
+            barrier: Arc::default(),
+        }
+    }
+
+    /// The same, sharing `barrier` with the other stores of one `RecordStore` (`rmp` #1025). This is
+    /// the constructor the engine uses; [`new`](Self::new) leaves an allocator with a private barrier,
+    /// which is right for a standalone one (a test fixture) and wrong for a store in a set of six.
+    #[must_use]
+    pub fn with_shared_barrier(barrier: Arc<SharedReuseBarrier>) -> Self {
+        Self {
+            alloc: PhysicalAllocator::new(),
+            state: Mutex::new(AllocState::default()),
+            barrier,
         }
     }
 
@@ -410,13 +472,23 @@ impl StoreAllocator {
     /// Panics if `high_water` is `0` (id `0` is reserved).
     #[must_use]
     pub fn restore(high_water: u64, free: FreeList) -> Self {
+        Self::restore_with_shared_barrier(high_water, free, Arc::default())
+    }
+
+    /// [`restore`](Self::restore), sharing `barrier` with the other stores (`rmp` #1025).
+    #[must_use]
+    pub fn restore_with_shared_barrier(
+        high_water: u64,
+        free: FreeList,
+        barrier: Arc<SharedReuseBarrier>,
+    ) -> Self {
         Self {
             alloc: PhysicalAllocator::restore(high_water),
             state: Mutex::new(AllocState {
                 free,
                 held: HashMap::new(),
-                reuse_barrier: None,
             }),
+            barrier,
         }
     }
 
@@ -442,6 +514,7 @@ impl StoreAllocator {
     pub fn lock(&self) -> AllocGuard<'_> {
         AllocGuard {
             alloc: &self.alloc,
+            barrier: &self.barrier,
             state: self
                 .state
                 .lock()
@@ -457,6 +530,31 @@ impl StoreAllocator {
     /// Returns a storage error if the physical-id space is exhausted (`rmp` #452).
     pub fn allocate(&self) -> Result<Allocation> {
         self.lock().allocate()
+    }
+
+    /// Arms (or, with `None`, disarms) the `rmp` #588 reuse barrier for **every** store sharing it,
+    /// as one atomic store (`rmp` #1025).
+    ///
+    /// Takes no hold, and must not: arming is a single global act, and taking six latches in sequence
+    /// to publish one value is exactly the staggered window this replaced. The read-and-act atomicity
+    /// that matters is on the other side — [`AllocGuard::push_free_shadow_held`] loads this inside the
+    /// store's hold.
+    pub fn arm_reuse_barrier(&self, barrier: Option<u64>) {
+        self.barrier.set(barrier);
+    }
+
+    /// The barrier currently armed, as this store sees it (`rmp` #1025). Observability, and the hook
+    /// the arming-atomicity test needs: with one shared atom, "store 0 sees it armed" and "store 5
+    /// sees it armed" are the same fact, which is the whole property.
+    #[must_use]
+    pub fn armed_barrier(&self) -> Option<u64> {
+        self.barrier.get()
+    }
+
+    /// A handle to this allocator's shared barrier, for building its five siblings (`rmp` #1025).
+    #[must_use]
+    pub fn shared_barrier(&self) -> Arc<SharedReuseBarrier> {
+        Arc::clone(&self.barrier)
     }
 
     /// Lists `id` as free and, if a GC pass has armed a reuse barrier, shadow-holds it from reuse —
@@ -524,6 +622,9 @@ impl StoreAllocator {
 #[derive(Debug)]
 pub struct AllocGuard<'a> {
     alloc: &'a PhysicalAllocator,
+    /// The globally-shared reuse barrier (`rmp` #1025). Loaded inside this hold, so reading it and
+    /// stamping the overlay stay one indivisible decision.
+    barrier: &'a SharedReuseBarrier,
     state: MutexGuard<'a, AllocState>,
     /// Debug-only marker proving no I/O happens while this guard is alive. Declared last so it is
     /// dropped **after** the latch is released: over-reporting the held region is the safe direction
@@ -704,7 +805,10 @@ impl AllocGuard<'_> {
     /// The stamp is written **before** the id is listed, so a panic between them fails closed: an
     /// unlisted-but-held id can never be handed out, whereas a listed-but-unstamped one could.
     pub fn push_free_shadow_held(&mut self, id: u64) {
-        if let Some(barrier) = self.state.reuse_barrier {
+        // The load is INSIDE this hold (`rmp` #1025): reading the barrier and stamping the overlay
+        // remain one decision, exactly as when the barrier was a per-store field. What changed is that
+        // the value read is global, so a free cannot land between one store being armed and another.
+        if let Some(barrier) = self.barrier.get() {
             self.state.held.insert(id, barrier);
         }
         self.state.free.push(id);
@@ -762,8 +866,13 @@ impl AllocGuard<'_> {
     }
 
     /// Sets (or clears) the reuse barrier stamped onto subsequent frees (`rmp` #588).
+    ///
+    /// Arms it for **every** store sharing this barrier, in one atomic store (`rmp` #1025) — it is no
+    /// longer this store's own field. Kept on the guard because callers already hold one and because
+    /// arming is meaningless outside a store's context, but note that it does not need the hold: see
+    /// [`StoreAllocator::arm_reuse_barrier`], which is what the engine calls.
     pub fn set_reuse_barrier(&mut self, barrier: Option<u64>) {
-        self.state.reuse_barrier = barrier;
+        self.barrier.set(barrier);
     }
 
     /// Releases every shadow-held slot whose barrier `b` satisfies `b <= oldest_open_ticket` — i.e.

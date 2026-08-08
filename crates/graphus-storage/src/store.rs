@@ -42,7 +42,7 @@ use graphus_txn::{CommitRegistry, Snapshot, TxnOutcome};
 use graphus_wal::{LogSink, WalManager};
 
 use crate::heap::{self, BLOCK_PAYLOAD, HeapBlock, STRINGS_RECORD_SIZE};
-use crate::idalloc::{Allocation, ElementIdAllocator, NULL_ID, StoreAllocator};
+use crate::idalloc::{Allocation, ElementIdAllocator, NULL_ID, SharedReuseBarrier, StoreAllocator};
 use crate::labels;
 use crate::meta::{
     CompositeIndexEntry, ConstraintEntry, CountKey, FulltextIndexEntry, IndexState,
@@ -233,19 +233,23 @@ impl FixedStore {
     ///
     /// # Errors
     /// Returns a storage error if the catalog's page list exceeds the page map's addressable ceiling.
-    fn from_meta(kind: StoreKind, m: &StoreMeta) -> Result<Self> {
+    fn from_meta(kind: StoreKind, m: &StoreMeta, barrier: Arc<SharedReuseBarrier>) -> Result<Self> {
         Ok(Self {
             kind,
-            alloc: StoreAllocator::restore(m.high_water.max(1), m.free_list.clone()),
+            alloc: StoreAllocator::restore_with_shared_barrier(
+                m.high_water.max(1),
+                m.free_list.clone(),
+                barrier,
+            ),
             device_pages: PageMapWriter::from_pages(m.device_pages.iter().copied().map(PageId))?,
         })
     }
 
     /// A brand-new, empty store handle (the `create` path): an empty page map, a fresh allocator.
-    fn empty(kind: StoreKind) -> Self {
+    fn empty(kind: StoreKind, barrier: Arc<SharedReuseBarrier>) -> Self {
         Self {
             kind,
-            alloc: StoreAllocator::new(),
+            alloc: StoreAllocator::with_shared_barrier(barrier),
             device_pages: PageMapWriter::new(),
         }
     }
@@ -1368,7 +1372,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             wal: shared,
             element_ids: ElementIdAllocator::new(element_id_seed.max(1)),
             tokens: TokenStore::new(),
-            stores: ALL_STORE_KINDS.map(FixedStore::empty),
+            // One barrier for all six (`rmp` #1025) — see `SharedReuseBarrier`.
+            stores: {
+                let barrier = Arc::<SharedReuseBarrier>::default();
+                ALL_STORE_KINDS.map(|k| FixedStore::empty(k, Arc::clone(&barrier)))
+            },
             commit_ts_hw: 0,
             // A fresh store has made no durable write, so both the queue and the bookmark high-water start
             // empty/zero (`rmp` #813): a read before the first write mints `"<db>:0"`.
@@ -1467,13 +1475,19 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // What `decode` CANNOT decide is whether an older image's properties still mean what this
         // build reads; that is `refuse_legacy_property_tombstones` below (`rmp` #967).
         let store_format_version = meta.format_version;
+        // One barrier for all six (`rmp` #1025) — see `SharedReuseBarrier`.
+        let reuse_barrier = Arc::<SharedReuseBarrier>::default();
         let mut stores = [
-            FixedStore::from_meta(StoreKind::Node, &meta.stores[0])?,
-            FixedStore::from_meta(StoreKind::Rel, &meta.stores[1])?,
-            FixedStore::from_meta(StoreKind::Prop, &meta.stores[2])?,
-            FixedStore::from_meta(StoreKind::Strings, &meta.stores[3])?,
-            FixedStore::from_meta(StoreKind::Undo, &meta.stores[4])?,
-            FixedStore::from_meta(StoreKind::Commit, &meta.stores[5])?,
+            FixedStore::from_meta(StoreKind::Node, &meta.stores[0], Arc::clone(&reuse_barrier))?,
+            FixedStore::from_meta(StoreKind::Rel, &meta.stores[1], Arc::clone(&reuse_barrier))?,
+            FixedStore::from_meta(StoreKind::Prop, &meta.stores[2], Arc::clone(&reuse_barrier))?,
+            FixedStore::from_meta(
+                StoreKind::Strings,
+                &meta.stores[3],
+                Arc::clone(&reuse_barrier),
+            )?,
+            FixedStore::from_meta(StoreKind::Undo, &meta.stores[4], Arc::clone(&reuse_barrier))?,
+            FixedStore::from_meta(StoreKind::Commit, &meta.stores[5], reuse_barrier)?,
         ];
         // Re-attribute every record page the device holds back to its owning store (`rmp` #239). The
         // durable catalog persists a store's `device_pages`/`high_water` only at a *commit*; a page
@@ -5400,9 +5414,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// same value in all six — replicating it costs one word per store and buys the read-and-act
     /// atomicity a shared field could not have given without a seventh, global latch.
     pub fn set_reuse_barrier(&self, barrier: Option<u64>) {
-        for store in &self.stores {
-            store.alloc.lock().set_reuse_barrier(barrier);
-        }
+        // ONE atomic store, visible identically to all six stores (`rmp` #1025). This used to loop,
+        // arming each store under its own latch, so a free landing on a store not yet armed went
+        // unstamped and its slot was immediately reusable — the `rmp` #588 Isolation violation,
+        // re-opened by the very replication meant to make the stamp atomic. Reading the barrier and
+        // stamping the overlay are still one hold; it is only the ARMING that is now one act.
+        self.stores[0].alloc.arm_reuse_barrier(barrier);
     }
 
     /// **`rmp` #588.** Releases every shadow-held slot whose reuse barrier is now safe: a slot held at

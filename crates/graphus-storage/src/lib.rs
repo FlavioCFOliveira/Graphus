@@ -113,7 +113,7 @@ pub use graphus_pagemap::{PageMap, PageMapWriter};
 pub use heap::{BLOCK_PAYLOAD, HeapBlock, STRINGS_RECORD_SIZE};
 pub use idalloc::{
     AllocGuard, Allocation, ElementIdAllocator, FreeList, NULL_ID, PhysicalAllocator,
-    StoreAllocator,
+    SharedReuseBarrier, StoreAllocator,
 };
 pub use incremental::{
     CHAIN_FORMAT_VERSION, ChainArtifact, ChainLinks, ChainManifest, IncrementMeta, LinkCodec,
