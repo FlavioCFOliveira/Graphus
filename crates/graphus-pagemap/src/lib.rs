@@ -154,9 +154,17 @@ const MAX_ENTRIES: usize = ((1usize << MAX_CHUNKS) - 1) << CHUNK0_LOG2;
 /// A store's live, append-only, lock-free store-relative-page → device-`PageId` map (`rmp` #721).
 ///
 /// **Readers only.** This type exposes *no* way to mutate the map: appending requires the
-/// [`PageMapWriter`] token, which is not `Clone`, is owned solely by the store's `FixedStore`, and is
-/// reachable only through `&mut RecordStore`. So the single-writer contract is enforced by the borrow
-/// checker, not by convention — see [`PageMapWriter`].
+/// [`PageMapWriter`] token, which is not `Clone` and is owned solely by the store's `FixedStore`. That
+/// is a *capability* boundary — who may append at all — and it is all it has ever been meant to be.
+///
+/// It is **not** a single-writer contract, and there is no longer one to enforce (`rmp` #1012). This
+/// comment used to claim the borrow checker enforced one, on the strength of `push` taking `&mut self`
+/// and the token being reachable only through `&mut RecordStore`. Both halves are now false: `push`
+/// takes `&self` since 37ecb26, and layer 4 of `rmp` #975 retired `RecordStore::store_mut` entirely,
+/// so a store handle is reached through `&self`. The safety of concurrent appends does not rest on
+/// exclusion at all — it rests on the index being claimed by `compare_exchange` and published in index
+/// order. See [`PageMapWriter`] for that protocol and for why it is a stronger guarantee than the one
+/// it replaced.
 ///
 /// Shared as an `Arc<PageMap>` between the writer and every off-thread reader. See the module
 /// documentation for the monotonicity invariant that makes a live map the correct location oracle, and

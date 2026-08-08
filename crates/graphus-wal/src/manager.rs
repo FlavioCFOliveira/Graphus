@@ -752,6 +752,10 @@ impl<S: LogSink> WalManager<S> {
     /// throughout the (debug-profile) test suite.
     fn harden(&mut self) {
         graphus_core::latch::assert_no_frame_latch_held("WalManager::harden");
+        // Same guarantee, for the store's rank-25 physical-id allocation latch (`rmp` #1012). It is
+        // never held across I/O, and a barrier is the sharpest instance of that: held here, one
+        // `fdatasync` would convoy every allocator of that store. Also debug-only.
+        graphus_core::latch::assert_no_alloc_latch_held("WalManager::harden");
         if let Err(e) = self.sink.sync() {
             panic!("WAL fdatasync failed; aborting to avoid silent data loss (fsyncgate): {e}");
         }

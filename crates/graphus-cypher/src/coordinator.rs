@@ -11563,7 +11563,9 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// [`checkpoint`](Self::checkpoint) and `None` after; forwards to
     /// [`RecordStore::set_reuse_barrier`]. See [`release_reusable_slots`](Self::release_reusable_slots).
     pub fn set_reuse_barrier(&self, barrier: Option<u64>) {
-        self.store.borrow_mut().set_reuse_barrier(barrier);
+        // `&self` since `rmp` #1012: the barrier lives inside each store's own allocation latch, so
+        // arming it no longer needs exclusive access to the whole `RecordStore`.
+        self.store.borrow().set_reuse_barrier(barrier);
     }
 
     /// **`rmp` #588.** Lifts the reuse hold on every GC-freed slot whose barrier the oldest open
@@ -11572,7 +11574,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// readers retire, so a freed slot becomes reusable exactly when no predating reader remains — no
     /// space leak, no premature reuse. Forwards to [`RecordStore::release_held`].
     pub fn release_reusable_slots(&self, oldest_open_ticket: u64) {
-        self.store.borrow_mut().release_held(oldest_open_ticket);
+        // `&self` since `rmp` #1012 — see `set_reuse_barrier` above.
+        self.store.borrow().release_held(oldest_open_ticket);
     }
 
     /// **`rmp` #992** (observability): how many entries the value-keyed derived indexes hold in total

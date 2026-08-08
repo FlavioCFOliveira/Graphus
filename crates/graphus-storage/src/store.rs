@@ -42,7 +42,7 @@ use graphus_txn::{CommitRegistry, Snapshot, TxnOutcome};
 use graphus_wal::{LogSink, WalManager};
 
 use crate::heap::{self, BLOCK_PAYLOAD, HeapBlock, STRINGS_RECORD_SIZE};
-use crate::idalloc::{ElementIdAllocator, FreeList, NULL_ID, PhysicalAllocator};
+use crate::idalloc::{Allocation, ElementIdAllocator, FreeList, NULL_ID, StoreAllocator};
 use crate::labels;
 use crate::meta::{
     CompositeIndexEntry, ConstraintEntry, CountKey, FulltextIndexEntry, IndexState,
@@ -198,14 +198,27 @@ impl StoreKind {
 /// `device_pages` is a [`PageMapWriter`] — the append side of a **live**, append-only, lock-free map
 /// whose read side ([`Arc<PageMap>`]) is shared with every off-thread reader (`rmp` #721). It is
 /// deliberately NOT a `Vec` owned solely by the writer: the reader's location oracle must be live,
-/// because the record *content* it navigates is live. The writer token is not `Clone` and appending
-/// takes `&mut`, so the borrow checker still enforces the single-writer contract exactly as it did for
-/// the old `Vec<PageId>`. See [`crate::pagemap`] for the monotonicity invariant, the publication
-/// ordering, and why the single-writer contract is load-bearing for durability.
+/// because the record *content* it navigates is live.
+///
+/// **There is no single-writer contract here any more, and nothing enforces one** (`rmp` #1012). An
+/// earlier version of this comment said the borrow checker did, because `push` took `&mut self`. That
+/// stopped being true in 37ecb26: `push` takes `&self` and is safe for `N` producers, because the
+/// index it appends at is claimed by `compare_exchange` rather than by a non-atomic read-then-write.
+/// What replaced the borrow checker's guarantee is therefore *stronger*, not looser — it holds for
+/// many producers instead of assuming there is only ever one. See [`graphus_pagemap::PageMapWriter`]
+/// for the three-phase reserve/write/publish protocol, and [`graphus_pagemap`] for the monotonicity
+/// invariant that makes a live map the correct location oracle.
+///
+/// `alloc` is a [`StoreAllocator`] — the store's high-water mark, its free list, its `rmp` #588
+/// shadow-hold overlay and its reuse barrier, behind **one latch of its own** (`rmp` #1012, layer 4
+/// of #975). One latch per store, not one for the six: a writer creating a node and a writer creating
+/// a relationship contend for nothing. Every field of a `FixedStore` is now mutable through `&self`
+/// — the allocator through its latch, the page map through its multi-producer `push` — which is what
+/// retired `store_mut` and, with it, the last structural reason the store's write path needed
+/// `&mut self` to reach a store handle.
 struct FixedStore {
     kind: StoreKind,
-    alloc: PhysicalAllocator,
-    free: FreeList,
+    alloc: StoreAllocator,
     device_pages: PageMapWriter,
 }
 
@@ -223,8 +236,7 @@ impl FixedStore {
     fn from_meta(kind: StoreKind, m: &StoreMeta) -> Result<Self> {
         Ok(Self {
             kind,
-            alloc: PhysicalAllocator::restore(m.high_water.max(1)),
-            free: m.free_list.clone(),
+            alloc: StoreAllocator::restore(m.high_water.max(1), m.free_list.clone()),
             device_pages: PageMapWriter::from_pages(m.device_pages.iter().copied().map(PageId))?,
         })
     }
@@ -233,18 +245,78 @@ impl FixedStore {
     fn empty(kind: StoreKind) -> Self {
         Self {
             kind,
-            alloc: PhysicalAllocator::restore(1),
-            free: FreeList::default(),
+            alloc: StoreAllocator::new(),
             device_pages: PageMapWriter::new(),
         }
     }
 
-    fn to_meta(&self) -> StoreMeta {
-        StoreMeta {
-            high_water: self.alloc.high_water(),
-            free_list: self.free.clone(),
-            device_pages: self.device_pages.iter().map(|p| p.0).collect(),
+    /// This store's durable catalog entry — **refusing** to produce one that is internally
+    /// inconsistent.
+    ///
+    /// # The invariant, stated
+    ///
+    /// > **`high_water <= capacity.max(1)`**, where `capacity = mapped pages * records per page`.
+    ///
+    /// Every physical id that has ever been handed out must have a mapped device page. Ids run
+    /// `1..high_water`, so the largest one ever allocated is `high_water - 1`, and it is addressable
+    /// exactly when `high_water - 1 < capacity`. The `.max(1)` folds in the never-used store, which
+    /// legitimately carries `high_water == 1` with zero mapped pages: the next id it *will* hand out
+    /// is not yet an id it *has* handed out.
+    ///
+    /// # Why this is a floor and not an assertion
+    ///
+    /// The decoder has refused to *load* such a catalog since `rmp` #452
+    /// ([`Meta::decode`](crate::meta::Meta::decode), the identical predicate). Until now nothing
+    /// refused to *write* one, and the asymmetry is what turned VOPR seed 5043221 into silent loss of
+    /// committed data: a transaction advanced the high-water, failed a later step before mapping the
+    /// page, and a checkpoint persisted `high_water > capacity`. The next rollback's catalog reload
+    /// then rejected the image it had just written, and — because that error aborted the reload after
+    /// it had already dismantled the page maps — blank pages were allocated over committed records.
+    /// A store cannot be recovered from a catalog it refuses to read, so writing one is never the
+    /// lesser evil: refusing the checkpoint fails the transaction with a diagnosis, which is
+    /// recoverable, instead of producing an image that is not.
+    ///
+    /// With one writer this is unreachable, because [`alloc_id`](RecordStore::alloc_id) maps the page
+    /// before returning the id and un-bumps if it cannot. With `N` writers the un-bump can be legally
+    /// *declined* (another writer has already allocated past it — see
+    /// [`AllocGuard::unbump_fresh`](crate::idalloc::AllocGuard::unbump_fresh)), so the window becomes
+    /// reachable and this stops being theatre. Closing it at the source — mapping the page *before*
+    /// publishing the bump — is `rmp` #1014 (layer 5b), acceptance criterion 6.
+    ///
+    /// # Errors
+    /// Returns a storage error if this store's high-water mark exceeds the capacity its device-page
+    /// map addresses.
+    fn to_meta(&self) -> Result<StoreMeta> {
+        // ONE hold: the mark and the free list are two halves of one image, and a free id must be
+        // an id the mark accounts for.
+        let guard = self.alloc.lock();
+        let high_water = guard.high_water();
+        let free_list = guard.free().clone();
+        drop(guard);
+        // The page list is walked with the latch RELEASED — deliberately. It is O(mapped pages), and
+        // holding a rank-25 latch for the length of a catalog checkpoint would stall every allocator
+        // of this store for no gain: the check below is exact regardless of ordering, because it
+        // compares the very `high_water` and the very `device_pages` this image PERSISTS. A page map
+        // that grew in between only makes the persisted image more consistent, never less.
+        let device_pages: Vec<u64> = self.device_pages.iter().map(|p| p.0).collect();
+        let capacity = paging::capacity(device_pages.len() as u64, self.kind.record_size());
+        if high_water > capacity.max(1) {
+            return Err(GraphusError::Storage(format!(
+                "refusing to checkpoint {:?} store: high_water {} exceeds the capacity {} its {} \
+                 mapped device page(s) address. Every allocated physical id must have a mapped page \
+                 (`rmp` #479); a catalog that breaks it is one this build's own decoder rejects on \
+                 reopen (`rmp` #452), so persisting it would make the store unrecoverable.",
+                self.kind,
+                high_water,
+                capacity,
+                device_pages.len()
+            )));
         }
+        Ok(StoreMeta {
+            high_water,
+            free_list,
+            device_pages,
+        })
     }
 }
 
@@ -263,8 +335,27 @@ impl StorePages for [FixedStore; STORE_COUNT] {
             })
     }
 
+    /// Clamped to the mapped capacity, exactly as
+    /// [`capture_read_meta`](RecordStore::capture_read_meta) clamps the off-thread twin (`rmp` #1012).
+    ///
+    /// The two are the *same* read path served through two oracles, so a bound that is safe in one and
+    /// raw in the other is not a difference in policy — it is one of them being wrong. Layer 4 clamped
+    /// the snapshot and left this one raw, which would have made every **inline** scan of a store the
+    /// one that dies with `"{kind} store page N not allocated"` once `high_water > capacity` becomes
+    /// reachable: the window [`alloc_id`](RecordStore::alloc_id) opens between publishing the bump and
+    /// mapping the page, plus any un-bump that a concurrent writer declines and so leaves standing.
+    /// `seed_pending_undo_chains` scans `1..high_water` through this very oracle, so the first GC pass
+    /// after such a window would be the casualty.
+    ///
+    /// Inert today — with one writer nothing reads between the bump and the map — and deliberately
+    /// installed before it stops being inert (`rmp` #1013 / #1014). The clamp is sound for the same
+    /// reason as its twin: an id at or above the mapped capacity has no page, so it has never been
+    /// written, so no record is hidden by declining to scan it. The cure remains mapping the page
+    /// before publishing the bump (`rmp` #1014, acceptance criterion 6); this is the floor until then.
     fn high_water(&self, kind: StoreKind) -> u64 {
-        self[kind as usize].alloc.high_water()
+        let s = &self[kind as usize];
+        let capacity = paging::capacity(s.device_pages.len() as u64, kind.record_size());
+        s.alloc.high_water().min(capacity)
     }
 
     fn mapped_page_count(&self, kind: StoreKind) -> u64 {
@@ -1088,27 +1179,28 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// leak the field's predecessor already accepted, and now bounded rather than per-transaction.
     spare_undo_slabs: Vec<(u64, u64)>,
     gc_freeze_low_savepoint: Option<(TxnId, [u64; STORE_COUNT])>,
-    /// **`rmp` #588 (sprint-52 B1) — reader-safe physical-slot reuse.** A per-kind, in-memory overlay
-    /// of GC-freed physical ids that [`alloc_id`](Self::alloc_id) must NOT hand back out **yet**,
-    /// mapping `id -> reuse barrier`. A [`gc`](Self::gc)-freed relationship/node/property slot keeps its
-    /// record body (chain pointers) intact — only its `in_use` bit is cleared — so a still-in-flight
-    /// **off-thread reader** (`rmp` #336) that cached `predecessor.next = id` across an unlatched hop
-    /// still threads correctly THROUGH the freed corpse to the live record below it. The hazard is
-    /// **reuse**: if a later create pops `id` and overwrites its body while that reader is mid-walk, the
-    /// reader reads a FOREIGN record and diverts — losing a committed live edge or reporting a foreign
-    /// one (an ACID Isolation violation). So a freed id is *listed* on the durable free list at reclaim
-    /// (recovery has no in-flight readers → it is immediately reusable after a restart) but is **shadow-
-    /// held** here until every reader that predates the free has retired, tracked by comparing the
-    /// barrier (the engine's `next_ticket` at free time — every open transaction then has a strictly
-    /// smaller ticket) against the oldest open transaction's ticket in [`release_held`](Self::release_held).
-    /// Empty on the inline/DST path and whenever no transaction is open (immediate reuse — the pre-#588
-    /// behaviour), so it is allocation-free and deterministic there.
-    held_slots: [HashMap<u64, u64>; STORE_COUNT],
-    /// **`rmp` #588.** The reuse barrier stamped onto every [`free_push`](Self::free_push) while a GC
-    /// pass runs with at least one open transaction. `None` outside a bracketed GC pass (set by the
-    /// engine via [`set_reuse_barrier`](Self::set_reuse_barrier) around [`gc`](Self::gc)), in which case
-    /// a freed id is immediately reusable — the inline/DST path and the no-open-reader fast path.
-    reuse_barrier: Option<u64>,
+    //
+    // **`rmp` #588 (sprint-52 B1) — reader-safe physical-slot reuse.** The `held_slots` overlay and
+    // the `reuse_barrier` that stamps it used to live here, as two more fields of the `RecordStore`.
+    // `rmp` #1012 moved both **into each store's own allocation latch**
+    // ([`StoreAllocator`](crate::idalloc::StoreAllocator)), alongside the free list they gate and the
+    // high-water mark they defer, because they were never separable from it:
+    //
+    // A [`gc`](Self::gc)-freed relationship/node/property slot keeps its record body (chain pointers)
+    // intact — only its `in_use` bit is cleared — so a still-in-flight **off-thread reader** (`rmp`
+    // #336) that cached `predecessor.next = id` across an unlatched hop still threads correctly
+    // THROUGH the freed corpse to the live record below it. The hazard is **reuse**: if a later create
+    // pops `id` and overwrites its body while that reader is mid-walk, the reader reads a FOREIGN
+    // record and diverts — losing a committed live edge or reporting a foreign one (an ACID Isolation
+    // violation). So a freed id is *listed* on the durable free list at reclaim (recovery has no
+    // in-flight readers → it is immediately reusable after a restart) but is **shadow-held** until
+    // every reader that predates the free has retired.
+    //
+    // Deciding that means READING the overlay and ACTING on the free list. Two fields under two
+    // different latches would put a time-of-check/time-of-use window between them that no
+    // single-writer test can observe; one latch over both makes it one decision. See
+    // [`AllocGuard::pop_reusable`](crate::idalloc::AllocGuard::pop_reusable) and
+    // [`AllocGuard::push_free_shadow_held`](crate::idalloc::AllocGuard::push_free_shadow_held).
     /// **`rmp` #966.** The on-disk format version the durable catalog carried when this store was
     /// opened (`05 §12.6`); [`graphus_core::constants::FORMAT_VERSION`] for a store this build
     /// created. Surfaced by [`opened_format_version`](Self::opened_format_version) so a caller can
@@ -1307,8 +1399,6 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             gc_freeze_low_savepoint: None,
             spare_undo_slabs: Vec::new(),
             // `rmp` #588: reader-safe slot-reuse overlay (in-memory; empty unless off-thread readers hold a slot).
-            held_slots: std::array::from_fn(|_| HashMap::new()),
-            reuse_barrier: None,
             opened_format_version: graphus_core::constants::FORMAT_VERSION,
             // `rmp` #966 undo-area state: all in-memory, all rebuilt from scratch every open. The
             // chain sweep's pending set is reseeded by the first pass's full scan
@@ -1453,8 +1543,6 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             gc_freeze_low_savepoint: None,
             spare_undo_slabs: Vec::new(),
             // `rmp` #588: reader-safe slot-reuse overlay (in-memory; empty unless off-thread readers hold a slot).
-            held_slots: std::array::from_fn(|_| HashMap::new()),
-            reuse_barrier: None,
             opened_format_version: store_format_version,
             // `rmp` #966 undo-area state: all in-memory, all rebuilt from scratch every open. The
             // chain sweep's pending set is reseeded by the first pass's full scan
@@ -1508,12 +1596,15 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         &self.stores[kind as usize]
     }
 
-    fn store_mut(&mut self, kind: StoreKind) -> &mut FixedStore {
-        &mut self.stores[kind as usize]
-    }
-
-    fn snapshot_meta(&self, committing: TxnId) -> Meta {
-        Meta {
+    /// # Errors
+    /// Returns a storage error if any store's catalog entry would be internally inconsistent — see
+    /// [`FixedStore::to_meta`], which is where the `high_water <= capacity` floor lives.
+    fn snapshot_meta(&self, committing: TxnId) -> Result<Meta> {
+        let mut stores: [StoreMeta; STORE_COUNT] = std::array::from_fn(|_| StoreMeta::default());
+        for (slot, store) in stores.iter_mut().zip(self.stores.iter()) {
+            *slot = store.to_meta()?;
+        }
+        Ok(Meta {
             // Every catalog this build writes is a format-version-3 image, so a store opened at an
             // earlier version is UPGRADED by its first checkpoint (`05 §12.6`). From version 1 the
             // upgrade adds the two (empty) undo-area stores and loses nothing — a version-1 store has
@@ -1524,7 +1615,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             format_version: graphus_core::constants::FORMAT_VERSION,
             element_id_next: self.element_ids.peek(),
             commit_ts_hw: self.commit_ts_hw,
-            stores: std::array::from_fn(|i| self.stores[i].to_meta()),
+            stores,
             tokens: self.tokens.clone(),
             // Clones the whole `Statistics` (counts *and* the `rmp` task #81 property-histogram map):
             // the histogram blobs ride the same checkpoint-at-commit path as the counts with no
@@ -1533,7 +1624,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // still-open transaction's uncommitted DDL, and checkpointing that would publish an
             // in-flight schema change as committed. See `committed_statistics`.
             statistics: self.committed_statistics(committing),
-        }
+        })
     }
 
     /// Allocates and initialises the metadata page (device page `0`) on a fresh device. Uses the
@@ -1829,7 +1920,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             let rpp = paging::records_per_page(kind.record_size()) as u64;
             let capacity = stores[i].device_pages.len() as u64 * rpp;
             if capacity > stores[i].alloc.high_water() {
-                stores[i].alloc.observe(capacity.saturating_sub(1));
+                stores[i].alloc.lock().observe(capacity.saturating_sub(1));
             }
         }
         Ok(())
@@ -1921,7 +2012,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 id = next;
             }
             if last_materialised >= start {
-                store.alloc.observe(last_materialised);
+                store.alloc.lock().observe(last_materialised);
             }
         }
     }
@@ -2045,7 +2136,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// When `commit` is set, `txn` is begun and committed around the write (standalone catalog
     /// change, `04 §2.6`); otherwise the write joins the caller's open `txn`.
     fn checkpoint_meta(&mut self, txn: TxnId, commit: bool) -> Result<()> {
-        let meta = self.snapshot_meta(txn);
+        // The catalog is built (and its `high_water <= capacity` floor checked, `rmp` #1012) BEFORE
+        // anything is written or the WAL is touched, so a refused image aborts the checkpoint having
+        // changed nothing.
+        let meta = self.snapshot_meta(txn)?;
         let payload = meta.encode()?;
         // Split the catalog into [`META_CHUNK_CAP`]-byte chunks across the metadata-page chain. At
         // least one page (the head) is always written, even for an empty chunk.
@@ -2116,6 +2210,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Maps a store-relative page index to its device `PageId`, growing the store (extending the
     /// device, initialising a record-page header, recording the mapping) as needed, under `txn`.
     fn ensure_store_page(&mut self, kind: StoreKind, rel_page: u64, txn: TxnId) -> Result<PageId> {
+        // `rmp` #1012, rank 25: the caller must have DROPPED the store's allocation latch before
+        // getting here. Everything below grows the device, fetches pages, may evict and may harden
+        // the log — holding a rank-25 latch across that takes rank 30..60 out of order and convoys
+        // every allocator in the database behind one `fdatasync`. Debug-only; compiled out in release.
+        graphus_core::latch::assert_no_alloc_latch_held("RecordStore::ensure_store_page");
         let rel_page = rel_page as usize;
         while self.store(kind).device_pages.len() <= rel_page {
             let (f, dev_page) = self.pool.new_page()?;
@@ -2135,7 +2234,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // always LOCATE it; the reverse order would resurrect the "store page N not allocated"
             // defect this fix closes. The page is fully initialised (header seeded, `flush_unlogged`d,
             // unpinned) before it is published, so a reader can never observe a half-built page.
-            self.store_mut(kind).device_pages.push(dev_page)?;
+            self.store(kind).device_pages.push(dev_page)?;
             // WAL-log the record page's type+subtype header word with **undo == redo** (`rmp` #239).
             //
             // The per-store device-page map (`device_pages`) is persisted only in the durable catalog at
@@ -2360,27 +2459,16 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// # Errors
     /// Returns a storage error if the store's physical-id space is exhausted (`rmp` #452, see
     /// [`PhysicalAllocator::alloc_fresh`]) or if mapping the fresh id's page fails (e.g. ENOSPC).
-    /// Pops the next **reusable** freed physical id of `kind`, or `None` when the free list is empty
-    /// or holds only ids still shadow-held for an in-flight off-thread reader (`rmp` #588).
+    /// A point-in-time set of `kind`'s freed physical ids, for a caller that must test membership many
+    /// times (`rmp` #1012).
     ///
-    /// Held ids are stashed and re-listed so they stay free for later reuse once released; if only
-    /// held ids remain this returns `None` and the caller grows a fresh id rather than reusing one.
-    /// On the common path (`held_slots` empty) this is the pre-#588 single pop.
-    fn pop_free_id(&mut self, kind: StoreKind) -> Option<u64> {
-        if self.held_slots[kind as usize].is_empty() {
-            return self.store_mut(kind).free.pop();
-        }
-        let mut stash: Vec<u64> = Vec::new();
-        let picked = loop {
-            match self.store_mut(kind).free.pop() {
-                Some(id) if self.held_slots[kind as usize].contains_key(&id) => stash.push(id),
-                other => break other,
-            }
-        };
-        for id in stash {
-            self.store_mut(kind).free.push(id);
-        }
-        picked
+    /// One latch acquisition and `O(log n)` lookups, instead of one acquisition **and** a linear scan
+    /// per test. Use this whenever the test is inside a loop over the id space; use
+    /// [`StoreAllocator::free_contains`] for a one-off. The snapshot is point-in-time by design — a
+    /// caller that frees ids mid-pass and must see its own frees has to re-take it, and should say so
+    /// where it does.
+    fn free_id_set(&self, kind: StoreKind) -> std::collections::BTreeSet<u64> {
+        self.store(kind).alloc.free_ids().into_iter().collect()
     }
 
     /// Records that `txn` **popped** (reused) freed physical id `id` of `kind`, so a live rollback can
@@ -2401,29 +2489,46 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     fn alloc_id(&mut self, kind: StoreKind, txn: TxnId) -> Result<u64> {
         // A freed id is reused first: its store page already exists (the record once lived there), so
         // no growth — and no fallibility — is needed. `rmp` #588: SKIP any freed id still shadow-held
-        // for an in-flight off-thread reader (see [`held_slots`](Self#structfield.held_slots)) — reusing
+        // for an in-flight off-thread reader (the `rmp` #588 shadow-hold overlay) — reusing
         // its slot would let that reader read a foreign record mid chain-walk (an ACID Isolation
         // violation). Held ids are stashed and re-listed so they stay free for later reuse once released;
         // if only held ids remain we grow a fresh id rather than reuse one. On the common path
-        // (`held_slots` empty) `contains_key` is a cheap miss and this is the pre-#588 single pop.
+        // (nothing shadow-held) `contains_key` is a cheap miss and this is the pre-#588 single pop.
         // (`rmp` #968 retired the id-keyed label history that used to make a reused id dangerous here:
         // a node's label versions are deltas on its own record's chain, reclaimed with the record, so a
         // reused slot starts at `undo_ptr == 0` with nothing to inherit.)
-        if let Some(id) = self.pop_free_id(kind) {
-            self.note_popped_id(txn, kind, id);
-            return Ok(id);
-        }
-        // Fresh id: `alloc_fresh` first (it fails closed at the `u64::MAX` ceiling, `rmp` #452, so we
-        // never compute a page index for an astronomically large id), then map the page the id lands
-        // on. A within-page id finds its page already mapped (a cheap no-op); only a page-boundary
-        // crossing actually grows `device_pages` — exactly the growth `write_record` would have done,
-        // just up front.
-        let id = self.store_mut(kind).alloc.alloc_fresh()?;
+        //
+        // `rmp` #1012: pop-or-grow is ONE operation under ONE hold on the store's allocation latch,
+        // which ends on the next line. "The list offered nothing reusable" and "so advance the mark"
+        // are a single decision; split across two holds, another allocator slips between them. The
+        // allocation fails closed at the `u64::MAX` ceiling (`rmp` #452), so we never compute a page
+        // index for an astronomically large id.
+        let allocated = self.store(kind).alloc.allocate()?;
+        let id = match allocated {
+            Allocation::Reused(id) => {
+                self.note_popped_id(txn, kind, id);
+                return Ok(id);
+            }
+            Allocation::Fresh(id) => id,
+        };
+        // Fresh id: the latch is RELEASED before its page is mapped, because growing the store touches
+        // the device, the buffer pool and the WAL (ranks 30..60) and rank 25 is never held across I/O.
+        // A within-page id finds its page already mapped (a cheap no-op); only a page-boundary crossing
+        // actually grows `device_pages` — exactly the growth `write_record` would have done, just up
+        // front.
         let (rel_page, _) = paging::record_location(id, kind.record_size());
         if let Err(e) = self.ensure_store_page(kind, rel_page, txn) {
             // Mapping failed (e.g. ENOSPC growing the device): un-bump the high-water so it never
             // exceeds the mapped capacity. `id` was never written, so re-handing it out is safe.
-            self.store_mut(kind).alloc = PhysicalAllocator::restore(id.max(1));
+            //
+            // CONDITIONALLY (`rmp` #1012). This was `alloc = PhysicalAllocator::restore(id)` — a
+            // read-then-replace that, with a second writer, drops the mark BELOW an id another writer
+            // is still holding, so the next allocation issues it a second time. `unbump_fresh` is a
+            // compare-exchange: it withdraws only if the mark is still exactly where we left it, and
+            // otherwise declines and burns `id` — the direction that cannot lose data. See
+            // `AllocGuard::unbump_fresh`, and `rmp` #1014 criterion 6 for the cure (map the page
+            // BEFORE publishing the bump, so there is nothing to withdraw).
+            self.store(kind).alloc.lock().unbump_fresh(id);
             return Err(e);
         }
         Ok(id)
@@ -2746,13 +2851,56 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// (`rmp` #239). Locating a post-snapshot record is harmless — `graphus_txn::is_visible` still
     /// filters it out above. The capture is now also strictly cheaper: one `Arc` refcount bump per
     /// store instead of a full copy of every store's page list on every read dispatch.
+    ///
+    /// # The bound is CLAMPED to the mapped capacity (`rmp` #1012)
+    ///
+    /// [`alloc_id`](Self::alloc_id) publishes the high-water bump **before** it maps the new id's
+    /// page, so between those two steps the store genuinely has `high_water > mapped capacity`. That
+    /// window has two faces, and until now only one of them was written down:
+    ///
+    /// - the **catalog** face — a checkpoint landing inside it would persist an image this build's own
+    ///   decoder rejects on reopen. Refused by [`FixedStore::to_meta`]'s floor.
+    /// - the **read-path** face, closed here. A reader capturing inside the window would take a bound
+    ///   naming a slot with no page, and
+    ///   [`read_view::for_each_record_slot`](crate::read_view) would then fail the whole scan with
+    ///   `"{kind} store page N not allocated"` — a legitimate query dying on an internal error, which
+    ///   is the same symptom `rmp` #721 fixed from the opposite direction.
+    ///
+    /// The clamp is `min(high_water, capacity(mapped pages))`, and it is sound because an id at or
+    /// above the mapped capacity **has never been written**: no page exists to have written it to. So
+    /// the clamp removes only slots that could not have held a record, never a record a reader is
+    /// entitled to see.
+    ///
+    /// The handle is taken **first** and the mark **second**, and — corrected `rmp` #1012, after the
+    /// layer-4 audit — that order is *preferable*, not load-bearing. This comment previously claimed
+    /// the reverse order would "let the map grow underneath the mark so the clamp fails to bind
+    /// exactly when it was needed". That is false, and a false reason is worse than none: it invites a
+    /// future reader to "fix" the order on a premise that does not hold. Both orders are sound, given
+    /// the pre-existing contract that a capture happens at or after the reader's snapshot
+    /// ([`read_view`](crate::read_view)):
+    ///
+    /// - **handle then mark** (here) gives `min(hw_late, cap_early)`. It cannot name an unmapped page
+    ///   because `cap_early <= cap_live`, and it cannot hide a visible record because such a record
+    ///   was written before the snapshot, so its page was mapped before `cap_early` was read.
+    /// - **mark then handle** would give `min(hw_early, cap_late)`. Also `<= cap_live`, since the map
+    ///   only grows; and if the clamp "fails to bind" it is because `cap_late >= hw_early` — the live
+    ///   capacity already covers the mark, which is precisely when not binding is the right answer.
+    ///
+    /// The order is kept because it yields the tighter, more conservative bound (the capacity is
+    /// measured at the earliest of the two instants), not because reversing it would be incorrect.
+    ///
+    /// This is a mitigation. The cure is to map the page **before** publishing the bump, so the window
+    /// never opens: `rmp` #1014 (layer 5b), acceptance criterion 6.
     #[must_use]
     pub fn capture_read_meta(&self) -> MetaSnapshot {
         let snap = |kind: StoreKind| {
             let s = self.store(kind);
+            // Handle first, mark second: the tighter of two sound orders — see the note above.
+            let device_pages = s.device_pages.reader();
+            let capacity = paging::capacity(device_pages.len() as u64, kind.record_size());
             StoreMetaSnapshot {
-                high_water: s.alloc.high_water(),
-                device_pages: s.device_pages.reader(),
+                high_water: s.alloc.high_water().min(capacity),
+                device_pages,
             }
         };
         // Every store, including the undo area's two: the off-thread read path resolves a record's
@@ -3476,7 +3624,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Returns a storage error if the slab cannot be refilled (id-space exhaustion, or a failure
     /// mapping the slab's page).
     fn alloc_undo_id(&mut self, txn: TxnId) -> Result<u64> {
-        if let Some(id) = self.pop_free_id(StoreKind::Undo) {
+        // The `rmp` #588-aware pop, under one hold on the undo store's allocation latch (`rmp` #1012).
+        let reusable = self.store(StoreKind::Undo).alloc.lock().pop_reusable();
+        if let Some(id) = reusable {
             self.note_popped_id(txn, StoreKind::Undo, id);
             return Ok(id);
         }
@@ -3500,31 +3650,47 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             return Ok((first, end));
         }
         let rpp = paging::records_per_page(undo::UNDO_RECORD_SIZE) as u64;
-        let first = self.store(StoreKind::Undo).alloc.high_water().max(1);
-        let rel_page = first / rpp;
-        // Fail closed rather than compute a wrapped range: a wrapped `end <= first` would make the
-        // slab permanently empty and every refill a no-op, i.e. a livelock on a path that is supposed
-        // to report exhaustion. `alloc_fresh` fails closed at the same ceiling for the same reason
-        // (`rmp` #452).
-        let end = rel_page
-            .checked_add(1)
-            .and_then(|p| p.checked_mul(rpp))
-            .filter(|&end| end > first)
-            .ok_or_else(|| {
-                GraphusError::Storage(
-                    "undo.store physical-id space is exhausted; no delta slab can be claimed"
-                        .to_owned(),
-                )
+        // Reading the mark and advancing it over the whole run is ONE hold (`rmp` #1012): the run's
+        // extent is computed FROM the mark it then moves, so a second writer slipping between the read
+        // and the advance would hand two transactions overlapping slabs. `claim_run` makes it one
+        // indivisible decision; the closure supplies the policy (stop at the page boundary) without
+        // giving the allocator any knowledge of paging.
+        //
+        // Bumping over the whole run BEFORE mapping the page — and un-bumping on a mapping failure —
+        // is the same fail-closed discipline `alloc_id` uses, and for the same reason: the catalog
+        // invariant `high_water <= addressable capacity` must hold the instant it can be observed.
+        // No id in the run has been written, so re-handing them out later is safe.
+        let (first, end) = self
+            .store(StoreKind::Undo)
+            .alloc
+            .lock()
+            .claim_run(|first| {
+                let rel_page = first / rpp;
+                // Fail closed rather than compute a wrapped range: a wrapped `end <= first` would make the
+                // slab permanently empty and every refill a no-op, i.e. a livelock on a path that is
+                // supposed to report exhaustion. `allocate` fails closed at the same ceiling for the same
+                // reason (`rmp` #452).
+                rel_page
+                    .checked_add(1)
+                    .and_then(|p| p.checked_mul(rpp))
+                    .filter(|&end| end > first)
+                    .ok_or_else(|| {
+                        GraphusError::Storage(
+                        "undo.store physical-id space is exhausted; no delta slab can be claimed"
+                            .to_owned(),
+                    )
+                    })
             })?;
-        // Bump the allocator over the whole run BEFORE mapping the page, then un-bump on a mapping
-        // failure — the same fail-closed discipline `alloc_id` uses, and for the same reason: the
-        // catalog invariant `high_water <= addressable capacity` must hold the instant it can be
-        // observed. No id in the run has been written, so re-handing them out later is safe.
-        for _ in first..end {
-            self.store_mut(StoreKind::Undo).alloc.alloc_fresh()?;
-        }
+        let rel_page = first / rpp;
+        // The latch is released before the page is mapped (rank 25 is never held across I/O).
         if let Err(e) = self.ensure_store_page(StoreKind::Undo, rel_page, txn) {
-            self.store_mut(StoreKind::Undo).alloc = PhysicalAllocator::restore(first);
+            // CONDITIONALLY, exactly as `alloc_id` un-bumps a single fresh id (`rmp` #1012): the run is
+            // withdrawn only if the mark is still where this claim left it, never lowered underneath a
+            // writer that has already claimed the next slab.
+            self.store(StoreKind::Undo)
+                .alloc
+                .lock()
+                .unbump_run(first, end);
             return Err(e);
         }
         self.active.entry(txn).or_default().undo_slab = Some((first, end));
@@ -4659,14 +4825,24 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// the transaction this id belonged to has already ended, so there is no rollback left to withdraw
     /// the push. The `rmp` #588 reuse hold still applies: an off-thread reader mid-walk may hold a
     /// pointer into the slot.
-    fn free_orphan_slot(&mut self, kind: StoreKind, id: u64) {
-        if self.store(kind).free.ids().contains(&id) {
+    ///
+    /// Takes `&self` (`rmp` #1012): it touches nothing but the store's own allocation latch. The
+    /// "is it already listed?" test and the listing are ONE hold, because they are one decision —
+    /// re-listing an id that is already free would put it on the stack twice, and the second pop would
+    /// hand a live slot to a second writer (the `rmp` #578 duplicate-free-list-entry shape).
+    ///
+    /// The test is a linear scan of the free list, and it stays inside the hold. That is not an
+    /// oversight: hoisting it out (as the sweeps above hoist theirs, via
+    /// [`free_id_set`](Self::free_id_set)) would split the decision across two holds, which is the
+    /// hazard, not the cost. The scan itself is unchanged from before this layer — the free list has
+    /// always been a `Vec`-backed stack, because its LIFO order is part of the durable image — so what
+    /// this costs over the old code is one uncontended acquisition per call, on a GC/rollback path.
+    fn free_orphan_slot(&self, kind: StoreKind, id: u64) {
+        let mut alloc = self.store(kind).alloc.lock();
+        if alloc.free().ids().contains(&id) {
             return;
         }
-        self.store_mut(kind).free.push(id);
-        if let Some(barrier) = self.reuse_barrier {
-            self.held_slots[kind as usize].insert(id, barrier);
-        }
+        alloc.push_free_shadow_held(id);
     }
 
     /// GC phase F (`rmp` #966): reclaims every undo chain no live snapshot can still reach, and
@@ -4828,6 +5004,17 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         chain_heads: Option<&std::collections::BTreeSet<u64>>,
     ) -> Result<usize> {
         let undo_hw = self.store(StoreKind::Undo).alloc.high_water();
+        // Snapshot the free list ONCE per loop instead of probing it per id (`rmp` #1012).
+        // `free_contains` takes the store's allocation latch, so the old per-id probe turned what used
+        // to be a borrow into `O(high_water)` mutex acquisitions across three loops — and each one
+        // still paid the same linear scan it always did. A `BTreeSet` snapshot gives `O(log n)`
+        // membership for one acquisition, the shape `heap_block_usage` already uses.
+        //
+        // Each loop re-snapshots rather than sharing one image, and that is **required**, not
+        // sloppiness: phase 1 FREES deltas, so phase 2 must see a list that already contains them —
+        // a delta phase 1 reclaimed must not go on holding its commit slot referenced, or the slot
+        // leaks. Sharing a pre-phase-1 image would be a behaviour change, and a silent one.
+        let undo_free = self.free_id_set(StoreKind::Undo);
         let mut freed_deltas = 0usize;
         if let Some(heads) = chain_heads {
             // Phase 1 — unreachable deltas. `next` links come from deltas that are themselves still
@@ -4835,7 +5022,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             let mut reachable = heads.clone();
             let mut corpses: Vec<u64> = Vec::new();
             for id in 1..undo_hw {
-                if self.store(StoreKind::Undo).free.ids().contains(&id) {
+                if undo_free.contains(&id) {
                     continue;
                 }
                 let Some(delta) = self.read_delta(id)? else {
@@ -4856,10 +5043,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             }
         }
 
-        // Phase 2 — unreachable commit slots, over what phase 1 left standing.
+        // Phase 2 — unreachable commit slots, over what phase 1 left standing. RE-SNAPSHOT: phase 1
+        // above has just freed deltas, and this loop must skip them, exactly as the per-id live probe
+        // it replaces did.
+        let undo_free = self.free_id_set(StoreKind::Undo);
         let mut referenced = std::collections::BTreeSet::new();
         for id in 1..undo_hw {
-            if self.store(StoreKind::Undo).free.ids().contains(&id) {
+            if undo_free.contains(&id) {
                 continue;
             }
             if let Some(delta) = self.read_delta(id)? {
@@ -4869,11 +5059,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         let open: std::collections::BTreeSet<u64> =
             self.active.values().filter_map(|a| a.commit_slot).collect();
         let commit_hw = self.store(StoreKind::Commit).alloc.high_water();
+        // This loop DOES free commit slots as it goes, and the snapshot is still exact — worth stating
+        // so it is not "fixed" into a per-id probe again. Each iteration frees at most its own `id`,
+        // and `id` ascends, so everything the loop has added to the live list is strictly BELOW the id
+        // the next iteration tests. The snapshot and the live list therefore agree on every id this
+        // loop ever asks about.
+        let commit_free = self.free_id_set(StoreKind::Commit);
         for id in 1..commit_hw {
-            if referenced.contains(&id)
-                || open.contains(&id)
-                || self.store(StoreKind::Commit).free.ids().contains(&id)
-            {
+            if referenced.contains(&id) || open.contains(&id) || commit_free.contains(&id) {
                 continue;
             }
             let Some(slot) = self.read_commit_slot(id)? else {
@@ -5058,7 +5251,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
 
     /// Returns physical id `id` to `kind`'s in-memory free list AND records the push under `txn`
     /// (`rmp` #578). **Every** GC/reclaim free-list push must go through this — never
-    /// `store_mut(kind).free.push(id)` directly — so a **live** rollback of the freeing transaction
+    /// `alloc.lock().push_free(id)` directly — so a **live** rollback of the freeing transaction
     /// can withdraw its own pushes.
     ///
     /// The hazard it closes is the free-list twin of the `rmp` #220/#172 monotonic high-water floor:
@@ -5074,26 +5267,27 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// `SYSTEM_TXN` guard (the system transaction never frees records and is never rolled back).
     fn free_push(&mut self, kind: StoreKind, id: u64, txn: TxnId) {
         // `rmp` #973 coverage point: the instant a slot becomes reusable. Paired with the `rmp` #588
-        // `held_slots` shadow-hold below, this is where a reader that predates the free races slot
-        // recycling, so an interleaving that reaches it is worth being able to replay.
+        // shadow-hold inside `push_free_shadow_held`, this is where a reader that predates the free
+        // races slot recycling, so an interleaving that reaches it is worth being able to replay.
         sched::yield_at(YieldSite::FreeListPush, ResourceId::slot(kind as u8, id));
-        self.store_mut(kind).free.push(id);
+        // `rmp` #588: while a GC pass runs with open transactions, the freed id is shadow-held so
+        // [`alloc_id`](Self::alloc_id) does not reuse its slot until every reader that predates the
+        // free has retired. Overwriting an existing hold is correct — the id is on the free list only
+        // because THIS push listed it, so its recorded barrier is always the current (newest) one.
+        // Outside a bracketed GC pass (no barrier armed) — the inline/DST path and every non-GC free
+        // (e.g. a rollback of a just-popped id) — the slot is immediately reusable, exactly as before
+        // #588.
+        //
+        // `rmp` #1012: reading the barrier, stamping the hold and listing the id are ONE hold on the
+        // store's allocation latch, because they are one decision. Listed first and stamped second,
+        // a concurrent `alloc_id` could pop the id in between and hand a still-read slot to a writer.
+        self.store(kind).alloc.free_shadow_held(id);
         if txn != SYSTEM_TXN {
             self.active
                 .entry(txn)
                 .or_default()
                 .freed_ids
                 .push((kind, id));
-        }
-        // `rmp` #588: while a GC pass runs with open transactions, shadow-hold the freed id so
-        // [`alloc_id`](Self::alloc_id) does not reuse its slot until every reader that predates the free
-        // has retired (see [`held_slots`](Self#structfield.held_slots)). Overwriting an existing entry is
-        // correct — the id is on the free list only because THIS push listed it, so its recorded barrier
-        // is always the current (newest) one. Outside a bracketed GC pass (`reuse_barrier == None`) — the
-        // inline/DST path and every non-GC free (e.g. a rollback of a just-popped id) — the slot is
-        // immediately reusable, exactly as before #588.
-        if let Some(barrier) = self.reuse_barrier {
-            self.held_slots[kind as usize].insert(id, barrier);
         }
     }
 
@@ -5183,11 +5377,18 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
 
     /// **`rmp` #588.** Sets (or clears) the reuse barrier stamped onto GC-pass frees. The engine brackets
     /// each maintenance [`gc`](Self::gc) pass with `Some(next_ticket)` … `None` so only that pass's freed
-    /// slots are shadow-held (see [`held_slots`](Self#structfield.held_slots)); every open transaction at
-    /// that instant has a strictly smaller ticket, so [`release_held`](Self::release_held) can later tell
-    /// when they have all retired.
-    pub fn set_reuse_barrier(&mut self, barrier: Option<u64>) {
-        self.reuse_barrier = barrier;
+    /// slots are shadow-held; every open transaction at that instant has a strictly smaller ticket, so
+    /// [`release_held`](Self::release_held) can later tell when they have all retired.
+    ///
+    /// Takes `&self` (`rmp` #1012): the barrier now lives inside each store's allocation latch, next to
+    /// the overlay it stamps, so that a free can read it and act on it under one hold. Six latches are
+    /// taken in turn, one per store, and none is held while another is acquired. The barrier is the
+    /// same value in all six — replicating it costs one word per store and buys the read-and-act
+    /// atomicity a shared field could not have given without a seventh, global latch.
+    pub fn set_reuse_barrier(&self, barrier: Option<u64>) {
+        for store in &self.stores {
+            store.alloc.lock().set_reuse_barrier(barrier);
+        }
     }
 
     /// **`rmp` #588.** Releases every shadow-held slot whose reuse barrier is now safe: a slot held at
@@ -5196,11 +5397,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// `u64::MAX` (no open transaction) releases everything. The released ids are already on the durable
     /// free list — this only lifts the in-memory reuse hold — so [`alloc_id`](Self::alloc_id) may hand
     /// them out again. Called by the engine after each maintenance pass and as readers retire.
-    pub fn release_held(&mut self, oldest_open_ticket: u64) {
-        for k in 0..STORE_COUNT {
-            if !self.held_slots[k].is_empty() {
-                self.held_slots[k].retain(|_id, &mut barrier| barrier > oldest_open_ticket);
-            }
+    ///
+    /// Takes `&self` (`rmp` #1012): each store's overlay is released under that store's own latch.
+    pub fn release_held(&self, oldest_open_ticket: u64) {
+        for store in &self.stores {
+            store.alloc.lock().release_held(oldest_open_ticket);
         }
     }
 
@@ -5209,7 +5410,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// holding a freed slot.
     #[must_use]
     pub fn held_slots_len(&self) -> usize {
-        self.held_slots.iter().map(HashMap::len).sum()
+        self.stores.iter().map(|s| s.alloc.held_len()).sum()
     }
 
     /// **`rmp` #588** (observability / tests): the number of physical slots of **one** store currently
@@ -5219,7 +5420,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// the same mid-walk hazard as one walking an incidence chain.
     #[must_use]
     pub fn held_slots_len_of(&self, kind: StoreKind) -> usize {
-        self.held_slots[kind as usize].len()
+        self.store(kind).alloc.held_len()
     }
 
     /// Records that property `pid` was prepended onto `(owner_kind, owner_id)` — but only if `pid` was
@@ -6429,7 +6630,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 if self.read_mvcc(kind, id)?.in_use() {
                     continue;
                 }
-                if self.store(kind).free.ids().contains(&id) {
+                if self.store(kind).alloc.free_contains(id) {
                     continue;
                 }
                 self.free_push(kind, id, txn);
@@ -6635,7 +6836,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // reflects every concurrent pop (and this txn's own pushes), so restoring IT — minus this
         // txn's own pushes — is the free-list twin of the #220/#172 high-water floor.
         let pre_free: [FreeList; STORE_COUNT] =
-            std::array::from_fn(|i| self.stores[i].free.clone());
+            std::array::from_fn(|i| self.stores[i].alloc.free_snapshot());
         // The live-record COUNTERS have exactly the same hazard, for exactly the same reason (`rmp`
         // #866). They move eagerly at write time, so the in-memory value is "durable image + every
         // in-flight transaction's delta", and `reload_catalog` below throws all of that away. Snapshot
@@ -6921,7 +7122,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // re-handed-out. `observe(hw - 1)` lifts the high-water to `hw` without inventing a new id.
         for (i, hw) in pre_high_water.into_iter().enumerate() {
             if hw > self.stores[i].alloc.high_water() {
-                self.stores[i].alloc.observe(hw - 1);
+                self.stores[i].alloc.lock().observe(hw - 1);
             }
         }
         // Restore the free lists to their pre-rollback in-memory image, then withdraw exactly this
@@ -6932,11 +7133,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // `in_use` bit, so its slot must NOT remain free. A normal write transaction pushes nothing,
         // so its `pre_free` is restored verbatim. Ordering is irrelevant: `aborted_freed_ids` and the
         // concurrent pops are disjoint id sets (a popped id is off the list; a freed id was in use).
-        for (i, pf) in pre_free.into_iter().enumerate() {
-            self.stores[i].free = pf;
+        for (store, pf) in self.stores.iter().zip(pre_free) {
+            store.alloc.lock().replace_free(pf);
         }
         for (kind, id) in aborted_freed_ids {
-            self.stores[kind as usize].free.remove_id(id);
+            self.stores[kind as usize].alloc.lock().remove_free_id(id);
         }
         // `rmp` #581: RECLAIM this transaction's own reused-id pops. Every pop the abort left as a
         // genuinely-unreferenced dead slot returns to the free list (bounded by the pops the txn made);
@@ -6996,7 +7197,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ) {
         for &(kind, id) in popped_ids {
             // Never create a duplicate free-list entry (a re-pushed id must be unique).
-            if self.store(kind).free.ids().contains(&id) {
+            if self.store(kind).alloc.free_contains(id) {
                 continue;
             }
             let safe = match kind {
@@ -7031,7 +7232,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 },
             };
             if safe {
-                self.store_mut(kind).free.push(id);
+                self.store(kind).alloc.lock().push_free(id);
             }
         }
     }
@@ -7195,10 +7396,16 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 )));
             }
         }
-        for (i, sm) in meta.stores.iter().enumerate() {
-            // Restore ONLY the allocator and the free list. `device_pages` is left exactly as it is.
-            self.stores[i].alloc = PhysicalAllocator::restore(sm.high_water.max(1));
-            self.stores[i].free = sm.free_list.clone();
+        for (store, sm) in self.stores.iter().zip(meta.stores.iter()) {
+            // Restore ONLY the high-water mark and the free list, and restore them TOGETHER under one
+            // hold (`rmp` #1012) — they are two halves of one durable image, and a writer must never
+            // observe a mark that has been reloaded next to a free list that has not. `device_pages`
+            // is left exactly as it is, and so is the #588 shadow-hold overlay: that describes
+            // in-flight readers, not durable state, and a catalog reload knows nothing about them.
+            store
+                .alloc
+                .lock()
+                .restore(sm.high_water.max(1), sm.free_list.clone());
         }
         self.tokens = meta.tokens;
         // Restore the whole `Statistics` from the durable catalog (`rmp` task #79 / #81). This is a
@@ -8173,7 +8380,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // 0, 0)`, zeroing the forward pointer, which severed such a reader's walk mid-flight and dropped
         // every live rel threaded below the corpse — a silent short (wrong) traversal result confirmed
         // by a two-thread reproduction (`rmp` #811). Only the now-dangling prop head is dropped and the
-        // in-use bit stays clear; the slot is reuse-deferred by `held_slots` (#588) until every
+        // in-use bit stays clear; the slot is reuse-deferred by the #588 shadow-hold overlay until every
         // predating reader retires, after which a fresh allocation overwrites the body wholesale — so
         // the "zero it so a reused slot starts clean" rationale is moot (both hazards close together).
         for &corpse_id in &corpses {
@@ -8501,7 +8708,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // freed: the aborting txn already released those blocks through its own WAL undo, so the
             // blocks are no longer in-use and freeing again would double-free.
             let is_corpse =
-                !prop.mvcc.in_use() && !self.store(StoreKind::Prop).free.ids().contains(&cur);
+                !prop.mvcc.in_use() && !self.store(StoreKind::Prop).alloc.free_contains(cur);
             if is_tombstone || is_corpse {
                 // An EMPTY cell owns no overflow chain by construction (`type_tag == 0` carries no
                 // value), and a corpse's blocks were already released by its transaction's WAL undo.
@@ -8529,7 +8736,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 // identical reason; this brings the property chain in line. The GC watermark protects
                 // VISIBILITY (the reader skips the tombstone), not STRUCTURAL traversal (it must still
                 // thread `next_prop` to reach the live successor). The bridge below unlinks `cur` for
-                // FRESH walks that start after it; `held_slots` (#588) defers slot **reuse** while a
+                // FRESH walks that start after it; the #588 shadow-hold overlay defers slot **reuse** while a
                 // predating reader is in flight; and a later `write_prop_create` overwrites the slot
                 // wholesale, so no stale pointer ever survives into a reused slot.
                 self.write_prop(cur, &dead, txn)?;
@@ -9182,10 +9389,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         let high_water = self.store(StoreKind::Strings).alloc.high_water();
         let freed: std::collections::BTreeSet<u64> = self
             .store(StoreKind::Strings)
-            .free
-            .ids()
-            .iter()
-            .copied()
+            .alloc
+            .free_ids()
+            .into_iter()
             .collect();
         let mut live = 0u64;
         for id in 1..high_water {
@@ -9566,7 +9772,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     pub fn used_rel_slots(&self) -> u64 {
         let store = self.store(StoreKind::Rel);
         // ids run 1..high_water (id 0 is the reserved null), minus those returned to the free list.
-        (store.alloc.high_water().saturating_sub(1)).saturating_sub(store.free.len() as u64)
+        // Both halves are read under ONE hold (`rmp` #1012): they are one measurement, and a count
+        // taken from a mark and a list that disagree is a leak report nobody can act on.
+        let alloc = store.alloc.lock();
+        (alloc.high_water().saturating_sub(1)).saturating_sub(alloc.free().len() as u64)
     }
 
     /// The number of **used** property slots, the [`used_rel_slots`](Self::used_rel_slots) measure
@@ -9580,7 +9789,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     #[must_use]
     pub fn used_prop_slots(&self) -> u64 {
         let store = self.store(StoreKind::Prop);
-        (store.alloc.high_water().saturating_sub(1)).saturating_sub(store.free.len() as u64)
+        // One hold, for the reason `used_rel_slots` states.
+        let alloc = store.alloc.lock();
+        (alloc.high_water().saturating_sub(1)).saturating_sub(alloc.free().len() as u64)
     }
 
     /// Stamps `expired_ts` on property cell `prop_id` — a **forging accessor for tests**
@@ -11080,7 +11291,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
 
     /// The freed physical ids of `kind`'s store (`04 §2.7`).
     pub(crate) fn checker_free_ids(&self, kind: StoreKind) -> Vec<u64> {
-        self.store(kind).free.ids().to_vec()
+        self.store(kind).alloc.free_ids()
     }
 
     /// The number of interned `PropKey`-namespace tokens (`04 §2.6`): key token ids are dense in
@@ -11133,8 +11344,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     #[must_use]
     pub fn undo_area_free_counts(&self) -> (usize, usize) {
         (
-            self.store(StoreKind::Undo).free.len(),
-            self.store(StoreKind::Commit).free.len(),
+            self.store(StoreKind::Undo).alloc.free_len(),
+            self.store(StoreKind::Commit).alloc.free_len(),
         )
     }
 
@@ -12385,8 +12596,8 @@ mod tests {
         s.gc(TxnId(3), wm).unwrap();
         s.commit(TxnId(3)).unwrap();
         assert_eq!(
-            s.store(StoreKind::Prop).free.ids(),
-            &[p],
+            s.store(StoreKind::Prop).alloc.free_ids(),
+            vec![p],
             "setup: the deleted property's slot P is on the free list after GC"
         );
         (h, key, p)
@@ -12413,8 +12624,8 @@ mod tests {
         s.gc(TxnId(3), wm).unwrap();
         s.commit(TxnId(3)).unwrap();
         assert_eq!(
-            s.store(StoreKind::Rel).free.ids(),
-            &[r],
+            s.store(StoreKind::Rel).alloc.free_ids(),
+            vec![r],
             "setup: the deleted relationship's slot R is on the free list after GC"
         );
         assert_eq!(
@@ -12448,15 +12659,15 @@ mod tests {
             "T1 popped the freed slot P (precondition reached)"
         );
         assert!(
-            s.store(StoreKind::Prop).free.is_empty(),
+            s.store(StoreKind::Prop).alloc.free_is_empty(),
             "P is off the free list while T1 holds it"
         );
         s.rollback(t1).unwrap();
 
         // #581: P was never consumed (T1 aborted) and is unreferenced, so it is BACK on the free list.
         assert_eq!(
-            s.store(StoreKind::Prop).free.ids(),
-            &[p],
+            s.store(StoreKind::Prop).alloc.free_ids(),
+            vec![p],
             "rmp #581: the aborted unreferenced pop is reclaimed to the free list"
         );
         // Observable end-to-end: the next allocation reuses P (pre-#581 it leaked and allocated fresh).
@@ -12522,8 +12733,8 @@ mod tests {
         // back to the free list.
         s.rollback(t1).unwrap();
         assert_eq!(
-            s.store(StoreKind::Prop).free.ids(),
-            &[p],
+            s.store(StoreKind::Prop).alloc.free_ids(),
+            vec![p],
             "rmp #581: the holder's own pop is reclaimed once it aborts"
         );
         let report = crate::check::check_store(&mut s, &[]).unwrap();
@@ -12581,7 +12792,7 @@ mod tests {
         let (reused, _) = s.create_rel(t1, ty, a, b).unwrap();
         assert_eq!(reused, r, "T1 popped the freed rel slot R");
         assert!(
-            s.store(StoreKind::Rel).free.is_empty(),
+            s.store(StoreKind::Rel).alloc.free_is_empty(),
             "R is off the free list while T1 holds it"
         );
 
@@ -12653,7 +12864,7 @@ mod tests {
             "R's slot is retired by the abort"
         );
         assert!(
-            !s.store(StoreKind::Rel).free.ids().contains(&r),
+            !s.store(StoreKind::Rel).alloc.free_contains(r),
             "rmp #970: the abort PARKS the unlinked slot rather than recycling it — the in-memory \
              latest-state indexes still hold a document keyed on that physical id"
         );
@@ -12670,7 +12881,7 @@ mod tests {
         s.gc(TxnId(7), wm2).unwrap();
         s.commit(TxnId(7)).unwrap();
         assert!(
-            s.store(StoreKind::Rel).free.ids().contains(&r),
+            s.store(StoreKind::Rel).alloc.free_contains(r),
             "rmp #970 AC 7: the orphan sweep reclaims the slot the abort unlinked — clean disconnect \
              does not leak"
         );
@@ -12699,7 +12910,7 @@ mod tests {
         assert_eq!(reused, p);
         s.commit(t1).unwrap();
         assert!(
-            s.store(StoreKind::Prop).free.is_empty(),
+            s.store(StoreKind::Prop).alloc.free_is_empty(),
             "a committed reuse leaves nothing on the free list"
         );
         assert!(
@@ -12915,7 +13126,7 @@ mod tests {
                 for (id, m) in read_view::scan_in_use_mvcc(&s.pool, &s.stores, kind).unwrap() {
                     out.push((kind as u8, id, m.created_ts, m.expired_ts));
                 }
-                for &fid in s.store(kind).free.ids() {
+                for fid in s.store(kind).alloc.free_ids() {
                     out.push((kind as u8, fid, u64::MAX, u64::MAX)); // free-list marker
                 }
             }
@@ -13529,7 +13740,10 @@ mod tests {
         // Force the Node store's allocator high-water mark to u64::MAX (the corrupt-catalog state the
         // `Meta::decode` bound rejects on open; here we install it directly to prove the allocator
         // itself fails closed even if such a state were ever reached in memory).
-        s.store_mut(StoreKind::Node).alloc = PhysicalAllocator::restore(u64::MAX);
+        s.store(StoreKind::Node)
+            .alloc
+            .lock()
+            .restore(u64::MAX, FreeList::new());
         let txn = TxnId(1);
         s.begin(txn);
         let r = s.create_node(txn);
@@ -13539,6 +13753,142 @@ mod tests {
         );
         // No record id 0 was minted: the allocator high-water is unchanged (no silent advance).
         assert_eq!(s.store(StoreKind::Node).alloc.high_water(), u64::MAX);
+    }
+
+    /// **The read-path face of the same window: a capture inside it must not poison the reader**
+    /// (`rmp` #1012).
+    ///
+    /// [`alloc_id`](RecordStore::alloc_id) publishes the high-water bump before mapping the new id's
+    /// page, so a store can momentarily have `high_water > mapped capacity`. A reader capturing there
+    /// used to take that bound verbatim and then die on `"store page N not allocated"` — a legitimate
+    /// query failing with an internal error, not a wrong answer but not an answer either.
+    /// [`capture_read_meta`](RecordStore::capture_read_meta) now clamps the bound to the mapped
+    /// capacity, which is sound because a slot with no page has never been written.
+    ///
+    /// The state is installed directly, as the catalog-floor and id-ceiling tests above do: with one
+    /// writer the window is not reachable from outside, and with `N` writers it is `rmp` #1014
+    /// criterion 6 that closes it at the source.
+    #[test]
+    fn a_read_capture_inside_the_unmapped_high_water_window_still_scans_1012() {
+        let mut s = fresh();
+        let t0 = TxnId(1);
+        s.begin(t0);
+        let (a, _) = s.create_node(t0).unwrap();
+        let (b, _) = s.create_node(t0).unwrap();
+        s.commit(t0).unwrap();
+
+        let capacity = paging::capacity(
+            s.store(StoreKind::Node).device_pages.len() as u64,
+            StoreKind::Node.record_size(),
+        );
+        // Open the window: the mark names a slot one past the last addressable one.
+        let free = s.store(StoreKind::Node).alloc.free_snapshot();
+        s.store(StoreKind::Node)
+            .alloc
+            .lock()
+            .restore(capacity + 1, free);
+
+        let meta = s.capture_read_meta();
+
+        // THE symptom, asserted first: the scan an off-thread reader performs must SUCCEED. Without
+        // the clamp it dies on `"Node store page N not allocated"` — a legitimate query failing with
+        // an internal error.
+        let seen = read_view::scan_in_use_mvcc(&s.pool, &meta, StoreKind::Node).unwrap_or_else(|e| {
+            panic!(
+                "a read capture taken inside the unmapped-high-water window must still scan, not \
+                 fail internally: {e}"
+            )
+        });
+        // ...and it must still see every committed node: the clamp removes only slots that no page
+        // could have held, never a record the reader is entitled to.
+        let ids: Vec<u64> = seen.iter().map(|(id, _)| *id).collect();
+        assert!(
+            ids.contains(&a) && ids.contains(&b),
+            "the clamp must not hide a committed record: expected {a} and {b} in {ids:?}"
+        );
+        // The mechanism, asserted second: the bound really was clamped, so the success above is the
+        // clamp working and not the window having failed to open.
+        assert_eq!(
+            meta.store(StoreKind::Node).high_water,
+            capacity,
+            "the captured bound must be clamped to the mapped capacity, never the raw mark"
+        );
+        assert!(
+            s.store(StoreKind::Node).alloc.high_water() > capacity,
+            "the fixture must actually be inside the window, or this test proves nothing"
+        );
+    }
+
+    /// **The catalog floor: a checkpoint REFUSES an image whose `high_water` outruns its mapped
+    /// capacity** (`rmp` #1012, acceptance criterion 7).
+    ///
+    /// The invariant is `high_water <= capacity.max(1)`, and the decoder has enforced it since
+    /// `rmp` #452 — on the way *in*. Nothing enforced it on the way *out*, and that asymmetry is what
+    /// turned VOPR seed 5043221 into silent loss of committed data: a transaction advanced the mark,
+    /// failed before mapping the page, and a checkpoint persisted `high_water > capacity`. The next
+    /// rollback's catalog reload then rejected the image the store had just written, and — because
+    /// that error aborted the reload after it had dismantled the page maps — blank pages were
+    /// allocated over committed records. A store cannot be recovered from a catalog it refuses to
+    /// read, so writing one is never the lesser evil.
+    ///
+    /// With one writer the state is unreachable (`alloc_id` maps the page before returning the id, and
+    /// un-bumps if it cannot), so it is installed directly here — exactly as the ceiling test above
+    /// installs `u64::MAX`. With `N` writers the un-bump can be legally *declined*
+    /// (`AllocGuard::unbump_fresh`), which is what makes the window reachable and this floor load-
+    /// bearing rather than theatre.
+    #[test]
+    fn a_checkpoint_refuses_a_catalog_whose_high_water_outruns_its_mapped_pages_1012() {
+        /// Runs one committing transaction with the Node store's mark forced to `mark`, and returns
+        /// what the commit did. Everything but `mark` is identical between the two calls below, so the
+        /// difference in outcome can only be the invariant.
+        fn commit_with_node_high_water(mark_from_capacity: impl Fn(u64) -> u64) -> Result<()> {
+            let mut s = fresh();
+            let t0 = TxnId(1);
+            s.begin(t0);
+            s.create_node(t0).unwrap();
+            s.commit(t0).unwrap();
+
+            let capacity = paging::capacity(
+                s.store(StoreKind::Node).device_pages.len() as u64,
+                StoreKind::Node.record_size(),
+            );
+            assert!(
+                capacity >= 1,
+                "the node store must have a mapped page by now"
+            );
+
+            // A second transaction with real work, so its commit genuinely persists the catalog
+            // rather than taking the read-only fast path (`rmp` #529) and skipping the floor.
+            let t1 = TxnId(2);
+            s.begin(t1);
+            s.create_node(t1).unwrap();
+            // Install the mark AFTER the allocation, so nothing maps a page in response to it.
+            let free = s.store(StoreKind::Node).alloc.free_snapshot();
+            s.store(StoreKind::Node)
+                .alloc
+                .lock()
+                .restore(mark_from_capacity(capacity), free);
+            s.commit(t1)
+        }
+
+        // One id past the last addressable slot: refused, with a diagnosis rather than an image.
+        let err = commit_with_node_high_water(|capacity| capacity + 1).expect_err(
+            "the checkpoint must refuse a catalog whose high_water exceeds its mapped capacity: \
+             this build's own decoder rejects such an image on reopen, so persisting it would make \
+             the store unrecoverable",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("refusing to checkpoint") && msg.contains("mapped device page"),
+            "the refusal must say what it refused and why, got: {msg}"
+        );
+
+        // Exactly AT capacity is the boundary and is legal — the last addressable slot is
+        // `capacity - 1`, and `high_water` is one past the largest id. The identical commit goes
+        // through, which is what says the floor rejects the inconsistency itself and not the path
+        // around it (an off-by-one in the predicate would fail every checkpoint of a full page).
+        commit_with_node_high_water(|capacity| capacity)
+            .expect("a catalog exactly at capacity is consistent and must checkpoint normally");
     }
 
     /// `rmp` #821 (deterministic RED→GREEN for the property-chain `rmp` #811 severance): a reclaimable
@@ -13579,7 +13929,7 @@ mod tests {
         s.gc(TxnId(3), wm).unwrap();
         s.commit(TxnId(3)).unwrap();
         assert!(
-            s.store(StoreKind::Prop).free.ids().contains(&b),
+            s.store(StoreKind::Prop).alloc.free_contains(b),
             "the reclaimed tombstone B is returned to the Prop free list"
         );
 

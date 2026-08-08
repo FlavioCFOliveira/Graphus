@@ -1,12 +1,19 @@
 //! **Lock-held tripwires**: debug-build guards proving that no durability barrier is ever issued
 //! while a lock that must not span I/O is held.
 //!
-//! Two are defined here, one per lock that was measured to convoy behind a barrier:
+//! Three are defined here:
 //!
 //! * the **frame-latch tripwire** ([`FrameLatchScope`], `rmp` #974) — the buffer pool's per-frame
 //!   latch;
 //! * the **doublewrite-lock tripwire** ([`DwbLockScope`], `rmp` #993) — the mutex guarding the
-//!   doublewrite buffer's device.
+//!   doublewrite buffer's device;
+//! * the **allocator-latch tripwire** ([`AllocLatchScope`], `rmp` #1012) — the per-store physical-id
+//!   allocation latch.
+//!
+//! The first two were each *measured* to convoy behind a barrier and then hoisted out. The third is
+//! the same guarantee stated **before** the convoy can be built: the allocation latch is new, and it
+//! sits at rank 25 of the lock order (see [`AllocLatchScope`]) precisely on the promise that it is
+//! never held across I/O. A promise nobody checks is a promise that lasts until the next refactor.
 //!
 //! # Why this exists
 //!
@@ -227,6 +234,144 @@ pub fn assert_no_frame_latch_held(site: &str) {
     let _ = site;
 }
 
+/// Whether the current thread holds a store's physical-id allocation latch — `0` or `1`, never more
+/// (`rmp` #1012).
+///
+/// Unlike [`frame_latch_depth`] this is a flag rather than a nesting count, because rank 25 admits at
+/// most one holder per thread: [`AllocLatchScope::new`] panics on a second. Always `0` in a release
+/// build.
+#[cfg(debug_assertions)]
+#[must_use]
+pub fn alloc_latch_depth() -> u32 {
+    ALLOC_DEPTH.with(std::cell::Cell::get)
+}
+
+/// Whether the current thread holds a store's allocation latch. Always `0` in a release build.
+#[cfg(not(debug_assertions))]
+#[must_use]
+pub const fn alloc_latch_depth() -> u32 {
+    0
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static ALLOC_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// An RAII marker for a region in which the current thread holds a store's physical-id allocation
+/// latch (`rmp` #1012).
+///
+/// # The rank, and the rule it encodes
+///
+/// Graphus orders its latches by rank, innermost last: **10** catalog/DDL, **20** commit sequencer
+/// and active-transaction table, **25** the allocation latch, **30** WAL, **40** buffer-pool frame
+/// latch, **50** page-table shard, **60** device and doublewrite stager. An acquisition out of rank
+/// order is permitted only as a `try_lock`, which creates no wait edge.
+///
+/// Rank 25 says two things. Below the active-transaction table (20), because allocating or freeing an
+/// id happens inside a transaction that records the pop or push in that table. Above the WAL (30) and
+/// everything under it, because the allocation latch is **released before any I/O**: allocating a
+/// fresh id may have to map its store page, which grows the device, fetches pages, may evict, and may
+/// harden the log. Holding the latch across that chain would convoy every allocator in the database
+/// behind one `fdatasync` — the `rmp` #974 / #993 shape, arriving by a new route.
+///
+/// This tripwire enforces **both** of the rank's obligations, and they need different mechanisms:
+///
+/// * *not held across I/O* — [`assert_no_alloc_latch_held`], called at the points that must find the
+///   latch already released (store-page growth, the WAL barrier);
+/// * *at most one holder per thread* — the assertion in [`new`](Self::new). Two locks of the SAME
+///   rank cannot be ordered by rank at all, so two threads acquiring a different pair in a different
+///   order deadlock. A depth counter alone could not see this: it cannot tell "held" from "held
+///   twice", and the interleaving that deadlocks is exactly the one it would miss.
+///
+/// Like the other two scopes it is `!Send`/`!Sync`, because the depth is a thread-local and a scope
+/// created on one thread and dropped on another would corrupt both threads' counters. The
+/// `MutexGuard` it accompanies is already `!Send`, so nothing is lost.
+#[derive(Debug)]
+pub struct AllocLatchScope {
+    _private: std::marker::PhantomData<*const ()>,
+}
+
+impl AllocLatchScope {
+    /// Enters an allocation-latch region on the current thread.
+    ///
+    /// # Panics
+    /// Panics in a debug build if this thread **already** holds an allocation latch. Unlike
+    /// [`FrameLatchScope`], this scope is deliberately **not** re-entrant — see below. Compiled out in
+    /// release, where the whole tripwire is a no-op.
+    #[must_use]
+    #[inline]
+    pub fn new() -> Self {
+        #[cfg(debug_assertions)]
+        ALLOC_DEPTH.with(|d| {
+            // Rank 25 admits AT MOST ONE holder per thread, and this is where that is enforced
+            // (`rmp` #1012). The frame latch counts a depth because a batch flush legitimately holds
+            // one latch per dirty frame; two *allocation* latches at once are a different animal —
+            // they are two locks of the SAME rank, which the rank order cannot sequence, so two
+            // threads taking a different pair in a different order is a textbook lock-order-inversion
+            // deadlock. Nothing in the store needs it: every composite decision lives inside one
+            // store's `AllocGuard`, and the six stores allocate independently.
+            //
+            // Without this assertion the tripwire could not tell "held" from "held twice" — the
+            // counter carries no store identity and `assert_no_alloc_latch_held` only tests for zero —
+            // so the one interleaving that actually deadlocks would be the one it could not see. The
+            // reachable shape is `AllocGuard::claim_run`, whose closure runs WITH the latch held: a
+            // closure that reached for a second store's allocator would deadlock two threads and pass
+            // every test.
+            assert!(
+                d.get() == 0,
+                "a second store allocation latch was taken while this thread already holds one. \
+                 Rank 25 is not re-entrant and admits one holder per thread (`rmp` #1012): two locks \
+                 of the same rank cannot be ordered by rank, so two threads acquiring a different \
+                 pair in a different order deadlock. Restructure so the decision needs one store's \
+                 latch, or take them strictly one after the other (see `graphus_core::latch`)."
+            );
+            d.set(1);
+        });
+        Self {
+            _private: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Default for AllocLatchScope {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for AllocLatchScope {
+    #[inline]
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        ALLOC_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// Panics (debug builds only) if the current thread holds a store's physical-id allocation latch.
+///
+/// Call this at every point the allocation latch must already have been released: the durability
+/// barrier, and the store-page growth path an allocation hands off to. `site` names the point so a
+/// failure points straight at the offending path.
+///
+/// # Panics
+/// Panics in a debug build if [`alloc_latch_depth`] is non-zero. Compiled out in release.
+#[inline]
+pub fn assert_no_alloc_latch_held(site: &str) {
+    #[cfg(debug_assertions)]
+    {
+        let depth = alloc_latch_depth();
+        assert!(
+            depth == 0,
+            "{site}: reached while holding {depth} store allocation latch(es). That latch is rank 25 \
+             and must be released before any I/O (`rmp` #1012): held across page growth or a \
+             durability barrier it convoys every allocator in the database behind one fdatasync, and \
+             it takes rank-30..60 locks out of order. Drop the guard first (see `graphus_core::latch`)."
+        );
+    }
+    let _ = site;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,6 +407,55 @@ mod tests {
     fn assert_fires_inside_a_latched_region() {
         let _scope = FrameLatchScope::new();
         assert_no_frame_latch_held("test barrier");
+    }
+
+    /// The allocation-latch tripwire (`rmp` #1012) must actually fire, exactly like the other two:
+    /// a guard alive at a point that forbids it panics in a debug build.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "store allocation latch")]
+    fn alloc_assert_fires_inside_a_latched_region() {
+        let _scope = AllocLatchScope::new();
+        assert_no_alloc_latch_held("test page growth");
+    }
+
+    #[test]
+    fn alloc_assert_passes_outside_a_latched_region() {
+        assert_eq!(alloc_latch_depth(), 0);
+        assert_no_alloc_latch_held("test page growth");
+    }
+
+    /// **Positive control for the non-re-entrancy rule** (`rmp` #1012): taking a second rank-25 scope
+    /// while one is alive must panic in a debug build. Without this the assertion in
+    /// [`AllocLatchScope::new`] could be deleted and every test would still pass — the deadlock shape
+    /// it forbids is precisely the one no test can otherwise observe.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "Rank 25 is not re-entrant")]
+    fn a_second_alloc_scope_on_one_thread_is_refused() {
+        let _first = AllocLatchScope::new();
+        let _second = AllocLatchScope::new();
+    }
+
+    /// Sequential scopes are fine — the rule is against *simultaneous* holders, not against taking the
+    /// latch twice in a row. (A rule that forbade the latter would make `set_reuse_barrier`'s
+    /// six-store loop illegal, so this is what says the assertion is aimed at the right thing.)
+    #[test]
+    fn alloc_scopes_taken_one_after_another_are_fine() {
+        for _ in 0..3 {
+            let _s = AllocLatchScope::new();
+        }
+        assert_eq!(alloc_latch_depth(), 0);
+    }
+
+    /// The three tripwires are independent counters: holding one must not trip another's assertion.
+    #[test]
+    fn alloc_scope_does_not_trip_the_other_tripwires() {
+        let _scope = AllocLatchScope::new();
+        #[cfg(debug_assertions)]
+        assert_eq!(alloc_latch_depth(), 1);
+        assert_no_frame_latch_held("unrelated barrier");
+        assert_no_dwb_lock_held("unrelated barrier");
     }
 
     /// The depth is **per thread**: one thread's latched region must not make another thread's

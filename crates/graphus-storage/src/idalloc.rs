@@ -13,8 +13,26 @@
 //!
 //! Physical id `0` is reserved as the null pointer (`04 §2.2`), so both the first real physical
 //! id and the first `ElementId` are `1`.
+//!
+//! # One latch per store (`rmp` #1012, layer 4 of #975)
+//!
+//! A store's physical-id state is not one number but four, and they are only correct **together**:
+//! the high-water mark ([`PhysicalAllocator`]), the [`FreeList`], the `rmp` #588 shadow-hold overlay,
+//! and the reuse barrier that stamps it. [`StoreAllocator`] owns all four behind **one**
+//! [`Mutex`] — one per [`StoreKind`](crate::StoreKind), never one global latch — and
+//! [`StoreAllocator::lock`] is the only door to mutating any of them.
+//!
+//! That the latch covers all four is the load-bearing part, not an implementation detail. Deciding
+//! "this freed id is shadow-held, so do not hand it out" means **reading** the overlay and
+//! **acting** on the free list; splitting those across two holds would not prepare the code for
+//! concurrency, it would *create* a time-of-check/time-of-use window that no single-writer test can
+//! observe. Every composite decision here is therefore expressed as one method on
+//! [`AllocGuard`], and the borrow checker enforces it: the free list, the overlay and the barrier
+//! are unreachable except through a guard, and a guard is one hold.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 use graphus_core::{ElementId, GraphusError, Result};
 
@@ -26,9 +44,24 @@ pub const NULL_ID: u64 = 0;
 ///
 /// `next` is the high-water mark — one past the largest id ever allocated; ids `[1, next)` have
 /// existed at some point. Freed ids are reclaimed from a [`FreeList`] before `next` is bumped.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// # Read without a latch, mutated only under one (`rmp` #1012)
+///
+/// The mark is an [`AtomicU64`], and that is what lets [`high_water`](Self::high_water) take `&self`
+/// and answer **lock-free** — which it must, because it is the read path's scan bound
+/// ([`StorePages::high_water`](crate::StorePages::high_water)) and is consulted once per record scan
+/// and once per undo-chain hop. Putting it inside the store's mutex would have put a lock acquisition
+/// on the hottest read in the engine to protect a value the reader only uses as a *ceiling*.
+///
+/// Every **mutation**, on the other hand, happens while the owning [`StoreAllocator`]'s latch is
+/// held: the mutators below are private to this module and reachable only through [`AllocGuard`]. So
+/// the atomic is not a second, competing synchronisation scheme — it is the mechanism that permits a
+/// lock-free *observer*, while the latch remains the single total order over every change to the
+/// store's allocation state. The atomicity is still load-bearing on its own for
+/// [`try_lower`](Self::try_lower): see [`AllocGuard::unbump_fresh`].
+#[derive(Debug)]
 pub struct PhysicalAllocator {
-    next: u64,
+    next: AtomicU64,
 }
 
 impl Default for PhysicalAllocator {
@@ -41,7 +74,9 @@ impl PhysicalAllocator {
     /// A fresh allocator whose first fresh id is `1` (id `0` is the reserved null).
     #[must_use]
     pub fn new() -> Self {
-        Self { next: 1 }
+        Self {
+            next: AtomicU64::new(1),
+        }
     }
 
     /// Restores an allocator whose high-water mark is `next` (one past the largest live id),
@@ -52,13 +87,21 @@ impl PhysicalAllocator {
     #[must_use]
     pub fn restore(next: u64) -> Self {
         assert!(next >= 1, "physical id 0 is reserved as the null pointer");
-        Self { next }
+        Self {
+            next: AtomicU64::new(next),
+        }
     }
 
     /// The high-water mark (one past the largest id allocated so far).
+    ///
+    /// Lock-free, and `Relaxed` on purpose: this value is a **bound**, never a gate. Nothing is
+    /// published by advancing it — a record's bytes are published by the buffer pool's frame latch
+    /// and its page by [`PageMap`](graphus_pagemap::PageMap)'s `Release`/`Acquire` `len` — so a
+    /// stronger ordering here would order nothing that is not already ordered, and would cost a real
+    /// barrier on `aarch64` (Apple Silicon, Raspberry Pi 5 are first-class targets).
     #[must_use]
-    pub fn high_water(self) -> u64 {
-        self.next
+    pub fn high_water(&self) -> u64 {
+        self.next.load(Ordering::Relaxed)
     }
 
     /// Allocates the next fresh physical id by bumping the high-water mark.
@@ -68,23 +111,51 @@ impl PhysicalAllocator {
     /// fail-closed bound (`rmp` #452): the release profile leaves `overflow-checks` off, so an
     /// unchecked `self.next += 1` at the ceiling would WRAP to `0` and hand out the reserved NULL id
     /// (id `0` is the "none" pointer for `first_rel`/`first_prop`/`next_prop`) as a live record id —
-    /// an ACID/identity violation. `checked_add` turns that overflow into a clean error instead.
-    pub fn alloc_fresh(&mut self) -> Result<u64> {
-        let id = self.next;
-        self.next = self.next.checked_add(1).ok_or_else(|| {
-            GraphusError::Storage(
-                "physical-id space exhausted: high-water mark at u64::MAX".to_owned(),
-            )
-        })?;
-        Ok(id)
+    /// an ACID/identity violation. `checked_add` turns that overflow into a clean error instead, and
+    /// `fetch_update` applies it atomically so a check-then-add cannot let two callers at the ceiling
+    /// both pass the check.
+    fn alloc_fresh(&self) -> Result<u64> {
+        self.next
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .map_err(|_| {
+                GraphusError::Storage(
+                    "physical-id space exhausted: high-water mark at u64::MAX".to_owned(),
+                )
+            })
+    }
+
+    /// Lowers the mark from `from` to `to`, **only if it is still exactly `from`**; reports whether
+    /// it moved.
+    ///
+    /// This is the conditional un-bump, and the condition is the whole point (`rmp` #1012). See
+    /// [`AllocGuard::unbump_fresh`] for the defect an unconditional lowering reintroduces.
+    fn try_lower(&self, from: u64, to: u64) -> bool {
+        debug_assert!(to >= 1, "physical id 0 is reserved as the null pointer");
+        self.next
+            .compare_exchange(from, to, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
     }
 
     /// Records that `id` has been observed (e.g. when rebuilding from a scan), keeping the
     /// high-water mark one past the largest seen id.
-    pub fn observe(&mut self, id: u64) {
-        if id >= self.next {
-            self.next = id + 1;
-        }
+    ///
+    /// A compare-exchange max, so it can only ever move the mark **forwards** — the same discipline
+    /// as [`ElementIdAllocator::observe`], and for the same reason: this is how a rollback restores
+    /// the pre-rollback floor (`rmp` #220 / #172), and a read-then-replace there would discard a
+    /// concurrent writer's advance and re-hand-out an id that already names a committed record.
+    fn observe(&self, id: u64) {
+        let want = id.saturating_add(1);
+        let _ = self
+            .next
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                (want > n).then_some(want)
+            });
+    }
+
+    /// Replaces the mark outright (the catalog-reload path, which restores a durable image).
+    fn restore_to(&self, next: u64) {
+        assert!(next >= 1, "physical id 0 is reserved as the null pointer");
+        self.next.store(next, Ordering::Relaxed);
     }
 }
 
@@ -189,6 +260,427 @@ impl FreeList {
             ));
         }
         Ok(Self { stack })
+    }
+}
+
+/// What [`AllocGuard::allocate`] handed out, and where it came from.
+///
+/// The distinction is not cosmetic: a reused id's page already exists, while a fresh id's page may
+/// still have to be mapped — and only the fresh one can ever need un-bumping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Allocation {
+    /// A freed id popped off the free list. Its store page is already mapped.
+    Reused(u64),
+    /// A fresh id taken by advancing the high-water mark. Its page must be mapped before the id is
+    /// used, and the caller must [`unbump_fresh`](AllocGuard::unbump_fresh) if that mapping fails.
+    Fresh(u64),
+}
+
+impl Allocation {
+    /// The allocated physical id, whichever way it was obtained.
+    #[must_use]
+    pub fn id(self) -> u64 {
+        match self {
+            Allocation::Reused(id) | Allocation::Fresh(id) => id,
+        }
+    }
+}
+
+/// The latch-guarded half of one store's allocation state.
+#[derive(Debug, Default)]
+struct AllocState {
+    /// Freed ids available for reuse (`04 §2.7`).
+    free: FreeList,
+    /// `rmp` #588 shadow-hold overlay: `id -> reuse barrier`. A freed id listed here is on the
+    /// durable free list but must NOT be handed out until every off-thread reader that predates the
+    /// free has retired.
+    held: HashMap<u64, u64>,
+    /// The barrier stamped onto each free while a bracketed GC pass runs; `None` outside one, when a
+    /// freed slot is immediately reusable.
+    reuse_barrier: Option<u64>,
+}
+
+/// One store's complete physical-id allocation state, and the latch that covers it (`rmp` #1012).
+///
+/// Six of these exist, one per [`StoreKind`](crate::StoreKind) — deliberately **not** one global
+/// latch. The stores allocate independently: a writer creating a node and a writer creating a
+/// relationship contend for nothing, and a GC pass reclaiming undo slots blocks neither.
+///
+/// # What is behind the latch, and what is not
+///
+/// Behind it: the free list, the `rmp` #588 shadow-hold overlay and its barrier — the three that no
+/// decision can read separately from acting on. The high-water mark is an atomic
+/// ([`PhysicalAllocator`]) so the read path's scan bound stays lock-free, but **every mutation of it
+/// also happens under this latch**, so the latch remains a total order over every change to the
+/// four together. That is what makes a composite read taken under the latch (the durable catalog
+/// image, the live-record cardinality) internally consistent.
+///
+/// # The latch is never held across I/O — rank 25
+///
+/// Graphus orders its latches by rank (innermost last): **10** catalog/DDL, **20** commit sequencer
+/// and active-transaction table, **25** *this latch*, **30** WAL, **40** buffer-pool frame latch,
+/// **50** page-table shard, **60** device and doublewrite stager. An out-of-order acquisition is
+/// permitted only as a `try_lock`, which creates no wait edge.
+///
+/// Rank 25 is the tightest position that is truthful. It must be **below** the active-transaction
+/// table (20), because the paths that allocate and free ids are already inside a transaction and
+/// record their pops and pushes in that table. It must be **above** the WAL (30) and everything
+/// under it, because the hard rule of this latch is that it is **released before any I/O**: mapping a
+/// fresh id's page ([`ensure_store_page`](crate::RecordStore)) grows the device, fetches pages, may
+/// evict, and may harden the log — a chain that would otherwise convoy every allocator in the
+/// database behind one `fdatasync`. The rule is mechanically checked in debug builds by
+/// [`graphus_core::latch::assert_no_alloc_latch_held`], armed here in [`lock`](Self::lock).
+#[derive(Debug)]
+pub struct StoreAllocator {
+    alloc: PhysicalAllocator,
+    state: Mutex<AllocState>,
+}
+
+impl Default for StoreAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StoreAllocator {
+    /// A fresh, empty allocator: high-water `1`, no freed ids, no shadow holds, no barrier.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            alloc: PhysicalAllocator::new(),
+            state: Mutex::new(AllocState::default()),
+        }
+    }
+
+    /// An allocator rebuilt from a durable catalog entry: `high_water` and its freed ids. No slot is
+    /// shadow-held — a store that has just been opened has no in-flight reader to protect.
+    ///
+    /// # Panics
+    /// Panics if `high_water` is `0` (id `0` is reserved).
+    #[must_use]
+    pub fn restore(high_water: u64, free: FreeList) -> Self {
+        Self {
+            alloc: PhysicalAllocator::restore(high_water),
+            state: Mutex::new(AllocState {
+                free,
+                held: HashMap::new(),
+                reuse_barrier: None,
+            }),
+        }
+    }
+
+    /// The high-water mark — one past the largest id ever allocated. **Lock-free**: this is the read
+    /// path's scan bound (`1..high_water`), so it must not take the latch. See
+    /// [`PhysicalAllocator::high_water`].
+    #[must_use]
+    pub fn high_water(&self) -> u64 {
+        self.alloc.high_water()
+    }
+
+    /// Takes the store's allocation latch. Everything that mutates the free list, the shadow-hold
+    /// overlay, the reuse barrier or the high-water mark goes through the returned guard.
+    ///
+    /// # Panics
+    /// Never for poisoning: a poisoned latch is recovered rather than re-panicked, matching the
+    /// crate's convention ([`crate::wal_rule::SharedWal`], [`crate::dwb`]). It is sound here because
+    /// each guarded operation is ordered to fail **closed** if a panic tears it — a half-done free
+    /// leaves a slot shadow-held but unlisted (never handed out again; a bounded leak), and a
+    /// half-done pop loses a reusable id (likewise). No partial update can produce a *live* record
+    /// sharing a slot, which is the only outcome that would justify bricking the store.
+    #[must_use]
+    pub fn lock(&self) -> AllocGuard<'_> {
+        AllocGuard {
+            alloc: &self.alloc,
+            state: self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            _scope: graphus_core::latch::AllocLatchScope::new(),
+        }
+    }
+
+    /// Allocates one physical id — a reusable freed one if the free list offers it, otherwise a fresh
+    /// one — under **one** hold. See [`AllocGuard::allocate`] for why pop-or-grow cannot be two.
+    ///
+    /// # Errors
+    /// Returns a storage error if the physical-id space is exhausted (`rmp` #452).
+    pub fn allocate(&self) -> Result<Allocation> {
+        self.lock().allocate()
+    }
+
+    /// Lists `id` as free and, if a GC pass has armed a reuse barrier, shadow-holds it from reuse —
+    /// under **one** hold. See [`AllocGuard::push_free_shadow_held`] for why stamping and listing
+    /// cannot be two.
+    pub fn free_shadow_held(&self, id: u64) {
+        self.lock().push_free_shadow_held(id);
+    }
+
+    /// A copy of the free list — the durable catalog image, and the `rmp` #578 pre-rollback snapshot.
+    #[must_use]
+    pub fn free_snapshot(&self) -> FreeList {
+        self.lock().free().clone()
+    }
+
+    /// Whether `id` is currently listed as free.
+    #[must_use]
+    pub fn free_contains(&self, id: u64) -> bool {
+        self.lock().free().ids().contains(&id)
+    }
+
+    /// The freed ids currently held, in stack (LIFO) order.
+    #[must_use]
+    pub fn free_ids(&self) -> Vec<u64> {
+        self.lock().free().ids().to_vec()
+    }
+
+    /// How many ids are currently listed as free.
+    #[must_use]
+    pub fn free_len(&self) -> usize {
+        self.lock().free().len()
+    }
+
+    /// Whether no id is currently listed as free.
+    #[must_use]
+    pub fn free_is_empty(&self) -> bool {
+        self.lock().free().is_empty()
+    }
+
+    /// How many slots of this store are currently shadow-held from reuse (`rmp` #588).
+    #[must_use]
+    pub fn held_len(&self) -> usize {
+        self.lock().held_len()
+    }
+}
+
+/// Exclusive access to one store's allocation state (`rmp` #1012). See [`StoreAllocator`].
+///
+/// Every composite decision — "pop a reusable id", "free this id and shadow-hold it" — is a single
+/// method here, so that reading the state and acting on it can never be split across two holds.
+#[derive(Debug)]
+pub struct AllocGuard<'a> {
+    alloc: &'a PhysicalAllocator,
+    state: MutexGuard<'a, AllocState>,
+    /// Debug-only marker proving no I/O happens while this guard is alive. Declared last so it is
+    /// dropped **after** the latch is released: over-reporting the held region is the safe direction
+    /// for a tripwire, under-reporting is not.
+    _scope: graphus_core::latch::AllocLatchScope,
+}
+
+impl AllocGuard<'_> {
+    /// The high-water mark. Exact while the guard is alive — no mutation can be in flight.
+    #[must_use]
+    pub fn high_water(&self) -> u64 {
+        self.alloc.high_water()
+    }
+
+    /// Allocates one physical id: a reusable freed id if the free list offers one, otherwise a fresh
+    /// id from the high-water mark.
+    ///
+    /// Pop-or-grow is **one** operation, under **one** hold, because the two halves are a single
+    /// decision: splitting them would let another allocator slip between "the free list gave me
+    /// nothing" and "so I will grow".
+    ///
+    /// # Errors
+    /// Returns a storage error if the physical-id space is exhausted (`rmp` #452).
+    pub fn allocate(&mut self) -> Result<Allocation> {
+        if let Some(id) = self.pop_reusable() {
+            return Ok(Allocation::Reused(id));
+        }
+        Ok(Allocation::Fresh(self.alloc.alloc_fresh()?))
+    }
+
+    /// Pops the next **reusable** freed id, or `None` when the free list is empty or holds only ids
+    /// still shadow-held for an in-flight off-thread reader (`rmp` #588).
+    ///
+    /// Held ids are stashed and re-listed so they stay free for later reuse once released; if only
+    /// held ids remain this returns `None` and the caller grows a fresh id rather than reusing one.
+    /// On the common path (nothing shadow-held) this is the pre-#588 single pop.
+    ///
+    /// Consulting the overlay and popping the list happen under the one hold this guard *is*. That
+    /// is the correctness requirement, not an optimisation: with two holds, a slot released between
+    /// the check and the pop would be handed to a writer while a reader still threads through it —
+    /// the ACID Isolation violation #588 exists to close.
+    pub fn pop_reusable(&mut self) -> Option<u64> {
+        if self.state.held.is_empty() {
+            return self.state.free.pop();
+        }
+        let mut stash: Vec<u64> = Vec::new();
+        let picked = loop {
+            match self.state.free.pop() {
+                Some(id) if self.state.held.contains_key(&id) => stash.push(id),
+                other => break other,
+            }
+        };
+        for id in stash {
+            self.state.free.push(id);
+        }
+        picked
+    }
+
+    /// Claims a **run** of fresh ids: reads the mark, asks `end_of_run` where the run stops, and
+    /// advances the mark to that point. Returns the claimed `[first, end)`.
+    ///
+    /// One hold, for the reason [`allocate`](Self::allocate) is one hold: the run's extent is
+    /// computed *from* the mark it is about to move, so reading and advancing must be indivisible.
+    /// Undo-delta slabs (`rmp` #1011) are the caller.
+    ///
+    /// # Monotonicity is checked in RELEASE, not asserted (`rmp` #1012)
+    ///
+    /// `end_of_run` is caller-supplied and this method is public, so its result is untrusted input:
+    /// the guard against `end <= first` belongs in the primitive, not in every caller. It used to be a
+    /// `debug_assert!` followed by an unconditional store — which means that in a release build, where
+    /// `overflow-checks` and `debug_assert!` are both off, a closure returning a smaller value would
+    /// have **silently lowered the mark and re-issued live ids**: exactly the defect class this whole
+    /// layer exists to close, arriving through the one door left open. Refusing costs a comparison.
+    ///
+    /// # Errors
+    /// Returns a storage error if `end_of_run` fails, or if it proposes a run that does not advance
+    /// the mark. The mark is unmoved in both cases.
+    pub fn claim_run<F>(&mut self, end_of_run: F) -> Result<(u64, u64)>
+    where
+        F: FnOnce(u64) -> Result<u64>,
+    {
+        let first = self.high_water().max(1);
+        let end = end_of_run(first)?;
+        if end <= first {
+            return Err(GraphusError::Storage(format!(
+                "refusing to claim the physical-id run [{first}, {end}): a run must advance the \
+                 high-water mark, and applying this one would lower it — re-issuing ids that are \
+                 already live (`rmp` #1012)"
+            )));
+        }
+        self.alloc.restore_to(end);
+        Ok((first, end))
+    }
+
+    /// Withdraws a fresh id that was never used — but **only if the mark has not moved on**; reports
+    /// whether it was withdrawn.
+    ///
+    /// # Why the condition is the fix (`rmp` #1012)
+    ///
+    /// This was an unconditional `alloc = PhysicalAllocator::restore(id)`: a read-then-replace, the
+    /// same shape as the page map's old index claim, and wrong for the same reason the moment a
+    /// second writer exists. Writer A takes `id`, writer B takes `id + 1`; A's page mapping then
+    /// fails and its unconditional restore drops the mark to `id` — **below** the id B is still
+    /// holding. The next allocation re-issues `id + 1`, so two live records share one physical slot
+    /// and their property / incidence chains self-cycle; and, until then, the catalog carries a
+    /// `high_water` that no longer covers every allocated id.
+    ///
+    /// The compare-exchange makes "the mark is still exactly where I left it, and it is now back" a
+    /// single indivisible decision. When it is not — because someone allocated after us — the
+    /// withdrawal is simply declined and `id` is left accounted for: conservative in the one
+    /// direction that cannot lose data (a burnt id, never a shared slot).
+    ///
+    /// # This is a mitigation, not the cure
+    ///
+    /// The real defect is that the mark is advanced **before** the id's page is mapped, so the
+    /// catalog invariant `high_water <= addressable capacity` is momentarily false and needs undoing
+    /// at all. Mapping the page before publishing the bump is `rmp` #1014 (layer 5b), acceptance
+    /// criterion 6 — it needs the buffer pool and the WAL to be reachable under `&self`, which is
+    /// that layer's subject. Until then this refuses to make the window worse, and
+    /// [`StoreAllocator`]'s catalog floor refuses to *persist* a catalog written inside it.
+    pub fn unbump_fresh(&mut self, id: u64) -> bool {
+        self.alloc.try_lower(id.saturating_add(1), id.max(1))
+    }
+
+    /// Withdraws a whole claimed run `[first, end)` that was never used, on the same conditional
+    /// terms as [`unbump_fresh`](Self::unbump_fresh); reports whether it was withdrawn.
+    pub fn unbump_run(&mut self, first: u64, end: u64) -> bool {
+        self.alloc.try_lower(end, first.max(1))
+    }
+
+    /// Raises the mark so that `id` is accounted for, never lowering it (`rmp` #220 / #172 floor).
+    pub fn observe(&mut self, id: u64) {
+        self.alloc.observe(id);
+    }
+
+    /// Restores the mark and the free list together from a durable catalog image (the rollback
+    /// catalog reload). One hold, so no writer can observe the two disagreeing.
+    ///
+    /// The shadow-hold overlay and the barrier are deliberately **left alone**: they describe
+    /// in-flight *readers*, not durable state, and a catalog reload knows nothing about them.
+    ///
+    /// # This LOWERS the mark unconditionally — only `reload_catalog` may call it
+    ///
+    /// Every other mutator here either advances the mark or withdraws conditionally
+    /// ([`unbump_fresh`](Self::unbump_fresh), [`claim_run`](Self::claim_run)), because lowering it
+    /// underneath a live id re-issues that id. This one lowers it flat, so it is sound **only** in the
+    /// one situation where lowering is the point: replacing the whole in-memory image with the last
+    /// durably-committed one during
+    /// [`RecordStore::reload_catalog`](crate::RecordStore). Even there it is only *half* the answer —
+    /// the durable image predates every concurrent open transaction's allocations, so the caller MUST
+    /// re-floor the mark afterwards with [`observe`](Self::observe) over the pre-rollback high-water
+    /// (`rmp` #220 / #172). Calling this from anywhere else silently lowers the mark under a live
+    /// writer, and nothing downstream will notice until two records share a slot.
+    ///
+    /// # Panics
+    /// Panics if `high_water` is `0` (id `0` is reserved).
+    pub fn restore(&mut self, high_water: u64, free: FreeList) {
+        self.alloc.restore_to(high_water);
+        self.state.free = free;
+    }
+
+    /// Replaces just the free list (the `rmp` #578 pre-rollback restore).
+    pub fn replace_free(&mut self, free: FreeList) {
+        self.state.free = free;
+    }
+
+    /// Lists `id` as free.
+    pub fn push_free(&mut self, id: u64) {
+        self.state.free.push(id);
+    }
+
+    /// Lists `id` as free **and**, if a GC pass has armed a reuse barrier, shadow-holds it from reuse
+    /// until every reader that predates the free has retired (`rmp` #588).
+    ///
+    /// Reading the barrier, stamping the overlay and listing the id are one hold — the free list must
+    /// never be able to offer an id whose stamp has not landed yet.
+    ///
+    /// The stamp is written **before** the id is listed, so a panic between them fails closed: an
+    /// unlisted-but-held id can never be handed out, whereas a listed-but-unstamped one could.
+    pub fn push_free_shadow_held(&mut self, id: u64) {
+        if let Some(barrier) = self.state.reuse_barrier {
+            self.state.held.insert(id, barrier);
+        }
+        self.state.free.push(id);
+    }
+
+    /// Removes every occurrence of `id` from the free list (`rmp` #578 rollback withdrawal).
+    pub fn remove_free_id(&mut self, id: u64) {
+        self.state.free.remove_id(id);
+    }
+
+    /// The free list, for inspection (the consistency checker and the durable catalog image).
+    #[must_use]
+    pub fn free(&self) -> &FreeList {
+        &self.state.free
+    }
+
+    /// Sets (or clears) the reuse barrier stamped onto subsequent frees (`rmp` #588).
+    pub fn set_reuse_barrier(&mut self, barrier: Option<u64>) {
+        self.state.reuse_barrier = barrier;
+    }
+
+    /// Releases every shadow-held slot whose barrier `b` satisfies `b <= oldest_open_ticket` — i.e.
+    /// every reader that predated the free has retired (`rmp` #588). `u64::MAX` releases everything.
+    pub fn release_held(&mut self, oldest_open_ticket: u64) {
+        if !self.state.held.is_empty() {
+            self.state
+                .held
+                .retain(|_id, &mut barrier| barrier > oldest_open_ticket);
+        }
+    }
+
+    /// How many slots are currently shadow-held from reuse.
+    #[must_use]
+    pub fn held_len(&self) -> usize {
+        self.state.held.len()
+    }
+
+    /// Whether `id` is currently shadow-held from reuse.
+    #[must_use]
+    pub fn is_shadow_held(&self, id: u64) -> bool {
+        self.state.held.contains_key(&id)
     }
 }
 
@@ -345,7 +837,7 @@ mod tests {
 
     #[test]
     fn physical_ids_start_at_one_and_are_monotonic() {
-        let mut a = PhysicalAllocator::new();
+        let a = PhysicalAllocator::new();
         assert_eq!(a.alloc_fresh().unwrap(), 1);
         assert_eq!(a.alloc_fresh().unwrap(), 2);
         assert_eq!(a.high_water(), 3);
@@ -353,7 +845,7 @@ mod tests {
 
     #[test]
     fn observe_keeps_high_water_ahead() {
-        let mut a = PhysicalAllocator::new();
+        let a = PhysicalAllocator::new();
         a.observe(10);
         assert_eq!(a.alloc_fresh().unwrap(), 11);
     }
@@ -364,7 +856,7 @@ mod tests {
     /// unchecked `+= 1` here would silently return `0` in a release build; `checked_add` errors.
     #[test]
     fn alloc_fresh_at_u64_max_ceiling_errors_instead_of_wrapping_to_null() {
-        let mut a = PhysicalAllocator::restore(u64::MAX);
+        let a = PhysicalAllocator::restore(u64::MAX);
         // The id at the ceiling is itself `u64::MAX` — but advancing past it overflows, so the call
         // must report the exhausted space and must NOT have produced (or be about to produce) `0`.
         let err = a.alloc_fresh();
@@ -377,6 +869,290 @@ mod tests {
         // And it keeps failing — it never resurrects as id `0`.
         assert!(a.alloc_fresh().is_err());
         assert_ne!(a.high_water(), NULL_ID);
+    }
+
+    // ----------------------- StoreAllocator (`rmp` #1012) ------------------------
+
+    /// **A withdrawal that would drop the mark below a live id is REFUSED** (`rmp` #1012).
+    ///
+    /// This is restriction (a) of layer 4, and it is deterministic: it needs no threads, only the
+    /// *order* two writers can produce. `A` takes an id, `B` takes the next one, then `A`'s page
+    /// mapping fails. An unconditional `restore(id)` — what this replaced — would drop the mark to
+    /// `A`'s id, below the id `B` is still holding, and the very next allocation would issue `B`'s id
+    /// a **second** time: two live records in one physical slot, whose property / incidence chains
+    /// then self-cycle (the `rmp` #578 shape), plus a catalog whose `high_water` no longer covers
+    /// every allocated id (the `rmp` #479 / VOPR seed 5043221 shape).
+    #[test]
+    fn a_withdrawal_is_refused_once_another_allocation_has_moved_the_mark() {
+        let alloc = StoreAllocator::new();
+        let a = alloc.allocate().expect("space");
+        let b = alloc.allocate().expect("space");
+        assert_eq!((a, b), (Allocation::Fresh(1), Allocation::Fresh(2)));
+        assert_eq!(alloc.high_water(), 3);
+
+        // `A`'s mapping fails *after* `B` has already taken id 2.
+        assert!(
+            !alloc.lock().unbump_fresh(a.id()),
+            "the withdrawal must be DECLINED: the mark has moved on, and lowering it would drop it \
+             below id 2, which another allocation is still holding"
+        );
+        assert_eq!(
+            alloc.high_water(),
+            3,
+            "a declined withdrawal must leave the mark exactly where it was"
+        );
+
+        // And the proof that matters: no id is ever issued twice.
+        let c = alloc.allocate().expect("space");
+        assert_eq!(
+            c,
+            Allocation::Fresh(3),
+            "the next allocation must continue past the ids still outstanding, never re-issue one"
+        );
+
+        // The conditional withdrawal still WORKS when it is the sound thing to do — nothing has
+        // allocated since, so `c` really is the last id out and can be handed back.
+        assert!(alloc.lock().unbump_fresh(c.id()));
+        assert_eq!(alloc.high_water(), 3);
+    }
+
+    /// A claimed run is withdrawn on the same terms: only while the mark is still at its end.
+    #[test]
+    fn a_run_withdrawal_is_refused_once_another_claim_has_moved_the_mark() {
+        let alloc = StoreAllocator::new();
+        let (first_a, end_a) = alloc
+            .lock()
+            .claim_run(|first| Ok(first + 8))
+            .expect("first run");
+        let (first_b, end_b) = alloc
+            .lock()
+            .claim_run(|first| Ok(first + 8))
+            .expect("second run");
+        assert_eq!((first_a, end_a), (1, 9));
+        assert_eq!(
+            (first_b, end_b),
+            (9, 17),
+            "runs are claimed from the mark under one hold, so they never overlap"
+        );
+
+        assert!(
+            !alloc.lock().unbump_run(first_a, end_a),
+            "withdrawing the FIRST run would strand the second one above the mark"
+        );
+        assert_eq!(alloc.high_water(), 17);
+        assert!(
+            alloc.lock().unbump_run(first_b, end_b),
+            "the last run out is still withdrawable"
+        );
+        assert_eq!(alloc.high_water(), 9);
+    }
+
+    /// **A run that would lower the mark is REFUSED, in release as in debug** (`rmp` #1012).
+    ///
+    /// `claim_run` is public and its extent comes from a caller-supplied closure, so the closure's
+    /// result is untrusted input. It used to be guarded by a `debug_assert!` in front of an
+    /// unconditional store — meaning that in a release build (no `debug_assert!`, no
+    /// `overflow-checks`) a closure returning a smaller value would have silently lowered the mark and
+    /// re-issued live ids: the exact defect this layer exists to close, coming through the one door
+    /// left open. This test runs in both profiles because the guard is now a real branch.
+    #[test]
+    fn a_run_that_would_lower_the_mark_is_refused() {
+        let alloc = StoreAllocator::new();
+        let (_, end) = alloc.lock().claim_run(|first| Ok(first + 16)).expect("run");
+        assert_eq!(alloc.high_water(), end);
+
+        for proposed in [1u64, 5, end - 1, end] {
+            let err = alloc.lock().claim_run(|_| Ok(proposed));
+            assert!(
+                err.is_err(),
+                "a run ending at {proposed} does not advance the mark ({end}) and must be refused"
+            );
+            assert_eq!(
+                alloc.high_water(),
+                end,
+                "a refused run must leave the mark exactly where it was"
+            );
+        }
+
+        // And the ids the first run claimed are still accounted for: nothing was re-issued.
+        assert_eq!(
+            alloc.lock().allocate().expect("space"),
+            Allocation::Fresh(end)
+        );
+
+        // A propagated closure error also moves nothing.
+        let err = alloc
+            .lock()
+            .claim_run(|_| Err(graphus_core::GraphusError::Storage("no slab".to_owned())));
+        assert!(err.is_err());
+        assert_eq!(alloc.high_water(), end + 1);
+    }
+
+    /// **A shadow-held slot is never handed out, and reading the overlay is part of the pop**
+    /// (`rmp` #588 through the `rmp` #1012 API).
+    ///
+    /// The check and the pop are one hold because they are one decision. Split, a slot released
+    /// between them goes to a writer while an off-thread reader is still threading through it.
+    #[test]
+    fn a_shadow_held_slot_is_skipped_until_it_is_released() {
+        let alloc = StoreAllocator::restore(100, FreeList::new());
+        // A GC pass frees three slots with a barrier armed.
+        {
+            let mut g = alloc.lock();
+            g.set_reuse_barrier(Some(7));
+            for id in [10, 20, 30] {
+                g.push_free_shadow_held(id);
+            }
+            g.set_reuse_barrier(None);
+        }
+        assert_eq!(alloc.held_len(), 3);
+        assert_eq!(alloc.free_len(), 3, "the ids ARE listed as free, just held");
+
+        // Every allocation grows instead of reusing a held slot...
+        for expected in 100..105 {
+            assert_eq!(
+                alloc.allocate().expect("space"),
+                Allocation::Fresh(expected),
+                "a shadow-held slot must never be reused while a predating reader may hold it"
+            );
+        }
+        // ...and the held ids are still on the free list afterwards (stashed and re-listed, never
+        // dropped), so no space is lost.
+        let mut still_free = alloc.free_ids();
+        still_free.sort_unstable();
+        assert_eq!(still_free, vec![10, 20, 30]);
+
+        // Once every predating reader has retired, they become reusable — LIFO, as before #588.
+        alloc.lock().release_held(7);
+        assert_eq!(alloc.held_len(), 0);
+        let mut reused = Vec::new();
+        for _ in 0..3 {
+            match alloc.allocate().expect("space") {
+                Allocation::Reused(id) => reused.push(id),
+                Allocation::Fresh(id) => panic!("expected reuse, grew to {id}"),
+            }
+        }
+        reused.sort_unstable();
+        assert_eq!(reused, vec![10, 20, 30]);
+    }
+
+    /// The barrier is read and the hold stamped inside the same operation that lists the id, so the
+    /// free list can never offer an id whose stamp has not landed.
+    #[test]
+    fn freeing_under_an_armed_barrier_stamps_before_it_lists() {
+        let alloc = StoreAllocator::restore(50, FreeList::new());
+        alloc.lock().set_reuse_barrier(Some(42));
+        alloc.free_shadow_held(5);
+        let g = alloc.lock();
+        assert!(g.is_shadow_held(5));
+        assert!(g.free().ids().contains(&5));
+        drop(g);
+
+        // No barrier armed => listed, not held: the pre-#588 immediate-reuse path.
+        alloc.lock().set_reuse_barrier(None);
+        alloc.free_shadow_held(6);
+        let g = alloc.lock();
+        assert!(!g.is_shadow_held(6));
+        assert!(g.free().ids().contains(&6));
+    }
+
+    /// `allocate` prefers reuse over growth, and reports which it did — the distinction the caller
+    /// needs, since only a fresh id can require a page to be mapped.
+    #[test]
+    fn allocate_prefers_reuse_and_reports_its_provenance() {
+        let mut free = FreeList::new();
+        free.push(3);
+        let alloc = StoreAllocator::restore(10, free);
+        assert_eq!(alloc.allocate().unwrap(), Allocation::Reused(3));
+        assert_eq!(alloc.allocate().unwrap(), Allocation::Fresh(10));
+        assert_eq!(alloc.high_water(), 11);
+    }
+
+    /// Exhaustion still fails closed through the latched API — a wrapped mark would hand out the
+    /// reserved NULL id (`rmp` #452).
+    #[test]
+    fn allocate_at_the_ceiling_fails_closed_through_the_latch() {
+        let alloc = StoreAllocator::restore(u64::MAX, FreeList::new());
+        assert!(alloc.allocate().is_err());
+        assert_eq!(alloc.high_water(), u64::MAX);
+        assert_ne!(alloc.high_water(), NULL_ID);
+    }
+
+    /// **The allocator is shareable across threads — the point of layer 4** (`rmp` #1012).
+    ///
+    /// Asserted by the compiler rather than described in prose: if a later change puts a `Cell`, an
+    /// `Rc` or a raw pointer inside the guarded state, this stops compiling instead of quietly
+    /// un-sharing the store one layer above.
+    #[test]
+    fn the_store_allocator_is_send_and_sync() {
+        const fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<StoreAllocator>();
+        assert_send_sync::<PhysicalAllocator>();
+        assert_send_sync::<Allocation>();
+    }
+
+    /// **Two allocation latches at once are refused** (`rmp` #1012) — the real shape, at the
+    /// `StoreAllocator` level rather than at the raw scope.
+    ///
+    /// Two rank-25 latches cannot be sequenced *by* rank, so two threads that take a different pair in
+    /// a different order deadlock. Nothing in the store needs to hold two: every composite decision
+    /// lives inside one store's guard. The reachable way to violate it is
+    /// [`AllocGuard::claim_run`], whose closure runs with the latch held — a closure that reached for
+    /// a second store's allocator would deadlock and pass every test that only checks results.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "Rank 25 is not re-entrant")]
+    fn holding_two_store_latches_at_once_is_refused() {
+        let node = StoreAllocator::new();
+        let rel = StoreAllocator::new();
+        let _a = node.lock();
+        let _b = rel.lock();
+    }
+
+    /// ...and the same latch taken twice **in sequence** is fine, which is what every six-store loop
+    /// (`set_reuse_barrier`, `release_held`, the catalog image) relies on.
+    #[test]
+    fn taking_the_six_latches_one_after_another_is_fine() {
+        let stores: Vec<StoreAllocator> = (0..6).map(|_| StoreAllocator::new()).collect();
+        for s in &stores {
+            s.lock().set_reuse_barrier(Some(7));
+        }
+        for s in &stores {
+            s.free_shadow_held(1);
+        }
+        assert!(stores.iter().all(|s| s.held_len() == 1));
+    }
+
+    /// **The rank-25 tripwire is actually armed by `lock()`** (`rmp` #1012).
+    ///
+    /// [`graphus_core::latch`] proves the assertion *fires* when the depth is non-zero; this proves
+    /// the depth is non-zero exactly while an [`AllocGuard`] is alive. Without this link the tripwire
+    /// at `ensure_store_page` and at the WAL barrier would be permanently satisfied and would prove
+    /// nothing — a dead guard that reads as a live one.
+    #[test]
+    fn holding_the_latch_arms_the_no_io_tripwire() {
+        use graphus_core::latch::alloc_latch_depth;
+        let alloc = StoreAllocator::new();
+        assert_eq!(alloc_latch_depth(), 0);
+        {
+            let _g = alloc.lock();
+            #[cfg(debug_assertions)]
+            assert_eq!(
+                alloc_latch_depth(),
+                1,
+                "StoreAllocator::lock must arm the rank-25 scope, or the I/O tripwires are dead"
+            );
+        }
+        assert_eq!(
+            alloc_latch_depth(),
+            0,
+            "the scope must unwind with the guard, or every later barrier would false-alarm"
+        );
+        // The convenience wrappers take and release the latch too — the depth must not leak.
+        let _ = alloc.allocate();
+        alloc.free_shadow_held(1);
+        let _ = alloc.free_len();
+        assert_eq!(alloc_latch_depth(), 0);
     }
 
     #[test]

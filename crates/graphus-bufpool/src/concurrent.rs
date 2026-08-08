@@ -867,6 +867,15 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
     /// full of pinned frames so no victim can be evicted, or a contended load fails to resolve
     /// within the internal retry bound (a live-lock backstop).
     pub fn fetch(&self, page_id: PageId) -> Result<PinnedFrame> {
+        // The rank-25 allocation latch must already be released (`rmp` #1012). A `fetch` may miss,
+        // read the device, evict a dirty victim and hoist the WAL — so a store's allocator held across
+        // it would convoy every writer of that store behind one page fault. The rule the rank states
+        // is "released before any I/O", and the two sites armed with this tripwire in layer 4
+        // (`RecordStore::ensure_store_page`, `WalManager::harden`) did not cover the fault-in path
+        // itself: a guard held through here would not invert the latch order (25 < 40) and so would be
+        // a *silent* convoy — the failure mode a tripwire exists to make loud. Asserted on every
+        // `fetch`, hit or miss, because the caller cannot know which it will be. Debug-only.
+        graphus_core::latch::assert_no_alloc_latch_held("BufferPool::fetch");
         // One backoff per `fetch` call: it escalates across the transient retries below (lost hit-race,
         // peer `Loading`, contended victim sweep) so a herd of concurrent fetchers spreads out in time
         // and the in-flight loader latches drain — instead of re-contending in lockstep, the
