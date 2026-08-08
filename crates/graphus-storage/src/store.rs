@@ -4837,12 +4837,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// hazard, not the cost. The scan itself is unchanged from before this layer — the free list has
     /// always been a `Vec`-backed stack, because its LIFO order is part of the durable image — so what
     /// this costs over the old code is one uncontended acquisition per call, on a GC/rollback path.
+    ///
+    /// Since `rmp` #1024 the pairing is the allocator's primitive rather than this function's own
+    /// discipline: three other call sites had written the same test-then-push by hand and split it
+    /// across two holds, so it stopped being something each caller may re-derive.
     fn free_orphan_slot(&self, kind: StoreKind, id: u64) {
-        let mut alloc = self.store(kind).alloc.lock();
-        if alloc.free().ids().contains(&id) {
-            return;
-        }
-        alloc.push_free_shadow_held(id);
+        self.store(kind).alloc.free_shadow_held_if_absent(id);
     }
 
     /// GC phase F (`rmp` #966): reclaims every undo chain no live snapshot can still reach, and
@@ -5254,18 +5254,25 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// `alloc.lock().push_free(id)` directly — so a **live** rollback of the freeing transaction
     /// can withdraw its own pushes.
     ///
-    /// The hazard it closes is the free-list twin of the `rmp` #220/#172 monotonic high-water floor:
-    /// [`reload_catalog`](Self::reload_catalog) restores the free list to the last *durably committed*
-    /// image, but under statement-granularity interleaving a still-open **concurrent** transaction may
-    /// have already **popped** a freed id (via [`alloc_id`](Self::alloc_id)). Re-listing the committed
-    /// image would hand that id out **again** — two live records sharing one physical slot, whose
-    /// property/incidence chains then self-cycle (`P.next_prop = P` / `P.start_next = P`). [`rollback`]
-    /// (Self::rollback) instead restores the *pre-rollback* in-memory list (which already reflects every
-    /// concurrent pop) and removes exactly the ids recorded here, so an aborted GC pass — whose WAL undo
-    /// restores each reclaimed record's `in_use` bit — leaves no freed id whose slot is once again live.
-    /// Mirrors [`note_created`](Self::note_created) / [`note_expired`](Self::note_expired), including the
+    /// The bookkeeping exists so an aborted GC pass leaves no freed id whose slot is live again: its
+    /// WAL undo restores each reclaimed record's `in_use` bit, and [`rollback`](Self::rollback)
+    /// withdraws exactly the ids recorded here (`remove_free_id`). Mirrors
+    /// [`note_created`](Self::note_created) / [`note_expired`](Self::note_expired), including the
     /// `SYSTEM_TXN` guard (the system transaction never frees records and is never rolled back).
-    fn free_push(&mut self, kind: StoreKind, id: u64, txn: TxnId) {
+    ///
+    /// (Until `rmp` #1023 this note also described a second mechanism — `reload_catalog` reverting the
+    /// free list to the durable image, and the rollback restoring a pre-rollback snapshot on top. That
+    /// is gone: the reload no longer touches the free list, so there is no reversion to compensate for
+    /// and no stale snapshot to restore. The withdrawal above is now the whole of it.)
+    ///
+    /// # Refuses to list an id twice (`rmp` #1024)
+    ///
+    /// Returns whether it listed the id. A caller that has already proved the slot dead may still be
+    /// racing another reclaimer that proved the same thing, so the "not already listed" test lives
+    /// **inside** the hold that pushes — see [`AllocGuard::push_free_if_absent`]. Callers that used to
+    /// test first and push later must pass their test's outcome *through* this, not around it: a
+    /// declined push means somebody else got there, which is not an error.
+    fn free_push(&mut self, kind: StoreKind, id: u64, txn: TxnId) -> bool {
         // `rmp` #973 coverage point: the instant a slot becomes reusable. Paired with the `rmp` #588
         // shadow-hold inside `push_free_shadow_held`, this is where a reader that predates the free
         // races slot recycling, so an interleaving that reaches it is worth being able to replay.
@@ -5281,7 +5288,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // `rmp` #1012: reading the barrier, stamping the hold and listing the id are ONE hold on the
         // store's allocation latch, because they are one decision. Listed first and stamped second,
         // a concurrent `alloc_id` could pop the id in between and hand a still-read slot to a writer.
-        self.store(kind).alloc.free_shadow_held(id);
+        //
+        // `rmp` #1024: the "already listed?" test joins them, in the same hold and for the same
+        // reason. It is the id's SECOND listing that hands one slot to two writers, and no amount of
+        // testing beforehand rules that out.
+        if !self.store(kind).alloc.free_shadow_held_if_absent(id) {
+            return false;
+        }
         if txn != SYSTEM_TXN {
             self.active
                 .entry(txn)
@@ -5289,6 +5302,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 .freed_ids
                 .push((kind, id));
         }
+        true
     }
 
     /// Moves one **live-record cardinality counter** by `±1` under `txn` AND records the move in
@@ -6630,11 +6644,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 if self.read_mvcc(kind, id)?.in_use() {
                     continue;
                 }
-                if self.store(kind).alloc.free_contains(id) {
-                    continue;
+                // The "already listed?" test is no longer taken here and acted on below (`rmp`
+                // #1024): it is `free_push`'s, inside the hold that lists. Two GC passes reaching the
+                // same orphan both saw it absent and both pushed it, and a free list holding one id
+                // twice hands one slot to two writers.
+                if self.free_push(kind, id, txn) {
+                    reclaimed += 1;
                 }
-                self.free_push(kind, id, txn);
-                reclaimed += 1;
             }
         }
         Ok(reclaimed)
@@ -7167,7 +7183,17 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         prop_owners: &[(u64, StoreKind, u64)],
     ) {
         for &(kind, id) in popped_ids {
-            // Never create a duplicate free-list entry (a re-pushed id must be unique).
+            // An OPTIMISATION, not the decision (`rmp` #1024). An id already listed needs none of the
+            // proof below, and that proof is expensive — `rel_slot_referenced` and
+            // `prop_chain_visits` walk chains and fetch pages. Dropping this short-circuit made the
+            // `rmp` #970 rollback-cost test fail by 12x on a large store, which is exactly what it
+            // exists to catch.
+            //
+            // What it is NOT is the guard against a duplicate entry. That used to be its job, taken
+            // here and acted on ~35 lines below with page fetches in the gap — the widest of this
+            // defect's three windows. The I/O cannot move inside a hold (latch rank 25 is never held
+            // across it, and since `rmp` #1012 `BufferPool::fetch` panics in debug if it is), so the
+            // shape is: cheap test here, proof here, and then a RE-TEST inside the hold that lists.
             if self.store(kind).alloc.free_contains(id) {
                 continue;
             }
@@ -7203,7 +7229,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 },
             };
             if safe {
-                self.store(kind).alloc.lock().push_free(id);
+                // Re-tested inside the acting hold, not trusted from before the I/O above. NOT
+                // shadow-held: these pushes never were, and `rmp` #1024 is about atomicity, not about
+                // changing which pushes the #588 hold covers.
+                self.store(kind).alloc.free_if_absent(id);
             }
         }
     }
@@ -8705,6 +8734,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // successor below it). GC splices it out and frees its slot here. Its overflow heap is NOT
             // freed: the aborting txn already released those blocks through its own WAL undo, so the
             // blocks are no longer in-use and freeing again would double-free.
+            // The free-list test here decides whether to SPLICE, and it is necessarily taken before
+            // the `write_prop` below — there is no way to fold a WAL write into an allocation hold,
+            // and rank 25 forbids trying (`rmp` #1012). What must not also be taken here is the
+            // decision to LIST the slot: that one is re-taken inside the hold that lists, by
+            // `free_push` (`rmp` #1024). Splitting them is what let two sweeps push `cur` twice, with
+            // a durable write sitting in the gap — the widest window of the three.
             let is_corpse =
                 !prop.mvcc.in_use() && !self.store(StoreKind::Prop).alloc.free_contains(cur);
             if is_tombstone || is_corpse {

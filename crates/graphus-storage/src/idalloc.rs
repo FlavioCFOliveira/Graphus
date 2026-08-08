@@ -164,10 +164,41 @@ impl PhysicalAllocator {
 /// Deletion pushes the freed id; allocation pops a freed id before extending the store. The whole
 /// stack is small and held in memory; [`encode`](Self::encode) / [`decode`](Self::decode) give it
 /// a byte image so the store can log and recover it.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+/// # Membership is O(1) (`rmp` #1024)
+///
+/// The stack carries a `HashSet` mirror of its own contents, so `contains` is a hash lookup rather
+/// than a scan. The mirror lives **inside** this type deliberately: every mutation already goes
+/// through `push` / `pop` / `remove_id` / `decode`, so there is no way for a caller to move the stack
+/// and forget the index, which is exactly how a hand-maintained side index rots.
+///
+/// It is not a micro-optimisation. `rmp` #1024 folds an "is it already listed?" test into every free,
+/// and with a linear scan that turns a rollback freeing *n* ids into O(n²) work — measured at **12×**
+/// on the large-store leg of the `rmp` #970 rollback-cost test, which is precisely the regression that
+/// test exists to catch. The mirror is derived state and is never encoded:
+/// [`encode`](Self::encode) writes the stack alone, and [`decode`](Self::decode) rebuilds it.
+///
+/// A **multiset**, not a set, so that every operation is O(1) *including* `pop`. A set would force
+/// `pop` to scan the stack before dropping the entry — reintroducing the linear cost on the hottest
+/// path of all, allocation — and a multiset also stays honest if a malformed list ever does arrive
+/// through [`decode`](Self::decode) or [`replace_free`](AllocGuard::replace_free): the count tracks
+/// how many copies are really there, so `contains` cannot start lying in the direction that would
+/// permit yet another push.
+#[derive(Debug, Default, Clone)]
 pub struct FreeList {
     stack: Vec<u64>,
+    /// How many times each id appears in `stack`. Derived, never serialised — see the type docs.
+    index: HashMap<u64, u32>,
 }
+
+/// Equality is decided by the **stack** alone: the index is derived from it, so two lists with equal
+/// stacks are equal lists. Comparing the mirror as well would be comparing the same fact twice.
+impl PartialEq for FreeList {
+    fn eq(&self, other: &Self) -> bool {
+        self.stack == other.stack
+    }
+}
+
+impl Eq for FreeList {}
 
 impl FreeList {
     /// An empty free list.
@@ -183,11 +214,19 @@ impl FreeList {
     pub fn push(&mut self, id: u64) {
         assert!(id != NULL_ID, "cannot free the reserved null id 0");
         self.stack.push(id);
+        *self.index.entry(id).or_insert(0u32) += 1;
     }
 
     /// Pops the most recently freed id, if any (LIFO reuse).
     pub fn pop(&mut self) -> Option<u64> {
-        self.stack.pop()
+        let id = self.stack.pop()?;
+        if let std::collections::hash_map::Entry::Occupied(mut e) = self.index.entry(id) {
+            *e.get_mut() -= 1;
+            if *e.get() == 0 {
+                e.remove();
+            }
+        }
+        Some(id)
     }
 
     /// Removes every occurrence of `id` from the stack, preserving the relative (LIFO) order of the
@@ -201,6 +240,14 @@ impl FreeList {
     /// this removes exactly the transaction's push.
     pub fn remove_id(&mut self, id: u64) {
         self.stack.retain(|&x| x != id);
+        self.index.remove(&id);
+    }
+
+    /// Whether `id` is currently listed, in O(1) (`rmp` #1024). See the type docs for why the mirror
+    /// that makes this constant-time is not optional.
+    #[must_use]
+    pub fn contains(&self, id: u64) -> bool {
+        self.index.contains_key(&id)
     }
 
     /// The number of free ids currently held.
@@ -259,7 +306,11 @@ impl FreeList {
                 bytes[off..off + 8].try_into().expect("8-byte slice"),
             ));
         }
-        Ok(Self { stack })
+        let mut index: HashMap<u64, u32> = HashMap::with_capacity(stack.len());
+        for &id in &stack {
+            *index.entry(id).or_insert(0u32) += 1;
+        }
+        Ok(Self { stack, index })
     }
 }
 
@@ -415,6 +466,20 @@ impl StoreAllocator {
         self.lock().push_free_shadow_held(id);
     }
 
+    /// Lists `id` **only if it is not already listed**, shadow-holding it, under one hold; reports
+    /// whether it listed it. See [`AllocGuard::push_free_shadow_held_if_absent`] for why the test and
+    /// the push cannot be two holds (`rmp` #1024).
+    pub fn free_shadow_held_if_absent(&self, id: u64) -> bool {
+        self.lock().push_free_shadow_held_if_absent(id)
+    }
+
+    /// The same, **without** the `rmp` #588 shadow hold — the pairing of
+    /// [`AllocGuard::push_free`], for the one caller (`reclaim_aborted_pops`) whose pushes were never
+    /// shadow-held and must stay that way.
+    pub fn free_if_absent(&self, id: u64) -> bool {
+        self.lock().push_free_if_absent(id)
+    }
+
     /// A copy of the free list — the durable catalog image, and the `rmp` #578 pre-rollback snapshot.
     #[must_use]
     pub fn free_snapshot(&self) -> FreeList {
@@ -424,7 +489,7 @@ impl StoreAllocator {
     /// Whether `id` is currently listed as free.
     #[must_use]
     pub fn free_contains(&self, id: u64) -> bool {
-        self.lock().free().ids().contains(&id)
+        self.lock().free().contains(id)
     }
 
     /// The freed ids currently held, in stack (LIFO) order.
@@ -643,6 +708,46 @@ impl AllocGuard<'_> {
             self.state.held.insert(id, barrier);
         }
         self.state.free.push(id);
+    }
+
+    /// Lists `id` **only if it is not already listed**, shadow-holding it as
+    /// [`push_free_shadow_held`](Self::push_free_shadow_held) does; reports whether it listed it.
+    ///
+    /// # This exists so the caller cannot get it wrong (`rmp` #1024)
+    ///
+    /// "Is it already listed?" and "list it" are **one** decision. Split across two holds — even two
+    /// holds a microsecond apart — two reclaimers can both observe the id absent and both push it, and
+    /// a free list holding the same id twice hands one physical slot to two writers. That is the
+    /// `rmp` #578 duplicate-free-list-entry shape: two live records in one slot, whose property /
+    /// incidence chains then self-cycle. [`FreeList::remove_id`](FreeList::remove_id)'s contract
+    /// ("a well-formed free list holds each id at most once") depends on it never happening.
+    ///
+    /// Before the per-store latch of `rmp` #1012 the pairing was free: every caller held `&mut
+    /// RecordStore`, so the test and the push were atomic whether the author thought about it or not.
+    /// Turning that borrow into a latch acquisition removed the guarantee without changing a line of
+    /// the logic — the classic hazard of this refactor — and left three call sites deciding under one
+    /// hold and acting under another, one of them with a **WAL write** in the gap.
+    ///
+    /// So the primitive takes the whole decision. A caller that must do I/O first (reading a record to
+    /// prove the slot unreferenced) does it **outside** any hold, as latch rank 25 requires, and then
+    /// calls this — which re-tests inside the hold that acts, rather than trusting what it read
+    /// earlier. Impossible-by-construction, instead of correct-by-caller-discipline.
+    pub fn push_free_shadow_held_if_absent(&mut self, id: u64) -> bool {
+        if self.state.free.contains(id) {
+            return false;
+        }
+        self.push_free_shadow_held(id);
+        true
+    }
+
+    /// [`push_free_if_absent`](Self::push_free_shadow_held_if_absent) without the `rmp` #588 hold —
+    /// the pairing of [`push_free`](Self::push_free), for the one caller that must not shadow-hold.
+    pub fn push_free_if_absent(&mut self, id: u64) -> bool {
+        if self.state.free.contains(id) {
+            return false;
+        }
+        self.push_free(id);
+        true
     }
 
     /// Removes every occurrence of `id` from the free list (`rmp` #578 rollback withdrawal).
