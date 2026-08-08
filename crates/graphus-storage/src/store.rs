@@ -42,7 +42,7 @@ use graphus_txn::{CommitRegistry, Snapshot, TxnOutcome};
 use graphus_wal::{LogSink, WalManager};
 
 use crate::heap::{self, BLOCK_PAYLOAD, HeapBlock, STRINGS_RECORD_SIZE};
-use crate::idalloc::{Allocation, ElementIdAllocator, FreeList, NULL_ID, StoreAllocator};
+use crate::idalloc::{Allocation, ElementIdAllocator, NULL_ID, StoreAllocator};
 use crate::labels;
 use crate::meta::{
     CompositeIndexEntry, ConstraintEntry, CountKey, FulltextIndexEntry, IndexState,
@@ -6825,19 +6825,15 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             .active
             .get(&txn)
             .is_some_and(|a| !a.schema_undo.is_empty());
-        // Snapshot the in-memory free lists BEFORE the catalog reload (`rmp` #578). The free list has
-        // the SAME monotonicity hazard as the high-water / token / device-page state restored below,
-        // but — unlike them — is NOT monotonic (ids are popped as well as pushed), so it cannot use a
-        // simple floor. `reload_catalog` resets it to the last DURABLY-COMMITTED image, yet under
-        // STATEMENT-granularity interleaving a still-open CONCURRENT transaction may already have
-        // POPPED a freed id (via `alloc_id`): re-listing the committed image would hand that id out
-        // AGAIN, so two live records would share one physical slot and their property / incidence
-        // chains self-cycle (the #578 "malformed (cycle?)"). This pre-rollback snapshot already
-        // reflects every concurrent pop (and this txn's own pushes), so restoring IT — minus this
-        // txn's own pushes — is the free-list twin of the #220/#172 high-water floor.
-        let pre_free: [FreeList; STORE_COUNT] =
-            std::array::from_fn(|i| self.stores[i].alloc.free_snapshot());
-        // The live-record COUNTERS have exactly the same hazard, for exactly the same reason (`rmp`
+        // The free lists are NOT snapshotted (`rmp` #1023). They used to be, because `reload_catalog`
+        // reset them to the durable image and the pre-rollback snapshot had to be restored on top —
+        // and restoring a snapshot taken before the WAL undo is what silently reverted a concurrent
+        // transaction's pops. `reload_catalog` no longer touches the free lists at all, so the live
+        // list already IS the correct state, and the only thing this rollback owes it is the
+        // withdrawal of its own pushes below.
+        //
+        // The live-record COUNTERS still have the old hazard, because `reload_catalog` still reverts
+        // the whole `Statistics` wholesale (`rmp`
         // #866). They move eagerly at write time, so the in-memory value is "durable image + every
         // in-flight transaction's delta", and `reload_catalog` below throws all of that away. Snapshot
         // them now — the snapshot already reflects every CONCURRENT open transaction's increments and
@@ -6852,30 +6848,26 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // bounded by the number of distinct labels/relationship types in the schema, not by the number
         // of records the transaction touched.
         let pre_counts = self.statistics.counts_image();
-        // Capture the in-memory physical-id high-water marks BEFORE the catalog reload (`rmp` #220 /
-        // #172). `reload_catalog` restores the allocators from the last COMMITTED metadata — but under
-        // STATEMENT-granularity interleaving a CONCURRENT, still-open transaction may have advanced a
-        // high-water by allocating its own fresh records, which are not in that committed checkpoint.
-        // Reloading wholesale would lower the high-water below those ids, so a later commit of the
-        // concurrent txn leaves its records OUTSIDE the scanned `1..high_water` range — invisible to
-        // every label/full scan (the engine-level face of #220/#172: committed leaves/edges vanish).
-        // Like device-page growth below, the physical-id high-water is monotonic and must never be
-        // lowered by an unrelated txn's rollback. (A physical id once allocated to a concurrent writer
-        // must not be re-handed-out either; flooring the high-water preserves that too.)
-        let pre_high_water: [u64; STORE_COUNT] =
-            std::array::from_fn(|i| self.stores[i].alloc.high_water());
-        // Same monotonicity hazard for the **token dictionary** and the **`ElementId` allocator**
-        // (`rmp` #220 / #172). `reload_catalog` resets both to the last committed catalog, but a
-        // concurrent open txn may have interned a relationship-type/label/key token (e.g. `LINK`) and
-        // allocated `ElementId`s for records it will soon commit. Dropping those tokens strands a
-        // committed rel's `type_id` on a now-unknown token (a `[:LINK]` type filter then matches
-        // nothing — the engine-level face of #220 where the typed edges "vanish"); lowering the
-        // `ElementId` high-water could re-hand-out a public identity a committed record already uses.
-        // Both are append-only and never reused, so a SUPERSET is always safe; preserve the richer
-        // in-memory views over the committed reload (a token interned only by the aborting txn is
-        // harmless to keep — an unused id, idempotent on re-intern).
+        // The physical-id high-water marks are NOT captured either (`rmp` #1023), and for the same
+        // reason as the free lists: `reload_catalog` no longer lowers them, so there is nothing to
+        // floor back. The capture and the floor together only ever computed `max(durable, in-memory)`,
+        // and a checkpoint persists the in-memory mark, so the durable value can only lag — the answer
+        // was always the value already in place. The `rmp` #220 / #172 property they defended is now
+        // structural rather than restored: a concurrent open transaction's freshly allocated ids stay
+        // inside the scanned `1..high_water` range because nothing ever moves the mark backwards.
+        //
+        // Same for the **`ElementId` allocator**, previously rebuilt from the catalog and then floored:
+        // it is append-only and never reused, so the durable seed could only lag and the floor could
+        // only restore what was there. `reload_catalog` leaves it alone.
+        //
+        // The **token dictionary** still needs its capture: `reload_catalog` does still replace it
+        // wholesale, and a concurrent open txn may have interned a relationship-type/label/key token
+        // (e.g. `LINK`) for records it will soon commit. Dropping those strands a committed rel's
+        // `type_id` on a now-unknown token (a `[:LINK]` type filter then matches nothing — the
+        // engine-level face of #220 where typed edges "vanish"). Append-only, so a SUPERSET is always
+        // safe: a token interned only by the aborting txn is harmless to keep (an unused id,
+        // idempotent on re-intern).
         let pre_tokens = self.tokens.clone();
-        let pre_element_next = self.element_ids.peek();
         // Same monotonicity hazard for the **schema-catalog** half of `Statistics` — the twelve
         // `catalog_dirty`-guarded DDL maps (declared indexes of every kind, their names, constraints,
         // property histograms) (`rmp` #534, defense-in-depth for the `rmp` #529 read-only-commit fast
@@ -7105,41 +7097,20 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 self.catalog_dirty = true;
             }
         }
-        // Raise the identity counter to its pre-rollback floor, atomically (`rmp` #1012). This was a
-        // read-then-replace — `if pre > peek() { element_ids = new(pre) }` — which is the same shape
-        // the page map's index claim had, and wrong for the same reason once a second writer exists:
-        // between the comparison and the replacement another writer can allocate, and the replacement
-        // would then discard its advance and re-hand-out an identity that already names a committed
-        // entity. `observe` is a compare-exchange max, so it can only ever move the counter forwards
-        // and a racing pair leaves it at the larger of the two — the identical discipline, and the
-        // identical `hw - 1` idiom, as the physical allocators floored immediately below.
-        if pre_element_next > 0 {
-            self.element_ids
-                .observe(graphus_core::ElementId(pre_element_next - 1));
-        }
-        // Floor each allocator at its pre-rollback high-water so a concurrent open txn's freshly
-        // allocated (and possibly soon-committed) ids stay within the scanned range and are never
-        // re-handed-out. `observe(hw - 1)` lifts the high-water to `hw` without inventing a new id.
-        for (i, hw) in pre_high_water.into_iter().enumerate() {
-            if hw > self.stores[i].alloc.high_water() {
-                self.stores[i].alloc.lock().observe(hw - 1);
-            }
-        }
-        // Restore the free lists to their pre-rollback in-memory image, then withdraw exactly this
-        // transaction's own pushes (`rmp` #578). Restoring `pre_free` (not the committed
-        // `reload_catalog` image) preserves every CONCURRENT open transaction's pops, so a popped id
-        // stays OUT of the free list and is never double-allocated. Withdrawing `aborted_freed_ids`
-        // undoes a GC pass's reclamations: the WAL undo above just restored each reclaimed record's
-        // `in_use` bit, so its slot must NOT remain free. A normal write transaction pushes nothing,
-        // so its `pre_free` is restored verbatim. Ordering is irrelevant: `aborted_freed_ids` and the
-        // concurrent pops are disjoint id sets (a popped id is off the list; a freed id was in use).
-        for (store, pf) in self.stores.iter().zip(pre_free) {
-            store.alloc.lock().replace_free(pf);
-        }
+        // The identity counter and the physical allocators are NOT restored here (`rmp` #1023). There
+        // is nothing to restore: `reload_catalog` no longer moves them, so the floor that used to be
+        // applied at this point — `observe(pre_element_next - 1)` and `observe(pre_high_water - 1)`,
+        // each raising back what the reload had just lowered — computed a value that had never left.
+        // Removing both halves is what closes the window between them, which no `max` could.
+        //
+        // What DOES belong to this rollback is its own free-list delta, and only that. First the
+        // pushes it made: a GC pass's reclamations are undone by the WAL undo that has already run, so
+        // those slots hold live records again and must not stay listed (`rmp` #578). A normal write
+        // transaction pushes nothing and this loop is empty.
         for (kind, id) in aborted_freed_ids {
             self.stores[kind as usize].alloc.lock().remove_free_id(id);
         }
-        // `rmp` #581: RECLAIM this transaction's own reused-id pops. Every pop the abort left as a
+        // `rmp` #581: then RECLAIM this transaction's own reused-id pops. Every pop the abort left as a
         // genuinely-unreferenced dead slot returns to the free list (bounded by the pops the txn made);
         // pops that a concurrently-committed writer turned into a live corpse are left for the #220/#172
         // GC splice, never double-freed. Runs AFTER the free-list restore above so a re-push cannot be
@@ -7326,14 +7297,22 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     }
 
     /// Rebuilds the in-memory catalog from the durable metadata page.
+    ///
+    /// Restores the token dictionary, the `Statistics`, the commit-timestamp high-water and the meta
+    /// chain. Does **not** touch the live page map (`rmp` #721), the physical-id allocators or the
+    /// `ElementId` counter (`rmp` #1023) — see the notes at each site for why reverting those to the
+    /// durable image was both unnecessary and unsafe.
     fn reload_catalog(&mut self) -> Result<()> {
         self.catalog_reloads += 1;
         let (meta, meta_chain) = Self::read_meta(&self.pool)?;
-        // `try_new`, not `new` (`rmp` #1012): this seed comes from the durable catalog, so a corrupt
-        // or adversarial one must fail the reload rather than panic the engine — and, above all, must
-        // never be truncated into the live range, which would re-issue identities that already name
-        // committed entities.
-        self.element_ids = ElementIdAllocator::try_new(meta.element_id_next.max(1))?;
+        // THE IDENTITY COUNTER IS PRESERVED — by never being touched (`rmp` #1023), for the same
+        // reason as the page map below. It used to be rebuilt from `meta.element_id_next` and then
+        // raised back to its pre-rollback value by the caller. Both steps are now gone: the counter is
+        // monotonic and never reused, and the durable catalog can only ever LAG the in-memory value,
+        // so "reload then floor" was an elaborate way of computing the value already in memory — with
+        // a window in the middle during which the counter read LOWER than ids already handed out.
+        // (The durable seed's validation belongs to `open`, which is where a corrupt catalog must be
+        // refused; reading it here only to discard it validated nothing.)
         // The commit-timestamp oracle is a strictly-monotonic counter that only ever ADVANCES (at
         // commit) and must NEVER move backwards within a running process — a reissued timestamp could
         // collide with one a still-tracked committed transaction holds and confuse SSI's concurrency
@@ -7396,17 +7375,36 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 )));
             }
         }
-        for (store, sm) in self.stores.iter().zip(meta.stores.iter()) {
-            // Restore ONLY the high-water mark and the free list, and restore them TOGETHER under one
-            // hold (`rmp` #1012) — they are two halves of one durable image, and a writer must never
-            // observe a mark that has been reloaded next to a free list that has not. `device_pages`
-            // is left exactly as it is, and so is the #588 shadow-hold overlay: that describes
-            // in-flight readers, not durable state, and a catalog reload knows nothing about them.
-            store
-                .alloc
-                .lock()
-                .restore(sm.high_water.max(1), sm.free_list.clone());
-        }
+        // THE PHYSICAL ALLOCATORS ARE PRESERVED — by never being touched (`rmp` #1023).
+        //
+        // This loop used to rebuild each store's high-water mark and free list from the durable
+        // catalog, and the caller then put both back: `observe(hw - 1)` raised the mark to its
+        // pre-rollback floor ~170 lines later, and `replace_free(pre_free)` restored the list ~300
+        // lines after its capture, with the WAL undo and page I/O in between. The end state was
+        // right and every intermediate state was published, which is the worst of both:
+        //
+        // * **the mark.** Between the lower and the raise, the allocator hands out ids BELOW the
+        //   floor — ids a concurrent open transaction has already written records into. Two logical
+        //   records then share one physical slot: if that transaction commits, its `ElementId` and
+        //   index entries name a slot that now belongs to somebody else; if it aborts, its WAL undo
+        //   restores its pre-image OVER the committed record. Silent loss of committed data, the
+        //   shape of `rmp` #578 and #220.
+        // * **the free list.** `replace_free` restored a list captured BEFORE the window, so it did
+        //   not merely preserve a concurrent transaction's earlier pops — it UNDID every pop made
+        //   inside the window, re-listing ids that by then named live records.
+        //
+        // Not touching them removes both windows by construction, and computes the same state it
+        // used to compute the long way round. The mark is monotonic and the durable catalog can only
+        // LAG memory (a checkpoint persists the in-memory mark), so `max(durable, pre_rollback)` was
+        // always just the pre-rollback value — the value already in place. The free list is not
+        // monotonic, but `pre_free` was captured from this very field, so restoring it was a no-op on
+        // everything except the concurrent pops it wrongly reverted. What genuinely belongs to the
+        // rollback is the aborting transaction's OWN delta, and that is all the caller now applies:
+        // `remove_free_id` for its pushes, `reclaim_aborted_pops` for its pops.
+        //
+        // This is the same argument the page map has settled below, extended to the two fields that
+        // were still being reverted — and it is what the sprint means by a rollback that replays its
+        // own deltas instead of reverting shared state.
         self.tokens = meta.tokens;
         // Restore the whole `Statistics` from the durable catalog (`rmp` task #79 / #81). This is a
         // WHOLESALE revert of both halves — the live-record counters and the schema-catalog DDL maps —
@@ -11499,6 +11497,9 @@ mod tests {
     //! Node-labels API unit tests over a real in-memory store (`rmp` task #42). The bitmap codec
     //! itself is tested in [`crate::labels`]; here we test the WAL-logged store methods end to end.
     use super::*;
+    // `FreeList` is no longer used by the store itself since `rmp` #1023 retired the rollback's
+    // pre-image capture; the fixtures below still build one directly.
+    use crate::idalloc::FreeList;
     use graphus_io::MemBlockDevice;
     use graphus_wal::{MemLogSink, WalManager};
 
@@ -13729,6 +13730,142 @@ mod tests {
                 "guard must never be 0 (would disable the bound)"
             );
         }
+    }
+
+    /// **WINDOW A (`rmp` #1023): a catalog reload must not lower the high-water mark, not even for an
+    /// instant.**
+    ///
+    /// The defect was never the end state — the rollback did put the mark back, ~170 lines later. It
+    /// was that the mark was *published* at the durable value in between, so a concurrent writer
+    /// allocating inside that window received an id BELOW the floor: an id another open transaction
+    /// had already written a record into. Two logical records in one physical slot, and if the
+    /// concurrent transaction later aborts, its WAL undo restores its pre-image over the committed
+    /// record — silent loss of committed data (`rmp` #578 / #220).
+    ///
+    /// # Why this is asserted on `reload_catalog` and not on two threads
+    ///
+    /// A thread test could only sample the mark and hope to catch the window; this asserts the window
+    /// does not exist. `reload_catalog` is the *only* thing that ever lowered the mark, so proving it
+    /// leaves the mark alone proves no such instant occurs — for every interleaving, not for the ones
+    /// a scheduler happened to produce. It is also the test that can be written today, with one
+    /// writer: the observer this defect needs does not exist until `rmp` #1013.
+    ///
+    /// Non-vacuous: restoring the old `alloc.lock().restore(sm.high_water.max(1), …)` to
+    /// `reload_catalog` makes this fail, because the durable catalog here genuinely lags memory.
+    #[test]
+    fn a_catalog_reload_never_lowers_the_high_water_mark_1023() {
+        let mut s = fresh();
+        // Commit once, so a durable catalog exists and records a low mark.
+        let t1 = TxnId(1);
+        s.begin(t1);
+        s.create_node(t1).expect("create");
+        s.commit(t1).expect("commit");
+        let durable_mark = s.store(StoreKind::Node).alloc.high_water();
+
+        // Now advance the in-memory mark WITHOUT committing — exactly what a concurrent open
+        // transaction does while somebody else is rolling back.
+        let t2 = TxnId(2);
+        s.begin(t2);
+        for _ in 0..5 {
+            s.create_node(t2).expect("create");
+        }
+        let live_mark = s.store(StoreKind::Node).alloc.high_water();
+        assert!(
+            live_mark > durable_mark,
+            "fixture is vacuous: the in-memory mark ({live_mark}) must outrun the durable one \
+             ({durable_mark}) or there is no window to open"
+        );
+
+        s.reload_catalog().expect("reload");
+
+        assert_eq!(
+            s.store(StoreKind::Node).alloc.high_water(),
+            live_mark,
+            "the catalog reload lowered the high-water mark to the durable image. A writer \
+             allocating at that instant would be handed an id another open transaction has already \
+             written a record into (`rmp` #1023, window A)"
+        );
+    }
+
+    /// **WINDOW B (`rmp` #1023): a catalog reload must not touch the free list, so a concurrent pop
+    /// can never be undone.**
+    ///
+    /// This is the wider of the two windows and the one that survived the first fix attempt. The
+    /// rollback restored a free list captured *before* the WAL undo, so it did not merely preserve
+    /// earlier pops — it reverted every pop made inside the window, re-listing ids that by then named
+    /// live records. The next allocation handed one out a second time.
+    ///
+    /// Making the reload leave the list alone removes the capture, and with it the window: there is no
+    /// "before" image to be stale. Asserted the same way as window A and for the same reason.
+    ///
+    /// Non-vacuous: restoring the old `restore(…, sm.free_list.clone())` makes this fail, because the
+    /// durable list here differs from the live one by exactly the pop below.
+    #[test]
+    fn a_catalog_reload_never_reverts_a_free_list_pop_1023() {
+        let mut s = fresh();
+        // Build a committed free list: create two nodes, delete one, and let a GC pass list its slot.
+        let t1 = TxnId(1);
+        s.begin(t1);
+        let (keep, _) = s.create_node(t1).expect("create");
+        let (doomed_a, _) = s.create_node(t1).expect("create");
+        let (doomed_b, _) = s.create_node(t1).expect("create");
+        s.commit(t1).expect("commit");
+        let t2 = TxnId(2);
+        s.begin(t2);
+        s.delete_node(t2, doomed_a).expect("delete");
+        s.delete_node(t2, doomed_b).expect("delete");
+        s.commit(t2).expect("commit");
+        s.gc(TxnId(9), Timestamp(u64::MAX)).expect("gc");
+        // Checkpoint so the DURABLE catalog carries a freed slot. A read-only commit writes no catalog
+        // (`rmp` #529), so this transaction must actually change something — and because a create
+        // REUSES a freed slot, two were freed above so that one still remains listed afterwards. With
+        // only one, the checkpointing create consumed it and the durable list was persisted empty,
+        // which the vacuity guard below caught.
+        let t3 = TxnId(3);
+        s.begin(t3);
+        s.create_node(t3).expect("create");
+        s.commit(t3).expect("commit");
+        // Read the free list back FROM THE DEVICE, not from memory. This is the list a reload would
+        // restore, and the whole test turns on it holding the slot — an earlier draft asserted against
+        // the in-memory snapshot instead, which made the test pass even with the defect reinstated.
+        let durable_free = Store::read_meta(&s.pool).expect("read meta").0.stores
+            [StoreKind::Node as usize]
+            .free_list
+            .clone();
+        assert!(
+            !durable_free.is_empty(),
+            "fixture is vacuous: the DURABLE free list must hold the reclaimed slot, or there is \
+             nothing for a reload to wrongly restore"
+        );
+
+        // A concurrent open transaction POPS the freed slot and writes a record into it.
+        let t4 = TxnId(4);
+        s.begin(t4);
+        let (reused, _) = s.create_node(t4).expect("create");
+        assert!(
+            durable_free.ids().contains(&reused),
+            "fixture is vacuous: the create must have REUSED a slot the DURABLE free list lists \
+             ({reused} is not in it), so a reload would have nothing to wrongly resurrect"
+        );
+        assert!(
+            !s.store(StoreKind::Node).alloc.free_contains(reused),
+            "the pop must have taken {reused} off the live list"
+        );
+
+        s.reload_catalog().expect("reload");
+
+        assert!(
+            !s.store(StoreKind::Node).alloc.free_contains(reused),
+            "the catalog reload put physical id {reused} back on the free list, undoing a pop whose \
+             record is already written. The next allocation would hand the same slot out again, so \
+             two live records would share it and their chains would self-cycle (`rmp` #1023, window \
+             B; the #578 duplicate-free-list-entry shape)"
+        );
+        // The node that was kept is untouched by any of this — the reload is not free to lose it.
+        assert!(
+            s.read_node(keep).is_ok(),
+            "the surviving node must still read"
+        );
     }
 
     /// Regression (`rmp` #452): an `alloc_fresh` at the physical-id ceiling surfaces a clean
