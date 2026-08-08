@@ -28,6 +28,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use graphus_bufpool::ConcurrentBufferPool;
 use graphus_bufpool::page::{self, HEADER_SIZE};
@@ -992,7 +993,14 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// The largest MVCC commit timestamp issued so far (`04 §5.2`); persisted in [`Meta`] so it
     /// resumes monotonically after reopen. The next commit timestamp is `commit_ts_hw + 1`, and a
     /// fresh reader's snapshot timestamp is `commit_ts_hw` (it sees exactly what has committed).
-    commit_ts_hw: u64,
+    /// An `Arc<AtomicU64>` since `rmp` #1022, for the same reason the allocator's high-water mark is
+    /// an atomic (`rmp` #1012): it is a value maintenance needs to read **without taking the store's
+    /// hold at all**. The index collector must compare it across its two phases, and it must do so
+    /// while holding the index — holding the store there instead would convoy every writer behind a
+    /// witness read that fetches pages. Every mutation still happens under the store's exclusive
+    /// hold, so the hold remains the total order over changes to it; the atom only permits a
+    /// lock-free observer. Shared out by [`commit_clock`](Self::commit_clock).
+    commit_ts_hw: Arc<AtomicU64>,
     /// Durable-write commit timestamps that have been PREPAREd (a `COMMIT` record appended) but whose
     /// group-commit `fdatasync` may not yet have hardened, as `(commit_lsn, commit_ts)` pairs in
     /// ascending `commit_lsn` order (`commit_prepare` runs serially on the engine thread, so pushes are
@@ -1412,7 +1420,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 let barrier = Arc::<SharedReuseBarrier>::default();
                 ALL_STORE_KINDS.map(|k| FixedStore::empty(k, Arc::clone(&barrier)))
             },
-            commit_ts_hw: 0,
+            commit_ts_hw: Arc::new(AtomicU64::new(0)),
             // A fresh store has made no durable write, so both the queue and the bookmark high-water start
             // empty/zero (`rmp` #813): a read before the first write mints `"<db>:0"`.
             pending_write_commits: VecDeque::new(),
@@ -1558,7 +1566,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             element_ids: ElementIdAllocator::new(meta.element_id_next.max(1)),
             tokens: meta.tokens,
             stores,
-            commit_ts_hw: meta.commit_ts_hw,
+            commit_ts_hw: Arc::new(AtomicU64::new(meta.commit_ts_hw)),
             // Nothing is un-hardened at open (recovery truncated the un-synced WAL tail). Seed the
             // durable-write bookmark high-water from the recovered `commit_ts_hw` (`rmp` #813): after a
             // crash only durable commit records survive, so this reflects the last durable write and can
@@ -1663,7 +1671,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // that this image holds no cell whose meaning would change (`rmp` #967).
             format_version: graphus_core::constants::FORMAT_VERSION,
             element_id_next: self.element_ids.peek(),
-            commit_ts_hw: self.commit_ts_hw,
+            commit_ts_hw: self.commit_ts_hw.load(Ordering::Acquire),
             stores,
             tokens: self.tokens.clone(),
             // Clones the whole `Statistics` (counts *and* the `rmp` task #81 property-histogram map):
@@ -2839,7 +2847,20 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// and nothing committed later. A fresh store (no commits yet) returns `Timestamp(0)`.
     #[must_use]
     pub fn snapshot_ts(&self) -> Timestamp {
-        Timestamp(self.commit_ts_hw)
+        Timestamp(self.commit_ts_hw.load(Ordering::Acquire))
+    }
+
+    /// A handle to the commit-timestamp clock, readable **without the store's hold** (`rmp` #1022).
+    ///
+    /// The index collector reads its witness off the store under one hold and removes entries under
+    /// the index's hold, and the removal is only sound if no commit landed in between. Comparing the
+    /// clock across both phases answers exactly that — but the second read has to happen while the
+    /// index is held, and taking the store's hold there would serialise every writer behind a witness
+    /// read that fetches pages. This handle is how that comparison is made without paying for it. See
+    /// `TxnCoordinator::collect_dead_index_keys`.
+    #[must_use]
+    pub fn commit_clock(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.commit_ts_hw)
     }
 
     /// The **durable-write commit-timestamp high-water** (`rmp` task #813): the largest commit timestamp
@@ -3468,12 +3489,15 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Panics if the 63-bit timestamp space is exhausted (in practice unreachable; the assertion
     /// guards the version-stamp discriminant just like the transaction oracle's).
     fn next_commit_ts(&mut self) -> Timestamp {
-        self.commit_ts_hw += 1;
+        // `Release` on the way out: this is the edge that publishes a commit to the lock-free
+        // observers of `commit_clock`, and the index collector's whole argument is that seeing an
+        // unchanged clock means no commit landed in between.
+        let next = self.commit_ts_hw.fetch_add(1, Ordering::AcqRel) + 1;
         assert!(
-            self.commit_ts_hw <= MAX_TIMESTAMP,
+            next <= MAX_TIMESTAMP,
             "commit timestamp space exhausted (63-bit)"
         );
-        Timestamp(self.commit_ts_hw)
+        Timestamp(next)
     }
 
     /// Overwrites the 8-byte MVCC header word at `field_off` (one of [`MVCC_OFF_CREATED_TS`] /
@@ -7403,7 +7427,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // lower it to the persisted catalog. (Before #529 the two were always equal at any rollback
         // point — every durable commit persisted its own timestamp — so this `max` is a no-op for the
         // pre-#529 behaviour and strictly preserves monotonicity now.)
-        self.commit_ts_hw = self.commit_ts_hw.max(meta.commit_ts_hw);
+        self.commit_ts_hw
+            .fetch_max(meta.commit_ts_hw, Ordering::AcqRel);
         // THE LIVE PAGE MAP IS PRESERVED — by never being touched (`rmp` #721).
         //
         // Every other per-store field is restored from the durable committed catalog. The page map is

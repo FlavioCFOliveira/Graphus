@@ -1784,6 +1784,34 @@ pub(crate) fn similarity_from_storage(similarity: VectorSimilarity) -> Similarit
     }
 }
 
+/// A test-only rendezvous between the two phases of `collect_dead_index_keys` (`rmp` #1022).
+///
+/// The fix is an ORDERING — the commit clock is read under the index's hold rather than while the
+/// store is still held — and an ordering is not observable by racing two threads and hoping: a
+/// free-running ticker advances the clock during the witness read as well, so the batch is abandoned
+/// either way and the test passes under the defect. (That is exactly what the first draft of the test
+/// below did, and it is why this hook exists rather than being avoided.) Pinning the advance to the
+/// one interval that distinguishes the two orderings is the only way to make the ordering itself
+/// falsifiable.
+///
+/// Compiled out entirely outside `cfg(test)`, so the shipped path has neither the branch nor the load.
+#[cfg(test)]
+pub(crate) static BETWEEN_WITNESS_AND_REMOVAL: std::sync::Mutex<
+    Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+> = std::sync::Mutex::new(None);
+
+/// Runs the `rmp` #1022 rendezvous, if a test installed one.
+#[cfg(test)]
+fn between_witness_and_removal() {
+    let hook = BETWEEN_WITNESS_AND_REMOVAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(f) = hook {
+        f();
+    }
+}
+
 impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// A coordinator over `store` with no open transactions.
     ///
@@ -11367,25 +11395,35 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ///
     /// 1. the index is asked whether any transaction **other than** this pass has entries in flight
     ///    ([`IndexSet::has_other_index_writer_in_flight`]), evaluated under the very hold that then
-    ///    performs the removals. This one is load-bearing: it covers the uncommitted writer whose
-    ///    entry a dead key names, for the whole duration of the removals;
-    /// 2. the store's commit high-water is compared across the witness. Under today's exclusive hold
-    ///    it *cannot* differ, so it is dormant by construction — it starts paying when the witness
-    ///    comes to be read under a shared hold that admits concurrent commits, which is exactly the
-    ///    change the multi-writer layers make.
+    ///    performs the removals. This covers the **uncommitted** writer whose entry a dead key names,
+    ///    for the whole duration of the removals;
+    /// 2. the store's commit clock is compared between reading the witness and removing — and the
+    ///    second read happens **under the index's hold**, not before the store's was released
+    ///    (`rmp` #1022). This covers the writer that **commits** in between.
     ///
     /// Either one abandons the whole collection, keeping every entry — always safe (a retained entry
     /// is a false positive the seek's re-check drops), free under one writer, and visible via
     /// [`DeadKeyCollection::abandoned`].
     ///
-    /// **What they do NOT cover**, stated because the residue is the whole reason `rmp` #1022 exists:
-    /// a writer that commits in the instant between the store hold being released and the index hold
-    /// being taken has already drained its in-flight entries, so check 1 sees nothing and its
-    /// freshly-committed entry can still be removed. Closing that needs the decision and the removal
-    /// to be one indivisible step — a single ordered hold over both cells, or a removal made
-    /// conditional on the version stamp of the entry it deletes. That is `rmp` #1022, and it
-    /// **blocks** the layers that admit the second writer, so the residue cannot outlive the
-    /// assumption that makes it harmless.
+    /// # Why the two together are exhaustive (`rmp` #1022)
+    ///
+    /// For a removal to delete an entry some other transaction's committed version warrants, that
+    /// transaction must have done two things: **advanced the commit clock**, and **published its
+    /// entries under the index's hold**. Check 2 is read while this pass holds the index, so:
+    ///
+    /// * if the writer advanced the clock at any point since the witness, the clock differs and the
+    ///   batch is abandoned;
+    /// * if it has not advanced the clock, it has not committed, so its entries are in flight and
+    ///   check 1 sees them;
+    /// * and it cannot publish anything while we hold the index, so no third case appears mid-removal.
+    ///
+    /// Slice 3 read the clock while the store was still held, which left the interval between
+    /// releasing the store and acquiring the index uncovered — a writer committing in exactly that gap
+    /// had already drained its in-flight entries, so check 1 saw nothing and its freshly-committed
+    /// entry was removed. Those are candidate-only index kinds, so a missing posting is a **lost row**
+    /// that no re-check resurrects. Moving one read across one hold boundary is the whole fix; it
+    /// needs no new latch order, because the clock is read lock-free
+    /// ([`RecordStore::commit_clock`]) rather than by taking the store's hold inside the index's.
     fn collect_dead_index_keys(&self, gc_txn: TxnId, keys: &[DeadIndexKey]) -> DeadKeyCollection {
         if keys.is_empty() {
             return DeadKeyCollection::default();
@@ -11407,14 +11445,36 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // batches — a read, never a wrong answer. The keys arrive grouped by entity (the GC emits an
         // entity's whole chain together), so straddling is the exception.
         for batch in keys.chunks(DEAD_KEY_EVIDENCE_BATCH) {
-            let (evidence, ts_before, ts_after) = {
+            let (evidence, ts_before, clock) = {
                 let store = self.store.borrow();
                 let before = store.snapshot_ts();
                 let evidence = Self::read_dead_key_evidence(&store, batch, &covered);
-                let after = store.snapshot_ts();
-                (evidence, before, after)
+                // The clock handle, taken while the store is held; read again below WITHOUT it.
+                (evidence, before, store.commit_clock())
             };
+            // The store's hold is released; the index's is not yet taken. This is the interval the
+            // defect lived in — see `BETWEEN_WITNESS_AND_REMOVAL`.
+            #[cfg(test)]
+            between_witness_and_removal();
             let mut index = self.index.borrow_mut();
+            // `rmp` #1022: the second read happens HERE, under the hold that removes — not before the
+            // store's hold was released. That is the whole fix, and it is one line's worth of ordering.
+            //
+            // Why it closes the window. A writer that makes an entry committed must do two things:
+            // advance this clock, and publish its index entries under the index's hold. We are holding
+            // the index, so no writer can complete the second while we remove; and if any writer
+            // completed the first since the witness was read, the clock differs and we abandon. So a
+            // commit either happened entirely before the witness — in which case the witness saw it —
+            // or it cannot become visible in the index before we are done. The previous ordering read
+            // the clock while the store was still held, leaving the interval between releasing the
+            // store and acquiring the index uncovered: a writer that committed in exactly that gap had
+            // already drained its in-flight entries, so check 2 below saw nothing, and its
+            // freshly-committed entry was removed. That is the committed-row loss this task closes.
+            //
+            // Read without the store's hold, deliberately: taking it here would hold index AND store
+            // at once, imposing a latch order on the engine's two hottest cells and convoying every
+            // writer behind a witness read that fetches pages. See `RecordStore::commit_clock`.
+            let ts_after = Timestamp(clock.load(std::sync::atomic::Ordering::Acquire));
             if ts_before != ts_after || index.has_other_index_writer_in_flight(gc_txn) {
                 out.abandoned = true;
                 out.keys_retained += batch.len();
@@ -14047,6 +14107,112 @@ mod index_gc_collection_992 {
                 .expect("registered"),
             1,
             "the relationship-property index still grows with the version count"
+        );
+    }
+
+    /// **A commit landing between the witness and the removal is detected, because the clock is read
+    /// under the hold that removes** (`rmp` #1022).
+    ///
+    /// # What this proves, and what it deliberately does not
+    ///
+    /// The scenario the acceptance criterion describes in full — one writer creating an entity in a
+    /// just-reclaimed slot while another rewrites a value, both during a collection — cannot be built
+    /// today: the engine has one writer thread, which is exactly what `rmp` #1013 changes and exactly
+    /// why this task blocks it. What CAN be built, and is what the fix actually turns on, is the
+    /// detection itself: a real thread advances the commit clock while a collection runs, and the
+    /// collection must never remove entries across an advance it did not see.
+    ///
+    /// The clock is a genuine seam, not a mock: it is the same `Arc<AtomicU64>` a commit bumps
+    /// (`RecordStore::next_commit_ts`), reached through the same `commit_clock` handle the collector
+    /// uses. Advancing it from another thread is what a concurrent commit does to the value this
+    /// decision reads.
+    ///
+    /// Non-vacuity is asserted, not assumed: the run is required to have actually raced (the clock
+    /// moved during the collection at least once), otherwise the assertion below never faced anything.
+    #[test]
+    fn a_clock_advance_during_a_collection_is_never_removed_across_1022() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        let mut coord = fresh_coord();
+        commit_stmt(&mut coord, "CREATE (:Person {name: 'p', age: 0})");
+        coord
+            .create_node_property_index("Person", "age")
+            .expect("create index");
+        for v in 1..=64 {
+            commit_stmt(
+                &mut coord,
+                &format!("MATCH (n:Person) SET n.age = {v} RETURN n"),
+            );
+        }
+
+        let clock: Arc<AtomicU64> = coord.store.borrow().commit_clock();
+        let advances = Arc::new(AtomicU64::new(0));
+        // Two rendezvous points, so the advance happens strictly INSIDE the interval: the collector
+        // waits for the committer, the committer advances the clock, and only then is the collector
+        // released. A free-running ticker cannot express that, and a test built on one passes under
+        // the defect (verified).
+        let arrived = Arc::new(Barrier::new(2));
+        let done = Arc::new(Barrier::new(2));
+
+        let committer = {
+            let clock = Arc::clone(&clock);
+            let advances = Arc::clone(&advances);
+            let arrived = Arc::clone(&arrived);
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                // One advance per batch the collector decides.
+                loop {
+                    arrived.wait();
+                    if advances.load(Ordering::Acquire) == u64::MAX {
+                        break;
+                    }
+                    // Exactly what a concurrent commit does to the value this decision reads.
+                    clock.fetch_add(1, Ordering::AcqRel);
+                    advances.fetch_add(1, Ordering::Release);
+                    done.wait();
+                }
+            })
+        };
+
+        {
+            let arrived = Arc::clone(&arrived);
+            let done = Arc::clone(&done);
+            let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                arrived.wait();
+                done.wait();
+            });
+            *crate::coordinator::BETWEEN_WITNESS_AND_REMOVAL
+                .lock()
+                .unwrap() = Some(hook);
+        }
+
+        let removed_before = coord.index_collection_totals().entries_removed;
+        let report = coord.gc().expect("gc pass");
+        let removed = coord.index_collection_totals().entries_removed - removed_before;
+
+        // Tear the rendezvous down before asserting, so a failure does not leave the committer parked.
+        *crate::coordinator::BETWEEN_WITNESS_AND_REMOVAL
+            .lock()
+            .unwrap() = None;
+        advances.store(u64::MAX, Ordering::Release);
+        arrived.wait();
+        committer.join().expect("committer panicked");
+
+        assert!(
+            report.dead_index_keys > 0,
+            "NON-VACUITY: the pass must have reported dead keys, or the collection never ran"
+        );
+
+        // THE property. Every batch was decided with a commit landing between reading the witness and
+        // removing, so every batch must have been abandoned. Reading the clock while the store was
+        // still held — the ordering this task replaced — misses that advance entirely and removes
+        // entries a committed version warrants. Those kinds are candidate-only, so a missing posting
+        // is a lost row no re-check resurrects.
+        assert_eq!(
+            removed, 0,
+            "entries were removed although a commit landed between the witness and the removal: the \
+             clock was read too early to see it (`rmp` #1022)"
         );
     }
 }
