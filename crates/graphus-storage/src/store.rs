@@ -287,9 +287,38 @@ impl FixedStore {
     /// reachable and this stops being theatre. Closing it at the source — mapping the page *before*
     /// publishing the bump — is `rmp` #1014 (layer 5b), acceptance criterion 6.
     ///
+    /// # The floor CLAMPS; it does not refuse (`rmp` #1027)
+    ///
+    /// Refusing was wrong in the one direction that matters operationally. `alloc_id` publishes the
+    /// bump **before** it maps the page, and mapping grows the device, fetches pages, may evict and may
+    /// harden the log — milliseconds, with I/O inside. A checkpoint landing in that window belongs to
+    /// some *other* transaction, which would then fail its commit because of an allocation of a
+    /// writer it has nothing to do with. One allocation in `records_per_page` opens the window, so
+    /// that is not a corner case but the allocator's ordinary behaviour seen from outside. Worse, with
+    /// `N` writers a declined un-bump leaves `high_water > capacity` standing indefinitely, and from
+    /// then on *every* writing commit on that store fails.
+    ///
+    /// Clamping persists `min(high_water, capacity)` instead, and loses nothing: an id at or above the
+    /// mapped capacity has **no page**, so it has never been written, so no record is dropped by
+    /// declining to account for it. Nor can such an id belong to a committed transaction —
+    /// `alloc_id` maps the page before handing the id out, so a committed record's page was mapped
+    /// before its commit, hence before any checkpoint that could observe it. The image written is
+    /// consistent by construction, which is what `Meta::decode` demands (`rmp` #452), and `open`
+    /// re-raises the mark from any orphan pages it finds on the device (`rmp` #239).
+    ///
+    /// The burnt id — one whose un-bump was declined — is deliberately **not** recycled onto the free
+    /// list. Every id on that list has a mapped page ([`Allocation::Reused`] states it), and listing
+    /// one that does not would hand a writer an id whose page does not exist. It stays burnt: one
+    /// unused slot, bounded by the number of declined un-bumps, reclaimed by the next successful
+    /// allocation of the same page (a page covers many records, so mapping it for a later id makes the
+    /// earlier one addressable again).
+    ///
+    /// The cure is still to map the page **before** publishing the bump, so the window never opens:
+    /// `rmp` #1014 (layer 5b), acceptance criterion 6. This is the floor until then.
+    ///
     /// # Errors
-    /// Returns a storage error if this store's high-water mark exceeds the capacity its device-page
-    /// map addresses.
+    /// Returns a storage error only for the state no clamp can express: a store with **no** mapped
+    /// pages whose mark claims ids beyond the first.
     fn to_meta(&self) -> Result<StoreMeta> {
         // ONE hold: the mark and the free list are two halves of one image, and a free id must be
         // an id the mark accounts for.
@@ -304,20 +333,26 @@ impl FixedStore {
         // that grew in between only makes the persisted image more consistent, never less.
         let device_pages: Vec<u64> = self.device_pages.iter().map(|p| p.0).collect();
         let capacity = paging::capacity(device_pages.len() as u64, self.kind.record_size());
-        if high_water > capacity.max(1) {
+        // The clamp. `capacity.max(1)` folds in the never-used store, which legitimately carries
+        // `high_water == 1` with zero mapped pages.
+        let persisted_high_water = high_water.min(capacity.max(1));
+        // The one state a clamp cannot express, kept as an error: no mapped page at all, yet the mark
+        // claims ids beyond the first. `capacity == 0` means not one page exists, so `min` would write
+        // `1` and silently forget every id from `1` upwards — which, unlike clamping an unmapped tail,
+        // WOULD drop ids that may have pages the catalog has lost track of. That is the `rmp` #479
+        // shape and must fail loudly rather than be papered over.
+        if capacity == 0 && high_water > 1 {
             return Err(GraphusError::Storage(format!(
-                "refusing to checkpoint {:?} store: high_water {} exceeds the capacity {} its {} \
-                 mapped device page(s) address. Every allocated physical id must have a mapped page \
-                 (`rmp` #479); a catalog that breaks it is one this build's own decoder rejects on \
-                 reopen (`rmp` #452), so persisting it would make the store unrecoverable.",
-                self.kind,
-                high_water,
-                capacity,
-                device_pages.len()
+                "refusing to checkpoint {:?} store: high_water {high_water} claims allocated ids but \
+                 the store has NO mapped device page. Every allocated physical id must have a mapped \
+                 page (`rmp` #479); this is not the unmapped-tail window a clamp covers (`rmp` #1027) \
+                 but a catalog that has lost the pages its ids live on, so persisting it would make \
+                 the store unrecoverable.",
+                self.kind
             )));
         }
         Ok(StoreMeta {
-            high_water,
+            high_water: persisted_high_water,
             free_list,
             device_pages,
         })
@@ -14008,29 +14043,34 @@ mod tests {
         );
     }
 
-    /// **The catalog floor: a checkpoint REFUSES an image whose `high_water` outruns its mapped
-    /// capacity** (`rmp` #1012, acceptance criterion 7).
+    /// **The catalog floor CLAMPS an image whose `high_water` outruns its mapped capacity, and never
+    /// writes an inconsistent one** (`rmp` #1012 acceptance criterion 7, amended by `rmp` #1027).
     ///
-    /// The invariant is `high_water <= capacity.max(1)`, and the decoder has enforced it since
-    /// `rmp` #452 — on the way *in*. Nothing enforced it on the way *out*, and that asymmetry is what
-    /// turned VOPR seed 5043221 into silent loss of committed data: a transaction advanced the mark,
-    /// failed before mapping the page, and a checkpoint persisted `high_water > capacity`. The next
-    /// rollback's catalog reload then rejected the image the store had just written, and — because
-    /// that error aborted the reload after it had dismantled the page maps — blank pages were
-    /// allocated over committed records. A store cannot be recovered from a catalog it refuses to
-    /// read, so writing one is never the lesser evil.
+    /// The invariant is `high_water <= capacity.max(1)`, enforced by the decoder since `rmp` #452 on
+    /// the way *in*. Nothing enforced it on the way *out*, and that asymmetry turned VOPR seed 5043221
+    /// into silent loss of committed data: a transaction advanced the mark, failed before mapping the
+    /// page, and a checkpoint persisted `high_water > capacity`. The next rollback's reload then
+    /// rejected the image the store had just written and, having already dismantled the page maps,
+    /// left blank pages allocated over committed records.
     ///
-    /// With one writer the state is unreachable (`alloc_id` maps the page before returning the id, and
-    /// un-bumps if it cannot), so it is installed directly here — exactly as the ceiling test above
-    /// installs `u64::MAX`. With `N` writers the un-bump can be legally *declined*
-    /// (`AllocGuard::unbump_fresh`), which is what makes the window reachable and this floor load-
-    /// bearing rather than theatre.
+    /// Layer 4 closed that by **refusing** the checkpoint. `rmp` #1027 replaced the refusal with a
+    /// **clamp**, because refusing fails the wrong transaction: `alloc_id` publishes the bump before
+    /// mapping the page, so a checkpoint landing in that window aborts some *other* transaction's
+    /// commit over an allocation it has nothing to do with — and with `N` writers a declined un-bump
+    /// leaves the state standing, failing every writing commit from then on. What is asserted here is
+    /// therefore both halves: the image is written, and it is written **consistent**.
+    ///
+    /// With one writer the state is unreachable (`alloc_id` maps the page before returning the id and
+    /// un-bumps if it cannot), so it is installed directly, exactly as the ceiling test above installs
+    /// `u64::MAX`.
     #[test]
-    fn a_checkpoint_refuses_a_catalog_whose_high_water_outruns_its_mapped_pages_1012() {
+    fn a_checkpoint_clamps_a_catalog_whose_high_water_outruns_its_mapped_pages_1027() {
         /// Runs one committing transaction with the Node store's mark forced to `mark`, and returns
         /// what the commit did. Everything but `mark` is identical between the two calls below, so the
         /// difference in outcome can only be the invariant.
-        fn commit_with_node_high_water(mark_from_capacity: impl Fn(u64) -> u64) -> Result<()> {
+        fn commit_with_node_high_water(
+            mark_from_capacity: impl Fn(u64) -> u64,
+        ) -> (Result<()>, u64, u64) {
             let mut s = fresh();
             let t0 = TxnId(1);
             s.begin(t0);
@@ -14057,27 +14097,68 @@ mod tests {
                 .alloc
                 .lock()
                 .restore(mark_from_capacity(capacity), free);
-            s.commit(t1)
+            let outcome = s.commit(t1);
+            // What actually reached the device, read back so the assertions below are about the
+            // persisted image and not about memory.
+            let persisted = Store::read_meta(&s.pool)
+                .map(|(m, _)| m.stores[StoreKind::Node as usize].high_water)
+                .unwrap_or(0);
+            (outcome, capacity, persisted)
         }
 
-        // One id past the last addressable slot: refused, with a diagnosis rather than an image.
-        let err = commit_with_node_high_water(|capacity| capacity + 1).expect_err(
-            "the checkpoint must refuse a catalog whose high_water exceeds its mapped capacity: \
-             this build's own decoder rejects such an image on reopen, so persisting it would make \
-             the store unrecoverable",
+        // One id past the last addressable slot: the commit SUCCEEDS (it is another transaction's
+        // allocation window, not this transaction's fault)...
+        let (outcome, capacity, persisted) = commit_with_node_high_water(|capacity| capacity + 1);
+        outcome.expect(
+            "a checkpoint landing inside another writer's bump window must not fail this \
+             transaction's commit (`rmp` #1027)",
         );
-        let msg = err.to_string();
-        assert!(
-            msg.contains("refusing to checkpoint") && msg.contains("mapped device page"),
-            "the refusal must say what it refused and why, got: {msg}"
+        // ...and what it wrote is consistent, which is the half that keeps `rmp` #479 closed.
+        assert_eq!(
+            persisted, capacity,
+            "the persisted mark must be clamped to the mapped capacity, never the raw mark: an \
+             image with high_water > capacity is one this build's own decoder rejects on reopen \
+             (`rmp` #452), so the store would be unrecoverable"
         );
 
         // Exactly AT capacity is the boundary and is legal — the last addressable slot is
         // `capacity - 1`, and `high_water` is one past the largest id. The identical commit goes
-        // through, which is what says the floor rejects the inconsistency itself and not the path
-        // around it (an off-by-one in the predicate would fail every checkpoint of a full page).
-        commit_with_node_high_water(|capacity| capacity)
-            .expect("a catalog exactly at capacity is consistent and must checkpoint normally");
+        // through and is NOT clamped, which is what says the clamp binds on the inconsistency itself
+        // and not on the path around it (an off-by-one would silently shrink every full page).
+        let (outcome, capacity, persisted) = commit_with_node_high_water(|capacity| capacity);
+        outcome.expect("a catalog exactly at capacity is consistent and must checkpoint normally");
+        assert_eq!(
+            persisted, capacity,
+            "a mark exactly at capacity is already consistent and must be persisted untouched"
+        );
+    }
+
+    /// **The one state the clamp must NOT paper over** (`rmp` #1027): a store with no mapped page at
+    /// all, whose mark claims ids beyond the first.
+    ///
+    /// Clamping an unmapped *tail* loses nothing — those ids have no page, so no record. Clamping to
+    /// `1` when there is no page at all is different in kind: it would silently forget every id from
+    /// `1` upwards, ids that may well have pages the catalog has lost track of. That is the `rmp` #479
+    /// shape, and it must fail loudly. This is the boundary between the two, asserted so a future
+    /// simplification of the predicate to a bare `min` is caught.
+    #[test]
+    fn a_checkpoint_still_refuses_a_catalog_with_no_mapped_page_at_all_1027() {
+        let s = FixedStore::empty(StoreKind::Node, Arc::default());
+        s.alloc.lock().observe(41); // mark = 42, zero mapped pages
+        let err = s
+            .to_meta()
+            .expect_err("a mark claiming ids with no mapped page must be refused, never clamped");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("refusing to checkpoint") && msg.contains("NO mapped device page"),
+            "the refusal must distinguish itself from the clamped window, got: {msg}"
+        );
+        // ...and the never-used store, which legitimately has mark 1 and no pages, is fine.
+        let fresh_store = FixedStore::empty(StoreKind::Node, Arc::default());
+        let meta = fresh_store
+            .to_meta()
+            .expect("a never-used store is consistent");
+        assert_eq!(meta.high_water, 1);
     }
 
     /// `rmp` #821 (deterministic RED→GREEN for the property-chain `rmp` #811 severance): a reclaimable
