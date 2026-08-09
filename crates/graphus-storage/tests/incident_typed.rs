@@ -46,7 +46,7 @@ fn typed_ids(s: &Store, node: u64, types: &[u32]) -> Vec<u64> {
 
 #[test]
 fn typed_prune_matches_filtered_incident_rels() {
-    let mut s = fresh();
+    let s = fresh();
     let txn = TxnId(1);
     s.begin(txn);
     let t_friend = s.intern_token(Namespace::RelType, "FRIEND").unwrap();
@@ -110,7 +110,7 @@ fn typed_prune_matches_filtered_incident_rels() {
 
 #[test]
 fn untyped_returns_all_like_incident_rels() {
-    let mut s = fresh();
+    let s = fresh();
     let txn = TxnId(1);
     s.begin(txn);
     let t_a = s.intern_token(Namespace::RelType, "A").unwrap();
@@ -132,7 +132,7 @@ fn untyped_returns_all_like_incident_rels() {
 
 #[test]
 fn multigraph_parallel_same_type_edges_all_enumerated() {
-    let mut s = fresh();
+    let s = fresh();
     let txn = TxnId(1);
     s.begin(txn);
     let t = s.intern_token(Namespace::RelType, "LINK").unwrap();
@@ -155,7 +155,7 @@ fn multigraph_parallel_same_type_edges_all_enumerated() {
 
 #[test]
 fn self_loop_emitted_once_typed() {
-    let mut s = fresh();
+    let s = fresh();
     let txn = TxnId(1);
     s.begin(txn);
     let t = s.intern_token(Namespace::RelType, "SELF").unwrap();
@@ -195,7 +195,7 @@ fn typed_walk_after_an_aborted_prepend_sees_exactly_the_live_edges() {
     // (The walk's tolerance of a genuine `!in_use` record still on a chain is not retired with this
     // test: a crash-recovered abort still produces one, and `tests/crash_recovery.rs` and
     // `tests/mvcc.rs` assert the walk over it.)
-    let mut s = fresh();
+    let s = fresh();
     let setup = TxnId(1);
     s.begin(setup);
     let t = s.intern_token(Namespace::RelType, "T").unwrap();

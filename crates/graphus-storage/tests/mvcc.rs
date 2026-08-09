@@ -45,7 +45,7 @@ fn recover_no_force(store: &Store) -> Store {
 
 #[test]
 fn created_ts_stays_inflight_after_commit_and_resolves_through_the_registry() {
-    let mut s = fresh();
+    let s = fresh();
     let txn = TxnId(1);
     s.begin(txn);
     let (id, _eid) = s.create_node(txn).unwrap();
@@ -82,7 +82,7 @@ fn created_ts_stays_inflight_after_commit_and_resolves_through_the_registry() {
 
 #[test]
 fn delete_is_a_tombstone_reclaimed_only_by_gc() {
-    let mut s = fresh();
+    let s = fresh();
     s.begin(TxnId(1));
     let (id, _eid) = s.create_node(TxnId(1)).unwrap();
     s.commit(TxnId(1)).unwrap(); // committed at ts 1
@@ -125,14 +125,14 @@ fn delete_is_a_tombstone_reclaimed_only_by_gc() {
 
 #[test]
 fn commit_timestamp_high_water_survives_recovery_and_stays_monotonic() {
-    let mut s = fresh();
+    let s = fresh();
     s.begin(TxnId(1));
     let (first, _eid) = s.create_node(TxnId(1)).unwrap();
     s.commit(TxnId(1)).unwrap(); // ts 1
     assert_eq!(s.snapshot_ts(), Timestamp(1));
 
     // Crash + recover: the durable commit-timestamp high-water is restored from the metadata page.
-    let mut s = recover_no_force(&s);
+    let s = recover_no_force(&s);
     assert_eq!(
         s.snapshot_ts(),
         Timestamp(1),
@@ -176,7 +176,7 @@ fn lazy_committed_version_survives_recovery_while_a_loser_resolves_invisible() {
     // stamp on disk (no GC ran), yet must resolve as committed after a crash — which works only
     // because recovery rebuilds the Active/Recent Transaction Table from the WAL commit records.
     // Conversely an uncommitted (loser) transaction must resolve as invisible.
-    let mut s = fresh();
+    let s = fresh();
     s.begin(TxnId(1));
     let (committed_node, _) = s.create_node(TxnId(1)).unwrap();
     s.commit(TxnId(1)).unwrap(); // committed at ts 1; header left in-flight (no GC freeze)
@@ -221,7 +221,7 @@ fn lazy_committed_version_survives_recovery_while_a_loser_resolves_invisible() {
 /// entries at the store level — their stamps resolve as not-committed by absence).
 #[test]
 fn gc_freezes_committed_headers_and_prunes_the_transaction_table() {
-    let mut s = fresh();
+    let s = fresh();
     let key = s.intern_token(Namespace::PropKey, "v").unwrap();
     let knows = s.intern_token(Namespace::RelType, "KNOWS").unwrap();
 
@@ -344,7 +344,7 @@ fn gc_freezes_committed_headers_and_prunes_the_transaction_table() {
 /// sweep), so its table entry must survive — it is pruned only by a *later* pass that freezes it.
 #[test]
 fn a_writer_committing_during_the_gc_window_is_not_pruned() {
-    let mut s = fresh();
+    let s = fresh();
     let t1 = TxnId(1);
     s.begin(t1);
     let (_a, _) = s.create_node(t1).unwrap();
@@ -391,7 +391,7 @@ fn a_writer_committing_during_the_gc_window_is_not_pruned() {
 /// in-flight stamp would be stranded as unresolvable (it would wrongly read as aborted).
 #[test]
 fn rolled_back_gc_pass_prunes_nothing_and_strands_no_stamp() {
-    let mut s = fresh();
+    let s = fresh();
     let t1 = TxnId(1);
     s.begin(t1);
     let (a, _) = s.create_node(t1).unwrap();
@@ -445,7 +445,7 @@ fn rolled_back_gc_pass_prunes_nothing_and_strands_no_stamp() {
 /// every restored in-flight stamp. No prune survives the crash (it was never applied).
 #[test]
 fn crash_mid_gc_restores_inflight_stamps_and_a_resolving_table() {
-    let mut s = fresh();
+    let s = fresh();
     let t1 = TxnId(1);
     s.begin(t1);
     let (a, _) = s.create_node(t1).unwrap();
@@ -460,7 +460,7 @@ fn crash_mid_gc_restores_inflight_stamps_and_a_resolving_table() {
     assert_eq!(report.frozen, 1);
     s.flush().unwrap();
 
-    let mut s = recover_no_force(&s);
+    let s = recover_no_force(&s);
 
     // The loser GC's freeze was undone; the rebuilt table resolves the restored in-flight stamp.
     let mvcc = s.node(a).unwrap().mvcc;
@@ -498,7 +498,7 @@ fn crash_mid_gc_restores_inflight_stamps_and_a_resolving_table() {
 /// reads back as `Committed(ts)`, and the next pass simply prunes the stale entries again.
 #[test]
 fn frozen_headers_survive_a_crash_and_stale_entries_reprune() {
-    let mut s = fresh();
+    let s = fresh();
     let t1 = TxnId(1);
     s.begin(t1);
     let (a, _) = s.create_node(t1).unwrap();
@@ -510,7 +510,7 @@ fn frozen_headers_survive_a_crash_and_stale_entries_reprune() {
     s.commit(t2).unwrap(); // freeze durable; t1 pruned
     assert_eq!(s.commit_registry().len(), 1);
 
-    let mut s = recover_no_force(&s);
+    let s = recover_no_force(&s);
 
     // The frozen header is durable; the rebuilt table again holds every WAL-committed writer —
     // t1, t2, and the create-time system catalog transaction (its commit record carries the ts-0
@@ -548,7 +548,7 @@ fn frozen_headers_survive_a_crash_and_stale_entries_reprune() {
 /// the two surviving committed edges are preserved and the chain is not severed.
 #[test]
 fn crash_recovery_aborted_middle_rel_keeps_both_committed_edges() {
-    let mut s = fresh();
+    let s = fresh();
     let rt = s.intern_token(Namespace::RelType, "R").unwrap();
 
     // Setup (committed): hub + three leaves.

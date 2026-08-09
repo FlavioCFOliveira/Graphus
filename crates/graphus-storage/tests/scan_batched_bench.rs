@@ -40,7 +40,7 @@ fn bench_batched_vs_per_id_node_scan() {
     // pages, so a 4096-frame pool keeps them resident.
     let device = MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new()).expect("wal");
-    let mut s = RecordStore::create(device, wal, 4096, 1).expect("store");
+    let s = RecordStore::create(device, wal, 4096, 1).expect("store");
     let n: u64 = 200_000;
     let txn = TxnId(1);
     s.begin(txn);
@@ -82,7 +82,7 @@ fn bench_batched_vs_per_id_node_scan() {
 fn bench_batched_vs_per_id_rel_scan() {
     let device = MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new()).expect("wal");
-    let mut s = RecordStore::create(device, wal, 4096, 1).expect("store");
+    let s = RecordStore::create(device, wal, 4096, 1).expect("store");
     let txn = TxnId(1);
     s.begin(txn);
     let hubs: Vec<u64> = (0..100).map(|_| s.create_node(txn).unwrap().0).collect();

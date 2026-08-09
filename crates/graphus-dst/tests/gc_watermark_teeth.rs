@@ -54,7 +54,7 @@ fn build() -> Fixture {
     let device = MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new()).expect("create wal");
     // A small pool, like the harness; the scenario touches a handful of pages.
-    let mut store: Store = RecordStore::create(device, wal, 32, 1).expect("create store");
+    let store: Store = RecordStore::create(device, wal, 32, 1).expect("create store");
 
     let t1 = TxnId(1);
     store.begin(t1);
@@ -121,7 +121,7 @@ fn reader_snapshot_at_ts1() -> Snapshot {
 /// (`2 <= 1` is false) and the old reader reads V1.
 #[test]
 fn old_reader_keeps_its_version_under_safe_watermark() {
-    let mut f = build();
+    let f = build();
     let reader = reader_snapshot_at_ts1();
 
     // Before any overwrite the old reader sees V1.
@@ -197,7 +197,7 @@ fn old_reader_keeps_its_version_under_safe_watermark() {
 /// This is precisely what `oldest_active_snapshot()` prevents.
 #[test]
 fn old_reader_loses_its_version_under_buggy_snapshot_ts_watermark() {
-    let mut f = build();
+    let f = build();
     let reader = reader_snapshot_at_ts1();
 
     assert_eq!(

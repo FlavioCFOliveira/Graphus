@@ -23,7 +23,7 @@ fn fresh(cap: usize) -> Store {
 
 /// Clean reopen: flush, stage every mapped page onto a fresh device, reopen over the same WAL sink.
 /// What is asserted after this is what is **durable**, not what is merely in memory.
-fn reopen(mut s: Store) -> Store {
+fn reopen(s: Store) -> Store {
     s.flush().expect("flush");
     let pages = s.mapped_pages();
     let max = pages.iter().map(|p| p.0).max().unwrap_or(0);
@@ -51,7 +51,7 @@ fn reopen(mut s: Store) -> Store {
 /// gone — in memory *and* durably once A commits.
 #[test]
 fn rolling_back_txn_discards_only_its_own_pending_catalog_ddl() {
-    let mut s = fresh(64);
+    let s = fresh(64);
 
     // --- committed baseline: tokens + one committed index/histogram pair -------------------------
     let t0 = TxnId(1);
@@ -151,7 +151,7 @@ fn rolling_back_txn_discards_only_its_own_pending_catalog_ddl() {
 /// `bystander` decides whether an unrelated transaction is open across the rollback — the only
 /// difference between the two calls below.
 fn durable_histogram_after_rolled_back_set(bystander: bool) -> Option<Vec<u8>> {
-    let mut s = fresh(64);
+    let s = fresh(64);
 
     let t0 = TxnId(1);
     s.begin(t0);
@@ -225,7 +225,7 @@ fn a_rolled_back_catalog_mutation_is_discarded_whether_or_not_a_bystander_txn_is
 /// while it was pending.
 #[test]
 fn a_rolled_back_addition_does_not_survive_an_intervening_commit() {
-    let mut s = fresh(64);
+    let s = fresh(64);
 
     let t0 = TxnId(1);
     s.begin(t0);
@@ -269,7 +269,7 @@ fn a_rolled_back_addition_does_not_survive_an_intervening_commit() {
 /// face of the same interleaving, because here the damage is to data that WAS committed.
 #[test]
 fn a_rolled_back_drop_does_not_destroy_committed_catalog_state() {
-    let mut s = fresh(64);
+    let s = fresh(64);
 
     // Committed baseline: an index, its name, and a histogram.
     let t0 = TxnId(1);
@@ -320,7 +320,7 @@ fn a_rolled_back_drop_does_not_destroy_committed_catalog_state() {
 /// so a checkpoint landing between the two used to write an image the store cannot reopen at all.
 #[test]
 fn an_intervening_commit_cannot_bake_a_half_applied_drop() {
-    let mut s = fresh(64);
+    let s = fresh(64);
 
     let t0 = TxnId(1);
     s.begin(t0);
@@ -371,7 +371,7 @@ fn an_intervening_commit_cannot_bake_a_half_applied_drop() {
 /// COMMITTED value — not the value the first-aborting transaction wrote.
 #[test]
 fn out_of_order_aborts_on_one_entry_restore_the_committed_value() {
-    let mut s = fresh(64);
+    let s = fresh(64);
 
     let t0 = TxnId(1);
     s.begin(t0);
@@ -410,7 +410,7 @@ fn out_of_order_aborts_on_one_entry_restore_the_committed_value() {
 /// link is in the middle of a chain the aborting transaction itself extended.
 #[test]
 fn out_of_order_aborts_unwind_an_interleaved_chain() {
-    let mut s = fresh(64);
+    let s = fresh(64);
 
     let t0 = TxnId(1);
     s.begin(t0);
@@ -451,7 +451,7 @@ fn three_concurrent_writers_on_one_entry_unwind_in_any_abort_order() {
         [2, 0, 1],
         [2, 1, 0],
     ] {
-        let mut s = fresh(64);
+        let s = fresh(64);
 
         let t0 = TxnId(1);
         s.begin(t0);
@@ -489,7 +489,7 @@ fn three_concurrent_writers_on_one_entry_unwind_in_any_abort_order() {
 /// holed chain publishes T1's aborted value as though it were committed.
 #[test]
 fn an_out_of_order_abort_does_not_publish_its_value_through_a_checkpoint() {
-    let mut s = fresh(64);
+    let s = fresh(64);
 
     let t0 = TxnId(1);
     s.begin(t0);
@@ -527,7 +527,7 @@ fn an_out_of_order_abort_does_not_publish_its_value_through_a_checkpoint() {
 /// agree — the `schema_eq`-equal branch skips `adopt_schema_from`, so nothing else asserts it.
 #[test]
 fn the_generation_map_and_the_catalog_agree_after_a_no_net_change_rollback() {
-    let mut s = fresh(64);
+    let s = fresh(64);
 
     let t0 = TxnId(1);
     s.begin(t0);
@@ -573,7 +573,7 @@ fn the_generation_map_and_the_catalog_agree_after_a_no_net_change_rollback() {
 /// catalog undirtied so T2's own commit persists nothing at all.
 #[test]
 fn a_rollback_does_not_revert_a_concurrent_identical_write() {
-    let mut s = fresh(64);
+    let s = fresh(64);
 
     let t0 = TxnId(1);
     s.begin(t0);
@@ -633,7 +633,7 @@ fn a_rollback_does_not_revert_a_concurrent_identical_write() {
 /// transactions live and durable.
 #[test]
 fn identical_concurrent_writes_both_rolling_back_restore_the_committed_value() {
-    let mut s = fresh(64);
+    let s = fresh(64);
 
     let t0 = TxnId(1);
     s.begin(t0);

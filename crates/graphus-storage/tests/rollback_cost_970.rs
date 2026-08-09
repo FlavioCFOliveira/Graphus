@@ -52,7 +52,7 @@ fn fresh() -> Store {
 /// — a free list carrying `nodes / 2` reclaimed ids, then opens a transaction that writes exactly
 /// [`WRITES`] records and returns it ready to be rolled back.
 fn build(nodes: usize, keys: usize, churn: bool) -> (Store, Vec<u64>, Vec<u32>) {
-    let mut s = fresh();
+    let s = fresh();
 
     let mut key_ids = Vec::with_capacity(keys);
     s.begin(TxnId(1));

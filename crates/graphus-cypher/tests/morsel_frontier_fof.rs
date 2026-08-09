@@ -44,7 +44,7 @@ type Store = RecordStore<MemBlockDevice, MemLogSink>;
 fn seed_reco(n_users: i64, n_products: i64, friend_deg: i64, purchase_deg: i64) -> Store {
     let device = MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new()).expect("create wal");
-    let mut s = RecordStore::create(device, wal, 256, 1).expect("create store");
+    let s = RecordStore::create(device, wal, 256, 1).expect("create store");
     let txn = TxnId(1);
     s.begin(txn);
     let l_user = s.intern_token(Namespace::Label, "User").unwrap();

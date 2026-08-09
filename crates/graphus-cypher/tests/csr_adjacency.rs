@@ -88,7 +88,7 @@ fn ids_of(out: &[Incident]) -> Vec<(u64, u64)> {
 ///
 /// Returns `(store, hub_id, expected_visible_like_count)`.
 fn build_multigraph() -> (Store, u64, usize) {
-    let mut s = fresh();
+    let s = fresh();
     let txn = TxnId(1);
     s.begin(txn);
     let t_friend = s.intern_token(Namespace::RelType, "FRIEND").unwrap();
@@ -466,7 +466,7 @@ fn csr_footprint_bytes_per_edge() {
     //
     // Demonstrate the floor with a dense clustered graph: a few hubs each carrying many same-type
     // edges, so groups ≪ entries.
-    let mut s2 = fresh();
+    let s2 = fresh();
     let txn = TxnId(1);
     s2.begin(txn);
     let t = s2.intern_token(Namespace::RelType, "LIKE").unwrap();

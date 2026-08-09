@@ -308,7 +308,7 @@ fn crash_no_force(store: Store) -> (Store, usize) {
 
 /// Steal crash: flush dirty pages home, snapshot that on-disk image, then recover so undo rolls back
 /// any stolen uncommitted (loser) pages.
-fn crash_steal(mut store: Store) -> (Store, usize) {
+fn crash_steal(store: Store) -> (Store, usize) {
     store.flush().expect("flush (steal)");
     let pages = store.mapped_pages();
     let max = pages.iter().map(|p| p.0).max().unwrap_or(0);
@@ -401,7 +401,7 @@ fn read_only_transactions_are_crash_neutral_across_many_seeds() {
 fn read_only_reader_does_not_floor_reclamation_but_a_writer_does() {
     let device = MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new()).expect("create wal");
-    let mut store: Store =
+    let store: Store =
         RecordStore::create(device, wal, POOL_CAPACITY, 1).expect("create store");
 
     // Commit a base node so there is committed data + a non-trivial WAL.

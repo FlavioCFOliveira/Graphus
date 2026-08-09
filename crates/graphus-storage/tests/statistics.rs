@@ -261,7 +261,7 @@ fn grand_totals_count_every_node_once_independent_of_labels() {
 
 #[test]
 fn grand_totals_persist_across_reopen() {
-    let mut s = fresh(64);
+    let s = fresh(64);
     let txn = TxnId(1);
     s.begin(txn);
     let ty = s.intern_token(Namespace::RelType, "T").unwrap();
@@ -285,7 +285,7 @@ fn grand_totals_persist_across_reopen() {
 
 #[test]
 fn grand_totals_recover_after_a_no_force_crash() {
-    let mut s = fresh(64);
+    let s = fresh(64);
     let txn = TxnId(1);
     s.begin(txn);
     let ty = s.intern_token(Namespace::RelType, "T").unwrap();
@@ -577,7 +577,7 @@ fn gc_reclamation_does_not_change_counts() {
 
 #[test]
 fn counts_persist_across_reopen() {
-    let mut s = fresh(64);
+    let s = fresh(64);
     let txn = TxnId(1);
     s.begin(txn);
     let person = s.intern_token(Namespace::Label, "Person").unwrap();
@@ -600,7 +600,7 @@ fn counts_persist_across_reopen() {
 
 /// Splits a flushed store into its device + a freshly-opened WAL over the same durable log, so the
 /// store can be reopened. The pages were flushed home, so this is a clean reopen (no recovery work).
-fn into_parts(mut s: Store) -> (MemBlockDevice, WalManager<MemLogSink>) {
+fn into_parts(s: Store) -> (MemBlockDevice, WalManager<MemLogSink>) {
     s.flush().unwrap();
     let pages = s.mapped_pages();
     let max = pages.iter().map(|p| p.0).max().unwrap_or(0);
@@ -625,7 +625,7 @@ fn into_parts(mut s: Store) -> (MemBlockDevice, WalManager<MemLogSink>) {
 
 #[test]
 fn counts_recover_after_a_no_force_crash() {
-    let mut s = fresh(64);
+    let s = fresh(64);
     let txn = TxnId(1);
     s.begin(txn);
     let person = s.intern_token(Namespace::Label, "Person").unwrap();
@@ -677,7 +677,7 @@ fn counts_recover_after_a_steal_crash() {
 
 #[test]
 fn an_uncommitted_transaction_does_not_contribute_to_recovered_counts() {
-    let mut s = fresh(64);
+    let s = fresh(64);
     // Committed baseline.
     let t1 = TxnId(1);
     s.begin(t1);
@@ -804,7 +804,7 @@ fn fresh_store_has_no_property_histograms() {
 
 #[test]
 fn property_histogram_persists_across_reopen() {
-    let mut s = fresh(64);
+    let s = fresh(64);
     let txn = TxnId(1);
     s.begin(txn);
     let person = s.intern_token(Namespace::Label, "Person").unwrap();
@@ -833,7 +833,7 @@ fn property_histogram_persists_across_reopen() {
 
 #[test]
 fn property_histogram_recovers_after_a_no_force_crash() {
-    let mut s = fresh(64);
+    let s = fresh(64);
     let txn = TxnId(1);
     s.begin(txn);
     let person = s.intern_token(Namespace::Label, "Person").unwrap();
@@ -870,7 +870,7 @@ fn property_histogram_recovers_after_a_steal_crash() {
 
 #[test]
 fn an_uncommitted_histogram_does_not_survive_recovery() {
-    let mut s = fresh(64);
+    let s = fresh(64);
     // Committed baseline.
     let t1 = TxnId(1);
     s.begin(t1);
@@ -893,7 +893,7 @@ fn an_uncommitted_histogram_does_not_survive_recovery() {
 
 #[test]
 fn rolled_back_histogram_change_is_discarded() {
-    let mut s = fresh(64);
+    let s = fresh(64);
     let t1 = TxnId(1);
     s.begin(t1);
     let person = s.intern_token(Namespace::Label, "Person").unwrap();
@@ -932,7 +932,7 @@ fn rolled_back_histogram_change_is_discarded() {
 
 #[test]
 fn removed_property_histogram_stays_removed_across_reopen() {
-    let mut s = fresh(64);
+    let s = fresh(64);
     let t1 = TxnId(1);
     s.begin(t1);
     let person = s.intern_token(Namespace::Label, "Person").unwrap();
@@ -966,7 +966,7 @@ fn removed_property_histogram_stays_removed_across_reopen() {
 
 #[test]
 fn an_empty_blob_is_treated_as_a_removal() {
-    let mut s = fresh(64);
+    let s = fresh(64);
     let t1 = TxnId(1);
     s.begin(t1);
     let person = s.intern_token(Namespace::Label, "Person").unwrap();
@@ -1007,7 +1007,7 @@ fn fresh_store_has_empty_index_catalog() {
 
 #[test]
 fn node_property_index_persists_across_reopen() {
-    let mut s = fresh(64);
+    let s = fresh(64);
     let txn = TxnId(1);
     s.begin(txn);
     let person = s.intern_token(Namespace::Label, "Person").unwrap();
@@ -1042,7 +1042,7 @@ fn node_property_index_persists_across_reopen() {
 
 #[test]
 fn node_property_index_recovers_after_a_no_force_crash() {
-    let mut s = fresh(64);
+    let s = fresh(64);
     let txn = TxnId(1);
     s.begin(txn);
     let person = s.intern_token(Namespace::Label, "Person").unwrap();
@@ -1082,7 +1082,7 @@ fn node_property_index_recovers_after_a_steal_crash() {
 
 #[test]
 fn an_uncommitted_index_declaration_does_not_survive_recovery() {
-    let mut s = fresh(64);
+    let s = fresh(64);
     // Committed baseline: one declared index.
     let t1 = TxnId(1);
     s.begin(t1);
@@ -1115,7 +1115,7 @@ fn an_uncommitted_index_declaration_does_not_survive_recovery() {
 
 #[test]
 fn rolled_back_index_declaration_is_discarded() {
-    let mut s = fresh(64);
+    let s = fresh(64);
     let t1 = TxnId(1);
     s.begin(t1);
     let person = s.intern_token(Namespace::Label, "Person").unwrap();
@@ -1181,7 +1181,7 @@ fn rolled_back_index_declaration_is_discarded() {
 
 #[test]
 fn concurrent_pending_index_survives_an_unrelated_rollback() {
-    let mut s = fresh(64);
+    let s = fresh(64);
 
     // Durable baseline: intern the schema tokens and commit, so the tokens the pending index will
     // reference are already durable. This isolates the test to the index catalog ENTRY, not token
@@ -1246,7 +1246,7 @@ fn concurrent_pending_index_survives_an_unrelated_rollback() {
 
 #[test]
 fn removed_node_property_index_stays_removed_across_reopen() {
-    let mut s = fresh(64);
+    let s = fresh(64);
     let t1 = TxnId(1);
     s.begin(t1);
     let person = s.intern_token(Namespace::Label, "Person").unwrap();

@@ -140,7 +140,7 @@ fn the_superset_view_is_not_a_transparent_sequence() {
 fn the_two_polarities_answer_differently_over_the_same_chain() {
     let device = MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new()).expect("create wal");
-    let mut store: RecordStore<MemBlockDevice, MemLogSink> =
+    let store: RecordStore<MemBlockDevice, MemLogSink> =
         RecordStore::create(device, wal, 64, 1).expect("create store");
 
     let key = store

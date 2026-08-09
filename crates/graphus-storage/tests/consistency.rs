@@ -1590,7 +1590,7 @@ const SLOT_OFF_DELTA_COUNT: usize = 24;
 
 /// Builds a small store with live version chains, ready to be corrupted.
 fn store_with_chains() -> (Store, u64, u128) {
-    let mut s = fresh(64);
+    let s = fresh(64);
     let txn = TxnId(1);
     s.begin(txn);
     let t = s.intern_token(Namespace::RelType, "T").unwrap();
@@ -1822,7 +1822,7 @@ const ACTION_REMOVE_INCIDENT_EDGE: u8 = 7;
 /// A store whose relationship endpoints were **committed before** the edge, so the creator gate does
 /// not apply and both endpoints carry an incidence delta (`rmp` #969).
 fn store_with_incidence_deltas() -> Store {
-    let mut s = fresh(64);
+    let s = fresh(64);
     let setup = TxnId(1);
     s.begin(setup);
     let (a, _) = s.create_node(setup).unwrap();

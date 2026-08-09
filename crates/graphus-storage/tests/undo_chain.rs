@@ -172,7 +172,7 @@ fn every_entity_gets_its_own_chain() {
 /// unpublished before the commit rather than published early with a plausible-looking value.
 #[test]
 fn the_commit_slot_is_published_once_at_commit_and_not_before() {
-    let mut s = fresh();
+    let s = fresh();
     let txn = TxnId(1);
     s.begin(txn);
     let (n, _) = s.create_node(txn).expect("create");

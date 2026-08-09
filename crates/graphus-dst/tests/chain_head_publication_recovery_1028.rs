@@ -86,7 +86,7 @@ fn run(seed: u64) -> Report {
 
     let device = MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new()).expect("create wal");
-    let mut store = RecordStore::create(device, wal, POOL_CAPACITY, 1).expect("create store");
+    let store = RecordStore::create(device, wal, POOL_CAPACITY, 1).expect("create store");
 
     let mut next = 1u64;
     let setup = next_txn(&mut next);
@@ -185,7 +185,7 @@ fn crash_no_force(store: Store) -> Store {
 }
 
 /// Steal crash: flush dirty pages home, snapshot that on-disk image, then recover onto it.
-fn crash_steal(mut store: Store) -> Store {
+fn crash_steal(store: Store) -> Store {
     store.flush().expect("flush (steal)");
     let pages = store.mapped_pages();
     let max = pages.iter().map(|p| p.0).max().unwrap_or(0);

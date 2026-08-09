@@ -4333,7 +4333,7 @@ fn harden_store<D: BlockDevice, S: LogSink>(
     coordinator: TxnCoordinator<D, S>,
 ) -> (Result<()>, u64) {
     // Safe: `drain_inflight` left no open transaction and no statement seam is live here.
-    let mut store: RecordStore<D, S> = coordinator.into_store();
+    let store: RecordStore<D, S> = coordinator.into_store();
     let out = store.flush();
     // Safe: `flush` has returned, so nothing holds the WAL lock this re-takes (no re-entrancy).
     let wal_len = store.with_wal(|w| w.durable_len());

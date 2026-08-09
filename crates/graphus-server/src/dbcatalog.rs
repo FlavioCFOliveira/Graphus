@@ -750,7 +750,7 @@ fn open_or_create_coordinator(
         // Reopen the WAL fresh for serving (recovery consumed the recovery view).
         let wal = WalManager::open(open_wal_sink(wal_file, keyring.as_ref())?)
             .map_err(|e| GraphusError::Storage(format!("reopening WAL manager: {e}")))?;
-        let mut store = RecordStore::open(device, wal, pool_pages)?;
+        let store = RecordStore::open(device, wal, pool_pages)?;
         // Attach the (now-recovered) DWB so every subsequent checkpoint/flush home write is
         // doublewrite-protected for the rest of this store's lifetime.
         store.attach_dwb(dwb);
@@ -768,7 +768,7 @@ fn open_or_create_coordinator(
         let wal = WalManager::create(create_wal_sink(wal_file, keyring.as_ref())?)
             .map_err(|e| GraphusError::Storage(format!("creating WAL manager: {e}")))?;
         // Seed element ids from 1 (`04 §2.2`).
-        let mut store = RecordStore::create(device, wal, pool_pages, 1)?;
+        let store = RecordStore::create(device, wal, pool_pages, 1)?;
         // Create and attach the persistent doublewrite buffer (`rmp` #384) so every checkpoint/flush
         // from now on is torn-write protected. `RecordStore::create`'s own initial flush already ran
         // (unprotected) above — correct, the fresh store holds no committed data yet.

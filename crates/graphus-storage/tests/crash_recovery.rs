@@ -101,7 +101,7 @@ fn gc_pass(s: &mut Store, txn: TxnId) {
 
 #[test]
 fn committed_nodes_and_edges_survive_a_no_force_crash() {
-    let mut s = fresh(64);
+    let s = fresh(64);
     let txn = TxnId(1);
     s.begin(txn);
     let (a, eid_a) = s.create_node(txn).unwrap();
@@ -125,7 +125,7 @@ fn committed_nodes_and_edges_survive_a_no_force_crash() {
 
 #[test]
 fn uncommitted_work_is_rolled_back_after_a_no_force_crash() {
-    let mut s = fresh(64);
+    let s = fresh(64);
     // T1 commits a node.
     let t1 = TxnId(1);
     s.begin(t1);
@@ -202,7 +202,7 @@ fn stolen_uncommitted_pages_are_undone_after_a_steal_crash() {
 
 #[test]
 fn tokens_and_element_id_counter_recover() {
-    let mut s = fresh(64);
+    let s = fresh(64);
     let txn = TxnId(1);
     s.begin(txn);
     let lbl = s.intern_token(Namespace::Label, "Person").unwrap();
@@ -210,7 +210,7 @@ fn tokens_and_element_id_counter_recover() {
     let (a, eid_a) = s.create_node(txn).unwrap();
     s.commit(txn).unwrap();
 
-    let mut rec = recover_no_force(&s);
+    let rec = recover_no_force(&s);
     assert_eq!(rec.token_id(Namespace::Label, "Person"), Some(lbl));
     assert_eq!(rec.token_id(Namespace::PropKey, "name"), Some(key));
     assert_eq!(rec.node(a).unwrap().element_id, eid_a);
@@ -230,7 +230,7 @@ fn tokens_and_element_id_counter_recover() {
 fn committed_node_labels_survive_a_no_force_crash() {
     // `rmp` task #42: node labels are WAL-logged page patches of the node record, so they recover
     // exactly like any other committed node write.
-    let mut s = fresh(64);
+    let s = fresh(64);
     let txn = TxnId(1);
     s.begin(txn);
     let (a, _) = s.create_node(txn).unwrap();
@@ -268,7 +268,7 @@ fn label_mutations_recover_under_a_steal_crash() {
 #[test]
 fn uncommitted_label_change_is_rolled_back_after_a_crash() {
     // Committed baseline: node a labelled :L.
-    let mut s = fresh(64);
+    let s = fresh(64);
     let t1 = TxnId(1);
     s.begin(t1);
     let (a, _) = s.create_node(t1).unwrap();
@@ -309,7 +309,7 @@ fn free_list_recovers_so_ids_keep_reusing() {
     // durable WAL prefix that recovery replays — that is the state this test asserts is recovered.
     gc_pass(&mut s, TxnId(3));
 
-    let mut rec = recover_no_force(&s);
+    let rec = recover_no_force(&s);
     // The freed id is still on the recovered free list and is reused first.
     let t4 = TxnId(4);
     rec.begin(t4);
@@ -334,7 +334,7 @@ fn a_checkpoint_bounds_recovery_redo_and_replays_post_checkpoint_work() {
     use graphus_io::BlockDevice;
     use graphus_wal::HEADER_LEN;
 
-    let mut s = fresh(64);
+    let s = fresh(64);
     s.set_checkpoint_interval_bytes(0); // manual checkpoints, for a precise redo_start assertion
 
     // Pre-checkpoint committed work.
@@ -413,7 +413,7 @@ fn a_checkpoint_bounds_recovery_redo_and_replays_post_checkpoint_work() {
 fn crash_mid_checkpoint_torn_coalesced_run_recovers_all_committed_work() {
     use graphus_io::BlockDevice;
 
-    let mut s = fresh(256);
+    let s = fresh(256);
 
     // Many committed nodes → many dirty store pages with contiguous ids → one big coalesced run when
     // the buffer pool's flush_all writes them home. Record handles + element ids to assert recovery.
@@ -583,7 +583,7 @@ fn automatic_checkpoint_cadence_emits_a_checkpoint() {
 /// and recovered (no-force) twice. A must read back with **zero** incident relationships, with no error.
 #[test]
 fn double_crash_aborted_prependers_leave_no_phantom_edge() {
-    let mut s = fresh(64);
+    let s = fresh(64);
 
     // Commit node A on its own (a durable node whose first_rel will be exercised).
     let t0 = TxnId(1);
@@ -648,7 +648,7 @@ fn double_crash_aborted_prependers_leave_no_phantom_edge() {
 #[test]
 fn rollback_exceeding_pool_capacity_undoes_and_recovers() {
     // A deliberately tiny pool so the aborting txn's page span far exceeds the frame count.
-    let mut store = fresh(3);
+    let store = fresh(3);
 
     // Commit a baseline node first: it must SURVIVE both the rollback and the crash.
     let keep = TxnId(1);
@@ -709,7 +709,7 @@ fn multi_field_record_write_recovers_and_aborts_byte_identically() {
     let key2 = 9_u32;
 
     // --- Committed: a node with three inline properties survives a no-force crash (redo). ---
-    let mut s = fresh(64);
+    let s = fresh(64);
     let txn = TxnId(1);
     s.begin(txn);
     let (node, _) = s.create_node(txn).unwrap();

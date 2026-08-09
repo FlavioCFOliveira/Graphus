@@ -164,7 +164,7 @@ fn fresh() -> Store {
 #[test]
 fn typed_expand_skips_nonmatching_reads_and_marks() {
     // A `top_liked`-shaped hub: many FRIEND edges, a minority of LIKE edges.
-    let mut s = fresh();
+    let s = fresh();
     let txn = TxnId(1);
     s.begin(txn);
     let t_friend = s.intern_token(Namespace::RelType, "FRIEND").unwrap();
@@ -241,7 +241,7 @@ fn typed_expand_skips_nonmatching_reads_and_marks() {
 #[test]
 fn untyped_expand_marks_and_returns_all() {
     // Untyped expand must still examine + mark + return every incident edge (MUST #5).
-    let mut s = fresh();
+    let s = fresh();
     let txn = TxnId(1);
     s.begin(txn);
     let t_a = s.intern_token(Namespace::RelType, "A").unwrap();

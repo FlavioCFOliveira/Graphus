@@ -59,7 +59,7 @@ fn recover_no_force(store: &Store) -> Store {
 /// the corpse run so the two committed self-loops stay readable.
 #[test]
 fn crash_recovery_keeps_committed_self_loops_through_interleaved_loser_corpses() {
-    let mut s = fresh();
+    let s = fresh();
     let rt = s.intern_token(Namespace::RelType, "KNOWS").unwrap();
 
     // txn1: create node 1 (committed). txn2 begins, stays empty.
@@ -110,7 +110,7 @@ fn crash_recovery_keeps_committed_self_loops_through_interleaved_loser_corpses()
 /// not — losers undone in LIFO order restore `first_rel` to the committed head).
 #[test]
 fn variant_a_inflight_multi_self_loop_no_live_rollback() {
-    let mut s = fresh();
+    let s = fresh();
     let rt = s.intern_token(Namespace::RelType, "KNOWS").unwrap();
     s.begin(TxnId(1));
     let (n1, _) = s.create_node(TxnId(1)).unwrap();
@@ -140,7 +140,7 @@ fn variant_a_inflight_multi_self_loop_no_live_rollback() {
 /// txn6 keeps a live head, no recovery involved).
 #[test]
 fn variant_b_live_rollback_multi_self_loop_no_crash() {
-    let mut s = fresh();
+    let s = fresh();
     let rt = s.intern_token(Namespace::RelType, "KNOWS").unwrap();
     s.begin(TxnId(1));
     let (n1, _) = s.create_node(TxnId(1)).unwrap();
@@ -173,7 +173,7 @@ fn variant_b_live_rollback_multi_self_loop_no_crash() {
 /// not — the committed txn6 head is live and the walk threads through the txn5 corpses).
 #[test]
 fn variant_c_live_rollback_then_commit_other_loser() {
-    let mut s = fresh();
+    let s = fresh();
     let rt = s.intern_token(Namespace::RelType, "KNOWS").unwrap();
     s.begin(TxnId(1));
     let (n1, _) = s.create_node(TxnId(1)).unwrap();

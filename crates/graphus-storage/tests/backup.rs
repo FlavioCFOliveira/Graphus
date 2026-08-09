@@ -167,7 +167,7 @@ fn snapshot<D: graphus_io::BlockDevice>(store: &mut RecordStore<D, MemLogSink>) 
 /// properties), edges (incl. parallel edges and self-loops). Returns the store and the reltype
 /// token id used for edges. All work is committed.
 fn build_graph(seed: u64, ops: usize) -> Store {
-    let mut store = fresh(64);
+    let store = fresh(64);
     let txn = TxnId(1);
     store.begin(txn);
     // Intern tokens across all three namespaces so the durable token dictionary is non-trivial and

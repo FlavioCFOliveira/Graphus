@@ -71,7 +71,7 @@ type Live = RecordStoreGraph<MemBlockDevice, MemLogSink>;
 fn coord_with_people(n: i64) -> TxnCoordinator<MemBlockDevice, MemLogSink> {
     let device = MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new()).expect("create wal");
-    let mut s = RecordStore::create(device, wal, 64, 1).expect("create store");
+    let s = RecordStore::create(device, wal, 64, 1).expect("create store");
     let txn = TxnId(1);
     s.begin(txn);
     let l_person = s.intern_token(Namespace::Label, "Person").unwrap();
@@ -560,7 +560,7 @@ fn assert_morsel_equals_serial(
 fn seed_people(n: i64) -> (Store, graphus_core::Timestamp) {
     let device = MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new()).expect("create wal");
-    let mut s = RecordStore::create(device, wal, 8, 1).expect("create store");
+    let s = RecordStore::create(device, wal, 8, 1).expect("create store");
     let txn = TxnId(1);
     s.begin(txn);
     let l_person = s.intern_token(Namespace::Label, "Person").unwrap();
@@ -633,7 +633,7 @@ fn morsel_rows_equals_serial_fresh() {
 /// morsel converge must see newest-visible values, in serial order, across morsel counts.
 #[test]
 fn morsel_rows_equals_serial_overwritten() {
-    let (mut store, _) = seed_people(300);
+    let (store, _) = seed_people(300);
     let txn2 = TxnId(2);
     store.begin(txn2);
     let k_age = store
@@ -656,7 +656,7 @@ fn morsel_rows_equals_serial_overwritten() {
 /// The morsel converge must drop them via per-candidate MVCC re-validation, in serial order.
 #[test]
 fn morsel_rows_equals_serial_deleted() {
-    let (mut store, _) = seed_people(300);
+    let (store, _) = seed_people(300);
     let txn2 = TxnId(2);
     store.begin(txn2);
     for id in (5..=300u64).step_by(5) {
@@ -674,7 +674,7 @@ fn morsel_rows_equals_serial_deleted() {
 /// final store by `Coordinated::new`, so they are candidates). The morsel converge equals serial.
 #[test]
 fn morsel_rows_equals_serial_inserted() {
-    let (mut store, _) = seed_people(250);
+    let (store, _) = seed_people(250);
     let txn2 = TxnId(2);
     store.begin(txn2);
     let l_person = store
@@ -708,7 +708,7 @@ fn morsel_rows_equals_serial_inserted() {
 /// (MVCC visibility filters identically on the morsel and serial paths), in serial order.
 #[test]
 fn morsel_rows_equals_serial_cross_snapshot() {
-    let (mut store, ts_early) = seed_people(300);
+    let (store, ts_early) = seed_people(300);
     let txn2 = TxnId(2);
     store.begin(txn2);
     let k_age = store

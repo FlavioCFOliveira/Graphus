@@ -89,7 +89,7 @@ impl LabelRollbackReport {
 fn drive_scenario() -> (Store, u64, u64) {
     let device = MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new()).expect("create wal");
-    let mut store: Store =
+    let store: Store =
         RecordStore::create(device, wal, POOL_CAPACITY, 1).expect("create store");
     let mut next = 1u64;
 
@@ -182,7 +182,7 @@ pub fn run_label_rollback_clobber_crash(steal: bool) -> LabelRollbackReport {
     let (store, n, committed_prop_id) = drive_scenario();
     // Harden the committed + CLR tail so the crash WAL carries the whole history.
     store.with_wal(WalManager::flush);
-    let mut store = if steal {
+    let store = if steal {
         crash_steal(store)
     } else {
         crash_no_force(store)
@@ -213,7 +213,7 @@ fn crash_no_force(store: Store) -> Store {
 
 /// Steal crash: flush dirty pages home, snapshot that on-disk image, then recover so undo rolls back
 /// any stolen uncommitted pages.
-fn crash_steal(mut store: Store) -> Store {
+fn crash_steal(store: Store) -> Store {
     store.flush().expect("flush (steal)");
     let pages = store.mapped_pages();
     let max = pages.iter().map(|p| p.0).max().unwrap_or(0);

@@ -116,7 +116,7 @@ impl CatalogRollbackReport {
 pub fn run_catalog_rollback_undo(a: AOutcome, crash: Crash) -> CatalogRollbackReport {
     let device = MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new()).expect("create wal");
-    let mut store: Store =
+    let store: Store =
         RecordStore::create(device, wal, POOL_CAPACITY, 1).expect("create store");
 
     // --- seed: tokens + one committed, named index. Committed and flushed, so what follows is
@@ -197,7 +197,7 @@ fn crash_no_force(store: Store) -> Store {
 
 /// Steal crash: flush dirty pages home, snapshot that on-disk image, then recover so undo rolls back
 /// any stolen uncommitted pages.
-fn crash_steal(mut store: Store) -> Store {
+fn crash_steal(store: Store) -> Store {
     store.flush().expect("flush (steal)");
     let pages = store.mapped_pages();
     let max = pages.iter().map(|p| p.0).max().unwrap_or(0);
@@ -248,7 +248,7 @@ pub enum BEnding {
 pub fn run_checkpoint_excludes_pending_ddl(ending: BEnding, crash: Crash) -> bool {
     let device = MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new()).expect("create wal");
-    let mut store: Store =
+    let store: Store =
         RecordStore::create(device, wal, POOL_CAPACITY, 1).expect("create store");
 
     let t0 = TxnId(1);
@@ -310,7 +310,7 @@ pub fn run_checkpoint_excludes_pending_ddl(ending: BEnding, crash: Crash) -> boo
 pub fn run_multi_holder_out_of_order_abort(order: [usize; 3], crash: Crash) -> Option<Vec<u8>> {
     let device = MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new()).expect("create wal");
-    let mut store: Store =
+    let store: Store =
         RecordStore::create(device, wal, POOL_CAPACITY, 1).expect("create store");
 
     let t0 = TxnId(1);

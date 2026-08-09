@@ -49,7 +49,7 @@ fn fresh(cap: usize) -> RecordStore<MemBlockDevice, MemLogSink> {
 /// `Neo.DatabaseError.General.UnknownError` the reader pool surfaced to clients.
 #[test]
 fn reader_view_follows_rel_chain_onto_a_page_allocated_after_its_snapshot() {
-    let mut s = fresh(512);
+    let s = fresh(512);
 
     let txn = TxnId(1);
     s.begin(txn);
@@ -116,7 +116,7 @@ fn reader_view_follows_rel_chain_onto_a_page_allocated_after_its_snapshot() {
 /// that assertion the re-arming would itself be unverified.
 #[test]
 fn reader_view_follows_prop_chain_onto_a_page_allocated_after_its_snapshot() {
-    let mut s = fresh(512);
+    let s = fresh(512);
 
     let txn = TxnId(1);
     s.begin(txn);
@@ -176,7 +176,7 @@ fn reader_view_follows_prop_chain_onto_a_page_allocated_after_its_snapshot() {
 /// Pre-fix this fails with `Storage("Strings store page N not allocated")`.
 #[test]
 fn reader_view_follows_overflow_chain_onto_a_page_allocated_after_its_snapshot() {
-    let mut s = fresh(512);
+    let s = fresh(512);
 
     // A value comfortably past the inline threshold, so it spills into the strings heap.
     let long = |i: usize| Value::String("x".repeat(400 + i));

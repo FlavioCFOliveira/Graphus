@@ -168,7 +168,7 @@ fn recover_no_force(store: &Store) -> Store {
 
 /// Splits a flushed store into its device + a freshly-opened WAL over the same durable log, so the
 /// store can be reopened. The pages were flushed home, so this is a clean reopen.
-fn into_parts(mut s: Store) -> (MemBlockDevice, WalManager<MemLogSink>) {
+fn into_parts(s: Store) -> (MemBlockDevice, WalManager<MemLogSink>) {
     s.flush().unwrap();
     let pages = s.mapped_pages();
     let max = pages.iter().map(|p| p.0).max().unwrap_or(0);
@@ -520,7 +520,7 @@ fn a_committed_writes_counts_survive_the_checkpoint_and_reopen() {
     // must NOT be stripped from its own checkpoint. `commit_prepare` removes `txn` from the active
     // set BEFORE it calls `checkpoint_meta`, so the strip sees only the OTHER open transactions —
     // this test is the guard that keeps that ordering true.
-    let mut s = fresh(64);
+    let s = fresh(64);
     let t0 = TxnId(1);
     s.begin(t0);
     let person = s.intern_token(Namespace::Label, "Person").unwrap();

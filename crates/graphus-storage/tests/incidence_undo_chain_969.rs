@@ -383,7 +383,7 @@ fn an_aborted_edge_insertion_leaves_no_live_incidence_version() {
 /// Measured on this tree: **1096 B/edge**, 2 deltas/edge.
 #[test]
 fn versioning_an_edge_writes_exactly_two_deltas_on_the_relationship() {
-    let mut s = fresh();
+    let s = fresh();
     let rt = s.intern_token(Namespace::RelType, "R").expect("intern");
 
     const EDGES: usize = 200;

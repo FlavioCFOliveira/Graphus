@@ -390,7 +390,7 @@ fn crash_no_force(store: Store) -> Store {
 }
 
 /// Steal crash: flush dirty pages home, snapshot that on-disk image, then recover.
-fn crash_steal(mut store: Store) -> Store {
+fn crash_steal(store: Store) -> Store {
     store.flush().expect("flush (steal)");
     let pages = store.mapped_pages();
     let max = pages.iter().map(|p| p.0).max().unwrap_or(0);

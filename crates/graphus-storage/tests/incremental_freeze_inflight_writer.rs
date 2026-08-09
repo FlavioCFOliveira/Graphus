@@ -52,7 +52,7 @@ fn visible_value(store: &Store, node: u64, key: u32, reader: Snapshot) -> Option
 
 #[test]
 fn committed_value_survives_a_gc_that_ran_while_its_writer_was_in_flight() {
-    let mut s = fresh();
+    let s = fresh();
     let key = s.intern_token(Namespace::PropKey, "v").unwrap();
 
     // 1) t1: n.v = 1, commit.

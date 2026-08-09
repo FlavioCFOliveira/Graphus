@@ -161,7 +161,7 @@ impl Driver {
     fn new(seed: u64, fault: FaultKind) -> Self {
         let device = MemBlockDevice::new(0);
         let wal = WalManager::create(MemLogSink::new()).expect("create wal");
-        let mut store = RecordStore::create(device, wal, POOL_CAPACITY, 1).expect("create store");
+        let store = RecordStore::create(device, wal, POOL_CAPACITY, 1).expect("create store");
         // Intern the tokens once, in their own committed transaction, so they are durable before any
         // workload runs (token creation is itself a WAL-logged, transactional operation, `04 §2.6`).
         let setup = TxnId(1);

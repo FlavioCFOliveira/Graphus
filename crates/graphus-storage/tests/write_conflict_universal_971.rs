@@ -47,7 +47,7 @@ fn assert_retriable(err: &GraphusError, what: &str) {
 /// final count of nodes carrying the label is **0** instead of 1.
 #[test]
 fn a_second_writer_of_the_same_label_bit_is_refused_not_silently_dropped() {
-    let mut s = fresh();
+    let s = fresh();
     let label = s.intern_token(Namespace::Label, "Extra").expect("intern");
 
     let setup = TxnId(1);
@@ -93,7 +93,7 @@ fn a_second_writer_of_the_same_label_bit_is_refused_not_silently_dropped() {
 /// while the committed transaction was told it removed it.
 #[test]
 fn a_second_remover_of_the_same_label_bit_is_refused_not_silently_dropped() {
-    let mut s = fresh();
+    let s = fresh();
     let label = s.intern_token(Namespace::Label, "Extra").expect("intern");
 
     let setup = TxnId(1);
@@ -133,7 +133,7 @@ fn a_second_remover_of_the_same_label_bit_is_refused_not_silently_dropped() {
 /// three `*_entity_propert*` functions and every assertion below fails on the error class.
 #[test]
 fn a_challenger_meeting_an_unresolved_tombstone_is_told_to_retry_not_that_it_is_gone() {
-    let mut s = fresh();
+    let s = fresh();
     let key = s.intern_token(Namespace::PropKey, "p").expect("intern");
     let label = s.intern_token(Namespace::Label, "L").expect("intern");
 
@@ -194,7 +194,7 @@ fn a_challenger_meeting_an_unresolved_tombstone_is_told_to_retry_not_that_it_is_
 /// labels while the committed transaction was told it set them.
 #[test]
 fn a_second_whole_word_label_writer_is_refused_on_the_bulk_import_path() {
-    let mut s = fresh();
+    let s = fresh();
     let a = s.intern_token(Namespace::Label, "A").expect("intern");
     let b = s.intern_token(Namespace::Label, "B").expect("intern");
 

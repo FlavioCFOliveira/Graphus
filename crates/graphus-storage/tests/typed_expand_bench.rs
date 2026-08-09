@@ -23,7 +23,7 @@ type Store = RecordStore<MemBlockDevice, MemLogSink>;
 fn build(hubs: u64, degree: u64, keep_every: u64) -> (Store, u32, Vec<u64>) {
     let device = MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new()).expect("wal");
-    let mut s = RecordStore::create(device, wal, 4096, 1).expect("store");
+    let s = RecordStore::create(device, wal, 4096, 1).expect("store");
     let txn = TxnId(1);
     s.begin(txn);
     let t_friend = s.intern_token(Namespace::RelType, "FRIEND").unwrap();

@@ -110,7 +110,7 @@ fn sees_label(store: &Store, n: u64, owner: TxnId, ts: u64) -> bool {
 fn drive_scenario() -> (Store, u64, LabelSnapshotReport) {
     let device = MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new()).expect("create wal");
-    let mut store: Store =
+    let store: Store =
         RecordStore::create(device, wal, POOL_CAPACITY, 1).expect("create store");
     let mut next = 1u64;
 
@@ -170,7 +170,7 @@ pub fn run_label_snapshot_visibility() -> LabelSnapshotReport {
 pub fn run_label_snapshot_visibility_crash(steal: bool) -> (bool, bool) {
     let (store, n, _report) = drive_scenario();
     store.with_wal(WalManager::flush);
-    let mut store = if steal {
+    let store = if steal {
         crash_steal(store)
     } else {
         crash_no_force(store)
@@ -199,7 +199,7 @@ fn crash_no_force(store: Store) -> Store {
 }
 
 /// Steal crash: flush dirty pages home, snapshot that on-disk image, then recover.
-fn crash_steal(mut store: Store) -> Store {
+fn crash_steal(store: Store) -> Store {
     store.flush().expect("flush (steal)");
     let pages = store.mapped_pages();
     let max = pages.iter().map(|p| p.0).max().unwrap_or(0);

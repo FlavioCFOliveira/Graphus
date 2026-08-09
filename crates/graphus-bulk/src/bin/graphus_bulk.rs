@@ -307,7 +307,7 @@ fn cmd_import(args: Vec<String>) -> Result<(), String> {
         ));
     }
 
-    let (mut store, stats) = importer.finish();
+    let (store, stats) = importer.finish();
     store.flush().map_err(|e| format!("flushing store: {e}"))?;
 
     // Durability (`rmp` #404): the store + WAL files were created and written inside `--db`, but the

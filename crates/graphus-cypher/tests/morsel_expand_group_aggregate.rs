@@ -73,7 +73,7 @@ type Live = RecordStoreGraph<MemBlockDevice, MemLogSink>;
 fn seed_top_liked(n_users: i64, n_articles: i64, pool_frames: usize) -> Store {
     let device = MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new()).expect("create wal");
-    let mut s = RecordStore::create(device, wal, pool_frames, 1).expect("create store");
+    let s = RecordStore::create(device, wal, pool_frames, 1).expect("create store");
     let txn = TxnId(1);
     s.begin(txn);
     let l_user = s.intern_token(Namespace::Label, "USER").unwrap();
@@ -645,7 +645,7 @@ fn expand_group_bundle_equals_serial_fresh() {
 /// group-key-order + marker-union identical to serial at the newest snapshot (MVCC visibility preserved).
 #[test]
 fn expand_group_bundle_equals_serial_after_overwrite() {
-    let mut store = seed_top_liked(400, 40, 16);
+    let store = seed_top_liked(400, 40, 16);
 
     // A second committed transaction overwrites some LIKE-edge weights (does not change the topology, so the
     // group-key set / order is unchanged, but the property reads the aggregates perform are re-validated).

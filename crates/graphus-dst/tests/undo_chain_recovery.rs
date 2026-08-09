@@ -84,7 +84,7 @@ fn run_undo_chain_crash(seed: u64) -> UndoRecoveryReport {
 
     let device = MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new()).expect("create wal");
-    let mut store = RecordStore::create(device, wal, POOL_CAPACITY, 1).expect("create store");
+    let store = RecordStore::create(device, wal, POOL_CAPACITY, 1).expect("create store");
 
     let mut next = 1u64;
     let setup = next_txn(&mut next);
@@ -322,7 +322,7 @@ fn crash_no_force(store: Store) -> (Store, usize) {
 
 /// Steal crash: flush dirty pages home, snapshot that on-disk image, then recover so undo rolls back
 /// any stolen uncommitted (loser) pages — including the loser's delta writes.
-fn crash_steal(mut store: Store) -> (Store, usize) {
+fn crash_steal(store: Store) -> (Store, usize) {
     store.flush().expect("flush (steal)");
     let pages = store.mapped_pages();
     let max = pages.iter().map(|p| p.0).max().unwrap_or(0);

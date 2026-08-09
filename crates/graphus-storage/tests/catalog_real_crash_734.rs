@@ -92,7 +92,7 @@ fn recover_file_store(dir: &Path) -> FileStore {
 ///
 /// Runs only when [`CHILD_DIR`] is set, so under a normal `cargo test` this is inert.
 fn run_child_and_abort(dir: &Path) -> ! {
-    let mut s = create_file_store(dir);
+    let s = create_file_store(dir);
 
     // --- committed baseline DDL ------------------------------------------------------------------
     let t0 = TxnId(1);
@@ -219,7 +219,7 @@ fn catalog_ddl_survives_a_real_process_crash_exactly_when_committed() {
 fn the_modelled_reopen_agrees_with_the_real_crash_on_the_same_interleaving() {
     let device = MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new()).expect("create wal");
-    let mut s = RecordStore::create(device, wal, POOL_PAGES, 1).expect("create store");
+    let s = RecordStore::create(device, wal, POOL_PAGES, 1).expect("create store");
 
     let t0 = TxnId(1);
     s.begin(t0);

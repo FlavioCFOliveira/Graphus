@@ -67,7 +67,7 @@ pub fn intern_tokens(store: &mut BenchStore) -> (u32, u32) {
 pub fn build_graph(nodes: u64, edges_per_node: u64, batch: u64) -> (BenchStore, Vec<u64>) {
     assert!(nodes > 0, "need at least one node");
     assert!(batch > 0, "batch size must be positive");
-    let mut store = fresh_store();
+    let store = fresh_store();
     let rel_type = store
         .intern_token(Namespace::RelType, REL_TYPE)
         .expect("intern reltype");

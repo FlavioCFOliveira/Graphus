@@ -61,7 +61,7 @@ fn recover_no_force(store: &Store, kr: &Keyring) -> Store {
 #[test]
 fn committed_graph_survives_a_crash_over_the_encrypted_device() {
     let kr = keyring(0x01);
-    let mut s = fresh_store(&kr, 64);
+    let s = fresh_store(&kr, 64);
 
     let txn = TxnId(1);
     s.begin(txn);
@@ -86,7 +86,7 @@ fn committed_graph_survives_a_crash_over_the_encrypted_device() {
 #[test]
 fn uncommitted_work_is_rolled_back_over_the_encrypted_device() {
     let kr = keyring(0x02);
-    let mut s = fresh_store(&kr, 64);
+    let s = fresh_store(&kr, 64);
 
     // T1 commits a node.
     let t1 = TxnId(1);
@@ -115,7 +115,7 @@ fn uncommitted_work_is_rolled_back_over_the_encrypted_device() {
 #[test]
 fn a_wrong_key_cannot_open_the_recovered_store() {
     let kr = keyring(0x03);
-    let mut s = fresh_store(&kr, 64);
+    let s = fresh_store(&kr, 64);
     let txn = TxnId(1);
     s.begin(txn);
     let _ = s.create_node(txn).unwrap();

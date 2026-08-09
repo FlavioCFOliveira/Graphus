@@ -266,7 +266,7 @@ struct Run {
 fn run_one(m: u64, reads: u64, arm: Arm) -> Run {
     assert!(m >= DECILES as u64, "M must be at least {DECILES}");
 
-    let mut store: BenchStore = fresh_store();
+    let store: BenchStore = fresh_store();
 
     // Intern every key up front, outside the timers: token interning is not the subject, and in the
     // `Distinct` arm it would otherwise grow the measured cost for a reason unrelated to #967.

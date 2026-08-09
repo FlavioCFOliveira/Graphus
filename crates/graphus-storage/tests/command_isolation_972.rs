@@ -250,7 +250,7 @@ fn old_stays_pinned_across_many_writes_of_the_same_statement() {
 /// answer "absent" for the wrong reason. So the same read is asserted to be `Some` at `NEW`.
 #[test]
 fn a_property_first_set_by_this_statement_is_absent_to_its_own_old_view() {
-    let mut s = fresh();
+    let s = fresh();
     let t1 = TxnId(1);
     s.begin(t1);
     let (n, _) = s.create_node(t1).expect("create node");
@@ -322,7 +322,7 @@ fn a_statement_does_not_observe_its_own_label_change_but_the_next_one_does() {
 /// removing it: a node created **and** labelled by one statement still links no label delta.
 #[test]
 fn a_node_created_by_an_earlier_statement_has_its_labels_versioned() {
-    let mut s = fresh();
+    let s = fresh();
 
     let t = TxnId(1);
     s.begin(t);
@@ -348,7 +348,7 @@ fn a_node_created_by_an_earlier_statement_has_its_labels_versioned() {
 
     // The fast path the gate exists for is intact: one statement that creates AND labels links no
     // label delta, because no view of any statement can ask what came before.
-    let mut s2 = fresh();
+    let s2 = fresh();
     let t2 = TxnId(1);
     s2.begin(t2);
     s2.begin_command(t2);
@@ -376,7 +376,7 @@ fn a_node_created_by_an_earlier_statement_has_its_labels_versioned() {
 /// stops. The answer lives on the undo chain, in the `DeleteObject` delta the creation wrote.
 #[test]
 fn a_node_created_by_this_statement_does_not_exist_to_its_own_old_view() {
-    let mut s = fresh();
+    let s = fresh();
     let registry = s.commit_registry_snapshot();
 
     let t = TxnId(1);
@@ -436,7 +436,7 @@ fn a_node_deleted_by_this_statement_still_exists_to_its_own_old_view() {
 /// errors: the chain holds a `RecreateObject` over a `DeleteObject` and the two must compose.
 #[test]
 fn a_node_created_and_deleted_in_one_statement_is_absent_under_both_views() {
-    let mut s = fresh();
+    let s = fresh();
     let registry = s.commit_registry_snapshot();
 
     let t = TxnId(1);

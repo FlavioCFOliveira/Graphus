@@ -303,7 +303,7 @@ fn a_committed_overwrites_old_chain_survives_until_the_watermark_passes_it() {
 /// an overwrite and a removal, and over both owner kinds.
 #[test]
 fn an_older_snapshot_reads_the_exact_old_value_never_absent() {
-    let mut s = fresh();
+    let s = fresh();
     let key = s.intern_token(Namespace::PropKey, "v").expect("intern");
     let rtype = s.intern_token(Namespace::RelType, "R").expect("intern");
 
@@ -514,7 +514,7 @@ fn the_holder_of_an_entity_keeps_writing_it() {
 /// snapshot, key by key, with the exact values it held.
 #[test]
 fn clearing_the_property_set_keeps_every_old_value_for_an_older_snapshot() {
-    let mut s = fresh();
+    let s = fresh();
     let keys: Vec<u32> = (0..4)
         .map(|i| {
             s.intern_token(Namespace::PropKey, &format!("k{i}"))

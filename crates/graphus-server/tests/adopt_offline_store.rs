@@ -100,7 +100,7 @@ fn offline_import_with_persist_id(import_dir: &Path) {
     importer
         .import_relationships(RELS_CSV.as_bytes())
         .expect("import rels");
-    let (mut store, _stats) = importer.finish();
+    let (store, _stats) = importer.finish();
     store.flush().expect("flush store");
     // Harden the import directory entries so the store/WAL files are findable (mirrors the CLI's
     // durable-create barrier).

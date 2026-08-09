@@ -67,7 +67,7 @@ fn assert_results_eq<T: PartialEq + std::fmt::Debug>(
 /// Builds the populated fixture and returns the committed store. The fixture is intentionally rich so
 /// the equivalence sweep covers every decode branch.
 fn populated_store() -> Store {
-    let mut s = fresh();
+    let s = fresh();
 
     // ---- transaction 1: build the live graph (commit so it is durable, settled state) ----
     let txn = TxnId(1);

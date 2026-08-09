@@ -2095,7 +2095,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let txn = TxnId(next_txn_id + 1);
         store.borrow_mut().begin(txn);
         {
-            let mut store = store.borrow_mut();
+            let store = store.borrow_mut();
             for &(label_token, prop_key) in &populating {
                 store.set_node_property_index(txn, label_token, prop_key, IndexState::Online);
             }
@@ -2186,7 +2186,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let txn = TxnId(next_txn_id + 1);
         store.borrow_mut().begin(txn);
         {
-            let mut store = store.borrow_mut();
+            let store = store.borrow_mut();
             for (label_token, prop_key) in nameless {
                 // Resolve the tokens to names; skip (leave nameless, retried next open) if a token has no
                 // resolvable name — a defensive impossibility for a live token.
@@ -4270,7 +4270,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let txn = TxnId(self.next_txn_id);
         self.store.borrow_mut().begin(txn);
         let (label_token, prop_key) = {
-            let mut store = self.store.borrow_mut();
+            let store = self.store.borrow_mut();
             let label_token = match store.intern_token(Namespace::Label, label) {
                 Ok(t) => t,
                 Err(e) => {
@@ -4378,7 +4378,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let txn = TxnId(self.next_txn_id);
         self.store.borrow_mut().begin(txn);
         let (type_token, prop_key) = {
-            let mut store = self.store.borrow_mut();
+            let store = self.store.borrow_mut();
             let type_token = match store.intern_token(Namespace::RelType, rel_type) {
                 Ok(t) => t,
                 Err(e) => {
@@ -4452,7 +4452,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let txn = TxnId(self.next_txn_id);
         self.store.borrow_mut().begin(txn);
         {
-            let mut store = self.store.borrow_mut();
+            let store = self.store.borrow_mut();
             store.remove_rel_property_index(txn, type_token, prop_key);
             store.remove_rel_property_index_name_for(txn, type_token, prop_key);
         }
@@ -5436,7 +5436,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let txn = TxnId(self.next_txn_id);
         self.store.borrow_mut().begin(txn);
         let (label_token, prop_key) = {
-            let mut store = self.store.borrow_mut();
+            let store = self.store.borrow_mut();
             let label_token = match store.intern_token(Namespace::Label, label) {
                 Ok(t) => t,
                 Err(e) => {
@@ -5807,7 +5807,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let txn = TxnId(self.next_txn_id);
         self.store.borrow_mut().begin(txn);
         let (type_token, property_tokens, effective_name) = {
-            let mut store = self.store.borrow_mut();
+            let store = self.store.borrow_mut();
             let type_token = match store.intern_token(Namespace::RelType, rel_type) {
                 Ok(t) => t,
                 Err(e) => {
@@ -10229,7 +10229,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let txn = TxnId(self.next_txn_id);
         self.store.borrow_mut().begin(txn);
         {
-            let mut store = self.store.borrow_mut();
+            let store = self.store.borrow_mut();
             store.remove_node_property_index(txn, label_token, prop_key);
             store.remove_node_property_index_name_for(txn, label_token, prop_key);
         }
@@ -11296,7 +11296,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // The moment layers 3-7 admit a second writer, this hold becomes a serialisation point and must
         // be revisited — the fix will be the same one `rmp` #974/#993 applied to the pool: hoist the
         // barrier out of the locked region, not shorten the transaction.
-        let mut store = self.store.borrow_mut();
+        let store = self.store.borrow_mut();
         store.begin(gc_txn);
         let gc_result = if freeze_only {
             store.gc_freeze_only(gc_txn, watermark)

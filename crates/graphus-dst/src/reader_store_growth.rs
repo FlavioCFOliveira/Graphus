@@ -143,7 +143,7 @@ fn fresh() -> Store {
 #[allow(clippy::too_many_lines)]
 pub fn run_reader_vs_store_growth(seed: u64) -> ReaderGrowthReport {
     let mut rng = DetRng::new(seed);
-    let mut s = fresh();
+    let s = fresh();
 
     // ---------------------------------------------------------------------------------------------
     // Setup: the SURVIVORS — committed strictly before the reader's snapshot.

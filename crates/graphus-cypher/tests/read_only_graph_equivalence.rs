@@ -82,7 +82,7 @@ struct Fixture {
 /// `ts_early` (after txn 1) sees the full graph as built; `ts_latest` (after txn 2) additionally sees
 /// txn 2's deletes. The rolled-back txn 3 leaves a dead-link corpse visible at neither.
 fn populated() -> Fixture {
-    let mut s = fresh();
+    let s = fresh();
 
     // ---- transaction 1: build the live graph (commit so it is durable, settled state) ----
     let txn = TxnId(1);
@@ -722,7 +722,7 @@ fn relationship_scan_ssi_footprint_is_a_superset_of_the_node_walk() {
 /// (owner = the writer) so its in-flight tombstone is "ours".
 #[test]
 fn self_delete_visibility_is_identical() {
-    let mut s = fresh();
+    let s = fresh();
     let setup = TxnId(1);
     s.begin(setup);
     let l = s.intern_token(Namespace::Label, "T").unwrap();
@@ -838,7 +838,7 @@ fn fulltext_query_off_thread_is_byte_identical_to_inline() {
         "database and graph theory",
         "marketing lead",
     ];
-    let mut s = fresh();
+    let s = fresh();
     let txn = TxnId(1);
     s.begin(txn);
     let l_person = s.intern_token(Namespace::Label, "Person").unwrap();
@@ -991,7 +991,7 @@ fn fulltext_query_rel_off_thread_is_byte_identical_to_inline() {
         "rust systems programmer",
         "database and graph theory",
     ];
-    let mut s = fresh();
+    let s = fresh();
     let txn = TxnId(1);
     s.begin(txn);
     let t_knows = s.intern_token(Namespace::RelType, "KNOWS").unwrap();
@@ -1152,7 +1152,7 @@ fn fulltext_query_rel_off_thread_is_byte_identical_to_inline() {
 /// an artifact of the seek paths sharing a bug.
 #[test]
 fn off_thread_index_seek_equals_inline_seek_and_scan_across_snapshots() {
-    let mut s = fresh();
+    let s = fresh();
 
     // --- t1: four Person nodes; `p0` holds the value we will seek. -------------------------------
     let txn1 = TxnId(1);
@@ -1190,7 +1190,7 @@ fn off_thread_index_seek_equals_inline_seek_and_scan_across_snapshots() {
 
     // --- t2: the concurrent writer commits AFTER the stale snapshot. -----------------------------
     let p_new = {
-        let mut store = coord.store.borrow_mut();
+        let store = coord.store.borrow_mut();
         let txn2 = TxnId(2);
         store.begin(txn2);
         // (a) move `p0` OFF the sought value: the `(a@x.io → p0)` index entry becomes stale but REMAINS.
@@ -1354,7 +1354,7 @@ fn off_thread_index_seek_equals_inline_seek_and_scan_across_snapshots() {
 fn off_thread_range_composite_text_seeks_equal_inline_rows_and_ssi_footprint() {
     use graphus_cypher::physical::TextSeekOp;
 
-    let mut s = fresh();
+    let s = fresh();
     let txn = TxnId(1);
     s.begin(txn);
     let l_person = s.intern_token(Namespace::Label, "Person").unwrap();
@@ -1597,7 +1597,7 @@ fn off_thread_range_composite_text_seeks_equal_inline_rows_and_ssi_footprint() {
 /// (for range/composite the blanket `mark_all_live_rels` fills the key set).
 #[test]
 fn off_thread_rel_seeks_equal_inline_rows_and_ssi_footprint() {
-    let mut s = fresh();
+    let s = fresh();
     let txn = TxnId(1);
     s.begin(txn);
     let t_likes = s.intern_token(Namespace::RelType, "LIKES").unwrap();
@@ -1777,7 +1777,7 @@ fn off_thread_rel_seeks_equal_inline_rows_and_ssi_footprint() {
 fn off_thread_spatial_seeks_equal_inline_rows_and_ssi_footprint() {
     let cart = |x: f64, y: f64| Value::Point(Point::new_2d(Crs::Cartesian, x, y));
 
-    let mut s = fresh();
+    let s = fresh();
     let txn = TxnId(1);
     s.begin(txn);
     let l_city = s.intern_token(Namespace::Label, "City").unwrap();

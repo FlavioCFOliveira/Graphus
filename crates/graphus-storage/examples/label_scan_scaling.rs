@@ -72,7 +72,7 @@ fn build_store(armed: bool, scan_nodes: u64, tracked_nodes: u64) -> Store {
     let wal = WalManager::create(MemLogSink::new()).expect("create wal");
     // A pool large enough that the scan is CPU-bound rather than an I/O benchmark: the subject is
     // the per-candidate cost of the resolution, not the buffer pool.
-    let mut store: Store = RecordStore::create(device, wal, 65_536, 1).expect("create store");
+    let store: Store = RecordStore::create(device, wal, 65_536, 1).expect("create store");
 
     let l0 = store
         .intern_token(Namespace::Label, "Scanned")

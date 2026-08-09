@@ -30,7 +30,7 @@ fn gc_pass(s: &mut RecordStore<MemBlockDevice, MemLogSink>, txn: graphus_core::T
 
 #[test]
 fn create_two_nodes_and_an_edge_then_traverse() {
-    let mut s = fresh(64);
+    let s = fresh(64);
     let txn = graphus_core::TxnId(1);
     s.begin(txn);
     let (a, eid_a) = s.create_node(txn).unwrap();
@@ -55,7 +55,7 @@ fn create_two_nodes_and_an_edge_then_traverse() {
 
 #[test]
 fn parallel_edges_are_distinct_records_in_both_chains() {
-    let mut s = fresh(64);
+    let s = fresh(64);
     let txn = graphus_core::TxnId(1);
     s.begin(txn);
     let (a, _) = s.create_node(txn).unwrap();
@@ -81,7 +81,7 @@ fn parallel_edges_are_distinct_records_in_both_chains() {
 
 #[test]
 fn self_loop_appears_once_in_distinct_traversal_but_is_threaded_twice() {
-    let mut s = fresh(64);
+    let s = fresh(64);
     let txn = graphus_core::TxnId(1);
     s.begin(txn);
     let (a, _) = s.create_node(txn).unwrap();
@@ -101,7 +101,7 @@ fn self_loop_appears_once_in_distinct_traversal_but_is_threaded_twice() {
 
 #[test]
 fn self_loop_mixed_with_normal_edges_traverses_correctly() {
-    let mut s = fresh(64);
+    let s = fresh(64);
     let txn = graphus_core::TxnId(1);
     s.begin(txn);
     let (a, _) = s.create_node(txn).unwrap();
@@ -233,7 +233,7 @@ fn regression_pushing_a_head_before_a_self_loop_keeps_both_links() {
     // pushed onto a node whose existing head was a self-loop, `relink_old_head` repointed *both*
     // sides of the loop (because both face the node), corrupting the loop's internal link. The fix
     // repoints only the head link (the side with prev == NULL). This test pins the exact shape.
-    let mut s = fresh(64);
+    let s = fresh(64);
     let txn = graphus_core::TxnId(1);
     s.begin(txn);
     let (n1, _) = s.create_node(txn).unwrap();
@@ -266,7 +266,7 @@ fn regression_pushing_a_head_before_a_self_loop_keeps_both_links() {
 
 #[test]
 fn properties_chain_head_to_tail() {
-    let mut s = fresh(64);
+    let s = fresh(64);
     let txn = graphus_core::TxnId(1);
     s.begin(txn);
     let (a, _) = s.create_node(txn).unwrap();
@@ -322,7 +322,7 @@ fn freed_physical_ids_are_reused_lifo() {
 #[test]
 fn store_grows_across_pages() {
     // Force the node store to span several pages (125 node records per 8 KiB page).
-    let mut s = fresh(8);
+    let s = fresh(8);
     let txn = graphus_core::TxnId(1);
     s.begin(txn);
     let mut ids = Vec::new();

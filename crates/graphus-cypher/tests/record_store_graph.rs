@@ -960,7 +960,7 @@ fn overwriting_a_string_property_frees_the_old_chain_no_leak() {
     let first = "first value, deliberately long enough that it spans several heap blocks of forty-eight bytes each";
     let second = "second value, also long enough to span multiple heap blocks so the chain has more than one link";
     let store = fresh_store();
-    let (_r, mut store) = run_commit(&format!("CREATE (n {{bio: '{first}'}})"), store, 1);
+    let (_r, store) = run_commit(&format!("CREATE (n {{bio: '{first}'}})"), store, 1);
     let before = store.heap_block_usage().expect("usage before overwrite");
     assert!(
         before > 1,
@@ -989,7 +989,7 @@ fn overwriting_a_string_property_frees_the_old_chain_no_leak() {
 #[test]
 fn removing_a_string_property_frees_its_chain_and_clears_the_value() {
     let store = fresh_store();
-    let (_r, mut store) = run_commit(
+    let (_r, store) = run_commit(
         "CREATE (n {keep: 1, drop: 'a string long enough to use multiple heap blocks'})",
         store,
         1,
@@ -1102,7 +1102,7 @@ fn uncommitted_string_property_does_not_survive_a_crash() {
         store.with_wal(graphus_wal::WalManager::flush);
     }
 
-    let mut recovered = recover_steal(&mut store);
+    let recovered = recover_steal(&mut store);
     // The loser's heap blocks were rolled back: no live heap blocks remain.
     assert_eq!(
         recovered.heap_block_usage().expect("usage"),
@@ -1222,7 +1222,7 @@ fn deleting_a_relationship_frees_its_property_chain() {
     let store = fresh_store();
     let long = "y".repeat(400);
     let src = format!("CREATE (a)-[:KNOWS {{since: 1999, note: '{long}', tags: [1, 2, 3]}}]->(b)");
-    let (_r, mut store) = run_commit(&src, store, 1);
+    let (_r, store) = run_commit(&src, store, 1);
 
     assert!(
         store.heap_block_usage().expect("heap usage") > 0,
@@ -1312,7 +1312,7 @@ fn uncommitted_relationship_property_is_rolled_back_after_a_crash() {
     let store = graph.into_store(); // do NOT commit — this is the loser
     store.with_wal(graphus_wal::WalManager::flush);
 
-    let mut recovered = recover_no_force(&store);
+    let recovered = recover_no_force(&store);
     assert_eq!(
         recovered.heap_block_usage().expect("heap usage"),
         0,

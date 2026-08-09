@@ -224,7 +224,7 @@ fn measure_commit_short_txn() -> f64 {
 /// leaf `benches/read_path.rs` characterizes, distilled to one number.
 fn measure_scan_1k() -> f64 {
     // Build a 1000-node store (no edges needed for the scan leaf), committed in one batch.
-    let mut store = fresh_store();
+    let store = fresh_store();
     let txn = TxnId(1);
     store.begin(txn);
     for _ in 0..1000 {

@@ -42,7 +42,7 @@ const SENTINEL_LABEL: &str = "__mode_a_sentinel__";
 fn fresh() -> Store {
     let device = MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new()).expect("create wal");
-    let mut store = RecordStore::create(device, wal, POOL_CAPACITY, 1).expect("create store");
+    let store = RecordStore::create(device, wal, POOL_CAPACITY, 1).expect("create store");
     store.set_checkpoint_interval_bytes(0);
     store
 }

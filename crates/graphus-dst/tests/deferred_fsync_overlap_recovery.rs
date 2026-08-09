@@ -323,7 +323,7 @@ fn crash_no_force_deferred(store: Store) -> (Store, usize) {
 /// page LSN is in the written-but-un-synced window hardens that range inline (`ensure_durable` → `sync`),
 /// so the overlap batches' records (and `COMMIT`s) become durable. Snapshot the on-disk image + the (now
 /// complete) durable log, then recover.
-fn crash_steal_deferred(mut store: Store) -> (Store, usize) {
+fn crash_steal_deferred(store: Store) -> (Store, usize) {
     store.flush().expect("flush (steal)");
     let pages = store.mapped_pages();
     let max = pages.iter().map(|p| p.0).max().unwrap_or(0);

@@ -267,7 +267,7 @@ fn assert_morsel_equals_serial(
 /// Seeds `n` `(:Person {age: i})` nodes (ages `0..n`), plus two non-`Person` nodes carrying `age` that
 /// must never leak into a `:Person` scan. Returns the committed store + its snapshot timestamp.
 fn seed_people(n: i64) -> (Store, graphus_core::Timestamp) {
-    let mut s = fresh();
+    let s = fresh();
     let txn = TxnId(1);
     s.begin(txn);
     let l_person = s.intern_token(Namespace::Label, "Person").unwrap();
@@ -305,7 +305,7 @@ fn morsel_equals_serial_fresh() {
 /// serial, across morsel counts.
 #[test]
 fn morsel_equals_serial_overwritten() {
-    let (mut store, _) = seed_people(200);
+    let (store, _) = seed_people(200);
     // Overwrite the age of the first 40 Persons (ids 1..=40) in a second committed transaction.
     let txn2 = TxnId(2);
     store.begin(txn2);
@@ -328,7 +328,7 @@ fn morsel_equals_serial_overwritten() {
 /// final committed store, so the candidate set includes them). The morsel read equals serial.
 #[test]
 fn morsel_equals_serial_inserted() {
-    let (mut store, _) = seed_people(150);
+    let (store, _) = seed_people(150);
     let txn2 = TxnId(2);
     store.begin(txn2);
     let l_person = store
@@ -355,7 +355,7 @@ fn morsel_equals_serial_inserted() {
 /// re-validation, exactly as serial — the index over-broadness is corrected by the visibility re-check.
 #[test]
 fn morsel_equals_serial_deleted() {
-    let (mut store, _) = seed_people(200);
+    let (store, _) = seed_people(200);
     let txn2 = TxnId(2);
     store.begin(txn2);
     // Delete every 5th Person (ids 5,10,...,200).
@@ -373,7 +373,7 @@ fn morsel_equals_serial_deleted() {
 /// morsel and serial paths.
 #[test]
 fn morsel_equals_serial_cross_snapshot() {
-    let (mut store, ts_early) = seed_people(200);
+    let (store, ts_early) = seed_people(200);
     // A later transaction deletes + overwrites, advancing the snapshot. The early snapshot must NOT see
     // any of it on either path.
     let txn2 = TxnId(2);
@@ -525,7 +525,7 @@ fn coord_with_people(
     // small pool guards that the parallel read stays correct under eviction.
     let device = MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new()).expect("create wal");
-    let mut s = RecordStore::create(device, wal, 64, 1).expect("create store");
+    let s = RecordStore::create(device, wal, 64, 1).expect("create store");
     let txn = TxnId(1);
     s.begin(txn);
     let l_person = s.intern_token(Namespace::Label, "Person").unwrap();

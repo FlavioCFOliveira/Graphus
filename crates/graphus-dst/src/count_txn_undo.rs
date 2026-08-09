@@ -608,7 +608,7 @@ pub fn run_stolen_pages_vs_checkpointed_counts(
     ending: BystanderEnding,
     crash: Crash,
 ) -> StolenCheckpointReport {
-    let mut store = create_store(POOL_CAPACITY);
+    let store = create_store(POOL_CAPACITY);
 
     let t0 = TxnId(1);
     store.begin(t0);
@@ -725,7 +725,7 @@ pub fn run_crash_between_checkpoint_and_commit_harden(
     fate: CommitRecordFate,
     crash: Crash,
 ) -> CountReport {
-    let mut store = create_store(POOL_CAPACITY);
+    let store = create_store(POOL_CAPACITY);
 
     let t0 = TxnId(1);
     store.begin(t0);
@@ -851,7 +851,7 @@ fn crash_no_force(
 /// Steal crash: flush dirty pages home (stealing the open transaction's uncommitted pages onto the
 /// durable image), snapshot that image, then recover so undo rolls those pages back.
 fn crash_steal(
-    mut store: Store,
+    store: Store,
     truncate_by: usize,
     capacity: usize,
 ) -> (Store, graphus_wal::RecoveryReport) {

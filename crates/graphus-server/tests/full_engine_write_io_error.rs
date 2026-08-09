@@ -170,7 +170,7 @@ fn spawn_dwb_engine(
         Arc::from("io_err"),
         move || {
             let wal = WalManager::create(sink)?;
-            let mut store = RecordStore::create(store_dev, wal, pool_capacity, 1)?;
+            let store = RecordStore::create(store_dev, wal, pool_capacity, 1)?;
             // Attach the doublewrite buffer over its own device, exactly as `dbcatalog` does — this also
             // installs the DWB stager on the pool so the eviction/steal home-write path is protected.
             store.attach_dwb(Dwb::new(dwb_dev)?);

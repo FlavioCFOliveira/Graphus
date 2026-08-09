@@ -584,7 +584,7 @@ mod tests {
             EncryptedFileLogSink::create(wal_backing, &kr).expect("create wal sink"),
         )
         .expect("create wal");
-        let mut store: FileStore = RecordStore::create(device, wal, 64, 1).expect("create store");
+        let store: FileStore = RecordStore::create(device, wal, 64, 1).expect("create store");
 
         let txn = graphus_core::TxnId(1);
         store.begin(txn);

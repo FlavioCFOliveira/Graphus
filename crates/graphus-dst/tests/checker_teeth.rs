@@ -32,7 +32,7 @@ struct Fixture {
 fn build() -> Fixture {
     let device = MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new()).unwrap();
-    let mut s: Store = RecordStore::create(device, wal, 32, 1).unwrap();
+    let s: Store = RecordStore::create(device, wal, 32, 1).unwrap();
 
     let t = TxnId(1);
     s.begin(t);

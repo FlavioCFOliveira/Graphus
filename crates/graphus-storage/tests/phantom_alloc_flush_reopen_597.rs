@@ -137,7 +137,7 @@ const POOL: usize = 128;
 
 fn build(sink: SharedSink, dev: SharedDevice, dwb_dev: SharedDevice) -> Store {
     let wal = WalManager::create(sink).expect("create wal");
-    let mut store = RecordStore::create(dev, wal, POOL, 1).expect("create store");
+    let store = RecordStore::create(dev, wal, POOL, 1).expect("create store");
     store.attach_dwb(Dwb::new(dwb_dev).expect("dwb")); // exactly as dbcatalog wires production
     store
 }
@@ -167,7 +167,7 @@ fn run(arm: bool) -> Outcome {
     let sink = SharedSink::new();
     let dev = SharedDevice::new();
     let dwb_dev = SharedDevice::new();
-    let mut store = build(sink.clone(), dev.clone(), dwb_dev.clone());
+    let store = build(sink.clone(), dev.clone(), dwb_dev.clone());
 
     // Phase A: commit a block of nodes spanning a few record pages, then checkpoint so every resident
     // frame is CLEAN (a later `new_page` victim, if one is even needed, writes nothing home) — so the

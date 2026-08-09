@@ -57,7 +57,7 @@ fn an_open_transaction_that_has_written_nothing_is_not_a_writer() {
 
 #[test]
 fn a_created_record_makes_its_transaction_a_writer() {
-    let mut store = fresh();
+    let store = fresh();
     store.begin(TxnId(7));
     let _ = store.create_node(TxnId(7)).expect("create node");
     assert_eq!(store.uncommitted_data_writer(), Some(TxnId(7)));
@@ -129,7 +129,7 @@ fn a_delete_makes_its_transaction_a_writer() {
 #[test]
 fn resolving_the_writer_clears_it_whichever_way_it_resolves() {
     for commit in [true, false] {
-        let mut store = fresh();
+        let store = fresh();
         store.begin(TxnId(7));
         let _ = store.create_node(TxnId(7)).expect("create node");
         assert_eq!(store.uncommitted_data_writer(), Some(TxnId(7)));
@@ -151,7 +151,7 @@ fn resolving_the_writer_clears_it_whichever_way_it_resolves() {
 /// answer reaches an operator-visible error message and a DST replay, both of which must be stable.
 #[test]
 fn several_open_writers_report_the_lowest_id_deterministically() {
-    let mut store = fresh();
+    let store = fresh();
     for txn in [TxnId(9), TxnId(4), TxnId(6)] {
         store.begin(txn);
         let _ = store.create_node(txn).expect("create node");

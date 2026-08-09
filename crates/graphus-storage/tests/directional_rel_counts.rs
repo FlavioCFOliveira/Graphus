@@ -84,7 +84,7 @@ fn assert_non_vacuous(s: &Store) {
 
 /// Splits a flushed store into its device + a freshly-opened WAL over the same durable log, so the
 /// store can be reopened. The pages were flushed home, so this is a clean reopen (no recovery work).
-fn into_parts(mut s: Store) -> (MemBlockDevice, WalManager<MemLogSink>) {
+fn into_parts(s: Store) -> (MemBlockDevice, WalManager<MemLogSink>) {
     s.flush().unwrap();
     let pages = s.mapped_pages();
     let max = pages.iter().map(|p| p.0).max().unwrap_or(0);
@@ -591,7 +591,7 @@ fn has_directional_counts_distinguishes_absent_from_a_genuine_zero() {
     // a genuine zero, and must still report no counters — there is nothing to distinguish it from an
     // un-backfilled catalogue at the map level, which is precisely why the CONSUMER must fall back in
     // both cases (task #886).
-    let mut s = fresh(64);
+    let s = fresh(64);
     let txn = TxnId(1);
     s.begin(txn);
     let l = s.intern_token(Namespace::Label, "L").unwrap();

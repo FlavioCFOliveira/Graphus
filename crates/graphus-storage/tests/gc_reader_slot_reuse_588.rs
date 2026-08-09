@@ -182,7 +182,7 @@ fn gc_freed_slot_is_not_reused_while_an_inflight_reader_may_walk_through_it() {
 /// FAILS on the pre-fix zeroing phase 3: the reader's `out` loses the live rel below the corpse.
 #[test]
 fn a_gc_freed_dead_link_corpse_still_threads_an_inflight_reader_to_the_live_rel_below_811() {
-    let mut s = fresh(256);
+    let s = fresh(256);
     let t = {
         let txn = graphus_core::TxnId(1);
         s.begin(txn);

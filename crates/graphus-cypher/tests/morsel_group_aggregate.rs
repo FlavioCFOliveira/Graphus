@@ -105,7 +105,7 @@ fn coord_with_grouped_people(
     // A deliberately small pool (64 frames) so the concurrent morsel scan over a much larger node store
     // exercises the concurrent eviction path, not just resident-page reads (the workload that surfaced the
     // `rmp` #337 lost-pin race — running the grouped end-to-end over a small pool guards it stays correct).
-    let mut s = RecordStore::create(device, wal, 64, 1).expect("create store");
+    let s = RecordStore::create(device, wal, 64, 1).expect("create store");
     let txn = graphus_core::TxnId(1);
     s.begin(txn);
     let l_person = s.intern_token(Namespace::Label, "Person").unwrap();
@@ -228,7 +228,7 @@ fn grouped_output_order_is_worker_count_independent() {
 fn grouped_float_sum_matches_serial_via_decline() {
     let device = MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new()).expect("create wal");
-    let mut s = RecordStore::create(device, wal, 64, 1).expect("create store");
+    let s = RecordStore::create(device, wal, 64, 1).expect("create store");
     let txn = graphus_core::TxnId(1);
     s.begin(txn);
     let l = s.intern_token(Namespace::Label, "Person").unwrap();
@@ -274,7 +274,7 @@ fn grouped_float_sum_matches_serial_via_decline() {
 fn grouped_sum_saturation_matches_serial() {
     let device = MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new()).expect("create wal");
-    let mut s = RecordStore::create(device, wal, 64, 1).expect("create store");
+    let s = RecordStore::create(device, wal, 64, 1).expect("create store");
     let txn = graphus_core::TxnId(1);
     s.begin(txn);
     let l = s.intern_token(Namespace::Label, "Person").unwrap();

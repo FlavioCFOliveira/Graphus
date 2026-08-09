@@ -81,7 +81,7 @@ fn adaptive_interval(store_bytes: u64) -> u64 {
 fn fresh_mem() -> MemCoord {
     let device = MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new()).expect("create wal");
-    let mut store = RecordStore::create(device, wal, 256, 1).expect("create store");
+    let store = RecordStore::create(device, wal, 256, 1).expect("create store");
     // Disable the store-level redo-bounding auto-checkpoint (which never reclaims WAL disk on its own,
     // since only the GC freeze sweep settles `unfrozen_commit_lsn`) so the workload's RAW WAL is
     // measured; reclamation is then driven explicitly, exactly as the engine maintenance loop does.

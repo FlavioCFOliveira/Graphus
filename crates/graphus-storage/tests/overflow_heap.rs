@@ -52,7 +52,7 @@ fn gc_pass(s: &mut Store, txn: TxnId) {
 
 #[test]
 fn chain_round_trips_single_block() {
-    let mut s = fresh();
+    let s = fresh();
     let txn = TxnId(1);
     s.begin(txn);
     let payload = b"short"; // < BLOCK_PAYLOAD -> exactly one block
@@ -63,7 +63,7 @@ fn chain_round_trips_single_block() {
 
 #[test]
 fn chain_round_trips_two_blocks() {
-    let mut s = fresh();
+    let s = fresh();
     let txn = TxnId(1);
     s.begin(txn);
     // BLOCK_PAYLOAD + 1 bytes -> exactly two blocks (boundary).
@@ -75,7 +75,7 @@ fn chain_round_trips_two_blocks() {
 
 #[test]
 fn chain_round_trips_many_blocks() {
-    let mut s = fresh();
+    let s = fresh();
     let txn = TxnId(1);
     s.begin(txn);
     // Many blocks, and a payload whose length is not a multiple of BLOCK_PAYLOAD (a partial tail).
@@ -89,7 +89,7 @@ fn chain_round_trips_many_blocks() {
 
 #[test]
 fn chain_round_trips_an_empty_payload() {
-    let mut s = fresh();
+    let s = fresh();
     let txn = TxnId(1);
     s.begin(txn);
     let head = s.alloc_chain(txn, &[]).unwrap();
@@ -102,7 +102,7 @@ fn chain_round_trips_an_empty_payload() {
 
 #[test]
 fn chain_round_trips_a_large_payload() {
-    let mut s = fresh();
+    let s = fresh();
     let txn = TxnId(1);
     s.begin(txn);
     // 100 KiB spans many heap pages as well as many blocks.
@@ -114,7 +114,7 @@ fn chain_round_trips_a_large_payload() {
 
 #[test]
 fn distinct_chains_are_independent() {
-    let mut s = fresh();
+    let s = fresh();
     let txn = TxnId(1);
     s.begin(txn);
     let a = s.alloc_chain(txn, b"alpha payload one").unwrap();
@@ -131,7 +131,7 @@ fn distinct_chains_are_independent() {
 
 #[test]
 fn free_then_realloc_reuses_blocks() {
-    let mut s = fresh();
+    let s = fresh();
     let txn = TxnId(1);
     s.begin(txn);
     let payload: Vec<u8> = (0..(BLOCK_PAYLOAD * 4)).map(|i| i as u8).collect();
@@ -160,7 +160,7 @@ fn free_then_realloc_reuses_blocks() {
 
 #[test]
 fn reading_a_freed_chain_head_is_an_error_not_garbage() {
-    let mut s = fresh();
+    let s = fresh();
     let txn = TxnId(1);
     s.begin(txn);
     let head = s.alloc_chain(txn, b"to be freed").unwrap();
@@ -190,7 +190,7 @@ fn recover_no_force(store: &Store) -> Store {
 
 #[test]
 fn committed_chain_survives_a_no_force_crash() {
-    let mut s = fresh();
+    let s = fresh();
     let txn = TxnId(1);
     s.begin(txn);
     let payload: Vec<u8> = (0..(BLOCK_PAYLOAD * 3 + 7))
@@ -209,7 +209,7 @@ fn committed_chain_survives_a_no_force_crash() {
 
 #[test]
 fn uncommitted_chain_is_rolled_back_after_a_crash() {
-    let mut s = fresh();
+    let s = fresh();
     // A committed baseline chain.
     let t1 = TxnId(1);
     s.begin(t1);
@@ -224,7 +224,7 @@ fn uncommitted_chain_is_rolled_back_after_a_crash() {
         .unwrap();
     s.with_wal(graphus_wal::WalManager::flush);
 
-    let mut rec = recover_no_force(&s);
+    let rec = recover_no_force(&s);
     // The committed chain survives; the loser's blocks are not live (rolled back, not leaked).
     assert_eq!(rec.read_chain(kept).unwrap(), b"committed value");
     assert_eq!(
@@ -240,7 +240,7 @@ fn uncommitted_chain_is_rolled_back_after_a_crash() {
 
 #[test]
 fn inline_scalars_stay_inline_and_use_no_heap_blocks() {
-    let mut s = fresh();
+    let s = fresh();
     let txn = TxnId(1);
     s.begin(txn);
     let (n, _) = s.create_node(txn).unwrap();
@@ -270,7 +270,7 @@ fn inline_scalars_stay_inline_and_use_no_heap_blocks() {
 
 #[test]
 fn string_and_list_values_round_trip_through_the_property_api() {
-    let mut s = fresh();
+    let s = fresh();
     let txn = TxnId(1);
     s.begin(txn);
     let (n, _) = s.create_node(txn).unwrap();
@@ -304,7 +304,7 @@ fn temporal_values_round_trip_through_the_property_api() {
         Date, Duration, LocalDateTime, LocalTime, ZonedDateTime, ZonedTime,
     };
 
-    let mut s = fresh();
+    let s = fresh();
     let txn = TxnId(1);
     s.begin(txn);
     let (n, _) = s.create_node(txn).unwrap();
@@ -405,7 +405,7 @@ fn temporal_values_round_trip_through_the_property_api() {
 fn committed_temporal_property_survives_a_crash_and_recovers() {
     use graphus_core::value::temporal::{LocalDateTime, ZonedDateTime};
 
-    let mut s = fresh();
+    let s = fresh();
     let txn = TxnId(1);
     s.begin(txn);
     let (n, _) = s.create_node(txn).unwrap();
@@ -438,7 +438,7 @@ fn committed_temporal_property_survives_a_crash_and_recovers() {
 fn spatial_point_values_round_trip_through_the_property_api() {
     use graphus_core::value::spatial::{Crs, Point};
 
-    let mut s = fresh();
+    let s = fresh();
     let txn = TxnId(1);
     s.begin(txn);
     let (n, _) = s.create_node(txn).unwrap();
@@ -491,7 +491,7 @@ fn spatial_point_values_round_trip_through_the_property_api() {
 fn committed_point_property_survives_a_crash_and_recovers() {
     use graphus_core::value::spatial::{Crs, Point};
 
-    let mut s = fresh();
+    let s = fresh();
     let txn = TxnId(1);
     s.begin(txn);
     let (n, _) = s.create_node(txn).unwrap();
@@ -620,7 +620,7 @@ fn clearing_all_properties_frees_every_overflow_chain() {
 
 #[test]
 fn committed_overflow_property_survives_a_crash_and_recovers() {
-    let mut s = fresh();
+    let s = fresh();
     let txn = TxnId(1);
     s.begin(txn);
     let (n, _) = s.create_node(txn).unwrap();

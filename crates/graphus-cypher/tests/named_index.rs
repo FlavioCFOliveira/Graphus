@@ -255,7 +255,7 @@ fn drop_by_name_missing_is_an_error_without_if_exists_and_a_noop_with_it() {
 /// Builds a store that declares a node-property index the **legacy** way — a durable index-catalog
 /// entry with **no** name — exactly the state a pre-#623 image recovers to.
 fn store_with_legacy_anonymous_index() -> Store {
-    let mut store = fresh_store();
+    let store = fresh_store();
     let txn = TxnId(1);
     store.begin(txn);
     let lt = store

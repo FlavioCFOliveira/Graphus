@@ -82,7 +82,7 @@ fn coord_with_social(n: i64, fanout: i64) -> TxnCoordinator<MemBlockDevice, MemL
 fn seed_social(n: i64, fanout: i64, pool_frames: usize) -> Store {
     let device = MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new()).expect("create wal");
-    let mut s = RecordStore::create(device, wal, pool_frames, 1).expect("create store");
+    let s = RecordStore::create(device, wal, pool_frames, 1).expect("create store");
     let txn = TxnId(1);
     s.begin(txn);
     let l_person = s.intern_token(Namespace::Label, "Person").unwrap();
@@ -242,7 +242,7 @@ fn morsel_expand_end_to_end_match_serial() {
 /// at a tombstone, which keeps the post-delete neighbour-collect projection well-defined on both paths.
 #[test]
 fn morsel_expand_end_to_end_after_mutations() {
-    let mut store = seed_social(60_000, 4, 64);
+    let store = seed_social(60_000, 4, 64);
 
     // (1) In-place property overwrites directly on the store (changes b.age / the CASE bucket).
     let txn2 = TxnId(2);
@@ -647,7 +647,7 @@ fn morsel_expand_equals_serial_fresh() {
 /// converge identical to serial.
 #[test]
 fn morsel_expand_equals_serial_overwrite() {
-    let mut store = seed_social(400, 5, 16);
+    let store = seed_social(400, 5, 16);
     let txn2 = TxnId(2);
     store.begin(txn2);
     let k_name = store.token_id(Namespace::PropKey, "name").expect("name");
@@ -668,7 +668,7 @@ fn morsel_expand_equals_serial_overwrite() {
 /// serial at the latest snapshot.
 #[test]
 fn morsel_expand_equals_serial_insert() {
-    let mut store = seed_social(400, 5, 16);
+    let store = seed_social(400, 5, 16);
     let txn2 = TxnId(2);
     store.begin(txn2);
     let l_person = store.token_id(Namespace::Label, "Person").expect("person");
@@ -706,7 +706,7 @@ fn morsel_expand_equals_serial_insert() {
 /// keep the converge clean so the row/marker assertions are exercised).
 #[test]
 fn morsel_expand_equals_serial_delete() {
-    let mut store = seed_social(400, 5, 16);
+    let store = seed_social(400, 5, 16);
     // Add a handful of EDGE-FREE :Person anchors to delete (anchor-tombstone test, no dangling rels).
     let txn_iso = TxnId(2);
     store.begin(txn_iso);
@@ -752,7 +752,7 @@ fn morsel_expand_equals_serial_delete() {
 /// visibility filters identically on the morsel and serial expand paths.
 #[test]
 fn morsel_expand_equals_serial_cross_snapshot() {
-    let mut store = seed_social(400, 5, 16);
+    let store = seed_social(400, 5, 16);
     let ts_early = store.snapshot_ts();
     let txn2 = TxnId(2);
     store.begin(txn2);
@@ -779,7 +779,7 @@ fn morsel_expand_equals_serial_cross_snapshot() {
 fn morsel_expand_self_loops_dedup_identical() {
     let device = MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new()).expect("wal");
-    let mut s = RecordStore::create(device, wal, 16, 1).expect("store");
+    let s = RecordStore::create(device, wal, 16, 1).expect("store");
     let txn = TxnId(1);
     s.begin(txn);
     let l = s.intern_token(Namespace::Label, "Person").unwrap();

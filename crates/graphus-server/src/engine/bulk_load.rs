@@ -914,7 +914,7 @@ mod tests {
             max_reclaim_up_to: Arc::clone(&max_reclaim),
         })
         .expect("create WAL");
-        let mut store = RecordStore::create(device, wal, 64, 1).expect("create store");
+        let store = RecordStore::create(device, wal, 64, 1).expect("create store");
         store.set_checkpoint_interval_bytes(0);
         (TxnCoordinator::new(store), max_reclaim)
     }

@@ -1246,7 +1246,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     /// Returns a storage error if the commit (catalog persist + WAL group-commit) fails.
     pub fn commit(self) -> Result<RecordStore<D, S>, GraphusError> {
         let txn = self.txn;
-        let mut store = Self::unwrap_store(self.store);
+        let store = Self::unwrap_store(self.store);
         store.commit(txn)?;
         Ok(store)
     }
@@ -1273,7 +1273,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     /// Returns a storage error if the undo apply or catalog reload fails.
     pub fn rollback(self) -> Result<RecordStore<D, S>, GraphusError> {
         let txn = self.txn;
-        let mut store = Self::unwrap_store(self.store);
+        let store = Self::unwrap_store(self.store);
         store.rollback(txn)?;
         Ok(store)
     }
