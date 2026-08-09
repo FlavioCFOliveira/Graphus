@@ -69,7 +69,15 @@ pub const SECONDS_PER_DAY: i64 = 86_400;
 pub const AVG_SECONDS_PER_MONTH: i64 = 2_629_746;
 
 /// The average Gregorian month in nanoseconds (see [`AVG_SECONDS_PER_MONTH`]).
-const AVG_NANOS_PER_MONTH: i128 = AVG_SECONDS_PER_MONTH as i128 * NANOS_PER_SECOND as i128;
+///
+/// **The single point of truth** (`rmp` #1018). Two other copies existed — in `graphus-index`'s key
+/// codec and in `graphus-cypher`'s ordering — and both were wrong by a factor of **86.4**
+/// (`30_436_875 * 1_000_000`, which is 30 436.875 *seconds*, i.e. 8.45 hours, not a month). Because
+/// those two are the constants that ORDER and COMPARE durations while this one converts them, the
+/// server contradicted itself: `P1M` sorted before `P1D`, `min`/`max` returned the wrong extreme, and
+/// `WHERE d > duration({days:1})` silently dropped the `P1M` row. Anything that needs a month in
+/// nanoseconds imports this.
+pub const AVG_NANOS_PER_MONTH: i128 = AVG_SECONDS_PER_MONTH as i128 * NANOS_PER_SECOND as i128;
 
 /// Nanoseconds in one standard day, widened for interim arithmetic.
 const NANOS_PER_DAY_I128: i128 = NANOS_PER_DAY as i128;

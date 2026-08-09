@@ -66,7 +66,7 @@ use graphus_core::{Value, cmp_int_float};
 /// The average nanoseconds per month used **only** to order durations (`365.2425 / 12 ≈ 30.436875`
 /// days, expressed in nanoseconds). Cypher durations have no exact length, so the order compares
 /// them by this normalised approximation (openCypher temporal CIP); equality stays component-wise.
-const AVG_NANOS_PER_MONTH: i128 = 30_436_875 * 1_000_000;
+use graphus_core::temporal_calc::AVG_NANOS_PER_MONTH;
 
 /// The global value-class rank (ascending), per CIP2016-06-14 §Orderability.
 ///

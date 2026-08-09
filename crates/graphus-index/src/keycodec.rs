@@ -242,12 +242,15 @@ pub fn encode_number(into: &mut Vec<u8>, v: &Value) -> Result<(), KeyEncodeError
     Ok(())
 }
 
-/// The approximate number of days in a month used **only** for *ordering* durations
+/// The approximate length of a month used **only** for *ordering* durations
 /// (`365.2425 / 12 ≈ 30.436875` days). Cypher durations have no exact length (a month is not a
 /// fixed number of days), so the global order compares them by this normalised approximation
 /// (openCypher temporal CIP); equality remains strictly component-wise (handled in
-/// `graphus-cypher`'s `equivalence`/`equality`). The factor is expressed in nanoseconds.
-const AVG_NANOS_PER_MONTH: i128 = 30_436_875 * 1_000_000;
+/// `graphus-cypher`'s `equivalence`/`equality`).
+///
+/// Imported rather than restated (`rmp` #1018): the local copy read `30_436_875 * 1_000_000`, which
+/// is 8.45 hours, so this index's ordering key disagreed with the engine's own conversion by 86.4x.
+use graphus_core::temporal_calc::AVG_NANOS_PER_MONTH;
 
 /// The approximate length of a [`Value::Duration`] in nanoseconds, used as its ordering key.
 ///

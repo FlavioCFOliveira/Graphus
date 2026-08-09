@@ -380,3 +380,69 @@ fn cross_class_pairs_agree_at_the_class_boundary() {
         );
     }
 }
+
+/// **A month is longer than a day, in both the comparator and the index key** (`rmp` #1018).
+///
+/// The ordering constant read `30_436_875 * 1_000_000` nanoseconds — 30 436.875 *seconds*, i.e. 8.45
+/// hours — in `graphus-cypher`'s ordering AND in `graphus-index`'s key codec, while `graphus-core`'s
+/// conversion used the correct 2 629 746 s. The server therefore contradicted itself by a factor of
+/// **86.4**, and the consequences were user-visible and silent:
+///
+/// * `ORDER BY d` put `P1M` before `P1D`, because `3.04e13 < 8.64e13`;
+/// * `min()` / `max()` over durations returned the wrong extreme;
+/// * `WHERE d > duration({days: 1})` **dropped the `P1M` row** — a committed row vanishing from an
+///   answer with no error. Because the index key used the same constant, the index and the scan
+///   agreed with each other and disagreed with reality, so a bag comparison could not see it either.
+///
+/// The TCK is blind to this (no feature orders durations) and stayed at 3914 with and without the
+/// defect, which is exactly why this test is named after the symptom.
+///
+/// Non-vacuous: restoring `30_436_875 * 1_000_000` makes every assertion here fail.
+#[test]
+fn a_month_orders_after_a_day_in_comparator_and_index_key_1018() {
+    let day = Value::Duration(Duration {
+        months: 0,
+        days: 1,
+        seconds: 0,
+        nanos: 0,
+    });
+    let month = Value::Duration(Duration {
+        months: 1,
+        days: 0,
+        seconds: 0,
+        nanos: 0,
+    });
+    // Nine hours: longer than the broken month constant (8.45 h), shorter than a real month. It is
+    // what separates "the constant is wrong" from "the constant is merely different".
+    let nine_hours = Value::Duration(Duration {
+        months: 0,
+        days: 0,
+        seconds: 9 * 3_600,
+        nanos: 0,
+    });
+
+    assert_eq!(
+        cmp_values(&day, &month),
+        Ordering::Less,
+        "P1D must order before P1M: a month is ~30.44 days, not 8.45 hours (`rmp` #1018)"
+    );
+    assert_eq!(
+        cmp_values(&nine_hours, &month),
+        Ordering::Less,
+        "PT9H must order before P1M. Under the old constant a month was 8.45 hours, so this pair is \
+         what tells a wrong constant apart from a merely different one"
+    );
+
+    // And the index key must agree, or a seek and a scan return different rows for the same
+    // predicate — the shape that made this invisible to a bag comparison.
+    for (a, b) in [(&day, &month), (&nine_hours, &month)] {
+        assert_eq!(
+            cmp_values(a, b),
+            encode_single(a)
+                .expect("durations are index-encodable")
+                .cmp(&encode_single(b).expect("durations are index-encodable")),
+            "the index key must order durations exactly as the comparator does, or an indexed \
+             predicate silently returns a different set of rows than a scan"
+        );
+    }
+}

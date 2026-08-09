@@ -50,9 +50,17 @@ fn class_rank(v: &Value) -> u8 {
     }
 }
 
-/// The average nanoseconds per month used to order durations (mirrors the encoder's
-/// `30.436875` days/month, expressed in nanoseconds). Written independently here.
-const AVG_NANOS_PER_MONTH: i128 = 30_436_875 * 1_000_000;
+/// The average nanoseconds per month used to order durations.
+///
+/// Derived here from first principles, NOT copied from the encoder (`rmp` #1018). The previous
+/// version claimed to be written independently and was in fact the encoder's own constant, wrong by a
+/// factor of 86.4 — so the oracle agreed with the defect and the test passed. An oracle that restates
+/// the implementation proves only that the implementation equals itself.
+///
+/// The Gregorian year is 365.2425 days, so a month is `365.2425 / 12 = 30.436875` days, and a day is
+/// 86 400 seconds of 1e9 nanoseconds each. Written as integer arithmetic scaled by 10 000 to keep the
+/// year exact.
+const AVG_NANOS_PER_MONTH: i128 = (3_652_425 * 86_400 * 1_000_000_000) / (10_000 * 12);
 
 /// The reference ordering key for a `Duration`: its approximate normalised length in nanoseconds.
 fn duration_nanos(d: &Duration) -> i128 {
