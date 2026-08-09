@@ -8,7 +8,9 @@
 //! * the **doublewrite-lock tripwire** ([`DwbLockScope`], `rmp` #993) — the mutex guarding the
 //!   doublewrite buffer's device;
 //! * the **allocator-latch tripwire** ([`AllocLatchScope`], `rmp` #1012) — the per-store physical-id
-//!   allocation latch.
+//!   allocation latch;
+//! * the **chain-head-latch tripwire** ([`ChainHeadLatchScope`], `rmp` #1028) — the sharded latch
+//!   that makes one chain-head publication atomic.
 //!
 //! The first two were each *measured* to convoy behind a barrier and then hoisted out. The third is
 //! the same guarantee stated **before** the convoy can be built: the allocation latch is new, and it
@@ -264,9 +266,10 @@ thread_local! {
 /// # The rank, and the rule it encodes
 ///
 /// Graphus orders its latches by rank, innermost last: **10** catalog/DDL, **20** commit sequencer
-/// and active-transaction table, **25** the allocation latch, **30** WAL, **40** buffer-pool frame
-/// latch, **50** page-table shard, **60** device and doublewrite stager. An acquisition out of rank
-/// order is permitted only as a `try_lock`, which creates no wait edge.
+/// and active-transaction table, **25** the allocation latch, **27** the chain-head publication
+/// latch, **30** WAL, **40** buffer-pool frame latch, **50** page-table shard, **60** device and
+/// doublewrite stager. An acquisition out of rank order is permitted only as a `try_lock`, which
+/// creates no wait edge.
 ///
 /// Rank 25 says two things. Below the active-transaction table (20), because allocating or freeing an
 /// id happens inside a transaction that records the pop or push in that table. Above the WAL (30) and
@@ -372,6 +375,125 @@ pub fn assert_no_alloc_latch_held(site: &str) {
     let _ = site;
 }
 
+/// Whether the current thread holds a chain-head publication latch — `0` or `1`, never more
+/// (`rmp` #1028).
+///
+/// Like [`alloc_latch_depth`] this is a flag rather than a nesting count: rank 27 admits at most one
+/// holder per thread. Always `0` in a release build.
+#[cfg(debug_assertions)]
+#[must_use]
+pub fn chain_head_latch_depth() -> u32 {
+    CHAIN_HEAD_DEPTH.with(std::cell::Cell::get)
+}
+
+/// Whether the current thread holds a chain-head publication latch. Always `0` in a release build.
+#[cfg(not(debug_assertions))]
+#[must_use]
+pub const fn chain_head_latch_depth() -> u32 {
+    0
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static CHAIN_HEAD_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// An RAII marker for a region in which the current thread holds a chain-head publication latch
+/// (`rmp` #1028).
+///
+/// # The rank, and the rule it encodes
+///
+/// Rank **27**, between the allocation latch (25) and the WAL (30) — see [`AllocLatchScope`] for the
+/// full order. That position is the whole design of the latch, and it is forced from both sides:
+///
+/// * **Below the WAL (30) and the frame latch (40)**, because publishing a chain head *is* the
+///   sequence "append the redo record, then apply it to the page". Those two must happen in one
+///   indivisible step, or the order in which publications enter the log stops matching the order in
+///   which they take effect — and ARIES replays in log order, so recovery would then reach a
+///   different verdict from the live system and the *replayed* one is what survives the crash. The
+///   latch is what makes that one step; it must therefore be outside both locks it serialises.
+/// * **Above everything that does I/O**, and hence never held across a durability barrier: it is
+///   taken only once the page is already resident and pinned, and released before the frame is
+///   unpinned. Held across a barrier it would convoy every writer of the same shard behind one
+///   `fdatasync` — the `rmp` #974 / #993 / #1012 shape arriving by a fourth route.
+///
+/// As with rank 25, **at most one holder per thread**: two locks of the same rank cannot be ordered
+/// by rank, so two threads acquiring a different pair in a different order deadlock. Nothing needs
+/// two: a relationship publishes its start endpoint's head and its end endpoint's head strictly one
+/// after the other, precisely so that this stays true.
+///
+/// `!Send`/`!Sync` for the same reason as its siblings — the depth is a thread-local, and a scope
+/// created on one thread and dropped on another would corrupt both threads' counters.
+#[derive(Debug)]
+pub struct ChainHeadLatchScope {
+    _private: std::marker::PhantomData<*const ()>,
+}
+
+impl ChainHeadLatchScope {
+    /// Enters a chain-head-publication region on the current thread.
+    ///
+    /// # Panics
+    /// Panics in a debug build if this thread **already** holds a chain-head latch (rank 27 is not
+    /// re-entrant — see above). Compiled out in release.
+    #[must_use]
+    #[inline]
+    pub fn new() -> Self {
+        #[cfg(debug_assertions)]
+        CHAIN_HEAD_DEPTH.with(|d| {
+            assert!(
+                d.get() == 0,
+                "a second chain-head publication latch was taken while this thread already holds \
+                 one. Rank 27 is not re-entrant and admits one holder per thread (`rmp` #1028): two \
+                 locks of the same rank cannot be ordered by rank, so two threads acquiring a \
+                 different pair in a different order deadlock. Publish one head at a time (see \
+                 `graphus_core::latch`)."
+            );
+            d.set(1);
+        });
+        Self {
+            _private: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Default for ChainHeadLatchScope {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for ChainHeadLatchScope {
+    #[inline]
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        CHAIN_HEAD_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// Panics (debug builds only) if the current thread holds a chain-head publication latch.
+///
+/// Call this at every point the latch must already have been released: the durability barrier, and
+/// the page-fetch / store-growth paths that can evict (and therefore write home, and therefore
+/// harden). `site` names the point so a failure points straight at the offending path.
+///
+/// # Panics
+/// Panics in a debug build if [`chain_head_latch_depth`] is non-zero. Compiled out in release.
+#[inline]
+pub fn assert_no_chain_head_latch_held(site: &str) {
+    #[cfg(debug_assertions)]
+    {
+        let depth = chain_head_latch_depth();
+        assert!(
+            depth == 0,
+            "{site}: reached while holding {depth} chain-head publication latch(es). That latch is \
+             rank 27 and must be released before any I/O (`rmp` #1028): held across page growth, a \
+             page fetch that can evict, or a durability barrier, it convoys every publisher of the \
+             shard behind one fdatasync. Pin the page before taking it (see `graphus_core::latch`)."
+        );
+    }
+    let _ = site;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,7 +570,7 @@ mod tests {
         assert_eq!(alloc_latch_depth(), 0);
     }
 
-    /// The three tripwires are independent counters: holding one must not trip another's assertion.
+    /// The tripwires are independent counters: holding one must not trip another's assertion.
     #[test]
     fn alloc_scope_does_not_trip_the_other_tripwires() {
         let _scope = AllocLatchScope::new();
@@ -456,6 +578,52 @@ mod tests {
         assert_eq!(alloc_latch_depth(), 1);
         assert_no_frame_latch_held("unrelated barrier");
         assert_no_dwb_lock_held("unrelated barrier");
+        assert_no_chain_head_latch_held("unrelated barrier");
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "chain-head publication latch")]
+    fn chain_head_assert_fires_inside_a_latched_region() {
+        let _scope = ChainHeadLatchScope::new();
+        assert_no_chain_head_latch_held("test durability barrier");
+    }
+
+    #[test]
+    fn chain_head_assert_passes_outside_a_latched_region() {
+        assert_eq!(chain_head_latch_depth(), 0);
+        assert_no_chain_head_latch_held("test durability barrier");
+    }
+
+    /// **Positive control for the non-re-entrancy rule** (`rmp` #1028), the rank-27 twin of
+    /// [`a_second_alloc_scope_on_one_thread_is_refused`]: a relationship publishes its two endpoint
+    /// heads one after the other, and this is what makes "one after the other" a checked property
+    /// rather than a comment.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "Rank 27 is not re-entrant")]
+    fn a_second_chain_head_scope_on_one_thread_is_refused() {
+        let _first = ChainHeadLatchScope::new();
+        let _second = ChainHeadLatchScope::new();
+    }
+
+    /// Sequential scopes are fine — exactly the shape `create_rel` uses for its two endpoints.
+    #[test]
+    fn chain_head_scopes_taken_one_after_another_are_fine() {
+        for _ in 0..3 {
+            let _s = ChainHeadLatchScope::new();
+        }
+        assert_eq!(chain_head_latch_depth(), 0);
+    }
+
+    #[test]
+    fn chain_head_scope_does_not_trip_the_other_tripwires() {
+        let _scope = ChainHeadLatchScope::new();
+        #[cfg(debug_assertions)]
+        assert_eq!(chain_head_latch_depth(), 1);
+        assert_no_frame_latch_held("unrelated barrier");
+        assert_no_dwb_lock_held("unrelated barrier");
+        assert_no_alloc_latch_held("unrelated barrier");
     }
 
     /// The depth is **per thread**: one thread's latched region must not make another thread's

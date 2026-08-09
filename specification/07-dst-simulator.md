@@ -140,6 +140,9 @@ none. The N-writer scenarios that `D-dst-writer-scheduler` requires arrive with 
 four write-path yield points (`WriteReadMvcc`, `WriteConflictCheck`, `WriteChainHeadUnheld`,
 `WriteLinkDelta`) are installed but **not yet exercised** — with one writer thread per database there
 is nothing to interleave at them. The code says so at each of them, and so does this specification.
+Task **#1028** moved two of them: the undo chain's head-read (`WriteLinkDelta`) and head-publish
+(`UndoChainHeadPublish`) now sit **inside** the publication retry loop, so every attempt — not only the
+first — has its own read half and publication half for a future schedule to interleave.
 
 What remains **outside** the ceiling, with its real owner:
 
@@ -151,6 +154,7 @@ What remains **outside** the ceiling, with its real owner:
 | Doublewrite-buffer (DWB) eviction ring (`#411`/`#412`) | `graphus-bufpool/tests/loom_dwb_ring.rs`, `graphus-storage/tests/dwb_concurrent_eviction_411.rs` |
 | SSI commit-path interleavings at the memory level | `graphus-txn/tests/loom_ssi.rs` |
 | Real-OS-thread supernode write contention (the true-parallel pair to the DST `#220` logical guard) | `graphus-dst/tests/real_thread_supernode_stress.rs` |
+| Two writers **prepending onto one chain head** at the same instant (`#1028`). DST cannot open this window: a database has one writer thread and `RecordStore`'s write methods take `&mut self`, so the scenario catalogued in section 10 scripts the interleaving through a `dst`-gated seam instead of racing it | `graphus-chainhead/tests/loom_chainhead.rs` (the concurrent half: both entries end up in the chain, no fork, no cycle, and a naive publication is required to lose one) |
 | Engine-thread panic isolation; blocking-thread budget under load. The server's engine thread is `sched::exempt`: bringing it under the scheduler needs its blocking command/reply channels handled first | `graphus-server/tests/panic_isolation.rs`, `blocking_thread_budget.rs`, `connection_stress.rs`, `slow_consumer_no_head_of_line_block.rs` |
 
 **The memory model stays outside, by construction and by refusal.** This is a limitation, not a
@@ -393,6 +397,13 @@ before construction), the engine exposes a fault seam gated behind the `dst` car
   device so the harness can arm a `FaultPlan` (or the one-shot I/O-error / torn-write seams) during
   interleaved transactions. `LocalEngine::with_device_mut` returns `None` on an already-shut-down
   engine, so a caller can never panic on a spent engine.
+- `RecordStore::dst_publish_node_first_rel(node, expect, entry, txn)` (task #1028) publishes a node's
+  `first_rel` chain head through the ordinary publication primitive, reporting whether the
+  compare-and-publish was accepted. It exists so a scenario can **script** the interleaving a second
+  writer would produce — read the head, let another transaction publish onto it, then replay the first
+  writer's now-stale publication — which is the same window a race would open. Gated with the rest of
+  the seam and therefore never compiled into a production build, so it adds no writer of a chain head
+  to a shipped binary.
 - The feature forwards down the crate chain (`graphus-server/dst` → `graphus-cypher/dst` →
   `graphus-storage/dst` → `graphus-bufpool/dst`) and is **off by default**, so the production build
   never compiles the seam — the device stays encapsulated and the cost is exactly zero (the method does
@@ -654,6 +665,18 @@ concern it certifies, and its oracle.
 
 - `crash_recovery_durability` — drives `LocalEngine::crash_restart` (ARIES recovery from the durable
   WAL). *Oracle:* an acked commit survives the crash and uncommitted work does not.
+- `chain_head_publication_recovery_1028` (rmp #1028) — 200 seeds of prepends onto one hub node's
+  `first_rel` chain head, crashed by both shapes (steal: dirty pages already written home; no-force:
+  only the durable WAL prefix survives) and recovered through ARIES. Each seed also **scripts** the
+  interleaving a second writer would produce, through the `dst`-gated `dst_publish_node_first_rel`
+  seam (section 6.2): it reads the head, lets another transaction publish onto it, and then replays the
+  first writer's now-stale publication. *Oracle:* the stale publication is **refused**; and after
+  recovery the hub's incidence chain still holds **every** committed relationship — a conditional redo
+  that declined at replay would leave the head naming an older entry and silently drop every edge
+  published after it. Non-vacuity is asserted, not assumed: each seed must have committed at least
+  four prepends onto the one head, and the sweep must have exercised **both** crash shapes. The pool is
+  deliberately small (16 frames) so eviction and the WAL-before-data rule are live throughout rather
+  than everything staying resident until the crash.
 - `backup_restore_crash` (rmp #440) — drives the genuine backup → seal → file → restore /
   key-rotation pipeline on **real temp files** and injects a crash at each of its four atomicity windows
   (after `seal_artifact` / before the backup rename; mid `write_file_atomic`; mid

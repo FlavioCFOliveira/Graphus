@@ -206,11 +206,11 @@ const REL_OFF_END_NODE: usize = 53; // u64
 /// Byte offset of the `start_prev_rel` chain back-pointer within a rel record (used by the store's
 /// no-op-undo relink, `rmp` #220).
 pub(crate) const REL_OFF_START_PREV: usize = 61; // u64
-const REL_OFF_START_NEXT: usize = 69; // u64
+pub(crate) const REL_OFF_START_NEXT: usize = 69; // u64
 /// Byte offset of the `end_prev_rel` chain back-pointer within a rel record (used by the store's
 /// no-op-undo relink, `rmp` #220).
 pub(crate) const REL_OFF_END_PREV: usize = 77; // u64
-const REL_OFF_END_NEXT: usize = 85; // u64
+pub(crate) const REL_OFF_END_NEXT: usize = 85; // u64
 /// Byte offset of the `first_prop` chain-head pointer within a relationship record (used by the
 /// store's compare-and-set chain-head logical undo).
 pub(crate) const REL_OFF_FIRST_PROP: usize = 93; // u64
@@ -373,7 +373,7 @@ pub const PROP_RECORD_SIZE: usize = 46;
 const PROP_OFF_KEY: usize = 25; // u32
 const PROP_OFF_TYPE_TAG: usize = 29; // u8
 const PROP_OFF_VALUE_INLINE: usize = 30; // u64
-const PROP_OFF_NEXT_PROP: usize = 38; // u64
+pub(crate) const PROP_OFF_NEXT_PROP: usize = 38; // u64
 
 /// The contiguous byte range of a property record that a **value-level write owns**: `created_ts`,
 /// `expired_ts`, `undo_ptr`, `key`, `type_tag`, `value_inline` (`rmp` #967).

@@ -147,7 +147,12 @@ chain at all.
 > is no longer the permanently-zero reserved word it was. The head is published with the same
 > chain-head write `first_rel` / `first_prop` use, which since task **#970** carries **no undo image
 > at all**: the inverse of a prepend is to unlink the entry, computed at abort time from the
-> transaction's own deltas, and never the restoration of the word (`04` §4.4 and §5.1.5 row 3). The
+> transaction's own deltas, and never the restoration of the word (`04` §4.4 and §5.1.5 row 3). Since
+> task **#1028** a **prepend** publishes that head with a **compare-and-publish**: the head is
+> installed only if it still holds the value the writer linked its entry to, and a refused publication
+> writes nothing and logs nothing (`04` §5.7.1, which also names the unlink paths still outside that
+> discipline). The word's on-disk meaning and position are untouched by the change — what changed is
+> how a prepend installs it. The
 > consistency checker range-checks `undo_ptr` against **`undo.store`**'s high-water and walks the
 > chain below it (`Violation::UndoChain`, `crates/graphus-storage/src/check.rs`). The frozen 25-byte
 > header above did **not** change: `undo_ptr` was always specified to mean this, and #966 made the
@@ -230,7 +235,12 @@ self-describes its `ElementId`; the never-reused 128-bit counter is persisted in
 catalog). All mutations are WAL-logged as intra-page `(u16 offset, bytes)` patches and are
 crash-recoverable via three-phase ARIES recovery (`04-technical-design.md` §4.8). Every mutation
 carries a redo patch; its undo patch is a physical pre-image, a compare-and-set, or — for a chain-head
-write, whose inverse is logical (§12.5) — **empty**.
+write, whose inverse is logical (§12.5) — **empty**. A **chain-head write's redo patch is itself a
+compare-and-set image** (task #1028): it carries the word's expected pre-value beside its post-value,
+and both the live write and its replay install the post-value only where the word still holds the
+expected one. The patch encoding did not change to accommodate this — the conditional shape already
+existed for compare-and-set undo images and is reused unchanged — so neither the WAL format, the patch
+codec, nor the recovery loop was altered (`04` §4.4 and §5.7.1).
 
 ---
 
@@ -490,6 +500,13 @@ itself (§12.5), and frees its slot with them.
   is an entity whose `undo_ptr` names a **corpse**: a `!in_use` delta that every chain walk threads
   through and that the GC reclaims. Logical rollback is the inverse of a *live* transaction; the WAL
   is the inverse of a crashed one.
+- **A publication that was refused left nothing in the log to replay** (task #1028). The word is
+  compared before the redo record is appended, and both happen under one hold of the chain-head
+  publication latch, so the order in which publications enter the log is the order in which they took
+  effect on the page. Recovery therefore reproduces exactly the sequence of heads the live system
+  installed. This is what makes the redo image's own condition safe to trust: a record that replays
+  onto a page which already carries its publication declines instead of clobbering, and there is never
+  a record for a publication that did not happen (`04` §5.7.1).
 - **Consistency checking.** The checker's existing `undo_ptr` range guard
   (`MvccHeaderFault::UndoPtrOutOfRange`, `crates/graphus-storage/src/check.rs:1224-1229`) was written
   for this moment and needs no change in kind: it must now range-check against `undo.store`'s

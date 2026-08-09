@@ -1,0 +1,32 @@
+[package]
+name = "graphus-chainhead"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "The prepend publication protocol shared by every Graphus chain head (first_rel, first_prop, undo_ptr)."
+
+[dependencies]
+
+# `loom` model-checks the prepend publication protocol (`rmp` #1028). Only the *models* name it — the
+# library itself declares no synchronisation at all (it is generic over the head cell) — so a
+# dev-dependency gated on `--cfg loom` is the whole of it, and loom never enters a production build.
+#
+# This crate has NO dependencies, and that is deliberate: it is a LEAF. `--cfg loom` is a global
+# RUSTFLAG, so building a model flips the loom seam of EVERY crate in the dependency graph at once. A
+# protocol living inside `graphus-storage` (which depends on `graphus-bufpool`, itself carrying a loom
+# seam) therefore could not be model-checked at all: storage's `std::sync::Arc` would stop matching
+# bufpool's `loom::sync::Arc`. Having no edge to bufpool is exactly what makes the model check
+# possible — the same reason `graphus-pagemap` (`rmp` #721) and `graphus-groupsync` (`rmp` #994) are
+# leaves:
+#
+#   RUSTFLAGS="--cfg loom" cargo test -p graphus-chainhead --test loom_chainhead --release
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7.2"
+
+# `loom` is a custom cfg supplied through RUSTFLAGS; register it so `unexpected_cfgs` does not warn on
+# the `#![cfg(loom)]` gate in `tests/loom_chainhead.rs`.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

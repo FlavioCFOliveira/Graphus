@@ -1122,6 +1122,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "graphus-chainhead"
+version = "0.0.10"
+dependencies = [
+ "loom",
+]
+
+[[package]]
 name = "graphus-cli"
 version = "0.0.10"
 dependencies = [
@@ -1485,6 +1492,7 @@ version = "0.0.10"
 dependencies = [
  "crc32c",
  "graphus-bufpool",
+ "graphus-chainhead",
  "graphus-core",
  "graphus-groupsync",
  "graphus-index",

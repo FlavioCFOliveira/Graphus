@@ -59,6 +59,9 @@ read-probe = []
 graphus-core = { path = "../graphus-core" }
 graphus-io = { path = "../graphus-io" }
 graphus-bufpool = { path = "../graphus-bufpool" }
+# The prepend publication protocol shared by every chain head (`rmp` #1028). A leaf crate, so it can
+# be model-checked under the global `--cfg loom` rustflag; see its `Cargo.toml`.
+graphus-chainhead = { path = "../graphus-chainhead" }
 # The live, append-only, lock-free device-page map every fixed-record store's location oracle is built
 # on (`rmp` #721). A LEAF crate (graphus-core only), which is what lets it be `loom` model-checked in
 # isolation — see its Cargo.toml. Acyclic: it never depends on storage.

@@ -103,6 +103,12 @@ const C_OFF_DELTA_COUNT: usize = 24; // u64
 /// — the same corpse discipline the relationship store uses (`rmp` #220).
 pub const UNDO_OFF_FLAGS: usize = D_OFF_FLAGS;
 
+/// Byte offset of a delta's `next` word — the chain link. Exposed so the publication protocol can
+/// re-point a still-unpublished delta at a freshly re-read chain head when a compare-and-publish is
+/// refused (`rmp` #1028): an entry whose `next` names a head that is no longer the head must never be
+/// published, or the chain forks and everything below the winner falls out of it.
+pub const UNDO_OFF_NEXT: usize = D_OFF_NEXT;
+
 /// Byte offset of a commit slot's `flags` byte within its record. Same corpse discipline as
 /// [`UNDO_OFF_FLAGS`]: an aborted transaction's slot keeps its `txn_id` and its in-flight
 /// `commit_ts`, so the slot itself records "this transaction did not commit".

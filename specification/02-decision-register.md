@@ -10,9 +10,9 @@ to the domain/component it constrains. On ratification, the chosen option is rec
 and its status set to `ratified`.
 
 > **Status: all 24 decisions of the original 2026-06-05 round are ratified.** The chosen option is
-> recorded on each `Decision` node (`status: ratified`, property `chosen`). Twenty-one further
+> recorded on each `Decision` node (`status: ratified`, property `chosen`). Twenty-two further
 > decisions were ratified after that round; they are recorded in the same index below, each carrying
-> its own ratification date. The register therefore holds **45 decisions** in total. The decision index in
+> its own ratification date. The register therefore holds **46 decisions** in total. The decision index in
 > the next section is the canonical enumeration; the options tables below it are kept for the
 > rationale and trade-offs, and are not a decision list.
 
@@ -83,6 +83,7 @@ Parse contract, to be preserved by any future edit:
 | `D-chain-head-redo-only` | ratified | 2026-08-05 | **A chain-head publication (`undo_ptr`, `first_rel`, `first_prop`) and the relink of the head it displaces are logged redo-only, with an empty undo image.** Their inverse is to *unlink the entry*, computed at abort time from the transaction's own deltas, and never the restoration of the word. Neither form of restoration could be made safe: a plain pre-image undo of a shared head clobbers a concurrently-committed prepend (the whole of `rmp` #220), and the compare-and-set undo that replaced it was narrower but still unsound, because it restores an **id**, and once a slot can be freed and handed out again the id it restores may name a different record. The state a redo-only write leaves after recovery is a head naming a `!in_use` record — a **corpse**, which every chain walk in the storage core already threads through and the GC splice reclaims — and that is the state `rmp` #220 / #172 already designed the header-only creation undo around. Two exceptions are deliberate: the GC's clearing of `undo_ptr` keeps a physical undo, because it is not a prepend; and the compare-and-set undo itself is **not** retired, surviving on the node's `labels` word and on the MVCC header word, where a whole-word write's inverse *is* the word. Closes the chain-head half of `04-technical-design.md` §5.1.5 row 3; design in `04-technical-design.md` §4.4, and format consequences in `05-storage-format.md` §7 and §12.5. |
 | `D-orphan-slot-parking` | ratified | 2026-08-05 | **A record slot that a logical rollback orphans is parked in memory until the next garbage-collection pass, not returned to the free list by the abort itself.** The abort knows the slot is unreachable — it is what unlinked it — so the restraint is deliberate, and its reason lies outside the storage engine: the latest-state TEXT, FULLTEXT and SPATIAL indexes are in memory, **not transactional**, and key their documents by **physical node id**. An aborted node's posting survives its rollback as a harmless false positive that the re-check filters out, but recycling the id immediately turns the next writer's *insert* into what the index reads as the **replacement of a still-committed document** — the one shape `rmp` #756 must fail closed on, at the cost of a poisoned freshness marker and of every text or spatial seek degrading to a full scan until a rebuild. Parking keeps the space guarantee (the slots do come back, so an abort-heavy workload does not grow the store) while moving the recycle to a maintenance boundary; the GC phase is guarded on the record still being retired, so a slot legitimately re-used by some other path is never double-freed. The parking becomes unnecessary once those indexes are version-aware. Design in `04-technical-design.md` §5.1.5. |
 | `D-statement-isolation` | ratified | 2026-08-05 | **A statement does not observe its own writes, and the rule is one comparison operator over the delta's `command_id`.** Every read carries a **view** — `New` (the default) or `Old` — beside its snapshot; the view decides nothing about other transactions and only whether the reader's own uncommitted deltas are undone (`New`: written by a later command; `Old`: written by a later command **or by the current one**). A delta written outside any statement carries `command_id = 0` and is undone by **no** view, because it belongs to the transaction's baseline rather than to a statement. The counter lives in the record store, which is its single source of truth, and it advances at exactly **two** points: when a cursor opens, and at a `WITH` that follows a write. Polarity is fixed per clause: `Old` for every scan, every index seek, every relationship expansion, a `MATCH`'s `Filter`, `UNWIND` and a read-only procedure `CALL`; `New` for `MERGE`'s match sub-plan, every update clause, projection, aggregation and ordering, and a writing procedure `CALL`. The planner's `Eager` barriers are **all retained**: they decouple row production while the view re-polarises visibility, and reforming them is separate work. Closes the `command_id` half of `04-technical-design.md` §5.1.4; design in `04-technical-design.md` §§5.1.4, 5.3 and `05-storage-format.md` §12.2. |
+| `D-chain-head-publication` | ratified | 2026-08-09 | **A chain head is published by a compare-and-publish held atomic by a short publication latch, and a refused publication logs nothing.** The unconditional byte write through which a **prepend** published `first_rel`, `first_prop` and `undo_ptr` is retired: a prepend now reads the head, writes its entry linked to that head, publishes the entry **only if** the head still holds what it read, and fixes the displaced predecessor's back-pointer only **after** it has won — so two writers can never relink the same predecessor. A refusal re-reads the head, re-links the entry and retries. The protocol lives in the dependency-free leaf crate `graphus-chainhead`, where `loom` can model-check it. Atomicity and, equally, **durable order** (log order must equal the order in which publications take effect on the page) are supplied by a sharded latch at **rank 27**, between the allocation latch (25) and the WAL (30), taken with the page already pinned, admitting one holder per thread, and never held across I/O — mechanically enforced in debug builds. The redo image is a compare-and-set patch, which needs **no** new WAL record type, format version or recovery step. The write stays **redo-only** (`D-chain-head-redo-only` is unchanged). The same latch covers two further writes, because the head word alone is not the whole prepend: the shared `chain_flags` byte of the displaced relationship, which a prepend clears with a commutative mask instead of a computed byte, and the GC corpse splice's repointing of a node head, converted so that no writer of that word stores into it unconditionally. Facet table in the "Ratified decision (2026-08-09) — chain-head publication" section below; design in `04-technical-design.md` §5.7.1. |
 
 <!-- END decision-index -->
 
@@ -612,6 +613,96 @@ scope and are propagated into `00-overview.md` and `01-needs-survey.md`:
 > ratified decision, not as decisions of their own. Should the owner prefer any of them to carry a
 > decision key and a ratification date in the canonical index, that is a ratification only the owner
 > can make.
+
+## Ratified decision (2026-08-09) — chain-head publication
+
+> **`D-chain-head-publication` settles how a chain head is made safe to publish when more than one
+> writer may prepend to it, in task #1028.** It refines the earlier rounds rather than replacing any
+> part of them: `D-version-representation`, `D-write-conflict-detection`, `D-multi-writer`,
+> `D-dst-writer-scheduler`, `D-incidence-anchor`, the four property-path decisions, the three
+> logical-rollback decisions and `D-statement-isolation` are unchanged. In particular
+> **`D-chain-head-redo-only` is untouched**: the publication still carries an empty undo image. Every
+> one of the four inviolable requirements of `CLAUDE.md` stands as written, and **no byte of any
+> on-disk format changes** — not the record layouts, not the WAL record set, not the patch codec, not
+> the format version.
+>
+> **Status: ratified.**
+>
+> **Why now.** `D-multi-writer` ratified N parallel writers, and the layers that deliver them are
+> under way. Designing the acceptance criterion for one of those layers surfaced the engine's
+> number-one correctness risk: the chain head was published with a plain byte write, so
+> read-the-head / write-the-head was not atomic. With one writer thread that is latent; with two it
+> silently loses a prepend — a committed relationship out of its node's incidence chain, a committed
+> property version out of its owner's chain, a committed delta out of the undo chain that decides
+> visibility. It is the `rmp` #220 defect class returning as a live hazard, and it had to be closed
+> **before** the writers arrive, not after.
+>
+> **The alternatives weighed.**
+>
+> | Option | Verdict |
+> | --- | --- |
+> | **A — a compare-and-set on the head word alone, with no latch.** This is what the parent task asked for, and the only place in the epic where atomics rather than a latch were to be used. | **Rejected.** It cannot be reconciled with the project's own latch order. A compare-and-set needs read-compare-write under one frame latch (rank 40), while the redo record must be appended under the WAL mutex (rank 30) — and the WAL barrier already refuses, by tripwire, to run with a frame latch held. Emitting the record first and then declining the write leaves an **orphan** redo record in the log. Independently: a prepend publishes more than the head word, so a compare-and-set on that one word protects one of several words that must move together. |
+> | **B — option A plus a conditional redo image, tolerating the orphan as inert.** The argument was that a compare-and-set refused at run time would be refused again at replay, so the orphan would apply nothing. | **Rejected — the premise is false as soon as a second writer exists.** Recovery replays in **LSN order**; the live system applies in **frame-latch order**; nothing couples the two. Concretely, on a head holding `H0`: writer A logs `CAS(H0→A)` at LSN 10 and releases the WAL mutex; writer B logs `CAS(H0→B)` at LSN 12, takes the frame latch, finds `H0`, succeeds, and commits durably; A then takes the frame latch, finds `B`, and declines. A crash before A retries leaves recovery to apply LSN 10 (the word is `H0`, so it **applies**) and then LSN 12 (the word is now `A`, so it no-ops). The recovered head is `A` — a loser's entry — and chain-head writes have no undo, so nothing removes it: B's committed relationship has silently left the chain. The conditional redo did not make the orphan inert, it made it **harmful**, by resurrecting a transition that never happened. A monotonic `page_lsn` does not repair this: if the page never reached disk, recovery starts from a lower `page_lsn` and replays in LSN order regardless. |
+> | **C — a short publication latch that makes "peek, log, apply" one indivisible step, keeping the conditional redo for its replay properties. ★ chosen** | **Ratified.** The latch supplies the ordering invariant the conditional redo needs but cannot create: log order equals the order in which publications take effect on the page. Under it a refused publication is decided **before** anything is logged, so no orphan is ever written; and because the latch's scope is the whole publication rather than the single word, it also covers the two writes beside the head word that a prepend performs. |
+>
+> **The three reference implementations, read at a pinned revision.** They agree, and none of them
+> uses a conditional redo record: each pays for the "log order equals apply order" invariant with a
+> latch held across the LSN assignment.
+>
+> | Reference | What was read, and what it shows |
+> | --- | --- |
+> | **InnoDB** (`/data/refsrc/mysql-server`, tag `mysql-8.0.36`) | The redo record set (`mlog_id_t`, `storage/innobase/include/mtr0types.h`) contains **no conditional record type at all**: every InnoDB redo record applies unconditionally, gated only by the page LSN. The list-prepend primitive is the direct analogue of a chain-head prepend, and it demands the strongest form of the invariant: `flst_add_first` (`storage/innobase/fut/fut0lst.cc:132`) asserts that **both** the base page and the node page are X- or SX-fixed **in the same mini-transaction** (`mtr_memo_contains_page_flagged`, `:141-144`). |
+> | **PostgreSQL** (`/data/refsrc/postgres`) | Modifies the page **first** and only then assigns the LSN, with both steps inside one critical section under the buffer's exclusive content lock: `heap_insert` runs `START_CRIT_SECTION()` (`src/backend/access/heap/heapam.c:2066`), `RelationPutHeapTuple` (`:2068`, which `src/backend/access/heap/hio.c:32` documents as requiring `BUFFER_LOCK_EXCLUSIVE`), then `XLogInsert` (`:2178`) and `PageSetLSN` (`:2180`) before `END_CRIT_SECTION()` (`:2186`). The consequence that matters for Graphus: **"WAL-ahead" is not "log the record before touching the page"; it is "the record is durable before the page goes home"** — which Graphus already enforces, fail-closed. Logging strictly before the page touch is therefore a local convention of one Graphus write helper, not a durability requirement, and the latch may legitimately span both. |
+> | **Memgraph** (`/data/refsrc/memgraph`, commit `087bbf2`) | Gives **every vertex its own `utils::RWSpinLock`** (`src/storage/v2/vertex.hpp:47`), and `CreateEdge` takes both endpoint locks ordered by `gid` to avoid lock cycles (`src/storage/v2/inmemory/storage.cpp:130-141`, comment: "Obtain the locks by `gid` order"). Crucially it calls `PrepareForNonSequentialWrite` (`src/storage/v2/mvcc.hpp:150`) and **not** `PrepareForWrite`, deliberately, so that two open transactions may both add an edge to the same vertex without a serialization error. That is the precedent Graphus adopts: this is a **publication** latch, not write-conflict serialization. |
+>
+> **This latch is not the contention the sprint set out to remove.** What `D-write-conflict-detection`
+> retired, and task #971 deleted, is the global lock table and the wait-for-graph deadlock detector.
+> A publication latch is a physical latch in the sense of §5.7 — short, held for a memory operation
+> rather than a transaction, never waited on by a transaction. Memgraph, the closest reference by
+> architecture, reached the same conclusion independently: it chose the non-sequential write path
+> precisely so that concurrent edge creation on one vertex is **not** a serialization conflict, while
+> still guarding each vertex with its own spin lock.
+>
+> **The consequences that are normative.**
+>
+> - **Step 4 of a prepend — fixing the displaced predecessor's back-pointer — happens only after a
+>   winning publication.** A writer that has read the head but not yet published owns nothing;
+>   relinking first and then losing the race overwrites a pointer the winner legitimately owns. The
+>   publication primitive therefore returns the head it displaced, and that value alone drives step 4.
+> - **A refused publication appends no WAL record**, so the log never describes a write that did not
+>   happen. This is stronger than what option B proposed, and that difference is the whole reason
+>   option B was rejected.
+> - **Rank 27 admits one holder per thread and is never held across I/O.** A relationship therefore
+>   publishes its two endpoint heads strictly one after the other. Both obligations are checked
+>   mechanically in debug builds rather than left to review.
+> - **A compare-and-set is only as sound as its weakest writer**, because a single unconditional store
+>   makes every other writer's comparison meaningless. Every **prepend** now passes through the one
+>   primitive, and the garbage collector's corpse splice was converted to it for exactly this reason.
+>   The exact scope is stated in `04-technical-design.md` §5.7.1: the *unlink*
+>   paths, which remove an entry from a chain, still install a head with an unconditional whole-record
+>   write. On the GC paths that is safe because a GC pass holds the store exclusively; on the logical
+>   rollback of an incidence delta it is **outstanding work** that task #1028 did not deliver.
+> - **An operation writes only the fields it changes.** Rewriting a whole record from a snapshot taken
+>   before the write reverts whatever a concurrent writer changed in between — the #772 clobber class,
+>   arriving without any new mechanism.
+> - **The protocol lives in a dependency-free leaf crate so that `loom` can check it.** `--cfg loom` is
+>   a global rustflag, so a protocol inside a crate that reaches `graphus-bufpool` cannot be modelled
+>   at all. This is a placement constraint on model-checkable protocols, and it now has three
+>   instances (`graphus-pagemap`, `graphus-groupsync`, `graphus-chainhead`).
+>
+> **How it is proved.** A `loom` model runs the production protocol over a modelled cell and requires
+> that no prepended entry is ever lost, that a pre-existing tail is never orphaned, and that a refusal
+> leaves neither a fork nor a cycle — paired with a model over a plain load-then-store cell that is
+> **required to lose an entry**, so the pair also proves the atomicity is load-bearing. A DST scenario
+> crashes and recovers across a scripted contended publication and requires that every committed
+> prepend replays and that the refused one left no trace.
+>
+> **Where this is specified.** The protocol, the latch, the two ordering obligations, the writes
+> beside the head word and the proof obligations are `04-technical-design.md` §5.7.1; the latch ranks
+> are §3.3; the conditional redo image is §4.4; the delta-linking step that consumes the protocol is
+> §5.1.2 step 3; the leaf-crate rule is §11.4. Format-side consequences — none of them a byte change —
+> are `05-storage-format.md` §7, §9 and §12.5. The DST scenario and the `dst`-gated publication seam
+> are `07-dst-simulator.md` §6.2 and §10.
 
 ## TCK target (pinned — closes `D-cypher-line` open question 1)
 

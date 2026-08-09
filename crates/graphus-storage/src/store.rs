@@ -56,9 +56,9 @@ use crate::read_view::{self, MetaSnapshot, StoreMetaSnapshot, StorePages, StoreR
 use crate::record::{
     CHAIN_FLAG_END_FIRST, CHAIN_FLAG_START_FIRST, ChainSide, MVCC_HEADER_SIZE, MVCC_OFF_CREATED_TS,
     MVCC_OFF_EXPIRED_TS, MVCC_OFF_UNDO_PTR, MvccHeader, NODE_OFF_FIRST_PROP, NODE_OFF_FIRST_REL,
-    NODE_OFF_LABELS, NODE_RECORD_SIZE, NodeRecord, PROP_CELL_REGION, PROP_RECORD_SIZE, PropRecord,
-    REL_OFF_CHAIN_FLAGS, REL_OFF_END_PREV, REL_OFF_FIRST_PROP, REL_OFF_START_PREV, REL_RECORD_SIZE,
-    RelRecord,
+    NODE_OFF_LABELS, NODE_RECORD_SIZE, NodeRecord, PROP_CELL_REGION, PROP_OFF_NEXT_PROP,
+    PROP_RECORD_SIZE, PropRecord, REL_OFF_CHAIN_FLAGS, REL_OFF_END_NEXT, REL_OFF_END_PREV,
+    REL_OFF_FIRST_PROP, REL_OFF_START_NEXT, REL_OFF_START_PREV, REL_RECORD_SIZE, RelRecord,
 };
 use crate::scan_polarity::{DecidedProperties, SupersetProperties};
 use crate::tokens::{Namespace, TokenSnapshot, TokenStore};
@@ -1375,6 +1375,25 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// (`gc_full_scan_pending`), which is what makes a crash-recovered store's chains reclaimable
     /// without any of this in-memory state surviving.
     pending_undo_chains: std::collections::BTreeSet<(u8, u64)>,
+    /// **`rmp` #1028.** The sharded **chain-head publication latch** (rank 27, see
+    /// [`graphus_core::latch::ChainHeadLatchScope`]), keyed by the record that owns the head.
+    ///
+    /// One entry of this array is held for the whole of
+    /// [`compare_and_publish_chain_head`](Self::compare_and_publish_chain_head): peek at the head,
+    /// append the redo record, apply it. Those three steps have to be indivisible, and not for the
+    /// reason that first comes to mind. Making the read-compare-write atomic *in memory* is only half
+    /// of it; the half that bites is **durable order**. The redo record is appended under the WAL
+    /// mutex (rank 30) and applied under the frame latch (rank 40), and nothing else ties those two
+    /// instants together — so two publishers can enter the log in one order and take effect on the
+    /// page in the other. ARIES replays in log order, so recovery would then reach a *different*
+    /// verdict from the live system, and after a crash the replayed verdict is the one that survives:
+    /// a committed relationship dropped out of its node's incidence chain, which is `rmp` #220
+    /// arriving by a route the compare-and-set alone does not close.
+    ///
+    /// Sharded rather than global so publishers on unrelated records never wait for one another; the
+    /// shard count is a contention parameter only — correctness needs just that the *same* head
+    /// always maps to the *same* shard.
+    chain_head_locks: Box<[Mutex<()>]>,
     /// **`rmp` #966.** Set when a rollback left one of its deltas threaded on an entity's chain as a
     /// corpse (only possible when another transaction prepended onto the *same* entity in between),
     /// which also strands that transaction's commit slot. The next full GC pass resolves it with a
@@ -1502,6 +1521,117 @@ const MAX_SPARE_UNDO_SLABS: usize = 16;
 /// store pages — a handful of page fetches per kind.
 const FREEZE_AUDIT_WINDOW_IDS: u64 = 8192;
 
+/// Shards of the chain-head publication latch (`rmp` #1028).
+///
+/// Purely a contention parameter: correctness needs only that one head word always maps to one
+/// shard. Sized so that the publishers of unrelated records essentially never collide, while the
+/// array itself stays a few hundred bytes — a store holds one.
+const CHAIN_HEAD_LOCK_SHARDS: usize = 64;
+
+/// Builds the store's chain-head publication latch array.
+fn new_chain_head_locks() -> Box<[Mutex<()>]> {
+    (0..CHAIN_HEAD_LOCK_SHARDS)
+        .map(|_| Mutex::new(()))
+        .collect()
+}
+
+/// One chain-head prepend, as [`RecordStore::prepend_chain_head`] needs to describe it (`rmp` #1028).
+///
+/// Names the two records involved: the **owner**, whose `head_off` word is the chain head being
+/// published to, and the **entry**, whose `next_off` word names its successor and must be re-pointed
+/// whenever a publication is refused.
+#[derive(Debug, Clone, Copy)]
+struct ChainPrepend {
+    owner_kind: StoreKind,
+    owner_id: u64,
+    head_off: usize,
+    entry_kind: StoreKind,
+    entry_id: u64,
+    next_off: usize,
+    /// Re-run the undo chain's "this head is not held by another open transaction" rule
+    /// ([`RecordStore::ensure_chain_head_unheld`]) against every freshly re-read head.
+    ///
+    /// Only the undo chain has such a rule, and re-running it is not optional: the guard is what
+    /// makes the read path's early stop (`DeltaVerdict::Stop`) true, and a retry that re-linked onto
+    /// a head it had never checked would wave a second open transaction's delta through — evaluating
+    /// the guard once, against a head that is no longer the head, is exactly the stale check.
+    guard_unheld: bool,
+    /// The `rmp` #973 yield point that opens the head-read half of the publication window.
+    yield_reread: Option<YieldSite>,
+    /// The `rmp` #973 yield point that opens the publication half.
+    yield_publish: Option<YieldSite>,
+}
+
+/// The [`graphus_chainhead::ChainHead`] view of a chain head that lives in a word on a WAL-logged
+/// page (`rmp` #1028) — the storage core's one and only implementation.
+///
+/// The protocol itself is in [`graphus_chainhead`], deliberately: it is the part that has to be
+/// model-checked, and `--cfg loom` is a global rustflag, so it cannot live in a crate that depends on
+/// `graphus-bufpool`. What stays here is the medium — pages, the WAL, the publication latch.
+struct PageChainHead<'a, D: BlockDevice, S: LogSink> {
+    store: &'a mut RecordStore<D, S>,
+    plan: ChainPrepend,
+    txn: TxnId,
+}
+
+impl<D: BlockDevice, S: LogSink> PageChainHead<'_, D, S> {
+    /// The scheduler resource the two yield points key on: the record that owns the head.
+    fn resource(&self) -> ResourceId {
+        ResourceId::slot(self.plan.owner_kind as u8, self.plan.owner_id)
+    }
+}
+
+impl<D: BlockDevice, S: LogSink> graphus_chainhead::ChainHead for PageChainHead<'_, D, S> {
+    type Error = GraphusError;
+
+    fn compare_and_publish(&mut self, expect: u64, entry: u64) -> Result<bool> {
+        if let Some(site) = self.plan.yield_publish {
+            sched::yield_at(site, self.resource());
+        }
+        self.store.compare_and_publish_chain_head(
+            self.plan.owner_kind,
+            self.plan.owner_id,
+            self.plan.head_off,
+            expect,
+            entry,
+            self.txn,
+        )
+    }
+
+    fn reread(&mut self) -> Result<u64> {
+        if let Some(site) = self.plan.yield_reread {
+            sched::yield_at(site, self.resource());
+        }
+        let head = self.store.read_chain_head(
+            self.plan.owner_kind,
+            self.plan.owner_id,
+            self.plan.head_off,
+        )?;
+        if self.plan.guard_unheld {
+            self.store.ensure_chain_head_unheld(
+                self.plan.owner_kind,
+                self.plan.owner_id,
+                head,
+                self.txn,
+            )?;
+        }
+        Ok(head)
+    }
+
+    fn relink(&mut self, head: u64) -> Result<()> {
+        // Redo-only, exactly like the entry's original write: the entry is still unpublished and
+        // therefore private, and what undoes a prepend is unlinking the entry, never restoring a word
+        // (`rmp` #970).
+        self.store.write_field_redo_only(
+            self.plan.entry_kind,
+            self.plan.entry_id,
+            self.plan.next_off,
+            &head.to_le_bytes(),
+            self.txn,
+        )
+    }
+}
+
 impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Creates a brand-new record store on an empty `device`, with `wal` an already-created WAL,
     /// `pool_capacity` buffer frames, and `element_id_seed` the first `ElementId` to allocate
@@ -1570,6 +1700,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // chain sweep's pending set is reseeded by the first pass's full scan
             // (`gc_full_scan_pending`), so a crash-recovered store reclaims its chains normally.
             pending_undo_chains: std::collections::BTreeSet::new(),
+            chain_head_locks: new_chain_head_locks(),
             undo_orphan_slots_possible: false,
             // `rmp` #992: nothing is reported until a derived-index layer declares what it covers.
             index_interest: IndexInterest::default(),
@@ -1720,6 +1851,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // chain sweep's pending set is reseeded by the first pass's full scan
             // (`gc_full_scan_pending`), so a crash-recovered store reclaims its chains normally.
             pending_undo_chains: std::collections::BTreeSet::new(),
+            chain_head_locks: new_chain_head_locks(),
             undo_orphan_slots_possible: false,
             // `rmp` #992: nothing is reported until a derived-index layer declares what it covers.
             index_interest: IndexInterest::default(),
@@ -2387,6 +2519,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // the log — holding a rank-25 latch across that takes rank 30..60 out of order and convoys
         // every allocator in the database behind one `fdatasync`. Debug-only; compiled out in release.
         graphus_core::latch::assert_no_alloc_latch_held("RecordStore::ensure_store_page");
+        // Ditto for the rank-27 chain-head publication latch (`rmp` #1028). Debug-only.
+        graphus_core::latch::assert_no_chain_head_latch_held("RecordStore::ensure_store_page");
         let rel_page = rel_page as usize;
         while self.store(kind).device_pages.len() <= rel_page {
             let (f, dev_page) = self.pool.new_page()?;
@@ -3649,7 +3783,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
 
     /// Stamps the 8-byte MVCC header word at `field_off` of record `id` in `kind`'s store to
     /// `new_word` (redo = a plain post-image patch, so recovery redo repeats history byte-for-byte),
-    /// but logs a **compare-and-set logical undo** (`rmp` #301, mirroring [`write_chain_head`] and the
+    /// but logs a **compare-and-set logical undo** (`rmp` #301, mirroring [`compare_and_publish_chain_head`](Self::compare_and_publish_chain_head) and the
     /// `rmp` #239 chain-pointer fix): the undo restores the pre-image `old_word` **only if the word is
     /// still `new_word`** — i.e. only if this transaction's write is still the one on the page. If a
     /// concurrently-interleaved transaction has since re-stamped the same header word, the undo
@@ -3678,7 +3812,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         let f = self.pool.fetch(dev)?;
         // Capture the pre-image (`old_word`) under a read latch before the overwrite — the frame stays
         // pinned across the two sequential latches (`rmp` #337, Slice 1), exactly as `write_region` /
-        // `write_chain_head` do.
+        // `compare_and_publish_chain_head` do.
         let old_word = self.pool.with_page(f, |p| {
             u64::from_le_bytes(p[abs..abs + 8].try_into().expect("8-byte slice"))
         });
@@ -3754,17 +3888,243 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         Ok(())
     }
 
-    /// Publishes `new_head` into the 8-byte chain-head field at `field_off` of record `id`
-    /// (`rmp` #970): a redo-only write, undone by unlinking rather than by restoration.
-    fn write_chain_head(
+    /// The shard of the chain-head publication latch that guards the head words of record `id` in
+    /// `kind`'s store (`rmp` #1028).
+    ///
+    /// A record's two head words (a relationship's `first_prop` and its `undo_ptr`, say) share a
+    /// shard. That is deliberate and costs nothing: they are never published concurrently by one
+    /// writer, and correctness needs only that the *same* word always maps to the *same* shard.
+    fn chain_head_shard(&self, kind: StoreKind, id: u64) -> &Mutex<()> {
+        // Fibonacci hashing: multiply by 2^64/φ (odd, so the map is a bijection) and take the HIGH
+        // bits, which mixes the low-entropy input — physical ids are dense and consecutive, and the
+        // store kind lives in the top byte — instead of aliasing every 64th id onto one shard.
+        let key = ((kind as u64) << 56) | id;
+        let mixed = key.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let idx = (mixed >> 32) as usize % self.chain_head_locks.len();
+        &self.chain_head_locks[idx]
+    }
+
+    /// Publishes `new_head` into the 8-byte chain-head field at `field_off` of record `id` **if and
+    /// only if** that field still holds `expect`; reports whether it did (`rmp` #1028).
+    ///
+    /// This is the only way a chain head is **prepended onto**. It replaced an unconditional byte
+    /// write, which could not be made safe: a prepend is "read the head, write the entry naming it,
+    /// publish the entry", and with an unconditional publish two writers that read the same head both
+    /// publish, the second overwrites the first, and the first's entry — a committed relationship,
+    /// property version or undo delta — silently leaves the chain. That is the `rmp` #220 defect class
+    /// as a live hazard rather than a durability one.
+    ///
+    /// # What this does NOT yet cover, stated exactly
+    ///
+    /// A compare-and-publish is sound only while **every** writer of the word goes through it, so the
+    /// enumeration of those writers is load-bearing and is recorded here rather than assumed. Two
+    /// **unlink** paths still install a chain head by rewriting the owner record whole, and neither is
+    /// a prepend, so neither can use this primitive as it stands (`rmp` #1030):
+    ///
+    /// * [`unlink_side_with`](Self::unlink_side_with) writes the node's `first_rel` through
+    ///   `write_node`. Reached from `reclaim_rel` — a GC pass, which holds the store exclusively — but
+    ///   ALSO from [`undo_own_incidence`](Self::undo_own_incidence), which is logical rollback and
+    ///   therefore an ordinary transactional path. The GC argument does not cover it.
+    /// * [`set_owner_first_prop`](Self::set_owner_first_prop) writes the owner's `first_prop` whole,
+    ///   and is reached only from `gc_property_chain`.
+    ///
+    /// Under one writer both are harmless. Under the concurrent writers of `rmp` #1016 a whole-record
+    /// write carries `first_prop`, `labels` and the MVCC header along from a stale read, reverting a
+    /// concurrent writer's fields — the `rmp` #772 clobber class. `rmp` #1030 closes them and blocks
+    /// #1016; until it lands, this primitive's guarantee is scoped to the prepend paths.
+    ///
+    /// # The three steps, and why they are one
+    ///
+    /// Under the shard's rank-27 latch ([`chain_head_shard`](Self::chain_head_shard)) this peeks at
+    /// the head, appends the redo record, and applies it. Splitting them breaks the primitive in a way
+    /// no amount of care at the call sites repairs:
+    ///
+    /// * **Peek before logging** is what keeps a refused publication out of the log entirely. Logging
+    ///   first and comparing afterwards leaves an *orphan* redo record behind — a record whose write
+    ///   never happened — and an orphan is only harmless while the log order matches the order the
+    ///   page actually changed.
+    /// * **Which it need not.** The record is appended under the WAL mutex (rank 30) and applied under
+    ///   the frame latch (rank 40); with nothing holding those two together, a writer can append
+    ///   *first* and apply *second*. Recovery replays in log order, so the orphan of the writer that
+    ///   lost the race would be replayed **before** the winner's record, take effect (the head still
+    ///   holds `expect` at that point in the replay), and turn the winner's record into the no-op —
+    ///   installing, after the crash, a head the live system never had, with the winner's committed
+    ///   entry hanging off nothing. The latch is what makes log order and page order the same order.
+    ///
+    /// # Why the redo is a compare-and-set image and not a plain post-image
+    ///
+    /// [`paging::encode_cas_patch`] is applied conditionally by the *same*
+    /// [`paging::apply_patch`] that serves live rollback and crash recovery, so a conditional redo
+    /// costs no new WAL record type, no format version and no change to the recovery loop. It buys
+    /// two things: the record replays to the same verdict the live system reached even when the page
+    /// image it replays onto already has the publication (a `page_lsn` regressed by an unrelated
+    /// writer on the same page makes recovery replay further back than needed), and it states the
+    /// precondition of the write *in the record*, so a replay that would not have been valid declines
+    /// instead of clobbering.
+    ///
+    /// # No undo, still (`rmp` #970)
+    ///
+    /// Redo-only, exactly as the unconditional write it replaces — see the section note above. The
+    /// reasoning is untouched by this change and the conclusion is if anything firmer: a prepend's
+    /// inverse is *unlinking the entry*, computed at abort time, never restoring the word. #970 proved
+    /// that restoring the word is unsound even when the restoration is itself a compare-and-set,
+    /// because it restores an **id**, and an id only means something while it names the same record —
+    /// once a slot can be freed and handed out again, recovery can restore a head naming a record that
+    /// now belongs to somebody else (`graphus-dst` VOPR seed 12). Note that the compare-and-set here
+    /// is the opposite direction: it is the *forward* publication, whose `expect` is a head this
+    /// writer read moments ago and whose `new` is a slot this writer owns.
+    ///
+    /// # Errors
+    /// Returns a storage error if the record's page cannot be mapped or fetched.
+    fn compare_and_publish_chain_head(
         &mut self,
         kind: StoreKind,
         id: u64,
         field_off: usize,
+        expect: u64,
         new_head: u64,
         txn: TxnId,
-    ) -> Result<()> {
-        self.write_field_redo_only(kind, id, field_off, &new_head.to_le_bytes(), txn)
+    ) -> Result<bool> {
+        let (rel_page, off) = paging::record_location(id, kind.record_size());
+        let dev = self.ensure_store_page(kind, rel_page, txn)?;
+        let abs = off + field_off;
+        // Map and PIN the page before taking the latch. `ensure_store_page` grows the device and
+        // `fetch` may miss, evict, write a victim home and harden the log — none of which may happen
+        // under a rank-27 hold, and both paths assert it (`assert_no_chain_head_latch_held`).
+        let f = self.pool.fetch(dev)?;
+        let published = {
+            let _guard = self
+                .chain_head_shard(kind, id)
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Armed after the lock and disarmed before the unlock, so the tripwire's window is
+            // exactly the region the latch is held (declared second, dropped first).
+            let _scope = graphus_core::latch::ChainHeadLatchScope::new();
+            let current = self.pool.with_page(f, |p| {
+                u64::from_le_bytes(p[abs..abs + 8].try_into().expect("8-byte slice"))
+            });
+            if current == expect {
+                let redo = paging::encode_cas_patch(abs, expect, new_head);
+                let lsn = self.wal.with(|w| w.log_update_redo_only(txn, dev, &redo));
+                let wrote = self
+                    .pool
+                    .with_page_mut_lsn_if(f, lsn, |p| {
+                        // The conditional is the redo image's own semantics, applied here so the live
+                        // page and a replay of this record take the identical decision. Under the
+                        // latch it can only take the `true` arm — the assertion below is what keeps
+                        // that a checked claim rather than a comment, so a shard-mapping bug shows up
+                        // as a failure instead of being silently absorbed by the compare.
+                        let now =
+                            u64::from_le_bytes(p[abs..abs + 8].try_into().expect("8-byte slice"));
+                        (now == expect)
+                            .then(|| p[abs..abs + 8].copy_from_slice(&new_head.to_le_bytes()))
+                    })
+                    .is_some();
+                debug_assert!(
+                    wrote,
+                    "chain head of {kind:?} {id} changed under the rank-27 publication latch: the \
+                     shard mapping does not cover this word (`rmp` #1028)"
+                );
+                wrote
+            } else {
+                // Refused, and NOTHING was logged: the log carries no record of an attempt that never
+                // touched the page, so recovery has nothing to reason about. The caller re-links its
+                // entry and tries again (`graphus_chainhead::prepend`).
+                false
+            }
+        };
+        self.pool.unpin(f);
+        Ok(published)
+    }
+
+    /// **DST seam** (`rmp` #1028, `04 §11`): publishes `entry` as node `node`'s `first_rel` if that
+    /// word still holds `expect`, reporting whether it did.
+    ///
+    /// A deterministic scenario cannot run two writers on one chain — Graphus has one writer thread
+    /// per database until `rmp` #1016 — so the interleaving that matters is reproduced instead: the
+    /// scenario reads the head, lets another transaction publish onto it, and then replays the first
+    /// writer's *stale* publication through this seam. That is the same window a race would open,
+    /// opened deliberately, which is exactly what the DST simulator is for.
+    ///
+    /// OFF by default: the production build never compiles it, so a chain head still has exactly one
+    /// writer outside the prepend protocol, which is none.
+    ///
+    /// # Errors
+    /// Returns a storage error if the node's page cannot be mapped or fetched.
+    #[cfg(feature = "dst")]
+    pub fn dst_publish_node_first_rel(
+        &mut self,
+        node: u64,
+        expect: u64,
+        entry: u64,
+        txn: TxnId,
+    ) -> Result<bool> {
+        self.compare_and_publish_chain_head(
+            StoreKind::Node,
+            node,
+            NODE_OFF_FIRST_REL,
+            expect,
+            entry,
+            txn,
+        )
+    }
+
+    /// Reads the 8-byte chain-head field at `field_off` of record `id` in `kind`'s store.
+    ///
+    /// Deliberately a raw word read rather than a record decode: it is called on the retry path of a
+    /// publication, where the only thing wanted is the head that beat us, and decoding a whole record
+    /// to reach one field would fetch and validate everything else for nothing.
+    ///
+    /// # Errors
+    /// Returns a storage error if the record's page is not mapped or cannot be fetched.
+    fn read_chain_head(&self, kind: StoreKind, id: u64, field_off: usize) -> Result<u64> {
+        let (rel_page, off) = paging::record_location(id, kind.record_size());
+        let dev = self.device_page(kind, rel_page)?;
+        let abs = off + field_off;
+        self.pool.with_page_fetched(dev, |p| {
+            u64::from_le_bytes(p[abs..abs + 8].try_into().expect("8-byte slice"))
+        })
+    }
+
+    /// Prepends `plan.entry_*` onto the chain whose head is `plan.owner_*`, retrying until the
+    /// publication wins, and returns **the head it displaced** (`rmp` #1028).
+    ///
+    /// `observed` is the head the caller read when it wrote the entry — that is, the value the
+    /// entry's `next` field currently holds. The entry must already be written in full: the
+    /// publication order (`04 §5.1.2` step 3) is normative, and reversing it would let a reader or the
+    /// GC observe a head naming a record that is not yet a valid entry.
+    ///
+    /// The returned head is the only value a caller may use to fix a back-pointer, and it is not
+    /// necessarily `observed` — see [`graphus_chainhead`] for why the fix must come *after* the
+    /// winning publication and never before it.
+    ///
+    /// # Errors
+    /// Returns a storage error if a page cannot be read or written, a re-read head is held by another
+    /// open transaction (only for `guard_unheld` chains — a write-write conflict, reported as
+    /// [`GraphusError::Transaction`]), or the publication is refused
+    /// [`graphus_chainhead::MAX_ATTEMPTS`] times.
+    fn prepend_chain_head(
+        &mut self,
+        plan: ChainPrepend,
+        observed: u64,
+        entry: u64,
+        txn: TxnId,
+    ) -> Result<u64> {
+        let mut cell = PageChainHead {
+            store: self,
+            plan,
+            txn,
+        };
+        graphus_chainhead::prepend(&mut cell, observed, entry).map_err(|e| match e {
+            graphus_chainhead::PrependError::Cell(e) => e,
+            graphus_chainhead::PrependError::Exhausted { attempts } => {
+                GraphusError::Storage(format!(
+                    "chain head of {:?} {} refused {attempts} publications of {:?} {entry}; the \
+                     head is being written outside the prepend protocol (`rmp` #1028)",
+                    plan.owner_kind, plan.owner_id, plan.entry_kind
+                ))
+            }
+        })
     }
 
     // ------------------- the undo area (`rmp` #966, `05 §12`, `04 §5.1`) -------------------
@@ -4004,7 +4364,27 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // naming the current head — and only then is the head republished. Reversed, a reader or the
         // GC could observe an `undo_ptr` pointing at a slot that is not yet a valid delta.
         self.write_undo_area_create(StoreKind::Undo, id, &buf, undo::UNDO_OFF_FLAGS, txn)?;
-        self.write_chain_head(kind, entity, MVCC_OFF_UNDO_PTR, id, txn)?;
+        // The publication, with the retry that a refusal demands (`rmp` #1028). A refusal re-reads the
+        // head, re-runs the guard above against THAT head — a guard evaluated once, against a head
+        // that has since been displaced, is a stale check — and re-points this delta's `next` before
+        // trying again. The two `rmp` #973 yield points move inside the retry with it, so each
+        // iteration still has its read half and its publication half.
+        self.prepend_chain_head(
+            ChainPrepend {
+                owner_kind: kind,
+                owner_id: entity,
+                head_off: MVCC_OFF_UNDO_PTR,
+                entry_kind: StoreKind::Undo,
+                entry_id: id,
+                next_off: undo::UNDO_OFF_NEXT,
+                guard_unheld: true,
+                yield_reread: Some(YieldSite::WriteLinkDelta),
+                yield_publish: Some(YieldSite::UndoChainHeadPublish),
+            },
+            head,
+            id,
+            txn,
+        )?;
         self.active.with_entry(txn, |a| {
             a.undo_links.push(UndoLink {
                 kind,
@@ -5312,7 +5692,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// **whole-record** pre-image undo (`write_region`). The node record's OTHER words are
     /// concurrently shared: a different transaction's [`add_node_property`](Self::add_node_property) /
     /// [`create_rel`](Self::create_rel) pushes onto `first_prop` / `first_rel` via
-    /// [`write_chain_head`](Self::write_chain_head), and its delete/tombstone re-stamps the MVCC
+    /// [`compare_and_publish_chain_head`](Self::compare_and_publish_chain_head), and its delete/tombstone re-stamps the MVCC
     /// header via [`patch_header_word_cas`](Self::patch_header_word_cas). Under statement-granularity
     /// interleaving that writer can COMMIT between the label change and its abort, so the aborting
     /// label change's whole-record pre-image no longer describes those words. Replaying it on abort
@@ -5374,7 +5754,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///
     /// Sound because `id` is the creating txn's freshly-allocated, slot-private record: no concurrent
     /// txn ever mutates a not-yet-committed creator's own new slot, so the header pre-image is never
-    /// stale (unlike the chain-head field, which IS concurrently shared — hence `write_chain_head`).
+    /// stale (unlike the chain-head field, which IS concurrently shared — hence
+    /// `compare_and_publish_chain_head`).
     fn write_record_header_undo(
         &mut self,
         kind: StoreKind,
@@ -8317,16 +8698,38 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             rel.set_chain_pointers(ChainSide::Start, id, old_head); // prev = end-side of self
             rel.set_chain_pointers(ChainSide::End, NULL_ID, id); // end-side is the new head
             rel.chain_flags |= CHAIN_FLAG_END_FIRST;
-            if old_head != NULL_ID {
-                self.relink_old_head(old_head, start, id, txn)?;
-            }
             // The new rel record is written with the header-only creation undo (`rmp` #220): a loser's
             // abort reverts only its slot's in-use bit and PRESERVES its body, so a committed prepend
-            // on top threads through it. The chain head is pushed via the compare-and-set logical undo
-            // — NOT carried in a plain `write_node` body — so the abort never clobbers a later
-            // committed head (it CAS-no-ops once a committed writer pushed on top).
+            // on top threads through it. The chain head is pushed redo-only (`rmp` #970), so the abort
+            // never clobbers a later committed head — what undoes a prepend is unlinking the entry.
             self.write_rel_create(id, &rel, txn)?;
-            self.write_chain_head(StoreKind::Node, start, NODE_OFF_FIRST_REL, id, txn)?;
+            // The self-loop threads into the ONE chain twice, so the word that names `old_head` is the
+            // start side's `next` — the end side's names this record's own start side (see
+            // `set_chain_pointers` above and `CHAIN_FLAG_END_FIRST`). That is the field a refused
+            // publication has to re-point.
+            let displaced = self.prepend_chain_head(
+                ChainPrepend {
+                    owner_kind: StoreKind::Node,
+                    owner_id: start,
+                    head_off: NODE_OFF_FIRST_REL,
+                    entry_kind: StoreKind::Rel,
+                    entry_id: id,
+                    next_off: REL_OFF_START_NEXT,
+                    guard_unheld: false,
+                    yield_reread: None,
+                    yield_publish: None,
+                },
+                old_head,
+                id,
+                txn,
+            )?;
+            // AFTER the winning publication, never before (`rmp` #1028, and see `graphus_chainhead`):
+            // only the publisher whose compare-and-publish succeeded with `expect == displaced`
+            // displaced it, so only that publisher owns its back-pointer. Relinking first would have
+            // this writer overwrite a predecessor it may then fail to displace at all.
+            if displaced != NULL_ID {
+                self.relink_old_head(displaced, start, id, txn)?;
+            }
             self.link_incidence_deltas(id, type_id, start, end, txn)?;
             // Maintain the per-relationship-type live count (`rmp` task #79) and the grand-total
             // live-relationship count (`rmp` task #82): the self-loop is now a live version. Both
@@ -8348,29 +8751,67 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             return Ok((id, eid));
         }
 
-        // Push at the head of the START node's chain.
+        // Link BOTH sides of the new record to the heads observed above, then write it whole. Only
+        // after that is either head published — the order of `04 §5.1.2` step 3, so a reader or the GC
+        // never observes a head naming a record that is not yet a valid entry.
         let start_head = start_node.first_rel;
         rel.set_chain_pointers(ChainSide::Start, NULL_ID, start_head);
         rel.chain_flags |= CHAIN_FLAG_START_FIRST;
-        if start_head != NULL_ID {
-            self.relink_old_head(start_head, start, id, txn)?;
-        }
 
-        // Push at the head of the END node's chain.
         let end_head = end_node.first_rel;
         rel.set_chain_pointers(ChainSide::End, NULL_ID, end_head);
         rel.chain_flags |= CHAIN_FLAG_END_FIRST;
-        if end_head != NULL_ID {
-            self.relink_old_head(end_head, end, id, txn)?;
-        }
 
-        // Header-only creation undo for the new rel + compare-and-set logical undo for BOTH endpoint
-        // chain heads (`rmp` #220). The endpoint `first_rel` is pushed through `write_chain_head`, NOT
-        // carried in a plain `write_node` body — otherwise a loser's abort would restore a stale head
+        // Header-only creation undo for the new rel (`rmp` #220); both endpoint heads published
+        // redo-only through the compare-and-publish primitive (`rmp` #970 / #1028). The endpoint
+        // `first_rel` is NEVER carried in a plain `write_node` body — that would restore a stale head
         // over a concurrently-committed prepend, collapsing a shared supernode's fan-out.
         self.write_rel_create(id, &rel, txn)?;
-        self.write_chain_head(StoreKind::Node, start, NODE_OFF_FIRST_REL, id, txn)?;
-        self.write_chain_head(StoreKind::Node, end, NODE_OFF_FIRST_REL, id, txn)?;
+
+        // The two endpoints are two INDEPENDENT chains, so they are two independent publications with
+        // a retry loop each. If the second were refused after the first had won, the first would stay
+        // published, and that is correct rather than a torn write: this record is genuinely the head of
+        // the start node's chain and not yet of the end node's, which is exactly the intermediate state
+        // a single-threaded prepend of two chains also passes through. The retry then completes it.
+        let start_displaced = self.prepend_chain_head(
+            ChainPrepend {
+                owner_kind: StoreKind::Node,
+                owner_id: start,
+                head_off: NODE_OFF_FIRST_REL,
+                entry_kind: StoreKind::Rel,
+                entry_id: id,
+                next_off: REL_OFF_START_NEXT,
+                guard_unheld: false,
+                yield_reread: None,
+                yield_publish: None,
+            },
+            start_head,
+            id,
+            txn,
+        )?;
+        if start_displaced != NULL_ID {
+            self.relink_old_head(start_displaced, start, id, txn)?;
+        }
+
+        let end_displaced = self.prepend_chain_head(
+            ChainPrepend {
+                owner_kind: StoreKind::Node,
+                owner_id: end,
+                head_off: NODE_OFF_FIRST_REL,
+                entry_kind: StoreKind::Rel,
+                entry_id: id,
+                next_off: REL_OFF_END_NEXT,
+                guard_unheld: false,
+                yield_reread: None,
+                yield_publish: None,
+            },
+            end_head,
+            id,
+            txn,
+        )?;
+        if end_displaced != NULL_ID {
+            self.relink_old_head(end_displaced, end, id, txn)?;
+        }
         self.link_incidence_deltas(id, type_id, start, end, txn)?;
         // Maintain the per-relationship-type live count (`rmp` task #79) and the grand-total
         // live-relationship count (`rmp` task #82): the relationship is now a written, live version
@@ -8450,14 +8891,17 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // head form when the new (loser) record becomes a corpse.
         let mut start_prev = old.start_prev_rel;
         let mut end_prev = old.end_prev_rel;
-        let mut flags = old.chain_flags;
+        // The bits this relink is responsible for clearing. Collected as a MASK rather than as a
+        // finished byte, because the byte is shared with the other side of this record and must be
+        // updated by an atomic clear — see `clear_chain_first_flags` (`rmp` #1028).
+        let mut clear = 0u8;
         if old.start_node == node && old.start_prev_rel == NULL_ID {
             start_prev = new_id;
-            flags &= !CHAIN_FLAG_START_FIRST;
+            clear |= CHAIN_FLAG_START_FIRST;
         }
         if old.end_node == node && old.end_prev_rel == NULL_ID {
             end_prev = new_id;
-            flags &= !CHAIN_FLAG_END_FIRST;
+            clear |= CHAIN_FLAG_END_FIRST;
         }
         self.write_field_redo_only(
             StoreKind::Rel,
@@ -8473,7 +8917,57 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             &end_prev.to_le_bytes(),
             txn,
         )?;
-        self.write_field_redo_only(StoreKind::Rel, old_head, REL_OFF_CHAIN_FLAGS, &[flags], txn)?;
+        self.clear_chain_first_flags(old_head, clear, txn)?;
+        Ok(())
+    }
+
+    /// Clears the bits of `mask` in relationship `rel_id`'s `chain_flags` byte, as one **atomic
+    /// read-modify-write** (`rmp` #1028).
+    ///
+    /// # Why this is not a `write_field_redo_only` of a byte the caller computed
+    ///
+    /// `chain_flags` packs BOTH sides' first-in-chain markers ([`CHAIN_FLAG_START_FIRST`],
+    /// [`CHAIN_FLAG_END_FIRST`]) into one byte, and one relationship can be the head of **two
+    /// different nodes' chains** — its start node's and its end node's. Two writers prepending to
+    /// those two nodes therefore both displace this record and both clear a bit of this one byte.
+    /// Computed outside and written whole, that is a textbook lost update: each reads `0b11`, each
+    /// clears its own bit, each writes its own result, and whichever lands second resurrects the
+    /// other's marker. A record that still claims first-in-chain while a committed prepend sits above
+    /// it is precisely what lets the GC reclaim it as a head (`rmp` #220 / #239).
+    ///
+    /// The head word's compare-and-publish does not cover this: different word, different record. So
+    /// the read, the clear and the write run under the same rank-27 shard latch a publication uses —
+    /// keyed on the record being modified — which also puts the redo record in the log in the order
+    /// the byte actually changed. Taking a **mask** rather than a finished byte is what makes the
+    /// operation commutative: two clears of disjoint bits compose to the same result in either order.
+    ///
+    /// # Errors
+    /// Returns a storage error if the record's page cannot be mapped, fetched or written.
+    fn clear_chain_first_flags(&mut self, rel_id: u64, mask: u8, txn: TxnId) -> Result<()> {
+        if mask == 0 {
+            return Ok(());
+        }
+        let (rel_page, off) = paging::record_location(rel_id, StoreKind::Rel.record_size());
+        let dev = self.device_page(StoreKind::Rel, rel_page)?;
+        let abs = off + REL_OFF_CHAIN_FLAGS;
+        // Pinned before the latch, for the reason `compare_and_publish_chain_head` pins before it: a
+        // `fetch` under a rank-27 hold could evict, write home and harden.
+        let f = self.pool.fetch(dev)?;
+        {
+            let _guard = self
+                .chain_head_shard(StoreKind::Rel, rel_id)
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _scope = graphus_core::latch::ChainHeadLatchScope::new();
+            let current = self.pool.with_page(f, |p| p[abs]);
+            let flags = current & !mask;
+            if flags != current {
+                let redo = paging::encode_patch(abs, &[flags]);
+                let lsn = self.wal.with(|w| w.log_update_redo_only(txn, dev, &redo));
+                self.pool.with_page_mut_lsn(f, lsn, |p| p[abs] = flags);
+            }
+        }
+        self.pool.unpin(f);
         Ok(())
     }
 
@@ -8605,7 +9099,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     //
     //   1. A corpse's OWN stored `prev`/`next`/head-flag can be **stale**. When the corpse was the
     //      chain head and a later committed writer's compare-and-set push installed a new head on top
-    //      of it ([`write_chain_head`]), the node's `first_rel` no longer points at the corpse, yet the
+    //      of it ([`compare_and_publish_chain_head`]), the node's `first_rel` no longer points at the corpse, yet the
     //      corpse still records `prev == NULL` and its first-in-chain marker. Trusting those stored
     //      pointers to find neighbours would mis-locate the splice and sever the live chain.
     //   2. Corpses can be **consecutive**: several aborted creations in a row leave a run of corpses
@@ -8767,9 +9261,32 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     fn bridge_corpse_run(&mut self, run: &CorpseRun, txn: TxnId) -> Result<()> {
         // Forward link: pred.next_facing_node := succ  (or node.first_rel := succ when pred is head).
         if run.pred == NULL_ID {
-            let mut n = self.read_node(run.node)?;
-            n.first_rel = run.succ;
-            self.write_node(run.node, &n, txn)?;
+            // `rmp` #1028: repoint ONLY the head word, through the one primitive every writer of that
+            // word goes through. This used to read the whole `NodeRecord` and write it back with
+            // `first_rel` replaced — a read-modify-write of the ENTIRE record, `first_prop`, `labels`
+            // and the MVCC header included, from a snapshot taken before the write, which is the
+            // `rmp` #772 clobber class. It also bypassed the compare-and-publish, and a
+            // compare-and-set is only sound if EVERY writer of the word passes through it: one writer
+            // that stores unconditionally makes every other writer's comparison meaningless.
+            //
+            // Refusal is fail-closed. A GC pass holds the store exclusively, so the head cannot move
+            // under it; if it ever does, the run this pass computed describes a chain that no longer
+            // exists and splicing it would sever live structure.
+            let head = self.read_chain_head(StoreKind::Node, run.node, NODE_OFF_FIRST_REL)?;
+            if !self.compare_and_publish_chain_head(
+                StoreKind::Node,
+                run.node,
+                NODE_OFF_FIRST_REL,
+                head,
+                run.succ,
+                txn,
+            )? {
+                return Err(GraphusError::Storage(format!(
+                    "node {} first_rel moved during a GC corpse splice; the collapsed run is stale \
+                     (`rmp` #1028)",
+                    run.node
+                )));
+            }
         } else {
             self.relink_run_endpoint(run.pred, run.node, run.succ, NeighbourPtr::Next, txn)?;
         }
@@ -9242,7 +9759,22 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // version below the loser's record is never severed.
         self.write_prop_create(pid, &prop, txn)?;
         self.note_created(txn, StoreKind::Prop, pid);
-        self.write_chain_head(StoreKind::Node, node_id, NODE_OFF_FIRST_PROP, pid, txn)?;
+        self.prepend_chain_head(
+            ChainPrepend {
+                owner_kind: StoreKind::Node,
+                owner_id: node_id,
+                head_off: NODE_OFF_FIRST_PROP,
+                entry_kind: StoreKind::Prop,
+                entry_id: pid,
+                next_off: PROP_OFF_NEXT_PROP,
+                guard_unheld: false,
+                yield_reread: None,
+                yield_publish: None,
+            },
+            node.first_prop,
+            pid,
+            txn,
+        )?;
         Ok(pid)
     }
 
@@ -9912,7 +10444,22 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // below this record, nor clobbers a committed head.
         self.write_prop_create(pid, &prop, txn)?;
         self.note_created(txn, StoreKind::Prop, pid);
-        self.write_chain_head(StoreKind::Rel, rel_id, REL_OFF_FIRST_PROP, pid, txn)?;
+        self.prepend_chain_head(
+            ChainPrepend {
+                owner_kind: StoreKind::Rel,
+                owner_id: rel_id,
+                head_off: REL_OFF_FIRST_PROP,
+                entry_kind: StoreKind::Prop,
+                entry_id: pid,
+                next_off: PROP_OFF_NEXT_PROP,
+                guard_unheld: false,
+                yield_reread: None,
+                yield_publish: None,
+            },
+            rel.first_prop,
+            pid,
+            txn,
+        )?;
         Ok(pid)
     }
 
@@ -14895,6 +15442,214 @@ mod tests {
             "in {ROUNDS} rounds the frontier ended above the smallest id proposed {} time(s): a \
              concurrent descent was overwritten by a larger one (`rmp` #1014)",
             rises.load(Ordering::Relaxed)
+        );
+    }
+}
+
+/// **The chain-head publication protocol** (`rmp` #1028), tested on the real medium: pages, the WAL,
+/// and the rank-27 publication latch.
+///
+/// The property these tests exist for — *two writers prepending onto one head produce a chain
+/// containing both entries* — has a part that cannot be reached from here. Graphus has one writer
+/// thread per database until `rmp` #1016, and `RecordStore`'s write methods take `&mut self`, so no
+/// test in this crate can put two writers on one chain at the same instant; the deterministic
+/// scheduler of `rmp` #973 cannot either, and says so in its own doc comments. That half of the
+/// property is proved by the `loom` model in `graphus-chainhead`, which drives this exact protocol
+/// with two real threads over an atomic cell.
+///
+/// What IS reachable from here, and is what these tests do, is the decisive half: the window between
+/// a writer's observation of the head and its publication, reproduced deterministically by letting a
+/// second writer land inside it. That is the same window, opened by hand instead of by a race.
+#[cfg(test)]
+mod chain_head_publication_tests {
+    use super::*;
+    use graphus_io::MemBlockDevice;
+    use graphus_wal::{MemLogSink, WalManager};
+
+    type Store = RecordStore<MemBlockDevice, MemLogSink>;
+
+    fn fresh() -> Store {
+        let device = MemBlockDevice::new(0);
+        let wal = WalManager::create(MemLogSink::new()).expect("create wal");
+        RecordStore::create(device, wal, 64, 1).expect("create store")
+    }
+
+    /// A publication whose `expect` no longer matches the head must be REFUSED, and must leave the
+    /// head exactly as the writer that got there first left it.
+    ///
+    /// With the unconditional write this replaced, the second publication would land, and `r_win` —
+    /// a committed relationship — would drop out of the hub's incidence chain with nothing reporting
+    /// it. That is `rmp` #220.
+    #[test]
+    fn a_publication_against_a_displaced_head_is_refused() {
+        let mut s = fresh();
+        let t = TxnId(1);
+        s.begin(t);
+        let ty = s
+            .intern_token(Namespace::RelType, "LINK")
+            .expect("intern reltype");
+        let (hub, _) = s.create_node(t).expect("hub");
+        let (peer, _) = s.create_node(t).expect("peer");
+
+        // The head a writer observes when it starts a prepend.
+        let observed = s.node(hub).expect("hub").first_rel;
+
+        // A second writer gets there first and publishes its own edge onto the same head.
+        let (r_win, _) = s.create_rel(t, ty, hub, peer).expect("create_rel");
+        assert_eq!(
+            s.node(hub).expect("hub").first_rel,
+            r_win,
+            "the winner must be the head"
+        );
+
+        // The first writer now publishes against the head it observed. Its entry id is irrelevant:
+        // the publication must not happen at all.
+        let published = s
+            .compare_and_publish_chain_head(
+                StoreKind::Node,
+                hub,
+                NODE_OFF_FIRST_REL,
+                observed,
+                r_win + 1,
+                t,
+            )
+            .expect("publish");
+
+        assert!(
+            !published,
+            "a publication against a head that has since been displaced must be refused"
+        );
+        assert_eq!(
+            s.node(hub).expect("hub").first_rel,
+            r_win,
+            "the refused publication must leave the winner's head untouched — overwriting it here is \
+             exactly how a committed relationship leaves its node's incidence chain (`rmp` #220)"
+        );
+    }
+
+    /// The retry: after a refusal the protocol re-reads the head, RE-LINKS its entry to it, and
+    /// publishes — so the finished chain holds both the entry that won the race and the entry that
+    /// lost it, in that order.
+    ///
+    /// The entry used here is a relationship created between two unrelated nodes, so that
+    /// `create_rel` publishes it onto *their* chains and not onto the hub's; the test then prepends it
+    /// onto the hub's chain by hand. That makes the graph structurally odd on purpose — this is a test
+    /// of the pointer protocol, not of graph semantics — and it is what lets a single thread stand in
+    /// for the writer whose publication was refused.
+    #[test]
+    fn a_refused_publication_retries_and_the_chain_keeps_both_entries() {
+        let mut s = fresh();
+        let t = TxnId(1);
+        s.begin(t);
+        let ty = s
+            .intern_token(Namespace::RelType, "LINK")
+            .expect("intern reltype");
+        let (hub, _) = s.create_node(t).expect("hub");
+        let (peer, _) = s.create_node(t).expect("peer");
+        let (a, _) = s.create_node(t).expect("a");
+        let (b, _) = s.create_node(t).expect("b");
+
+        let observed = s.node(hub).expect("hub").first_rel;
+        let (r_win, _) = s.create_rel(t, ty, hub, peer).expect("winner");
+        let (r_late, _) = s.create_rel(t, ty, a, b).expect("late entry");
+
+        let displaced = s
+            .prepend_chain_head(
+                ChainPrepend {
+                    owner_kind: StoreKind::Node,
+                    owner_id: hub,
+                    head_off: NODE_OFF_FIRST_REL,
+                    entry_kind: StoreKind::Rel,
+                    entry_id: r_late,
+                    next_off: REL_OFF_START_NEXT,
+                    guard_unheld: false,
+                    yield_reread: None,
+                    yield_publish: None,
+                },
+                observed,
+                r_late,
+                t,
+            )
+            .expect("prepend");
+
+        assert_eq!(
+            displaced, r_win,
+            "the retry must report the head it ACTUALLY displaced, not the stale one it observed: \
+             that value is what the caller uses to fix the predecessor's back-pointer, and using the \
+             stale one would clobber a back-pointer the winner owns"
+        );
+        assert_eq!(
+            s.node(hub).expect("hub").first_rel,
+            r_late,
+            "the retried publication must land"
+        );
+        assert_eq!(
+            s.rel(r_late).expect("late").start_next_rel,
+            r_win,
+            "the retry must RE-LINK the entry to the head it displaced; left naming the stale head, \
+             the chain forks and everything below the winner falls out of it"
+        );
+    }
+
+    /// The GC's corpse splice writes the head through the same primitive as every prepend, and its
+    /// write touches ONLY that word. It used to read the whole `NodeRecord` and write it back, which
+    /// carried `first_prop`, `labels` and the MVCC header along from a stale snapshot (`rmp` #772),
+    /// and bypassed the compare-and-publish entirely — and a compare-and-set is only sound when every
+    /// writer of the word goes through it.
+    #[test]
+    fn the_gc_corpse_splice_publishes_the_head_without_clobbering_the_rest_of_the_record() {
+        let mut s = fresh();
+        let t = TxnId(1);
+        s.begin(t);
+        let ty = s
+            .intern_token(Namespace::RelType, "LINK")
+            .expect("intern reltype");
+        let label = s
+            .intern_token(Namespace::Label, "Hub")
+            .expect("intern label");
+        let (hub, _) = s.create_node(t).expect("hub");
+        let (peer, _) = s.create_node(t).expect("peer");
+        s.add_label(t, hub, label).expect("label");
+        let key = s
+            .intern_token(Namespace::PropKey, "k")
+            .expect("intern prop key");
+        s.set_node_property_value(t, hub, key, &graphus_core::Value::Integer(7))
+            .expect("property");
+        let (r, _) = s.create_rel(t, ty, hub, peer).expect("rel");
+        s.commit(t).expect("commit");
+
+        let before = s.node(hub).expect("hub");
+        assert_eq!(before.first_rel, r);
+        assert_ne!(before.first_prop, NULL_ID, "the fixture needs a property");
+        assert_ne!(before.labels, 0, "the fixture needs a label");
+
+        // Splice the whole chain out, exactly as a GC pass that found `r` reclaimable would.
+        let t2 = TxnId(2);
+        s.begin(t2);
+        s.bridge_corpse_run(
+            &CorpseRun {
+                node: hub,
+                pred: NULL_ID,
+                succ: NULL_ID,
+            },
+            t2,
+        )
+        .expect("splice");
+
+        let after = s.node(hub).expect("hub");
+        assert_eq!(after.first_rel, NULL_ID, "the head must be spliced out");
+        assert_eq!(
+            after.first_prop, before.first_prop,
+            "the splice must not carry the property chain head along: a full-record write from a \
+             stale read silently reverts every OTHER field of the record (`rmp` #772 / #1028)"
+        );
+        assert_eq!(
+            after.labels, before.labels,
+            "nor the label word — same clobber, different field"
+        );
+        assert_eq!(
+            after.mvcc.undo_ptr, before.mvcc.undo_ptr,
+            "nor the MVCC header, whose undo pointer decides visibility"
         );
     }
 }

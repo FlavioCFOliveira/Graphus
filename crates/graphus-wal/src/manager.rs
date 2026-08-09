@@ -756,6 +756,10 @@ impl<S: LogSink> WalManager<S> {
         // never held across I/O, and a barrier is the sharpest instance of that: held here, one
         // `fdatasync` would convoy every allocator of that store. Also debug-only.
         graphus_core::latch::assert_no_alloc_latch_held("WalManager::harden");
+        // And for the store's rank-27 chain-head publication latch (`rmp` #1028), which sits between
+        // the allocator and this log for the same reason and carries the same never-across-I/O
+        // promise. Debug-only.
+        graphus_core::latch::assert_no_chain_head_latch_held("WalManager::harden");
         if let Err(e) = self.sink.sync() {
             panic!("WAL fdatasync failed; aborting to avoid silent data loss (fsyncgate): {e}");
         }

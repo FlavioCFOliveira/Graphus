@@ -82,6 +82,7 @@ A single Cargo workspace, Edition 2024, 64-bit-only targets (`D-target-matrix`).
 | `graphus-io` | lib | Async file/socket I/O; epoll/kqueue baseline + io_uring fast path with runtime fallback (`D-io-backend`); dedicated fsync threads. |
 | `graphus-wal` | lib | WAL record format, log writer with group commit, LSN allocation, checkpointer, ARIES analysis/redo/undo, recovery driver. |
 | `graphus-bufpool` | lib | Frame table, page latches, pin counts, eviction (CLOCK/2Q), prefetch, write-back coordination with WAL (WAL rule). |
+| `graphus-chainhead` | lib | The **prepend publication protocol** every chain head in the storage core shares — `first_rel`, `first_prop` and the MVCC `undo_ptr` (§5.7.1): the four ordered steps, the retry a refused publication demands, and the `ChainHead` trait that states the two obligations the underlying medium must honour. A true **leaf**: it depends on no other crate, and that is a requirement rather than an accident. `--cfg loom` is a global rustflag, so a protocol that must be model-checked cannot live in a crate that reaches `graphus-bufpool`, whose own loom seam would then stop matching. `#![forbid(unsafe_code)]`. |
 | `graphus-storage` | lib | Page formats; node/relationship/property/label record codecs; index-free adjacency chains; token/dictionary store; free-space management; element-ID→physical-ID map. |
 | `graphus-index` | lib | B+-tree, token-lookup index, composite & relationship-property indexes; constraint checks; index recovery. |
 | `graphus-txn` | lib | Transaction lifecycle, MVCC version chains and their undo deltas, visibility, SSI conflict tracker, timestamp oracle, version GC, write-conflict detection (§5.7), latch policy. |
@@ -357,6 +358,30 @@ and for the **WAL rule** (a dirty page may not be flushed until the WAL is durab
 - **Lock ordering** to prevent latch deadlock: always latch pages in a fixed global order (by store
   then page id) for multi-page operations; B+-tree uses crabbing with a documented top-down
   discipline.
+- **A mutation that may decline to happen must not stamp the page.** The pool offers a declining
+  variant of its stamped write: the closure reports whether it wrote, and the frame is marked dirty
+  and stamped with the record's LSN **only** if it did (`BufferPool::with_page_mut_lsn_if`,
+  `crates/graphus-bufpool/src/concurrent.rs:849`; added for the chain-head publication of §5.7.1).
+  **Advancing `page_lsn` without a write is corruption, not a harmless over-approximation**: redo
+  skips every record whose LSN is at or below `page_lsn`, so a page carrying an LSN it never applied
+  silently loses every legitimate record logged at or below it, and nothing reports the loss. Marking
+  the frame dirty without a write is the milder half of the same mistake — it schedules a pointless
+  write-back and, on a page whose `page_lsn` is still zero, trips the WAL-rule guard. The frame's
+  write latch is taken whether or not the write happens, because the decision itself must be made
+  under it.
+- **Latch ranks.** Every blocking primitive in the engine carries a **rank**, and a thread acquires
+  ranks in ascending order, innermost last: **10** catalog / DDL, **20** commit sequencer and
+  active-transaction table, **25** the per-store physical-id allocation latch, **27** the chain-head
+  publication latch (§5.7.1), **30** the WAL, **40** the buffer-pool frame latch, **50** the
+  page-table shard, **60** the device and the doublewrite stager. An acquisition out of rank order is
+  permitted only as a `try_lock`, which creates no wait edge. Ranks 25 and 27 admit **at most one
+  holder per thread**: two locks of the same rank cannot be ordered by rank at all, so two threads
+  that acquire a different pair in a different order deadlock. Both are also **released before any
+  I/O** — held across store growth, across a page fetch that may evict, or across a durability
+  barrier, either one convoys every writer that shares it behind a single `fdatasync`. Debug builds
+  check both obligations mechanically, with thread-local tripwires (`graphus_core::latch`) armed at
+  the WAL barrier, at `BufferPool::fetch` and at the store-page growth path; a release build pays
+  nothing for them.
 
 ### 3.4 Eviction
 
@@ -465,6 +490,20 @@ the head it displaces. Their inverse is to **unlink the entry**, computed from t
 time and carried by the transaction's own deltas (§5.1.5 row 3), and the state such a write leaves
 after recovery is a head naming a `!in_use` record: a corpse, which every walk in the storage core
 already threads through and the GC splice reclaims.
+
+**A chain-head publication's redo image is itself conditional** (task #1028, §5.7.1). The record
+carries the word's expected pre-value beside its post-value (`paging::encode_cas_patch`,
+`crates/graphus-storage/src/paging.rs:131`), and `paging::apply_patch` (`:150`) — the one applier that
+serves a live rollback and recovery's redo alike — installs the post-value only where the word still
+holds the expected one. **No WAL record type, format version or recovery step changes to obtain
+this**: the conditional patch shape already existed, because it was the shape of the compare-and-set
+*undo* images, and it is reused unchanged. It buys two things. The record replays to the verdict the
+live system reached even when the page image it replays onto already carries the publication — which
+happens whenever an unrelated writer on the same page regressed `page_lsn` and made recovery start
+further back than it needed to. And the record states the precondition of its own write, so a replay
+that would not have been valid declines instead of clobbering. **A publication that is refused
+appends no record at all** (§5.7.1), so the log never carries a record for a write that did not
+happen.
 
 **A live rollback that fails leaves its transaction OPEN.** That ARIES guarantee is about *crash*
 recovery, which restarts the undo from the durable log. A *live* rollback has no such restart point:
@@ -731,6 +770,14 @@ the chain head. The lifecycle has five steps:
    **first**, and publish the new head **last**, so the chain is a valid list at every instant
    (Memgraph's `CreateAndLinkDelta` documents and enforces exactly this order —
    `/data/refsrc/memgraph/src/storage/v2/mvcc.hpp:314-359`).
+
+   **Publishing the head is a compare-and-publish against the head the delta was linked to**, and it
+   is the same protocol every other chain head in the storage core uses — §5.7.1 specifies it in
+   full. A refusal re-reads the head, re-points the delta's `next` at that head, and tries again. On
+   the undo chain, and only there, a refusal also **re-runs the conflict check of step 1 against the
+   freshly re-read head**. That is not optional: the check is what makes the reader's early stop of
+   §5.3 true, and a check evaluated once against a head that has since been displaced is a stale
+   check that would wave a second open transaction's delta onto the chain.
 4. **In-place mutation.** Only then does the writer change the home record, so the newest value is in
    place and its predecessor is recoverable from the delta just linked.
 5. **Resolution.** On commit, the transaction publishes its commit timestamp once (below) and its
@@ -955,7 +1002,7 @@ and does not restate it.
 | 0 | ~~**No undo area at all.** `undo_ptr` is reserved in every record and always written `0`, so there is no chain to anchor.~~ **CLOSED.** | was `crates/graphus-storage/src/record.rs`; now `crates/graphus-storage/src/undo.rs` + `StoreKind::Undo` / `StoreKind::Commit` | The undo area and the delta record; `undo_ptr` is the live chain head | **#966 — done** |
 | 1 | ~~**Property tombstone plus chain prepend.** Setting a property walks the entity's whole property chain to tombstone the previous version, then prepends a new one — **O(M²)** over M assignments (15.1 µs/op at M = 1000; 97.8 µs/op at M = 8000).~~ **CLOSED.** | was `RecordStore::tombstone_props_for_key`; now the one property write path, `RecordStore::set_entity_property_encoded`, `crates/graphus-storage/src/store.rs:8282` | One `SetProperty` delta carrying the old value; the home property record is updated in place, and a **removal** is an empty cell in place rather than a tombstone (below) | **#967 — done** |
 | 2 | ~~**Label bitmap mutated in place, with the version history held only in memory.** The history is an in-process structure shared by `Arc`; nothing about it is durable, so labels are not versioned on disk.~~ **CLOSED.** | was `crates/graphus-storage/src/label_history.rs`; now `RecordStore::link_label_deltas`, `crates/graphus-storage/src/store.rs:3751` | `AddLabel` / `RemoveLabel` deltas on the same durable chain as every other change | **#968 — done** |
-| 3 | ~~**Ad-hoc compare-and-set undo for chain heads.**~~ **CLOSED.** A chain-head publication and the relink of the head it displaces are logged **redo-only** (§4.4); their inverse is to unlink the entry, never to restore the word. **What survives is a different mechanism, deliberately kept:** the node's `labels` word and the MVCC header word keep a compare-and-set undo, because each is a whole-word write whose inverse *is* the word — and that undo is now consumed only by recovery, since a data transaction's live rollback applies no WAL undo image at all. | was `store.rs` `write_chain_head` (pre-image, then compare-and-set) and `write_rel_field_keep`; now `RecordStore::write_field_redo_only`, `crates/graphus-storage/src/store.rs:3132`. The surviving compare-and-set is `patch_header_word_cas`, `:3064`, and `write_node_labels`, `:4402` | `AddIncidentEdge` / `RemoveIncidentEdge` deltas naming one incidence entry, so no shared pointer word is ever rewritten by an undo | **#969** (the deltas) + **#970 — done** (the compensations) |
+| 3 | ~~**Ad-hoc compare-and-set undo for chain heads.**~~ **CLOSED.** A chain-head publication and the relink of the head it displaces are logged **redo-only** (§4.4); their inverse is to unlink the entry, never to restore the word. **What survives is a different mechanism, deliberately kept:** the node's `labels` word and the MVCC header word keep a compare-and-set undo, because each is a whole-word write whose inverse *is* the word — and that undo is now consumed only by recovery, since a data transaction's live rollback applies no WAL undo image at all. | was `store.rs` `write_chain_head` (pre-image, then compare-and-set) and `write_rel_field_keep`. `write_chain_head` **no longer exists**: since task **#1028** a chain-head **prepend** publishes through `RecordStore::compare_and_publish_chain_head` (`crates/graphus-storage/src/store.rs:3960`), driven by `prepend_chain_head` (`:4087`) over the `graphus-chainhead` protocol; its redo image is conditional and its undo image is still empty (§5.7.1, which also names the two *unlink* paths that still install a head with a whole-record write). The displaced head's relink writes only the fields it changes, through `RecordStore::write_field_redo_only` (`:3869`). The surviving compare-and-set undo is `patch_header_word_cas` (`:3801`) and `write_node_labels` (`:5692`) | `AddIncidentEdge` / `RemoveIncidentEdge` deltas naming one incidence entry, so no shared pointer word is ever rewritten by an undo | **#969** (the deltas) + **#970 — done** (the compensations) |
 | 4 | ~~**Physical ARIES rollback.** Undo reverts bytes. This is the origin of the recurring defect family rmp #220 / #172 / #239 / #301 / #578 / #772, each one a case of one transaction's byte-level undo damaging another's committed state.~~ **CLOSED for every transaction that holds MVCC state.** | was `RecordStore::rollback`; now `RecordStore::rollback_logical`, `crates/graphus-storage/src/store.rs:5986`. `rollback_physical`, `:6062`, survives as the inverse of a maintenance or catalog-only transaction — one that owns no commit slot (§4.3) | Logical rollback: the transaction walks its own deltas and applies them | **#970 — done** |
 | 5 | ~~**Write-lock table plus wait-for-graph deadlock detector.**~~ **CLOSED.** | was `crates/graphus-txn/src/lock.rs` | Conflict detection on the entity's MVCC header, aborting immediately without waiting (§5.7) | **#971 — done** |
 
@@ -1294,11 +1341,14 @@ deadlock detector, because a transaction never waits for another transaction.
 
 **Latches (physical, short) are the only blocking.** They protect page bytes and in-memory structures
 (§3.3), are held for the duration of a memory operation rather than a transaction, and are ordered to
-be deadlock-free by construction (§3.3, lock ordering). What makes a chain safe to walk while it is
+be deadlock-free by construction (§3.3, latch ranks). What makes a chain safe to walk while it is
 being extended is the publication order of §5.1.2 step 3, not a transaction-scoped lock: the new delta
 is written in full first, its `next` is set to the current head, and the record's `undo_ptr` is
-published **last**, under the latch of the record's own page. A concurrent reader, or the GC, therefore
-observes either the old chain or the new one, never a partially-linked one.
+published **last**. A concurrent reader, or the GC, therefore observes either the old chain or the new
+one, never a partially-linked one. What makes the publication itself safe **against a second writer**
+is the protocol of §5.7.1, which is a different guarantee and needs its own mechanism: the order above
+keeps the chain well-formed at every instant, but on its own it does not stop two writers from
+publishing over each other.
 
 **Write-write conflicts are detected on the entity's own MVCC state, and abort immediately.** Before
 writing, a transaction reads the head of the entity's delta chain and decides in constant time:
@@ -1376,6 +1426,157 @@ The `TxnManager` in `crates/graphus-txn/src/manager.rs` is **not** the server's 
 the server uses `TxnCoordinator` — and it is kept, without any locking, as the harness the SSI
 certification suites (`tests/isolation.rs`, `tests/elle_no_anomalies.rs`, `tests/ssi_staggered.rs`)
 run against. Its first-updater-wins rule is now expressed directly over its own writer set.
+
+#### 5.7.1 The chain-head publication protocol (task #1028)
+
+A **chain head** is a single word inside a record that names the first entry of a chain hanging off
+that record. The storage core has three of them — a node's `first_rel`, an entity's `first_prop`, and
+the MVCC `undo_ptr` — and every writer that adds to such a chain does so by **prepending** to it.
+
+**The defect this closes.** Until task #1028 a chain head was published with a plain byte write, so
+the read-the-head / write-the-head pair was not atomic. Two writers that read the same head both
+publish, the second overwrites the first, and the first's entry silently leaves the chain: a
+committed relationship gone from its node's incidence chain, a committed property version gone from
+its owner's chain, a committed delta gone from the undo chain that decides visibility. That is the
+`rmp` #220 defect class, latent only while a database has a single writer thread and live the instant
+the N writers of this section arrive.
+
+**The protocol has four steps, and their order is normative.**
+
+1. Read the head `H`.
+2. Write the new entry `E` in full, with `E.next := H`. `E` is private at this point: no chain names
+   it, so neither a reader nor a GC pass can reach it.
+3. Publish `head := E` by **compare-and-publish against `H`** — the store installs `E` if and only if
+   the head still holds `H`, and reports whether it did.
+4. Only then, and only after a **winning** publication, fix the displaced predecessor's back-pointer
+   `H.prev := E`. This step applies to doubly-linked chains only, which means the relationship
+   incidence chain.
+
+**Step 4 comes after step 3, and that is not an implementation detail.** A writer that has read `H`
+but has not yet published holds no claim on `H` at all. Relinking first and then losing the
+compare-and-publish would leave that writer having overwritten the `H.prev` the winner legitimately
+owns. Winning the compare-and-publish with the expected value `H` is precisely what makes a writer
+the one that displaced `H`, so only the winner relinks, and two writers can never relink the same
+predecessor. The publication primitive therefore returns **the head it displaced**, and that value —
+not the head originally read — is the only one a caller may use for step 4.
+
+**A refusal re-links the entry and retries.** The retry cannot live inside the publication itself,
+because a refusal invalidates `E.next`: the entry is linked to a head that is no longer the head, and
+publishing it as it stands would fork the chain and orphan everything below the winner. A refusal
+therefore re-reads the head, rewrites `E.next` to that head, and tries again. The loop is **lock-free**
+in the technical sense — an attempt is refused only when some other publisher succeeded — so the
+system as a whole always progresses and a live-lock is impossible. The bound of 65 536 attempts is
+not there to break a live-lock; it exists so that a head being written by something *outside* the
+protocol surfaces as a loud, attributable error instead of an unkillable thread inside a database.
+
+**The protocol lives in its own leaf crate.** `graphus-chainhead` (§1.2) holds the four steps and the
+retry, generic over a `ChainHead` trait that models the head cell. The trait states **two obligations
+on the medium**, not on the protocol, and getting either wrong reintroduces the lost prepend with no
+symptom the protocol itself could detect:
+
+- **Atomicity.** The comparison and the store are one indivisible step with respect to every other
+  publisher of the same head.
+- **Durable order.** The order in which publications enter the log equals the order in which they take
+  effect on the page. Recovery replays in log order, so if the two orders differ, replay reaches a
+  different verdict from the one the live system reached — and after a crash the *replayed* verdict is
+  the one that survives.
+
+**The storage core honours both with a sharded rank-27 publication latch.** Its head cell is an
+8-byte word on a WAL-logged page, and one shard of the latch is held across three steps that have to
+be one: peek at the word, append the redo record, apply it. Splitting them is exactly what breaks
+durable order — the record is appended under the WAL mutex (rank 30) and applied under the frame
+latch (rank 40), and nothing else ties those two instants together, so two publishers can enter the
+log in one order and take effect on the page in the other. Three consequences are normative:
+
+- **The page is mapped and pinned before the latch is taken**, and the latch is released before the
+  frame is unpinned. Rank 27 is never held across store growth, across a page fetch that may evict, or
+  across a durability barrier: held across any of them it convoys every publisher of the shard behind
+  one `fdatasync`. Debug builds enforce this at the WAL barrier, at `BufferPool::fetch` and at the
+  store-page growth path (§3.3).
+- **At most one holder per thread** (§3.3). A relationship publishes its start endpoint's head and its
+  end endpoint's head strictly one after the other, precisely so that this stays true. The two
+  endpoints are two independent chains and therefore two independent publications, each with its own
+  retry loop; if the second is refused after the first has won, the intermediate state is correct
+  rather than torn — the record really is the head of the start node's chain and not yet of the end
+  node's — and the retry completes it.
+- **The shard count is a contention parameter only.** Correctness requires nothing more than that one
+  head word always maps to one shard.
+
+**A refused publication appends no record.** Under the latch the word is observed first, and the redo
+record is appended only if it still holds the expected value, so the log never carries a record for a
+write that did not happen and recovery has nothing to reason about. This is deliberately stronger
+than tolerating an inert orphan record: an orphan is harmless only while log order matches the order
+in which the page actually changed, and that is precisely the property a second writer removes.
+
+**The publication remains redo-only** (`D-chain-head-redo-only`, §4.4). Its inverse is to unlink the
+entry, computed at abort time from the transaction's own deltas, and never the restoration of the
+word. Task #970 proved that restoring the word is unsound even when the restoration is itself a
+compare-and-set, because it restores an **id**, and an id means something only while it names the same
+record. The compare-and-publish specified here runs in the opposite direction: it is the *forward*
+publication, whose expected value is a head this writer read moments ago and whose new value is a slot
+this writer owns.
+
+**The same latch covers two further writes, because the head word alone is not the whole story.** The
+first is part of a prepend; the second is a different operation on the same word, brought under the
+primitive so that no writer of that word stores into it unconditionally.
+
+- **The `chain_flags` byte of a displaced relationship.** One byte packs the first-in-chain markers of
+  **both** sides of a relationship, and a relationship can be the head of two different nodes' chains —
+  its start node's and its end node's. Two writers prepending onto those two nodes therefore both
+  displace that record and both clear a bit of that one byte. Computed outside and written whole, that
+  is a lost update: whichever write lands second resurrects the other's marker, and a record that
+  still claims first-in-chain while a committed prepend sits above it is exactly what lets the GC
+  reclaim it as a head. The clear is therefore an atomic read-modify-write under the same rank-27
+  shard latch, keyed on the record being modified, and it takes a **mask** rather than a finished
+  byte — which makes it commutative, so two clears of disjoint bits compose to the same result in
+  either order.
+- **The GC's corpse splice.** When a collapsed run of corpses starts at the node head, the splice
+  repoints the head word through the same publication primitive instead of rewriting the node record.
+  The principle behind that conversion is general: a compare-and-set is sound only to the extent that
+  the writers of the word pass through it, because a single writer that stores unconditionally makes
+  every other writer's comparison meaningless. Refusal in the splice is fail-closed — a GC pass holds
+  the store exclusively, so the head cannot move under it, and if it ever does, the run that pass
+  computed describes a chain that no longer exists and splicing it would sever live structure.
+
+**An operation writes only the fields it changes.** The splice above used to read the whole
+`NodeRecord` and write it back with `first_rel` replaced. A whole-record write built from a snapshot
+taken before the write reverts every field a concurrent writer changed in between — here `first_prop`,
+`labels` and the MVCC header — which is the #772 clobber class arriving without any new mechanism. The
+rule is stated positively: an operation that changes a chain head, a chain pointer or a chain marker
+writes exactly those fields and nothing else.
+
+**What task #1028 covers, stated exactly.** The protocol and the latch cover **prepending** — the
+operation that *adds* an entry to a chain — at all six prepend sites of the storage core (both
+endpoint heads of a new relationship, the self-loop's single chain, a node's and a relationship's
+`first_prop`, and the undo chain's `undo_ptr`), plus the GC corpse splice's repointing of a node head.
+They do **not** yet cover the operations that *remove* an entry from a chain, which still install a
+chain head with an unconditional whole-record write:
+
+| Site | What it installs unconditionally | Reached from |
+| --- | --- | --- |
+| `RecordStore::unlink_side_with` | a node's `first_rel`, by rewriting the whole `NodeRecord` | `undo_own_incidence` — the **logical rollback** of an incidence delta, a transactional path — and `reclaim_rel`, a GC path |
+| `RecordStore::set_owner_first_prop` | an owner's `first_prop`, by rewriting the whole `NodeRecord` or `RelRecord` | `gc_property_chain`, a GC path only |
+
+The GC paths are safe for the same reason the splice's refusal is fail-closed: a GC pass holds the
+store exclusively. The rollback path is not covered by that argument. Bringing it under the protocol
+is **outstanding work**, not something task #1028 delivered, and this specification records it as such
+rather than implying an invariant the code does not yet hold.
+
+**How this is proved.** Two suites, deliberately different in kind, because neither can stand in for
+the other:
+
+- **A `loom` model** — `crates/graphus-chainhead/tests/loom_chainhead.rs` — drives the production
+  protocol unchanged over a modelled medium (an atomic head word and an array of `next` slots) and
+  requires that every entry prepended is reachable from the head, that a pre-existing tail is never
+  orphaned, and that a refused publication leaves neither a fork nor a cycle. A fourth model runs the
+  identical protocol over a cell whose publication is a plain load-then-store and **requires that at
+  least one interleaving loses an entry**, so the pair asserts both "the protocol is correct" and "the
+  atomicity it rests on is doing the work". A real-thread test cannot replace this: the window needs
+  two writers to read one head before either publishes, and a run in which that window never opens
+  certifies nothing.
+- **A DST crash scenario** — `crates/graphus-dst/tests/chain_head_publication_recovery_1028.rs` —
+  proves the durable half: every committed publication replays, and a refused publication leaves no
+  trace for recovery to find. See `07-dst-simulator.md` §10.
 
 ---
 
@@ -2362,9 +2563,18 @@ of each level.
 
 ### 11.4 loom / Miri / proptest / fuzz / Criterion
 
-- **loom:** exhaustive interleavings for every lock-free/atomic unit (§9.2). **Miri:** UB and
-  aliasing for all `unsafe`; runs the unsafe-bearing modules' tests. **aarch64 hardware run:** because
-  loom doesn't model ARM reordering (§10.1).
+- **loom:** exhaustive interleavings for every lock-free/atomic unit (§9.2), and for the chain-head
+  prepend publication protocol (§5.7.1). **Miri:** UB and aliasing for all `unsafe`; runs the
+  unsafe-bearing modules' tests. **aarch64 hardware run:** because loom doesn't model ARM reordering
+  (§10.1).
+- **A protocol that is to be model-checked must sit in a leaf crate.** `--cfg loom` is a global
+  rustflag, so building a model flips the loom seam of **every** crate in the dependency graph at
+  once: a protocol living inside a crate that reaches `graphus-bufpool` could not be checked at all,
+  because its `std::sync` types would stop matching that crate's `loom::sync` types. This is why
+  `graphus-pagemap` (task #721), `graphus-groupsync` (task #994) and `graphus-chainhead` (task #1028,
+  §1.2) carry **no edge to `graphus-bufpool`**: the first two depend on `graphus-core` alone, and
+  `graphus-chainhead` on nothing at all. It is a design constraint on where a model-checkable protocol
+  may live, not an accident of packaging.
 - **proptest:** for the high-value pure modules — the order-preserving key encoding (§6.2),
   three-valued logic / ordering / equivalence (§7.6), PackStream and Jolt/CBOR round-trips, temporal
   arithmetic, and record codecs (round-trip and invariant properties).

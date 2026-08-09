@@ -823,6 +823,47 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
         func(&mut meta.data)
     }
 
+    /// Like [`with_page_mut_lsn`](Self::with_page_mut_lsn) but for a mutation that may decline to
+    /// happen: `func` returns `Some(_)` **iff** it wrote to the page, and the frame is marked dirty
+    /// and stamped with `lsn` only in that case (`rmp` #1028).
+    ///
+    /// # Why a declining variant has to exist
+    ///
+    /// A compare-and-set publication reads a word, compares it, and writes only on a match. Routing
+    /// that through [`with_page_mut_lsn`](Self::with_page_mut_lsn) would stamp `page_lsn` even when
+    /// nothing was written, and **advancing `page_lsn` without a write is corruption**, not a
+    /// harmless over-approximation: recovery skips every record whose `lsn <= page_lsn`, so a page
+    /// carrying an LSN it never applied silently loses every legitimate record logged at or below it
+    /// — the changes are dropped and nothing reports it. Marking the frame dirty without a write is
+    /// the milder half of the same mistake: it schedules a pointless write-back and, on a page whose
+    /// `page_lsn` is still `0`, trips `write_back`'s WAL-before-data guard.
+    ///
+    /// The contract is on the closure and cannot be checked from here: **return `None` if and only
+    /// if the page was not modified.** A closure that mutates and returns `None` produces a dirty
+    /// page the pool believes is clean.
+    ///
+    /// Takes the frame's **write latch** for the duration of `func` (exclusive) exactly as
+    /// [`with_page_mut`](Self::with_page_mut) does — the latch is taken whether or not the write
+    /// happens, because the decision itself must be made under it. `func` must not block or call back
+    /// into the pool with this frame.
+    pub fn with_page_mut_lsn_if<R>(
+        &self,
+        f: PinnedFrame,
+        lsn: Lsn,
+        func: impl FnOnce(&mut Page) -> Option<R>,
+    ) -> Option<R> {
+        let _release = frame_release(f.0);
+        let mut meta = latch_write(self.slot(f), f.0, YieldSite::FrameWriteWithPageMutLsn);
+        let out = func(&mut meta.data);
+        if out.is_some() {
+            // Only now: the write happened, so the page is dirty and its `page_lsn` really does cover
+            // this record. The order (mutate, then stamp) is irrelevant under the exclusive latch.
+            meta.dirty = true;
+            page::set_page_lsn(&mut meta.data, lsn);
+        }
+        out
+    }
+
     /// Decrements the pin count of a frame (`Release`), so the frame can later be evicted once no
     /// pins remain. Saturating at zero, so a stray double-unpin cannot underflow.
     pub fn unpin(&self, f: PinnedFrame) {
@@ -876,6 +917,11 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
         // a *silent* convoy — the failure mode a tripwire exists to make loud. Asserted on every
         // `fetch`, hit or miss, because the caller cannot know which it will be. Debug-only.
         graphus_core::latch::assert_no_alloc_latch_held("BufferPool::fetch");
+        // Same argument for the rank-27 chain-head publication latch (`rmp` #1028): the publication
+        // primitive pins its page BEFORE taking the latch precisely so this path is never reached
+        // under it — a fetch under the latch could evict, write home and harden, convoying every
+        // publisher of the shard behind one `fdatasync`. Debug-only.
+        graphus_core::latch::assert_no_chain_head_latch_held("BufferPool::fetch");
         // One backoff per `fetch` call: it escalates across the transient retries below (lost hit-race,
         // peer `Loading`, contended victim sweep) so a herd of concurrent fetchers spreads out in time
         // and the in-flight loader latches drain — instead of re-contending in lockstep, the
