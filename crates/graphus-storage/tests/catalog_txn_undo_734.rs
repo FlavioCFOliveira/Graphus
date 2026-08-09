@@ -90,7 +90,7 @@ fn rolling_back_txn_discards_only_its_own_pending_catalog_ddl() {
     );
     assert_eq!(
         s.property_histogram(person, name),
-        Some(&[0xAAu8, 0xAA][..]),
+        Some([0xAAu8, 0xAA].to_vec()),
         "A's pending histogram must survive an unrelated transaction's rollback"
     );
 
@@ -107,7 +107,7 @@ fn rolling_back_txn_discards_only_its_own_pending_catalog_ddl() {
     );
     assert_eq!(
         s.property_histogram(person, age),
-        Some(baseline_hist.as_slice()),
+        Some(baseline_hist.clone()),
         "B's own replacement of a committed histogram must be undone by B's rollback"
     );
 
@@ -122,7 +122,7 @@ fn rolling_back_txn_discards_only_its_own_pending_catalog_ddl() {
     );
     assert_eq!(
         r.property_histogram(person, name),
-        Some(&[0xAAu8, 0xAA][..]),
+        Some([0xAAu8, 0xAA].to_vec()),
         "A's committed histogram must be durable"
     );
     assert_eq!(
@@ -137,7 +137,7 @@ fn rolling_back_txn_discards_only_its_own_pending_catalog_ddl() {
     );
     assert_eq!(
         r.property_histogram(person, age),
-        Some(baseline_hist.as_slice()),
+        Some(baseline_hist.clone()),
         "the committed baseline histogram must be untouched by B's rolled-back replacement"
     );
     assert_eq!(
@@ -184,7 +184,7 @@ fn durable_histogram_after_rolled_back_set(bystander: bool) -> Option<Vec<u8>> {
     }
 
     let r = reopen(s);
-    r.property_histogram(person, age).map(<[u8]>::to_vec)
+    r.property_histogram(person, age)
 }
 
 /// The ACID face of #734: a rolled-back catalog mutation must be discarded **regardless** of whether
@@ -310,7 +310,7 @@ fn a_rolled_back_drop_does_not_destroy_committed_catalog_state() {
     );
     assert_eq!(
         r.property_histogram(person, age),
-        Some(baseline_hist.as_slice()),
+        Some(baseline_hist.clone()),
         "a rolled-back DROP must leave the committed histogram intact"
     );
 }
@@ -395,13 +395,13 @@ fn out_of_order_aborts_on_one_entry_restore_the_committed_value() {
 
     assert_eq!(
         s.property_histogram(person, age),
-        Some(committed.as_slice()),
+        Some(committed.clone()),
         "after both writers aborted, the entry must hold the committed value — not T1's aborted write"
     );
     let r = reopen(s);
     assert_eq!(
         r.property_histogram(person, age),
-        Some(committed.as_slice()),
+        Some(committed.clone()),
         "the aborted value must not be durable either"
     );
 }
@@ -434,7 +434,7 @@ fn out_of_order_aborts_unwind_an_interleaved_chain() {
 
     assert_eq!(
         s.property_histogram(person, age),
-        Some(committed.as_slice()),
+        Some(committed.clone()),
         "an interleaved chain must unwind all the way back to the committed value"
     );
 }
@@ -472,13 +472,13 @@ fn three_concurrent_writers_on_one_entry_unwind_in_any_abort_order() {
 
         assert_eq!(
             s.property_histogram(person, age),
-            Some(committed.as_slice()),
+            Some(committed.clone()),
             "abort order {order:?}: three aborted writers must leave the committed value"
         );
         let r = reopen(s);
         assert_eq!(
             r.property_histogram(person, age),
-            Some(committed.as_slice()),
+            Some(committed.clone()),
             "abort order {order:?}: no aborted value may be durable"
         );
     }
@@ -518,7 +518,7 @@ fn an_out_of_order_abort_does_not_publish_its_value_through_a_checkpoint() {
     let r = reopen(s);
     assert_eq!(
         r.property_histogram(person, age),
-        Some(committed.as_slice()),
+        Some(committed.clone()),
         "the checkpoint published a value written only by an aborted transaction"
     );
 }
@@ -545,10 +545,7 @@ fn the_generation_map_and_the_catalog_agree_after_a_no_net_change_rollback() {
     s.begin(t1);
     s.set_property_histogram(t1, person, age, vec![0x11u8]);
     s.rollback(t1).unwrap();
-    assert_eq!(
-        s.property_histogram(person, age),
-        Some(committed.as_slice())
-    );
+    assert_eq!(s.property_histogram(person, age), Some(committed.clone()));
 
     // If the generation map were left stamped with T1's (now-reverted) generation, this second write
     // would record a `prev` chained to a generation the catalog no longer reflects, and its own
@@ -560,15 +557,12 @@ fn the_generation_map_and_the_catalog_agree_after_a_no_net_change_rollback() {
 
     assert_eq!(
         s.property_histogram(person, age),
-        Some(committed.as_slice()),
+        Some(committed.clone()),
         "a later writer's rollback restored a stale generation's value"
     );
     s.rollback(idle).unwrap();
     let r = reopen(s);
-    assert_eq!(
-        r.property_histogram(person, age),
-        Some(committed.as_slice())
-    );
+    assert_eq!(r.property_histogram(person, age), Some(committed.clone()));
 }
 
 /// The undo's last-writer test must be an **owner** test, not a value test.
@@ -606,7 +600,7 @@ fn a_rollback_does_not_revert_a_concurrent_identical_write() {
     s.rollback(t1).unwrap();
     assert_eq!(
         s.property_histogram(person, age),
-        Some(identical.as_slice()),
+        Some(identical.clone()),
         "T1's rollback reverted T2's identical-valued write (ABA)"
     );
     assert_eq!(
@@ -621,7 +615,7 @@ fn a_rollback_does_not_revert_a_concurrent_identical_write() {
     let r = reopen(s);
     assert_eq!(
         r.property_histogram(person, age),
-        Some(identical.as_slice()),
+        Some(identical.clone()),
         "T2's committed histogram was not persisted"
     );
     assert_eq!(
@@ -665,7 +659,7 @@ fn identical_concurrent_writes_both_rolling_back_restore_the_committed_value() {
 
     assert_eq!(
         s.property_histogram(person, age),
-        Some(committed.as_slice()),
+        Some(committed.clone()),
         "both writers aborted: the committed histogram must be restored"
     );
     assert_eq!(
@@ -676,7 +670,7 @@ fn identical_concurrent_writes_both_rolling_back_restore_the_committed_value() {
     let r = reopen(s);
     assert_eq!(
         r.property_histogram(person, age),
-        Some(committed.as_slice()),
+        Some(committed.clone()),
         "the aborted histogram must not be durable"
     );
     assert_eq!(

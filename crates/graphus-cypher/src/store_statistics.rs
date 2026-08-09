@@ -121,7 +121,7 @@ pub(crate) fn decode_histogram<D: BlockDevice, S: LogSink>(
     let Some(bytes) = store.property_histogram(label_token, prop_token) else {
         return Ok(None);
     };
-    PropertyHistogram::decode(bytes).map(Some).map_err(|e| {
+    PropertyHistogram::decode(&bytes).map(Some).map_err(|e| {
         GraphusError::Storage(format!(
             "corrupt property histogram for ({label}.{property}): {e}"
         ))

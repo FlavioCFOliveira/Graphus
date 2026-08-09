@@ -346,7 +346,7 @@ fn colliding_auto_name_rebuild_keeps_one_name_per_target_and_reopens() {
     // duplicate target), and re-opening the real store succeeds.
     let decoded = graphus_storage::Statistics::decode(&stats.encode())
         .expect("the resulting image must reopen (not be rejected as a duplicate target)");
-    assert_eq!(&decoded, stats);
+    assert_eq!(decoded, *stats);
     let recovered = recover_no_force(&store);
     let coord = TxnCoordinator::new(recovered); // panics via `open`'s decode if the image were invalid.
     assert_eq!(

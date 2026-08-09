@@ -524,7 +524,7 @@ fn a_catalogue_image_without_the_projections_decodes_them_empty() {
 
     // Re-encode the same catalogue with both projections emptied: that image is byte-identical to what
     // a pre-#856 build would have written, since the two blocks are last and encode as a zero count.
-    let mut without = s.statistics().clone();
+    let mut without = (*s.statistics()).clone();
     without.rels_per_start_label_type.clear();
     without.rels_per_type_end_label.clear();
     let legacy = without.encode();

@@ -374,15 +374,23 @@ and for the **WAL rule** (a dirty page may not be flushed until the WAL is durab
   ranks in ascending order, innermost last: **10** catalog / DDL, **20** commit sequencer and
   active-transaction table, **25** the per-store physical-id allocation latch, **27** the chain-head
   publication latch (§5.7.1), **30** the WAL, **40** the buffer-pool frame latch, **50** the
-  page-table shard, **60** the device and the doublewrite stager. An acquisition out of rank order is
-  permitted only as a `try_lock`, which creates no wait edge. Ranks 25 and 27 admit **at most one
-  holder per thread**: two locks of the same rank cannot be ordered by rank at all, so two threads
-  that acquire a different pair in a different order deadlock. Both are also **released before any
-  I/O** — held across store growth, across a page fetch that may evict, or across a durability
-  barrier, either one convoys every writer that shares it behind a single `fdatasync`. Debug builds
-  check both obligations mechanically, with thread-local tripwires (`graphus_core::latch`) armed at
-  the WAL barrier, at `BufferPool::fetch` and at the store-page growth path; a release build pays
-  nothing for them.
+  page-table shard, **60** the device and the doublewrite stager. Rank **22**, the GC's maintenance
+  latch, sits between 20 and 25 (task #1014). An acquisition out of rank order is permitted only as a
+  `try_lock`, which creates no wait edge. Ranks 10, 22, 25 and 27 admit **at most one holder per
+  thread**: two locks of the same rank cannot be ordered by rank at all, so two threads that acquire a
+  different pair in a different order deadlock. Ranks 25 and 27 are also **released before any I/O** —
+  held across store growth, across a page fetch that may evict, or across a durability barrier, either
+  one convoys every writer that shares it behind a single `fdatasync`.
+
+  The two ends of the order are pinned from opposite directions, and mechanically. Rank **22** is a
+  **leaf**: nothing may be acquired while it is held, so a GC pass snapshots the set it is draining and
+  works with the latch dropped (task #1014). Rank **10**, the catalog latch (task #1015), is the
+  **root**: it refuses to be entered while any inner latch is held, so it is taken first or not at all
+  — and, being outermost, it is the one latch that MAY span I/O, because the operation it protects (a
+  checkpoint of the catalog) *is* the I/O. Debug builds check every one of these obligations with
+  thread-local tripwires (`graphus_core::latch`) armed at the WAL barrier, at `BufferPool::fetch`, at
+  the store-page growth path and at each scope's own construction; a release build pays nothing for
+  them.
 
 ### 3.4 Eviction
 

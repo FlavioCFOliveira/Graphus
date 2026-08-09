@@ -2193,10 +2193,10 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 let (Some(label), Some(property)) = (
                     store
                         .token_name(Namespace::Label, label_token)
-                        .map(str::to_owned),
+                        .map(|n| n.to_string()),
                     store
                         .token_name(Namespace::PropKey, prop_key)
-                        .map(str::to_owned),
+                        .map(|n| n.to_string()),
                 ) else {
                     continue;
                 };
@@ -4490,7 +4490,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let txn = TxnId(self.next_txn_id);
         self.store.borrow_mut().begin(txn);
         {
-            let mut store = self.store.borrow_mut();
+            let store = self.store.borrow_mut();
             store.remove_rel_property_index(txn, type_token, prop_key);
             store.remove_rel_property_index_name(txn, name);
         }
@@ -4768,7 +4768,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 let property = store.token_name(Namespace::PropKey, prop_key)?;
                 let name = store
                     .rel_property_index_name_for(type_token, prop_key)
-                    .unwrap_or_else(|| auto_rel_index_name(rel_type, property));
+                    .unwrap_or_else(|| auto_rel_index_name(&rel_type, &property));
                 Some((name, rel_type.to_owned(), property.to_owned(), state))
             })
             .collect()
@@ -4800,7 +4800,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let txn = TxnId(self.next_txn_id);
         self.store.borrow_mut().begin(txn);
         let (label_token, prop_key) = {
-            let mut store = self.store.borrow_mut();
+            let store = self.store.borrow_mut();
             let label_token = match store.intern_token(Namespace::Label, label) {
                 Ok(t) => t,
                 Err(e) => {
@@ -4860,7 +4860,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let txn = TxnId(self.next_txn_id);
         self.store.borrow_mut().begin(txn);
         let (label_token, prop_key) = {
-            let mut store = self.store.borrow_mut();
+            let store = self.store.borrow_mut();
             let label_token = match store.intern_token(Namespace::Label, label) {
                 Ok(t) => t,
                 Err(e) => {
@@ -5014,7 +5014,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let txn = TxnId(self.next_txn_id);
         self.store.borrow_mut().begin(txn);
         let (label_token, prop_key) = {
-            let mut store = self.store.borrow_mut();
+            let store = self.store.borrow_mut();
             let label_token = match store.intern_token(Namespace::Label, label) {
                 Ok(t) => t,
                 Err(e) => {
@@ -5579,7 +5579,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let txn = TxnId(self.next_txn_id);
         self.store.borrow_mut().begin(txn);
         let (label_token, property_tokens, effective_name) = {
-            let mut store = self.store.borrow_mut();
+            let store = self.store.borrow_mut();
             let label_token = match store.intern_token(Namespace::Label, label) {
                 Ok(t) => t,
                 Err(e) => {
@@ -5998,7 +5998,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let txn = TxnId(self.next_txn_id);
         self.store.borrow_mut().begin(txn);
         let entry = {
-            let mut store = self.store.borrow_mut();
+            let store = self.store.borrow_mut();
             let mut label_tokens = Vec::with_capacity(labels.len());
             for label in labels {
                 match store.intern_token(Namespace::Label, label) {
@@ -6113,7 +6113,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let txn = TxnId(self.next_txn_id);
         self.store.borrow_mut().begin(txn);
         let entry = {
-            let mut store = self.store.borrow_mut();
+            let store = self.store.borrow_mut();
             let mut type_tokens = Vec::with_capacity(types.len());
             for ty in types {
                 match store.intern_token(Namespace::RelType, ty) {
@@ -6342,7 +6342,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let txn = TxnId(self.next_txn_id);
         self.store.borrow_mut().begin(txn);
         let (label_token, prop_key) = {
-            let mut store = self.store.borrow_mut();
+            let store = self.store.borrow_mut();
             let label_token = match store.intern_token(Namespace::Label, label) {
                 Ok(t) => t,
                 Err(e) => {
@@ -6441,7 +6441,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let txn = TxnId(self.next_txn_id);
         self.store.borrow_mut().begin(txn);
         {
-            let mut store = self.store.borrow_mut();
+            let store = self.store.borrow_mut();
             let type_token = match store.intern_token(Namespace::RelType, rel_type) {
                 Ok(t) => t,
                 Err(e) => {
@@ -6705,7 +6705,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let txn = TxnId(self.next_txn_id);
         self.store.borrow_mut().begin(txn);
         let (label_token, prop_key) = {
-            let mut store = self.store.borrow_mut();
+            let store = self.store.borrow_mut();
             let label_token = match store.intern_token(Namespace::Label, label) {
                 Ok(t) => t,
                 Err(e) => {
@@ -6971,7 +6971,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let txn = TxnId(self.next_txn_id);
         self.store.borrow_mut().begin(txn);
         let (token, prop_key) = {
-            let mut store = self.store.borrow_mut();
+            let store = self.store.borrow_mut();
             let token = match store.intern_token(namespace, covering) {
                 Ok(t) => t,
                 Err(e) => {
@@ -7779,7 +7779,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             Namespace::Label
         };
         let intern = (|| -> Result<(u32, Vec<u32>)> {
-            let mut store = self.store.borrow_mut();
+            let store = self.store.borrow_mut();
             let label_token = store.intern_token(covering_ns, label)?;
             let mut prop_keys = Vec::with_capacity(properties.len());
             for property in properties {
@@ -9015,7 +9015,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             Some(
                 store
                     .node_property_index_name_for(b.label_token, b.prop_key)
-                    .unwrap_or_else(|| auto_index_name(label, property)),
+                    .unwrap_or_else(|| auto_index_name(&label, &property)),
             )
         };
 
@@ -10289,7 +10289,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let txn = TxnId(self.next_txn_id);
         self.store.borrow_mut().begin(txn);
         {
-            let mut store = self.store.borrow_mut();
+            let store = self.store.borrow_mut();
             store.remove_node_property_index(txn, label_token, prop_key);
             store.remove_node_property_index_name(txn, name);
         }
@@ -10339,7 +10339,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 let property = store.token_name(Namespace::PropKey, prop_key)?;
                 let name = store
                     .node_property_index_name_for(label_token, prop_key)
-                    .unwrap_or_else(|| auto_index_name(label, property));
+                    .unwrap_or_else(|| auto_index_name(&label, &property));
                 Some((name, label.to_owned(), property.to_owned(), state))
             })
             .collect()

@@ -224,7 +224,7 @@ fn a_catalogue_without_directional_counts_reports_unknown_not_zero() {
     );
     let store = graph.rollback().expect("read-only rollback");
 
-    let mut store = store;
+    let store = store;
     store.clear_directional_rel_counts_for_test();
     let graph = RecordStoreGraph::begin(store, TxnId(1001));
     let stats = graph.statistics().expect("statistics present");

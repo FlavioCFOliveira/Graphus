@@ -348,9 +348,7 @@ pub fn run_multi_holder_out_of_order_abort(order: [usize; 3], crash: Crash) -> O
         Crash::NoForce => crash_no_force(store),
         Crash::Steal => crash_steal(store),
     };
-    recovered
-        .property_histogram(person, age)
-        .map(<[u8]>::to_vec)
+    recovered.property_histogram(person, age)
 }
 
 #[cfg(test)]

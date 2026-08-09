@@ -279,9 +279,12 @@ fn key_name<D: BlockDevice, S: LogSink>(
     ns: Namespace,
     id: u32,
 ) -> Result<String> {
-    store.token_name(ns, id).map(str::to_owned).ok_or_else(|| {
-        graphus_core::GraphusError::Storage(format!("dump: unknown {ns:?} token id {id}"))
-    })
+    store
+        .token_name(ns, id)
+        .map(|n| n.to_string())
+        .ok_or_else(|| {
+            graphus_core::GraphusError::Storage(format!("dump: unknown {ns:?} token id {id}"))
+        })
 }
 
 /// Converts a `csv` writer error into a [`graphus_core::GraphusError`].

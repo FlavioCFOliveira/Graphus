@@ -387,7 +387,7 @@ impl<D: BlockDevice, S: LogSink> StoreReadSource for LiveSource<'_, D, S> {
         self.0.token_id(ns, name)
     }
     fn token_name(&self, ns: Namespace, id: u32) -> Option<String> {
-        self.0.token_name(ns, id).map(ToOwned::to_owned)
+        self.0.token_name(ns, id).map(|n| n.to_string())
     }
 }
 

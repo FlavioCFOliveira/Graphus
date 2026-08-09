@@ -1,8 +1,10 @@
 //! **Lock-held tripwires**: debug-build guards proving that no durability barrier is ever issued
 //! while a lock that must not span I/O is held.
 //!
-//! Five are defined here:
+//! Six are defined here:
 //!
+//! * the **catalog-latch tripwire** ([`CatalogLatchScope`], `rmp` #1015) — the outermost latch, over
+//!   the tokens, the schema counters, the metadata page chain and the DDL catalog;
 //! * the **frame-latch tripwire** ([`FrameLatchScope`], `rmp` #974) — the buffer pool's per-frame
 //!   latch;
 //! * the **doublewrite-lock tripwire** ([`DwbLockScope`], `rmp` #993) — the mutex guarding the
@@ -630,6 +632,109 @@ pub fn assert_no_maintenance_latch_held(site: &str) {
         );
     }
     let _ = site;
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static CATALOG_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether the current thread holds the catalog latch — `0` or `1`, never more (`rmp` #1015).
+#[cfg(debug_assertions)]
+#[must_use]
+pub fn catalog_latch_depth() -> u32 {
+    CATALOG_DEPTH.with(std::cell::Cell::get)
+}
+
+/// Whether the current thread holds the catalog latch. Always `0` in a release build.
+#[cfg(not(debug_assertions))]
+#[must_use]
+pub const fn catalog_latch_depth() -> u32 {
+    0
+}
+
+/// An RAII marker for a region in which the current thread holds the record store's **catalog latch**
+/// (`rmp` #1015): the one lock over the token store, the schema generation counters, the metadata page
+/// chain and the statistics/DDL catalog.
+///
+/// # The rank, and the rule it encodes
+///
+/// Rank **10** — the OUTERMOST latch in the order (see [`AllocLatchScope`] for the full list), and
+/// that direction is the design rather than a leftover. A DDL mutation touches the catalog and then,
+/// at commit, walks straight down through the active-transaction table (20), the allocator (25), the
+/// WAL (30) and the device (60). Taking the catalog first makes every one of those acquisitions
+/// *inward*, so no thread can hold an inner latch and then reach back out for the catalog — and a
+/// cycle needs exactly one thread doing that.
+///
+/// The scope enforces it: entering while ANY inner latch is held is a rank inversion and panics in a
+/// debug build. That is the mirror image of [`MaintenanceLatchScope`], which is a leaf and forbids
+/// acquiring anything *under* it; between them the two ends of the order are pinned.
+///
+/// Unlike the maintenance latch this one MAY be held across I/O, deliberately: it sits above the WAL
+/// in the order, and the operation it protects — checkpointing the catalog — *is* the I/O. What it
+/// must not do is stand in the OLTP path's way, and it does not: a data transaction that changes no
+/// catalog entry takes it only to read one flag.
+///
+/// # Why this is a latch and not a version chain
+///
+/// This makes concurrent DDL **safe**; it does not make the catalog **versioned**. A catalog mutation
+/// still becomes visible to every transaction the moment the latch is released, and a rollback still
+/// replays the transaction-scoped undo of `rmp` #734. Versioning the catalog under the same undo-chain
+/// mechanism as records — so a reader sees the catalog as of its own snapshot — is `rmp` #984, and it
+/// is a different change in kind: it alters what other transactions SEE, where this one only decides
+/// who may touch the state at the same instant. Keeping them apart is deliberate; conflating them
+/// would land a visibility change under tests that say nothing about visibility.
+#[derive(Debug)]
+pub struct CatalogLatchScope {
+    _private: std::marker::PhantomData<*const ()>,
+}
+
+impl CatalogLatchScope {
+    /// Enters a catalog-latch region on the current thread.
+    ///
+    /// # Panics
+    /// Panics in a debug build if this thread already holds the catalog latch (rank 10 is not
+    /// re-entrant), or if it holds any inner latch — rank 10 is taken first or not at all. Compiled
+    /// out in release.
+    #[must_use]
+    #[inline]
+    pub fn new() -> Self {
+        #[cfg(debug_assertions)]
+        {
+            assert_no_frame_latch_held("CatalogLatchScope::new");
+            assert_no_maintenance_latch_held("CatalogLatchScope::new");
+            assert_no_alloc_latch_held("CatalogLatchScope::new");
+            assert_no_chain_head_latch_held("CatalogLatchScope::new");
+            CATALOG_DEPTH.with(|d| {
+                assert!(
+                    d.get() == 0,
+                    "a second catalog latch was taken while this thread already holds one. Rank 10 \
+                     is not re-entrant and admits one holder per thread (`rmp` #1015): two locks of \
+                     the same rank cannot be ordered by rank, so two threads acquiring a different \
+                     pair in a different order deadlock. Perform the whole catalog mutation inside \
+                     ONE `with_catalog` (see `graphus_core::latch`)."
+                );
+                d.set(1);
+            });
+        }
+        Self {
+            _private: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Default for CatalogLatchScope {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for CatalogLatchScope {
+    #[inline]
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        CATALOG_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
 }
 
 #[cfg(test)]

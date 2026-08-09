@@ -1117,6 +1117,213 @@ pub type DirectionalRelCounts = (
 /// across I/O. Draining a set therefore means *snapshotting it under the latch and working with the
 /// latch dropped* — see [`RecordStore::with_maintenance`], and
 /// [`graphus_core::latch::MaintenanceLatchScope`] for the tripwire that enforces it.
+/// **The record store's catalog, behind one latch** (`rmp` #1015, layer 6 of #975): the token
+/// dictionary, the two schema-generation counters, the metadata page chain, the catalog-dirty flag,
+/// the reload counter, and the statistics/DDL catalog itself.
+///
+/// # Why these seven, and why one lock
+///
+/// They are one lock because they are one *transition*. A DDL mutation interns the tokens its entry
+/// names, writes the entry into the statistics catalog, stamps a new schema generation, records the
+/// previous generation for the undo, and marks the catalog dirty so the commit cannot take the
+/// read-only fast path. A reader that saw half of that would see an index that exists under a token
+/// that does not, or a generation that no undo claims. Separate locks would make each step atomic and
+/// the transition not atomic at all — which is the weaker guarantee wearing more machinery.
+///
+/// One lock is also enough. This is **DDL cadence, not OLTP cadence**: declarations, constraints and
+/// histograms are minted by schema changes, not by row writes. The one hot-path visitor is the
+/// commit's read-only check, which reads a single flag.
+///
+/// # An `RwLock`, because the catalog is read-mostly by construction
+///
+/// Every query plan consults it — which indexes exist, their state, the selectivity histograms — while
+/// only DDL writes it. A `Mutex` would serialise the planner against itself and hand the sprint's
+/// multi-writer engine a single-reader catalog, so the split is not an optimisation but the point.
+/// The same reasoning, and the same conclusion, as `commit_registry` in layer 5a (`rmp` #1013).
+///
+/// # This is a LATCH, not a version chain — and the difference is the whole of `rmp` #984
+///
+/// What lands here decides **who may touch the catalog at the same instant**. It does not change
+/// **what any transaction sees**: a catalog mutation is still visible to everyone the moment the write
+/// guard drops, and a rollback still replays the transaction-scoped undo of `rmp` #734 rather than
+/// walking a version chain. Giving the catalog MVCC visibility — so a reader sees the catalog as of
+/// its own snapshot, and a concurrent DDL is invisible until it commits — is `rmp` #984, deliberately
+/// left alone here. Doing both at once would land a visibility change under tests that only speak
+/// about mutual exclusion, and the two failure modes look nothing alike.
+#[derive(Debug)]
+struct CatalogState {
+    tokens: Arc<TokenStore>,
+    /// Set whenever a **catalog-only** mutation (one that changes durable [`Meta`] state *without*
+    /// logging a WAL data record) has run since the last checkpoint — token interning
+    /// ([`intern_token`](RecordStore::intern_token)) and the histogram / index / full-text / spatial /
+    /// constraint declarations. It is the second half of the read-only-commit signal (`rmp` #529):
+    /// [`commit`](RecordStore::commit) takes its zero-append/zero-`fdatasync` fast path only when the
+    /// transaction both logged no WAL data record (`WalManager::is_active` is false) **and** dirtied no
+    /// catalog here, because such a mutation is durable **only** via the commit-time
+    /// [`checkpoint_meta`](RecordStore::checkpoint_meta) the fast path would otherwise skip. Cleared after any
+    /// durable commit persists the catalog and on [`rollback`](RecordStore::rollback) (which reloads it) —
+    /// in both cases **only if no still-open transaction holds pending schema DDL**, which a checkpoint
+    /// deliberately does not persist (`rmp` #734, [`committed_statistics`](RecordStore::committed_statistics)).
+    /// The count mutators (`inc_node`/`inc_rel`/…) are *not* tracked here: they only ever run inside a
+    /// record-writing operation, so `WalManager::is_active` already covers them.
+    catalog_dirty: bool,
+    /// How many times [`reload_catalog`](RecordStore::reload_catalog) has rebuilt the in-memory catalog from
+    /// the durable metadata page (`rmp` #970, and observability for #985).
+    ///
+    /// It is here because it is the one **deterministic** witness of the cost `rmp` #970 removed from
+    /// the abort path: a reload is `O(free list + token dictionary + schema)`, i.e. `O(store)`, and
+    /// the whole `pre_free` / `pre_tokens` / `pre_statistics` snapshot family existed only to put
+    /// back what it threw away. A data transaction's rollback must not perform one — asserted by
+    /// `tests/rollback_cost_970.rs` without measuring a clock.
+    catalog_reloads: u64,
+    /// Monotonic stamp handed to each [`SchemaUndo`] so catalog mutations carry a **store-global**
+    /// order (`rmp` #734). Purely in-memory: undo logs never outlive the transactions that own them,
+    /// so this needs no durability and is not part of [`Meta`].
+    schema_seq: u64,
+    /// The generation ([`SchemaUndo::seq`]) of the most recent mutation of each schema-catalog entry
+    /// (`rmp` #734) — the **owner witness** an undo is conditioned on.
+    ///
+    /// Answers "am I still the last writer of this entry?" without comparing values, so an undo can
+    /// tell "nobody wrote since" apart from "somebody wrote the identical value since". Bounded by the
+    /// number of distinct catalog entries ever mutated in this process (tens, in practice: one per
+    /// declared index, name, constraint or histogram), and purely in-memory — a stamp left behind by a
+    /// long-resolved transaction is inert, because generations are unique and never reissued, so no
+    /// live undo entry can ever match it by accident.
+    schema_last_seq: HashMap<SchemaKey, u64>,
+    /// The metadata **continuation** pages (device ids of the catalog chain after [`META_PAGE`]),
+    /// in chain order (`rmp` task #51). Rebuilt from disk on open/recovery by walking the chain, and
+    /// grown on demand at [`checkpoint_meta`](RecordStore::checkpoint_meta) when the encoded catalog needs
+    /// more than the head page. Device-page maps only ever grow, so this list never shrinks; it is
+    /// surfaced through [`mapped_pages`](RecordStore::mapped_pages) so backup, the consistency checker and
+    /// the crash-recovery harness treat these as part of the durable image.
+    meta_chain: Vec<PageId>,
+    /// Exact, persisted live-record cardinalities for the planner's cardinality estimator
+    /// (`rmp` task #79): per-label node counts and per-relationship-type counts. Part of the durable
+    /// catalog ([`Meta`]) — mutated incrementally on the committed transitions that change a record's
+    /// live label/type contribution (`create_rel`, `delete_node`/`delete_rel`, the label-set
+    /// mutators), snapshotted at [`checkpoint_meta`](RecordStore::checkpoint_meta) and reloaded wholesale on
+    /// rollback / [`open`](RecordStore::open), so it shares the id high-water marks' durability lifecycle and
+    /// is correct after abort and after crash recovery. See [`Statistics`].
+    statistics: Arc<Statistics>,
+}
+
+/// A **borrow of the statistics catalog**, holding the rank-10 catalog latch open for as long as it
+/// lives (`rmp` #1015).
+///
+/// [`RecordStore::statistics`] used to hand out `&Statistics` straight out of the struct. Once the
+/// catalog moved behind a lock that reference had nowhere to borrow from — a reference into shared
+/// state is exactly what a lock exists to prevent — and the two honest replacements are "clone the
+/// whole catalog on every call" or "hand back the read guard". This is the second: the caller keeps
+/// writing `store.statistics().total_nodes()` and pays nothing, and a caller that needs the borrow for
+/// longer holds a value that says so.
+///
+/// # What holding one means
+///
+/// The catalog latch is held, shared, until this is dropped. Other readers proceed (that is what an
+/// `RwLock` buys, and the planner is all readers); a DDL writer waits. So: do not park one across a
+/// long computation, and never take one and then perform DDL on the same thread — the write would
+/// wait on a guard only that thread can release. In a debug build the second is caught rather than
+/// hung, by the re-entrancy assertion in
+/// [`CatalogLatchScope`](graphus_core::latch::CatalogLatchScope).
+#[derive(Debug)]
+pub struct StatisticsRef<'a> {
+    /// Ordering matters: this is declared FIRST so it drops LAST. The scope's tripwire must still see
+    /// the latch as held while the guard is being released, or a `Drop` ordering change would silently
+    /// disarm it.
+    _scope: graphus_core::latch::CatalogLatchScope,
+    guard: std::sync::RwLockReadGuard<'a, CatalogState>,
+}
+
+/// A **borrowed token name**, holding the rank-10 catalog latch open for as long as it lives
+/// (`rmp` #1015).
+///
+/// [`RecordStore::token_name`] returned `&str` straight out of the token dictionary. Behind a lock
+/// that is not expressible, and the cheap-looking replacement — return `String` — puts one allocation
+/// on every label, type and property name resolved, which is once per column per row on the result
+/// path. This hands back the hold instead, so the common uses (`format!`, `to_owned`, comparison via
+/// `&*`) cost exactly what they did.
+///
+/// The same caution as [`StatisticsRef`] applies, and more sharply because these are short-lived by
+/// nature: do not park one, and never hold one across DDL on the same thread.
+#[derive(Debug)]
+pub struct TokenNameRef {
+    /// A share of the dictionary, NOT a hold on the catalog latch. Holding the latch here would make
+    /// `store.token_name(..)` a lock that outlives the statement it appears in — and two of them in
+    /// one expression a recursive read, which `std::sync::RwLock` documents as a possible deadlock.
+    /// The dictionary is copy-on-write, so a share is enough to keep the name alive and costs one
+    /// refcount.
+    tokens: Arc<TokenStore>,
+    ns: Namespace,
+    id: u32,
+}
+
+impl std::ops::Deref for TokenNameRef {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        // INVARIANT: `token_name` resolved this id under this very hold before constructing the ref,
+        // and a token is never removed or renamed — the dictionary is append-only.
+        self.tokens
+            .name(self.ns, self.id)
+            .expect("INVARIANT: token resolved under this hold, and tokens are never removed")
+    }
+}
+
+impl std::fmt::Display for TokenNameRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self)
+    }
+}
+
+impl From<TokenNameRef> for String {
+    fn from(name: TokenNameRef) -> Self {
+        name.to_string()
+    }
+}
+
+impl PartialEq<str> for TokenNameRef {
+    fn eq(&self, other: &str) -> bool {
+        &**self == other
+    }
+}
+
+impl PartialEq<&str> for TokenNameRef {
+    fn eq(&self, other: &&str) -> bool {
+        &**self == *other
+    }
+}
+
+/// An exclusive borrow of the whole [`CatalogState`], holding the rank-10 latch for its lifetime
+/// (`rmp` #1015). See [`RecordStore::catalog_write`].
+#[derive(Debug)]
+struct CatalogWrite<'a> {
+    /// Declared first so it drops last — the tripwire must outlive the guard it describes.
+    _scope: graphus_core::latch::CatalogLatchScope,
+    guard: std::sync::RwLockWriteGuard<'a, CatalogState>,
+}
+
+impl std::ops::Deref for CatalogWrite<'_> {
+    type Target = CatalogState;
+
+    fn deref(&self) -> &CatalogState {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for CatalogWrite<'_> {
+    fn deref_mut(&mut self) -> &mut CatalogState {
+        &mut self.guard
+    }
+}
+
+impl std::ops::Deref for StatisticsRef<'_> {
+    type Target = Statistics;
+
+    fn deref(&self) -> &Statistics {
+        &self.guard.statistics
+    }
+}
+
 #[derive(Debug, Default)]
 struct Maintenance {
     /// Reclaim candidates: per-kind physical ids of MVCC tombstones (`xmax` set) awaiting reclamation
@@ -1201,7 +1408,11 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     pool: Arc<ConcurrentBufferPool<D, SharedWal<S>>>,
     wal: SharedWal<S>,
     element_ids: ElementIdAllocator,
-    tokens: TokenStore,
+    /// **The catalog, behind ONE latch** (`rmp` #1015, layer 6 of #975): the token
+    /// dictionary, the schema-generation counters, the metadata page chain and the
+    /// statistics/DDL catalog. See [`CatalogState`] for what each field is and why they
+    /// share a lock, and [`graphus_core::latch::CatalogLatchScope`] for the rank.
+    catalog: RwLock<CatalogState>,
     stores: [FixedStore; STORE_COUNT],
     /// The largest MVCC commit timestamp issued so far (`04 §5.2`); persisted in [`Meta`] so it
     /// resumes monotonically after reopen. The next commit timestamp is `commit_ts_hw + 1`, and a
@@ -1236,50 +1447,6 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// Per-open-transaction version-stamp bookkeeping, consumed at [`commit`](Self::commit) to
     /// settle in-flight headers to the commit timestamp (`04 §5.2`).
     active: ActiveTable,
-    /// Set whenever a **catalog-only** mutation (one that changes durable [`Meta`] state *without*
-    /// logging a WAL data record) has run since the last checkpoint — token interning
-    /// ([`intern_token`](Self::intern_token)) and the histogram / index / full-text / spatial /
-    /// constraint declarations. It is the second half of the read-only-commit signal (`rmp` #529):
-    /// [`commit`](Self::commit) takes its zero-append/zero-`fdatasync` fast path only when the
-    /// transaction both logged no WAL data record (`WalManager::is_active` is false) **and** dirtied no
-    /// catalog here, because such a mutation is durable **only** via the commit-time
-    /// [`checkpoint_meta`](Self::checkpoint_meta) the fast path would otherwise skip. Cleared after any
-    /// durable commit persists the catalog and on [`rollback`](Self::rollback) (which reloads it) —
-    /// in both cases **only if no still-open transaction holds pending schema DDL**, which a checkpoint
-    /// deliberately does not persist (`rmp` #734, [`committed_statistics`](Self::committed_statistics)).
-    /// The count mutators (`inc_node`/`inc_rel`/…) are *not* tracked here: they only ever run inside a
-    /// record-writing operation, so `WalManager::is_active` already covers them.
-    catalog_dirty: bool,
-    /// How many times [`reload_catalog`](Self::reload_catalog) has rebuilt the in-memory catalog from
-    /// the durable metadata page (`rmp` #970, and observability for #985).
-    ///
-    /// It is here because it is the one **deterministic** witness of the cost `rmp` #970 removed from
-    /// the abort path: a reload is `O(free list + token dictionary + schema)`, i.e. `O(store)`, and
-    /// the whole `pre_free` / `pre_tokens` / `pre_statistics` snapshot family existed only to put
-    /// back what it threw away. A data transaction's rollback must not perform one — asserted by
-    /// `tests/rollback_cost_970.rs` without measuring a clock.
-    catalog_reloads: u64,
-    /// Monotonic stamp handed to each [`SchemaUndo`] so catalog mutations carry a **store-global**
-    /// order (`rmp` #734). Purely in-memory: undo logs never outlive the transactions that own them,
-    /// so this needs no durability and is not part of [`Meta`].
-    schema_seq: u64,
-    /// The generation ([`SchemaUndo::seq`]) of the most recent mutation of each schema-catalog entry
-    /// (`rmp` #734) — the **owner witness** an undo is conditioned on.
-    ///
-    /// Answers "am I still the last writer of this entry?" without comparing values, so an undo can
-    /// tell "nobody wrote since" apart from "somebody wrote the identical value since". Bounded by the
-    /// number of distinct catalog entries ever mutated in this process (tens, in practice: one per
-    /// declared index, name, constraint or histogram), and purely in-memory — a stamp left behind by a
-    /// long-resolved transaction is inert, because generations are unique and never reissued, so no
-    /// live undo entry can ever match it by accident.
-    schema_last_seq: HashMap<SchemaKey, u64>,
-    /// The metadata **continuation** pages (device ids of the catalog chain after [`META_PAGE`]),
-    /// in chain order (`rmp` task #51). Rebuilt from disk on open/recovery by walking the chain, and
-    /// grown on demand at [`checkpoint_meta`](Self::checkpoint_meta) when the encoded catalog needs
-    /// more than the head page. Device-page maps only ever grow, so this list never shrinks; it is
-    /// surfaced through [`mapped_pages`](Self::mapped_pages) so backup, the consistency checker and
-    /// the crash-recovery harness treat these as part of the durable image.
-    meta_chain: Vec<PageId>,
     /// The Active/Recent Transaction Table (`04 §5.2`, `rmp` task #49). With **lazy GC-time header
     /// freezing**, [`commit`](Self::commit) no longer rewrites every version's header to settle its
     /// in-flight `TxnId` to the commit timestamp — it just records the `(TxnId → commit_ts)` here.
@@ -1480,14 +1647,6 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// store read that faulted. Non-zero means some orphaned index entries were left behind — safe,
     /// but it is the only signal that distinguishes that from having found nothing to collect.
     dead_index_keys_dropped: usize,
-    /// Exact, persisted live-record cardinalities for the planner's cardinality estimator
-    /// (`rmp` task #79): per-label node counts and per-relationship-type counts. Part of the durable
-    /// catalog ([`Meta`]) — mutated incrementally on the committed transitions that change a record's
-    /// live label/type contribution (`create_rel`, `delete_node`/`delete_rel`, the label-set
-    /// mutators), snapshotted at [`checkpoint_meta`](Self::checkpoint_meta) and reloaded wholesale on
-    /// rollback / [`open`](Self::open), so it shares the id high-water marks' durability lifecycle and
-    /// is correct after abort and after crash recovery. See [`Statistics`].
-    statistics: Statistics,
     /// Take an automatic checkpoint once this many WAL bytes have been appended since the last one
     /// (`04 §4.7`, `rmp` storage audit F3). `0` disables the automatic cadence (manual
     /// [`checkpoint`](Self::checkpoint) only). Bounds crash-recovery **redo** to roughly this much
@@ -1728,7 +1887,6 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             pool,
             wal: shared,
             element_ids: ElementIdAllocator::new(element_id_seed.max(1)),
-            tokens: TokenStore::new(),
             // One barrier for all six (`rmp` #1025) — see `SharedReuseBarrier`.
             stores: {
                 let barrier = Arc::<SharedReuseBarrier>::default();
@@ -1740,11 +1898,15 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             pending_write_commits: VecDeque::new(),
             durable_write_commit_ts_hw: 0,
             active: ActiveTable::default(),
-            catalog_dirty: false,
-            catalog_reloads: 0,
-            schema_seq: 0,
-            schema_last_seq: HashMap::default(),
-            meta_chain: Vec::new(),
+            catalog: RwLock::new(CatalogState {
+                tokens: Arc::new(TokenStore::new()),
+                catalog_dirty: false,
+                catalog_reloads: 0,
+                schema_seq: 0,
+                schema_last_seq: HashMap::default(),
+                meta_chain: Vec::new(),
+                statistics: Arc::new(Statistics::new()),
+            }),
             commit_registry: RwLock::new(CommitRegistry::new()),
             pending_gc_prune: None,
             // `rmp` #522 incremental-GC state (pure in-memory; rebuilt from scratch every open). The
@@ -1772,7 +1934,6 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             dead_index_keys: Vec::new(),
             dead_property_keys: 0,
             dead_index_keys_dropped: 0,
-            statistics: Statistics::new(),
             checkpoint_interval_bytes: DEFAULT_CHECKPOINT_INTERVAL_BYTES,
             wal_segment_sizing_adaptive: true,
             wal_len_at_last_checkpoint: 0,
@@ -1875,7 +2036,6 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             pool,
             wal: shared,
             element_ids: ElementIdAllocator::new(meta.element_id_next.max(1)),
-            tokens: meta.tokens,
             stores,
             commit_ts_hw: Arc::new(AtomicU64::new(meta.commit_ts_hw)),
             // Nothing is un-hardened at open (recovery truncated the un-synced WAL tail). Seed the
@@ -1887,11 +2047,15 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             pending_write_commits: VecDeque::new(),
             durable_write_commit_ts_hw: meta.commit_ts_hw,
             active: ActiveTable::default(),
-            catalog_dirty: false,
-            catalog_reloads: 0,
-            schema_seq: 0,
-            schema_last_seq: HashMap::default(),
-            meta_chain,
+            catalog: RwLock::new(CatalogState {
+                tokens: Arc::new(meta.tokens),
+                catalog_dirty: false,
+                catalog_reloads: 0,
+                schema_seq: 0,
+                schema_last_seq: HashMap::default(),
+                meta_chain,
+                statistics: Arc::new(meta.statistics),
+            }),
             commit_registry: RwLock::new(commit_registry),
             pending_gc_prune: None,
             // `rmp` #522 incremental-GC state (pure in-memory; rebuilt from scratch every open). The
@@ -1919,7 +2083,6 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             dead_index_keys: Vec::new(),
             dead_property_keys: 0,
             dead_index_keys_dropped: 0,
-            statistics: meta.statistics,
             checkpoint_interval_bytes: DEFAULT_CHECKPOINT_INTERVAL_BYTES,
             wal_segment_sizing_adaptive: true,
             wal_len_at_last_checkpoint: shared_len,
@@ -1984,6 +2147,62 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         f(&mut guard)
     }
 
+    /// Reads the catalog under a **shared** hold of the rank-10 catalog latch (`rmp` #1015).
+    ///
+    /// Shared, because the catalog is read-mostly by construction (see [`CatalogState`]): every query
+    /// plan asks it which indexes exist and how selective they are, and those asks must proceed in
+    /// parallel or the multi-writer engine gains a single-reader catalog. `f` therefore gets `&` and
+    /// cannot mutate — use [`with_catalog_mut`](Self::with_catalog_mut) for that.
+    ///
+    /// Rank 10 is the outermost latch, so `f` MAY go on to take inner latches, and the hold MAY span
+    /// I/O — the checkpoint that persists this catalog is exactly that. What `f` must not do is take
+    /// the catalog latch again: the scope's tripwire catches the re-entrancy that would otherwise
+    /// deadlock against a waiting writer.
+    ///
+    /// # Panics
+    /// Panics if the latch is poisoned — a previous holder panicked mid-update, so the catalog may be
+    /// half-written: an index recorded under a token that was never interned, or a generation no undo
+    /// claims. Serving reads from that is the fail-open direction.
+    /// Takes the catalog latch **exclusively** and hands back the guard. Used where a closure cannot serve —
+    /// `checkpoint_meta` writes the catalog it is reading, and a closure taking `&mut CatalogState`
+    /// cannot also borrow `self`. Sound because the catalog is the OUTERMOST latch: everything such a
+    /// path goes on to take is inner.
+    fn catalog_write(&self) -> CatalogWrite<'_> {
+        CatalogWrite {
+            _scope: graphus_core::latch::CatalogLatchScope::new(),
+            guard: self.catalog.write().expect(
+                "INVARIANT: a poisoned catalog latch means a half-applied DDL (`rmp` #1015)",
+            ),
+        }
+    }
+
+    fn with_catalog<R>(&self, f: impl FnOnce(&CatalogState) -> R) -> R {
+        let _scope = graphus_core::latch::CatalogLatchScope::new();
+        let guard = self
+            .catalog
+            .read()
+            .expect("INVARIANT: a poisoned catalog latch means a half-applied DDL (`rmp` #1015)");
+        f(&guard)
+    }
+
+    /// Mutates the catalog under an **exclusive** hold of the rank-10 catalog latch (`rmp` #1015).
+    ///
+    /// The whole mutation belongs inside one call. A DDL change interns its tokens, writes its entry,
+    /// stamps a generation, records the previous one for the undo and marks the catalog dirty; split
+    /// across two calls, another thread observes the half — see [`CatalogState`] for why those five
+    /// steps are one transition.
+    ///
+    /// # Panics
+    /// Panics if the latch is poisoned, for the reason given on [`with_catalog`](Self::with_catalog).
+    fn with_catalog_mut<R>(&self, f: impl FnOnce(&mut CatalogState) -> R) -> R {
+        let _scope = graphus_core::latch::CatalogLatchScope::new();
+        let mut guard = self
+            .catalog
+            .write()
+            .expect("INVARIANT: a poisoned catalog latch means a half-applied DDL (`rmp` #1015)");
+        f(&mut guard)
+    }
+
     /// # Errors
     /// Returns a storage error if any store's catalog entry would be internally inconsistent — see
     /// [`FixedStore::to_meta`], which is where the `high_water <= capacity` floor lives.
@@ -2004,7 +2223,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             element_id_next: self.element_ids.peek(),
             commit_ts_hw: self.commit_ts_hw.load(Ordering::Acquire),
             stores,
-            tokens: self.tokens.clone(),
+            tokens: self.with_catalog(|c| (*c.tokens).clone()),
             // Clones the whole `Statistics` (counts *and* the `rmp` task #81 property-histogram map):
             // the histogram blobs ride the same checkpoint-at-commit path as the counts with no
             // special-casing — `Statistics` is cloned structurally. The SCHEMA half is taken from the
@@ -2548,7 +2767,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // a valid checksum); the chunk + link bytes that follow are WAL-logged, so a crash
         // mid-checkpoint recovers atomically — a loser's link reverts and the orphan page is left
         // harmlessly unreferenced, exactly as for record-page growth (`04 §4.4`).
-        while self.meta_chain.len() < n_cont {
+        // The catalog latch is taken ONCE here and held to the end of the growth loop (`rmp` #1015):
+        // the chain a checkpoint grows is the chain it then writes, and re-reading it between the two
+        // would let a concurrent checkpoint's growth land in between. Rank 10 is the outermost latch,
+        // so the page allocation inside — buffer pool, device, WAL — is all inward and in order.
+        let mut catalog = self.catalog_write();
+        while catalog.meta_chain.len() < n_cont {
             let (f, dev_page) = self.pool.new_page()?;
             self.pool.with_page_mut(f, |p| {
                 page::set_page_type(p, PAGE_TYPE_META);
@@ -2558,7 +2782,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // for the freshly-allocated, not-yet-logged page (`flush_unlogged`, `rmp` #337).
             self.pool.flush_unlogged(f)?;
             self.pool.unpin(f);
-            self.meta_chain.push(dev_page);
+            catalog.meta_chain.push(dev_page);
         }
 
         // Write the head plus *every* owned continuation page (copied so the loop can take
@@ -2566,10 +2790,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // chain reachable on reopen even in the rare event the catalog shrank across a page boundary
         // (device-page maps only grow, so in practice the chain matches the catalog exactly), so no
         // allocated page is ever orphaned by a checkpoint.
-        let total = 1 + self.meta_chain.len();
+        let total = 1 + catalog.meta_chain.len();
         let mut pages = Vec::with_capacity(total);
         pages.push(META_PAGE);
-        pages.extend_from_slice(&self.meta_chain);
+        pages.extend_from_slice(&catalog.meta_chain);
+        // Everything the catalog contributes has been read; release the latch before the page writes
+        // below, so a concurrent DDL is not held up behind this checkpoint's I/O.
+        drop(catalog);
 
         for i in 0..total {
             let lo = (i * META_CHUNK_CAP).min(payload.len());
@@ -3103,7 +3330,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// rollback, and on nothing else.
     #[must_use]
     pub fn catalog_reloads(&self) -> u64 {
-        self.catalog_reloads
+        self.with_catalog(|c| c.catalog_reloads)
     }
 
     #[must_use]
@@ -3565,7 +3792,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             .pending_gc_prune
             .as_ref()
             .is_some_and(|p| p.gc_txn == txn);
-        if !wrote_durable && !self.catalog_dirty && !is_gc_prune {
+        if !wrote_durable && !self.with_catalog(|c| c.catalog_dirty) && !is_gc_prune {
             // Nothing fallible remains, so the bookkeeping can go (`rmp` #866 / #955). A transaction on
             // this path wrote no record, so its count delta is empty and there is nothing to withdraw.
             debug_assert!(
@@ -3667,7 +3894,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // would take the #529 fast path and silently drop its committed DDL, which is precisely the
         // silent-drop `rmp` #534 was written to prevent, arriving through the commit path instead of the
         // rollback path.
-        self.catalog_dirty = self.open_txn_holds_pending_ddl();
+        let holds_ddl = self.open_txn_holds_pending_ddl();
+        self.with_catalog_mut(|c| c.catalog_dirty = holds_ddl);
         // Remember this commit record's LSN until a GC freeze settles `txn`'s versions: WAL
         // reclamation must keep it readable so a crash can still resolve an unfrozen in-flight stamp
         // (`rmp` #114 / the lazy freeze of #49/#59). This only ever LOWERS the reclaim floor, and reclaim
@@ -6142,7 +6370,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
              never be withdrawn, so the counter would drift permanently"
         );
         let delta = if increment { 1 } else { -1 };
-        self.statistics.apply_count_delta(key, delta);
+        self.with_catalog_mut(|c| Arc::make_mut(&mut c.statistics).apply_count_delta(key, delta));
         self.active.with_existing(txn, |active| {
             active.counts.record(key, delta);
         });
@@ -7624,19 +7852,30 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // The counts twin of the delta replay: this transaction's own increments and decrements,
         // withdrawn from the live counters. Commutative and exactly invertible, so order is
         // irrelevant and no image of the counters is needed (`rmp` #866).
-        counts.withdraw_from(&mut self.statistics);
+        self.with_catalog_mut(|c| counts.withdraw_from(Arc::make_mut(&mut c.statistics)));
         if !schema_undo.is_empty() {
             // Catalog DDL is not WAL-logged (it becomes durable only through the commit-time
             // `checkpoint_meta`), so it has its own per-entry logical undo — the same shape as the
             // delta replay, applied to the live schema rather than to a restored copy (`rmp` #734).
-            let Self {
-                statistics,
-                active,
-                schema_last_seq,
-                ..
-            } = self;
-            Self::apply_schema_undo(statistics, schema_last_seq, &*active, &schema_undo);
-            self.catalog_dirty = true;
+            // ONE hold over the replay: the schema map and the generations it unwinds are two
+            // halves of one state, and a reader between them would see an entry whose generation
+            // belongs to a mutation that has already been undone (`rmp` #1015).
+            let active = &self.active;
+            self.with_catalog_mut(|c| {
+                let CatalogState {
+                    statistics,
+                    schema_last_seq,
+                    catalog_dirty,
+                    ..
+                } = c;
+                Self::apply_schema_undo(
+                    Arc::make_mut(statistics),
+                    schema_last_seq,
+                    active,
+                    &schema_undo,
+                );
+                *catalog_dirty = true;
+            });
         }
         Ok(())
     }
@@ -7702,7 +7941,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // only the counts (never the twelve DDL maps) keeps the unconditional capture cheap: it is
         // bounded by the number of distinct labels/relationship types in the schema, not by the number
         // of records the transaction touched.
-        let pre_counts = self.statistics.counts_image();
+        let pre_counts = self.with_catalog(|c| c.statistics.counts_image());
         // The physical-id high-water marks are NOT captured either (`rmp` #1023), and for the same
         // reason as the free lists: `reload_catalog` no longer lowers them, so there is nothing to
         // floor back. The capture and the floor together only ever computed `max(durable, in-memory)`,
@@ -7722,7 +7961,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // engine-level face of #220 where typed edges "vanish"). Append-only, so a SUPERSET is always
         // safe: a token interned only by the aborting txn is harmless to keep (an unused id,
         // idempotent on re-intern).
-        let pre_tokens = self.tokens.clone();
+        let pre_tokens = self.with_catalog(|c| Arc::clone(&c.tokens));
         // Same monotonicity hazard for the **schema-catalog** half of `Statistics` — the twelve
         // `catalog_dirty`-guarded DDL maps (declared indexes of every kind, their names, constraints,
         // property histograms) (`rmp` #534, defense-in-depth for the `rmp` #529 read-only-commit fast
@@ -7750,8 +7989,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // capturing pending DDL; this keeps the rollback correct regardless.) A transaction with no
         // catalog DDL and no concurrent transaction still clones nothing — the common path is unchanged.
         let another_txn_open = self.active.fold_all(false, |acc, t, _| acc || t != txn);
-        let pre_statistics =
-            (another_txn_open || holds_schema_undo).then(|| self.statistics.clone());
+        let pre_statistics = (another_txn_open || holds_schema_undo)
+            .then(|| self.with_catalog(|c| (*c.statistics).clone()));
         // ------------------------------------------------------------------------------------------
         // FALLIBLE SECTION (`rmp` #955). Everything from here to `reload_catalog` can fail — with an
         // `Err` from the pool/catalog, or by unwinding out of the WAL `fdatasync` panic. NOTHING in it
@@ -7844,7 +8083,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // durability — it rides the next durable commit's checkpoint if a later write actually uses it.)
         // A CONCURRENT open transaction's still-pending catalog DDL, by contrast, IS restored below and
         // must stay flagged: the `rmp` #534 superset-preserve block re-sets this flag when it keeps one.
-        self.catalog_dirty = false;
+        self.with_catalog_mut(|c| c.catalog_dirty = false);
         // If `txn` was a GC pass, discard its scheduled registry prune (`rmp` task #59): the WAL
         // undo above restored the in-flight header stamps the freeze had rewritten, and those
         // stamps still need their Active/Recent Transaction Table entries to resolve. A rolled-back
@@ -7876,7 +8115,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             }
             self.gc_freeze_low_savepoint = None;
         }
-        self.tokens = pre_tokens;
+        self.with_catalog_mut(|c| c.tokens = pre_tokens);
         // Restore the live-record COUNTERS to their pre-rollback in-memory image, then withdraw
         // exactly this transaction's own delta (`rmp` #866) — the counts twin of the `pre_free` minus
         // `aborted_freed_ids` free-list restore below.
@@ -7899,8 +8138,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // transaction's own effect and nothing else. Ordering is irrelevant — integer counts are
         // commutative and every delta is exactly invertible — which is why this needs none of the
         // generation/witness/splice machinery the schema undo below requires (see `CountDelta`).
-        self.statistics.restore_counts(pre_counts);
-        aborted_counts.withdraw_from(&mut self.statistics);
+        self.with_catalog_mut(|c| {
+            Arc::make_mut(&mut c.statistics).restore_counts(pre_counts);
+            aborted_counts.withdraw_from(Arc::make_mut(&mut c.statistics));
+        });
         // `rmp` #534: superset-preserve the schema-catalog half of `Statistics` for a CONCURRENT open
         // transaction (`pre_statistics` is `Some` exactly when one was open at capture, above).
         // `reload_catalog` reverted the whole `Statistics` to the durable image (counts AND schema);
@@ -7945,21 +8186,23 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // empty if anything between the take and the restore ever unwound. `active` is borrowed
             // alongside it so a declined mutation can be spliced out of the chains the transactions
             // still open are holding — see `apply_schema_undo`.
-            let Self {
-                active,
-                schema_last_seq,
-                ..
-            } = self;
-            Self::apply_schema_undo(
-                &mut pre_statistics,
-                schema_last_seq,
-                active,
-                &aborted_schema_undo,
-            );
-            if !self.statistics.schema_eq(&pre_statistics) {
-                self.statistics.adopt_schema_from(pre_statistics);
-                self.catalog_dirty = true;
-            }
+            // ONE hold from the replay through the adoption (`rmp` #1015): the generations are
+            // unwound, the result compared against the live schema, and the live schema adopted from
+            // it. A reader admitted between the replay and the adoption would see generations that
+            // have moved past a schema that has not.
+            let active = &self.active;
+            self.with_catalog_mut(|c| {
+                Self::apply_schema_undo(
+                    &mut pre_statistics,
+                    &mut c.schema_last_seq,
+                    active,
+                    &aborted_schema_undo,
+                );
+                if !c.statistics.schema_eq(&pre_statistics) {
+                    Arc::make_mut(&mut c.statistics).adopt_schema_from(pre_statistics);
+                    c.catalog_dirty = true;
+                }
+            });
         }
         // The identity counter and the physical allocators are NOT restored here (`rmp` #1023). There
         // is nothing to restore: `reload_catalog` no longer moves them, so the floor that used to be
@@ -8180,7 +8423,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// `ElementId` counter (`rmp` #1023) — see the notes at each site for why reverting those to the
     /// durable image was both unnecessary and unsafe.
     fn reload_catalog(&mut self) -> Result<()> {
-        self.catalog_reloads += 1;
+        self.with_catalog_mut(|c| c.catalog_reloads += 1);
         let (meta, meta_chain) = Self::read_meta(&self.pool)?;
         // THE IDENTITY COUNTER IS PRESERVED — by never being touched (`rmp` #1023), for the same
         // reason as the page map below. It used to be rebuilt from `meta.element_id_next` and then
@@ -8283,7 +8526,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // This is the same argument the page map has settled below, extended to the two fields that
         // were still being reverted — and it is what the sprint means by a rollback that replays its
         // own deltas instead of reverting shared state.
-        self.tokens = meta.tokens;
+        let mut catalog = self.catalog_write();
+        catalog.tokens = Arc::new(meta.tokens);
         // Restore the whole `Statistics` from the durable catalog (`rmp` task #79 / #81). This is a
         // WHOLESALE revert of both halves — the live-record counters and the schema-catalog DDL maps —
         // and, exactly like the id high-water / free-list restore above, it is only ever *part* of the
@@ -8294,10 +8538,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // (`rmp` #866), and `adopt_schema_from` + `apply_schema_undo` for the schema (`rmp` #534 /
         // #734). Do NOT read this line as "a rollback discards the aborting transaction's counts": it
         // discards *everybody's*, and the caller puts the others back.
-        self.statistics = meta.statistics;
+        catalog.statistics = Arc::new(meta.statistics);
         // The catalog is only ever checkpointed at commit, so during an open transaction the chain
         // already matches disk; reload (rollback / recovery) restores the durable committed chain.
-        self.meta_chain = meta_chain;
+        catalog.meta_chain = meta_chain;
+        drop(catalog);
         Ok(())
     }
 
@@ -8308,27 +8553,32 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///
     /// # Errors
     /// Returns a storage error if the namespace id space is exhausted.
-    pub fn intern_token(&mut self, ns: Namespace, name: &str) -> Result<u32> {
-        let (id, created) = self.tokens.intern(ns, name)?;
+    pub fn intern_token(&self, ns: Namespace, name: &str) -> Result<u32> {
+        let mut catalog = self.catalog_write();
+        let (id, created) = Arc::make_mut(&mut catalog.tokens).intern(ns, name)?;
         // A newly-interned token is a catalog-only change (no WAL data record), durable only via the
         // commit-time `checkpoint_meta` — flag it so `commit` does not take its read-only fast path and
         // drop it (`rmp` #529). A re-intern of an existing token changed nothing, so it need not flag.
         if created {
-            self.catalog_dirty = true;
+            catalog.catalog_dirty = true;
         }
         Ok(id)
     }
 
     /// The name for a token id in `ns`, if present.
     #[must_use]
-    pub fn token_name(&self, ns: Namespace, id: u32) -> Option<&str> {
-        self.tokens.name(ns, id)
+    pub fn token_name(&self, ns: Namespace, id: u32) -> Option<TokenNameRef> {
+        let tokens = self.with_catalog(|c| Arc::clone(&c.tokens));
+        // Resolved against the very share that is handed out, so the `expect` in `Deref` is an
+        // invariant of this value rather than a claim about the store's current state.
+        tokens.name(ns, id)?;
+        Some(TokenNameRef { tokens, ns, id })
     }
 
     /// The id for a token name in `ns`, if present.
     #[must_use]
     pub fn token_id(&self, ns: Namespace, name: &str) -> Option<u32> {
-        self.tokens.id(ns, name)
+        self.with_catalog(|c| c.tokens.id(ns, name))
     }
 
     /// Captures this store's token dictionary into an owned, `Send + Sync`, cheap-to-clone
@@ -8347,7 +8597,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// shape is **not** touched here.
     #[must_use]
     pub fn token_snapshot(&self) -> TokenSnapshot {
-        TokenSnapshot::new(Arc::new(self.tokens.clone()))
+        self.with_catalog(|c| TokenSnapshot::new(Arc::clone(&c.tokens)))
     }
 
     // ------------------------------- node CRUD ------------------------------
@@ -10885,9 +11135,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///
     /// Not a repair tool: [`backfill_directional_rel_counts`](Self::backfill_directional_rel_counts)
     /// replaces both maps outright, so nothing needs to clear them first.
-    pub fn clear_directional_rel_counts_for_test(&mut self) {
-        self.statistics.rels_per_start_label_type.clear();
-        self.statistics.rels_per_type_end_label.clear();
+    pub fn clear_directional_rel_counts_for_test(&self) {
+        self.with_catalog_mut(|c| {
+            let stats = Arc::make_mut(&mut c.statistics);
+            stats.rels_per_start_label_type.clear();
+            stats.rels_per_type_end_label.clear();
+        });
     }
 
     /// Rebuilds both **directional** relationship-count projections from a full scan of the
@@ -10922,10 +11175,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// equivalence predicate would otherwise be answering about a tally it does not govern. Noted so
     /// that "`apply_count_delta` is the only door" is not believed absolute: a future caller must
     /// either run inside a transaction whose delta it records, or stay off the count-store path.
-    pub fn backfill_directional_rel_counts(&mut self) -> Result<()> {
+    pub fn backfill_directional_rel_counts(&self) -> Result<()> {
         let rebuilt = self.recount_directional_rel_counts()?;
-        self.statistics.rels_per_start_label_type = rebuilt.0;
-        self.statistics.rels_per_type_end_label = rebuilt.1;
+        self.with_catalog_mut(|c| {
+            let stats = Arc::make_mut(&mut c.statistics);
+            stats.rels_per_start_label_type = rebuilt.0;
+            stats.rels_per_type_end_label = rebuilt.1;
+        });
         Ok(())
     }
 
@@ -11234,7 +11490,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     pub fn mapped_pages(&self) -> Vec<PageId> {
         let mut pages = vec![META_PAGE];
         // The catalog's continuation pages are part of the durable image too (`rmp` task #51).
-        pages.extend_from_slice(&self.meta_chain);
+        pages.extend_from_slice(&self.with_catalog(|c| c.meta_chain.clone()));
         for s in &self.stores {
             pages.extend(s.device_pages.iter());
         }
@@ -11250,7 +11506,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     #[must_use]
     pub fn store_page_count(&self) -> u64 {
         let mut n = 1u64; // META_PAGE
-        n += self.meta_chain.len() as u64;
+        n += self.with_catalog(|c| c.meta_chain.len()) as u64;
         for s in &self.stores {
             n += s.device_pages.len() as u64;
         }
@@ -11272,22 +11528,22 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// version is live when its slot is in use and it carries no MVCC tombstone), maintained
     /// incrementally and persisted with the catalog — equivalent to a full re-scan but without one.
     #[must_use]
-    pub fn statistics(&self) -> &Statistics {
-        &self.statistics
+    pub fn statistics(&self) -> Arc<Statistics> {
+        self.with_catalog(|c| Arc::clone(&c.statistics))
     }
 
     /// The number of currently-live nodes carrying the label with `label_token_id` (`0` if none),
     /// from the persisted statistics (`rmp` task #79). Convenience over [`statistics`](Self::statistics).
     #[must_use]
     pub fn node_count_for_label(&self, label_token_id: u32) -> u64 {
-        self.statistics.node_count_for_label(label_token_id)
+        self.with_catalog(|c| c.statistics.node_count_for_label(label_token_id))
     }
 
     /// The number of currently-live relationships of relationship-type `type_token_id` (`0` if none),
     /// from the persisted statistics (`rmp` task #79). Convenience over [`statistics`](Self::statistics).
     #[must_use]
     pub fn rel_count_for_type(&self, type_token_id: u32) -> u64 {
-        self.statistics.rel_count_for_type(type_token_id)
+        self.with_catalog(|c| c.statistics.rel_count_for_type(type_token_id))
     }
 
     /// The number of currently-live relationships of type `type_token_id` whose **start** node carries
@@ -11298,16 +11554,20 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// multi-labelled node.
     #[must_use]
     pub fn rel_count_for_start_label_type(&self, label_token_id: u32, type_token_id: u32) -> u64 {
-        self.statistics
-            .rel_count_for_start_label_type(label_token_id, type_token_id)
+        self.with_catalog(|c| {
+            c.statistics
+                .rel_count_for_start_label_type(label_token_id, type_token_id)
+        })
     }
 
     /// The number of currently-live relationships of type `type_token_id` whose **end** node carries
     /// `label_token_id` (`0` if none) — the `(*, type, label)` directional projection (`rmp` task #856).
     #[must_use]
     pub fn rel_count_for_type_end_label(&self, type_token_id: u32, label_token_id: u32) -> u64 {
-        self.statistics
-            .rel_count_for_type_end_label(type_token_id, label_token_id)
+        self.with_catalog(|c| {
+            c.statistics
+                .rel_count_for_type_end_label(type_token_id, label_token_id)
+        })
     }
 
     /// Whether this store's catalogue holds any directional relationship count (`rmp` task #856).
@@ -11318,7 +11578,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// the graph-wide degree instead.
     #[must_use]
     pub fn has_directional_rel_counts(&self) -> bool {
-        self.statistics.has_directional_rel_counts()
+        self.with_catalog(|c| c.statistics.has_directional_rel_counts())
     }
 
     /// The total number of currently-live nodes, **labelled or not**, from the persisted statistics
@@ -11327,14 +11587,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// over [`statistics`](Self::statistics).
     #[must_use]
     pub fn total_node_count(&self) -> u64 {
-        self.statistics.total_nodes()
+        self.with_catalog(|c| c.statistics.total_nodes())
     }
 
     /// The total number of currently-live relationships, from the persisted statistics
     /// (`rmp` task #82). Convenience over [`statistics`](Self::statistics).
     #[must_use]
     pub fn total_relationship_count(&self) -> u64 {
-        self.statistics.total_relationships()
+        self.with_catalog(|c| c.statistics.total_relationships())
     }
 
     /// Borrows the durable opaque value histogram for the node-label property
@@ -11344,8 +11604,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// (doing so would require depending on `graphus-index`, which depends on this crate). Only the
     /// query-layer producer/consumer knows their encoding.
     #[must_use]
-    pub fn property_histogram(&self, label_token: u32, prop_token: u32) -> Option<&[u8]> {
-        self.statistics.property_histogram(label_token, prop_token)
+    pub fn property_histogram(&self, label_token: u32, prop_token: u32) -> Option<Vec<u8>> {
+        self.with_catalog(|c| {
+            c.statistics
+                .property_histogram(label_token, prop_token)
+                .map(<[u8]>::to_vec)
+        })
     }
 
     // ---- Schema-catalog DDL: the per-transaction undo seam (`rmp` #734) --------------------------
@@ -11372,7 +11636,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// from the `schema_catalog_table!` in [`meta`](crate::meta). This is the backstop that keeps the
     /// undo log complete as new catalog mutators are added; it is the reason an omission surfaces as a
     /// failing test rather than as a silently un-undoable DDL.
-    fn with_schema_undo<F>(&mut self, txn: TxnId, keys: &[SchemaKey], apply: F)
+    fn with_schema_undo<F>(&self, txn: TxnId, keys: &[SchemaKey], apply: F)
     where
         F: FnOnce(&mut Statistics),
     {
@@ -11392,29 +11656,37 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
              generation chain unwinds exactly one link per replay step"
         );
 
+        // ONE exclusive hold covers the whole transition (`rmp` #1015): read the previous values and
+        // generations, apply the mutation, stamp the new generations, and mark the catalog dirty. A
+        // second writer that observed any prefix of that would see an entry whose generation no undo
+        // claims — see [`CatalogState`]. The hold ends before the active-set entry is touched, because
+        // that is a different latch and this one is not held across it.
+        let mut catalog = self.catalog_write();
+
         #[cfg(debug_assertions)]
-        let before = self.statistics.clone();
+        let before = (*catalog.statistics).clone();
         #[cfg(debug_assertions)]
-        let before_seq = self.schema_last_seq.clone();
+        let before_seq = catalog.schema_last_seq.clone();
 
         let prevs: Vec<(Option<SchemaValue>, u64)> = keys
             .iter()
             .map(|k| {
                 (
-                    self.statistics.schema_get(k),
-                    self.schema_last_seq.get(k).copied().unwrap_or(0),
+                    catalog.statistics.schema_get(k),
+                    catalog.schema_last_seq.get(k).copied().unwrap_or(0),
                 )
             })
             .collect();
-        apply(&mut self.statistics);
+        apply(Arc::make_mut(&mut catalog.statistics));
         let entries: Vec<SchemaUndo> = keys
             .iter()
             .zip(prevs)
             .map(|(key, (prev, prev_seq))| {
-                self.schema_seq += 1;
-                self.schema_last_seq.insert(key.clone(), self.schema_seq);
+                catalog.schema_seq += 1;
+                let seq = catalog.schema_seq;
+                catalog.schema_last_seq.insert(key.clone(), seq);
                 SchemaUndo {
-                    seq: self.schema_seq,
+                    seq,
                     prev_seq,
                     key: key.clone(),
                     prev,
@@ -11428,8 +11700,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // did not list: such an entry keeps its stale generation, and the comparison fails.
         #[cfg(debug_assertions)]
         {
-            let mut probe = self.statistics.clone();
-            let mut probe_seq = self.schema_last_seq.clone();
+            let mut probe = (*catalog.statistics).clone();
+            let mut probe_seq = catalog.schema_last_seq.clone();
             // Every entry just recorded IS its own entry's last writer, so all of them fire and the
             // splice target is never touched — a scratch map keeps the real logs out of the probe.
             let probe_live = ActiveTable::default();
@@ -11445,10 +11717,17 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // and — since nothing will ever commit or roll it back — its phantom entry would suppress the
         // catalog checkpoint forever (`committed_statistics`). Recording nothing is the lesser failure,
         // and the debug assertion above turns any such call site into a failing test.
+        // The undo is recorded BEFORE the catalog is marked dirty, and both happen while rank 10 is
+        // still held. The order is load-bearing: `catalog_dirty` is what lets a commit checkpoint the
+        // catalog, and `committed_statistics` withholds an open transaction's DDL by consulting the
+        // undo entries. Marking dirty first would leave a window in which a concurrent commit sees
+        // "catalog changed" but finds no undo naming this transaction — and checkpoints THIS
+        // transaction's uncommitted DDL as durable. Rank 20 (the active table) inside rank 10 is the
+        // order the ranks prescribe, so nesting them is not a new hazard.
         self.active.with_existing(txn, |active| {
             active.schema_undo.extend(entries);
         });
-        self.catalog_dirty = true;
+        catalog.catalog_dirty = true;
     }
 
     /// Rolls back a transaction's catalog undo log into `stats` (and its generations into `last_seq`),
@@ -11586,7 +11865,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// every workload that is not interleaving writes across statements — this is exactly the clone it
     /// always was, plus one `is_empty` check per open transaction.
     fn committed_statistics(&self, committing: TxnId) -> Statistics {
-        let mut committed = self.statistics.clone();
+        let mut committed = self.with_catalog(|c| (*c.statistics).clone());
         // Counts half (`rmp` #866). Order-independent, but NOT because "integer deltas commute" on its
         // own: `add_keyed`/`add_total` saturate at 0, and saturation does not commute. It holds because
         // an intermediate withdrawal can never go negative — each negative unit in a delta is a
@@ -11624,7 +11903,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         pending.sort_unstable_by_key(|e| std::cmp::Reverse(e.seq));
         // A scratch copy of the generations: this is a read-only view of the catalog, so the store's
         // own witness map must survive it untouched.
-        let mut last_seq = self.schema_last_seq.clone();
+        let mut last_seq = self.with_catalog(|c| c.schema_last_seq.clone());
         for entry in pending {
             // No splice here, and none is needed. A decline means some transaction wrote this entry
             // after `entry` and is not in `pending` — i.e. it COMMITTED, and its log was dropped with
@@ -11676,7 +11955,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///
     /// Like [`set_property_histogram`](Self::set_property_histogram), the removal is in-memory and
     /// becomes durable at `txn`'s commit, and is discarded on `txn`'s rollback.
-    pub fn remove_property_histogram(&mut self, txn: TxnId, label_token: u32, prop_token: u32) {
+    pub fn remove_property_histogram(&self, txn: TxnId, label_token: u32, prop_token: u32) {
         self.with_schema_undo(
             txn,
             &[SchemaKey::NodePropHistogram((label_token, prop_token))],
@@ -11693,7 +11972,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// task #90). Tokens are returned as ids; the caller resolves their names via the token store.
     #[must_use]
     pub fn node_property_indexes(&self) -> Vec<(u32, u32, IndexState)> {
-        self.statistics.node_property_indexes()
+        self.with_catalog(|c| c.statistics.node_property_indexes())
     }
 
     /// The durable build [`IndexState`] of the node-property index on `(label_token, prop_token)`, or
@@ -11704,8 +11983,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         label_token: u32,
         prop_token: u32,
     ) -> Option<IndexState> {
-        self.statistics
-            .node_property_index_state(label_token, prop_token)
+        self.with_catalog(|c| {
+            c.statistics
+                .node_property_index_state(label_token, prop_token)
+        })
     }
 
     /// Declares (or updates the state of) the node-property index on `(label_token, prop_token)` in the
@@ -11734,7 +12015,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///
     /// Like [`set_node_property_index`](Self::set_node_property_index), the removal is in-memory and
     /// becomes durable at `txn`'s commit, and is discarded on `txn`'s rollback.
-    pub fn remove_node_property_index(&mut self, txn: TxnId, label_token: u32, prop_token: u32) {
+    pub fn remove_node_property_index(&self, txn: TxnId, label_token: u32, prop_token: u32) {
         self.with_schema_undo(
             txn,
             &[SchemaKey::NodePropertyIndex((label_token, prop_token))],
@@ -11747,7 +12028,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// the global name-uniqueness check.
     #[must_use]
     pub fn node_property_index_name(&self, name: &str) -> Option<(u32, u32)> {
-        self.statistics.node_property_index_name(name)
+        self.with_catalog(|c| c.statistics.node_property_index_name(name))
     }
 
     /// The declared **name** of the node-property index on `(label_token, prop_token)`, or [`None`] if
@@ -11759,9 +12040,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         label_token: u32,
         prop_token: u32,
     ) -> Option<String> {
-        self.statistics
-            .node_property_index_name_for(label_token, prop_token)
-            .map(str::to_owned)
+        self.with_catalog(|c| {
+            c.statistics
+                .node_property_index_name_for(label_token, prop_token)
+                .map(str::to_owned)
+        })
     }
 
     /// Records (or replaces) the name of the node-property index on `(label_token, prop_token)` in the
@@ -11782,12 +12065,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // Skip when the target already carries exactly this name: the setter then removes and
         // reinserts the same entry, and listing the key twice would make the generation chain need two
         // replay steps where the undo does one.
-        if let Some(displaced) = self
-            .statistics
-            .node_property_index_name_for(label_token, prop_token)
-            .filter(|d| *d != name)
-        {
-            keys.push(SchemaKey::NodePropertyIndexName(displaced.to_owned()));
+        if let Some(displaced) = self.with_catalog(|c| {
+            c.statistics
+                .node_property_index_name_for(label_token, prop_token)
+                .filter(|d| *d != name)
+                .map(str::to_owned)
+        }) {
+            keys.push(SchemaKey::NodePropertyIndexName(displaced));
         }
         self.with_schema_undo(txn, &keys, |s| {
             s.set_node_property_index_name(name, label_token, prop_token);
@@ -11797,7 +12081,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Removes the name entry `name` from the durable catalog, if present (`rmp` task #623) — the
     /// durable half of `DROP INDEX <name>`. In-memory here; durable at `txn`'s commit, discarded on
     /// `txn`'s rollback.
-    pub fn remove_node_property_index_name(&mut self, txn: TxnId, name: &str) {
+    pub fn remove_node_property_index_name(&self, txn: TxnId, name: &str) {
         self.with_schema_undo(
             txn,
             &[SchemaKey::NodePropertyIndexName(name.to_owned())],
@@ -11817,11 +12101,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ) {
         // Resolve the target's name first: the undo log is keyed by name, and after the removal there
         // is nothing left to resolve. Nameless target -> nothing to remove and nothing to undo.
-        let Some(name) = self
-            .statistics
-            .node_property_index_name_for(label_token, prop_token)
-            .map(str::to_owned)
-        else {
+        let Some(name) = self.with_catalog(|c| {
+            c.statistics
+                .node_property_index_name_for(label_token, prop_token)
+                .map(str::to_owned)
+        }) else {
             return;
         };
         self.with_schema_undo(txn, &[SchemaKey::NodePropertyIndexName(name)], |s| {
@@ -11833,7 +12117,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// catalog (`rmp` task #623), ascending by name.
     #[must_use]
     pub fn node_property_index_names(&self) -> Vec<(String, u32, u32)> {
-        self.statistics.node_property_index_names()
+        self.with_catalog(|c| c.statistics.node_property_index_names())
     }
 
     // ---- Relationship-property index catalog delegation (`rmp` task #646) -------------------------
@@ -11846,15 +12130,17 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// *registration* survive a crash: a fresh coordinator re-registers these before its index rebuild.
     #[must_use]
     pub fn rel_property_indexes(&self) -> Vec<(u32, u32, IndexState)> {
-        self.statistics.rel_property_indexes()
+        self.with_catalog(|c| c.statistics.rel_property_indexes())
     }
 
     /// The durable build [`IndexState`] of the relationship-property index on `(type_token, prop_token)`,
     /// or [`None`] if no such index is declared (`rmp` task #646).
     #[must_use]
     pub fn rel_property_index_state(&self, type_token: u32, prop_token: u32) -> Option<IndexState> {
-        self.statistics
-            .rel_property_index_state(type_token, prop_token)
+        self.with_catalog(|c| {
+            c.statistics
+                .rel_property_index_state(type_token, prop_token)
+        })
     }
 
     /// Declares (or updates the state of) the relationship-property index on `(type_token, prop_token)`
@@ -11877,7 +12163,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Removes the relationship-property index on `(type_token, prop_token)` from the durable catalog,
     /// if declared (`rmp` task #646). In-memory here; durable at `txn`'s commit, discarded on `txn`'s
     /// rollback.
-    pub fn remove_rel_property_index(&mut self, txn: TxnId, type_token: u32, prop_token: u32) {
+    pub fn remove_rel_property_index(&self, txn: TxnId, type_token: u32, prop_token: u32) {
         self.with_schema_undo(
             txn,
             &[SchemaKey::RelPropertyIndex((type_token, prop_token))],
@@ -11890,7 +12176,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// <name>` and the global name-uniqueness check.
     #[must_use]
     pub fn rel_property_index_name(&self, name: &str) -> Option<(u32, u32)> {
-        self.statistics.rel_property_index_name(name)
+        self.with_catalog(|c| c.statistics.rel_property_index_name(name))
     }
 
     /// The declared **name** of the relationship-property index on `(type_token, prop_token)`, or
@@ -11898,9 +12184,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// `borrow()` of the store need not keep the borrow to read the name.
     #[must_use]
     pub fn rel_property_index_name_for(&self, type_token: u32, prop_token: u32) -> Option<String> {
-        self.statistics
-            .rel_property_index_name_for(type_token, prop_token)
-            .map(str::to_owned)
+        self.with_catalog(|c| {
+            c.statistics
+                .rel_property_index_name_for(type_token, prop_token)
+                .map(str::to_owned)
+        })
     }
 
     /// Records (or replaces) the name of the relationship-property index on `(type_token, prop_token)`
@@ -11920,11 +12208,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // Skip when the target already carries exactly this name: the setter then removes and
         // reinserts the same entry, and listing the key twice would make the generation chain need two
         // replay steps where the undo does one.
-        if let Some(displaced) = self
-            .statistics
-            .rel_property_index_name_for(type_token, prop_token)
-            .filter(|d| *d != name)
-        {
+        if let Some(displaced) = self.with_catalog(|c| {
+            c.statistics
+                .rel_property_index_name_for(type_token, prop_token)
+                .filter(|d| *d != name)
+                .map(str::to_owned)
+        }) {
             keys.push(SchemaKey::RelPropertyIndexName(displaced.to_owned()));
         }
         self.with_schema_undo(txn, &keys, |s| {
@@ -11935,7 +12224,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Removes the name entry `name` from the durable catalog, if present (`rmp` task #646) — the
     /// durable half of `DROP INDEX <name>`. In-memory here; durable at `txn`'s commit, discarded on
     /// `txn`'s rollback.
-    pub fn remove_rel_property_index_name(&mut self, txn: TxnId, name: &str) {
+    pub fn remove_rel_property_index_name(&self, txn: TxnId, name: &str) {
         self.with_schema_undo(
             txn,
             &[SchemaKey::RelPropertyIndexName(name.to_owned())],
@@ -11952,11 +12241,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         type_token: u32,
         prop_token: u32,
     ) {
-        let Some(name) = self
-            .statistics
-            .rel_property_index_name_for(type_token, prop_token)
-            .map(str::to_owned)
-        else {
+        let Some(name) = self.with_catalog(|c| {
+            c.statistics
+                .rel_property_index_name_for(type_token, prop_token)
+                .map(str::to_owned)
+        }) else {
             return;
         };
         self.with_schema_undo(txn, &[SchemaKey::RelPropertyIndexName(name)], |s| {
@@ -11968,7 +12257,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// durable catalog (`rmp` task #646), ascending by name.
     #[must_use]
     pub fn rel_property_index_names(&self) -> Vec<(String, u32, u32)> {
-        self.statistics.rel_property_index_names()
+        self.with_catalog(|c| c.statistics.rel_property_index_names())
     }
 
     /// The durable full-text index entry named `name`, or [`None`] if no such index is declared
@@ -11976,7 +12265,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// store. Cloned so the borrow of `self` does not outlive the call.
     #[must_use]
     pub fn fulltext_index(&self, name: &str) -> Option<FulltextIndexEntry> {
-        self.statistics.fulltext_index(name).cloned()
+        self.with_catalog(|c| c.statistics.fulltext_index(name).cloned())
     }
 
     /// Lists every declared full-text index as `(name, entry)` from the durable catalog (`rmp` task
@@ -11986,7 +12275,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// from the store.
     #[must_use]
     pub fn fulltext_indexes(&self) -> Vec<(String, FulltextIndexEntry)> {
-        self.statistics.fulltext_indexes()
+        self.with_catalog(|c| c.statistics.fulltext_indexes())
     }
 
     /// Declares (or replaces) the full-text index named `name` in the durable catalog (`rmp` task
@@ -11996,7 +12285,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// **durable when the enclosing transaction commits** (the catalog is checkpointed at commit) and
     /// is **discarded on rollback** (the catalog is reloaded from the last committed metadata page).
     /// Re-recording an existing name overwrites the entry (e.g. to flip its state).
-    pub fn set_fulltext_index(&mut self, txn: TxnId, name: String, entry: FulltextIndexEntry) {
+    pub fn set_fulltext_index(&self, txn: TxnId, name: String, entry: FulltextIndexEntry) {
         self.with_schema_undo(txn, &[SchemaKey::FulltextIndex(name.clone())], |s| {
             s.set_fulltext_index(name, entry);
         });
@@ -12005,7 +12294,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Removes the full-text index named `name` from the durable catalog, if declared (`rmp` task
     /// #72). Removing an absent entry is a harmless no-op. Durable at the enclosing transaction's
     /// commit, discarded on rollback.
-    pub fn remove_fulltext_index(&mut self, txn: TxnId, name: &str) {
+    pub fn remove_fulltext_index(&self, txn: TxnId, name: &str) {
         self.with_schema_undo(txn, &[SchemaKey::FulltextIndex(name.to_owned())], |s| {
             s.remove_fulltext_index(name);
         });
@@ -12016,7 +12305,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// store. Cloned so the borrow of `self` does not outlive the call.
     #[must_use]
     pub fn spatial_index(&self, name: &str) -> Option<SpatialIndexEntry> {
-        self.statistics.spatial_index(name).cloned()
+        self.with_catalog(|c| c.statistics.spatial_index(name).cloned())
     }
 
     /// Lists every declared spatial index as `(name, entry)` from the durable catalog (`rmp` task
@@ -12025,7 +12314,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// previously-declared spatial indexes before rebuilding their grid from the store.
     #[must_use]
     pub fn spatial_indexes(&self) -> Vec<(String, SpatialIndexEntry)> {
-        self.statistics.spatial_indexes()
+        self.with_catalog(|c| c.statistics.spatial_indexes())
     }
 
     /// Declares (or replaces) the spatial index named `name` in the durable catalog (`rmp` task #98).
@@ -12034,7 +12323,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// **durable when the enclosing transaction commits** (the catalog is checkpointed at commit) and
     /// is **discarded on rollback** (the catalog is reloaded from the last committed metadata page).
     /// Re-recording an existing name overwrites the entry (e.g. to flip its state).
-    pub fn set_spatial_index(&mut self, txn: TxnId, name: String, entry: SpatialIndexEntry) {
+    pub fn set_spatial_index(&self, txn: TxnId, name: String, entry: SpatialIndexEntry) {
         self.with_schema_undo(txn, &[SchemaKey::SpatialIndex(name.clone())], |s| {
             s.set_spatial_index(name, entry);
         });
@@ -12043,7 +12332,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Removes the spatial index named `name` from the durable catalog, if declared (`rmp` task #98).
     /// Removing an absent entry is a harmless no-op. Durable at the enclosing transaction's commit,
     /// discarded on rollback.
-    pub fn remove_spatial_index(&mut self, txn: TxnId, name: &str) {
+    pub fn remove_spatial_index(&self, txn: TxnId, name: &str) {
         self.with_schema_undo(txn, &[SchemaKey::SpatialIndex(name.to_owned())], |s| {
             s.remove_spatial_index(name);
         });
@@ -12054,7 +12343,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// via the token store. Cloned so the borrow of `self` does not outlive the call.
     #[must_use]
     pub fn composite_index(&self, name: &str) -> Option<CompositeIndexEntry> {
-        self.statistics.composite_index(name).cloned()
+        self.with_catalog(|c| c.statistics.composite_index(name).cloned())
     }
 
     /// Lists every declared composite index as `(name, entry)` from the durable catalog (`rmp` task
@@ -12063,7 +12352,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// the previously-declared composite indexes before rebuilding their B+-tree from the store.
     #[must_use]
     pub fn composite_indexes(&self) -> Vec<(String, CompositeIndexEntry)> {
-        self.statistics.composite_indexes()
+        self.with_catalog(|c| c.statistics.composite_indexes())
     }
 
     /// The **name** of the composite index covering exactly `(label_token, property_tokens)` — same
@@ -12075,9 +12364,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         label_token: u32,
         property_tokens: &[u32],
     ) -> Option<String> {
-        self.statistics
-            .composite_index_name_for(label_token, property_tokens)
-            .map(str::to_owned)
+        self.with_catalog(|c| {
+            c.statistics
+                .composite_index_name_for(label_token, property_tokens)
+                .map(str::to_owned)
+        })
     }
 
     /// Declares (or replaces) the composite index named `name` in the durable catalog (`rmp` task
@@ -12087,7 +12378,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// the enclosing transaction commits** (the catalog is checkpointed at commit) and is **discarded
     /// on rollback** (the catalog is reloaded from the last committed metadata page). Re-recording an
     /// existing name overwrites the entry (e.g. to flip its state).
-    pub fn set_composite_index(&mut self, txn: TxnId, name: String, entry: CompositeIndexEntry) {
+    pub fn set_composite_index(&self, txn: TxnId, name: String, entry: CompositeIndexEntry) {
         self.with_schema_undo(txn, &[SchemaKey::CompositeIndex(name.clone())], |s| {
             s.set_composite_index(name, entry);
         });
@@ -12096,7 +12387,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Removes the composite index named `name` from the durable catalog, if declared (`rmp` task
     /// #657). Removing an absent entry is a harmless no-op. Durable at the enclosing transaction's
     /// commit, discarded on rollback.
-    pub fn remove_composite_index(&mut self, txn: TxnId, name: &str) {
+    pub fn remove_composite_index(&self, txn: TxnId, name: &str) {
         self.with_schema_undo(txn, &[SchemaKey::CompositeIndex(name.to_owned())], |s| {
             s.remove_composite_index(name);
         });
@@ -12107,7 +12398,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// their names via the token store. Cloned so the borrow of `self` does not outlive the call.
     #[must_use]
     pub fn rel_composite_index(&self, name: &str) -> Option<RelCompositeIndexEntry> {
-        self.statistics.rel_composite_index(name).cloned()
+        self.with_catalog(|c| c.statistics.rel_composite_index(name).cloned())
     }
 
     /// Lists every declared composite relationship index as `(name, entry)` from the durable catalog
@@ -12116,7 +12407,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// reads this to re-register the previously-declared indexes before rebuilding their B+-tree.
     #[must_use]
     pub fn rel_composite_indexes(&self) -> Vec<(String, RelCompositeIndexEntry)> {
-        self.statistics.rel_composite_indexes()
+        self.with_catalog(|c| c.statistics.rel_composite_indexes())
     }
 
     /// The **name** of the composite relationship index covering exactly `(type_token, property_tokens)`
@@ -12128,9 +12419,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         type_token: u32,
         property_tokens: &[u32],
     ) -> Option<String> {
-        self.statistics
-            .rel_composite_index_name_for(type_token, property_tokens)
-            .map(str::to_owned)
+        self.with_catalog(|c| {
+            c.statistics
+                .rel_composite_index_name_for(type_token, property_tokens)
+                .map(str::to_owned)
+        })
     }
 
     /// Declares (or replaces) the composite relationship index named `name` in the durable catalog
@@ -12150,7 +12443,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Removes the composite relationship index named `name` from the durable catalog, if declared
     /// (`rmp` task #666). Removing an absent entry is a harmless no-op. Durable at the enclosing
     /// transaction's commit, discarded on rollback.
-    pub fn remove_rel_composite_index(&mut self, txn: TxnId, name: &str) {
+    pub fn remove_rel_composite_index(&self, txn: TxnId, name: &str) {
         self.with_schema_undo(txn, &[SchemaKey::RelCompositeIndex(name.to_owned())], |s| {
             s.remove_rel_composite_index(name);
         });
@@ -12161,7 +12454,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// token store. Cloned so the borrow of `self` does not outlive the call.
     #[must_use]
     pub fn text_index(&self, name: &str) -> Option<TextIndexEntry> {
-        self.statistics.text_index(name).cloned()
+        self.with_catalog(|c| c.statistics.text_index(name).cloned())
     }
 
     /// Lists every declared text index as `(name, entry)` from the durable catalog (`rmp` task #662),
@@ -12170,16 +12463,18 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// previously-declared text indexes before rebuilding their trigram index from the store.
     #[must_use]
     pub fn text_indexes(&self) -> Vec<(String, TextIndexEntry)> {
-        self.statistics.text_indexes()
+        self.with_catalog(|c| c.statistics.text_indexes())
     }
 
     /// The **name** of the text index covering exactly `(label_token, property_token)`, or [`None`] if
     /// none is declared (`rmp` task #662). Backs the `IF NOT EXISTS` schema-equivalence check.
     #[must_use]
     pub fn text_index_name_for(&self, label_token: u32, property_token: u32) -> Option<String> {
-        self.statistics
-            .text_index_name_for(label_token, property_token)
-            .map(str::to_owned)
+        self.with_catalog(|c| {
+            c.statistics
+                .text_index_name_for(label_token, property_token)
+                .map(str::to_owned)
+        })
     }
 
     /// Declares (or replaces) the text index named `name` in the durable catalog (`rmp` task #662).
@@ -12188,7 +12483,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// the enclosing transaction commits** (the catalog is checkpointed at commit) and is **discarded
     /// on rollback** (the catalog is reloaded from the last committed metadata page). Re-recording an
     /// existing name overwrites the entry (e.g. to flip its state).
-    pub fn set_text_index(&mut self, txn: TxnId, name: String, entry: TextIndexEntry) {
+    pub fn set_text_index(&self, txn: TxnId, name: String, entry: TextIndexEntry) {
         self.with_schema_undo(txn, &[SchemaKey::TextIndex(name.clone())], |s| {
             s.set_text_index(name, entry);
         });
@@ -12197,7 +12492,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Removes the text index named `name` from the durable catalog, if declared (`rmp` task #662).
     /// Removing an absent entry is a harmless no-op. Durable at the enclosing transaction's commit,
     /// discarded on rollback.
-    pub fn remove_text_index(&mut self, txn: TxnId, name: &str) {
+    pub fn remove_text_index(&self, txn: TxnId, name: &str) {
         self.with_schema_undo(txn, &[SchemaKey::TextIndex(name.to_owned())], |s| {
             s.remove_text_index(name);
         });
@@ -12208,7 +12503,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// store. Cloned so the borrow of `self` does not outlive the call.
     #[must_use]
     pub fn vector_index(&self, name: &str) -> Option<VectorIndexEntry> {
-        self.statistics.vector_index(name).cloned()
+        self.with_catalog(|c| c.statistics.vector_index(name).cloned())
     }
 
     /// Lists every declared vector index as `(name, entry)` from the durable catalog (`rmp` task #669),
@@ -12217,7 +12512,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// declared vector indexes before rebuilding their HNSW graph from the store.
     #[must_use]
     pub fn vector_indexes(&self) -> Vec<(String, VectorIndexEntry)> {
-        self.statistics.vector_indexes()
+        self.with_catalog(|c| c.statistics.vector_indexes())
     }
 
     /// The **name** of the vector index covering exactly `(entity, token, property_token)`, or [`None`]
@@ -12231,15 +12526,17 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         token: u32,
         property_token: u32,
     ) -> Option<String> {
-        self.statistics
-            .vector_index_name_for(entity, token, property_token)
-            .map(str::to_owned)
+        self.with_catalog(|c| {
+            c.statistics
+                .vector_index_name_for(entity, token, property_token)
+                .map(str::to_owned)
+        })
     }
 
     /// Declares (or replaces) the vector index named `name` in the durable catalog (`rmp` task #669).
     /// Purely in-memory here; becomes **durable when the enclosing transaction commits** and is
     /// **discarded on rollback**, exactly like [`set_text_index`](Self::set_text_index).
-    pub fn set_vector_index(&mut self, txn: TxnId, name: String, entry: VectorIndexEntry) {
+    pub fn set_vector_index(&self, txn: TxnId, name: String, entry: VectorIndexEntry) {
         self.with_schema_undo(txn, &[SchemaKey::VectorIndex(name.clone())], |s| {
             s.set_vector_index(name, entry);
         });
@@ -12248,7 +12545,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Removes the vector index named `name` from the durable catalog, if declared (`rmp` task #669).
     /// Removing an absent entry is a harmless no-op. Durable at the enclosing transaction's commit,
     /// discarded on rollback.
-    pub fn remove_vector_index(&mut self, txn: TxnId, name: &str) {
+    pub fn remove_vector_index(&self, txn: TxnId, name: &str) {
         self.with_schema_undo(txn, &[SchemaKey::VectorIndex(name.to_owned())], |s| {
             s.remove_vector_index(name);
         });
@@ -12259,7 +12556,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// store. Cloned so the borrow of `self` does not outlive the call.
     #[must_use]
     pub fn constraint(&self, name: &str) -> Option<ConstraintEntry> {
-        self.statistics.constraint(name).cloned()
+        self.with_catalog(|c| c.statistics.constraint(name).cloned())
     }
 
     /// Lists every declared constraint as `(name, entry)` from the durable catalog (`rmp` task #99),
@@ -12269,7 +12566,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// store) on open.
     #[must_use]
     pub fn constraints(&self) -> Vec<(String, ConstraintEntry)> {
-        self.statistics.constraints()
+        self.with_catalog(|c| c.statistics.constraints())
     }
 
     /// Declares (or replaces) the constraint named `name` in the durable catalog (`rmp` task #99).
@@ -12278,7 +12575,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// enclosing transaction commits** (the catalog is checkpointed at commit) and is **discarded on
     /// rollback** (the catalog is reloaded from the last committed metadata page). Re-recording an
     /// existing name overwrites the entry.
-    pub fn set_constraint(&mut self, txn: TxnId, name: String, entry: ConstraintEntry) {
+    pub fn set_constraint(&self, txn: TxnId, name: String, entry: ConstraintEntry) {
         self.with_schema_undo(txn, &[SchemaKey::Constraint(name.clone())], |s| {
             s.set_constraint(name, entry);
         });
@@ -12287,7 +12584,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Removes the constraint named `name` from the durable catalog, if declared (`rmp` task #99).
     /// Removing an absent entry is a harmless no-op. Durable at the enclosing transaction's commit,
     /// discarded on rollback.
-    pub fn remove_constraint(&mut self, txn: TxnId, name: &str) {
+    pub fn remove_constraint(&self, txn: TxnId, name: &str) {
         self.with_schema_undo(txn, &[SchemaKey::Constraint(name.to_owned())], |s| {
             s.remove_constraint(name);
         });
@@ -12346,21 +12643,21 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// `0..prop_key_token_count`. The consistency checker uses this to flag a `SetProperty` delta
     /// that names a key the token store does not have (`rmp` #967).
     pub(crate) fn checker_prop_key_token_count(&self) -> usize {
-        self.tokens.len(Namespace::PropKey)
+        self.with_catalog(|c| c.tokens.len(Namespace::PropKey))
     }
 
     /// The number of interned `Label`-namespace tokens (`04 §2.6`): label token ids are dense in
     /// `0..label_token_count`. The consistency checker uses this to verify that a node's label
     /// bitmap references only token ids that exist in the token store (`rmp` task #42).
     pub(crate) fn checker_label_token_count(&self) -> usize {
-        self.tokens.len(Namespace::Label)
+        self.with_catalog(|c| c.tokens.len(Namespace::Label))
     }
 
     /// The number of interned `RelType`-namespace tokens (`04 §2.6`): relationship-type token ids are
     /// dense in `0..rel_type_token_count`. The consistency checker uses this to flag an incidence
     /// delta that names a type the token store does not have (`rmp` #969).
     pub(crate) fn checker_rel_type_token_count(&self) -> usize {
-        self.tokens.len(Namespace::RelType)
+        self.with_catalog(|c| c.tokens.len(Namespace::RelType))
     }
 
     /// The **version chain** of entity `(kind, id)`, newest delta first (`05 §12`, `04 §5.1`;
@@ -15932,6 +16229,254 @@ mod chain_head_publication_tests {
         assert_eq!(
             after.mvcc.undo_ptr, before.mvcc.undo_ptr,
             "nor the MVCC header, whose undo pointer decides visibility"
+        );
+    }
+}
+
+/// **Layer 6 of `rmp` #975 (`rmp` #1015): the catalog under one latch, exercised by real threads.**
+///
+/// The rest of the suite drives the store from one thread, which is what the engine did until this
+/// layer. These tests exist because the property this layer adds — the catalog may be touched by more
+/// than one thread at once — is invisible to a single-threaded test: every one of them passes just as
+/// well against the `&mut self` catalog this replaced.
+#[cfg(test)]
+mod catalog_concurrency_1015 {
+    use super::*;
+    use crate::meta::FulltextEntity;
+    use graphus_io::MemBlockDevice;
+    use graphus_wal::{MemLogSink, WalManager};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    type Store = RecordStore<MemBlockDevice, MemLogSink>;
+
+    fn fresh() -> Store {
+        let device = MemBlockDevice::new(0);
+        let wal = WalManager::create(MemLogSink::new()).expect("create wal");
+        RecordStore::create(device, wal, 64, 1).expect("create store")
+    }
+
+    /// **The barrier this layer removes, stated as a type bound.**
+    ///
+    /// Before layer 6 the catalog was seven bare fields of `RecordStore`, so every DDL method took
+    /// `&mut self` and the store could not be `&`-shared across threads at all. This is a compile-time
+    /// assertion, and it fails to BUILD — not to run — if the catalog ever goes back.
+    #[test]
+    fn the_record_store_is_shareable_between_threads() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Store>();
+        assert_send_sync::<CatalogState>();
+    }
+
+    /// **Concurrent DDL from N threads is serialisable: every declaration lands, and none is lost.**
+    ///
+    /// Each thread declares its own full-text index through `&store`. A `set_*` is a read-modify-write
+    /// of the catalog — read the previous value for the undo, apply, stamp a generation — and the
+    /// assertion is a count as well as a lookup: 32 declarations were made and 32 must be readable.
+    ///
+    /// **What this can and cannot fail on.** It is not a negative control, and saying so matters: in
+    /// safe Rust the alternative to the latch is not a lost update, it is a program that does not
+    /// compile, so no seam here can be broken and observed at run time. What it does establish is that
+    /// the DDL path is genuinely reachable from several threads at once and produces the right answer
+    /// when it is — a property no single-threaded test in this file states, and the one this layer
+    /// exists to add. The interleaving that CAN be got wrong at run time — a DDL racing a commit that
+    /// checkpoints it — needs `commit` to take `&self`, which is layer 7 (`rmp` #1016).
+    #[test]
+    fn concurrent_ddl_from_many_threads_loses_no_declaration() {
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 4;
+
+        let store = Arc::new(fresh());
+        // One open transaction per thread, begun before the threads start: `begin` records the writer
+        // in the active table, and `with_schema_undo` refuses DDL for a transaction that is not open.
+        for t in 0..THREADS {
+            store.begin(TxnId(t as u64 + 1));
+        }
+
+        std::thread::scope(|scope| {
+            for t in 0..THREADS {
+                let store = Arc::clone(&store);
+                scope.spawn(move || {
+                    let txn = TxnId(t as u64 + 1);
+                    for i in 0..PER_THREAD {
+                        let name = format!("ft_{t}_{i}");
+                        store.set_fulltext_index(
+                            txn,
+                            name.clone(),
+                            FulltextIndexEntry {
+                                entity: FulltextEntity::Node,
+                                tokens: vec![1],
+                                property_tokens: vec![1],
+                                analyzer: 0,
+                                state: IndexState::Online,
+                            },
+                        );
+                    }
+                });
+            }
+        });
+
+        let declared = store.fulltext_indexes();
+        assert_eq!(
+            declared.len(),
+            THREADS * PER_THREAD,
+            "every concurrent declaration must survive: a lost one is a writer whose \
+             read-modify-write was overwritten inside another's (`rmp` #1015)"
+        );
+        for t in 0..THREADS {
+            for i in 0..PER_THREAD {
+                let name = format!("ft_{t}_{i}");
+                assert!(
+                    store.fulltext_index(&name).is_some(),
+                    "declaration {name} is missing from the catalog"
+                );
+            }
+        }
+    }
+
+    /// **Concurrent token interning hands out unique ids, and the same name always resolves to one.**
+    ///
+    /// `intern_token` is NOT DDL cadence — a `CREATE (n:NewLabel)` interns on the write path — so this
+    /// is the hot-path half of the same guarantee. Threads race over an overlapping name space: every
+    /// thread interns the same names in the same order, so the interner decides "already present"
+    /// concurrently, which is where a check-then-insert split across two holds would hand one name two
+    /// ids. It is worth being exact about where that atomicity comes from: `TokenTable::intern` checks
+    /// and inserts behind one `&mut`, so the check-then-insert is indivisible by construction and the
+    /// latch's job is only to ensure two such `&mut` never coexist. This test therefore certifies the
+    /// composition — concurrent interning through the shared store yields one id per name — and not a
+    /// seam that could be broken and observed on its own.
+    #[test]
+    fn concurrent_token_interning_is_consistent() {
+        const THREADS: usize = 8;
+        const SHARED_NAMES: usize = 16;
+
+        let store = Arc::new(fresh());
+        for t in 0..THREADS {
+            store.begin(TxnId(t as u64 + 1));
+        }
+        let ids: Arc<std::sync::Mutex<Vec<(String, u32)>>> = Arc::default();
+
+        std::thread::scope(|scope| {
+            for t in 0..THREADS {
+                let store = Arc::clone(&store);
+                let ids = Arc::clone(&ids);
+                scope.spawn(move || {
+                    let mut mine = Vec::new();
+                    for i in 0..SHARED_NAMES {
+                        // Every thread interns the SAME names, in the same order.
+                        let name = format!("Label{i}");
+                        let id = store
+                            .intern_token(Namespace::Label, &name)
+                            .expect("interning must succeed");
+                        mine.push((name, id));
+                    }
+                    // ...plus one of its own, so the id space genuinely grows under contention.
+                    let own = format!("Own{t}");
+                    let id = store
+                        .intern_token(Namespace::Label, &own)
+                        .expect("interning must succeed");
+                    mine.push((own, id));
+                    ids.lock().expect("no panic in the collector").extend(mine);
+                });
+            }
+        });
+
+        let observed = ids.lock().expect("no panic in the collector").clone();
+        // One name, one id — whichever thread got there first.
+        let mut by_name: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
+        for (name, id) in &observed {
+            match by_name.get(name.as_str()) {
+                Some(seen) => assert_eq!(
+                    *seen, *id,
+                    "token {name} was interned twice under different ids: a read-then-insert let two \
+                     threads both decide it was absent (`rmp` #1015)"
+                ),
+                None => {
+                    by_name.insert(name, *id);
+                }
+            }
+        }
+        assert_eq!(
+            by_name.len(),
+            SHARED_NAMES + THREADS,
+            "every distinct name must have exactly one id"
+        );
+        // Ids are unique across distinct names: two names sharing an id is the same defect seen from
+        // the other side (two interns both taking `by_id.len()` as their new id).
+        let distinct: std::collections::HashSet<u32> = by_name.values().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            by_name.len(),
+            "two distinct token names were handed the same id"
+        );
+        // And the dictionary itself agrees with what the callers were told.
+        for (name, id) in &by_name {
+            assert_eq!(
+                store.token_id(Namespace::Label, name),
+                Some(*id),
+                "the dictionary disagrees with the id {name} was interned under"
+            );
+        }
+    }
+
+    /// **A reader of the catalog never observes half a DDL transition.**
+    ///
+    /// A `set_*` writes the entry, stamps a new generation and marks the catalog dirty. A reader
+    /// admitted between the entry and the generation would see an index whose generation belongs to
+    /// the mutation before it — a state no rollback can unwind correctly (`rmp` #734). One writer
+    /// declares in a loop while readers snapshot the catalog; each snapshot must be internally
+    /// consistent: every index it can see must also be countable in the same snapshot.
+    #[test]
+    fn a_reader_never_sees_half_a_declaration() {
+        const ROUNDS: usize = 64;
+
+        let store = Arc::new(fresh());
+        store.begin(TxnId(1));
+        let torn = Arc::new(AtomicUsize::new(0));
+
+        std::thread::scope(|scope| {
+            let writer = {
+                let store = Arc::clone(&store);
+                scope.spawn(move || {
+                    for i in 0..ROUNDS {
+                        store.set_fulltext_index(
+                            TxnId(1),
+                            format!("idx_{i}"),
+                            FulltextIndexEntry {
+                                entity: FulltextEntity::Node,
+                                tokens: vec![1],
+                                property_tokens: vec![1],
+                                analyzer: 0,
+                                state: IndexState::Online,
+                            },
+                        );
+                    }
+                })
+            };
+            for _ in 0..4 {
+                let store = Arc::clone(&store);
+                let torn = Arc::clone(&torn);
+                scope.spawn(move || {
+                    for _ in 0..ROUNDS {
+                        // ONE snapshot, then two questions of it. Asking the store twice would be a
+                        // race in the test rather than in the store.
+                        let snapshot = store.statistics();
+                        let listed = snapshot.fulltext_indexes();
+                        for (name, _) in &listed {
+                            if snapshot.fulltext_index(name).is_none() {
+                                torn.fetch_add(1, AtomicOrdering::Relaxed);
+                            }
+                        }
+                    }
+                });
+            }
+            writer.join().expect("the writer must not panic");
+        });
+
+        assert_eq!(
+            torn.load(AtomicOrdering::Relaxed),
+            0,
+            "a reader listed an index it could then not resolve: the catalog was observed mid-transition"
         );
     }
 }

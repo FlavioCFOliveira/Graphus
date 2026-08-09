@@ -822,11 +822,11 @@ fn property_histogram_persists_across_reopen() {
     let reopened = RecordStore::open(device, wal, 64).expect("reopen");
     assert_eq!(
         reopened.property_histogram(person, age),
-        Some(age_hist.as_slice())
+        Some(age_hist.clone())
     );
     assert_eq!(
         reopened.property_histogram(person, name),
-        Some(name_hist.as_slice())
+        Some(name_hist.clone())
     );
     assert_eq!(reopened.property_histogram(person, 999), None);
 }
@@ -850,7 +850,7 @@ fn property_histogram_recovers_after_a_no_force_crash() {
     s.commit(t2).unwrap();
 
     let rec = recover_no_force(&s);
-    assert_eq!(rec.property_histogram(person, age), Some(newer.as_slice()));
+    assert_eq!(rec.property_histogram(person, age), Some(newer.clone()));
 }
 
 #[test]
@@ -865,7 +865,7 @@ fn property_histogram_recovers_after_a_steal_crash() {
     s.commit(txn).unwrap();
 
     let rec = recover_steal(&mut s);
-    assert_eq!(rec.property_histogram(person, age), Some(hist.as_slice()));
+    assert_eq!(rec.property_histogram(person, age), Some(hist.clone()));
 }
 
 #[test]
@@ -888,10 +888,7 @@ fn an_uncommitted_histogram_does_not_survive_recovery() {
 
     // Only T1's committed blob survives — the catalog is checkpointed only at commit.
     let rec = recover_no_force(&s);
-    assert_eq!(
-        rec.property_histogram(person, age),
-        Some(committed.as_slice())
-    );
+    assert_eq!(rec.property_histogram(person, age), Some(committed.clone()));
 }
 
 #[test]
@@ -915,7 +912,7 @@ fn rolled_back_histogram_change_is_discarded() {
 
     assert_eq!(
         s.property_histogram(person, age),
-        Some(baseline.as_slice()),
+        Some(baseline.clone()),
         "a rolled-back set must leave the committed blob untouched"
     );
     assert_eq!(
@@ -930,7 +927,7 @@ fn rolled_back_histogram_change_is_discarded() {
     s.begin(t3);
     s.remove_property_histogram(t3, person, age); // would delete the committed blob
     s.rollback(t3).unwrap();
-    assert_eq!(s.property_histogram(person, age), Some(baseline.as_slice()));
+    assert_eq!(s.property_histogram(person, age), Some(baseline.clone()));
 }
 
 #[test]
@@ -952,7 +949,10 @@ fn removed_property_histogram_stays_removed_across_reopen() {
     s.commit(t2).unwrap();
     s.flush().unwrap();
     assert_eq!(s.property_histogram(person, age), None);
-    assert_eq!(s.property_histogram(person, name), Some(&[4u8, 5, 6][..]));
+    assert_eq!(
+        s.property_histogram(person, name),
+        Some([4u8, 5, 6].to_vec())
+    );
 
     // The removal is durable: it must stay removed across a clean reopen.
     let (device, wal) = into_parts(s);
@@ -960,7 +960,7 @@ fn removed_property_histogram_stays_removed_across_reopen() {
     assert_eq!(reopened.property_histogram(person, age), None);
     assert_eq!(
         reopened.property_histogram(person, name),
-        Some(&[4u8, 5, 6][..])
+        Some([4u8, 5, 6].to_vec())
     );
 }
 
@@ -973,7 +973,10 @@ fn an_empty_blob_is_treated_as_a_removal() {
     let age = s.intern_token(Namespace::PropKey, "age").unwrap();
     s.set_property_histogram(t1, person, age, vec![1u8, 2, 3]);
     s.commit(t1).unwrap();
-    assert_eq!(s.property_histogram(person, age), Some(&[1u8, 2, 3][..]));
+    assert_eq!(
+        s.property_histogram(person, age),
+        Some([1u8, 2, 3].to_vec())
+    );
 
     // Setting an empty blob removes the entry (a histogram is never zero-length).
     let t2 = TxnId(2);

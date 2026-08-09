@@ -1814,11 +1814,19 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             let store = self.store.borrow();
             let type_names = type_tokens
                 .iter()
-                .filter_map(|tt| store.token_name(Namespace::RelType, *tt).map(str::to_owned))
+                .filter_map(|tt| {
+                    store
+                        .token_name(Namespace::RelType, *tt)
+                        .map(|n| n.to_string())
+                })
                 .collect();
             let prop_names = prop_keys
                 .iter()
-                .filter_map(|pk| store.token_name(Namespace::PropKey, *pk).map(str::to_owned))
+                .filter_map(|pk| {
+                    store
+                        .token_name(Namespace::PropKey, *pk)
+                        .map(|n| n.to_string())
+                })
                 .collect();
             (type_names, prop_names)
         };
@@ -1898,7 +1906,11 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             let store = self.store.borrow();
             prop_keys
                 .iter()
-                .filter_map(|pk| store.token_name(Namespace::PropKey, *pk).map(str::to_owned))
+                .filter_map(|pk| {
+                    store
+                        .token_name(Namespace::PropKey, *pk)
+                        .map(|n| n.to_string())
+                })
                 .collect()
         };
         let doc_texts = prop_names.iter().filter_map(|name| {
@@ -1925,7 +1937,11 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             let store = self.store.borrow();
             prop_keys
                 .iter()
-                .filter_map(|pk| store.token_name(Namespace::PropKey, *pk).map(str::to_owned))
+                .filter_map(|pk| {
+                    store
+                        .token_name(Namespace::PropKey, *pk)
+                        .map(|n| n.to_string())
+                })
                 .collect()
         };
         let doc_texts = prop_names
@@ -2537,7 +2553,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                 let store = self.store.borrow();
                 let Some(label) = store
                     .token_name(Namespace::Label, rule.label_token)
-                    .map(ToOwned::to_owned)
+                    .map(|n| n.to_string())
                 else {
                     continue;
                 };
@@ -2748,7 +2764,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                 let store = self.store.borrow();
                 let Some(type_name) = store
                     .token_name(Namespace::RelType, rule.label_token)
-                    .map(ToOwned::to_owned)
+                    .map(|n| n.to_string())
                 else {
                     continue;
                 };
@@ -3497,7 +3513,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                 .store
                 .borrow()
                 .token_name(Namespace::PropKey, prop_key)
-                .map(ToOwned::to_owned)?;
+                .map(|n| n.to_string())?;
             let value = props
                 .iter()
                 .find(|(k, _)| *k == name)
@@ -4782,7 +4798,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                     let property = store.token_name(Namespace::PropKey, prop_key)?;
                     let name = store
                         .node_property_index_name_for(label_token, prop_key)
-                        .unwrap_or_else(|| crate::coordinator::auto_index_name(label, property));
+                        .unwrap_or_else(|| crate::coordinator::auto_index_name(&label, &property));
                     Some((name, label.to_owned(), property.to_owned()))
                 })
                 .collect(),
@@ -5520,7 +5536,11 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         Some(
             prop_keys
                 .iter()
-                .filter_map(|pk| store.token_name(Namespace::PropKey, *pk).map(str::to_owned))
+                .filter_map(|pk| {
+                    store
+                        .token_name(Namespace::PropKey, *pk)
+                        .map(|n| n.to_string())
+                })
                 .collect(),
         )
     }
@@ -5534,7 +5554,11 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         Some(
             prop_keys
                 .iter()
-                .filter_map(|pk| store.token_name(Namespace::PropKey, *pk).map(str::to_owned))
+                .filter_map(|pk| {
+                    store
+                        .token_name(Namespace::PropKey, *pk)
+                        .map(|n| n.to_string())
+                })
                 .collect(),
         )
     }
@@ -5624,10 +5648,10 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             let (Some(label), Some(prop)) = (
                 store
                     .token_name(Namespace::Label, entry.token)
-                    .map(str::to_owned),
+                    .map(|n| n.to_string()),
                 store
                     .token_name(Namespace::PropKey, entry.property_token)
-                    .map(str::to_owned),
+                    .map(|n| n.to_string()),
             ) else {
                 return VectorQueryResult::NoSuchIndex;
             };
@@ -5737,10 +5761,10 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             let (Some(rel_type), Some(prop)) = (
                 store
                     .token_name(Namespace::RelType, entry.token)
-                    .map(str::to_owned),
+                    .map(|n| n.to_string()),
                 store
                     .token_name(Namespace::PropKey, entry.property_token)
-                    .map(str::to_owned),
+                    .map(|n| n.to_string()),
             ) else {
                 return VectorQueryResult::NoSuchIndex;
             };
@@ -5975,7 +5999,11 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             let store = self.store.borrow();
             prop_keys
                 .iter()
-                .filter_map(|pk| store.token_name(Namespace::PropKey, *pk).map(str::to_owned))
+                .filter_map(|pk| {
+                    store
+                        .token_name(Namespace::PropKey, *pk)
+                        .map(|n| n.to_string())
+                })
                 .collect()
         };
 
