@@ -95,7 +95,7 @@ fn coord_with_people(n: i64) -> TxnCoordinator<MemBlockDevice, MemLogSink> {
 /// Runs `src` over the coordinator in a fresh committed read transaction, returning the FULL ordered row
 /// sequence (each row rendered to a stable `Vec<(column, Debug-of-value)>` for order-sensitive compare).
 fn run_rows(
-    coord: &mut TxnCoordinator<MemBlockDevice, MemLogSink>,
+    coord: &TxnCoordinator<MemBlockDevice, MemLogSink>,
     src: &str,
 ) -> Vec<Vec<(String, String)>> {
     let toks = tokenize(src).expect("lex");
@@ -138,7 +138,7 @@ fn render_row(row: &Row) -> Vec<(String, String)> {
 /// sequence** with the morsel knob on (8 workers) as off (1 worker, serial) — the inviolable Slice-3b
 /// ordering obligation. The knob is a process global, so it is set around each phase; reset after.
 fn assert_knob_row_order_identical(
-    coord: &mut TxnCoordinator<MemBlockDevice, MemLogSink>,
+    coord: &TxnCoordinator<MemBlockDevice, MemLogSink>,
     q: &str,
 ) -> Vec<Vec<(String, String)>> {
     graphus_cypher::morsel::set_morsel_threads(1);
@@ -169,7 +169,7 @@ fn assert_knob_row_order_identical(
 /// large (60k > MORSEL_MIN_ROWS) `:Person` graph so the tier actually engages.
 #[test]
 fn morsel_rows_end_to_end_match_serial() {
-    let mut coord = coord_with_people(60_000);
+    let coord = coord_with_people(60_000);
 
     // (query, expected non-empty result — a smoke check that the run isn't vacuously empty)
     let queries = [
@@ -193,7 +193,7 @@ fn morsel_rows_end_to_end_match_serial() {
     ];
 
     for q in queries {
-        let rows = assert_knob_row_order_identical(&mut coord, q);
+        let rows = assert_knob_row_order_identical(&coord, q);
         assert!(!rows.is_empty(), "`{q}`: expected a non-empty result");
     }
 
@@ -205,16 +205,13 @@ fn morsel_rows_end_to_end_match_serial() {
 #[test]
 fn morsel_rows_end_to_end_overwrite_delete() {
     // Seed via the bulk path, then overwrite + delete in committed follow-on transactions.
-    let mut coord = coord_with_people(55_000);
+    let coord = coord_with_people(55_000);
 
     // Run a write transaction through the coordinator to overwrite some ages and delete some nodes, so the
     // candidate index keeps the (now-tombstoned / overwritten) ids.
     graphus_cypher::morsel::set_morsel_threads(1);
-    run_write(
-        &mut coord,
-        "MATCH (n:Person) WHERE n.age = 0 SET n.age = 9999",
-    );
-    run_write(&mut coord, "MATCH (n:Person) WHERE n.age = 1 DELETE n");
+    run_write(&coord, "MATCH (n:Person) WHERE n.age = 0 SET n.age = 9999");
+    run_write(&coord, "MATCH (n:Person) WHERE n.age = 1 DELETE n");
 
     let queries = [
         "MATCH (n:Person) WHERE n.age > 9000 RETURN n.age AS age, n.name AS name ORDER BY n.name LIMIT 100",
@@ -222,14 +219,14 @@ fn morsel_rows_end_to_end_overwrite_delete() {
         "MATCH (n:Person) WHERE n.age < 5 RETURN n.name AS name ORDER BY n.name",
     ];
     for q in queries {
-        assert_knob_row_order_identical(&mut coord, q);
+        assert_knob_row_order_identical(&coord, q);
     }
     graphus_cypher::morsel::set_morsel_threads(1);
 }
 
 /// Runs a write query through the coordinator and commits it (used to mutate the graph between read
 /// assertions). Returns the affected-row count is irrelevant here — it just applies the side effects.
-fn run_write(coord: &mut TxnCoordinator<MemBlockDevice, MemLogSink>, src: &str) {
+fn run_write(coord: &TxnCoordinator<MemBlockDevice, MemLogSink>, src: &str) {
     let toks = tokenize(src).expect("lex");
     let ast = parse_tokens(&toks, src).expect("parse");
     let plan = plan_physical(
@@ -915,7 +912,7 @@ fn measure_morsel_rows_cores() {
 
     // Preload (NOT measured for cores: the serial bulk insert + commit on the engine thread).
     let preload_start = Instant::now();
-    let mut coord = coord_with_people(people);
+    let coord = coord_with_people(people);
     let preload = preload_start.elapsed();
 
     // The Slice-3b AC query: filtered scan → projection → stable ORDER BY → top-k.
@@ -924,7 +921,7 @@ fn measure_morsel_rows_cores() {
     // Warm one run (fault pages into the buffer pool), then time the read loop — the phase whose
     // mean-cores is the AC. CPU time is read in ISOLATION via `/proc/self/stat` so the serial preload does
     // not dilute the core count the external `time -v` reports.
-    let warm = run_rows(&mut coord, q);
+    let warm = run_rows(&coord, q);
     assert_eq!(
         warm.len(),
         100,
@@ -933,7 +930,7 @@ fn measure_morsel_rows_cores() {
     let (cpu0, wall0) = (proc_cpu_secs(), Instant::now());
     let mut last_len = 0usize;
     for _ in 0..iters {
-        last_len = run_rows(&mut coord, q).len();
+        last_len = run_rows(&coord, q).len();
     }
     let elapsed = wall0.elapsed();
     let cpu = proc_cpu_secs() - cpu0;

@@ -292,7 +292,7 @@ fn plan_contains<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Syn
 
 /// Runs `src` and returns its rows, asserting the statement captured no error.
 fn run<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>(
-    coord: &mut TxnCoordinator<D, S>,
+    coord: &TxnCoordinator<D, S>,
     src: &str,
 ) -> Vec<Row> {
     let plan = compile(coord, src);
@@ -319,7 +319,7 @@ fn run<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'stati
 /// returns the rendered error. Used to prove that an unusable vector index ERRORS rather than returning
 /// an empty neighbour set.
 fn run_expect_error<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>(
-    coord: &mut TxnCoordinator<D, S>,
+    coord: &TxnCoordinator<D, S>,
     src: &str,
 ) -> String {
     let plan = compile(coord, src);
@@ -344,7 +344,7 @@ fn run_expect_error<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
 }
 
 fn write<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>(
-    coord: &mut TxnCoordinator<D, S>,
+    coord: &TxnCoordinator<D, S>,
     src: &str,
 ) {
     let _ = run(coord, src);
@@ -366,7 +366,7 @@ fn ids_of(rows: &[Row], column: &str) -> Vec<u64> {
 /// text property (full-text + text + range), and typed relationships with a text property (relationship
 /// full-text + relationship range).
 fn seed<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>(
-    coord: &mut TxnCoordinator<D, S>,
+    coord: &TxnCoordinator<D, S>,
 ) {
     write(
         coord,
@@ -399,7 +399,7 @@ fn seed<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'stat
 
 /// Declares one index of every kind, each fully built + `Online`.
 fn declare_indexes<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>(
-    coord: &mut TxnCoordinator<D, S>,
+    coord: &TxnCoordinator<D, S>,
 ) {
     coord
         .create_fulltext_index(
@@ -440,7 +440,7 @@ fn declare_indexes<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
 }
 
 fn truth_articles<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>(
-    coord: &mut TxnCoordinator<D, S>,
+    coord: &TxnCoordinator<D, S>,
 ) -> Vec<u64> {
     let rows = run(
         coord,
@@ -450,7 +450,7 @@ fn truth_articles<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sy
 }
 
 fn fulltext_articles<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>(
-    coord: &mut TxnCoordinator<D, S>,
+    coord: &TxnCoordinator<D, S>,
 ) -> Vec<u64> {
     let rows = run(
         coord,
@@ -461,7 +461,7 @@ fn fulltext_articles<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send +
 }
 
 fn fulltext_cites<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>(
-    coord: &mut TxnCoordinator<D, S>,
+    coord: &TxnCoordinator<D, S>,
 ) -> Vec<u64> {
     let rows = run(
         coord,
@@ -474,7 +474,7 @@ fn fulltext_cites<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sy
 /// A point lookup the planner routes through the node-property index when it is `Online`, and through a
 /// label scan + filter when it is not — the same rows either way.
 fn slug_lookup<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>(
-    coord: &mut TxnCoordinator<D, S>,
+    coord: &TxnCoordinator<D, S>,
 ) -> Vec<u64> {
     let rows = run(
         coord,
@@ -485,7 +485,7 @@ fn slug_lookup<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync 
 
 /// A `CONTAINS` the planner routes through the trigram text index when it is `Online`.
 fn contains_lookup<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>(
-    coord: &mut TxnCoordinator<D, S>,
+    coord: &TxnCoordinator<D, S>,
 ) -> Vec<u64> {
     let rows = run(
         coord,
@@ -533,9 +533,9 @@ fn baseline() -> MemStore {
     let device = MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new()).expect("create wal");
     let store: MemStore = RecordStore::create(device, wal, 64, 1).expect("create store");
-    let mut coord: MemCoord = TxnCoordinator::new(store);
-    seed(&mut coord);
-    declare_indexes(&mut coord);
+    let coord: MemCoord = TxnCoordinator::new(store);
+    seed(&coord);
+    declare_indexes(&coord);
     coord.into_store()
 }
 
@@ -573,7 +573,7 @@ fn a_rebuild_whose_scan_faults_never_leaves_an_online_empty_index() {
     let faulty: FaultyStore =
         RecordStore::open(device, wal, FAULTED_POOL_PAGES).expect("open store");
     fault.arm();
-    let mut coord: FaultyCoord = TxnCoordinator::new(faulty);
+    let coord: FaultyCoord = TxnCoordinator::new(faulty);
     fault.heal();
 
     // The engine must SAY it is degraded (`rmp` task #733, B4): a silent degradation is
@@ -617,25 +617,25 @@ fn a_rebuild_whose_scan_faults_never_leaves_an_online_empty_index() {
     );
 
     // And every query still returns the TRUE rows, through the scan fallback.
-    let expected = truth_articles(&mut coord);
+    let expected = truth_articles(&coord);
     assert_eq!(expected.len(), MATCHING, "ground truth");
     assert_eq!(
-        fulltext_articles(&mut coord),
+        fulltext_articles(&coord),
         expected,
         "the node full-text query must fall back to the scan, never answer from an empty index"
     );
     assert_eq!(
-        fulltext_cites(&mut coord).len(),
+        fulltext_cites(&coord).len(),
         1,
         "the relationship full-text query must fall back to the scan too"
     );
     assert_eq!(
-        slug_lookup(&mut coord).len(),
+        slug_lookup(&coord).len(),
         1,
         "the node-property point lookup must still find its row (via the label scan)"
     );
     assert_eq!(
-        contains_lookup(&mut coord).len(),
+        contains_lookup(&coord).len(),
         MATCHING,
         "CONTAINS must still find its rows (via the label scan + residual)"
     );
@@ -670,22 +670,22 @@ fn a_fault_at_any_point_of_the_rebuild_still_answers_correctly() {
             RecordStore::open(device, wal, FAULTED_POOL_PAGES).expect("open store");
         // Fail exactly the k-th read of the rebuild, then heal: a transient fault at every position.
         fault.fail_once_at_read(k);
-        let mut coord: FaultyCoord = TxnCoordinator::new(faulty);
+        let coord: FaultyCoord = TxnCoordinator::new(faulty);
         fault.heal();
 
-        let expected = truth_articles(&mut coord);
+        let expected = truth_articles(&coord);
         assert_eq!(
             expected.len(),
             MATCHING,
             "ground truth must hold with the fault at read #{k}"
         );
         assert_eq!(
-            fulltext_articles(&mut coord),
+            fulltext_articles(&coord),
             expected,
             "full-text must return the true set with the fault at read #{k}"
         );
         assert_eq!(
-            slug_lookup(&mut coord).len(),
+            slug_lookup(&coord).len(),
             1,
             "the point lookup must find its row with the fault at read #{k}"
         );
@@ -702,9 +702,9 @@ fn an_unusable_vector_index_errors_instead_of_returning_no_neighbours() {
         let device = MemBlockDevice::new(0);
         let wal = WalManager::create(MemLogSink::new()).expect("create wal");
         let store: MemStore = RecordStore::create(device, wal, 64, 1).expect("create store");
-        let mut coord: MemCoord = TxnCoordinator::new(store);
+        let coord: MemCoord = TxnCoordinator::new(store);
         write(
-            &mut coord,
+            &coord,
             "UNWIND range(1, 450) AS i CREATE (:Doc {embedding: [1.0, 0.0, 0.0], slug: 'd' + toString(i)})",
         );
         coord
@@ -728,9 +728,9 @@ fn an_unusable_vector_index_errors_instead_of_returning_no_neighbours() {
         let (device, wal) = restart_on_faulty_device(&mut store);
         let healthy: FaultyStore =
             RecordStore::open(device, wal, FAULTED_POOL_PAGES).expect("open store");
-        let mut coord: FaultyCoord = TxnCoordinator::new(healthy);
+        let coord: FaultyCoord = TxnCoordinator::new(healthy);
         let rows = run(
-            &mut coord,
+            &coord,
             "CALL db.index.vector.queryNodes('doc_vec', 3, [1.0, 0.0, 0.0]) \
              YIELD node RETURN id(node) AS id",
         );
@@ -743,11 +743,11 @@ fn an_unusable_vector_index_errors_instead_of_returning_no_neighbours() {
     let faulty: FaultyStore =
         RecordStore::open(device, wal, FAULTED_POOL_PAGES).expect("open store");
     fault.arm();
-    let mut coord: FaultyCoord = TxnCoordinator::new(faulty);
+    let coord: FaultyCoord = TxnCoordinator::new(faulty);
     fault.heal();
 
     let err = run_expect_error(
-        &mut coord,
+        &coord,
         "CALL db.index.vector.queryNodes('doc_vec', 3, [1.0, 0.0, 0.0]) \
          YIELD node RETURN id(node) AS id",
     );
@@ -772,8 +772,8 @@ fn a_text_index_whose_build_faults_is_never_left_online() {
         let device = MemBlockDevice::new(0);
         let wal = WalManager::create(MemLogSink::new()).expect("create wal");
         let store: MemStore = RecordStore::create(device, wal, 64, 1).expect("create store");
-        let mut coord: MemCoord = TxnCoordinator::new(store);
-        seed(&mut coord);
+        let coord: MemCoord = TxnCoordinator::new(store);
+        seed(&coord);
         coord.into_store()
     };
 
@@ -781,7 +781,7 @@ fn a_text_index_whose_build_faults_is_never_left_online() {
     let fault = device.handle();
     let faulty: FaultyStore =
         RecordStore::open(device, wal, FAULTED_POOL_PAGES).expect("open store");
-    let mut coord: FaultyCoord = TxnCoordinator::new(faulty); // healthy open: the pool warms up.
+    let coord: FaultyCoord = TxnCoordinator::new(faulty); // healthy open: the pool warms up.
 
     // Fault the create's own build scan. A warm pool serves most pages from memory, so arming EVERY read
     // is what guarantees the scan faults wherever its first miss falls.
@@ -800,7 +800,7 @@ fn a_text_index_whose_build_faults_is_never_left_online() {
     );
     // ...and the query must still return the true rows, through the label scan + residual.
     assert_eq!(
-        contains_lookup(&mut coord).len(),
+        contains_lookup(&coord).len(),
         MATCHING,
         "CONTAINS must keep returning the true rows after a faulted text-index build"
     );
@@ -817,8 +817,8 @@ fn an_incremental_build_that_skips_a_node_never_promotes_itself() {
         let device = MemBlockDevice::new(0);
         let wal = WalManager::create(MemLogSink::new()).expect("create wal");
         let store: MemStore = RecordStore::create(device, wal, 64, 1).expect("create store");
-        let mut coord: MemCoord = TxnCoordinator::new(store);
-        seed(&mut coord);
+        let coord: MemCoord = TxnCoordinator::new(store);
+        seed(&coord);
         coord.into_store()
     };
 
@@ -826,7 +826,7 @@ fn an_incremental_build_that_skips_a_node_never_promotes_itself() {
     let fault = device.handle();
     let faulty: FaultyStore =
         RecordStore::open(device, wal, FAULTED_POOL_PAGES).expect("open store");
-    let mut coord: FaultyCoord = TxnCoordinator::new(faulty);
+    let coord: FaultyCoord = TxnCoordinator::new(faulty);
     coord
         .create_fulltext_index(
             "article_ft",
@@ -850,10 +850,10 @@ fn an_incremental_build_that_skips_a_node_never_promotes_itself() {
         coord.has_pending_index_builds(),
         "a build that could not read a node must not promote itself Online"
     );
-    let expected = truth_articles(&mut coord);
+    let expected = truth_articles(&coord);
     assert_eq!(expected.len(), MATCHING, "ground truth");
     assert_eq!(
-        fulltext_articles(&mut coord),
+        fulltext_articles(&coord),
         expected,
         "while the build is stalled, the query must be served by the exact scan fallback"
     );
@@ -869,7 +869,7 @@ fn an_incremental_build_that_skips_a_node_never_promotes_itself() {
         );
     }
     assert_eq!(
-        fulltext_articles(&mut coord),
+        fulltext_articles(&coord),
         expected,
         "the promoted index must agree with the scan"
     );
@@ -902,8 +902,8 @@ fn a_wipe_mid_build_restarts_it_instead_of_publishing_a_holed_index() {
         let device = MemBlockDevice::new(0);
         let wal = WalManager::create(MemLogSink::new()).expect("create wal");
         let store: MemStore = RecordStore::create(device, wal, 64, 1).expect("create store");
-        let mut coord: MemCoord = TxnCoordinator::new(store);
-        seed(&mut coord);
+        let coord: MemCoord = TxnCoordinator::new(store);
+        seed(&coord);
         coord.into_store()
     };
 
@@ -921,7 +921,7 @@ fn a_wipe_mid_build_restarts_it_instead_of_publishing_a_holed_index() {
         let fault = device.handle();
         let faulty: FaultyStore =
             RecordStore::open(device, wal, FAULTED_POOL_PAGES).expect("open store");
-        let mut coord: FaultyCoord = TxnCoordinator::new(faulty);
+        let coord: FaultyCoord = TxnCoordinator::new(faulty);
 
         // The **incremental** (non-blocking) create: it registers `Populating` and defers the per-node
         // indexing to `advance_index_builds` — the queue that lives on the coordinator, which
@@ -946,7 +946,7 @@ fn a_wipe_mid_build_restarts_it_instead_of_publishing_a_holed_index() {
         // `Online` over the hole. Without a post-snapshot write the snapshot equals the whole store, the
         // restart covers everything, and the test is green while proving nothing.
         write(
-            &mut coord,
+            &coord,
             "CREATE (:Article {slug: 'late-1', title: 'escrita depois do snapshot'})",
         );
 
@@ -999,7 +999,7 @@ fn a_wipe_mid_build_restarts_it_instead_of_publishing_a_holed_index() {
 
     let mut wipes = 0;
     for k in 0..probe_reads {
-        let (mut coord, wiped) = scenario(k);
+        let (coord, wiped) = scenario(k);
         if wiped {
             wipes += 1;
         }
@@ -1021,7 +1021,7 @@ fn a_wipe_mid_build_restarts_it_instead_of_publishing_a_holed_index() {
         // these returned 0 rows: a committed row invisible to a query.
         for slug in ["match-1", "match-2", "match-3", "match-7", "late-1"] {
             let rows = run(
-                &mut coord,
+                &coord,
                 &format!("MATCH (a:Article {{slug: '{slug}'}}) RETURN id(a) AS id"),
             );
             assert_eq!(
@@ -1051,7 +1051,7 @@ fn a_wipe_mid_build_restarts_it_instead_of_publishing_a_holed_index() {
         // later rebuild can take it back.
         for slug in ["match-7", "late-1"] {
             let dup = run_expect_error(
-                &mut coord,
+                &coord,
                 &format!("CREATE (:Article {{slug: '{slug}', title: 'duplicate'}})"),
             );
             assert!(
@@ -1061,7 +1061,7 @@ fn a_wipe_mid_build_restarts_it_instead_of_publishing_a_holed_index() {
             );
             assert_eq!(
                 run(
-                    &mut coord,
+                    &coord,
                     &format!("MATCH (a:Article {{slug: '{slug}'}}) RETURN id(a) AS id")
                 )
                 .len(),
@@ -1101,15 +1101,15 @@ fn a_bitmap_index_whose_capture_faults_is_not_left_registered_and_empty() {
         let device = MemBlockDevice::new(0);
         let wal = WalManager::create(MemLogSink::new()).expect("create wal");
         let store: MemStore = RecordStore::create(device, wal, 64, 1).expect("create store");
-        let mut coord: MemCoord = TxnCoordinator::new(store);
-        seed(&mut coord);
+        let coord: MemCoord = TxnCoordinator::new(store);
+        seed(&coord);
         coord.into_store()
     };
     let (device, wal) = restart_on_faulty_device(&mut store);
     let fault = device.handle();
     let faulty: FaultyStore =
         RecordStore::open(device, wal, FAULTED_POOL_PAGES).expect("open store");
-    let mut coord: FaultyCoord = TxnCoordinator::new(faulty);
+    let coord: FaultyCoord = TxnCoordinator::new(faulty);
 
     fault.arm();
     let declared = coord.declare_bitmap_index("Article", "slug");
@@ -1122,14 +1122,14 @@ fn a_bitmap_index_whose_capture_faults_is_not_left_registered_and_empty() {
     // The (empty) bitmap must not be left answering seeks: every query still returns the true rows.
     assert_eq!(
         run(
-            &mut coord,
+            &coord,
             "MATCH (a:Article {slug: 'match-7'}) RETURN id(a) AS id"
         )
         .len(),
         1,
         "a point lookup must still find its row after a faulted bitmap capture"
     );
-    assert_eq!(truth_articles(&mut coord).len(), MATCHING, "ground truth");
+    assert_eq!(truth_articles(&coord).len(), MATCHING, "ground truth");
 }
 
 /// B3: a `CREATE CONSTRAINT … IS UNIQUE` must be REFUSED when the validation walk cannot read a node —
@@ -1141,8 +1141,8 @@ fn a_constraint_whose_validation_cannot_read_a_node_is_refused() {
         let device = MemBlockDevice::new(0);
         let wal = WalManager::create(MemLogSink::new()).expect("create wal");
         let store: MemStore = RecordStore::create(device, wal, 64, 1).expect("create store");
-        let mut coord: MemCoord = TxnCoordinator::new(store);
-        seed(&mut coord);
+        let coord: MemCoord = TxnCoordinator::new(store);
+        seed(&coord);
         coord.into_store()
     };
     let (device, wal) = restart_on_faulty_device(&mut store);
@@ -1183,7 +1183,7 @@ fn a_healthy_engine_really_does_plan_index_seeks_for_these_probes() {
     let (device, wal) = restart_on_faulty_device(&mut store);
     let healthy: FaultyStore =
         RecordStore::open(device, wal, FAULTED_POOL_PAGES).expect("open store");
-    let mut coord: FaultyCoord = TxnCoordinator::new(healthy);
+    let coord: FaultyCoord = TxnCoordinator::new(healthy);
 
     let point = "MATCH (a:Article {slug: 'match-7'}) RETURN id(a) AS id";
     let contains = "MATCH (a:Article) WHERE a.title CONTAINS 'relatorio' RETURN id(a) AS id";
@@ -1195,8 +1195,8 @@ fn a_healthy_engine_really_does_plan_index_seeks_for_these_probes() {
         plan_contains(&coord, contains, "NodeTextIndexSeek"),
         "the CONTAINS must plan a NodeTextIndexSeek on a healthy engine"
     );
-    assert_eq!(run(&mut coord, point).len(), 1);
-    assert_eq!(run(&mut coord, contains).len(), MATCHING);
+    assert_eq!(run(&coord, point).len(), 1);
+    assert_eq!(run(&coord, contains).len(), MATCHING);
 }
 
 // =================================================================================================
@@ -1218,15 +1218,15 @@ fn a_build_against_a_permanently_faulty_store_terminates_instead_of_spinning() {
         let device = MemBlockDevice::new(0);
         let wal = WalManager::create(MemLogSink::new()).expect("create wal");
         let store: MemStore = RecordStore::create(device, wal, 64, 1).expect("create store");
-        let mut coord: MemCoord = TxnCoordinator::new(store);
-        seed(&mut coord);
+        let coord: MemCoord = TxnCoordinator::new(store);
+        seed(&coord);
         coord.into_store()
     };
     let (device, wal) = restart_on_faulty_device(&mut store);
     let fault = device.handle();
     let faulty: FaultyStore =
         RecordStore::open(device, wal, FAULTED_POOL_PAGES).expect("open store");
-    let mut coord: FaultyCoord = TxnCoordinator::new(faulty);
+    let coord: FaultyCoord = TxnCoordinator::new(faulty);
     coord
         .begin_online_node_property_index("Article", "slug")
         .expect("declare the online index");
@@ -1255,14 +1255,14 @@ fn a_build_against_a_permanently_faulty_store_terminates_instead_of_spinning() {
     // ...and every query still returns the truth, through the exact scan.
     assert_eq!(
         run(
-            &mut coord,
+            &coord,
             "MATCH (a:Article {slug: 'match-7'}) RETURN id(a) AS id"
         )
         .len(),
         1,
         "answers must stay correct while the index is unusable"
     );
-    assert_eq!(truth_articles(&mut coord).len(), MATCHING);
+    assert_eq!(truth_articles(&coord).len(), MATCHING);
 }
 
 // =================================================================================================
@@ -1279,13 +1279,13 @@ fn a_rel_key_duplicate_check_fails_closed_on_a_read_fault() {
         let device = MemBlockDevice::new(0);
         let wal = WalManager::create(MemLogSink::new()).expect("create wal");
         let store: MemStore = RecordStore::create(device, wal, 64, 1).expect("create store");
-        let mut coord: MemCoord = TxnCoordinator::new(store);
-        seed(&mut coord);
+        let coord: MemCoord = TxnCoordinator::new(store);
+        seed(&coord);
         // MANY relationships, so the relationship store spans far more pages than the faulted buffer
         // pool: without this the duplicate check's `scan_rel_ids` is served entirely from memory and the
         // injected read fault can never land inside it — the test would be green and vacuous.
         write(
-            &mut coord,
+            &coord,
             "UNWIND range(1, 200) AS i \
              MATCH (a:Article {slug: 'match-1'}), (b:Article {slug: 'match-2'}) \
              CREATE (a)-[:CITES {note: 'nota ' + toString(i), tag: 'tag ' + toString(i)}]->(b)",
@@ -1323,14 +1323,14 @@ fn a_rel_key_duplicate_check_fails_closed_on_a_read_fault() {
     // Sanity + the injection-point count: on a HEALTHY engine the constraint rejects the duplicate.
     let reads = {
         let mut store = seeded();
-        let (mut coord, fault) = open_faulty(&mut store);
+        let (coord, fault) = open_faulty(&mut store);
         fault.reset_read_count();
-        let err = run_expect_error(&mut coord, DUP);
+        let err = run_expect_error(&coord, DUP);
         assert!(
             err.to_lowercase().contains("constraint"),
             "the healthy engine must reject the duplicate, got: {err}"
         );
-        assert_eq!(run(&mut coord, HOLDERS).len(), 1, "still one holder");
+        assert_eq!(run(&coord, HOLDERS).len(), 1, "still one holder");
         fault.reads()
     };
     assert!(reads > 0, "the write must reach the device");
@@ -1344,7 +1344,7 @@ fn a_rel_key_duplicate_check_fails_closed_on_a_read_fault() {
     // the duplicate check. The fail-OPEN was reachable precisely when everything else succeeded.
     for k in 0..reads {
         let mut store = seeded();
-        let (mut coord, fault) = open_faulty(&mut store);
+        let (coord, fault) = open_faulty(&mut store);
         fault.fail_once_at_read(k);
         let plan = compile(&coord, DUP);
         let txn = coord.begin_serializable();
@@ -1364,7 +1364,7 @@ fn a_rel_key_duplicate_check_fails_closed_on_a_read_fault() {
         fault.heal();
 
         assert_eq!(
-            run(&mut coord, HOLDERS).len(),
+            run(&coord, HOLDERS).len(),
             1,
             "a duplicate REL KEY tuple was COMMITTED through a read fault at read #{k}: the \
              duplicate check swallowed the scan error and reported 'no duplicate'"
@@ -1417,9 +1417,9 @@ fn a_dead_property_page_does_not_cause_an_unbounded_poison_resurrect_cycle() {
         let device = MemBlockDevice::new(0);
         let wal = WalManager::create(MemLogSink::new()).expect("create wal");
         let store: MemStore = RecordStore::create(device, wal, 64, 1).expect("create store");
-        let mut coord: MemCoord = TxnCoordinator::new(store);
+        let coord: MemCoord = TxnCoordinator::new(store);
         run(
-            &mut coord,
+            &coord,
             "UNWIND range(1, 120) AS i \
              CREATE (:Article {slug: 'slug-' + toString(i), title: 'title text ' + toString(i)})",
         );
@@ -1529,20 +1529,20 @@ fn sweep_duplicate_never_commits(
 ) {
     // Sanity on a healthy engine + the injection-point count.
     let reads = {
-        let (mut coord, fault) = open();
+        let (coord, fault) = open();
         fault.reset_read_count();
-        let err = run_expect_error(&mut coord, dup);
+        let err = run_expect_error(&coord, dup);
         assert!(
             err.to_lowercase().contains("constraint"),
             "the healthy engine must reject the duplicate, got: {err}"
         );
-        assert_eq!(run(&mut coord, holders).len(), 1, "still one holder");
+        assert_eq!(run(&coord, holders).len(), 1, "still one holder");
         fault.reads()
     };
     assert!(reads > 0, "the write must reach the device");
 
     for k in 0..reads {
-        let (mut coord, fault) = open();
+        let (coord, fault) = open();
         fault.fail_once_at_read(k);
         let plan = compile(&coord, dup);
         let txn = coord.begin_serializable();
@@ -1561,7 +1561,7 @@ fn sweep_duplicate_never_commits(
         }
         fault.heal();
         assert_eq!(
-            run(&mut coord, holders).len(),
+            run(&coord, holders).len(),
             1,
             "a DUPLICATE was committed through a read fault at read #{k}: the node uniqueness / \
              node-key check swallowed the holder's record fault and reported 'no conflict'"
@@ -1575,17 +1575,14 @@ fn seeded_articles(constraint: &str) -> MemStore {
     let device = MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new()).expect("create wal");
     let store: MemStore = RecordStore::create(device, wal, 64, 1).expect("create store");
-    let mut coord: MemCoord = TxnCoordinator::new(store);
+    let coord: MemCoord = TxnCoordinator::new(store);
     // The holder is created FIRST (a low id), then buried under a bulk of later nodes. After the
     // open-time rebuild reads the whole store in id order, the pool retains only the LAST few (high-id)
     // pages, so the holder's low-id record is COLD — its `store.node` read reaches the device, where a
     // swept fault can land on it. (Creating the holder last would leave it cached, and the test vacuous.)
+    run(&coord, "CREATE (:Article {slug: 'holder', tenant: 'acme'})");
     run(
-        &mut coord,
-        "CREATE (:Article {slug: 'holder', tenant: 'acme'})",
-    );
-    run(
-        &mut coord,
+        &coord,
         "UNWIND range(1, 700) AS i \
          CREATE (:Article {slug: 'slug-' + toString(i), tenant: 'acme'})",
     );
@@ -1675,9 +1672,9 @@ fn the_off_thread_label_filter_fails_closed_on_a_read_fault() {
         let device = MemBlockDevice::new(0);
         let wal = WalManager::create(MemLogSink::new()).expect("create wal");
         let store: MemStore = RecordStore::create(device, wal, 64, 1).expect("create store");
-        let mut coord: MemCoord = TxnCoordinator::new(store);
+        let coord: MemCoord = TxnCoordinator::new(store);
         run(
-            &mut coord,
+            &coord,
             "UNWIND range(1, 700) AS i CREATE (:Article {slug: 'slug-' + toString(i)})",
         );
         coord.into_store()
@@ -1687,7 +1684,7 @@ fn the_off_thread_label_filter_fails_closed_on_a_read_fault() {
     let all_ids: Vec<u64> = {
         let s = seeded();
         run(
-            &mut TxnCoordinator::new(s),
+            &TxnCoordinator::new(s),
             "MATCH (a:Article) RETURN id(a) AS id ORDER BY id",
         )
         .iter()
@@ -1791,9 +1788,9 @@ fn a_columnar_aggregation_fails_closed_on_a_read_fault() {
         let device = MemBlockDevice::new(0);
         let wal = WalManager::create(MemLogSink::new()).expect("create wal");
         let store: MemStore = RecordStore::create(device, wal, 64, 1).expect("create store");
-        let mut coord: MemCoord = TxnCoordinator::new(store);
+        let coord: MemCoord = TxnCoordinator::new(store);
         run(
-            &mut coord,
+            &coord,
             &format!("UNWIND range(1, {N}) AS i CREATE (:Article {{age: i}})"),
         );
         coord.into_store()
@@ -1819,9 +1816,9 @@ fn a_columnar_aggregation_fails_closed_on_a_read_fault() {
 
     // Sanity on a healthy engine + the injection-point count.
     let reads = {
-        let (mut coord, fault) = open();
+        let (coord, fault) = open();
         fault.reset_read_count();
-        let rows = run(&mut coord, AGG);
+        let rows = run(&coord, AGG);
         let s = match rows[0].value("s") {
             Value::Integer(i) => i,
             other => panic!("expected an integer sum, got {other:?}"),
@@ -1902,20 +1899,20 @@ fn a_rel_unique_check_fails_closed_on_a_read_fault() {
         let device = MemBlockDevice::new(0);
         let wal = WalManager::create(MemLogSink::new()).expect("create wal");
         let store: MemStore = RecordStore::create(device, wal, 64, 1).expect("create store");
-        let mut coord: MemCoord = TxnCoordinator::new(store);
+        let coord: MemCoord = TxnCoordinator::new(store);
         run(
-            &mut coord,
+            &coord,
             "CREATE (:Article {slug: 'a'}), (:Article {slug: 'b'})",
         );
         // The HOLDER relationship is created FIRST (a low rel id), then buried under many more, so its
         // record is COLD after reopen and its per-candidate re-read is a genuine device read.
         run(
-            &mut coord,
+            &coord,
             "MATCH (a:Article {slug: 'a'}), (b:Article {slug: 'b'}) \
              CREATE (a)-[:CITES {ref: 'holder'}]->(b)",
         );
         run(
-            &mut coord,
+            &coord,
             &format!(
                 "UNWIND range(1, {N}) AS i \
                  MATCH (a:Article {{slug: 'a'}}), (b:Article {{slug: 'b'}}) \
@@ -1951,20 +1948,20 @@ fn a_rel_unique_check_fails_closed_on_a_read_fault() {
 
     // Sanity + injection-point count.
     let reads = {
-        let (mut coord, fault) = open();
+        let (coord, fault) = open();
         fault.reset_read_count();
-        let err = run_expect_error(&mut coord, DUP);
+        let err = run_expect_error(&coord, DUP);
         assert!(
             err.to_lowercase().contains("constraint"),
             "the healthy engine must reject the duplicate relationship, got: {err}"
         );
-        assert_eq!(run(&mut coord, HOLDERS).len(), 1, "still one holder");
+        assert_eq!(run(&coord, HOLDERS).len(), 1, "still one holder");
         fault.reads()
     };
     assert!(reads > 0, "the write must reach the device");
 
     for k in 0..reads {
-        let (mut coord, fault) = open();
+        let (coord, fault) = open();
         fault.fail_once_at_read(k);
         let plan = compile(&coord, DUP);
         let txn = coord.begin_serializable();
@@ -1982,7 +1979,7 @@ fn a_rel_unique_check_fails_closed_on_a_read_fault() {
         }
         fault.heal();
         assert_eq!(
-            run(&mut coord, HOLDERS).len(),
+            run(&coord, HOLDERS).len(),
             1,
             "a DUPLICATE relationship was committed through a read fault at read #{k}: the REL \
              uniqueness check swallowed the holder's record/property fault and reported 'no conflict'"
@@ -2013,7 +2010,7 @@ fn a_degraded_rel_range_index_declines_the_seek_and_still_returns_every_row() {
     let src = "MATCH (a)-[c:CITES]->(b) WHERE c.tag >= 'p' RETURN id(c) AS id";
     let mut store = baseline();
     let truth = {
-        let mut healthy: MemCoord = TxnCoordinator::new(store);
+        let healthy: MemCoord = TxnCoordinator::new(store);
         assert!(
             catalog_exposes_rel(&healthy, IndexKind::RelProperty, "CITES", "tag"),
             "the healthy engine exposes the relationship RANGE index"
@@ -2022,7 +2019,7 @@ fn a_degraded_rel_range_index_declines_the_seek_and_still_returns_every_row() {
             plan_contains(&healthy, src, "RelIndexRangeSeek"),
             "the healthy engine really plans a RelIndexRangeSeek for {src}"
         );
-        let ids = ids_of(&run(&mut healthy, src), "id");
+        let ids = ids_of(&run(&healthy, src), "id");
         assert_eq!(
             ids.len(),
             1,
@@ -2153,9 +2150,9 @@ fn a_poisoned_build_is_distinguishable_from_a_healthy_build_in_progress() {
         let device = MemBlockDevice::new(0);
         let wal = WalManager::create(MemLogSink::new()).expect("create wal");
         let store: MemStore = RecordStore::create(device, wal, 64, 1).expect("create store");
-        let mut coord: MemCoord = TxnCoordinator::new(store);
+        let coord: MemCoord = TxnCoordinator::new(store);
         run(
-            &mut coord,
+            &coord,
             "UNWIND range(1, 120) AS i \
              CREATE (:Article {slug: 'slug-' + toString(i), title: 'title text ' + toString(i)})",
         );
@@ -2407,9 +2404,9 @@ fn dropping_an_index_with_a_poisoned_build_does_not_resurrect_it() {
         let device = MemBlockDevice::new(0);
         let wal = WalManager::create(MemLogSink::new()).expect("create wal");
         let store: MemStore = RecordStore::create(device, wal, 64, 1).expect("create store");
-        let mut coord: MemCoord = TxnCoordinator::new(store);
+        let coord: MemCoord = TxnCoordinator::new(store);
         run(
-            &mut coord,
+            &coord,
             "UNWIND range(1, 120) AS i \
              CREATE (:Article {slug: 'slug-' + toString(i), title: 'title text ' + toString(i)})",
         );

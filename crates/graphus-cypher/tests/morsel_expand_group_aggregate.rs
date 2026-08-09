@@ -144,7 +144,7 @@ fn seed_top_liked(n_users: i64, n_articles: i64, pool_frames: usize) -> Store {
 /// Runs `src` over the coordinator in a fresh committed read transaction, returning the FULL ordered row
 /// sequence (each row rendered to a stable `Vec<(column, Debug-of-value)>` for order-sensitive compare).
 fn run_rows(
-    coord: &mut TxnCoordinator<MemBlockDevice, MemLogSink>,
+    coord: &TxnCoordinator<MemBlockDevice, MemLogSink>,
     src: &str,
 ) -> Vec<Vec<(String, String)>> {
     let toks = tokenize(src).expect("lex");
@@ -185,7 +185,7 @@ fn render_row(row: &Row) -> Vec<(String, String)> {
 /// Asserts `q`, run through the real executor + coordinator, returns the exact same result with the morsel
 /// knob on (8 and 2 workers) as off (1, serial) — the inviolable obligation, worker-count-independent.
 fn assert_knob_identical(
-    coord: &mut TxnCoordinator<MemBlockDevice, MemLogSink>,
+    coord: &TxnCoordinator<MemBlockDevice, MemLogSink>,
     q: &str,
 ) -> Vec<Vec<(String, String)>> {
     graphus_cypher::morsel::set_morsel_threads(1);
@@ -253,10 +253,10 @@ fn query_matrix() -> Vec<&'static str> {
 fn expand_group_end_to_end_matches_serial() {
     graphus_cypher::morsel::set_morsel_min_rows(0);
     let store = seed_top_liked(6_000, 300, 64);
-    let mut coord = TxnCoordinator::new(store);
+    let coord = TxnCoordinator::new(store);
 
     for q in query_matrix() {
-        let rows = assert_knob_identical(&mut coord, q);
+        let rows = assert_knob_identical(&coord, q);
         assert!(
             !rows.is_empty(),
             "`{q}`: expected a non-empty grouped result (else the equivalence is vacuous)"
@@ -275,14 +275,14 @@ fn expand_group_end_to_end_matches_serial() {
 fn expand_group_tier_actually_engages() {
     graphus_cypher::morsel::set_morsel_min_rows(0);
     let store = seed_top_liked(6_000, 300, 64);
-    let mut coord = TxnCoordinator::new(store);
+    let coord = TxnCoordinator::new(store);
 
     let eligible = "MATCH (:USER)-[:LIKE]->(a:ARTICLE) WITH a, count(*) AS c RETURN a.id AS id, c";
 
     // knob=1 (serial): no parallel hit.
     graphus_cypher::morsel::set_morsel_threads(1);
     let before_serial = coord.parallel_scan_hits();
-    let _ = run_rows(&mut coord, eligible);
+    let _ = run_rows(&coord, eligible);
     assert_eq!(
         coord.parallel_scan_hits(),
         before_serial,
@@ -292,7 +292,7 @@ fn expand_group_tier_actually_engages() {
     // knob=8: the tier fires.
     graphus_cypher::morsel::set_morsel_threads(8);
     let before_par = coord.parallel_scan_hits();
-    let _ = run_rows(&mut coord, eligible);
+    let _ = run_rows(&coord, eligible);
     assert!(
         coord.parallel_scan_hits() > before_par,
         "the eligible grouped-over-expand query must engage the parallel tier at knob=8"
@@ -301,7 +301,7 @@ fn expand_group_tier_actually_engages() {
     // A DECLINE shape (`avg`, non-associative in parallel) must NOT engage even at knob=8.
     let declined = "MATCH (u:USER)-[l:LIKE]->(a:ARTICLE) RETURN a.id AS id, avg(l.weight) AS av";
     let before_decl = coord.parallel_scan_hits();
-    let _ = run_rows(&mut coord, declined);
+    let _ = run_rows(&coord, declined);
     assert_eq!(
         coord.parallel_scan_hits(),
         before_decl,
@@ -709,7 +709,7 @@ fn measure_top_liked_cores() {
     // Preload (NOT measured for cores: the serial bulk insert + commit on the engine thread).
     let preload_start = Instant::now();
     let store = seed_top_liked(users, articles, 4096);
-    let mut coord = TxnCoordinator::new(store);
+    let coord = TxnCoordinator::new(store);
     let preload = preload_start.elapsed();
 
     // The exact `top_liked` query (the measured bottleneck): expand all LIKE edges, group by ARTICLE, count,
@@ -719,13 +719,13 @@ fn measure_top_liked_cores() {
 
     // Warm one run (fault pages into the buffer pool), then time the read loop — the phase whose mean-cores
     // is the AC. CPU time is read in ISOLATION via `/proc/self/stat` so the serial preload does not dilute it.
-    let warm = run_rows(&mut coord, q);
+    let warm = run_rows(&coord, q);
     let top = warm.first().map(|r| format!("{r:?}")).unwrap_or_default();
 
     let (cpu0, wall0) = (proc_cpu_secs(), Instant::now());
     let mut last = String::new();
     for _ in 0..iters {
-        let r = run_rows(&mut coord, q);
+        let r = run_rows(&coord, q);
         last = r.first().map(|row| format!("{row:?}")).unwrap_or_default();
     }
     let elapsed = wall0.elapsed();

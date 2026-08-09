@@ -319,7 +319,7 @@ fn coord_with_one_big_group(n: i64) -> TxnCoordinator<MemBlockDevice, MemLogSink
 /// Runs `src` over the coordinator in a fresh serializable read txn, returning `Ok(rows)` or `Err(message)`
 /// — never panicking on a query outcome, so a clean rejection surfaces as `Err`.
 fn run_coord(
-    coord: &mut TxnCoordinator<MemBlockDevice, MemLogSink>,
+    coord: &TxnCoordinator<MemBlockDevice, MemLogSink>,
     src: &str,
 ) -> Result<usize, String> {
     let toks = tokenize(src).map_err(|e| format!("lex: {e:?}"))?;
@@ -352,7 +352,7 @@ fn parallel_grouped_collect_is_capped_and_falls_back_cleanly() {
     let _lock = CAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // 60k > MORSEL_MIN_ROWS (50k) ⇒ the grouped-morsel collect tier engages; one country ⇒ one group whose
     // collect accumulates all 60k ages.
-    let mut coord = coord_with_one_big_group(60_000);
+    let coord = coord_with_one_big_group(60_000);
     let q = "MATCH (n:Person) RETURN n.country AS c, collect(n.age) AS ages";
 
     // A budget that one big group's collect must exceed (60k * per-int >> 256 KiB). With the morsel knob ON,
@@ -361,9 +361,9 @@ fn parallel_grouped_collect_is_capped_and_falls_back_cleanly() {
     // panic, no wrong/oversized result, no hang.
     let _budget = BudgetOverride::new(256 * 1024);
     graphus_cypher::morsel::set_morsel_threads(8);
-    let parallel = run_coord(&mut coord, q);
+    let parallel = run_coord(&coord, q);
     graphus_cypher::morsel::set_morsel_threads(1);
-    let serial = run_coord(&mut coord, q);
+    let serial = run_coord(&coord, q);
 
     let perr = parallel.expect_err("the parallel grouped collect over budget must be rejected");
     let serr = serial.expect_err("the serial grouped collect over budget must be rejected");
@@ -382,10 +382,10 @@ fn parallel_grouped_collect_under_budget_is_unaffected() {
     let _lock = CAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Same large scan, but at the real 256 MiB default the per-group collect (60k small ints ≈ a few MiB) is
     // far under budget: the parallel tier completes normally and produces the one group.
-    let mut coord = coord_with_one_big_group(60_000);
+    let coord = coord_with_one_big_group(60_000);
     let q = "MATCH (n:Person) RETURN n.country AS c, collect(n.age) AS ages";
     graphus_cypher::morsel::set_morsel_threads(8);
-    let rows = run_coord(&mut coord, q);
+    let rows = run_coord(&coord, q);
     graphus_cypher::morsel::set_morsel_threads(1);
     assert_eq!(
         rows,

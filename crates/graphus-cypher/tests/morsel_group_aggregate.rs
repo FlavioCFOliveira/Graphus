@@ -61,7 +61,7 @@ fn render_row(row: &graphus_cypher::runtime::Row) -> Vec<(String, String)> {
 /// Runs `src` over the coordinator in a fresh committed read transaction, returning the rendered row
 /// sequence (order preserved). Mirrors `tests/morsel_rows.rs::run_rows`.
 fn run_rows(
-    coord: &mut TxnCoordinator<MemBlockDevice, MemLogSink>,
+    coord: &TxnCoordinator<MemBlockDevice, MemLogSink>,
     src: &str,
 ) -> Vec<Vec<(String, String)>> {
     let toks = tokenize(src).expect("lex");
@@ -134,7 +134,7 @@ fn coord_with_grouped_people(
 #[test]
 fn grouped_parallel_matches_serial_byte_identical() {
     // 80k > MORSEL_MIN_ROWS (50k), 8 countries ⇒ 8 groups, ~10k rows each.
-    let mut coord = coord_with_grouped_people(80_000, 8);
+    let coord = coord_with_grouped_people(80_000, 8);
 
     let queries = [
         "MATCH (n:Person) RETURN n.country AS c, count(*) AS k",
@@ -148,10 +148,10 @@ fn grouped_parallel_matches_serial_byte_identical() {
 
     for q in queries {
         graphus_cypher::morsel::set_morsel_threads(1);
-        let serial = run_rows(&mut coord, q);
+        let serial = run_rows(&coord, q);
 
         graphus_cypher::morsel::set_morsel_threads(8);
-        let parallel = run_rows(&mut coord, q);
+        let parallel = run_rows(&coord, q);
 
         assert_eq!(
             serial, parallel,
@@ -176,14 +176,14 @@ fn grouped_parallel_matches_serial_byte_identical() {
 #[test]
 fn grouped_collect_order_matches_serial() {
     // Many rows per group; `age = id % 100` makes each group's collected list a long, ordered sequence.
-    let mut coord = coord_with_grouped_people(60_000, 3);
+    let coord = coord_with_grouped_people(60_000, 3);
     let q = "MATCH (n:Person) RETURN n.country AS c, collect(n.age) AS ages";
 
     graphus_cypher::morsel::set_morsel_threads(1);
-    let serial = run_rows(&mut coord, q);
+    let serial = run_rows(&coord, q);
 
     graphus_cypher::morsel::set_morsel_threads(8);
-    let parallel = run_rows(&mut coord, q);
+    let parallel = run_rows(&coord, q);
 
     assert_eq!(
         serial, parallel,
@@ -199,15 +199,15 @@ fn grouped_collect_order_matches_serial() {
 /// yield the IDENTICAL row sequence — output order cannot depend on worker scheduling.
 #[test]
 fn grouped_output_order_is_worker_count_independent() {
-    let mut coord = coord_with_grouped_people(70_000, 16);
+    let coord = coord_with_grouped_people(70_000, 16);
     let q = "MATCH (n:Person) RETURN n.country AS c, count(*) AS k, sum(n.age) AS s";
 
     graphus_cypher::morsel::set_morsel_threads(1);
-    let serial = run_rows(&mut coord, q);
+    let serial = run_rows(&coord, q);
 
     for knob in [2usize, 8, 16] {
         graphus_cypher::morsel::set_morsel_threads(knob);
-        let parallel = run_rows(&mut coord, q);
+        let parallel = run_rows(&coord, q);
         assert_eq!(
             serial, parallel,
             "knob={knob}: grouped output (order included) must be identical to serial (knob=1)"
@@ -245,15 +245,15 @@ fn grouped_float_sum_matches_serial_via_decline() {
             .unwrap();
     }
     s.commit(txn).unwrap();
-    let mut coord = TxnCoordinator::new(s);
+    let coord = TxnCoordinator::new(s);
 
     let q = "MATCH (n:Person) RETURN n.country AS c, sum(n.score) AS total";
 
     graphus_cypher::morsel::set_morsel_threads(1);
-    let serial = run_rows(&mut coord, q);
+    let serial = run_rows(&coord, q);
 
     graphus_cypher::morsel::set_morsel_threads(8);
-    let parallel = run_rows(&mut coord, q);
+    let parallel = run_rows(&coord, q);
 
     assert_eq!(
         serial, parallel,
@@ -302,15 +302,15 @@ fn grouped_sum_saturation_matches_serial() {
             .unwrap();
     }
     s.commit(txn).unwrap();
-    let mut coord = TxnCoordinator::new(s);
+    let coord = TxnCoordinator::new(s);
 
     let q = "MATCH (n:Person) RETURN n.country AS c, sum(n.v) AS s";
 
     graphus_cypher::morsel::set_morsel_threads(1);
-    let serial = run_rows(&mut coord, q);
+    let serial = run_rows(&coord, q);
 
     graphus_cypher::morsel::set_morsel_threads(8);
-    let parallel = run_rows(&mut coord, q);
+    let parallel = run_rows(&coord, q);
 
     assert_eq!(
         serial, parallel,

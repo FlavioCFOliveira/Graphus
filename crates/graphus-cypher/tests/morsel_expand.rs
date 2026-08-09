@@ -134,7 +134,7 @@ fn seed_social(n: i64, fanout: i64, pool_frames: usize) -> Store {
 /// Runs `src` over the coordinator in a fresh committed read transaction, returning the FULL ordered row
 /// sequence (each row rendered to a stable `Vec<(column, Debug-of-value)>` for order-sensitive compare).
 fn run_rows(
-    coord: &mut TxnCoordinator<MemBlockDevice, MemLogSink>,
+    coord: &TxnCoordinator<MemBlockDevice, MemLogSink>,
     src: &str,
 ) -> Vec<Vec<(String, String)>> {
     let toks = tokenize(src).expect("lex");
@@ -176,7 +176,7 @@ fn render_row(row: &Row) -> Vec<(String, String)> {
 /// the morsel knob on (8 workers) as off (1 worker, serial) — the inviolable Slice-3c obligation, across
 /// worker counts (8 and 2) to prove the contiguous concat / degree sum is worker-count-independent.
 fn assert_knob_identical(
-    coord: &mut TxnCoordinator<MemBlockDevice, MemLogSink>,
+    coord: &TxnCoordinator<MemBlockDevice, MemLogSink>,
     q: &str,
 ) -> Vec<Vec<(String, String)>> {
     graphus_cypher::morsel::set_morsel_threads(1);
@@ -227,9 +227,9 @@ fn expand_query_matrix() -> Vec<&'static str> {
 /// (> MORSEL_MIN_ROWS) `:Person` graph so the tier actually engages.
 #[test]
 fn morsel_expand_end_to_end_match_serial() {
-    let mut coord = coord_with_social(60_000, 4);
+    let coord = coord_with_social(60_000, 4);
     for q in expand_query_matrix() {
-        let serial = assert_knob_identical(&mut coord, q);
+        let serial = assert_knob_identical(&coord, q);
         assert!(!serial.is_empty(), "`{q}` should not be vacuously empty");
     }
 }
@@ -264,20 +264,20 @@ fn morsel_expand_end_to_end_after_mutations() {
     // (3) DETACH DELETE a band of anchors through the REAL executor (so incident rels are detached first —
     // no dangling rel to a tombstone). Run with the morsel knob OFF so the delete itself is unambiguous.
     graphus_cypher::morsel::set_morsel_threads(1);
-    let mut coord = TxnCoordinator::new(store);
+    let coord = TxnCoordinator::new(store);
     run_write(
-        &mut coord,
+        &coord,
         "MATCH (a:Person) WHERE a.age = -500 OR a.age = -1000 DETACH DELETE a",
     );
 
     for q in expand_query_matrix() {
-        assert_knob_identical(&mut coord, q);
+        assert_knob_identical(&coord, q);
     }
 }
 
 /// Runs a writing statement `src` through the coordinator in a committed write transaction (used to drive
 /// DETACH DELETE through the real executor so detach semantics are correct).
-fn run_write(coord: &mut TxnCoordinator<MemBlockDevice, MemLogSink>, src: &str) {
+fn run_write(coord: &TxnCoordinator<MemBlockDevice, MemLogSink>, src: &str) {
     let toks = tokenize(src).expect("lex");
     let ast = parse_tokens(&toks, src).expect("parse");
     let plan = plan_physical(
@@ -983,7 +983,7 @@ fn measure_morsel_expand_cores() {
 
     // Preload (NOT measured for cores: the serial bulk insert + commit on the engine thread).
     let preload_start = Instant::now();
-    let mut coord = coord_with_social(people, fanout);
+    let coord = coord_with_social(people, fanout);
     let preload = preload_start.elapsed();
 
     // The Slice-3c AC query: the per-anchor single-hop expand is the heavy parallelized work; the degree
@@ -993,14 +993,14 @@ fn measure_morsel_expand_cores() {
     // Warm one run (fault pages into the buffer pool), then time the read loop — the phase whose
     // mean-cores is the AC. CPU time is read in ISOLATION via `/proc/self/stat` so the serial preload does
     // not dilute the core count the external `time -v` reports.
-    let warm = run_rows(&mut coord, q);
+    let warm = run_rows(&coord, q);
     assert_eq!(warm.len(), 1, "a bare count must return exactly one row");
     let degree = warm[0][0].1.clone();
 
     let (cpu0, wall0) = (proc_cpu_secs(), Instant::now());
     let mut last = String::new();
     for _ in 0..iters {
-        let r = run_rows(&mut coord, q);
+        let r = run_rows(&coord, q);
         last = r[0][0].1.clone();
     }
     let elapsed = wall0.elapsed();

@@ -1018,7 +1018,10 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // Held in an `Option` so the terminal `Shutdown` can move the coordinator out to consume it for
     // the final flush (`TxnCoordinator::into_store` is by-value). It is always `Some` while the loop
     // is processing commands.
-    let mut coordinator = Some(coordinator);
+    // `Arc` since `rmp` #1033: the coordinator is `Send + Sync` and every method takes `&self`, so
+    // several engine workers can hold it at once. The `Option` remains because `Shutdown` must take
+    // SOLE ownership back — `into_store` is by-value — which is what `Arc::try_unwrap` below asserts.
+    let mut coordinator: Option<Arc<TxnCoordinator<D, S>>> = Some(Arc::new(coordinator));
     // The WAL `durable_len` captured at the last background maintenance checkpoint (`rmp` #305). The
     // cadence fires when growth past it crosses `MAINTENANCE_CHECKPOINT_INTERVAL_BYTES`, reclaiming
     // RAM/disk/version slots without an operator trigger. Seeded from the current WAL length so a
@@ -1064,7 +1067,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         // not commands), so the result is ignored.
         process_retirements(
             &retire_rx,
-            &mut coordinator,
+            &coordinator,
             &mut open,
             &mut readers_inflight,
             &metrics,
@@ -1083,7 +1086,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         // (transient, bounded by the per-statement timeout, possibly mid-flight on an off-thread reader),
         // so a reap never races a live read.
         maybe_reap_aged(
-            &mut coordinator,
+            &coordinator,
             &mut open,
             &parked,
             max_transaction_age,
@@ -1102,7 +1105,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         // back and keeps the engine alive instead of unwinding the single engine thread.
         resume_parked_statements(
             &mut parked,
-            &mut coordinator,
+            &coordinator,
             &mut open,
             &extensions,
             &metrics,
@@ -1227,13 +1230,13 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                 Ok(cmd) => cmd,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     // No command this tick: advance any build, then loop (which drains retirements).
-                    drive_index_build(&mut coordinator);
+                    drive_index_build(&coordinator);
                     // Surface and repair a fail-closed index set (`rmp` task #733). Any repair changes
                     // what `catalog()` exposes (indexes come back `Online`), so the plan cache must be
                     // invalidated exactly as a completed build does — otherwise plans compiled while
                     // degraded (scan-only) would be served from cache forever.
                     if maintain_degraded_indexes(
-                        &mut coordinator,
+                        &coordinator,
                         &metrics,
                         &db_name,
                         &mut index_health_seen,
@@ -1317,7 +1320,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
 #[allow(clippy::too_many_arguments)] // The retirement path threads its execution context here.
 fn process_retirements<D: BlockDevice, S: LogSink>(
     retire_rx: &std::sync::mpsc::Receiver<read_pool::ReadRetirement>,
-    coordinator: &mut Option<TxnCoordinator<D, S>>,
+    coordinator: &Option<Arc<TxnCoordinator<D, S>>>,
     open: &mut OpenTxTable,
     readers_inflight: &mut u64,
     metrics: &Metrics,
@@ -1327,14 +1330,16 @@ fn process_retirements<D: BlockDevice, S: LogSink>(
 ) {
     let mut any_retired = false;
     while let Ok(retirement) = retire_rx.try_recv() {
-        if let Some(coord) = coordinator.as_mut() {
+        if let Some(coord) = coordinator.as_deref() {
             finish_reader(coord, open, retirement, metrics, db, degraded);
         }
         *readers_inflight = readers_inflight.saturating_sub(1);
         active_txns.publish(
-            coordinator.as_ref().map_or(0, TxnCoordinator::active_count),
             coordinator
-                .as_ref()
+                .as_deref()
+                .map_or(0, TxnCoordinator::active_count),
+            coordinator
+                .as_deref()
                 .map_or(0, TxnCoordinator::ssi_tracked_len),
         );
         any_retired = true;
@@ -1343,7 +1348,7 @@ fn process_retirements<D: BlockDevice, S: LogSink>(
     // barrier — lift the hold on every slot the (now-advanced) oldest open transaction has passed, so a
     // freed slot becomes reusable promptly rather than waiting for the next maintenance pass. Cheap: a
     // no-op when nothing is shadow-held.
-    if any_retired && let Some(coord) = coordinator.as_ref() {
+    if any_retired && let Some(coord) = coordinator.as_deref() {
         let oldest_open_ticket = open.keys().copied().min().unwrap_or(u64::MAX);
         coord.release_reusable_slots(oldest_open_ticket);
     }
@@ -1366,7 +1371,7 @@ fn process_retirements<D: BlockDevice, S: LogSink>(
 ///    releasing its hold on the GC watermark (`oldest_active_snapshot`) — only now, after its cursor
 ///    fully drained (the reader sent this retirement post-drain). The `open` ticket is removed too.
 fn finish_reader<D: BlockDevice, S: LogSink>(
-    coordinator: &mut TxnCoordinator<D, S>,
+    coordinator: &TxnCoordinator<D, S>,
     open: &mut OpenTxTable,
     retirement: read_pool::ReadRetirement,
     metrics: &Metrics,
@@ -1519,7 +1524,7 @@ fn gc_reuse_barrier(next_ticket: u64, readers_inflight: u64) -> Option<u64> {
 
 #[allow(clippy::too_many_arguments)] // the engine loop threads its maintenance context through here
 fn maybe_run_maintenance<D: BlockDevice, S: LogSink>(
-    coordinator: &mut Option<TxnCoordinator<D, S>>,
+    coordinator: &Option<Arc<TxnCoordinator<D, S>>>,
     wal_at_last_maintenance: &mut u64,
     consecutive_failures: &mut u32,
     metrics: &Metrics,
@@ -1535,7 +1540,7 @@ fn maybe_run_maintenance<D: BlockDevice, S: LogSink>(
     reuse_barrier: Option<u64>,
     oldest_open_ticket: u64,
 ) {
-    let Some(coord) = coordinator.as_mut() else {
+    let Some(coord) = coordinator.as_deref() else {
         return;
     };
     // `rmp` #565 — do NOT fire a maintenance GC pass on the loading→not-loading edge. When a Mode A
@@ -1659,7 +1664,7 @@ fn maybe_run_maintenance<D: BlockDevice, S: LogSink>(
 ///   later tick once idle (and is itself bounded by the per-statement timeout meanwhile).
 #[allow(clippy::too_many_arguments)] // the engine loop threads its execution context through here
 fn maybe_reap_aged<D: BlockDevice, S: LogSink>(
-    coordinator: &mut Option<TxnCoordinator<D, S>>,
+    coordinator: &Option<Arc<TxnCoordinator<D, S>>>,
     open: &mut OpenTxTable,
     parked: &VecDeque<exec::InFlightInline>,
     max_transaction_age: Option<std::time::Duration>,
@@ -1671,7 +1676,7 @@ fn maybe_reap_aged<D: BlockDevice, S: LogSink>(
     let Some(max_age) = max_transaction_age else {
         return; // cap disabled — opt-out, unbounded lifetime
     };
-    let Some(coord) = coordinator.as_mut() else {
+    let Some(coord) = coordinator.as_deref() else {
         return; // coordinator already consumed by Shutdown
     };
     let max_age_nanos = u64::try_from(max_age.as_nanos()).unwrap_or(u64::MAX);
@@ -1742,7 +1747,7 @@ fn resume_parked_statements<
     S: LogSink + Send + Sync + 'static,
 >(
     parked: &mut VecDeque<exec::InFlightInline>,
-    coordinator: &mut Option<TxnCoordinator<D, S>>,
+    coordinator: &Option<Arc<TxnCoordinator<D, S>>>,
     open: &mut OpenTxTable,
     extensions: &Arc<graphus_cypher::extension::ExtensionRegistry>,
     metrics: &Arc<Metrics>,
@@ -1761,7 +1766,7 @@ fn resume_parked_statements<
         let Some(mut stmt) = parked.pop_front() else {
             break;
         };
-        let Some(coord) = coordinator.as_mut() else {
+        let Some(coord) = coordinator.as_deref() else {
             // Coordinator already consumed (Shutdown in progress): put it back and stop; Shutdown's
             // `drain_inflight` rolls its transaction back and the queue drops at loop exit.
             parked.push_front(stmt);
@@ -1806,9 +1811,11 @@ fn resume_parked_statements<
         // A parked statement finalised/aborted — refresh the open-transaction gauge so observability
         // reflects it promptly (the threaded loop otherwise publishes only after a dispatched command).
         active_txns.publish(
-            coordinator.as_ref().map_or(0, TxnCoordinator::active_count),
             coordinator
-                .as_ref()
+                .as_deref()
+                .map_or(0, TxnCoordinator::active_count),
+            coordinator
+                .as_deref()
                 .map_or(0, TxnCoordinator::ssi_tracked_len),
         );
     }
@@ -1833,7 +1840,7 @@ fn resume_parked_statements<
 /// terminal error → drop), so the consumer sees an explicit error rather than a clean end-of-stream
 /// over a partial result (`rmp` #485 B2).
 fn recover_panicked_resume<D: BlockDevice, S: LogSink>(
-    coord: &mut TxnCoordinator<D, S>,
+    coord: &TxnCoordinator<D, S>,
     open: &mut OpenTxTable,
     txn: TxnId,
     metrics: &Metrics,
@@ -1875,7 +1882,7 @@ fn enqueue_suspended<D: BlockDevice, S: LogSink>(
     parked: &mut VecDeque<exec::InFlightInline>,
     just_suspended: &mut Option<exec::InFlightInline>,
     max_parked: usize,
-    coordinator: &mut Option<TxnCoordinator<D, S>>,
+    coordinator: &Option<Arc<TxnCoordinator<D, S>>>,
     open: &mut OpenTxTable,
     metrics: &Metrics,
     db: &str,
@@ -1893,7 +1900,7 @@ fn enqueue_suspended<D: BlockDevice, S: LogSink>(
     // FAILURE to its consumer (rollback → terminal error → drop) so it is reported as busy/aborted, not
     // a partial result over a successful end-of-stream (the CWE-393 class).
     let txn = stmt.txn();
-    if let Some(coord) = coordinator.as_mut() {
+    if let Some(coord) = coordinator.as_deref() {
         if let Some(ticket) = open.iter().find(|(_, t)| t.txn == txn).map(|(k, _)| *k) {
             open.remove(&ticket);
         }
@@ -2048,9 +2055,9 @@ fn intercept_simulate_maintenance(
 /// no-op when no build is pending. Kept tiny and inline-friendly so the loop's two call sites read
 /// clearly.
 fn drive_index_build<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>(
-    coordinator: &mut Option<TxnCoordinator<D, S>>,
+    coordinator: &Option<Arc<TxnCoordinator<D, S>>>,
 ) {
-    if let Some(coord) = coordinator.as_mut() {
+    if let Some(coord) = coordinator.as_deref() {
         let _remaining = coord.advance_index_builds(INDEX_BUILD_CHUNK);
     }
 }
@@ -2107,12 +2114,12 @@ impl IndexHealthSeen {
 }
 
 fn maintain_degraded_indexes<D: BlockDevice, S: LogSink>(
-    coordinator: &mut Option<TxnCoordinator<D, S>>,
+    coordinator: &Option<Arc<TxnCoordinator<D, S>>>,
     metrics: &Arc<Metrics>,
     db_name: &str,
     seen: &mut IndexHealthSeen,
 ) -> bool {
-    let Some(coord) = coordinator.as_mut() else {
+    let Some(coord) = coordinator.as_deref() else {
         return false;
     };
     // Report any VECTOR index that entered the `rmp` #780 blocked state since the last tick: its build
@@ -2248,14 +2255,13 @@ fn maintain_degraded_indexes<D: BlockDevice, S: LogSink>(
 /// [`has_pending_index_builds`](TxnCoordinator::has_pending_index_builds): when the last pending build
 /// drains, bump the schema version. `builds_were_pending` is updated in place to track the edge.
 fn invalidate_cache_on_build_completion<D: BlockDevice, S: LogSink>(
-    coordinator: &Option<TxnCoordinator<D, S>>,
+    coordinator: &Option<Arc<TxnCoordinator<D, S>>>,
     plan_cache: &mut exec::EnginePlanCache,
     builds_were_pending: &mut bool,
 ) {
     let now_pending = coordinator
-        .as_ref()
-        .map(TxnCoordinator::has_pending_index_builds)
-        .unwrap_or(false);
+        .as_deref()
+        .is_some_and(TxnCoordinator::has_pending_index_builds);
     if *builds_were_pending && !now_pending {
         // The last in-flight build just promoted to `Online`: the catalog changed, so invalidate.
         plan_cache.bump_schema();
@@ -2336,7 +2342,7 @@ struct ProcessCtx<'a, D: BlockDevice + Send + Sync + 'static, S: LogSink + Send 
     cmd: EngineCommand,
     /// The command channel, so a group-commit batch can non-blockingly drain further queued commits.
     rx: &'a std::sync::mpsc::Receiver<EngineCommand>,
-    coordinator: &'a mut Option<TxnCoordinator<D, S>>,
+    coordinator: &'a mut Option<Arc<TxnCoordinator<D, S>>>,
     open: &'a mut OpenTxTable,
     next_ticket: &'a mut u64,
     plan_cache: &'a mut exec::EnginePlanCache,
@@ -2536,7 +2542,7 @@ fn process_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
 #[allow(clippy::too_many_arguments)] // The engine loop threads all execution context through here.
 fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>(
     cmd: EngineCommand,
-    coordinator: &mut Option<TxnCoordinator<D, S>>,
+    coordinator: &mut Option<Arc<TxnCoordinator<D, S>>>,
     open: &mut OpenTxTable,
     next_ticket: &mut u64,
     plan_cache: &mut exec::EnginePlanCache,
@@ -2583,7 +2589,7 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
         cmd
     };
     let coord = coordinator
-        .as_mut()
+        .as_deref()
         .expect("INVARIANT: coordinator is Some until Shutdown breaks the loop");
     match cmd {
         Cmd::Begin { mode, reply } => {
@@ -2612,7 +2618,7 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             // death. `coord` is reborrowed from `coordinator` here so the borrow can be handed to the
             // catch handler for the rollback after `catch_unwind` consumes the closure's reborrow.
             let coord = coordinator
-                .as_mut()
+                .as_deref()
                 .expect("INVARIANT: coordinator is Some until Shutdown breaks the loop");
             run_statement_isolated(
                 coord,
@@ -2804,6 +2810,15 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             let coordinator = coordinator
                 .take()
                 .expect("INVARIANT: coordinator is Some at Shutdown");
+            // Sole ownership, asserted rather than assumed: the final flush consumes the coordinator,
+            // so every worker must already have dropped its share. A live share here means a worker
+            // outlived the shutdown barrier — the failure is loud instead of a silently skipped flush.
+            let coordinator = Arc::try_unwrap(coordinator).unwrap_or_else(|_| {
+                panic!(
+                    "INVARIANT: every engine worker has dropped its coordinator share before the \
+                     final flush (`rmp` #1033)"
+                )
+            });
             let (out, final_wal_len) = harden_store(coordinator);
             // `rmp` #745 — the one publish site that is required for CORRECTNESS, not freshness. The
             // final flush above appends WAL (its checkpoint record) AFTER the last commit's publish. If
@@ -2837,7 +2852,7 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
 ///
 /// ## Unwind-safety justification (the load-bearing reasoning)
 ///
-/// The closure captures `&mut TxnCoordinator` (and the open-tx map), which is `!UnwindSafe` because
+/// The closure captures `&TxnCoordinator` (and the open-tx map), which is `!UnwindSafe` because
 /// the coordinator transitively holds `Rc<RefCell<…>>`. [`AssertUnwindSafe`] is sound here because we
 /// **do not** observe any partially-mutated state across the boundary: on a caught panic we run
 /// [`rollback_panicked_statement`], which calls [`TxnCoordinator::rollback`] (→ ARIES
@@ -2874,7 +2889,7 @@ fn run_statement_isolated<
     D: BlockDevice + Send + Sync + 'static,
     S: LogSink + Send + Sync + 'static,
 >(
-    coord: &mut TxnCoordinator<D, S>,
+    coord: &TxnCoordinator<D, S>,
     open: &mut OpenTxTable,
     plan_cache: &mut exec::EnginePlanCache,
     ticket: TxTicket,
@@ -2991,7 +3006,7 @@ fn run_mode_b_chunk_isolated<
     D: BlockDevice + Send + Sync + 'static,
     S: LogSink + Send + Sync + 'static,
 >(
-    coord: &mut TxnCoordinator<D, S>,
+    coord: &TxnCoordinator<D, S>,
     open: &mut OpenTxTable,
     ticket: TxTicket,
     chunk: bulk_load_b::BulkImportModeBChunkInput,
@@ -3052,7 +3067,7 @@ fn run_mode_b_chunk_isolated<
 /// ticket from `open` so that later `ROLLBACK` is the documented idempotent no-op.
 #[allow(clippy::too_many_arguments)] // The recovery path threads its execution context here.
 fn rollback_panicked_statement<D: BlockDevice, S: LogSink>(
-    coord: &mut TxnCoordinator<D, S>,
+    coord: &TxnCoordinator<D, S>,
     open: &mut OpenTxTable,
     ticket: TxTicket,
     metrics: &Metrics,
@@ -3210,7 +3225,7 @@ fn degrade_on_incomplete_undo<D: BlockDevice, S: LogSink>(
 /// Guarded by [`TxnCoordinator::store_txn_unresolved`] so the SSI arm — which really has already rolled
 /// back — is not rolled back twice, and so a transaction that was never active is left alone.
 fn resolve_failed_commit<D: BlockDevice, S: LogSink>(
-    coord: &mut TxnCoordinator<D, S>,
+    coord: &TxnCoordinator<D, S>,
     txn: TxnId,
     degraded: &EngineDegraded,
     label: &'static str,
@@ -3236,7 +3251,7 @@ fn resolve_failed_commit<D: BlockDevice, S: LogSink>(
 ///   the store has kept the transaction open across the unwind (the active-set entry is released only
 ///   after the last fallible step, so there is no half-released entry to repair).
 fn recovery_rollback<D: BlockDevice, S: LogSink>(
-    coord: &mut TxnCoordinator<D, S>,
+    coord: &TxnCoordinator<D, S>,
     txn: TxnId,
     metrics: &Metrics,
     degraded: &EngineDegraded,
@@ -3271,7 +3286,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// `CREATE` is what keeps the engine responsive: it enqueues the build and returns, and the loop
 /// drives the build between subsequent commands.
 fn handle_index_ddl<D: BlockDevice, S: LogSink>(
-    coordinator: &mut TxnCoordinator<D, S>,
+    coordinator: &TxnCoordinator<D, S>,
     command: &IndexCommand,
 ) -> Result<IndexDdlReply> {
     match command {
@@ -3520,7 +3535,7 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
 /// the encoded artifact under the master key when the database is encrypted, rmp #89), keeping the
 /// engine thread free of key material.
 fn handle_backup<D: BlockDevice, S: LogSink>(
-    coordinator: &mut TxnCoordinator<D, S>,
+    coordinator: &TxnCoordinator<D, S>,
 ) -> Result<Vec<u8>> {
     use graphus_storage::{ChainArtifact, ChainLinks, Plain, begin_chain, capture_increment};
 
@@ -3548,7 +3563,7 @@ fn handle_backup<D: BlockDevice, S: LogSink>(
 /// and version slots that previously had no production reclamation trigger (`rmp` #305 / #313 / #315).
 /// Touches the coordinator directly, between commands, never under a held statement seam.
 fn handle_checkpoint<D: BlockDevice, S: LogSink>(
-    coordinator: &mut TxnCoordinator<D, S>,
+    coordinator: &TxnCoordinator<D, S>,
     reuse_barrier: Option<u64>,
     oldest_open_ticket: u64,
     metrics: &Metrics,
@@ -3606,7 +3621,7 @@ fn constraint_storage_kind(
 }
 
 fn handle_constraint_ddl<D: BlockDevice, S: LogSink>(
-    coordinator: &mut TxnCoordinator<D, S>,
+    coordinator: &TxnCoordinator<D, S>,
     command: &ConstraintCommand,
     transactions: &Arc<crate::txn_registry::TransactionRegistry>,
     db: &str,
@@ -3709,7 +3724,7 @@ fn handle_constraint_ddl<D: BlockDevice, S: LogSink>(
 /// configured cap. `auto_commit` records whether this transaction backs a single auto-commit statement
 /// (excluded from the age sweep) or an explicit `BEGIN … COMMIT` (the sweep's target).
 fn open_tx<D: BlockDevice, S: LogSink>(
-    coordinator: &mut TxnCoordinator<D, S>,
+    coordinator: &TxnCoordinator<D, S>,
     open: &mut OpenTxTable,
     next_ticket: &mut u64,
     mode: AccessMode,
@@ -3744,7 +3759,7 @@ fn open_tx<D: BlockDevice, S: LogSink>(
 ///   until [`flush_commit_batch`] has hardened a covering `fdatasync` (ack-after-fsync).
 #[allow(clippy::too_many_arguments)] // the commit path threads its execution context here
 fn commit_prepare_tx<D: BlockDevice, S: LogSink>(
-    coordinator: &mut TxnCoordinator<D, S>,
+    coordinator: &TxnCoordinator<D, S>,
     open: &mut OpenTxTable,
     ticket: TxTicket,
     reply: command::Reply<Result<RunSummary>>,
@@ -3815,7 +3830,7 @@ fn commit_prepare_tx<D: BlockDevice, S: LogSink>(
 /// [`checkpoint_after_batch`]); it runs after the acks, because the commits are already durable and a
 /// checkpoint only bounds later recovery redo.
 fn flush_commit_batch<D: BlockDevice, S: LogSink>(
-    coordinator: &mut Option<TxnCoordinator<D, S>>,
+    coordinator: &Option<Arc<TxnCoordinator<D, S>>>,
     batch: &mut Vec<PendingCommit>,
     metrics: &Metrics,
     db: &str,
@@ -3823,7 +3838,7 @@ fn flush_commit_batch<D: BlockDevice, S: LogSink>(
     if batch.is_empty() {
         return;
     }
-    let Some(coord) = coordinator.as_mut() else {
+    let Some(coord) = coordinator.as_deref() else {
         // The coordinator was consumed (Shutdown). Unreachable in practice: `Shutdown` drains before
         // consuming and a commit batch is always flushed within the same loop iteration that filled it,
         // before any `Shutdown` is dispatched. Drop the deferred replies (their connections error out
@@ -3871,7 +3886,7 @@ fn pipelined_group_commit<
 >(
     wal_sync: &WalSyncThread,
     rx: &std::sync::mpsc::Receiver<EngineCommand>,
-    coordinator: &mut Option<TxnCoordinator<D, S>>,
+    coordinator: &mut Option<Arc<TxnCoordinator<D, S>>>,
     open: &mut OpenTxTable,
     next_ticket: &mut u64,
     plan_cache: &mut exec::EnginePlanCache,
@@ -3928,7 +3943,7 @@ fn pipelined_group_commit<
     while !batch.is_empty() {
         // If the coordinator was consumed (Shutdown) — unreachable here, a `Cmd::Commit` never
         // consumes it — drop the deferred replies rather than panic.
-        let Some(coord) = coordinator.as_mut() else {
+        let Some(coord) = coordinator.as_deref() else {
             batch.clear();
             return;
         };
@@ -3969,7 +3984,7 @@ fn pipelined_group_commit<
         // (4) WAIT for the in-flight fdatasync (depth-1). PANICs on failure (fsyncgate) BEFORE any ack.
         let target = wal_sync.wait();
         // (5) complete_harden: advance the durable watermark (monotonic / race-free). (6) ack the batch.
-        if let Some(coord) = coordinator.as_mut() {
+        if let Some(coord) = coordinator.as_deref() {
             coord.complete_harden_wal(target);
             ack_prepared_commits(coord.wal_durable_len(), &mut batch, metrics, db);
         } else {
@@ -4097,7 +4112,7 @@ fn drain_commit_batch<
     S: LogSink + Send + Sync + 'static,
 >(
     rx: &std::sync::mpsc::Receiver<EngineCommand>,
-    coordinator: &mut Option<TxnCoordinator<D, S>>,
+    coordinator: &mut Option<Arc<TxnCoordinator<D, S>>>,
     open: &mut OpenTxTable,
     next_ticket: &mut u64,
     plan_cache: &mut exec::EnginePlanCache,
@@ -4241,9 +4256,9 @@ fn drain_commit_batch<
 /// **non-fatal**: it is logged and retried on the next batch (or by the background maintenance cadence),
 /// never turned into a spurious commit failure over already-durable data.
 fn checkpoint_after_batch<D: BlockDevice, S: LogSink>(
-    coordinator: &mut Option<TxnCoordinator<D, S>>,
+    coordinator: &Option<Arc<TxnCoordinator<D, S>>>,
 ) {
-    if let Some(coord) = coordinator.as_mut() {
+    if let Some(coord) = coordinator.as_deref() {
         if let Err(e) = coord.checkpoint_if_due() {
             tracing::warn!(
                 target: "graphus::engine",
@@ -4263,7 +4278,7 @@ fn checkpoint_after_batch<D: BlockDevice, S: LogSink>(
 /// engine on the same terms (`rmp` #955). The error is still returned to the client: it is a real
 /// failure of the statement, not only of the engine.
 fn rollback_tx<D: BlockDevice, S: LogSink>(
-    coordinator: &mut TxnCoordinator<D, S>,
+    coordinator: &TxnCoordinator<D, S>,
     open: &mut OpenTxTable,
     ticket: TxTicket,
     metrics: &Metrics,
@@ -4300,7 +4315,7 @@ fn rollback_tx<D: BlockDevice, S: LogSink>(
 /// force this without risking durability. Runs through `&mut` so the coordinator can then be consumed
 /// for the final flush.
 fn drain_inflight<D: BlockDevice, S: LogSink>(
-    coordinator: &mut TxnCoordinator<D, S>,
+    coordinator: &TxnCoordinator<D, S>,
     open: &mut OpenTxTable,
     metrics: &Metrics,
     db: &str,
@@ -4657,7 +4672,7 @@ mod maintenance_tests {
         let wal = graphus_wal::WalManager::create(graphus_wal::MemLogSink::new()).expect("wal");
         let store: RecordStore<graphus_io::MemBlockDevice, graphus_wal::MemLogSink> =
             RecordStore::create(device, wal, 256, 1).expect("store");
-        let mut coordinator = Some(TxnCoordinator::new(store));
+        let coordinator = Some(Arc::new(TxnCoordinator::new(store)));
         let mut wal_at_last_maintenance = 0u64;
         let mut consecutive_failures = 0u32;
         let metrics = Metrics::new();
@@ -4666,7 +4681,7 @@ mod maintenance_tests {
 
         for loading in [false, true] {
             maybe_run_maintenance(
-                &mut coordinator,
+                &coordinator,
                 &mut wal_at_last_maintenance,
                 &mut consecutive_failures,
                 &metrics,
@@ -4700,7 +4715,7 @@ mod maintenance_tests {
         let wal = graphus_wal::WalManager::create(graphus_wal::MemLogSink::new()).expect("wal");
         let store: RecordStore<graphus_io::MemBlockDevice, graphus_wal::MemLogSink> =
             RecordStore::create(device, wal, 256, 1).expect("store");
-        let mut coordinator = Some(TxnCoordinator::new(store));
+        let coordinator = Some(Arc::new(TxnCoordinator::new(store)));
         // Pretend the WAL has grown a full interval past the last maintenance (a freshly loaded store),
         // so the ordinary path WOULD fire a checkpoint. The edge guard must override that.
         let mut wal_at_last_maintenance = 0u64;
@@ -4710,7 +4725,7 @@ mod maintenance_tests {
         let live = coordinator.as_ref().unwrap().wal_durable_len();
 
         maybe_run_maintenance(
-            &mut coordinator,
+            &coordinator,
             &mut wal_at_last_maintenance,
             &mut consecutive_failures,
             &metrics,
@@ -4860,7 +4875,7 @@ mod max_transaction_age_tests {
     /// **young** explicit transaction is untouched.
     #[test]
     fn reaps_over_age_explicit_txn_only() {
-        let mut coord = fresh_coord();
+        let coord = fresh_coord();
         let mut open: OpenTxTable = OpenTxTable::new();
         let mut next_ticket: u64 = 0;
         let cap = std::time::Duration::from_secs(60);
@@ -4871,7 +4886,7 @@ mod max_transaction_age_tests {
 
         // Over-age explicit reader (begin at t=0 ⇒ age 61s ≥ cap).
         let aged_explicit = open_tx(
-            &mut coord,
+            &coord,
             &mut open,
             &mut next_ticket,
             AccessMode::Read,
@@ -4880,7 +4895,7 @@ mod max_transaction_age_tests {
         );
         // Over-age auto-commit statement (same age, but excluded from the sweep).
         let aged_auto = open_tx(
-            &mut coord,
+            &coord,
             &mut open,
             &mut next_ticket,
             AccessMode::Read,
@@ -4889,7 +4904,7 @@ mod max_transaction_age_tests {
         );
         // Young explicit reader (begin just now ⇒ age 1ns ≪ cap).
         let young_explicit = open_tx(
-            &mut coord,
+            &coord,
             &mut open,
             &mut next_ticket,
             AccessMode::Read,
@@ -4898,9 +4913,9 @@ mod max_transaction_age_tests {
         );
         assert_eq!(coord.active_count(), 3);
 
-        let mut coordinator = Some(coord);
+        let coordinator = Some(Arc::new(coord));
         maybe_reap_aged(
-            &mut coordinator,
+            &coordinator,
             &mut open,
             &VecDeque::new(), // nothing parked inline
             Some(cap),
@@ -4932,7 +4947,7 @@ mod max_transaction_age_tests {
     /// A disabled cap (`None`) is a no-op: even a transaction far past any sane cap stays open.
     #[test]
     fn disabled_cap_reaps_nothing() {
-        let mut coord = fresh_coord();
+        let coord = fresh_coord();
         let mut open: OpenTxTable = OpenTxTable::new();
         let mut next_ticket: u64 = 0;
         let clock = clock_at(u64::MAX); // arbitrarily far in the future
@@ -4940,7 +4955,7 @@ mod max_transaction_age_tests {
         let mut gauge = ActiveTxnGauge::new(Arc::clone(&metrics), Arc::from("test"));
 
         let _ = open_tx(
-            &mut coord,
+            &coord,
             &mut open,
             &mut next_ticket,
             AccessMode::Read,
@@ -4949,9 +4964,9 @@ mod max_transaction_age_tests {
         );
         assert_eq!(coord.active_count(), 1);
 
-        let mut coordinator = Some(coord);
+        let coordinator = Some(Arc::new(coord));
         maybe_reap_aged(
-            &mut coordinator,
+            &coordinator,
             &mut open,
             &VecDeque::new(),
             None, // cap disabled

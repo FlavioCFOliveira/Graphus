@@ -102,7 +102,7 @@ fn seed_reco(n_users: i64, n_products: i64, friend_deg: i64, purchase_deg: i64) 
 /// Runs `src` (with `$id` bound to `id`) over the coordinator in a fresh committed read transaction,
 /// returning the FULL ordered row sequence rendered to a stable `Vec<(column, Debug-of-value)>`.
 fn run_rows(
-    coord: &mut TxnCoordinator<MemBlockDevice, MemLogSink>,
+    coord: &TxnCoordinator<MemBlockDevice, MemLogSink>,
     src: &str,
     id: i64,
 ) -> Vec<Vec<(String, String)>> {
@@ -176,14 +176,14 @@ fn reco_family() -> Vec<&'static str> {
 #[test]
 fn frontier_fof_end_to_end_matches_serial_and_engages() {
     let store = seed_reco(1_000, 120, 14, 6);
-    let mut coord = TxnCoordinator::new(store);
+    let coord = TxnCoordinator::new(store);
     let seed_id = 0;
 
     for q in reco_family() {
         // Serial baseline (knob=1: the frontier tier is OFF — `morsel_threads <= 1`).
         graphus_cypher::morsel::set_morsel_threads(1);
         let hits_before_serial = coord.parallel_scan_hits();
-        let serial = run_rows(&mut coord, q, seed_id);
+        let serial = run_rows(&coord, q, seed_id);
         assert_eq!(
             coord.parallel_scan_hits(),
             hits_before_serial,
@@ -198,7 +198,7 @@ fn frontier_fof_end_to_end_matches_serial_and_engages() {
         for knob in [4usize, 16] {
             graphus_cypher::morsel::set_morsel_threads(knob);
             let hits_before = coord.parallel_scan_hits();
-            let parallel = run_rows(&mut coord, q, seed_id);
+            let parallel = run_rows(&coord, q, seed_id);
             assert!(
                 coord.parallel_scan_hits() > hits_before,
                 "`{q}`: the frontier tier must engage at knob={knob}"
@@ -219,7 +219,7 @@ fn frontier_fof_end_to_end_matches_serial_and_engages() {
 #[test]
 fn frontier_fof_declines_impure_residual() {
     let store = seed_reco(600, 80, 12, 5);
-    let mut coord = TxnCoordinator::new(store);
+    let coord = TxnCoordinator::new(store);
     let seed_id = 0;
     // A `toString(...)` residual is a function call — the frontier tier's residual gate rejects it.
     let q = "MATCH (me:User {id: $id})-[:FRIEND]-(:User)-[:FRIEND]-(f2:User) \
@@ -229,11 +229,11 @@ fn frontier_fof_declines_impure_residual() {
              ORDER BY reach DESC, product ASC LIMIT 10";
 
     graphus_cypher::morsel::set_morsel_threads(1);
-    let serial = run_rows(&mut coord, q, seed_id);
+    let serial = run_rows(&coord, q, seed_id);
 
     graphus_cypher::morsel::set_morsel_threads(16);
     let hits_before = coord.parallel_scan_hits();
-    let parallel = run_rows(&mut coord, q, seed_id);
+    let parallel = run_rows(&coord, q, seed_id);
     assert_eq!(
         coord.parallel_scan_hits(),
         hits_before,
@@ -298,7 +298,7 @@ fn measure_r3_fof3_cores() {
     // Preload (NOT measured for cores: the serial bulk insert + commit on the engine thread).
     let preload_start = Instant::now();
     let store = seed_reco(users, products, friend_deg, purchase_deg);
-    let mut coord = TxnCoordinator::new(store);
+    let coord = TxnCoordinator::new(store);
     let preload = preload_start.elapsed();
 
     // The exact `r3_fof3` query (the measured bottleneck): 3-hop friend chain from ONE seed, join PURCHASED,
@@ -312,13 +312,13 @@ fn measure_r3_fof3_cores() {
 
     // Warm one run (fault pages into the buffer pool), then time the read loop — the phase whose mean-cores
     // is the AC. CPU time is read in ISOLATION via `/proc/self/stat` so the serial preload does not dilute it.
-    let warm = run_rows(&mut coord, q, 0);
+    let warm = run_rows(&coord, q, 0);
     let top = format!("{warm:?}");
 
     let (cpu0, wall0) = (proc_cpu_secs(), Instant::now());
     let mut last = String::new();
     for _ in 0..iters {
-        let r = run_rows(&mut coord, q, 0);
+        let r = run_rows(&coord, q, 0);
         last = format!("{r:?}");
     }
     let elapsed = wall0.elapsed();

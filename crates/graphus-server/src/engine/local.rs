@@ -86,7 +86,7 @@ const LOCAL_INDEX_BUILD_BUDGET: usize = usize::MAX;
 pub struct LocalEngine<D: BlockDevice, S: LogSink> {
     /// The real coordinator, in an `Option` so [`Self::shutdown`] can consume it (mirrors the engine
     /// loop). `Some` until shutdown.
-    coordinator: Option<TxnCoordinator<D, S>>,
+    coordinator: Option<Arc<TxnCoordinator<D, S>>>,
     /// Open transactions, keyed by the ticket id the engine mints (same bookkeeping the loop keeps).
     open: OpenTxTable,
     /// Monotonic ticket counter (same as the loop's).
@@ -147,7 +147,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // (`rmp` #463); the inline engine never multiplexes databases.
         let db_name: Arc<str> = Arc::from("local");
         Self {
-            coordinator: Some(coordinator),
+            coordinator: Some(Arc::new(coordinator)),
             open: OpenTxTable::new(),
             next_ticket: 0,
             extensions: Arc::new(super::exec::install_extensions()),
@@ -241,12 +241,12 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // out, exactly as before group commit (`rmp` #528). A no-op when the command was not a durable
         // write commit. The redo-bounding checkpoint runs identically to the pre-split path.
         super::flush_commit_batch(
-            &mut self.coordinator,
+            &self.coordinator,
             &mut commit_batch,
             &self.metrics,
             &self.db_name,
         );
-        super::checkpoint_after_batch(&mut self.coordinator);
+        super::checkpoint_after_batch(&self.coordinator);
         debug_assert!(
             inflight.is_none(),
             "INVARIANT: the unbounded inline DST driver never suspends a cursor (rmp #372)"
@@ -971,7 +971,7 @@ mod tests {
     /// builds its `IndexSources` — including `builds: coordinator.index_build_progress()` — and calls
     /// `index_show::build_rows`. Nothing about the rendering is reimplemented or stubbed here.
     fn show_index_row_no_drain(
-        coord: &mut TxnCoordinator<MemBlockDevice, MemLogSink>,
+        coord: &TxnCoordinator<MemBlockDevice, MemLogSink>,
         name: &str,
     ) -> (String, f64) {
         let reply =

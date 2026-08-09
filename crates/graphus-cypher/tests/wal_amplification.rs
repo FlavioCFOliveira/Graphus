@@ -109,7 +109,7 @@ impl NodeInserter {
     /// Binds `$id`, opens a serializable transaction, runs the compiled `CREATE`, and commits. Generic
     /// over the device / sink so the same workload drives both the in-memory (#556) and file-backed
     /// (#706) coordinators.
-    fn insert_committed<D, S>(&self, coord: &mut TxnCoordinator<D, S>, id: i64)
+    fn insert_committed<D, S>(&self, coord: &TxnCoordinator<D, S>, id: i64)
     where
         D: BlockDevice + Send + Sync + 'static,
         S: LogSink + Send + Sync + 'static,
@@ -183,10 +183,10 @@ fn type_name(b: u8) -> &'static str {
 /// would silently reintroduce the unbounded on-disk WAL).
 #[test]
 fn reclamation_collapses_the_retained_wal() {
-    let mut coord = fresh_mem();
+    let coord = fresh_mem();
     let inserter = NodeInserter::new();
     for i in 0..2000 {
-        inserter.insert_committed(&mut coord, i);
+        inserter.insert_committed(&coord, i);
     }
 
     let before = wal_retained(&coord);
@@ -232,12 +232,12 @@ fn adaptive_cadence_bounds_the_wal_store_ratio() {
     let n = 20_000i64;
 
     let run = |adaptive: bool| -> (f64, u64) {
-        let mut coord = fresh_mem();
+        let coord = fresh_mem();
         let inserter = NodeInserter::new();
         let mut wal_at_last_ckpt = 0u64;
         let mut checkpoints = 0u64;
         for i in 0..n {
-            inserter.insert_committed(&mut coord, i);
+            inserter.insert_committed(&coord, i);
             let durable = coord.wal_durable_len();
             let interval = if adaptive {
                 adaptive_interval(store_bytes(&coord))
@@ -515,7 +515,7 @@ fn run_file_backed(cfg: &FileRun) -> WalAmpObservation {
         FileLogSink::open_with_segment_target(&wal_dir, cfg.segment_target).expect("open sink");
     let wal = WalManager::create(sink).expect("create wal");
     let store = RecordStore::create(device, wal, 4096, 1).expect("create store");
-    let mut coord: FileCoord = TxnCoordinator::new(store);
+    let coord: FileCoord = TxnCoordinator::new(store);
     coord.with_store_mut(|s| {
         s.set_checkpoint_interval_bytes(0);
         s.set_wal_segment_sizing_adaptive(cfg.adaptive);
@@ -538,7 +538,7 @@ fn run_file_backed(cfg: &FileRun) -> WalAmpObservation {
     const MAX_COMMITS: u64 = 200_000;
 
     while coord.wal_durable_len() < cfg.target_wal && commits < MAX_COMMITS {
-        inserter.insert_committed(&mut coord, id);
+        inserter.insert_committed(&coord, id);
         id += 1;
         commits += 1;
         let durable = coord.wal_durable_len();
@@ -683,7 +683,7 @@ fn the_production_adaptive_path_sizes_the_segment_to_the_store() {
     let sink = FileLogSink::open(&wal_dir).expect("open sink"); // 64 MiB default
     let wal = WalManager::create(sink).expect("create wal");
     let store = RecordStore::create(device, wal, 4096, 1).expect("create store");
-    let mut coord: FileCoord = TxnCoordinator::new(store);
+    let coord: FileCoord = TxnCoordinator::new(store);
     coord.with_store_mut(|s| s.set_checkpoint_interval_bytes(0));
 
     // Even on a FRESH store, create() already sized the segment away from the sink's 64 MiB default down
@@ -696,7 +696,7 @@ fn the_production_adaptive_path_sizes_the_segment_to_the_store() {
 
     let inserter = NodeInserter::new();
     for i in 0..120 {
-        inserter.insert_committed(&mut coord, i);
+        inserter.insert_committed(&coord, i);
     }
     coord.checkpoint().expect("checkpoint");
 
@@ -998,7 +998,7 @@ impl Statement {
     /// Generic over the device / sink, so the SAME workload drives the in-memory coordinator and the
     /// REAL file-backed one (`rmp` #745 follow-up: the example publishes file-backed numbers, so the
     /// decomposition has to be measurable on the device the server actually runs).
-    fn run_committed<D, S>(&self, coord: &mut TxnCoordinator<D, S>, params: &Parameters)
+    fn run_committed<D, S>(&self, coord: &TxnCoordinator<D, S>, params: &Parameters)
     where
         D: BlockDevice + Send + Sync + 'static,
         S: LogSink + Send + Sync + 'static,
@@ -1017,7 +1017,7 @@ impl Statement {
 
 /// Creates the [`SENSORS`]-strong fleet, each sensor exactly as the example's bootstrap does
 /// (`Generator::sensor_cypher`: an id, a kind, a site and a Cartesian `location` point).
-fn create_sensor_fleet<D, S>(coord: &mut TxnCoordinator<D, S>, catalog: &IndexCatalog)
+fn create_sensor_fleet<D, S>(coord: &TxnCoordinator<D, S>, catalog: &IndexCatalog)
 where
     D: BlockDevice + Send + Sync + 'static,
     S: LogSink + Send + Sync + 'static,
@@ -1047,7 +1047,7 @@ where
 ///
 /// This is the ONE variable of the controlled experiment below: the same ingest runs with this schema
 /// and with no secondary indexes at all, and the difference IS the index-maintenance term.
-fn apply_iot_schema<D, S>(coord: &mut TxnCoordinator<D, S>)
+fn apply_iot_schema<D, S>(coord: &TxnCoordinator<D, S>)
 where
     D: BlockDevice + Send + Sync + 'static,
     S: LogSink + Send + Sync + 'static,
@@ -1458,9 +1458,9 @@ fn measure_ingest(
     batch: usize,
     readings: usize,
 ) -> (CommitProfile, WalWindow, BTreeMap<u64, PageOwner>) {
-    let mut coord = fresh_mem();
+    let coord = fresh_mem();
     let (profile, window, owners, _) =
-        drive_ingest(&mut coord, "in-memory", schema, batch, readings, 0);
+        drive_ingest(&coord, "in-memory", schema, batch, readings, 0);
     (profile, window, owners)
 }
 
@@ -1477,7 +1477,7 @@ fn measure_ingest(
 /// the last so a file-backed caller can compare the LOGICAL encoded bytes against the FILE's own length
 /// growth (the quantity the example's instrument actually reports).
 fn drive_ingest<D, S>(
-    coord: &mut TxnCoordinator<D, S>,
+    coord: &TxnCoordinator<D, S>,
     device: &str,
     schema: bool,
     batch: usize,
@@ -1510,7 +1510,7 @@ where
     let single = Statement::compile(IOT_INGEST_SINGLE, &catalog);
     let batched = Statement::compile(IOT_INGEST_BATCH, &catalog);
     let mut seq = 0i64;
-    let ingest = |coord: &mut TxnCoordinator<D, S>, seq: i64| {
+    let ingest = |coord: &TxnCoordinator<D, S>, seq: i64| {
         if batch == 1 {
             single.run_committed(coord, &single_row_params(seq));
         } else {
@@ -2093,9 +2093,8 @@ fn the_file_backed_wal_grows_by_exactly_what_its_records_encode() {
     const READINGS: usize = 200;
 
     let tmp = TempStore::new("filebacked-1");
-    let mut coord = fresh_file(&tmp);
-    let (file_p, _w, _o, (from, to)) =
-        drive_ingest(&mut coord, "FILE-BACKED", true, 1, READINGS, 0);
+    let coord = fresh_file(&tmp);
+    let (file_p, _w, _o, (from, to)) = drive_ingest(&coord, "FILE-BACKED", true, 1, READINGS, 0);
     let on_disk = on_disk_wal_bytes(&tmp.wal_dir());
 
     // Three quantities that are NOT a priori the same: the bytes the window's records DECODE to, the
@@ -2176,12 +2175,12 @@ fn file_backed_batching_saves_exactly_the_per_commit_terms() {
     const READINGS: usize = 200;
 
     let tmp1 = TempStore::new("filebacked-b1");
-    let mut c1 = fresh_file(&tmp1);
-    let (single, _, _, _) = drive_ingest(&mut c1, "FILE-BACKED", true, 1, READINGS, 0);
+    let c1 = fresh_file(&tmp1);
+    let (single, _, _, _) = drive_ingest(&c1, "FILE-BACKED", true, 1, READINGS, 0);
 
     let tmp2 = TempStore::new("filebacked-b25");
-    let mut c2 = fresh_file(&tmp2);
-    let (batched, _, _, _) = drive_ingest(&mut c2, "FILE-BACKED", true, BATCH, READINGS, 0);
+    let c2 = fresh_file(&tmp2);
+    let (batched, _, _, _) = drive_ingest(&c2, "FILE-BACKED", true, BATCH, READINGS, 0);
 
     let saving = single.bytes_per_reading / batched.bytes_per_reading;
     let per_reading = |p: &CommitProfile, o: PageOwner| -> f64 {
@@ -2242,9 +2241,9 @@ fn the_per_commit_catalog_image_grows_with_the_store() {
     // already ingested before the measured window opens.
     let mut samples: Vec<(u64, u64, f64, f64)> = Vec::new(); // (store pages, store B, catalog B, total B)
     for warm_extra in [0i64, 1_000, 4_000] {
-        let mut coord = fresh_mem();
+        let coord = fresh_mem();
         let (p, _w, _o, _) = drive_ingest(
-            &mut coord,
+            &coord,
             &format!("store warmed with {warm_extra} extra readings"),
             true,
             1,
@@ -2362,9 +2361,9 @@ fn the_batching_saving_grows_with_the_store() {
     const BIG: i64 = 4_000;
 
     let measure = |batch: usize, warm_extra: i64| -> (CommitProfile, u64) {
-        let mut coord = fresh_mem();
+        let coord = fresh_mem();
         let (p, _w, _o, _) = drive_ingest(
-            &mut coord,
+            &coord,
             &format!("batch={batch}, store warmed +{warm_extra}"),
             true,
             batch,
@@ -2471,14 +2470,14 @@ fn a_retention_purge_inflates_every_later_commit_through_the_catalog_free_list()
     const WINDOW: usize = 100;
 
     let mut coord = fresh_mem();
-    apply_iot_schema(&mut coord);
+    apply_iot_schema(&coord);
     let catalog = coord.catalog();
-    create_sensor_fleet(&mut coord, &catalog);
+    create_sensor_fleet(&coord, &catalog);
     let single = Statement::compile(IOT_INGEST_SINGLE, &catalog);
 
     let mut seq = 0i64;
     while seq < PRELOAD {
-        single.run_committed(&mut coord, &single_row_params(seq));
+        single.run_committed(&coord, &single_row_params(seq));
         seq += 1;
     }
 
@@ -2498,7 +2497,7 @@ fn a_retention_purge_inflates_every_later_commit_through_the_catalog_free_list()
         &format!("MATCH (r:Reading) WHERE r.seq < {PURGE_BELOW} DETACH DELETE r"),
         &catalog,
     );
-    purge.run_committed(&mut coord, &Parameters::new());
+    purge.run_committed(&coord, &Parameters::new());
     let gc_report = coord.gc().expect("gc pass");
     eprintln!(
         "\nretention purge: DETACH DELETEd every Reading with seq < {PURGE_BELOW}, then one GC pass \

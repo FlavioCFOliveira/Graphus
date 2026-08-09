@@ -331,7 +331,7 @@ pub(super) fn handle_run<
     D: BlockDevice + Send + Sync + 'static,
     S: LogSink + Send + Sync + 'static,
 >(
-    coordinator: &mut TxnCoordinator<D, S>,
+    coordinator: &TxnCoordinator<D, S>,
     open: &mut OpenTxTable,
     plan_cache: &mut EnginePlanCache,
     ticket: TxTicket,
@@ -717,7 +717,7 @@ pub(super) fn handle_run<
 /// stored into `inflight.cursor` before the seam borrow drops.
 fn start_inline<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>(
     inflight: &mut InFlightInline,
-    coordinator: &mut TxnCoordinator<D, S>,
+    coordinator: &TxnCoordinator<D, S>,
     plan: &Arc<graphus_cypher::PhysicalPlan>,
     bound: &graphus_cypher::BoundParameters,
     extensions: &ExtensionRegistry,
@@ -1392,7 +1392,7 @@ pub(super) fn resume_inflight<
     S: LogSink + Send + Sync + 'static,
 >(
     inflight: &mut InFlightInline,
-    coordinator: &mut TxnCoordinator<D, S>,
+    coordinator: &TxnCoordinator<D, S>,
     open: &mut OpenTxTable,
     extensions: &ExtensionRegistry,
     metrics: &Metrics,
@@ -1458,7 +1458,7 @@ pub(super) fn resume_inflight<
 /// reaches a terminal condition. Pure batch mechanics; finalization (commit/log) is the caller's.
 fn run_batch<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>(
     inflight: &mut InFlightInline,
-    coordinator: &mut TxnCoordinator<D, S>,
+    coordinator: &TxnCoordinator<D, S>,
     extensions: &ExtensionRegistry,
 ) -> BatchStep {
     // A fresh per-visit seam for the SAME txn: same MVCC snapshot, same uncommitted write buffer (the
@@ -1617,7 +1617,7 @@ fn unwrap_row(item: super::stream::RowItem) -> Vec<graphus_cypher::MaterializedV
 #[allow(clippy::too_many_arguments)] // execution context + the #566 group-commit batch, all positional
 fn finalize_inflight<D: BlockDevice, S: LogSink>(
     inflight: &mut InFlightInline,
-    coordinator: &mut TxnCoordinator<D, S>,
+    coordinator: &TxnCoordinator<D, S>,
     open: &mut OpenTxTable,
     produced_ok: bool,
     metrics: &Metrics,
@@ -1813,7 +1813,7 @@ fn to_parameters(params: Vec<(String, graphus_core::Value)>) -> Parameters {
 /// terminal `PULL` `SUCCESS`.
 #[allow(clippy::too_many_arguments)] // commit bookkeeping + the #566 group-commit batch, all positional
 fn finish_autocommit<D: BlockDevice, S: LogSink>(
-    coordinator: &mut TxnCoordinator<D, S>,
+    coordinator: &TxnCoordinator<D, S>,
     open: &mut OpenTxTable,
     ticket: TxTicket,
     produced_ok: bool,
@@ -1913,7 +1913,7 @@ pub(super) fn bookmark_token(db: &str, commit_ts: graphus_core::Timestamp) -> St
 /// Rolls back an auto-commit transaction that failed to compile/bind (so it never leaks). A no-op
 /// for an explicit transaction (the caller still owns it).
 fn finish_failed_autocommit<D: BlockDevice, S: LogSink>(
-    coordinator: &mut TxnCoordinator<D, S>,
+    coordinator: &TxnCoordinator<D, S>,
     open: &mut OpenTxTable,
     ticket: TxTicket,
     auto_commit: bool,

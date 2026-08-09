@@ -1202,7 +1202,7 @@ fn the_fused_plan_is_faster_than_the_plan_it_replaces() {
     assert!(is_fused(&fused), "`{src}` must fuse:\n{}", fused.root);
     let reference = unfused(&fused);
 
-    let run = |coord: &mut TxnCoordinator<MemBlockDevice, MemLogSink>, plan: &PhysicalPlan| {
+    let run = |coord: &TxnCoordinator<MemBlockDevice, MemLogSink>, plan: &PhysicalPlan| {
         let bound = bind_parameters(plan, &Parameters::new()).expect("bind");
         let txn = coord.begin_serializable();
         let out = {

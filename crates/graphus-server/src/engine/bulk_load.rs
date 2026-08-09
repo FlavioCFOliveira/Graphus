@@ -190,7 +190,7 @@ impl LoadingSession {
     /// batch's transaction is always rolled back on error — no partial batch is ever left visible.
     fn ingest_nodes<D: BlockDevice, S: LogSink>(
         &mut self,
-        coordinator: &mut TxnCoordinator<D, S>,
+        coordinator: &TxnCoordinator<D, S>,
         header: &Arc<NodeHeader>,
         records: &[csv::StringRecord],
     ) -> Result<()> {
@@ -272,7 +272,7 @@ impl LoadingSession {
     /// bound to that external id).
     fn ingest_relationships<D: BlockDevice, S: LogSink>(
         &mut self,
-        coordinator: &mut TxnCoordinator<D, S>,
+        coordinator: &TxnCoordinator<D, S>,
         header: &Arc<RelHeader>,
         records: &[csv::StringRecord],
     ) -> Result<()> {
@@ -342,7 +342,7 @@ impl LoadingSession {
     /// error, exactly like an ordinary batch.
     fn finish<D: BlockDevice, S: LogSink>(
         self,
-        coordinator: &mut TxnCoordinator<D, S>,
+        coordinator: &TxnCoordinator<D, S>,
     ) -> Result<ImportStats> {
         if let Some(node_id) = self.sentinel_node_id {
             coordinator.raw_txn(|txn, store| -> Result<()> {
@@ -466,7 +466,7 @@ fn checkpoint_sentinel<D: BlockDevice, S: LogSink>(
 /// [`LoadingSession::ingest_nodes`]/[`LoadingSession::ingest_relationships`]/[`LoadingSession::finish`]),
 /// or from [`recover_and_delete_orphaned_sentinel`] on the crash-recovered `End` path.
 pub(crate) fn handle_bulk_import_batch<D: BlockDevice, S: LogSink>(
-    coordinator: &mut TxnCoordinator<D, S>,
+    coordinator: &TxnCoordinator<D, S>,
     session: &mut Option<LoadingSession>,
     batch: BulkImportBatchInput,
 ) -> Result<BulkImportBatchOutcome> {
@@ -576,7 +576,7 @@ pub(crate) fn handle_bulk_import_batch<D: BlockDevice, S: LogSink>(
 /// pre-fix reopen cost. It must therefore **never** fail the `End` response (the data landed and the
 /// session closed successfully); it is logged and swallowed, mirroring the background maintenance
 /// cadence's own non-fatal treatment of a checkpoint error (`crate::engine::maybe_run_maintenance`).
-fn reclaim_after_bulk_load<D: BlockDevice, S: LogSink>(coordinator: &mut TxnCoordinator<D, S>) {
+fn reclaim_after_bulk_load<D: BlockDevice, S: LogSink>(coordinator: &TxnCoordinator<D, S>) {
     match coordinator.checkpoint() {
         Ok(report) => {
             // `report.frozen` is the load-bearing signal: the freeze sweep settled that many committed
@@ -633,7 +633,7 @@ fn reclaim_after_bulk_load<D: BlockDevice, S: LogSink>(coordinator: &mut TxnCoor
 /// A storage error reading the sentinel's properties or deleting it; the delete's own transaction is
 /// rolled back on error, exactly like an ordinary batch.
 fn recover_and_delete_orphaned_sentinel<D: BlockDevice, S: LogSink>(
-    coordinator: &mut TxnCoordinator<D, S>,
+    coordinator: &TxnCoordinator<D, S>,
 ) -> Result<ImportStats> {
     coordinator.raw_txn(|txn, store| -> Result<ImportStats> {
         let label = store.intern_token(Namespace::Label, SESSION_SENTINEL_LABEL)?;
@@ -754,12 +754,12 @@ mod tests {
 
     #[test]
     fn nodes_then_relationships_then_end_round_trips() {
-        let mut coord = coordinator();
+        let coord = coordinator();
         let mut session: Option<LoadingSession> = None;
         let nh = node_header();
 
         let out = handle_bulk_import_batch(
-            &mut coord,
+            &coord,
             &mut session,
             BulkImportBatchInput::Nodes {
                 header: Arc::clone(&nh),
@@ -775,7 +775,7 @@ mod tests {
 
         let rh = rel_header();
         let out = handle_bulk_import_batch(
-            &mut coord,
+            &coord,
             &mut session,
             BulkImportBatchInput::Relationships {
                 header: Arc::clone(&rh),
@@ -793,8 +793,8 @@ mod tests {
             "the checkpoint sentinel was created by the first batch"
         );
 
-        let out = handle_bulk_import_batch(&mut coord, &mut session, BulkImportBatchInput::End)
-            .expect("end");
+        let out =
+            handle_bulk_import_batch(&coord, &mut session, BulkImportBatchInput::End).expect("end");
         assert_eq!(out.stats.nodes, 2);
         assert_eq!(out.stats.relationships, 1);
         assert!(session.is_none(), "End clears the session");
@@ -802,9 +802,9 @@ mod tests {
 
     #[test]
     fn end_without_a_session_is_a_no_op() {
-        let mut coord = coordinator();
+        let coord = coordinator();
         let mut session: Option<LoadingSession> = None;
-        let out = handle_bulk_import_batch(&mut coord, &mut session, BulkImportBatchInput::End)
+        let out = handle_bulk_import_batch(&coord, &mut session, BulkImportBatchInput::End)
             .expect("end with no session");
         assert_eq!(out.stats.nodes, 0);
         assert!(session.is_none());
@@ -812,13 +812,13 @@ mod tests {
 
     #[test]
     fn a_failed_row_rolls_back_the_whole_batch_and_restores_stats() {
-        let mut coord = coordinator();
+        let coord = coordinator();
         let mut session: Option<LoadingSession> = None;
         let nh = node_header();
 
         // First batch: one good node.
         let out = handle_bulk_import_batch(
-            &mut coord,
+            &coord,
             &mut session,
             BulkImportBatchInput::Nodes {
                 header: Arc::clone(&nh),
@@ -831,7 +831,7 @@ mod tests {
         // Second batch: a good row followed by a duplicate `:ID` (strict policy) — the WHOLE batch
         // must roll back, so `stats.nodes` stays at 1 (the first row's success is NOT retained).
         let err = handle_bulk_import_batch(
-            &mut coord,
+            &coord,
             &mut session,
             BulkImportBatchInput::Nodes {
                 header: Arc::clone(&nh),
@@ -850,7 +850,7 @@ mod tests {
 
         // A subsequent, all-good batch still works (the session is not poisoned by the failure).
         let out = handle_bulk_import_batch(
-            &mut coord,
+            &coord,
             &mut session,
             BulkImportBatchInput::Nodes {
                 header: Arc::clone(&nh),
@@ -925,14 +925,14 @@ mod tests {
     #[test]
     fn end_forces_a_reclaiming_checkpoint_that_advances_the_wal_floor() {
         use std::sync::atomic::Ordering;
-        let (mut coord, max_reclaim) = spy_coordinator();
+        let (coord, max_reclaim) = spy_coordinator();
         let mut session: Option<LoadingSession> = None;
         let nh = node_header();
 
         // Load many small node batches so the WAL grows well past the 8-byte header.
         for i in 0..64u32 {
             handle_bulk_import_batch(
-                &mut coord,
+                &coord,
                 &mut session,
                 BulkImportBatchInput::Nodes {
                     header: Arc::clone(&nh),
@@ -950,7 +950,7 @@ mod tests {
             "nothing must reclaim the WAL during the load itself"
         );
 
-        handle_bulk_import_batch(&mut coord, &mut session, BulkImportBatchInput::End).expect("end");
+        handle_bulk_import_batch(&coord, &mut session, BulkImportBatchInput::End).expect("end");
 
         let floor = max_reclaim.load(Ordering::SeqCst);
         assert!(
@@ -967,10 +967,10 @@ mod tests {
     #[test]
     fn end_with_no_session_and_no_data_does_not_reclaim() {
         use std::sync::atomic::Ordering;
-        let (mut coord, max_reclaim) = spy_coordinator();
+        let (coord, max_reclaim) = spy_coordinator();
         let mut session: Option<LoadingSession> = None;
 
-        let out = handle_bulk_import_batch(&mut coord, &mut session, BulkImportBatchInput::End)
+        let out = handle_bulk_import_batch(&coord, &mut session, BulkImportBatchInput::End)
             .expect("no-op end");
         assert_eq!(out.stats.nodes, 0);
         assert_eq!(
@@ -991,7 +991,7 @@ mod tests {
     #[test]
     fn mid_load_freeze_only_checkpoint_advances_the_floor_without_reclaiming() {
         use std::sync::atomic::Ordering;
-        let (mut coord, max_reclaim) = spy_coordinator();
+        let (coord, max_reclaim) = spy_coordinator();
         let mut session: Option<LoadingSession> = None;
         let nh = node_header();
 
@@ -999,7 +999,7 @@ mod tests {
         // version — the exact pattern that would gate the O(store) property sweep ON in a FULL pass).
         for i in 0..48u32 {
             handle_bulk_import_batch(
-                &mut coord,
+                &coord,
                 &mut session,
                 BulkImportBatchInput::Nodes {
                     header: Arc::clone(&nh),
@@ -1043,13 +1043,13 @@ mod tests {
 
     #[test]
     fn relationship_batch_resolves_only_against_committed_nodes() {
-        let mut coord = coordinator();
+        let coord = coordinator();
         let mut session: Option<LoadingSession> = None;
         let nh = node_header();
         let rh = rel_header();
 
         handle_bulk_import_batch(
-            &mut coord,
+            &coord,
             &mut session,
             BulkImportBatchInput::Nodes {
                 header: Arc::clone(&nh),
@@ -1060,7 +1060,7 @@ mod tests {
 
         // `:END_ID` "2" was never committed — the relationship batch must fail cleanly, not panic.
         let err = handle_bulk_import_batch(
-            &mut coord,
+            &coord,
             &mut session,
             BulkImportBatchInput::Relationships {
                 header: Arc::clone(&rh),

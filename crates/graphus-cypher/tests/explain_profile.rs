@@ -546,8 +546,7 @@ fn profile_db_hits_prove_the_index_seek_reads_less_of_the_store() {
         .expect("index");
 
     let query = "PROFILE MATCH (n:Person {name: 'p7'}) RETURN n.name AS name";
-    let run_it = |coord: &mut TxnCoordinator<MemBlockDevice, MemLogSink>,
-                  catalog: &IndexCatalog| {
+    let run_it = |coord: &TxnCoordinator<MemBlockDevice, MemLogSink>, catalog: &IndexCatalog| {
         let plan = compile(query, catalog);
         let params = bind_parameters(&plan, &Parameters::new()).expect("bind");
         let txn = coord.begin_serializable();

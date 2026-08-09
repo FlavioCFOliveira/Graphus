@@ -817,8 +817,7 @@ fn exists_with_an_indexed_inner_predicate_reads_a_fraction_of_the_label() {
         .expect("index");
 
     let query = "PROFILE MATCH (m:MARKER) WHERE EXISTS { (u:USER {uidn: 1}) } RETURN count(*) AS c";
-    let run_it = |coord: &mut TxnCoordinator<MemBlockDevice, MemLogSink>,
-                  catalog: &IndexCatalog| {
+    let run_it = |coord: &TxnCoordinator<MemBlockDevice, MemLogSink>, catalog: &IndexCatalog| {
         let plan = compile_with(query, catalog);
         let params = bind_parameters(&plan, &Parameters::new()).expect("bind");
         let txn = coord.begin_serializable();

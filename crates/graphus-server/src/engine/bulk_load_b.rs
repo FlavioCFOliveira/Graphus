@@ -261,7 +261,7 @@ mod tests {
     }
 
     fn open_txn(
-        coord: &mut TxnCoordinator<MemBlockDevice, MemLogSink>,
+        coord: &TxnCoordinator<MemBlockDevice, MemLogSink>,
         open: &mut OpenTxTable,
         next_ticket: &mut u64,
     ) -> TxTicket {
@@ -301,10 +301,10 @@ mod tests {
 
     #[test]
     fn ingests_node_chunk_through_the_graph_access_seam() {
-        let mut coord = coordinator();
+        let coord = coordinator();
         let mut open = OpenTxTable::new();
         let mut next_ticket = 0u64;
-        let ticket = open_txn(&mut coord, &mut open, &mut next_ticket);
+        let ticket = open_txn(&coord, &mut open, &mut next_ticket);
 
         let out = ingest_mode_b_chunk(
             &coord,
@@ -328,10 +328,10 @@ mod tests {
 
     #[test]
     fn ingests_rel_chunk_resolving_against_the_confirmed_id_map() {
-        let mut coord = coordinator();
+        let coord = coordinator();
         let mut open = OpenTxTable::new();
         let mut next_ticket = 0u64;
-        let ticket = open_txn(&mut coord, &mut open, &mut next_ticket);
+        let ticket = open_txn(&coord, &mut open, &mut next_ticket);
 
         let node_out = ingest_mode_b_chunk(
             &coord,
@@ -367,10 +367,10 @@ mod tests {
 
     #[test]
     fn unknown_endpoint_is_a_terminal_storage_error() {
-        let mut coord = coordinator();
+        let coord = coordinator();
         let mut open = OpenTxTable::new();
         let mut next_ticket = 0u64;
-        let ticket = open_txn(&mut coord, &mut open, &mut next_ticket);
+        let ticket = open_txn(&coord, &mut open, &mut next_ticket);
 
         let err = ingest_mode_b_chunk(
             &coord,
@@ -388,10 +388,10 @@ mod tests {
 
     #[test]
     fn malformed_typed_cell_is_a_terminal_parse_error() {
-        let mut coord = coordinator();
+        let coord = coordinator();
         let mut open = OpenTxTable::new();
         let mut next_ticket = 0u64;
-        let ticket = open_txn(&mut coord, &mut open, &mut next_ticket);
+        let ticket = open_txn(&coord, &mut open, &mut next_ticket);
 
         let bad_header = Arc::new(NodeHeader {
             columns: vec![
