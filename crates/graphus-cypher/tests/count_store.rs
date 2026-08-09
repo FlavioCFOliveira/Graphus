@@ -485,7 +485,7 @@ fn a_reader_on_an_older_snapshot_sees_its_snapshot_relationship_count() {
 /// observable outcome, which is what the ACID contract is actually stated in.
 #[test]
 fn a_serializable_count_keeps_the_read_footprint_that_catches_a_phantom() {
-    let mut coord = fresh_coord();
+    let coord = fresh_coord();
 
     let t1 = coord.begin_serializable();
     let t2 = coord.begin_serializable();

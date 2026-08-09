@@ -71,7 +71,7 @@ fn auto_index_name_is_deterministic_and_sanitizes() {
 
 #[test]
 fn named_create_records_name_and_drop_by_name_removes_it() {
-    let mut coord = fresh_coord();
+    let coord = fresh_coord();
     coord
         .begin_online_node_property_index_named(Some("ix_person"), "Person", "name", false)
         .expect("named create");
@@ -88,7 +88,7 @@ fn named_create_records_name_and_drop_by_name_removes_it() {
 fn create_and_drop_report_whether_they_mutated() {
     // `rmp` #626 follow-up: the return flag drives the Neo4j-conformant `indexes-added`/`-removed`
     // counters — a real create/drop is `true`, an idempotent no-op is `false`.
-    let mut coord = fresh_coord();
+    let coord = fresh_coord();
 
     // First create actually creates → true.
     assert!(
@@ -130,7 +130,7 @@ fn create_and_drop_report_whether_they_mutated() {
 
 #[test]
 fn omitted_name_gets_the_deterministic_auto_name() {
-    let mut coord = fresh_coord();
+    let coord = fresh_coord();
     coord
         .begin_online_node_property_index_named(None, "Person", "age", false)
         .expect("anonymous create");
@@ -143,7 +143,7 @@ fn omitted_name_gets_the_deterministic_auto_name() {
 
 #[test]
 fn duplicate_name_on_a_different_target_is_rejected_unless_if_not_exists() {
-    let mut coord = fresh_coord();
+    let coord = fresh_coord();
     coord
         .begin_online_node_property_index_named(Some("shared"), "Person", "age", false)
         .expect("first create");
@@ -166,7 +166,7 @@ fn duplicate_name_on_a_different_target_is_rejected_unless_if_not_exists() {
 
 #[test]
 fn equivalent_index_on_same_target_is_rejected_unless_if_not_exists() {
-    let mut coord = fresh_coord();
+    let coord = fresh_coord();
     coord
         .begin_online_node_property_index_named(Some("a"), "Person", "age", false)
         .expect("first create");
@@ -192,7 +192,7 @@ fn equivalent_index_on_same_target_is_rejected_unless_if_not_exists() {
 #[test]
 fn a_name_is_unique_across_catalogs() {
     // A full-text index and a node-property index cannot share a name (either declaration order).
-    let mut coord = fresh_coord();
+    let coord = fresh_coord();
     coord
         .create_fulltext_index(
             "shared",
@@ -211,7 +211,7 @@ fn a_name_is_unique_across_catalogs() {
     );
 
     // The reverse: a full-text create colliding with an existing node-property index name.
-    let mut coord = fresh_coord();
+    let coord = fresh_coord();
     coord
         .begin_online_node_property_index_named(Some("np"), "Person", "name", false)
         .expect("node-property create");
@@ -236,7 +236,7 @@ fn a_name_is_unique_across_catalogs() {
 
 #[test]
 fn drop_by_name_missing_is_an_error_without_if_exists_and_a_noop_with_it() {
-    let mut coord = fresh_coord();
+    let coord = fresh_coord();
     // Missing name, no IF EXISTS → IndexDropFailed.
     let err = coord
         .drop_node_property_index_by_name("nope", false)
@@ -291,7 +291,7 @@ fn legacy_anonymous_index_is_backfilled_with_a_stable_auto_name_on_open() {
         "the backfilled name is stable across a crash/restart"
     );
     // And it is droppable by that auto-name.
-    let mut coord = coord;
+    let coord = coord;
     coord
         .drop_node_property_index_by_name("index_Person_age", false)
         .expect("drop the backfilled index by its auto-name");
@@ -310,7 +310,7 @@ fn legacy_anonymous_index_is_backfilled_with_a_stable_auto_name_on_open() {
 /// rejected as a duplicate target. This is the exact HIGH sequence the audit flagged.
 #[test]
 fn colliding_auto_name_rebuild_keeps_one_name_per_target_and_reopens() {
-    let mut coord = fresh_coord();
+    let coord = fresh_coord();
     // `index_A_b_c` is the base of BOTH: sanitize("A")+"_"+sanitize("b_c") == sanitize("A_b")+"_"+sanitize("c").
     assert_eq!(auto_index_name("A", "b_c"), auto_index_name("A_b", "c"));
 
@@ -362,7 +362,7 @@ fn colliding_auto_name_rebuild_keeps_one_name_per_target_and_reopens() {
 /// explicit index's name pointing at its ORIGINAL index.
 #[test]
 fn anonymous_create_never_steals_an_existing_explicit_name() {
-    let mut coord = fresh_coord();
+    let coord = fresh_coord();
     // Explicitly name an index `index_A_b_c` — which is ALSO the auto-name base of (A, b_c).
     coord
         .begin_online_node_property_index_named(Some("index_A_b_c"), "Person", "email", false)

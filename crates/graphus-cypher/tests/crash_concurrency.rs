@@ -90,7 +90,7 @@ fn count_label(coord: &mut Coord, label: &str) -> usize {
 /// hardened into the durable log. After recovery, every `:Keep` must survive and no `:Loser` may.
 fn run_crash_scenario(seed: u64, keeps: usize, losers: usize) {
     let mut rng = SimRng::new(seed);
-    let mut coord = TxnCoordinator::new(fresh_store());
+    let coord = TxnCoordinator::new(fresh_store());
 
     // Open all the loser transactions first and write through them, but never commit them.
     let loser_txns: Vec<TxnId> = (0..losers).map(|_| coord.begin_serializable()).collect();

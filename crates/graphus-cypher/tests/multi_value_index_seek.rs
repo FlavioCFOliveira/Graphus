@@ -706,7 +706,7 @@ fn a_matching_list_alternative_declines_the_whole_union_to_the_exact_scan() {
 fn parameters_bind_as_alternatives() {
     // Every alternative is walked by `binding::walk_physical`, or a `$param` alternative would never
     // bind. Exercised end-to-end through the executor.
-    let mut coord = seeded_indexed_coord();
+    let coord = seeded_indexed_coord();
     let catalog = coord.catalog();
     let src = "MATCH (u:USER) WHERE u.uidn IN [$a, $b] RETURN u.id AS id";
     let plan = compile_with(src, &catalog);
@@ -921,7 +921,7 @@ fn the_single_value_seek_still_elides_its_order_by() {
 fn an_order_by_over_a_multi_value_seek_still_returns_sorted_rows() {
     // The behavioural half of the guard: whatever the plan shape, the rows come out sorted. This is the
     // assertion that would fail if the multi-seek were wrongly granted the elision.
-    let mut coord = seeded_indexed_coord();
+    let coord = seeded_indexed_coord();
     let catalog = coord.catalog();
     let plan = compile_with(
         "MATCH (u:USER) WHERE u.uidn IN [4, 1, 2] RETURN u.uidn AS id ORDER BY u.uidn",

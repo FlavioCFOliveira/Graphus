@@ -145,7 +145,7 @@ fn assert_plans_rel_index_seek(coord: &Coord, src: &str) {
 ///
 /// Returns whether T1 (the pivot) aborted, i.e. whether the edge under test formed.
 fn probe(seek_value: &str, expect_seen: i64, write_src: &str) -> bool {
-    let mut coord = seeded_coord();
+    let coord = seeded_coord();
     let seek_query =
         format!("MATCH ()-[r:TRANSFER]->() WHERE r.tx_id = '{seek_value}' RETURN count(r) AS c");
     assert_plans_rel_index_seek(&coord, &seek_query);

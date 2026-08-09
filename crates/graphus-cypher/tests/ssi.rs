@@ -248,7 +248,7 @@ fn read_only_transaction_commits_concurrently_with_a_writer() {
 /// refactor is free to move where the conflict is detected; it is not free to permit that state.
 #[test]
 fn detach_delete_vs_create_edge_is_serializable() {
-    let mut coord = fresh_coord();
+    let coord = fresh_coord();
     let s = coord.begin_serializable();
     let (_r, e) = run_stmt(&coord, s, "CREATE (:N {id: 5}), (:B {id: 9})");
     assert!(e.is_none(), "seed error: {e:?}");
@@ -308,7 +308,7 @@ fn detach_delete_vs_create_edge_is_serializable() {
 /// over-abort.
 #[test]
 fn disjoint_delete_and_create_edge_both_commit() {
-    let mut coord = fresh_coord();
+    let coord = fresh_coord();
     let s = coord.begin_serializable();
     let (_r, e) = run_stmt(&coord, s, "CREATE (:N {id: 5}), (:C {id: 1}), (:D {id: 2})");
     assert!(e.is_none(), "seed error: {e:?}");

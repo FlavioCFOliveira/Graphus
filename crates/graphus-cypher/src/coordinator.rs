@@ -1609,7 +1609,7 @@ pub struct TxnCoordinator<D: BlockDevice, S: LogSink> {
     /// only while fresh, falling back to the chain walk otherwise. Derived, in-memory, never recovered.
     csr: Option<SharedCell<crate::csr_adjacency::CsrAdjacency>>,
     /// Open transactions (begun, not yet committed/rolled back).
-    active: HashMap<TxnId, ActiveTxn>,
+    active: std::sync::Mutex<HashMap<TxnId, ActiveTxn>>,
     /// Monotonic transaction-id source (distinct from the commit timestamp, which the store issues).
     next_txn_id: AtomicU64,
     /// **Every pending / poisoned / conflicted index build, behind one latch** (`rmp` #1033).
@@ -1932,7 +1932,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             // declared via `declare_zone_map` and rebuilt from the store, derived/never-recovered.
             zones: SharedCell::new(crate::zone_map::ZoneMap::new()),
             csr,
-            active: HashMap::new(),
+            active: std::sync::Mutex::new(HashMap::new()),
             next_txn_id: AtomicU64::new(next_txn_id),
             builds: std::sync::Mutex::new(IndexBuilds::default()),
             degraded_retry_skip: AtomicU32::new(0),
@@ -2000,7 +2000,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// `D`/`S` carry `Send + Sync + 'static` for the same reason [`statement`](Self::statement) does —
     /// the statement seam this drives is bounded that way; every real store instantiation already
     /// meets these bounds.
-    fn seed_index_histogram(&mut self, label_token: u32, prop_key: u32)
+    fn seed_index_histogram(&self, label_token: u32, prop_key: u32)
     where
         D: Send + Sync + 'static,
         S: Send + Sync + 'static,
@@ -4241,7 +4241,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// Its read snapshot is the store's latest commit ([`RecordStore::snapshot_ts`], `04 §5.2`), so
     /// it sees exactly what has committed so far; it is registered with the SSI tracker so its
     /// conflicts are tracked from this begin timestamp.
-    pub fn begin(&mut self, isolation: IsolationLevel) -> TxnId {
+    pub fn begin(&self, isolation: IsolationLevel) -> TxnId {
         self.begin_inner(isolation, None)
     }
 
@@ -4255,31 +4255,33 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// expire a fresh transaction nor perpetually reprieve a stale one. Otherwise identical to
     /// [`begin`](Self::begin) (which leaves the transaction age-untracked, hence never reaped — the TCK
     /// / unit-test path).
-    pub fn begin_at(&mut self, isolation: IsolationLevel, begin_nanos: u64) -> TxnId {
+    pub fn begin_at(&self, isolation: IsolationLevel, begin_nanos: u64) -> TxnId {
         self.begin_inner(isolation, Some(begin_nanos))
     }
 
     /// Shared body of [`begin`](Self::begin) / [`begin_at`](Self::begin_at): mints the id, snapshots
     /// the store's latest commit, registers SSI tracking, and inserts the active entry with its
     /// (optional) monotonic begin reading.
-    fn begin_inner(&mut self, isolation: IsolationLevel, begin_nanos: Option<u64>) -> TxnId {
+    fn begin_inner(&self, isolation: IsolationLevel, begin_nanos: Option<u64>) -> TxnId {
         let txn = self.mint_txn();
         let begin_ts = self.store.borrow().snapshot_ts();
         self.store.borrow_mut().begin(txn);
         self.ssi.borrow_mut().register(txn, begin_ts);
-        self.active.insert(
-            txn,
-            ActiveTxn {
-                snapshot: Snapshot::new(txn, begin_ts),
-                isolation,
-                begin_nanos,
-            },
-        );
+        self.with_active(|a| {
+            a.insert(
+                txn,
+                ActiveTxn {
+                    snapshot: Snapshot::new(txn, begin_ts),
+                    isolation,
+                    begin_nanos,
+                },
+            )
+        });
         txn
     }
 
     /// Begins a SERIALIZABLE transaction (the default level).
-    pub fn begin_serializable(&mut self) -> TxnId {
+    pub fn begin_serializable(&self) -> TxnId {
         self.begin(IsolationLevel::Serializable)
     }
 
@@ -4303,7 +4305,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// # Errors
     /// Returns a storage error if interning either token, recording the catalog entry, or the
     /// committing transaction fails.
-    pub fn create_node_property_index(&mut self, label: &str, property: &str) -> Result<()>
+    pub fn create_node_property_index(&self, label: &str, property: &str) -> Result<()>
     where
         D: Send + Sync + 'static,
         S: Send + Sync + 'static,
@@ -4376,7 +4378,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// - a storage error if interning a token, recording the catalog entry, or committing fails. On any
     ///   error the index is left undeclared.
     pub fn create_rel_property_index_named(
-        &mut self,
+        &self,
         name: Option<&str>,
         rel_type: &str,
         property: &str,
@@ -4466,7 +4468,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ///
     /// # Errors
     /// Returns a storage error if the committing transaction fails.
-    pub fn drop_rel_property_index(&mut self, rel_type: &str, property: &str) -> Result<bool> {
+    pub fn drop_rel_property_index(&self, rel_type: &str, property: &str) -> Result<bool> {
         let tokens = {
             let store = self.store.borrow();
             match (
@@ -4514,7 +4516,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// # Errors
     /// - `Neo.ClientError.Schema.IndexDropFailed` (no `IF EXISTS`) when no index of that name exists;
     /// - a storage error if the committing transaction fails.
-    pub fn drop_rel_property_index_by_name(&mut self, name: &str, if_exists: bool) -> Result<bool> {
+    pub fn drop_rel_property_index_by_name(&self, name: &str, if_exists: bool) -> Result<bool> {
         let target = self.store.borrow().rel_property_index_name(name);
         let Some((type_token, prop_key)) = target else {
             return if if_exists {
@@ -4553,7 +4555,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// # Errors
     /// - `Neo.ClientError.Schema.IndexDropFailed` (no `IF EXISTS`) when no index of that name exists;
     /// - a storage error if the committing transaction fails.
-    pub fn drop_property_index_by_name(&mut self, name: &str, if_exists: bool) -> Result<bool> {
+    pub fn drop_property_index_by_name(&self, name: &str, if_exists: bool) -> Result<bool> {
         // A node-property index of that name? (Its resolver already handles the missing case, but we
         // gate here so a rel index of the same-shaped name is not shadowed by the node resolver's
         // "not found" — names are globally unique, so only one catalog can hold it.)
@@ -4612,11 +4614,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ///
     /// # Errors
     /// Returns a storage error if the committing transaction fails.
-    pub fn drop_node_composite_index(
-        &mut self,
-        label: &str,
-        properties: &[String],
-    ) -> Result<bool> {
+    pub fn drop_node_composite_index(&self, label: &str, properties: &[String]) -> Result<bool> {
         let resolved = {
             let store = self.store.borrow();
             match Self::resolve_property_tokens(store, label, properties) {
@@ -4642,7 +4640,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// # Errors
     /// Returns a storage error if the committing transaction fails.
     fn remove_composite_index_committed(
-        &mut self,
+        &self,
         name: &str,
         label_token: u32,
         property_tokens: &[u32],
@@ -4706,11 +4704,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ///
     /// # Errors
     /// Returns a storage error if the committing transaction fails.
-    pub fn drop_rel_composite_index(
-        &mut self,
-        rel_type: &str,
-        properties: &[String],
-    ) -> Result<bool> {
+    pub fn drop_rel_composite_index(&self, rel_type: &str, properties: &[String]) -> Result<bool> {
         let resolved = {
             let store = self.store.borrow();
             match Self::resolve_rel_property_tokens(store, rel_type, properties) {
@@ -4736,7 +4730,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// # Errors
     /// Returns a storage error if the committing transaction fails.
     fn remove_rel_composite_index_committed(
-        &mut self,
+        &self,
         name: &str,
         type_token: u32,
         property_tokens: &[u32],
@@ -4828,7 +4822,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ///
     /// # Errors
     /// Returns a storage error if interning either token (or its committing transaction) fails.
-    pub fn declare_columnar_cache(&mut self, label: &str, property: &str) -> Result<()> {
+    pub fn declare_columnar_cache(&self, label: &str, property: &str) -> Result<()> {
         // Intern the tokens in one committed transaction (the only durable effect — no columnar data
         // is persisted). Mirrors the token-minting prologue of `create_node_property_index`.
         let txn = self.mint_txn();
@@ -4887,7 +4881,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// - [`GraphusError::Runtime`] if the column's distinct-value count exceeds
     ///   [`graphus_index::bitmap::MAX_DISTINCT_VALUES`] — the column is too high-cardinality for a
     ///   bitmap index (use the B+-tree node-property index instead).
-    pub fn declare_bitmap_index(&mut self, label: &str, property: &str) -> Result<()> {
+    pub fn declare_bitmap_index(&self, label: &str, property: &str) -> Result<()> {
         let txn = self.mint_txn();
         self.store.borrow_mut().begin(txn);
         let (label_token, prop_key) = {
@@ -5035,7 +5029,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ///
     /// # Errors
     /// Returns a storage error if interning either token (or its committing transaction) fails.
-    pub fn declare_zone_map(&mut self, label: &str, property: &str) -> Result<()> {
+    pub fn declare_zone_map(&self, label: &str, property: &str) -> Result<()> {
         let txn = self.mint_txn();
         self.store.borrow_mut().begin(txn);
         let (label_token, prop_key) = {
@@ -5377,7 +5371,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// re-declare is a clean no-op success. The named server surface (a Cypher `CREATE INDEX`) goes
     /// through [`begin_online_node_property_index_named`](Self::begin_online_node_property_index_named),
     /// which enforces global name uniqueness and Neo4j `IF NOT EXISTS` semantics.
-    pub fn begin_online_node_property_index(&mut self, label: &str, property: &str) -> Result<()> {
+    pub fn begin_online_node_property_index(&self, label: &str, property: &str) -> Result<()> {
         // `if_not_exists = true` preserves the historical idempotent-on-redeclare behaviour of this
         // positional API (a second declare of the same index is a no-op, never an error). The
         // created-vs-no-op flag is irrelevant to the positional callers, so it is discarded here.
@@ -5412,7 +5406,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// - a storage error if interning a token, recording the catalog entry, committing, or the initial
     ///   snapshot scan fails. On any error the index is left undeclared.
     pub fn begin_online_node_property_index_named(
-        &mut self,
+        &self,
         name: Option<&str>,
         label: &str,
         property: &str,
@@ -5542,7 +5536,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// Panics if `properties` is empty (the parser guarantees at least one property; a composite has two
     /// or more).
     pub fn begin_online_node_composite_index_named(
-        &mut self,
+        &self,
         name: Option<&str>,
         label: &str,
         properties: &[String],
@@ -5772,7 +5766,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// # Panics
     /// Panics if `properties` is empty (the parser guarantees at least one property).
     pub fn begin_online_rel_composite_index_named(
-        &mut self,
+        &self,
         name: Option<&str>,
         rel_type: &str,
         properties: &[String],
@@ -5975,7 +5969,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// entry, the committing transaction, or the initial snapshot scan fails. On any error the index
     /// is left undeclared.
     pub fn create_fulltext_index(
-        &mut self,
+        &self,
         name: &str,
         labels: &[String],
         properties: &[String],
@@ -6097,7 +6091,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// Returns a storage error if `types` or `properties` is empty, interning any token, recording the
     /// catalog entry, or the committing transaction fails. On any error the index is left undeclared.
     pub fn create_fulltext_rel_index(
-        &mut self,
+        &self,
         name: &str,
         types: &[String],
         properties: &[String],
@@ -6238,7 +6232,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ///
     /// # Errors
     /// Returns a storage error if the committing transaction fails.
-    pub fn drop_fulltext_index(&mut self, name: &str, if_exists: bool) -> Result<bool> {
+    pub fn drop_fulltext_index(&self, name: &str, if_exists: bool) -> Result<bool> {
         // Not declared: without `IF EXISTS` this is a `Neo.ClientError.Schema.IndexDropFailed` error
         // (Neo4j) and side-effect-free (nothing durable to remove). With `IF EXISTS` it is a clean no-op
         // success — defensively cancel any stray in-flight build + in-memory registration first
@@ -6334,7 +6328,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// Returns a storage error if interning either token, recording the catalog entry, the committing
     /// transaction, or the initial snapshot scan fails. On any error the index is left undeclared.
     pub fn create_point_index(
-        &mut self,
+        &self,
         name: &str,
         label: &str,
         property: &str,
@@ -6440,7 +6434,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// transaction fails; `Neo.ClientError.Schema.IndexWithNameAlreadyExists` when `name` is already
     /// taken by another schema catalog. On any error the index is left undeclared.
     pub fn create_point_rel_index(
-        &mut self,
+        &self,
         name: &str,
         rel_type: &str,
         property: &str,
@@ -6566,7 +6560,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ///
     /// # Errors
     /// Returns a storage error if the committing transaction fails.
-    pub fn drop_point_index(&mut self, name: &str, if_exists: bool) -> Result<bool> {
+    pub fn drop_point_index(&self, name: &str, if_exists: bool) -> Result<bool> {
         // ONE hold for this whole operation (`rmp` #1033): a build moves between queues,
         // and two holds would let a reader see it on both or on neither.
         let mut guard = self.builds();
@@ -6694,7 +6688,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// - a storage error if interning a token, recording the catalog entry, committing, or the build
     ///   scan fails. On any error the index is left undeclared.
     pub fn create_text_index(
-        &mut self,
+        &self,
         name: &str,
         label: &str,
         property: &str,
@@ -6845,7 +6839,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// - `Neo.ClientError.Schema.IndexDropFailed` when the index is not declared and `if_exists` is
     ///   `false`;
     /// - a storage error if the committing transaction fails.
-    pub fn drop_text_index(&mut self, name: &str, if_exists: bool) -> Result<bool> {
+    pub fn drop_text_index(&self, name: &str, if_exists: bool) -> Result<bool> {
         // Resolve the covered `(label_token, prop_key)` from the durable entry so we can unregister the
         // right trigram index from the in-memory set (which is keyed by tokens, not by name).
         let entry = self.store.borrow().text_index(name);
@@ -6925,7 +6919,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ///   fails. On any error the index is left undeclared.
     #[allow(clippy::too_many_arguments)]
     pub fn begin_online_vector_index_named(
-        &mut self,
+        &self,
         name: Option<&str>,
         entity: VectorEntity,
         covering: &str,
@@ -7158,7 +7152,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// - `Neo.ClientError.Schema.IndexDropFailed` when the index is not declared and `if_exists` is
     ///   `false`;
     /// - a storage error if the committing transaction fails.
-    pub fn drop_vector_index(&mut self, name: &str, if_exists: bool) -> Result<bool> {
+    pub fn drop_vector_index(&self, name: &str, if_exists: bool) -> Result<bool> {
         // Resolve the covered `(entity, token, prop_key)` from the durable entry so we can unregister the
         // right graph from the in-memory set (which is keyed by tokens, not by name).
         let entry = self.store.borrow().vector_index(name);
@@ -7375,7 +7369,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// drop leaves the name free — matching the operator's intent to replace).
     #[allow(clippy::too_many_arguments)]
     pub fn create_constraint_ddl(
-        &mut self,
+        &self,
         name: &str,
         covering: &str,
         properties: &[&str],
@@ -7418,7 +7412,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// [`create_constraint_general_cancellable`](Self::create_constraint_general_cancellable).
     #[allow(clippy::too_many_arguments)]
     pub fn create_constraint_ddl_cancellable(
-        &mut self,
+        &self,
         name: &str,
         covering: &str,
         properties: &[&str],
@@ -7680,7 +7674,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// a storage error if interning a token, recording the catalog entry, or the committing transaction
     /// fails. On any error the constraint is left undeclared.
     pub fn create_constraint(
-        &mut self,
+        &self,
         name: &str,
         label: &str,
         property: &str,
@@ -7712,7 +7706,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// constraint, or a storage error if interning a token, recording the entry, or committing fails.
     /// On any error the constraint is left undeclared.
     pub fn create_constraint_general(
-        &mut self,
+        &self,
         name: &str,
         label: &str,
         properties: &[&str],
@@ -7754,7 +7748,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// As [`create_constraint_general`](Self::create_constraint_general), plus a
     /// [`GraphusError::Transaction`] naming the constraint when the token is cancelled.
     pub fn create_constraint_general_cancellable(
-        &mut self,
+        &self,
         name: &str,
         label: &str,
         properties: &[&str],
@@ -7984,14 +7978,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// footprint — and while it validates there is none, because
     /// [`refuse_constraint_ddl_while_writers_open`](Self::refuse_constraint_ddl_while_writers_open) ran
     /// first and no writer can start mid-DDL on a single-threaded engine.
-    fn begin_schema_txn(&mut self) -> (TxnId, Snapshot) {
+    fn begin_schema_txn(&self) -> (TxnId, Snapshot) {
         let txn = self.begin_serializable();
         // `begin_serializable` has just inserted the entry; the fallback reconstructs the identical
         // snapshot `begin_inner` builds rather than panicking on an invariant this method owns.
-        let snapshot = self.active.get(&txn).map_or_else(
-            || Snapshot::new(txn, self.store.borrow().snapshot_ts()),
-            |a| a.snapshot,
-        );
+        let snapshot = self
+            .with_active(|a| a.get(&txn).map(|t| t.snapshot))
+            .unwrap_or_else(|| Snapshot::new(txn, self.store.borrow().snapshot_ts()));
         (txn, snapshot)
     }
 
@@ -8706,7 +8699,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ///
     /// # Errors
     /// Returns a storage error if the committing transaction fails.
-    pub fn drop_constraint(&mut self, name: &str) -> Result<bool> {
+    pub fn drop_constraint(&self, name: &str) -> Result<bool> {
         // Resolve the entry first so a node key's backing composite index can be unregistered by its
         // covered `(label, property tuple)` after the durable removal.
         let entry = self.store.borrow().constraint(name);
@@ -8950,7 +8943,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// The conflict queue must be purged for exactly the reason the poison graveyard is: a parked build
     /// that outlives its index is resurrected later — here as soon as its blocking writer commits — and
     /// durably re-creates an index the user dropped, or races the fresh build of a re-declared one.
-    fn cancel_fulltext_builds(&mut self, name: &str) {
+    fn cancel_fulltext_builds(&self, name: &str) {
         // ONE hold for this whole operation (`rmp` #1033): a build moves between queues,
         // and two holds would let a reader see it on both or on neither.
         let mut guard = self.builds();
@@ -9139,7 +9132,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// graveyard truly clears — i.e. a resurrected build actually **completed** — so a genuinely-healed
     /// store returns to a fast retry while a permanently-broken one has its retry rate collapse
     /// geometrically to one attempt per [`MAX_DEGRADED_RETRY_BACKOFF`] drains.
-    pub fn retry_poisoned_index_builds(&mut self) -> bool {
+    pub fn retry_poisoned_index_builds(&self) -> bool {
         // ONE hold for this whole operation (`rmp` #1033): a build moves between queues,
         // and two holds would let a reader see it on both or on neither.
         let mut guard = self.builds();
@@ -9231,7 +9224,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// in *attempts* rather than wall-clock: the coordinator must stay deterministic for DST, so it may
     /// not read the clock. A no-op returning `true` when the index set is healthy, so callers can invoke
     /// it unconditionally.
-    pub fn retry_degraded_index_rebuild(&mut self) -> bool {
+    pub fn retry_degraded_index_rebuild(&self) -> bool {
         // `rmp` task #803 — the trigger covers a POISONED marker as well as a degraded set.
         //
         // A poisoned cross-snapshot full-text/spatial marker pins `effective_ft_spatial_marker` at
@@ -9383,7 +9376,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// success); a repair that reaches FULL quiescence (no vector index, node or rel, still blocked)
     /// DRAINS it to the floor (`rmp` task #802), so the coordinator-global backoff cannot outlive the
     /// storm that armed it and spend itself as a wide skip on the next unrelated index to block.
-    fn retry_conflicted_vector_builds(&mut self) -> bool {
+    fn retry_conflicted_vector_builds(&self) -> bool {
         let node_keys = self.index.borrow().conflicted_vector();
         let rel_keys = self.index.borrow().conflicted_vector_rel();
         if node_keys.is_empty() && rel_keys.is_empty() {
@@ -9596,7 +9589,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// [`retry_degraded_index_rebuild`](Self::retry_degraded_index_rebuild) documents: this conflict is
     /// inherently flapping — overlapping write transactions resolve one after another — so an unthrottled
     /// repair would run one O(store) rebuild per writer generation, on the engine thread, forever.
-    fn retry_conflicted_fulltext_builds(&mut self) -> bool {
+    fn retry_conflicted_fulltext_builds(&self) -> bool {
         // ONE hold for this whole operation (`rmp` #1033): a build moves between queues,
         // and two holds would let a reader see it on both or on neither.
         let mut guard = self.builds();
@@ -9708,7 +9701,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// is legal from **any** cursor position — the chunk bounds saturate rather than overflow (`rmp` task
     /// #573). If the durable promotion commit fails, the build is left in place `Populating` (still
     /// correct via the scan fallback) to be retried on the next call/open.
-    pub fn advance_index_builds(&mut self, budget: usize) -> bool
+    pub fn advance_index_builds(&self, budget: usize) -> bool
     where
         D: Send + Sync + 'static,
         S: Send + Sync + 'static,
@@ -9776,7 +9769,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// [`advance_index_builds`](Self::advance_index_builds)); the recompute itself is the best-effort
     /// [`seed_index_histogram`](Self::seed_index_histogram), which runs it in its own yield-free
     /// auto-commit transaction.
-    fn drain_one_pending_resample(&mut self)
+    fn drain_one_pending_resample(&self)
     where
         D: Send + Sync + 'static,
         S: Send + Sync + 'static,
@@ -9799,7 +9792,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
 
     /// Advances the front **node-property** build by up to `budget` nodes (`rmp` task #91), promoting
     /// + dequeuing it when complete.
-    fn advance_node_property_build(&mut self, budget: usize)
+    fn advance_node_property_build(&self, budget: usize)
     where
         D: Send + Sync + 'static,
         S: Send + Sync + 'static,
@@ -9963,7 +9956,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// bounded number of snapshot nodes' text into the inverted index via the shared
     /// [`index_one_node_fulltext`](Self::index_one_node_fulltext) helper, then on completion the named
     /// catalog entry is durably flipped to [`IndexState::Online`].
-    fn advance_fulltext_build(&mut self, budget: usize) {
+    fn advance_fulltext_build(&self, budget: usize) {
         // ONE hold for this whole operation (`rmp` #1033): a build moves between queues,
         // and two holds would let a reader see it on both or on neither.
         let mut guard = self.builds();
@@ -10184,7 +10177,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// [`index_one_node_spatial`](Self::index_one_node_spatial) helper, then on completion the named
     /// catalog entry is durably flipped to [`IndexState::Online`] (after which the planner begins
     /// routing proximity seeks to it).
-    fn advance_spatial_build(&mut self, budget: usize) {
+    fn advance_spatial_build(&self, budget: usize) {
         // ONE hold for this whole operation (`rmp` #1033): a build moves between queues,
         // and two holds would let a reader see it on both or on neither.
         let mut guard = self.builds();
@@ -10333,7 +10326,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ///
     /// # Errors
     /// Returns a storage error if the committing transaction fails.
-    pub fn drop_node_property_index(&mut self, label: &str, property: &str) -> Result<bool> {
+    pub fn drop_node_property_index(&self, label: &str, property: &str) -> Result<bool> {
         // ONE hold for this whole operation (`rmp` #1033): a build moves between queues,
         // and two holds would let a reader see it on both or on neither.
         let mut guard = self.builds();
@@ -10409,11 +10402,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// # Errors
     /// - `Neo.ClientError.Schema.IndexDropFailed` (no `IF EXISTS`) when no index of that name exists;
     /// - a storage error if the committing transaction fails.
-    pub fn drop_node_property_index_by_name(
-        &mut self,
-        name: &str,
-        if_exists: bool,
-    ) -> Result<bool> {
+    pub fn drop_node_property_index_by_name(&self, name: &str, if_exists: bool) -> Result<bool> {
         // ONE hold for this whole operation (`rmp` #1033): a build moves between queues,
         // and two holds would let a reader see it on both or on neither.
         let mut guard = self.builds();
@@ -10714,9 +10703,11 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         D: Send + Sync + 'static,
         S: Send + Sync + 'static,
     {
-        let snapshot = self.active.get(&txn).map(|a| a.snapshot).ok_or_else(|| {
-            GraphusError::Transaction(format!("statement in inactive txn {}", txn.0))
-        })?;
+        let snapshot = self
+            .with_active(|a| a.get(&txn).map(|t| t.snapshot))
+            .ok_or_else(|| {
+                GraphusError::Transaction(format!("statement in inactive txn {}", txn.0))
+            })?;
         Ok(RecordStoreGraph::attach(
             self.store.clone(),
             txn,
@@ -10767,9 +10758,15 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// (both the off-thread reader path and the inline fallback), so the isolation is identical however
     /// the read is dispatched; explicit user transactions (`BEGIN … COMMIT`) and every write keep full
     /// Serializable SSI.
-    pub fn demote_read_to_snapshot(&mut self, txn: TxnId) {
-        if let Some(active) = self.active.get_mut(&txn) {
-            active.isolation = IsolationLevel::Snapshot;
+    pub fn demote_read_to_snapshot(&self, txn: TxnId) {
+        // The demotion is recorded under the hold and the SSI tracker told after it: the hold
+        // covers this table only, and `mark_snapshot` takes a different lock.
+        let demoted = self.with_active(|a| {
+            a.get_mut(&txn).map(|t| {
+                t.isolation = IsolationLevel::Snapshot;
+            })
+        });
+        if demoted.is_some() {
             self.ssi.borrow_mut().mark_snapshot(txn);
         }
     }
@@ -10781,9 +10778,11 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             graphus_core::sched::YieldSite::SnapshotReadTaskInputs,
             graphus_core::sched::ResourceId::txn(txn.0),
         );
-        let snapshot = self.active.get(&txn).map(|a| a.snapshot).ok_or_else(|| {
-            GraphusError::Transaction(format!("read dispatch for inactive txn {}", txn.0))
-        })?;
+        let snapshot = self
+            .with_active(|a| a.get(&txn).map(|t| t.snapshot))
+            .ok_or_else(|| {
+                GraphusError::Transaction(format!("read dispatch for inactive txn {}", txn.0))
+            })?;
         let store = self.store.borrow();
         Ok(ReadTaskInputs {
             view: store.read_view(),
@@ -10865,7 +10864,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         }
         // The reader's own snapshot decides whether a captured seek may be trusted at all (the rebuild
         // gate — `rmp` #755/#768, containing / closing `rmp` #765). An unknown txn captures nothing.
-        let Some(reader_ts) = self.active.get(&txn).map(|a| a.snapshot.ts) else {
+        let Some(reader_ts) = self.with_active(|a| a.get(&txn).map(|t| t.snapshot.ts)) else {
             return crate::read_source::IndexCandidateCapture::default();
         };
         // Resolve names → tokens through the live store, exactly as the inline seek does. A label or
@@ -11022,7 +11021,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             return capture;
         }
         // An unknown transaction cannot have a snapshot to be equivalent to; decline.
-        let Some(active) = self.active.get(&txn) else {
+        let Some(active) = self.with_active(|a| a.get(&txn).copied()) else {
             return capture;
         };
         // E3, keyed on `SsiTracker::is_snapshot` — the SAME predicate the inline seam uses
@@ -11086,7 +11085,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// on the engine thread from the single serial event stream, M1 reduces to in-order event
     /// processing (see the Slice 3b no-lost-edge proof). Calling it for a still-open `txn` simply folds
     /// the markers in; it does not commit or remove the transaction.
-    pub fn merge_read_buffer(&mut self, buffer: SsiReadBuffer) {
+    pub fn merge_read_buffer(&self, buffer: SsiReadBuffer) {
         self.ssi.borrow_mut().merge_read_buffer(buffer);
     }
 
@@ -11099,10 +11098,12 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// - [`GraphusError::Transaction`] (retriable serialization failure) if `txn` is chosen as the
     ///   SSI abort victim — it is rolled back and the caller should retry.
     /// - A storage error if the store commit fails.
-    pub fn commit(&mut self, txn: TxnId) -> Result<Timestamp> {
-        let isolation = self.active.get(&txn).map(|a| a.isolation).ok_or_else(|| {
-            GraphusError::Transaction(format!("commit of inactive txn {}", txn.0))
-        })?;
+    pub fn commit(&self, txn: TxnId) -> Result<Timestamp> {
+        let isolation = self
+            .with_active(|a| a.get(&txn).map(|t| t.isolation))
+            .ok_or_else(|| {
+                GraphusError::Transaction(format!("commit of inactive txn {}", txn.0))
+            })?;
 
         // 1) SSI validation (SERIALIZABLE only): abort a pivot on a dangerous structure (`04 §5.4`).
         if isolation.runs_ssi() {
@@ -11150,7 +11151,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // Drop this txn's derived-index undo log too (`rmp` #992): on commit its entries describe
         // committed writes and must stay, so only the bookkeeping is freed.
         self.index.borrow_mut().forget_txn_entries(txn);
-        self.active.remove(&txn);
+        self.with_active(|a| a.remove(&txn));
         Ok(commit_ts)
     }
 
@@ -11173,10 +11174,12 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ///   victim — it is rolled back and its client should retry. **An aborted pivot never joins a
     ///   batch** (it appended no `COMMIT` record), so the caller answers it the error immediately.
     /// - A storage error if the store PREPARE fails.
-    pub fn commit_prepare(&mut self, txn: TxnId) -> Result<(Timestamp, Option<Lsn>)> {
-        let isolation = self.active.get(&txn).map(|a| a.isolation).ok_or_else(|| {
-            GraphusError::Transaction(format!("commit of inactive txn {}", txn.0))
-        })?;
+    pub fn commit_prepare(&self, txn: TxnId) -> Result<(Timestamp, Option<Lsn>)> {
+        let isolation = self
+            .with_active(|a| a.get(&txn).map(|t| t.isolation))
+            .ok_or_else(|| {
+                GraphusError::Transaction(format!("commit of inactive txn {}", txn.0))
+            })?;
 
         // 1) SSI validation (SERIALIZABLE only): abort a pivot on a dangerous structure (`04 §5.4`) —
         //    identical to `commit`. An aborted pivot never reaches the WAL PREPARE below.
@@ -11218,7 +11221,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // And this txn's derived-index undo log (`rmp` #992): its entries describe writes that are now
         // committed, so they must stay. A no-op unless an index covered something it wrote.
         self.index.borrow_mut().forget_txn_entries(txn);
-        self.active.remove(&txn);
+        self.with_active(|a| a.remove(&txn));
         Ok((commit_ts, commit_lsn))
     }
 
@@ -11231,7 +11234,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// # Panics
     /// Panics (controlled abort) if the durability `fdatasync` fails (`04 §4.9`, fsyncgate) — the WHOLE
     /// batch fails together (none of its members are acked), which is correct.
-    pub fn harden_wal(&mut self) {
+    pub fn harden_wal(&self) {
         self.store.borrow_mut().harden_wal();
     }
 
@@ -11249,7 +11252,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ///
     /// # Panics
     /// Panics (fsyncgate, `04 §4.9`) if writing the records to the backing store fails.
-    pub fn begin_harden_wal(&mut self) -> graphus_wal::FsyncJob {
+    pub fn begin_harden_wal(&self) -> graphus_wal::FsyncJob {
         self.store.borrow_mut().begin_harden_wal()
     }
 
@@ -11258,7 +11261,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// [`begin_harden_wal`](Self::begin_harden_wal)) after that job's `fdatasync` has run. Monotonic
     /// (composes with an eviction's inline hardening during the overlap). Call **before** acking any
     /// committer whose record the job covered.
-    pub fn complete_harden_wal(&mut self, target_len: u64) {
+    pub fn complete_harden_wal(&self, target_len: u64) {
         self.store.borrow_mut().complete_harden_wal(target_len);
     }
 
@@ -11282,7 +11285,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ///
     /// # Errors
     /// Returns a storage error if flushing the dirty pages or syncing the device fails.
-    pub fn checkpoint_if_due(&mut self) -> Result<()> {
+    pub fn checkpoint_if_due(&self) -> Result<()> {
         self.store.borrow_mut().checkpoint_if_due()
     }
 
@@ -11312,7 +11315,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             graphus_core::sched::YieldSite::SnapshotOldestActive,
             graphus_core::sched::ResourceId::NONE,
         );
-        self.active.values().map(|a| a.snapshot.ts).min()
+        self.with_active(|a| a.values().map(|t| t.snapshot.ts).min())
     }
 
     /// The [`TxnId`]s of open transactions whose lifetime (`now_nanos − begin`) is **at least**
@@ -11354,12 +11357,16 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             return Vec::new();
         }
         let mut aged: Vec<TxnId> = self
-            .active
-            .iter()
-            .filter_map(|(id, a)| {
-                let begin = a.begin_nanos?;
-                (now_nanos.saturating_sub(begin) >= max_age_nanos).then_some(*id)
+            .with_active(|active| {
+                active
+                    .iter()
+                    .filter_map(|(id, a)| {
+                        let begin = a.begin_nanos?;
+                        (now_nanos.saturating_sub(begin) >= max_age_nanos).then_some(*id)
+                    })
+                    .collect::<Vec<_>>()
             })
+            .into_iter()
             .collect();
         aged.sort_unstable();
         aged
@@ -11397,7 +11404,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ///
     /// # Errors
     /// Propagates a storage error from the GC pass or its commit.
-    pub fn gc(&mut self) -> Result<GcPassReport> {
+    pub fn gc(&self) -> Result<GcPassReport> {
         self.gc_scoped(false)
     }
 
@@ -11405,7 +11412,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// [`RecordStore::gc`], so it advances the WAL reclaim floor (the incremental freeze sweep) without
     /// paying the `O(store)` reclamation sweeps. Used only by the mid-bulk-load maintenance cadence — see
     /// [`checkpoint_reader_safe_freeze_only`](Self::checkpoint_reader_safe_freeze_only).
-    fn gc_scoped(&mut self, freeze_only: bool) -> Result<GcPassReport> {
+    fn gc_scoped(&self, freeze_only: bool) -> Result<GcPassReport> {
         // ONE hold for this whole operation (`rmp` #1033): a build moves between queues,
         // and two holds would let a reader see it on both or on neither.
         let mut guard = self.builds();
@@ -11836,7 +11843,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// run concurrently with an off-thread reader (`rmp` #336) MUST use this, never bare
     /// [`checkpoint`](Self::checkpoint).
     pub fn checkpoint_reader_safe(
-        &mut self,
+        &self,
         reuse_barrier: Option<u64>,
         oldest_open_ticket: u64,
     ) -> Result<GcPassReport> {
@@ -11857,7 +11864,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// as [`checkpoint_reader_safe`](Self::checkpoint_reader_safe) (a no-op in practice, since a freeze-only
     /// pass frees no slots).
     pub fn checkpoint_reader_safe_freeze_only(
-        &mut self,
+        &self,
         reuse_barrier: Option<u64>,
         oldest_open_ticket: u64,
     ) -> Result<GcPassReport> {
@@ -11865,7 +11872,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     }
 
     fn checkpoint_reader_safe_scoped(
-        &mut self,
+        &self,
         reuse_barrier: Option<u64>,
         oldest_open_ticket: u64,
         freeze_only: bool,
@@ -11879,7 +11886,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         outcome
     }
 
-    pub fn checkpoint(&mut self) -> Result<GcPassReport> {
+    pub fn checkpoint(&self) -> Result<GcPassReport> {
         self.checkpoint_scoped(false)
     }
 
@@ -11887,7 +11894,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// maintenance path (`rmp` #590): a GC pass (full or freeze-only per `freeze_only`), then the sharp
     /// store checkpoint that reclaims the WAL prefix below the now-lowered floor, then the SSI-tracker
     /// prune.
-    fn checkpoint_scoped(&mut self, freeze_only: bool) -> Result<GcPassReport> {
+    fn checkpoint_scoped(&self, freeze_only: bool) -> Result<GcPassReport> {
         let report = self.gc_scoped(freeze_only)?;
         self.store.borrow_mut().checkpoint()?;
 
@@ -11938,8 +11945,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// # Errors
     /// Returns [`GraphusError::Transaction`] if `txn` is not open, or a storage error if the undo
     /// fails.
-    pub fn rollback(&mut self, txn: TxnId) -> Result<()> {
-        if !self.active.contains_key(&txn) {
+    pub fn rollback(&self, txn: TxnId) -> Result<()> {
+        if !self.with_active(|a| a.contains_key(&txn)) {
             return Err(GraphusError::Transaction(format!(
                 "rollback of inactive txn {}",
                 txn.0
@@ -11951,7 +11958,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// The number of currently open transactions (observability / tests).
     #[must_use]
     pub fn active_count(&self) -> usize {
-        self.active.len()
+        self.with_active(|a| a.len())
     }
 
     /// Whether the **store** still holds `txn` as an open, unresolved writer (`rmp` #955) — i.e. its
@@ -12048,6 +12055,24 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// Panics if the store is already borrowed (a live statement seam from
     /// [`statement`](Self::statement) is held, or `f` re-enters the coordinator) — the same misuse
     /// [`into_store`](Self::into_store) rejects.
+    /// Runs `f` with the coordinator's open-transaction table held (`rmp` #1033).
+    ///
+    /// A closure rather than a guard, deliberately: this table is touched by every statement, so a
+    /// guard escaping into a caller is a hold of unbounded length, and two of them on one thread are
+    /// the deadlock the index-build latch had to grow a tripwire to find. `f` returns a value; the
+    /// hold ends with the call.
+    ///
+    /// # Panics
+    /// Panics if the latch is poisoned: a holder panicked mid-update, so a transaction may be
+    /// half-registered — visible to one question about it and not to another.
+    fn with_active<R>(&self, f: impl FnOnce(&mut HashMap<TxnId, ActiveTxn>) -> R) -> R {
+        let mut guard = self
+            .active
+            .lock()
+            .expect("INVARIANT: a poisoned active-txn latch means a half-registered transaction");
+        f(&mut guard)
+    }
+
     /// Takes the builds latch and hands back the guard, for the callers a closure cannot serve
     /// (`rmp` #1033).
     ///
@@ -12133,7 +12158,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// # Panics
     /// Panics if the store is already borrowed (a live statement seam, or `f` re-enters the
     /// coordinator).
-    pub fn raw_txn<R>(&mut self, f: impl FnOnce(TxnId, &RecordStore<D, S>) -> R) -> R {
+    pub fn raw_txn<R>(&self, f: impl FnOnce(TxnId, &RecordStore<D, S>) -> R) -> R {
         let txn = self.mint_txn();
         f(txn, self.store.borrow_mut())
     }
@@ -12183,13 +12208,15 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// successful undo. Unlike the bitmap these trees are a candidate SUPERSET, so a leftover entry is
     /// merely imprecise while removing the wrong one would lose a committed row; that is why only
     /// *created* entries are logged and why a build's entries are never touched.
-    fn abort(&mut self, txn: TxnId) -> Result<()> {
+    fn abort(&self, txn: TxnId) -> Result<()> {
         /// Drop guard that frees the pure in-memory transaction state. Runs on normal return **and** on
         /// unwind, so a panicking store undo can never leak the SSI markers or the `active` entry.
         struct Cleanup<'a> {
             ssi: &'a SharedCell<SsiTracker>,
             index: &'a SharedCell<IndexSet>,
-            active: &'a mut HashMap<TxnId, ActiveTxn>,
+            /// The table itself, not a borrow of its contents: the guard runs in `Drop`, where a
+            /// hold taken earlier could not be released in time (`rmp` #1033).
+            active: &'a std::sync::Mutex<HashMap<TxnId, ActiveTxn>>,
             txn: TxnId,
         }
         impl Drop for Cleanup<'_> {
@@ -12209,7 +12236,10 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 // not poison and the fast path is preserved. A no-op if `txn` was not a mutator, so the
                 // common (non-full-text/spatial) rollback leaves the fast path untouched.
                 self.index.borrow_mut().rollback_ft_spatial_marker(self.txn);
-                self.active.remove(&self.txn);
+                self.active
+                    .lock()
+                    .expect("INVARIANT: a poisoned active-txn latch means a half-registered transaction")
+                    .remove(&self.txn);
             }
         }
 
@@ -12226,7 +12256,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let cleanup = Cleanup {
             ssi: &self.ssi,
             index: &self.index,
-            active: &mut self.active,
+            active: &self.active,
             txn,
         };
         // The durable undo runs while the guard is armed. Its borrow of `self.store` is a *different*
@@ -12538,7 +12568,7 @@ mod abort_failure_tests {
     #[test]
     fn abort_failure_does_not_leak_active_txn_or_watermark() {
         let fail_sync = Arc::new(AtomicBool::new(false));
-        let mut coord = fresh_coord(Arc::clone(&fail_sync));
+        let coord = fresh_coord(Arc::clone(&fail_sync));
 
         let baseline_active = coord.active_count();
         let baseline_watermark = coord.gc_watermark();
@@ -12678,7 +12708,7 @@ mod max_transaction_age_tests {
     /// the accumulated garbage. The reaped reader's next use is a clean retriable error.
     #[test]
     fn aged_reader_is_reaped_freeing_the_gc_watermark() {
-        let mut coord = fresh_coord();
+        let coord = fresh_coord();
         // The configured cap (mirrors the server's `max_transaction_age_ms`), in monotonic nanoseconds.
         let max_age_nanos = 60 * 60 * 1000 * MS; // 1 hour
 
@@ -12789,7 +12819,7 @@ mod max_transaction_age_tests {
     /// age-untracked transaction (opened via `begin`) is never reported, and the boundary is inclusive.
     #[test]
     fn aged_transactions_detection_rules() {
-        let mut coord = fresh_coord();
+        let coord = fresh_coord();
 
         // Untracked (opened via the clock-agnostic `begin`): never reported, even far past any cap.
         let untracked = coord.begin(IsolationLevel::Serializable);
@@ -12891,7 +12921,7 @@ mod ssi_prune_tests {
     /// passes after (`after == 0`).
     #[test]
     fn checkpoint_prunes_accumulated_committed_ssi_records() {
-        let mut coord = fresh_coord();
+        let coord = fresh_coord();
         assert_eq!(
             coord.ssi_tracked_len(),
             0,
@@ -12952,7 +12982,7 @@ mod ssi_prune_tests {
     /// rw-antidependency and so must not be dropped.
     #[test]
     fn checkpoint_retains_records_a_live_reader_still_needs() {
-        let mut coord = fresh_coord();
+        let coord = fresh_coord();
 
         // Two writers that commit BEFORE the long reader opens its snapshot.
         let pre1 = coord.begin_serializable();
@@ -13632,7 +13662,7 @@ mod ft_spatial_statement_scope_803 {
 
     #[test]
     fn an_unrelated_aborting_statement_cannot_inherit_leaked_dirty_flags() {
-        let mut coord = fresh_coord();
+        let coord = fresh_coord();
         let seed = coord.begin_serializable();
         run_stmt(&coord, seed, "CREATE (:Product {id: 1, name: 'Widget 1'})");
         coord.commit(seed).expect("seed commits");
@@ -13742,7 +13772,7 @@ mod index_entry_rollback_wiring_992 {
     /// production caller, which is exactly the state the four `remove` APIs were in before this task.
     #[test]
     fn rollback_removes_the_index_entries_the_transaction_created() {
-        let mut coord = fresh_coord();
+        let coord = fresh_coord();
         let seed = coord.begin_serializable();
         run_stmt(&coord, seed, "CREATE (:Person {age: 30})");
         coord.commit(seed).expect("seed commits");
@@ -13793,7 +13823,7 @@ mod index_entry_rollback_wiring_992 {
     /// retained exactly as before. This pins the mechanism that keeps that test meaningful.
     #[test]
     fn an_index_ddl_between_the_write_and_the_rollback_retains_the_entry() {
-        let mut coord = fresh_coord();
+        let coord = fresh_coord();
         let seed = coord.begin_serializable();
         run_stmt(&coord, seed, "CREATE (:Person {age: 30})");
         coord.commit(seed).expect("seed commits");
@@ -13831,7 +13861,7 @@ mod index_entry_rollback_wiring_992 {
     /// nothing, so a later unrelated rollback cannot reach a committed transaction's entries.
     #[test]
     fn commit_keeps_the_index_entries_and_frees_the_log() {
-        let mut coord = fresh_coord();
+        let coord = fresh_coord();
         let seed = coord.begin_serializable();
         run_stmt(&coord, seed, "CREATE (:Person {age: 30})");
         coord.commit(seed).expect("seed commits");
@@ -14418,5 +14448,26 @@ mod index_gc_collection_992 {
             "entries were removed although a commit landed between the witness and the removal: the \
              clock was read too early to see it (`rmp` #1022)"
         );
+    }
+}
+
+#[cfg(test)]
+mod coordinator_shareable_1033 {
+    /// **The barrier layer 7b removes, stated as a type bound** (`rmp` #1033).
+    ///
+    /// Until this layer the coordinator's every mutator took `&mut self`, so `Arc<TxnCoordinator>`
+    /// could be *held* by several threads but used by none of them concurrently — the outer Mutex was
+    /// what made it usable at all, and it serialised whole statements. With the store, the catalog, the
+    /// index-build queues and the open-transaction table each behind their own latch, and the counters
+    /// atomic, the coordinator is shareable on its own terms.
+    ///
+    /// A compile-time assertion: it fails to BUILD, not to run, if a `&mut self` mutator or a non-`Sync`
+    /// field ever comes back.
+    #[test]
+    fn the_coordinator_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<
+            super::TxnCoordinator<graphus_io::MemBlockDevice, graphus_wal::MemLogSink>,
+        >();
     }
 }

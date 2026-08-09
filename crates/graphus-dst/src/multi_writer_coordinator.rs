@@ -144,7 +144,7 @@ pub fn fresh_shared_coordinator() -> SharedCoord {
     let wal = WalManager::create(MemLogSink::new()).expect("create wal");
     let store: RecordStore<MemBlockDevice, MemLogSink> =
         RecordStore::create(device, wal, 512, 1).expect("create store");
-    let mut coord = TxnCoordinator::new(store);
+    let coord = TxnCoordinator::new(store);
 
     // Intern the tokens up front, in their own committed transaction, so a writer thread's failure
     // can never be "the label did not exist yet" — which would make a lost write look like a refusal.
@@ -166,7 +166,7 @@ pub fn fresh_shared_coordinator() -> SharedCoord {
 fn write_one(coord: &SharedCoord, author: i64) -> Result<u64, String> {
     use graphus_cypher::graph_access::GraphAccess;
 
-    let mut guard = coord
+    let guard = coord
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let txn = guard.begin_serializable();
@@ -212,7 +212,7 @@ fn write_one(coord: &SharedCoord, author: i64) -> Result<u64, String> {
 fn read_back(coord: &SharedCoord, authors: usize) -> (usize, Vec<usize>) {
     use graphus_cypher::graph_access::GraphAccess;
 
-    let mut guard = coord
+    let guard = coord
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let txn = guard.begin_serializable();
@@ -356,7 +356,7 @@ pub fn run_contended_handoff() -> HandoffReport {
     };
 
     {
-        let mut guard = coord
+        let guard = coord
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         a_holds_tx.send(()).expect("B is still listening");

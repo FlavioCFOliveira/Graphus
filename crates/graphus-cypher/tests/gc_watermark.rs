@@ -79,7 +79,7 @@ fn snapshot_ts(coord: &Coord) -> Timestamp {
 /// timestamp via `next_commit_ts`, so begin snapshots are captured live rather than hard-coded).
 #[test]
 fn oldest_active_snapshot_is_the_min_over_open_readers() {
-    let mut coord = fresh_coord();
+    let coord = fresh_coord();
 
     assert_eq!(
         coord.oldest_active_snapshot(),
@@ -145,7 +145,7 @@ fn oldest_active_snapshot_is_the_min_over_open_readers() {
 /// production-seam analogue of the storage-level teeth in `graphus-dst/tests/gc_watermark_teeth.rs`.
 #[test]
 fn coordinator_gc_preserves_an_open_readers_version() {
-    let mut coord = fresh_coord();
+    let coord = fresh_coord();
 
     // Seed the register at v = 1.
     let t1 = coord.begin_serializable();

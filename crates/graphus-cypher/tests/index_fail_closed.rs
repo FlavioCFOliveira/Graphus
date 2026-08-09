@@ -983,7 +983,7 @@ fn a_wipe_mid_build_restarts_it_instead_of_publishing_a_holed_index() {
         let fault = device.handle();
         let faulty: FaultyStore =
             RecordStore::open(device, wal, FAULTED_POOL_PAGES).expect("open store");
-        let mut coord: FaultyCoord = TxnCoordinator::new(faulty);
+        let coord: FaultyCoord = TxnCoordinator::new(faulty);
         coord
             .begin_online_node_property_index("Article", "slug")
             .expect("declare");
@@ -1149,7 +1149,7 @@ fn a_constraint_whose_validation_cannot_read_a_node_is_refused() {
     let fault = device.handle();
     let faulty: FaultyStore =
         RecordStore::open(device, wal, FAULTED_POOL_PAGES).expect("open store");
-    let mut coord: FaultyCoord = TxnCoordinator::new(faulty);
+    let coord: FaultyCoord = TxnCoordinator::new(faulty);
 
     fault.arm();
     let created = coord.create_constraint_ddl(
@@ -1706,7 +1706,7 @@ fn the_off_thread_label_filter_fails_closed_on_a_read_fault() {
     // A tiny pool: after the open-time rebuild only a handful of node pages remain cached, so the low ids
     // (read first below) are cold and their record reads reach the device.
     let faulty: FaultyStore = RecordStore::open(device, wal, 2).expect("open store");
-    let mut coord: FaultyCoord = TxnCoordinator::new(faulty);
+    let coord: FaultyCoord = TxnCoordinator::new(faulty);
 
     let txn = coord.begin_serializable();
     let inputs = coord.read_task_inputs(txn).expect("read inputs");
@@ -1805,7 +1805,7 @@ fn a_columnar_aggregation_fails_closed_on_a_read_fault() {
         let fault = device.handle();
         let faulty: FaultyStore =
             RecordStore::open(device, wal, FAULTED_POOL_PAGES).expect("open store");
-        let mut coord: FaultyCoord = TxnCoordinator::new(faulty);
+        let coord: FaultyCoord = TxnCoordinator::new(faulty);
         // The columnar cache is in-memory only (`rmp` #329, never recovered), so it MUST be declared on
         // THIS reopened coordinator — declaring it before the restart would be gone after reopen and the
         // aggregation would silently use the Volcano path, making the test vacuous. Declared here while
@@ -1833,7 +1833,7 @@ fn a_columnar_aggregation_fails_closed_on_a_read_fault() {
 
     let mut saw_a_fault = false;
     for k in 0..reads {
-        let (mut coord, fault) = open();
+        let (coord, fault) = open();
         fault.fail_once_at_read(k);
         let plan = compile(&coord, AGG);
         let txn = coord.begin_serializable();
@@ -2038,7 +2038,7 @@ fn a_degraded_rel_range_index_declines_the_seek_and_still_returns_every_row() {
     let faulty: FaultyStore =
         RecordStore::open(device, wal, FAULTED_POOL_PAGES).expect("open store");
     fault.arm();
-    let mut coord: FaultyCoord = TxnCoordinator::new(faulty);
+    let coord: FaultyCoord = TxnCoordinator::new(faulty);
     fault.heal();
 
     assert!(
@@ -2168,7 +2168,7 @@ fn a_poisoned_build_is_distinguishable_from_a_healthy_build_in_progress() {
         let (device, wal) = restart_on_faulty_device(&mut store);
         let faulty: FaultyStore =
             RecordStore::open(device, wal, POISON_POOL_PAGES).expect("open store");
-        let mut coord: FaultyCoord = TxnCoordinator::new(faulty);
+        let coord: FaultyCoord = TxnCoordinator::new(faulty);
         coord
             .begin_online_node_property_index("Article", "slug")
             .expect("declare the build");
@@ -2207,7 +2207,7 @@ fn a_poisoned_build_is_distinguishable_from_a_healthy_build_in_progress() {
         let fault = device.handle();
         let faulty: FaultyStore =
             RecordStore::open(device, wal, POISON_POOL_PAGES).expect("open store");
-        let mut coord: FaultyCoord = TxnCoordinator::new(faulty);
+        let coord: FaultyCoord = TxnCoordinator::new(faulty);
 
         // Kill a page for good, then declare the build. A node-slot page fails the declare's own
         // snapshot scan (no build enqueued — not the scenario); a property page lets the build enqueue
@@ -2326,7 +2326,7 @@ fn the_dst_drain_loop_does_not_overflow_on_a_build_parked_at_the_degraded_gate()
 
     // Fault every read across the open-time `rebuild_index`: it fails closed, leaving the engine DEGRADED.
     fault.arm();
-    let mut coord: FaultyCoord = TxnCoordinator::new(faulty);
+    let coord: FaultyCoord = TxnCoordinator::new(faulty);
     assert!(
         coord.indexes_degraded(),
         "the open-time rebuild must have failed closed"
@@ -2429,7 +2429,7 @@ fn dropping_an_index_with_a_poisoned_build_does_not_resurrect_it() {
         let fault = device.handle();
         let faulty: FaultyStore =
             RecordStore::open(device, wal, POISON_POOL_PAGES).expect("open store");
-        let mut coord: FaultyCoord = TxnCoordinator::new(faulty);
+        let coord: FaultyCoord = TxnCoordinator::new(faulty);
 
         // Poison a build by killing a property page for good.
         fault.kill_page(dead as usize);

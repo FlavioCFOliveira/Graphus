@@ -393,7 +393,7 @@ fn rel_uniqueness_never_commits_a_duplicate_under_randomized_interleavings() {
     let mut total_committed = 0usize;
 
     for seed in 1..=12u64 {
-        let mut coord = fresh_coord();
+        let coord = fresh_coord();
         let t = coord.begin_serializable();
         let (_r, ok) = run_stmt(&coord, t, "CREATE (:Src), (:Dst)");
         assert!(ok, "seed endpoints");

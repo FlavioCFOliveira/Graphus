@@ -336,7 +336,7 @@ fn create_existence_over_missing_data_fails() {
 
 #[test]
 fn list_constraints_reports_declared_constraints() {
-    let mut coord = fresh_coord();
+    let coord = fresh_coord();
     coord
         .create_constraint("uniq_email", "Person", "email", ConstraintKind::Unique)
         .expect("create unique");

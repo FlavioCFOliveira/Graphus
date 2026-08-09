@@ -100,7 +100,7 @@ fn resolves(coord: &Coord, node: u64, key: u32, snapshot: Snapshot) -> Option<i6
 
 #[test]
 fn reader_pins_reclaim_floor_until_it_rolls_back() {
-    let mut coord = new_coord();
+    let coord = new_coord();
 
     // --- t1: create node A with A.p = V1, commit at ts 1 (the committed base the reader observes). ---
     let t1 = coord.begin(IsolationLevel::Serializable);

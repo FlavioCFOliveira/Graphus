@@ -543,7 +543,7 @@ fn create_point_index_if_not_exists_is_idempotent() {
 /// false`); the same drop **without** `IF EXISTS` is a `IndexDropFailed` error (`rmp` #661).
 #[test]
 fn drop_point_index_if_exists_no_op_when_missing() {
-    let mut coord = fresh_coord();
+    let coord = fresh_coord();
     assert!(
         !coord
             .drop_point_index("ghost", true)

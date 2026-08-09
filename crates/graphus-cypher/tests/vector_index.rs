@@ -400,7 +400,7 @@ fn drop_vector_index_removes_it_and_ddl_is_idempotent() {
 
 #[test]
 fn zero_dimension_is_rejected() {
-    let mut coord = fresh_coord();
+    let coord = fresh_coord();
     let err = coord
         .begin_online_vector_index_named(
             Some("bad_dim"),

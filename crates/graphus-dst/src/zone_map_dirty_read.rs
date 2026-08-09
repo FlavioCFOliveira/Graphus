@@ -235,7 +235,7 @@ fn seeded_coordinator() -> Coord {
 /// after the writer's fate is sealed.
 #[must_use]
 pub fn run_zone_map_dirty_read(ending: WriterEnding) -> ZoneDirtyReadReport {
-    let mut coord = seeded_coordinator();
+    let coord = seeded_coordinator();
     coord
         .declare_zone_map(LABEL, PROP)
         .expect("declare the zone map");
@@ -291,7 +291,7 @@ pub fn run_zone_map_dirty_read(ending: WriterEnding) -> ZoneDirtyReadReport {
 /// alone has narrowed the zone below the committed maximum, and nothing repairs it.
 #[must_use]
 pub fn run_zone_rebuild_across_an_open_overwrite(ending: WriterEnding) -> ZoneRebuildReport {
-    let mut coord = seeded_coordinator();
+    let coord = seeded_coordinator();
 
     // An open writer moves the column's maximum out of its zone.
     let writer = coord.begin_serializable();
