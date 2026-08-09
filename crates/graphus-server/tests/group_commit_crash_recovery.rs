@@ -494,7 +494,7 @@ fn run_one_crash_recovery(iter: usize, w: usize, m: i64, sentinel: i64) -> i64 {
 
     // ---- Recover from the durable prefix and assert the invariants. ----
     let mut store = recover_store(&wal_bytes, &device_pages);
-    let report = check_store(&mut store, &[]).expect("consistency check runs");
+    let report = check_store(&store, &[]).expect("consistency check runs");
     assert!(
         report.is_consistent(),
         "iter {iter}: recovered store is structurally inconsistent after the crash: {:?}",

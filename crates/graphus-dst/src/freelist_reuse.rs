@@ -388,12 +388,12 @@ fn drive_scenario(seed: u64) -> ScenarioOutcome {
 /// recovered graph against the reference model.
 #[must_use]
 pub fn run_freelist_reuse_after_rollback(seed: u64) -> FreelistReuseReport {
-    let mut outcome = drive_scenario(seed);
+    let outcome = drive_scenario(seed);
     // Write the committed pages home before the checker's page-checksum pass: a committed-but-unflushed
     // page carries a stale checksum field until write-back, so verifying it warm would false-positive
     // (the cold-open contract, `#426`; the same reason the harness flushes after its post-recovery GC).
     outcome.store.flush().expect("flush before verify");
-    let result = checker::verify(&mut outcome.store, &outcome.model);
+    let result = checker::verify(&outcome.store, &outcome.model);
     FreelistReuseReport {
         seed,
         target: outcome.target,
@@ -424,13 +424,13 @@ pub fn run_freelist_reuse_crash(seed: u64) -> FreelistReuseCrashReport {
     let store = outcome.store;
     // Harden the committed tail so the crash WAL carries A's and C's committed records.
     store.with_wal(WalManager::flush);
-    let (mut store, _losers) = if steal {
+    let (store, _losers) = if steal {
         crash_steal(store)
     } else {
         crash_no_force(store)
     };
 
-    let result = checker::verify(&mut store, &model);
+    let result = checker::verify(&store, &model);
     FreelistReuseCrashReport {
         seed,
         target,

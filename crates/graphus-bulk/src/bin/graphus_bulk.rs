@@ -378,18 +378,17 @@ fn cmd_dump(args: Vec<String>) -> Result<(), String> {
         auto_pool_pages_for_store(store_bytes, mem)
     })?;
 
-    let mut store = open_store(&db, pool_pages).map_err(|e| e.to_string())?;
+    let store = open_store(&db, pool_pages).map_err(|e| e.to_string())?;
 
     // Dump each entity kind to an in-memory CSV buffer (the canonical serialisation), then write it
     // out in the requested format. The CSV path writes the buffer verbatim; the gcol path transcodes
     // it through the columnar codecs.
     let mut node_csv = Vec::new();
-    dump_nodes(&mut store, &mut node_csv).map_err(|e| format!("dumping nodes: {e}"))?;
+    dump_nodes(&store, &mut node_csv).map_err(|e| format!("dumping nodes: {e}"))?;
     write_dump(&nodes_out, &node_csv, format)?;
 
     let mut rel_csv = Vec::new();
-    dump_relationships(&mut store, &mut rel_csv)
-        .map_err(|e| format!("dumping relationships: {e}"))?;
+    dump_relationships(&store, &mut rel_csv).map_err(|e| format!("dumping relationships: {e}"))?;
     write_dump(&rels_out, &rel_csv, format)?;
 
     println!(

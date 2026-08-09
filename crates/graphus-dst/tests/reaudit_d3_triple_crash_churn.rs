@@ -288,11 +288,11 @@ fn run_triple_crash(seed: u64) -> TripleCrashReport {
     let after_r2 = observe(&store2, shared);
 
     // --- Crash #3: replay the prefix R2 left (base + R1 CLRs + R2 ENDs). ---
-    let mut store3 = crash_no_force(store2);
+    let store3 = crash_no_force(store2);
 
     let result = (|| {
         // Full integrity bundle after the THIRD recovery.
-        checker::verify(&mut store3, &model)?;
+        checker::verify(&store3, &model)?;
         let a = after_r1?;
         let b = after_r2?;
         let c = observe(&store3, shared)?;

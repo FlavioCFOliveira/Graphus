@@ -41,7 +41,7 @@ fn store_grows_far_past_the_one_page_catalog_cap_and_recovers() {
 
     let device = MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new()).expect("create wal");
-    let mut store = RecordStore::create(device, wal, 256, 1).expect("create store");
+    let store = RecordStore::create(device, wal, 256, 1).expect("create store");
 
     let mut next_txn = 1u64;
     let mut created = 0u64;
@@ -72,7 +72,7 @@ fn store_grows_far_past_the_one_page_catalog_cap_and_recovers() {
 
     // Every node is present and the catalog is internally consistent before the crash.
     assert_eq!(store.scan_node_ids().expect("scan").len() as u64, NODES);
-    verify_on_open(&mut store, &[]).expect("store consistent before crash");
+    verify_on_open(&store, &[]).expect("store consistent before crash");
 
     // The highest-id node lives on one of the last device pages: reading it back proves the
     // node store's device-page map (the part that overflowed) is intact.
@@ -92,7 +92,7 @@ fn store_grows_far_past_the_one_page_catalog_cap_and_recovers() {
     );
 
     // --- crash + ARIES recovery, then reopen ---
-    let mut recovered = recover_no_force(&store);
+    let recovered = recover_no_force(&store);
 
     // The catalog round-trips: identical page set (continuation pages included), every node back,
     // and a clean consistency check on the recovered image.
@@ -109,7 +109,7 @@ fn store_grows_far_past_the_one_page_catalog_cap_and_recovers() {
         NODES,
         "every committed node must survive recovery"
     );
-    verify_on_open(&mut recovered, &[]).expect("recovered store consistent");
+    verify_on_open(&recovered, &[]).expect("recovered store consistent");
 
     let first = recovered.node(1).expect("read first node after recovery");
     let last = recovered

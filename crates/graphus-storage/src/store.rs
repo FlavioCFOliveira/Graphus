@@ -423,7 +423,7 @@ impl StorePages for [FixedStore; STORE_COUNT] {
 ///
 /// This is the hottest shared scalar on the write path: every begin, every command boundary, every
 /// version stamp, every free and every commit touches it. Layer 5a's job is to let the methods that
-/// touch *only* this table take `&self`, so the exclusive `&mut RecordStore` stops being the thing
+/// touch *only* this table take `&self`, so the exclusive `&RecordStore` stops being the thing
 /// that serialises them — and the compiler, not a comment, is what says a method qualified.
 ///
 /// One `Mutex` around the whole map would have achieved the signature change and none of the point:
@@ -11542,7 +11542,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// # Errors
     /// Returns a storage error if a page read, a DWB stage/sync, or the home flush fails. A DWB
     /// error aborts before any home write, preserving the protocol's ordering.
-    pub fn flush_protected<W: BlockDevice>(&mut self, dwb: &mut crate::dwb::Dwb<W>) -> Result<()> {
+    pub fn flush_protected<W: BlockDevice>(&self, dwb: &mut crate::dwb::Dwb<W>) -> Result<()> {
         let pages = self.mapped_pages();
         let mut images: Vec<(PageId, Box<graphus_io::Page>)> = Vec::with_capacity(pages.len());
         for p in &pages {
@@ -12690,7 +12690,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// production build never compiles this seam — the device stays encapsulated and the cost is
     /// zero (the method does not exist on the production path).
     #[cfg(feature = "dst")]
-    pub fn with_device_mut<R>(&mut self, f: impl FnOnce(&mut D) -> R) -> R {
+    pub fn with_device_mut<R>(&self, f: impl FnOnce(&mut D) -> R) -> R {
         self.pool.with_device_mut(f)
     }
 
@@ -12778,7 +12778,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
 
     /// Reads the `strings.store` overflow-heap block at physical id `id` (`rmp` task #43). Used by
     /// the consistency checker to scan and validate overflow chains.
-    pub(crate) fn checker_block(&mut self, id: u64) -> Result<HeapBlock> {
+    pub(crate) fn checker_block(&self, id: u64) -> Result<HeapBlock> {
         self.read_block(id)
     }
 
@@ -13209,7 +13209,7 @@ mod tests {
         // so the home-write side touches a page in the second batch.
         let pool_capacity = DWB_MAX_BATCH + 256;
         let wal = WalManager::create(MemLogSink::new()).expect("create wal");
-        let mut store: RecordStore<RecordingDevice, MemLogSink> =
+        let store: RecordStore<RecordingDevice, MemLogSink> =
             RecordStore::create(home_dev, wal, pool_capacity, 1).expect("create store");
 
         // Allocate more node-store pages than one DWB batch can hold, so the image set spans >= 2
@@ -13305,7 +13305,7 @@ mod tests {
         let device = MemBlockDevice::new(0);
         let wal = WalManager::create(MemLogSink::new()).expect("create wal");
         let pool_capacity = DWB_MAX_BATCH + 256;
-        let mut store: Store = RecordStore::create(device, wal, pool_capacity, 1).expect("create");
+        let store: Store = RecordStore::create(device, wal, pool_capacity, 1).expect("create");
 
         let txn = TxnId(1);
         store.begin(txn);
@@ -13877,7 +13877,7 @@ mod tests {
     /// interleaving the guard elides.
     #[test]
     fn tombstone_xmax_undo_is_non_lifo_safe_301() {
-        let mut s = fresh();
+        let s = fresh();
 
         // A committed node H, live (xmax == 0).
         let setup = TxnId(1);
@@ -13936,7 +13936,7 @@ mod tests {
         s.begin(TxnId(4));
         s.gc(TxnId(4), watermark).unwrap();
         s.commit(TxnId(4)).unwrap();
-        let report = crate::check::check_store(&mut s, &[]).unwrap();
+        let report = crate::check::check_store(&s, &[]).unwrap();
         assert!(
             report.is_consistent(),
             "store consistent after #301 non-LIFO abort: {:?}",
@@ -13957,7 +13957,7 @@ mod tests {
     /// first) is what makes it hold.
     #[test]
     fn a_single_txn_abort_of_a_removal_restores_the_exact_value_967() {
-        let mut s = fresh();
+        let s = fresh();
         let key = s.intern_token(Namespace::PropKey, "v").unwrap();
         let setup = TxnId(1);
         s.begin(setup);
@@ -13991,7 +13991,7 @@ mod tests {
             vec![(v0, key, Value::Integer(1))],
             "the property is readable again after the abort, with nothing left on the chain",
         );
-        let report = crate::check::check_store(&mut s, &[]).unwrap();
+        let report = crate::check::check_store(&s, &[]).unwrap();
         assert!(
             report.is_consistent(),
             "store consistent after the aborted removal: {:?}",
@@ -14100,7 +14100,7 @@ mod tests {
             "the reclaimed slot P is reused by the next allocation"
         );
         s.commit(t2).unwrap();
-        let report = crate::check::check_store(&mut s, &[]).unwrap();
+        let report = crate::check::check_store(&s, &[]).unwrap();
         assert!(
             report.is_consistent(),
             "store consistent after #581 reclaim + reuse: {:?}",
@@ -14158,7 +14158,7 @@ mod tests {
             vec![p],
             "rmp #581: the holder's own pop is reclaimed once it aborts"
         );
-        let report = crate::check::check_store(&mut s, &[]).unwrap();
+        let report = crate::check::check_store(&s, &[]).unwrap();
         assert!(
             report.is_consistent(),
             "store consistent after the refusal + abort: {:?}",
@@ -14171,7 +14171,7 @@ mod tests {
         let again = s.add_node_property(t2, h, other, 1, 0x30).unwrap();
         assert_eq!(again, p, "the reclaimed slot is handed straight back out");
         s.commit(t2).unwrap();
-        let report = crate::check::check_store(&mut s, &[]).unwrap();
+        let report = crate::check::check_store(&s, &[]).unwrap();
         assert!(
             report.is_consistent(),
             "store consistent after the retry succeeds: {:?}",
@@ -14289,7 +14289,7 @@ mod tests {
             "rmp #970: the abort PARKS the unlinked slot rather than recycling it — the in-memory \
              latest-state indexes still hold a document keyed on that physical id"
         );
-        let report = crate::check::check_store(&mut s, &[]).unwrap();
+        let report = crate::check::check_store(&s, &[]).unwrap();
         assert!(
             report.is_consistent(),
             "store consistent right after the abort, with no GC pass: {:?}",
@@ -14311,7 +14311,7 @@ mod tests {
         let (fresh_rel, _) = s.create_rel(t2, ty, a, b).unwrap();
         assert_eq!(fresh_rel, r, "and it is handed back out");
         s.commit(t2).unwrap();
-        let report = crate::check::check_store(&mut s, &[]).unwrap();
+        let report = crate::check::check_store(&s, &[]).unwrap();
         assert!(
             report.is_consistent(),
             "store consistent after the slot is reused: {:?}",
@@ -14338,7 +14338,7 @@ mod tests {
             s.property(p).unwrap().mvcc.in_use(),
             "the committed reused slot holds a live record"
         );
-        let report = crate::check::check_store(&mut s, &[]).unwrap();
+        let report = crate::check::check_store(&s, &[]).unwrap();
         assert!(report.is_consistent(), "{:?}", report.violations);
     }
 
@@ -14580,7 +14580,7 @@ mod tests {
             before,
             "the forced full GC changed the store — the incremental GC was not equivalent"
         );
-        let report = crate::check::check_store(&mut s, &[]).unwrap();
+        let report = crate::check::check_store(&s, &[]).unwrap();
         assert!(
             report.is_consistent(),
             "store consistent after #522 equivalence check: {:?}",
@@ -15579,7 +15579,7 @@ mod tests {
     /// is a hard, timing-free regression guard (RED before the fix — `next_prop` reads back `0`).
     #[test]
     fn gc_property_chain_preserves_reclaimed_tombstone_next_prop_811() {
-        let mut s = fresh();
+        let s = fresh();
         let ka = s.intern_token(Namespace::PropKey, "a").unwrap();
         let kb = s.intern_token(Namespace::PropKey, "b").unwrap();
 
@@ -15647,7 +15647,7 @@ mod tests {
 
         // No corruption and no leak: the checker stays green, and the owner's LIVE chain is bridged to
         // exactly the live property A (B is unlinked and reclaimed).
-        let report = crate::check::check_store(&mut s, &[]).unwrap();
+        let report = crate::check::check_store(&s, &[]).unwrap();
         assert!(
             report.is_consistent(),
             "store consistent after the property-chain GC: {:?}",

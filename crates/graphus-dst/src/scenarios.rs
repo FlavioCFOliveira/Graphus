@@ -1262,10 +1262,10 @@ fn open_restored_and_count(
     let dev = graphus_io::FileBlockDevice::open(device_path)
         .map_err(|e| format!("W4: reopening restored device: {e}"))?;
     let wal = WalManager::create(MemLogSink::new()).map_err(|e| format!("W4: fresh WAL: {e}"))?;
-    let mut store =
+    let store =
         RecordStore::open(dev, wal, 64).map_err(|e| format!("W4: opening restored store: {e}"))?;
     // The restored device must pass the full consistency pass (committed, internally consistent).
-    verify_on_open(&mut store, &[]).map_err(|e| format!("W4: restored store inconsistent: {e}"))?;
+    verify_on_open(&store, &[]).map_err(|e| format!("W4: restored store inconsistent: {e}"))?;
 
     let mut eng = LocalEngine::new(
         graphus_cypher::TxnCoordinator::new(store),

@@ -155,13 +155,13 @@ fn run_pipeline_recovery(seed: u64) -> PipelineRecoveryReport {
     // Harden the tail so any in-flight loser's records are in the crash WAL (recovery redoes+undoes).
     store.with_wal(WalManager::flush);
 
-    let (mut store, recovery_losers) = if steal {
+    let (store, recovery_losers) = if steal {
         crash_steal(store)
     } else {
         crash_no_force(store)
     };
 
-    let result = checker::verify(&mut store, &model);
+    let result = checker::verify(&store, &model);
 
     PipelineRecoveryReport {
         seed,

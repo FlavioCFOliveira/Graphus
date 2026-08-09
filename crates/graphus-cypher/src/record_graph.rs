@@ -73,7 +73,7 @@
 
 use std::cell::RefCell;
 
-use crate::shared_cell::SharedCell;
+use crate::shared_cell::{SharedCell, SharedRef};
 use graphus_core::error::GraphusError;
 use graphus_core::{CommandId, Timestamp, TxnId, Value};
 use graphus_index::histogram::PropertyHistogram;
@@ -297,7 +297,7 @@ pub struct RecordStoreGraph<D: BlockDevice, S: LogSink> {
     /// `Rc<RefCell<…>>` until `rmp` #1010 — see [`TxnCoordinator`](crate::coordinator::TxnCoordinator)'s
     /// own `store` field and [`crate::shared_cell`] for why the wrapper is a named type rather than a
     /// bare `Arc<Mutex<…>>`.
-    store: SharedCell<RecordStore<D, S>>,
+    store: SharedRef<RecordStore<D, S>>,
     /// The single transaction this query runs in.
     txn: TxnId,
     /// This query's MVCC read snapshot (`04 §5.3`, `rmp` task #45): every read is filtered through
@@ -415,7 +415,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // and own in-flight writes are visible via the owner rule, not the table.
         let registry = store.commit_registry_snapshot();
         Self {
-            store: SharedCell::new(store),
+            store: SharedRef::new(store),
             txn,
             snapshot,
             registry,
@@ -454,7 +454,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     // columns, zones) — an internal constructor where threading a struct would only obscure the seam.
     #[allow(clippy::too_many_arguments)]
     pub fn attach(
-        store: SharedCell<RecordStore<D, S>>,
+        store: SharedRef<RecordStore<D, S>>,
         txn: TxnId,
         snapshot: Snapshot,
         ssi: SharedCell<SsiTracker>,
@@ -475,7 +475,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // seam continue the transaction rather than restart its statement numbering — a restart would
         // let an `OLD` view of statement 2 hide statement 1's writes.
         let snapshot =
-            snapshot_at_current_command(&store.borrow(), txn, snapshot.ts).with_view(snapshot.view);
+            snapshot_at_current_command(store.borrow(), txn, snapshot.ts).with_view(snapshot.view);
         // The deferred-read buffer merges into the same shared tracker; clone the `Rc` for the guard
         // before `ssi` is moved into the field (`rmp` #341).
         let read_buffer = ReadBufferGuard::new(txn, Some(ssi.clone()));
@@ -944,7 +944,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         let registry = store.commit_registry_snapshot();
         let snapshot = snapshot_at_current_command(&store, txn, ts);
         Self {
-            store: SharedCell::new(store),
+            store: SharedRef::new(store),
             txn,
             snapshot,
             registry,
@@ -1054,7 +1054,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         mvcc: MvccHeader,
     ) -> Result<bool, GraphusError> {
         let store = self.store.borrow();
-        self.entity_visible_in(&store, kind, id, mvcc)
+        self.entity_visible_in(store, kind, id, mvcc)
     }
 
     /// [`entity_visible`](Self::entity_visible) against a store the caller has **already** borrowed.
@@ -1255,7 +1255,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     /// shared — only a standalone graph (the single-transaction path) owns its store outright; a
     /// coordinated statement handle must never end the transaction (the coordinator owns that
     /// lifecycle).
-    fn unwrap_store(store: SharedCell<RecordStore<D, S>>) -> RecordStore<D, S> {
+    fn unwrap_store(store: SharedRef<RecordStore<D, S>>) -> RecordStore<D, S> {
         match store.into_inner() {
             Ok(store) => store,
             Err(_) => panic!(
@@ -1402,7 +1402,6 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         let decided = match store.decision_scan_node_properties(node.0, self.snapshot) {
             Ok(decided) => decided,
             Err(e) => {
-                drop(store);
                 self.capture(e);
                 return None;
             }
@@ -1411,7 +1410,6 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         match store.decode_property_value(prop.type_tag, prop.value_inline) {
             Ok(value) => Some(value),
             Err(e) => {
-                drop(store);
                 self.capture(e);
                 None
             }
@@ -1436,7 +1434,6 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         let decided = match store.decision_scan_node_properties(node.0, self.snapshot) {
             Ok(decided) => decided,
             Err(e) => {
-                drop(store);
                 self.capture(e);
                 return Vec::new();
             }
@@ -1446,7 +1443,6 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             match store.decode_property_value(prop.type_tag, prop.value_inline) {
                 Ok(value) => out.push((prop.key, value)),
                 Err(e) => {
-                    drop(store);
                     self.capture(e);
                     return Vec::new();
                 }
@@ -1482,12 +1478,10 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         let ids = match store.scan_node_ids() {
             Ok(ids) => ids,
             Err(e) => {
-                drop(store);
                 self.capture(e);
                 return;
             }
         };
-        drop(store);
         for id in ids {
             self.note_read(node_ssi_key(id));
         }
@@ -1513,12 +1507,10 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         let ids = match store.scan_rel_ids() {
             Ok(ids) => ids,
             Err(e) => {
-                drop(store);
                 self.capture(e);
                 return;
             }
         };
-        drop(store);
         for id in ids {
             self.note_read(rel_ssi_key(id));
         }
@@ -1567,7 +1559,6 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                 // holder and commit a duplicate. `node` only errors on a genuine fault (a reclaimed
                 // slot returns `Ok` with `in_use=false`), so capturing is never a false alarm.
                 Err(e) => {
-                    drop(store);
                     self.note_candidates(examined, hidden, filtered);
                     self.capture(e);
                     return Vec::new();
@@ -1578,10 +1569,9 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             // `View::Old` a node this very statement created is not yet there. A chain read fault
             // FAILS CLOSED here for the same reason the `node` arm above does — never the header's
             // own verdict, which is the answer the chain was consulted to correct.
-            let visible = match self.entity_visible_in(&store, StoreKind::Node, id, rec.mvcc) {
+            let visible = match self.entity_visible_in(store, StoreKind::Node, id, rec.mvcc) {
                 Ok(v) => v,
                 Err(e) => {
-                    drop(store);
                     self.note_candidates(examined, hidden, filtered);
                     self.capture(e);
                     return Vec::new();
@@ -1596,11 +1586,10 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             // Resolve the label word AS OF THIS SNAPSHOT (`rmp` #767) instead of reading whatever it
             // holds now — the inline twin of `read_source::filter_label_candidates`. `rec` is already
             // in hand, so this also drops the second `read_node` `node_has_label` performed.
-            let bitmap = match self.label_bitmap_at(&store, id, rec.labels, rec.mvcc.undo_ptr) {
+            let bitmap = match self.label_bitmap_at(store, id, rec.labels, rec.mvcc.undo_ptr) {
                 Ok(b) => b,
                 Err(e) => {
                     // A chain read fault is captured, never answered with the live word.
-                    drop(store);
                     self.note_candidates(examined, hidden, filtered);
                     self.capture(e);
                     return Vec::new();
@@ -1612,14 +1601,12 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                 Err(e) => {
                     // An overflow-form bitmap (a #39-written node) surfaces as a captured error
                     // rather than a wrong (missing/extra) row.
-                    drop(store);
                     self.note_candidates(examined, hidden, filtered);
                     self.capture(GraphusError::from(e));
                     return Vec::new();
                 }
             }
         }
-        drop(store);
         self.note_candidates(examined, hidden, filtered);
         out
     }
@@ -1712,7 +1699,6 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                 // FAIL CLOSED on a genuine read fault (`rmp` task #733), matching the sibling
                 // `node_has_label` arm below and the single-label `filter_label_candidates`.
                 Err(e) => {
-                    drop(store);
                     self.note_candidates(examined, hidden, filtered);
                     self.capture(e);
                     return Vec::new();
@@ -1720,10 +1706,9 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             };
             examined += 1;
             // Statement-granular existence (`rmp` #972); fail-closed on a chain read fault.
-            let visible = match self.entity_visible_in(&store, StoreKind::Node, id, rec.mvcc) {
+            let visible = match self.entity_visible_in(store, StoreKind::Node, id, rec.mvcc) {
                 Ok(v) => v,
                 Err(e) => {
-                    drop(store);
                     self.note_candidates(examined, hidden, filtered);
                     self.capture(e);
                     return Vec::new();
@@ -1736,10 +1721,9 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                 continue;
             }
             // One snapshot-correct resolution (`rmp` #767) for the whole token loop below.
-            let bitmap = match self.label_bitmap_at(&store, id, rec.labels, rec.mvcc.undo_ptr) {
+            let bitmap = match self.label_bitmap_at(store, id, rec.labels, rec.mvcc.undo_ptr) {
                 Ok(b) => b,
                 Err(e) => {
-                    drop(store);
                     self.note_candidates(examined, hidden, filtered);
                     self.capture(e);
                     return Vec::new();
@@ -1754,7 +1738,6 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                     }
                     Ok(false) => {}
                     Err(e) => {
-                        drop(store);
                         self.note_candidates(examined, hidden, filtered);
                         self.capture(GraphusError::from(e));
                         return Vec::new();
@@ -1767,7 +1750,6 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                 filtered += 1;
             }
         }
-        drop(store);
         self.note_candidates(examined, hidden, filtered);
         out
     }
@@ -1846,7 +1828,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             // Visible + of a covered type? A hidden version yields no data at all (and every examined
             // relationship is SIREAD-marked either way).
             let read_source::RelCandidate::Visible(data) = read_source::rel_candidate(
-                &LiveSource(&*self.store.borrow()),
+                &LiveSource(self.store.borrow()),
                 &self.vis_ctx(),
                 self,
                 rel,
@@ -2517,7 +2499,6 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             match store.node_labels(node.0) {
                 Ok(ids) => ids,
                 Err(e) => {
-                    drop(store);
                     self.capture(e);
                     return;
                 }
@@ -2746,7 +2727,6 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             match store.rel(rel.0) {
                 Ok(r) => r.type_id,
                 Err(e) => {
-                    drop(store);
                     self.capture(e);
                     return;
                 }
@@ -3063,7 +3043,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // NOT in the body, because the rel scan fallback registers no such marker, so it must stay in each
         // seam (`rmp` #683). Read-only: `LiveSource` over the store's `&self` reads (`rmp` #337 Slice 2).
         let matches = read_source::rel_index_seek_eq_recheck(
-            &LiveSource(&*self.store.borrow()),
+            &LiveSource(self.store.borrow()),
             &self.vis_ctx(),
             self,
             type_name,
@@ -3130,7 +3110,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // by construction. The coarse `RelType` marker + the blanket `mark_all_live_rels` are registered
         // ABOVE, NOT in the body (`rmp` #683 asymmetry). Read-only: `LiveSource` over the store's `&self`.
         let matches = read_source::rel_index_seek_range_recheck(
-            &LiveSource(&*self.store.borrow()),
+            &LiveSource(self.store.borrow()),
             &self.vis_ctx(),
             self,
             type_name,
@@ -3701,7 +3681,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // The store borrow is a temporary scoped to this statement: it is released before `capture`
         // touches the (separate) error cell.
         let decoded =
-            crate::store_statistics::decode_histogram(&self.store.borrow(), label, property);
+            crate::store_statistics::decode_histogram(self.store.borrow(), label, property);
         match decoded {
             Ok(hist) => hist,
             Err(e) => {
@@ -3788,7 +3768,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
 
         // The decision, under THIS statement's snapshot, in the body every node equality seek shares.
         Some(read_source::index_seek_eq_recheck(
-            &LiveSource(&*self.store.borrow()),
+            &LiveSource(self.store.borrow()),
             &self.vis_ctx(),
             self,
             label_token,
@@ -3982,7 +3962,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             // The node must carry the label AS OF THIS SNAPSHOT (`rmp` #767), the row label scan's
             // membership test — resolved from the record already decoded above, not re-read live.
             let bitmap = match self.label_bitmap_at(
-                &self.store.borrow(),
+                self.store.borrow(),
                 id,
                 node_rec.labels,
                 node_rec.mvcc.undo_ptr,
@@ -4209,7 +4189,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             // relationship is SIREAD-marked — the same per-candidate re-check the full-text
             // relationship fallback uses, so membership and markers match the index path.
             let read_source::RelCandidate::Visible(data) = read_source::rel_candidate(
-                &LiveSource(&*self.store.borrow()),
+                &LiveSource(self.store.borrow()),
                 &self.vis_ctx(),
                 self,
                 rel,
@@ -4325,7 +4305,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // can have no live node, so it is an exact `Some(0)` — never the `None` "unknown" sentinel.
         // The reader is shared with `CoordinatorStatistics` (`rmp` task #82).
         Some(crate::store_statistics::nodes_with_label(
-            &self.store.borrow(),
+            self.store.borrow(),
             label,
         ))
     }
@@ -4337,7 +4317,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     fn relationships_with_type(&self, rel_type: &str) -> Option<u64> {
         // Exact per-relationship-type counts (`rmp` task #79); a never-interned type is an exact 0.
         Some(crate::store_statistics::relationships_with_type(
-            &self.store.borrow(),
+            self.store.borrow(),
             rel_type,
         ))
     }
@@ -4346,14 +4326,14 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // Exact `(startLabel, type)` directional counts (`rmp` task #856), or `None` when this
         // catalogue holds no directional projections at all — see `store_statistics`.
         crate::store_statistics::rels_from_label_with_type(
-            &self.store.borrow(),
+            self.store.borrow(),
             start_label,
             rel_type,
         )
     }
 
     fn rels_with_type_to_label(&self, rel_type: &str, end_label: &str) -> Option<u64> {
-        crate::store_statistics::rels_with_type_to_label(&self.store.borrow(), rel_type, end_label)
+        crate::store_statistics::rels_with_type_to_label(self.store.borrow(), rel_type, end_label)
     }
 
     fn estimate_nodes_label_property_eq(
@@ -4400,7 +4380,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // SIREAD-mark and visibility-filter every slot-occupied node — byte-identical to the prior
         // inline body, now also run by the off-thread reader. Read-only: `LiveSource` over the live
         // store's `&self` read methods (`rmp` #337 Slice 2), so a shared borrow suffices.
-        read_source::scan_nodes(&LiveSource(&*self.store.borrow()), &self.vis_ctx(), self)
+        read_source::scan_nodes(&LiveSource(self.store.borrow()), &self.vis_ctx(), self)
     }
 
     fn scan_nodes_by_label(&self, label: &str) -> Vec<NodeId> {
@@ -4444,7 +4424,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             // `capture` on a read fault, a different cell), and `mark_all_live_nodes` still runs
             // unconditionally below — so the SSI footprint is identical either way.
             let candidates = self.label_candidates(index, token_id);
-            let src = LiveSource(&*self.store.borrow());
+            let src = LiveSource(self.store.borrow());
             read_source::mark_all_live_nodes(&src, self);
             return read_source::filter_label_candidates(
                 &src,
@@ -4467,7 +4447,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             return Vec::new();
         };
         self.note_predicate_read(PredicateRead::Label(token_id));
-        let src = LiveSource(&*self.store.borrow());
+        let src = LiveSource(self.store.borrow());
         let ids = match src.0.scan_node_ids() {
             Ok(ids) => ids,
             Err(e) => {
@@ -4608,7 +4588,6 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         let source: Box<dyn crate::morsel::MorselSource> = Box::new(
             crate::morsel::MorselView::new(store.read_view(), store.token_snapshot()),
         );
-        drop(store);
 
         Some(crate::morsel::MorselLabelScan {
             candidates,
@@ -4644,7 +4623,6 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         let source: Box<dyn crate::morsel::MorselSource> = Box::new(
             crate::morsel::MorselView::new(store.read_view(), store.token_snapshot()),
         );
-        drop(store);
 
         Some(crate::morsel::MorselFrontierSource {
             source,
@@ -4681,7 +4659,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // visibility) by the body, so the result and SSI markers are byte-identical either way.
         let csr_candidates = self.csr_candidates_for(node, types);
         read_source::expand_with_csr(
-            &LiveSource(&*self.store.borrow()),
+            &LiveSource(self.store.borrow()),
             &self.vis_ctx(),
             self,
             node,
@@ -4698,7 +4676,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // [`read_source::scan_rels_typed`] for the marker-for-marker argument. Read-only: `LiveSource`
         // over the live store's `&self` read methods.
         read_source::scan_rels_typed(
-            &LiveSource(&*self.store.borrow()),
+            &LiveSource(self.store.borrow()),
             &self.vis_ctx(),
             self,
             types,
@@ -4709,18 +4687,18 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         let store = self.store.borrow();
         // ONE borrow spanning the predicate and the read — see `count_store_equivalent` for why that
         // is what makes the answer race-free rather than merely likely-correct.
-        if !self.count_store_equivalent(&store) {
+        if !self.count_store_equivalent(store) {
             return None;
         }
         Some(match label {
-            Some(l) => crate::store_statistics::nodes_with_label(&store, l),
+            Some(l) => crate::store_statistics::nodes_with_label(store, l),
             None => store.total_node_count(),
         })
     }
 
     fn count_store_rels(&self, types: &[String]) -> Option<u64> {
         let store = self.store.borrow();
-        if !self.count_store_equivalent(&store) {
+        if !self.count_store_equivalent(store) {
             return None;
         }
         // A relationship carries exactly one type, so the count over a set of types is the sum over
@@ -4731,7 +4709,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         } else {
             types
                 .iter()
-                .map(|t| crate::store_statistics::relationships_with_type(&store, t))
+                .map(|t| crate::store_statistics::relationships_with_type(store, t))
                 .sum()
         })
     }
@@ -4740,7 +4718,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // The shared lifted body (`rmp` task #336): "exists" = visible to this query's snapshot;
         // SIREAD-marks the examined node. Byte-identical to the prior inline body.
         read_source::node_exists(
-            &LiveSource(&*self.store.borrow()),
+            &LiveSource(self.store.borrow()),
             &self.vis_ctx(),
             self,
             node,
@@ -4748,12 +4726,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     }
 
     fn rel_exists(&self, rel: RelId) -> bool {
-        read_source::rel_exists(
-            &LiveSource(&*self.store.borrow()),
-            &self.vis_ctx(),
-            self,
-            rel,
-        )
+        read_source::rel_exists(&LiveSource(self.store.borrow()), &self.vis_ctx(), self, rel)
     }
 
     fn index_exists_by_name(&self, name: &str) -> Option<bool> {
@@ -4832,7 +4805,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // mapped + name-sorted; an overflow-form bitmap is captured and reported as `Some(vec![])`
         // (not silently wrong). Byte-identical to the prior inline body.
         read_source::node_labels(
-            &LiveSource(&*self.store.borrow()),
+            &LiveSource(self.store.borrow()),
             &self.vis_ctx(),
             self,
             node,
@@ -4840,12 +4813,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     }
 
     fn rel_data(&self, rel: RelId) -> Option<RelData> {
-        read_source::rel_data(
-            &LiveSource(&*self.store.borrow()),
-            &self.vis_ctx(),
-            self,
-            rel,
-        )
+        read_source::rel_data(&LiveSource(self.store.borrow()), &self.vis_ctx(), self, rel)
     }
 
     fn rel_data_including_deleted(&self, rel: RelId) -> Option<RelData> {
@@ -4853,7 +4821,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // passed so a storage *fault* on the lookup is captured, not swallowed into `None` (`rmp` #359
         // defence-in-depth). Keeps `type(r)`/`id(r)` accessible after a same-query `DELETE r`.
         read_source::rel_data_including_deleted(
-            &LiveSource(&*self.store.borrow()),
+            &LiveSource(self.store.borrow()),
             &self.vis_ctx(),
             self,
             rel,
@@ -4865,7 +4833,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // the sink is passed so a storage *fault* on the probe is captured rather than swallowed into
         // `false` (`rmp` #359 defence-in-depth).
         read_source::entity_deleted_by_txn(
-            &LiveSource(&*self.store.borrow()),
+            &LiveSource(self.store.borrow()),
             &self.vis_ctx(),
             self,
             entity,
@@ -4874,7 +4842,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
 
     fn node_property(&self, node: NodeId, key: &str) -> Option<Value> {
         read_source::node_property(
-            &LiveSource(&*self.store.borrow()),
+            &LiveSource(self.store.borrow()),
             &self.vis_ctx(),
             self,
             node,
@@ -4884,7 +4852,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
 
     fn rel_property(&self, rel: RelId, key: &str) -> Option<Value> {
         read_source::rel_property(
-            &LiveSource(&*self.store.borrow()),
+            &LiveSource(self.store.borrow()),
             &self.vis_ctx(),
             self,
             rel,
@@ -4894,7 +4862,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
 
     fn node_properties(&self, node: NodeId) -> Option<Vec<(String, Value)>> {
         read_source::node_properties(
-            &LiveSource(&*self.store.borrow()),
+            &LiveSource(self.store.borrow()),
             &self.vis_ctx(),
             self,
             node,
@@ -4902,12 +4870,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     }
 
     fn rel_properties(&self, rel: RelId) -> Option<Vec<(String, Value)>> {
-        read_source::rel_properties(
-            &LiveSource(&*self.store.borrow()),
-            &self.vis_ctx(),
-            self,
-            rel,
-        )
+        read_source::rel_properties(&LiveSource(self.store.borrow()), &self.vis_ctx(), self, rel)
     }
 
     fn index_seek_eq(
@@ -4981,7 +4944,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // call — the two can no longer drift, because they are the same code. Read-only: `LiveSource`
         // over the live store's `&self` reads (`rmp` #337 Slice 2), so a shared borrow suffices.
         Some(read_source::index_seek_eq_recheck(
-            &LiveSource(&*self.store.borrow()),
+            &LiveSource(self.store.borrow()),
             &self.vis_ctx(),
             self,
             label_token,
@@ -5001,7 +4964,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // longer conflict reciprocally (the abort-storm fix). Read-only: `LiveSource` over the live
         // store's `&self` reads (`rmp` #337 Slice 2), so a shared borrow suffices.
         read_source::scan_filter_eq(
-            &LiveSource(&*self.store.borrow()),
+            &LiveSource(self.store.borrow()),
             &self.vis_ctx(),
             self,
             label,
@@ -5077,7 +5040,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // are identical by construction, not by review. Read-only: `LiveSource` over the store's `&self`
         // reads (`rmp` #337 Slice 2).
         Some(read_source::index_seek_range_recheck(
-            &LiveSource(&*self.store.borrow()),
+            &LiveSource(self.store.borrow()),
             &self.vis_ctx(),
             self,
             label_token,
@@ -5136,7 +5099,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // SSI footprint are identical by construction. Read-only: `LiveSource` over the store's `&self`
         // reads (`rmp` #337 Slice 2).
         Some(read_source::index_seek_composite_recheck(
-            &LiveSource(&*self.store.borrow()),
+            &LiveSource(self.store.borrow()),
             &self.vis_ctx(),
             self,
             label_token,
@@ -5253,7 +5216,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // per-candidate SIREAD identical by construction. The coarse `RelType` marker + `mark_all_live_rels`
         // are registered ABOVE, NOT in the body (`rmp` #683 asymmetry). Read-only: `LiveSource` over `&self`.
         Some(read_source::rel_index_seek_composite_recheck(
-            &LiveSource(&*self.store.borrow()),
+            &LiveSource(self.store.borrow()),
             &self.vis_ctx(),
             self,
             rel_type,
@@ -5319,7 +5282,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // executor keeps the exact `distance` filter above). Both seams call this one body, so rows +
         // footprint match by construction. Read-only: `LiveSource` over the store's `&self` reads.
         Some(read_source::index_seek_spatial_recheck(
-            &LiveSource(&*self.store.borrow()),
+            &LiveSource(self.store.borrow()),
             &self.vis_ctx(),
             self,
             label_token,
@@ -5377,7 +5340,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // `rel_data` visibility/type re-check + the dedup, with no `distance` residual (the executor keeps
         // it above). Both seams call this one body, so rows + footprint match by construction.
         Some(read_source::rel_index_seek_spatial_recheck(
-            &LiveSource(&*self.store.borrow()),
+            &LiveSource(self.store.borrow()),
             &self.vis_ctx(),
             self,
             rel_type,
@@ -5452,7 +5415,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // `rmp` #662/#73). Both seams call this one body, so rows and footprint match by construction.
         // Read-only: `LiveSource` over the store's `&self` reads (`rmp` #337 Slice 2).
         Some(read_source::index_seek_text_recheck(
-            &LiveSource(&*self.store.borrow()),
+            &LiveSource(self.store.borrow()),
             &self.vis_ctx(),
             self,
             label_token,
@@ -5889,7 +5852,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             .filter(|&r| {
                 examined += 1;
                 let read_source::RelCandidate::Visible(data) = read_source::rel_candidate(
-                    &LiveSource(&*self.store.borrow()),
+                    &LiveSource(self.store.borrow()),
                     &self.vis_ctx(),
                     self,
                     r,
@@ -6656,7 +6619,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // to those visible to this transaction (a deleted edge is not reported) and SIREAD-marked.
         // Byte-identical to the prior inline body.
         read_source::incident_rels(
-            &LiveSource(&*self.store.borrow()),
+            &LiveSource(self.store.borrow()),
             &self.vis_ctx(),
             self,
             node,

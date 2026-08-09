@@ -47,7 +47,7 @@ use graphus_cypher::physical::{PhysicalPlan, plan_physical};
 use graphus_cypher::record_graph::RecordStoreGraph;
 use graphus_cypher::runtime::Row;
 use graphus_cypher::semantics::analyze;
-use graphus_cypher::shared_cell::SharedCell;
+use graphus_cypher::shared_cell::{SharedCell, SharedRef};
 use graphus_io::MemBlockDevice;
 use graphus_storage::{IndexState, Namespace, RecordStore};
 use graphus_txn::{Snapshot, SsiTracker};
@@ -71,7 +71,7 @@ type Coord = TxnCoordinator<MemBlockDevice, MemLogSink>;
 /// `rollback_removes_the_index_entries_the_transaction_created` in `src/coordinator.rs`, which is
 /// where the coordinator's private index handle is reachable.
 struct Fixture {
-    store: SharedCell<Store>,
+    store: SharedRef<Store>,
     ssi: SharedCell<SsiTracker>,
     index: SharedCell<IndexSet>,
     columns: SharedCell<graphus_cypher::column_cache::ColumnCache>,
@@ -85,7 +85,7 @@ impl Fixture {
         let wal = WalManager::create(MemLogSink::new()).expect("create wal");
         let store = RecordStore::create(device, wal, 64, 1).expect("create store");
         Self {
-            store: SharedCell::new(store),
+            store: SharedRef::new(store),
             ssi: SharedCell::new(SsiTracker::new()),
             index: SharedCell::new(IndexSet::new()),
             columns: SharedCell::new(graphus_cypher::column_cache::ColumnCache::new()),

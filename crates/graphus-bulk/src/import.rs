@@ -203,7 +203,7 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
     /// Simulation Test can arm a device fault on the LIVE store between two batches (`rmp` #955) —
     /// the importer owns the store outright, so there is no other way to reach the seam mid-import.
     #[doc(hidden)]
-    pub fn store_mut_for_test(&mut self) -> &mut RecordStore<D, S> {
+    pub fn store_mut_for_test(&mut self) -> &RecordStore<D, S> {
         &mut self.store
     }
 
@@ -333,7 +333,7 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
         record: &csv::StringRecord,
     ) -> Result<()> {
         ingest_node_row(
-            &mut self.store,
+            &self.store,
             txn,
             header,
             prop_key_tokens,
@@ -419,7 +419,7 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
         record: &csv::StringRecord,
     ) -> Result<()> {
         ingest_rel_row(
-            &mut self.store,
+            &self.store,
             txn,
             header,
             prop_key_tokens,
@@ -444,7 +444,7 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
     /// Thin forwarding wrapper over [`intern_property_key_tokens`] (`rmp` #519) — see
     /// [`ingest_node_record`]'s doc for why the logic is a free function.
     fn resolve_property_key_tokens(&mut self, columns: &[ColumnRole]) -> Result<Vec<Option<u32>>> {
-        intern_property_key_tokens(&mut self.store, columns)
+        intern_property_key_tokens(&self.store, columns)
     }
 
     /// Begins the next batch transaction and returns its id.
@@ -538,7 +538,7 @@ fn csv_err(e: csv::Error) -> graphus_core::GraphusError {
 // already owns (`graphus_cypher::TxnCoordinator`), so it must borrow that store for the scope of one
 // engine command and use a `TxnId` the coordinator's own counter allocated (never a private
 // from-1 counter, which could collide with ids the coordinator already issued). Extracting the
-// per-record body into free functions taking `&mut RecordStore` + an externally-supplied `TxnId`
+// per-record body into free functions taking `&RecordStore` + an externally-supplied `TxnId`
 // lets both callers share byte-identical store-mutation logic — "shared, unmodified code between
 // the offline tool and the network endpoint" per `08 §4.2` — while each owns its transaction/id
 // lifecycle appropriately for its own environment.
@@ -552,7 +552,7 @@ fn csv_err(e: csv::Error) -> graphus_core::GraphusError {
 /// # Errors
 /// Propagates a store write failure from interning a new property-key token.
 pub fn intern_property_key_tokens<D: BlockDevice, S: LogSink>(
-    store: &mut RecordStore<D, S>,
+    store: &RecordStore<D, S>,
     columns: &[ColumnRole],
 ) -> Result<Vec<Option<u32>>> {
     let mut out = Vec::with_capacity(columns.len());
@@ -597,7 +597,7 @@ pub fn intern_property_key_tokens<D: BlockDevice, S: LogSink>(
 /// does not own the transaction's lifecycle).
 #[allow(clippy::too_many_arguments)]
 pub fn ingest_node_row<D: BlockDevice, S: LogSink>(
-    store: &mut RecordStore<D, S>,
+    store: &RecordStore<D, S>,
     txn: TxnId,
     header: &NodeHeader,
     prop_key_tokens: &[Option<u32>],
@@ -721,7 +721,7 @@ pub fn ingest_node_row<D: BlockDevice, S: LogSink>(
 /// external id in `id_map`). The caller is responsible for rolling back `txn` on `Err`.
 #[allow(clippy::too_many_arguments)]
 pub fn ingest_rel_row<D: BlockDevice, S: LogSink>(
-    store: &mut RecordStore<D, S>,
+    store: &RecordStore<D, S>,
     txn: TxnId,
     header: &RelHeader,
     prop_key_tokens: &[Option<u32>],

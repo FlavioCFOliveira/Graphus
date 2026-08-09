@@ -160,7 +160,7 @@ fn current_by_name<D: BlockDevice, S: LogSink>(
 /// Returns a storage error if the store cannot be scanned, or an I/O error wrapped as
 /// [`graphus_core::GraphusError::Storage`] if `writer` fails.
 pub fn dump_nodes<D: BlockDevice, S: LogSink, W: Write>(
-    store: &mut RecordStore<D, S>,
+    store: &RecordStore<D, S>,
     writer: W,
 ) -> Result<Vec<String>> {
     let node_ids = store.scan_node_ids()?;
@@ -220,7 +220,7 @@ pub fn dump_nodes<D: BlockDevice, S: LogSink, W: Write>(
 ///
 /// Returns a storage error if the store cannot be scanned, or an I/O error if `writer` fails.
 pub fn dump_relationships<D: BlockDevice, S: LogSink, W: Write>(
-    store: &mut RecordStore<D, S>,
+    store: &RecordStore<D, S>,
     writer: W,
 ) -> Result<Vec<String>> {
     let rel_ids = store.scan_rel_ids()?;

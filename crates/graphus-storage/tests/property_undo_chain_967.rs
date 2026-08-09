@@ -226,7 +226,7 @@ fn the_corpse_delta_of_an_aborted_overwrite_never_frees_the_restored_chain() {
          its own bytes — this is the assertion a double-free actually fails",
     );
 
-    let report = graphus_storage::check::check_store(&mut s, &[]).expect("consistency check");
+    let report = graphus_storage::check::check_store(&s, &[]).expect("consistency check");
     assert!(
         report.is_consistent(),
         "store consistent after the aborted overwrite + GC: {:?}",
@@ -386,7 +386,7 @@ fn an_older_snapshot_reads_the_exact_old_value_never_absent() {
 /// write is accepted) and, with the write accepted, the reader sees T1's new value for `a`.
 #[test]
 fn a_second_writer_on_the_same_entity_is_refused_with_a_retriable_serialization_failure() {
-    let mut s = fresh();
+    let s = fresh();
     let ka = s.intern_token(Namespace::PropKey, "a").expect("intern");
     let kb = s.intern_token(Namespace::PropKey, "b").expect("intern");
 
@@ -456,7 +456,7 @@ fn a_second_writer_on_the_same_entity_is_refused_with_a_retriable_serialization_
     assert_eq!(value_at(&s, n, ka, reader), Some(Value::Integer(10)));
     assert_eq!(value_at(&s, n, kb, reader), Some(Value::Integer(20)));
 
-    let report = graphus_storage::check::check_store(&mut s, &[]).expect("consistency check");
+    let report = graphus_storage::check::check_store(&s, &[]).expect("consistency check");
     assert!(
         report.is_consistent(),
         "store consistent after the refused interleaving: {:?}",
@@ -471,7 +471,7 @@ fn a_second_writer_on_the_same_entity_is_refused_with_a_retriable_serialization_
 /// the test above perfectly.
 #[test]
 fn the_holder_of_an_entity_keeps_writing_it() {
-    let mut s = fresh();
+    let s = fresh();
     let keys: Vec<u32> = (0..5)
         .map(|i| {
             s.intern_token(Namespace::PropKey, &format!("k{i}"))
@@ -502,7 +502,7 @@ fn the_holder_of_an_entity_keeps_writing_it() {
     for &k in &keys {
         assert_eq!(current_value(&s, n, k), None, "every key was cleared");
     }
-    let report = graphus_storage::check::check_store(&mut s, &[]).expect("consistency check");
+    let report = graphus_storage::check::check_store(&s, &[]).expect("consistency check");
     assert!(
         report.is_consistent(),
         "store consistent after a single writer's full property lifecycle: {:?}",
@@ -576,7 +576,7 @@ fn clearing_the_property_set_keeps_every_old_value_for_an_older_snapshot() {
 /// fail, while the spectator assertions stay green.
 #[test]
 fn a_writer_reads_its_own_uncommitted_property_write_and_a_spectator_does_not() {
-    let mut s = fresh();
+    let s = fresh();
     let key = s.intern_token(Namespace::PropKey, "v").expect("intern");
     let big = s.intern_token(Namespace::PropKey, "big").expect("intern");
     let rtype = s.intern_token(Namespace::RelType, "R").expect("intern");
@@ -671,7 +671,7 @@ fn a_writer_reads_its_own_uncommitted_property_write_and_a_spectator_does_not() 
         Some(Value::String(long_before)),
     );
 
-    let report = graphus_storage::check::check_store(&mut s, &[]).expect("consistency check");
+    let report = graphus_storage::check::check_store(&s, &[]).expect("consistency check");
     assert!(
         report.is_consistent(),
         "store consistent after an own-write interleaving: {:?}",
@@ -761,7 +761,7 @@ fn an_empty_cell_deferred_by_the_watermark_is_reclaimed_by_a_later_pass() {
     // The surviving key is untouched by the reclamation, and the store is structurally sound.
     assert_eq!(current_value(&s, n, kept), Some(Value::Integer(2)));
     assert_eq!(current_value(&s, n, gone), None);
-    let report = graphus_storage::check::check_store(&mut s, &[]).expect("consistency check");
+    let report = graphus_storage::check::check_store(&s, &[]).expect("consistency check");
     assert!(
         report.is_consistent(),
         "store consistent after the deferred reclamation: {:?}",
@@ -933,12 +933,12 @@ fn a_legacy_store_carrying_a_property_tombstone_is_refused_at_open() {
     let current = capture(&mut s);
     drop(s);
 
-    let mut v3 = open_image(&current).expect("a current-version image is not refused by this gate");
+    let v3 = open_image(&current).expect("a current-version image is not refused by this gate");
     assert_eq!(
         v3.opened_format_version(),
         graphus_core::constants::FORMAT_VERSION,
     );
-    let report = graphus_storage::check::check_store(&mut v3, &[]).expect("consistency check");
+    let report = graphus_storage::check::check_store(&v3, &[]).expect("consistency check");
     assert!(
         !report.is_consistent(),
         "the second tier must catch what the open-time gate deliberately does not: {:?}",

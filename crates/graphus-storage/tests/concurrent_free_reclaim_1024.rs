@@ -12,7 +12,7 @@
 //! contract ("a well-formed free list holds each id at most once").
 //!
 //! Before the per-store latch of `rmp` #1012 the pairing was free: every caller held
-//! `&mut RecordStore`, so test and push were atomic whether or not the author thought about it.
+//! `&RecordStore`, so test and push were atomic whether or not the author thought about it.
 //! Turning that borrow into a latch acquisition removed the guarantee without changing a line of the
 //! logic. That is why this is asserted against real threads: with one writer the interleaving is
 //! unreachable, so the defect is invisible and the code that closes it is indistinguishable from code

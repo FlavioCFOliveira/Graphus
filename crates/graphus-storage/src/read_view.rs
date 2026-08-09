@@ -1386,7 +1386,7 @@ pub fn incident_rels_typed<D: BlockDevice, S: LogSink, P: StorePages>(
 /// `superset_scan_rel_properties` / `superset_scan_rel_property_values` / `incident_rels` and the
 /// low-level `read_*`), computed **purely** from `(pool, meta)` — it never touches the store's
 /// mutable fields (`tokens` / `statistics` / `element_ids` / free lists), so the writer keeps
-/// exclusive `&mut RecordStore` and the write/commit/GC/alloc path is untouched.
+/// exclusive `&RecordStore` and the write/commit/GC/alloc path is untouched.
 ///
 /// It carries **no** snapshot/visibility logic of its own: a returned record's `xmin`/`xmax` is
 /// filtered by `graphus_txn::is_visible` against the caller's own cloned `CommitRegistry` and

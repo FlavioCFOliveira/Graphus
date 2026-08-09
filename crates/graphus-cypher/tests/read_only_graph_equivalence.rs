@@ -31,7 +31,7 @@
 //! and the test proves index-arm == scan-fallback (results + markers), exactly the
 //! "index-present == index-absent" guarantee the seam promises.
 
-use graphus_cypher::shared_cell::SharedCell;
+use graphus_cypher::shared_cell::{SharedCell, SharedRef};
 
 use graphus_core::value::temporal::Date;
 use graphus_core::{Crs, Point, TxnId, Value};
@@ -247,10 +247,10 @@ fn populate_label_index(store: &Store, index: &SharedCell<IndexSet>) {
 
 /// A shared coordinated environment over one `Rc`-shared store: the `ssi` tracker (so reads register
 /// SIREAD markers), the lock table, and the populated derived index/column/zone sidecars `attach`
-/// requires. Owning the `SharedCell<Store>` here is what lets the test build the off-thread
+/// requires. Owning the `SharedRef<Store>` here is what lets the test build the off-thread
 /// `StoreReadView` from the very same store the live seam reads.
 struct Coordinated {
-    store: SharedCell<Store>,
+    store: SharedRef<Store>,
     ssi: SharedCell<SsiTracker>,
     index: SharedCell<IndexSet>,
     columns: SharedCell<graphus_cypher::column_cache::ColumnCache>,
@@ -262,7 +262,7 @@ impl Coordinated {
         let index = SharedCell::new(IndexSet::new());
         populate_label_index(&store, &index);
         Self {
-            store: SharedCell::new(store),
+            store: SharedRef::new(store),
             ssi: SharedCell::new(SsiTracker::new()),
             index,
             columns: SharedCell::new(graphus_cypher::column_cache::ColumnCache::new()),

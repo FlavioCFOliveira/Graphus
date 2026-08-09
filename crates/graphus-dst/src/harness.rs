@@ -251,7 +251,7 @@ impl Driver {
         // reflects the committed logical model the checker compares against. In-flight (loser)
         // tombstones were already undone by recovery, so only committed deletions are reclaimed.
         self.gc_after_recovery();
-        let result = checker::verify(&mut self.store, &self.model);
+        let result = checker::verify(&self.store, &self.model);
 
         let non_vacuous = committed_seen && (in_flight_seen || recovery.losers > 0);
 
@@ -600,7 +600,7 @@ impl Driver {
             // `open` leaves the victim non-resident: `open` legitimately pre-reads record pages (the
             // `rmp` #220 orphan reconstruction and the `rmp` #468 corpse high-water floor both fetch
             // record pages), so the victim may well be cached after open.
-            let mut corrupt_store = RecordStore::open(device, wal, 1).expect("open corrupt store");
+            let corrupt_store = RecordStore::open(device, wal, 1).expect("open corrupt store");
             // Arm bit-rot on the *live* device of the freshly-opened store (the `dst` seam again),
             // after open so the catalog read above sees the intact image. Flip enough bytes that the
             // corruption is overwhelmingly certain to break the victim page's checksum.

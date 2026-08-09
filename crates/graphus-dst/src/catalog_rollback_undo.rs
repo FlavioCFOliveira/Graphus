@@ -116,8 +116,7 @@ impl CatalogRollbackReport {
 pub fn run_catalog_rollback_undo(a: AOutcome, crash: Crash) -> CatalogRollbackReport {
     let device = MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new()).expect("create wal");
-    let store: Store =
-        RecordStore::create(device, wal, POOL_CAPACITY, 1).expect("create store");
+    let store: Store = RecordStore::create(device, wal, POOL_CAPACITY, 1).expect("create store");
 
     // --- seed: tokens + one committed, named index. Committed and flushed, so what follows is
     //     isolated to the catalog ENTRIES (token durability rides its own #220/#172 restore).
@@ -248,8 +247,7 @@ pub enum BEnding {
 pub fn run_checkpoint_excludes_pending_ddl(ending: BEnding, crash: Crash) -> bool {
     let device = MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new()).expect("create wal");
-    let store: Store =
-        RecordStore::create(device, wal, POOL_CAPACITY, 1).expect("create store");
+    let store: Store = RecordStore::create(device, wal, POOL_CAPACITY, 1).expect("create store");
 
     let t0 = TxnId(1);
     store.begin(t0);
@@ -310,8 +308,7 @@ pub fn run_checkpoint_excludes_pending_ddl(ending: BEnding, crash: Crash) -> boo
 pub fn run_multi_holder_out_of_order_abort(order: [usize; 3], crash: Crash) -> Option<Vec<u8>> {
     let device = MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new()).expect("create wal");
-    let store: Store =
-        RecordStore::create(device, wal, POOL_CAPACITY, 1).expect("create store");
+    let store: Store = RecordStore::create(device, wal, POOL_CAPACITY, 1).expect("create store");
 
     let t0 = TxnId(1);
     store.begin(t0);

@@ -66,8 +66,8 @@ fn live_device_image(store: &mut Store) -> MemBlockDevice {
 /// in-memory-only differences).
 fn artifact_of_device(device: MemBlockDevice, cap: usize) -> Vec<u8> {
     let wal = WalManager::create(MemLogSink::new()).expect("create wal");
-    let mut store = RecordStore::open(device, wal, cap).expect("open store");
-    backup_store(&mut store).expect("backup restored")
+    let store = RecordStore::open(device, wal, cap).expect("open store");
+    backup_store(&store).expect("backup restored")
 }
 
 /// The page section of a backup artifact (everything between the fixed header and the digest
@@ -104,7 +104,7 @@ fn full_chain_latest_is_byte_identical_to_a_full_backup() {
 
     // Seed some committed state, then start the chain (base captures it).
     commit_edge(&mut store, TxnId(1), "KNOWS");
-    let (mut manifest, base_link) = begin_chain(&mut store, &Plain).expect("begin chain");
+    let (mut manifest, base_link) = begin_chain(&store, &Plain).expect("begin chain");
     let mut links = ChainLinks {
         base: base_link,
         increments: Vec::new(),
@@ -113,7 +113,7 @@ fn full_chain_latest_is_byte_identical_to_a_full_backup() {
     // Commit more work in three batches, capturing an increment after each.
     for (i, rt) in ["LIKES", "FOLLOWS", "BLOCKS"].iter().enumerate() {
         commit_edge(&mut store, TxnId(2 + i as u64), rt);
-        let inc = capture_increment(&mut store, &mut manifest, &Plain).expect("capture");
+        let inc = capture_increment(&store, &mut manifest, &Plain).expect("capture");
         links.increments.push(inc);
     }
 
@@ -146,9 +146,9 @@ fn full_chain_latest_is_byte_identical_to_a_full_backup() {
 fn manifest_round_trips_through_its_own_codec() {
     let mut store = fresh(64);
     commit_edge(&mut store, TxnId(1), "KNOWS");
-    let (mut manifest, _base) = begin_chain(&mut store, &Plain).expect("begin");
+    let (mut manifest, _base) = begin_chain(&store, &Plain).expect("begin");
     commit_edge(&mut store, TxnId(2), "LIKES");
-    let _ = capture_increment(&mut store, &mut manifest, &Plain).expect("capture");
+    let _ = capture_increment(&store, &mut manifest, &Plain).expect("capture");
 
     let bytes = manifest.encode();
     let got = ChainManifest::decode(&bytes).expect("decode");
@@ -165,7 +165,7 @@ fn pitr_to_timestamp_reflects_exactly_the_committed_prefix() {
 
     // Base on an empty-ish store; capture each transaction as its own increment so we can pinpoint
     // commit boundaries. Record the snapshot timestamp right after each commit.
-    let (mut manifest, base_link) = begin_chain(&mut store, &Plain).expect("begin");
+    let (mut manifest, base_link) = begin_chain(&store, &Plain).expect("begin");
     let mut links = ChainLinks {
         base: base_link,
         increments: Vec::new(),
@@ -175,18 +175,18 @@ fn pitr_to_timestamp_reflects_exactly_the_committed_prefix() {
     let ts1 = store.snapshot_ts();
     links
         .increments
-        .push(capture_increment(&mut store, &mut manifest, &Plain).expect("inc1"));
+        .push(capture_increment(&store, &mut manifest, &Plain).expect("inc1"));
 
     let (a2, _, _) = commit_edge(&mut store, TxnId(2), "T2");
     let ts2 = store.snapshot_ts();
     links
         .increments
-        .push(capture_increment(&mut store, &mut manifest, &Plain).expect("inc2"));
+        .push(capture_increment(&store, &mut manifest, &Plain).expect("inc2"));
 
     let (a3, _, _) = commit_edge(&mut store, TxnId(3), "T3");
     links
         .increments
-        .push(capture_increment(&mut store, &mut manifest, &Plain).expect("inc3"));
+        .push(capture_increment(&store, &mut manifest, &Plain).expect("inc3"));
 
     assert!(ts1 < ts2, "timestamps must be monotonic: {ts1:?} < {ts2:?}");
 
@@ -228,7 +228,7 @@ fn pitr_to_timestamp_reflects_exactly_the_committed_prefix() {
 #[test]
 fn pitr_timestamp_between_two_commits_restores_exactly_the_prefix() {
     let mut store = fresh(64);
-    let (mut manifest, base_link) = begin_chain(&mut store, &Plain).expect("begin");
+    let (mut manifest, base_link) = begin_chain(&store, &Plain).expect("begin");
     let mut links = ChainLinks {
         base: base_link,
         increments: Vec::new(),
@@ -238,13 +238,13 @@ fn pitr_timestamp_between_two_commits_restores_exactly_the_prefix() {
     let ts1 = store.snapshot_ts();
     links
         .increments
-        .push(capture_increment(&mut store, &mut manifest, &Plain).expect("inc1"));
+        .push(capture_increment(&store, &mut manifest, &Plain).expect("inc1"));
 
     let (a2, _, _) = commit_edge(&mut store, TxnId(2), "T2");
     let ts2 = store.snapshot_ts();
     links
         .increments
-        .push(capture_increment(&mut store, &mut manifest, &Plain).expect("inc2"));
+        .push(capture_increment(&store, &mut manifest, &Plain).expect("inc2"));
 
     assert!(ts1 < ts2, "timestamps must be monotonic: {ts1:?} < {ts2:?}");
 
@@ -288,7 +288,7 @@ fn pitr_timestamp_between_two_commits_restores_exactly_the_prefix() {
 #[test]
 fn pitr_target_past_chain_tip_clamps_with_an_operator_visible_signal() {
     let mut store = fresh(64);
-    let (mut manifest, base_link) = begin_chain(&mut store, &Plain).expect("begin");
+    let (mut manifest, base_link) = begin_chain(&store, &Plain).expect("begin");
     let mut links = ChainLinks {
         base: base_link,
         increments: Vec::new(),
@@ -298,7 +298,7 @@ fn pitr_target_past_chain_tip_clamps_with_an_operator_visible_signal() {
     let last_ts = store.snapshot_ts();
     links
         .increments
-        .push(capture_increment(&mut store, &mut manifest, &Plain).expect("inc1"));
+        .push(capture_increment(&store, &mut manifest, &Plain).expect("inc1"));
 
     let tip = manifest.tip_lsn();
 
@@ -365,7 +365,7 @@ fn pitr_target_past_chain_tip_clamps_with_an_operator_visible_signal() {
 #[test]
 fn pitr_to_lsn_cuts_at_a_record_boundary() {
     let mut store = fresh(64);
-    let (mut manifest, base_link) = begin_chain(&mut store, &Plain).expect("begin");
+    let (mut manifest, base_link) = begin_chain(&store, &Plain).expect("begin");
     let mut links = ChainLinks {
         base: base_link,
         increments: Vec::new(),
@@ -376,12 +376,12 @@ fn pitr_to_lsn_cuts_at_a_record_boundary() {
     let cut = graphus_core::Lsn(store.with_wal(|w| w.durable_len()));
     links
         .increments
-        .push(capture_increment(&mut store, &mut manifest, &Plain).expect("inc1"));
+        .push(capture_increment(&store, &mut manifest, &Plain).expect("inc1"));
 
     let (a2, _, _) = commit_edge(&mut store, TxnId(2), "T2");
     links
         .increments
-        .push(capture_increment(&mut store, &mut manifest, &Plain).expect("inc2"));
+        .push(capture_increment(&store, &mut manifest, &Plain).expect("inc2"));
 
     // Restore to exactly the LSN at the end of T1's commit: T1 present, T2 absent.
     let mut device = MemBlockDevice::new(0);
@@ -408,7 +408,7 @@ fn pitr_to_lsn_cuts_at_a_record_boundary() {
 fn pitr_before_any_commit_restores_the_base_only() {
     let mut store = fresh(64);
     commit_edge(&mut store, TxnId(1), "SEED");
-    let (mut manifest, base_link) = begin_chain(&mut store, &Plain).expect("begin");
+    let (mut manifest, base_link) = begin_chain(&store, &Plain).expect("begin");
     let mut links = ChainLinks {
         base: base_link,
         increments: Vec::new(),
@@ -416,7 +416,7 @@ fn pitr_before_any_commit_restores_the_base_only() {
     let (a2, _, _) = commit_edge(&mut store, TxnId(2), "LATER");
     links
         .increments
-        .push(capture_increment(&mut store, &mut manifest, &Plain).expect("inc"));
+        .push(capture_increment(&store, &mut manifest, &Plain).expect("inc"));
 
     // A timestamp of 0 is before any real commit -> cut at base_lsn -> base only, no increment work.
     let mut device = MemBlockDevice::new(0);
@@ -450,9 +450,9 @@ fn pitr_before_any_commit_restores_the_base_only() {
 /// canonical "what does this durable image contain" yardstick for comparing two restores.
 fn node_liveness(device: MemBlockDevice, cap: usize) -> Vec<bool> {
     let wal = WalManager::create(MemLogSink::new()).expect("wal");
-    let mut store = RecordStore::open(device, wal, cap).expect("open");
+    let store = RecordStore::open(device, wal, cap).expect("open");
     // The restored image must itself be structurally consistent.
-    verify_on_open(&mut store, &[]).expect("restored store passes the consistency checker");
+    verify_on_open(&store, &[]).expect("restored store passes the consistency checker");
     let mut out = Vec::new();
     let mut id = 0u64;
     while let Ok(rec) = store.node(id) {
@@ -471,7 +471,7 @@ fn online_backup_mid_inflight_txn_does_not_bake_uncommitted_data() {
 
     // Capture the committed image as the oracle (a full backup at the pre-txn point).
     let pre_txn_image = {
-        let base = backup_store(&mut store).expect("oracle backup");
+        let base = backup_store(&store).expect("oracle backup");
         let mut dev = MemBlockDevice::new(0);
         restore_onto(&base, &mut dev).expect("restore oracle");
         node_liveness(dev, 64)
@@ -491,7 +491,7 @@ fn online_backup_mid_inflight_txn_does_not_bake_uncommitted_data() {
         .expect("in-flight rel");
 
     // Take the ONLINE backup MID-transaction (no commit, no abort).
-    let (mut manifest, base_link) = begin_chain(&mut store, &Plain).expect("online begin mid-txn");
+    let (mut manifest, base_link) = begin_chain(&store, &Plain).expect("online begin mid-txn");
     let mut links = ChainLinks {
         base: base_link,
         increments: Vec::new(),
@@ -500,7 +500,7 @@ fn online_backup_mid_inflight_txn_does_not_bake_uncommitted_data() {
     // is self-contained for a restore.
     links
         .increments
-        .push(capture_increment(&mut store, &mut manifest, &Plain).expect("increment"));
+        .push(capture_increment(&store, &mut manifest, &Plain).expect("increment"));
 
     // Restore the chain at Latest into a fresh device, then probe liveness of every node. This is
     // the PRIMARY fail-before/pass-after assertion: the in-flight txn's data must be ABSENT.
@@ -572,7 +572,7 @@ fn base_only_chain_equals_a_plain_restore() {
     commit_edge(&mut store, TxnId(1), "KNOWS");
     commit_edge(&mut store, TxnId(2), "LIKES");
 
-    let (manifest, base_link) = begin_chain(&mut store, &Plain).expect("begin");
+    let (manifest, base_link) = begin_chain(&store, &Plain).expect("begin");
     let links = ChainLinks {
         base: base_link.clone(),
         increments: Vec::new(),
@@ -610,7 +610,7 @@ fn base_only_chain_equals_a_plain_restore() {
 fn build_two_increment_chain() -> (ChainManifest, ChainLinks) {
     let mut store = fresh(64);
     commit_edge(&mut store, TxnId(1), "SEED");
-    let (mut manifest, base_link) = begin_chain(&mut store, &Plain).expect("begin");
+    let (mut manifest, base_link) = begin_chain(&store, &Plain).expect("begin");
     let mut links = ChainLinks {
         base: base_link,
         increments: Vec::new(),
@@ -618,11 +618,11 @@ fn build_two_increment_chain() -> (ChainManifest, ChainLinks) {
     commit_edge(&mut store, TxnId(2), "A");
     links
         .increments
-        .push(capture_increment(&mut store, &mut manifest, &Plain).expect("inc1"));
+        .push(capture_increment(&store, &mut manifest, &Plain).expect("inc1"));
     commit_edge(&mut store, TxnId(3), "B");
     links
         .increments
-        .push(capture_increment(&mut store, &mut manifest, &Plain).expect("inc2"));
+        .push(capture_increment(&store, &mut manifest, &Plain).expect("inc2"));
     (manifest, links)
 }
 
@@ -667,9 +667,9 @@ fn restore_chain_file_atomic_round_trips_at_latest() {
     )
     .expect("atomic chain restore");
     let dev = FileBlockDevice::open(&path).expect("reopen file");
-    let mut store = RecordStore::open(dev, WalManager::create(MemLogSink::new()).unwrap(), 64)
+    let store = RecordStore::open(dev, WalManager::create(MemLogSink::new()).unwrap(), 64)
         .expect("open restored store");
-    let actual = backup_store(&mut store).expect("backup restored store");
+    let actual = backup_store(&store).expect("backup restored store");
 
     assert_eq!(
         page_section(&expected),
@@ -799,7 +799,7 @@ impl LinkCodec for XorCodec {
 fn sealed_chain(codec: &XorCodec) -> (ChainManifest, ChainLinks, Vec<u8>) {
     let mut store = fresh(64);
     commit_edge(&mut store, TxnId(1), "SEED");
-    let (mut manifest, base_link) = begin_chain(&mut store, codec).expect("begin sealed");
+    let (mut manifest, base_link) = begin_chain(&store, codec).expect("begin sealed");
     let mut links = ChainLinks {
         base: base_link,
         increments: Vec::new(),
@@ -807,7 +807,7 @@ fn sealed_chain(codec: &XorCodec) -> (ChainManifest, ChainLinks, Vec<u8>) {
     commit_edge(&mut store, TxnId(2), "MORE");
     links
         .increments
-        .push(capture_increment(&mut store, &mut manifest, codec).expect("sealed inc"));
+        .push(capture_increment(&store, &mut manifest, codec).expect("sealed inc"));
 
     let live_artifact = {
         let device = live_device_image(&mut store);
@@ -931,8 +931,8 @@ fn chain_artifact_file_round_trip_preserves_all_committed_nodes() {
     assert_eq!(live_before, 6, "six live nodes seeded");
 
     // The server's capture: begin_chain (base + checkpoint) then one capture_increment.
-    let (mut manifest, base) = begin_chain(&mut store, &Plain).expect("begin chain");
-    let inc = capture_increment(&mut store, &mut manifest, &Plain).expect("capture");
+    let (mut manifest, base) = begin_chain(&store, &Plain).expect("begin chain");
+    let inc = capture_increment(&store, &mut manifest, &Plain).expect("capture");
     let artifact = ChainArtifact {
         manifest,
         links: ChainLinks {

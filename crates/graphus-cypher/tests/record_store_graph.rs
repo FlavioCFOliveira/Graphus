@@ -1231,7 +1231,7 @@ fn deleting_a_relationship_frees_its_property_chain() {
 
     // Delete the relationship (its endpoints survive). DETACH is unnecessary — `r` has no further
     // edges — but DELETE r alone suffices once the edge is matched.
-    let (_r, mut store) = run_commit("MATCH ()-[r:KNOWS]->() DELETE r", store, 2);
+    let (_r, store) = run_commit("MATCH ()-[r:KNOWS]->() DELETE r", store, 2);
 
     // DELETE is an MVCC tombstone now (`rmp` task #45): the relationship and its property/overflow
     // records are only physically reclaimed by a committed GC pass once no live snapshot can see the
@@ -1248,7 +1248,7 @@ fn deleting_a_relationship_frees_its_property_chain() {
         "deleting the relationship freed every overflow chain (no block leak)"
     );
     // A full consistency pass is clean: no dangling property record, no leaked block, free lists sane.
-    let rep = graphus_storage::check::check_store(&mut store, &[]).expect("checker runs");
+    let rep = graphus_storage::check::check_store(&store, &[]).expect("checker runs");
     assert!(
         rep.is_consistent(),
         "store is consistent after relationship delete: {:?}",

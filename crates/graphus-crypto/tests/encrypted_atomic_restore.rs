@@ -29,7 +29,7 @@ fn build_artifact() -> Vec<u8> {
     use graphus_io::MemBlockDevice;
     let device = MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new()).expect("wal");
-    let mut store = RecordStore::create(device, wal, 64, 1).expect("create store");
+    let store = RecordStore::create(device, wal, 64, 1).expect("create store");
     let txn = TxnId(1);
     store.begin(txn);
     let rt = store.intern_token(Namespace::RelType, "KNOWS").unwrap();
@@ -39,7 +39,7 @@ fn build_artifact() -> Vec<u8> {
     store.add_node_property(txn, a, key, 2, 42).unwrap();
     store.create_rel(txn, rt, a, b).unwrap();
     store.commit(txn).unwrap();
-    backup_store(&mut store).expect("backup")
+    backup_store(&store).expect("backup")
 }
 
 #[test]
@@ -72,13 +72,13 @@ fn restore_file_atomic_round_trips_over_an_encrypted_device() {
 
     // Reopen the encrypted store with the right key and re-prove consistency.
     let device = EncryptedFileDevice::open_file(&path, &keyring).expect("reopen encrypted");
-    let mut store = RecordStore::open(device, WalManager::create(MemLogSink::new()).unwrap(), 64)
+    let store = RecordStore::open(device, WalManager::create(MemLogSink::new()).unwrap(), 64)
         .expect("open restored encrypted store");
-    verify_on_open(&mut store, &[]).expect("restored encrypted store is consistent");
+    verify_on_open(&store, &[]).expect("restored encrypted store is consistent");
 
     // Re-backing-up the restored encrypted store reproduces the original artifact byte-for-byte:
     // encryption is transparent above the device seam, so the captured page images are identical.
-    let re_artifact = backup_store(&mut store).expect("re-backup");
+    let re_artifact = backup_store(&store).expect("re-backup");
     assert_eq!(
         artifact, re_artifact,
         "restored encrypted store must reproduce the original plaintext image exactly"

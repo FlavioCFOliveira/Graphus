@@ -239,8 +239,8 @@ fn run(arm: bool) -> Outcome {
         Err(e) => format!("{e}"),
     };
     let (reopen_consistent, live_nodes) = match reopen {
-        Ok(mut s) => {
-            let report = check_store(&mut s, &[]).expect("consistency check runs");
+        Ok(s) => {
+            let report = check_store(&s, &[]).expect("consistency check runs");
             (report.is_consistent(), report.live_nodes)
         }
         Err(_) => (false, 0),

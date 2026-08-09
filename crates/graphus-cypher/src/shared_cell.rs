@@ -310,6 +310,79 @@ impl<T: std::fmt::Debug> std::fmt::Debug for SharedGuard<'_, T> {
     }
 }
 
+/// A shared handle to a `T` **that needs no lock at all** — the end state [`SharedCell`] was the step
+/// towards (`rmp` #1033, layer 7b of #975).
+///
+/// `SharedCell` exists because the coordinator's members were reached through `&mut self` methods, so
+/// sharing them between threads required serialising every access. Once a type's whole API takes
+/// `&self` — which is what layers 1 to 7a did to [`RecordStore`](graphus_storage::RecordStore) — that
+/// serialisation protects nothing: the type's own latches already order what has to be ordered, at the
+/// granularity of the operation rather than of the statement. Keeping the outer `Mutex` would just
+/// mean every writer waits for the whole statement of every other writer, which is precisely the
+/// single-writer engine this sprint set out to retire.
+///
+/// The method names are [`SharedCell`]'s, deliberately: `borrow` and `borrow_mut` both hand back a
+/// plain `&T`, so 432 call sites migrate by changing one field's type. `borrow_mut` keeping its name
+/// while returning `&T` reads oddly on its own, and it is the honest description of what changed —
+/// the call sites did not stop mutating the store, the store stopped needing exclusive access to be
+/// mutated.
+#[derive(Debug)]
+pub struct SharedRef<T> {
+    inner: Arc<T>,
+}
+
+impl<T> SharedRef<T> {
+    /// Wraps `value` in a shared, lock-free handle.
+    #[must_use]
+    pub fn new(value: T) -> Self {
+        Self {
+            inner: Arc::new(value),
+        }
+    }
+
+    /// Borrows the value. No lock is taken and none is needed.
+    // `clippy::should_implement_trait`: the name mirrors `SharedCell`/`RefCell` on purpose — it is what
+    // lets 432 call sites migrate untouched — and implementing `std::borrow::Borrow` instead would not
+    // give them that, since they call the method by name.
+    #[allow(clippy::should_implement_trait)]
+    #[must_use]
+    #[inline]
+    pub fn borrow(&self) -> &T {
+        &self.inner
+    }
+
+    /// Borrows the value for mutation through its own `&self` API. Identical to
+    /// [`borrow`](Self::borrow) — see the type docs for why the name is kept.
+    #[must_use]
+    #[inline]
+    pub fn borrow_mut(&self) -> &T {
+        &self.inner
+    }
+
+    /// The underlying handle, for a caller that has to hand the value to another thread.
+    #[must_use]
+    #[inline]
+    pub fn share(&self) -> Arc<T> {
+        Arc::clone(&self.inner)
+    }
+
+    /// Unwraps the value when this is the sole handle; returns `self` back when it is not.
+    ///
+    /// # Errors
+    /// Returns the handle unchanged if another one still exists.
+    pub fn into_inner(self) -> std::result::Result<T, Self> {
+        Arc::try_unwrap(self.inner).map_err(|inner| Self { inner })
+    }
+}
+
+impl<T> Clone for SharedRef<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

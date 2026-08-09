@@ -82,9 +82,9 @@ fn build() -> Fixture {
 /// No false positives: the checker passes on the faithful model.
 #[test]
 fn checker_passes_on_faithful_model() {
-    let mut f = build();
+    let f = build();
     assert_eq!(
-        verify(&mut f.store, &f.model),
+        verify(&f.store, &f.model),
         Ok(()),
         "the checker must pass on a correct recovered state"
     );
@@ -96,7 +96,7 @@ fn checker_catches_a_lost_node() {
     let mut f = build();
     // Claim a never-created node id far past the high-water; the store has no such record page.
     f.model.add_node(9999);
-    let result = verify(&mut f.store, &f.model);
+    let result = verify(&f.store, &f.model);
     assert!(
         matches!(
             result,
@@ -113,7 +113,7 @@ fn checker_catches_an_incidence_mismatch() {
     // Add a phantom relationship incident to node_a that the store does not have on its chain.
     // Use a rel id the store does not map so it surfaces as a mismatch or a store error.
     f.model.add_rel(7777, f.node_a, f.node_b);
-    let result = verify(&mut f.store, &f.model);
+    let result = verify(&f.store, &f.model);
     assert!(
         matches!(
             result,
@@ -134,7 +134,7 @@ fn checker_catches_a_forgotten_committed_rel() {
     // Drop the real relationship from the model's rel map AND its incidence, simulating a checker
     // that under-counts. The store still has rel_ab on a's and b's chains -> incidence mismatch.
     f.model.remove_rel(f.rel_ab);
-    let result = verify(&mut f.store, &f.model);
+    let result = verify(&f.store, &f.model);
     assert!(
         matches!(result, Err(CheckFailure::IncidenceMismatch { .. })),
         "the store's surplus edge must fail the integrity check, got {result:?}"
@@ -153,7 +153,7 @@ fn checker_catches_a_property_mismatch() {
             value_inline: 1,
         },
     );
-    let result = verify(&mut f.store, &f.model);
+    let result = verify(&f.store, &f.model);
     assert!(
         matches!(result, Err(CheckFailure::PropMismatch { .. })),
         "a phantom property must fail the durability check, got {result:?}"
@@ -165,7 +165,7 @@ fn checker_catches_a_property_mismatch() {
 /// non-existent endpoint.
 #[test]
 fn checker_catches_wrong_endpoints() {
-    let mut f = build();
+    let f = build();
     // Rebuild a faithful model EXCEPT rel_ab claims endpoints (a, a) instead of (a, b), so the
     // failure isolates to the endpoint/incidence check rather than an unrelated property mismatch.
     let mut model = Model::new();
@@ -180,7 +180,7 @@ fn checker_catches_wrong_endpoints() {
             value_inline: 4242,
         },
     );
-    let result = verify(&mut f.store, &model);
+    let result = verify(&f.store, &model);
     assert!(
         matches!(
             result,

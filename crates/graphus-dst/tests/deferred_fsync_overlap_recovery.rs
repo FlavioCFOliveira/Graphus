@@ -281,13 +281,13 @@ fn run_deferred_overlap_recovery(seed: u64) -> OverlapReport {
         apply_ops_to_model(&mut model, &kp1_ops);
     }
 
-    let (mut store, recovery_losers) = if steal {
+    let (store, recovery_losers) = if steal {
         crash_steal_deferred(store)
     } else {
         crash_no_force_deferred(store)
     };
 
-    let result = checker::verify(&mut store, &model);
+    let result = checker::verify(&store, &model);
 
     OverlapReport {
         seed,
@@ -464,9 +464,9 @@ fn deferred_fsync_overlap_dropped_tail_is_a_genuine_oracle() {
 
     // (1) Correct recovery — from `durable_bytes()`, which DROPS the tail — matches the model (no prop).
     {
-        let mut recovered = recover_from_image(&correct_image);
+        let recovered = recover_from_image(&correct_image);
         assert!(
-            checker::verify(&mut recovered, &model).is_ok(),
+            checker::verify(&recovered, &model).is_ok(),
             "correct recovery (tail dropped) must match the committed-or-nothing model"
         );
         // n0 has NO property — the un-synced batch was lost whole.
@@ -485,8 +485,8 @@ fn deferred_fsync_overlap_dropped_tail_is_a_genuine_oracle() {
     {
         let mut buggy_image = correct_image.clone();
         buggy_image.extend_from_slice(&unsynced_tail);
-        let mut recovered = recover_from_image(&buggy_image);
-        let verdict = checker::verify(&mut recovered, &model);
+        let recovered = recover_from_image(&buggy_image);
+        let verdict = checker::verify(&recovered, &model);
         assert!(
             matches!(verdict, Err(CheckFailure::PropMismatch { node, .. }) if node == n0),
             "recovery from an image that KEPT the un-synced overlap tail must be caught by the checker \

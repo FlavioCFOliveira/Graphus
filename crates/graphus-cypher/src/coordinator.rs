@@ -63,7 +63,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
-use crate::shared_cell::SharedCell;
+use crate::shared_cell::{SharedCell, SharedRef};
 
 use graphus_core::Value;
 use graphus_core::error::{GraphusError, Result};
@@ -1465,7 +1465,7 @@ pub struct TxnCoordinator<D: BlockDevice, S: LogSink> {
     /// method names and — in a debug build — `RefCell`'s loud failure on re-entrancy, so the swap keeps
     /// a double borrow a panic instead of turning it into a silent deadlock. See
     /// [`crate::shared_cell`].
-    store: SharedCell<RecordStore<D, S>>,
+    store: SharedRef<RecordStore<D, S>>,
     /// The shared SSI dangerous-structure tracker (`04 §5.4`).
     ssi: SharedCell<SsiTracker>,
     /// The shared first-updater-wins write-lock table (`04 §5.7`).
@@ -1844,7 +1844,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // undone and an uncommitted record survives (an atomicity violation). Resuming past the
         // recovered high-water keeps ids globally unique across recovery. (`0` for a fresh store.)
         let recovered_txn_hw = store.recovered_txn_hw();
-        let store = SharedCell::new(store);
+        let store = SharedRef::new(store);
         let index = SharedCell::new(IndexSet::new());
         Self::rebuild_index(&store, &index);
         // Promote any index left `Populating` by an interrupted `rmp` task #91 build: the rebuild
@@ -1862,7 +1862,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // never recovered — a fresh coordinator over a recovered store rebuilds a store-consistent CSR.
         let csr = if crate::read_source::csr_adjacency_enabled() {
             let mut adjacency = crate::csr_adjacency::CsrAdjacency::empty();
-            adjacency.build_from_store(&store.borrow());
+            adjacency.build_from_store(store.borrow());
             Some(SharedCell::new(adjacency))
         } else {
             None
@@ -2040,7 +2040,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// leaves the index `Populating` (withheld from the planner, scan-and-filter fallback stays
     /// correct), to be retried on the next open.
     fn promote_recovered_populating_indexes(
-        store: &SharedCell<RecordStore<D, S>>,
+        store: &SharedRef<RecordStore<D, S>>,
         index: &SharedCell<IndexSet>,
         next_txn_id: u64,
     ) -> u64 {
@@ -2166,7 +2166,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// (Self::list_node_property_indexes) falls back to the freshly-computed auto-name meanwhile, so
     /// reads stay correct. Startup is allowed to block (the engine is not yet serving).
     fn backfill_recovered_index_names(
-        store: &SharedCell<RecordStore<D, S>>,
+        store: &SharedRef<RecordStore<D, S>>,
         next_txn_id: u64,
     ) -> u64 {
         // Which declared node-property indexes carry no durable name? (Legacy anonymous indexes.)
@@ -2203,7 +2203,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 // Compute against the *current* store state (including names assigned earlier in this
                 // same pass) so colliding bases are disambiguated deterministically.
                 let name =
-                    Self::unique_auto_index_name(&store, &label, &property, label_token, prop_key);
+                    Self::unique_auto_index_name(store, &label, &property, label_token, prop_key);
                 store.set_node_property_index_name(txn, name, label_token, prop_key);
             }
         }
@@ -2294,7 +2294,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// (not merely empty) so all consumers degrade to the always-correct store scan (`rmp` task #733).
     /// This matters at run time, not just on open: `rebuild_index` is also driven by index / constraint
     /// DDL.
-    fn rebuild_index(store: &SharedCell<RecordStore<D, S>>, index: &SharedCell<IndexSet>) {
+    fn rebuild_index(store: &SharedRef<RecordStore<D, S>>, index: &SharedCell<IndexSet>) {
         // Recover the durable index catalog (`rmp` task #90) into the in-memory set first: this is
         // what makes registration survive a crash. Done before `clear` (which keeps the registered set
         // but wipes entries) so the rebuild scan below indexes the recovered indexes too.
@@ -2924,7 +2924,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ///
     /// Returns [`None`] when the store scan faults — the caller must then **poison** the build (drop it
     /// un-promoted, leaving the index `Populating` and therefore unused), never resume it.
-    fn resnapshot_build(store: &SharedCell<RecordStore<D, S>>) -> Option<Vec<u64>> {
+    fn resnapshot_build(store: &SharedRef<RecordStore<D, S>>) -> Option<Vec<u64>> {
         // INVARIANT (`rmp` task #733, L1): every incremental build — node-property (`rmp` #91), full-text
         // (#72) and spatial (#98) — walks a snapshot of **node** ids, so one re-snapshot serves all three.
         // The relationship-covering indexes (rel-property, rel-composite, rel-full-text, rel-point,
@@ -2976,7 +2976,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     }
 
     fn index_one_node_composite(
-        store: &SharedCell<RecordStore<D, S>>,
+        store: &SharedRef<RecordStore<D, S>>,
         index: &SharedCell<IndexSet>,
         id: u64,
         registered: &[(u32, Vec<u32>)],
@@ -3101,7 +3101,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// skips that node's entries best-effort: a missing candidate degrades that node to the full-scan
     /// fallback for a reader, never to a wrong row (the candidate-set contract).
     fn index_one_node(
-        store: &SharedCell<RecordStore<D, S>>,
+        store: &SharedRef<RecordStore<D, S>>,
         index: &SharedCell<IndexSet>,
         id: u64,
         registered: &[(u32, u32)],
@@ -3201,7 +3201,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// stale-entry removal is needed. Store and index are borrowed in separate, non-overlapping scopes
     /// (the file's borrow discipline); a read fault skips this relationship best-effort.
     fn index_one_rel(
-        store: &SharedCell<RecordStore<D, S>>,
+        store: &SharedRef<RecordStore<D, S>>,
         index: &SharedCell<IndexSet>,
         id: u64,
         registered: &[(u32, u32)],
@@ -3275,7 +3275,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// skips this relationship best-effort. A relationship missing a covered property (an incomplete
     /// tuple) is left unindexed for that key.
     fn index_one_rel_composite(
-        store: &SharedCell<RecordStore<D, S>>,
+        store: &SharedRef<RecordStore<D, S>>,
         index: &SharedCell<IndexSet>,
         id: u64,
         registered: &[(u32, Vec<u32>)],
@@ -3402,7 +3402,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// skips it best-effort (the candidate-set contract: a missing candidate degrades to the
     /// scan-and-filter fallback for that reader, never a wrong row).
     fn index_one_node_fulltext(
-        store: &SharedCell<RecordStore<D, S>>,
+        store: &SharedRef<RecordStore<D, S>>,
         index: &SharedCell<IndexSet>,
         id: u64,
     ) {
@@ -3514,7 +3514,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// best-effort (the candidate-set contract). The store and the index are borrowed in **separate,
     /// non-overlapping** scopes, the load-bearing discipline of this file.
     fn index_one_rel_fulltext(
-        store: &SharedCell<RecordStore<D, S>>,
+        store: &SharedRef<RecordStore<D, S>>,
         index: &SharedCell<IndexSet>,
         id: u64,
     ) {
@@ -3623,7 +3623,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// [`index_one_node_spatial`](Self::index_one_node_spatial) for why that is the only safe image
     /// (`rmp` #766/#779).
     fn index_one_rel_spatial(
-        store: &SharedCell<RecordStore<D, S>>,
+        store: &SharedRef<RecordStore<D, S>>,
         index: &SharedCell<IndexSet>,
         id: u64,
         registered: &[(u32, u32)],
@@ -3703,7 +3703,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// [`insert_spatial_point`](IndexSet::insert_spatial_point)) stays last-wins, feeding one current
     /// point per key, so the union engages solely here.
     fn index_one_node_spatial(
-        store: &SharedCell<RecordStore<D, S>>,
+        store: &SharedRef<RecordStore<D, S>>,
         index: &SharedCell<IndexSet>,
         id: u64,
         registered: &[(u32, u32)],
@@ -3784,7 +3784,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// key, so the union engages solely here. The store and index are borrowed in **separate,
     /// non-overlapping** scopes (this file's borrow discipline).
     fn index_one_node_text(
-        store: &SharedCell<RecordStore<D, S>>,
+        store: &SharedRef<RecordStore<D, S>>,
         index: &SharedCell<IndexSet>,
         id: u64,
         registered: &[(u32, u32)],
@@ -3847,7 +3847,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// — so a node not carrying the covered label, or whose covered property is absent / malformed,
     /// contributes nothing. Store and index are borrowed in **separate, non-overlapping** scopes.
     fn index_one_node_vector(
-        store: &SharedCell<RecordStore<D, S>>,
+        store: &SharedRef<RecordStore<D, S>>,
         index: &SharedCell<IndexSet>,
         id: u64,
         registered: &[(u32, u32)],
@@ -4005,7 +4005,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// [`index_one_node_vector`](Self::index_one_node_vector) (its structure mirrors
     /// [`index_one_rel_spatial`](Self::index_one_rel_spatial)).
     fn index_one_rel_vector(
-        store: &SharedCell<RecordStore<D, S>>,
+        store: &SharedRef<RecordStore<D, S>>,
         index: &SharedCell<IndexSet>,
         id: u64,
         registered: &[(u32, u32)],
@@ -4121,7 +4121,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// extra membership is a false positive its consumer's re-check drops, while a node it wrongly
     /// OMITS is a committed row no re-check can ever resurrect.
     fn index_one_node_bitmap(
-        store: &SharedCell<RecordStore<D, S>>,
+        store: &SharedRef<RecordStore<D, S>>,
         index: &SharedCell<IndexSet>,
         id: u64,
         registered: &[(u32, u32)],
@@ -4274,7 +4274,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             let label_token = match store.intern_token(Namespace::Label, label) {
                 Ok(t) => t,
                 Err(e) => {
-                    drop(store);
                     let _ = self.store.borrow_mut().rollback(txn);
                     return Err(e);
                 }
@@ -4282,7 +4281,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             let prop_key = match store.intern_token(Namespace::PropKey, property) {
                 Ok(t) => t,
                 Err(e) => {
-                    drop(store);
                     let _ = self.store.borrow_mut().rollback(txn);
                     return Err(e);
                 }
@@ -4296,7 +4294,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             // shows up in `SHOW INDEXES` with a name and is droppable by name). Idempotent: recomputing
             // the auto-name of an index that already carries it is not a collision, so re-declaring the
             // same `(label, property)` keeps the same name.
-            let name = Self::unique_auto_index_name(&store, label, property, label_token, prop_key);
+            let name = Self::unique_auto_index_name(store, label, property, label_token, prop_key);
             store.set_node_property_index_name(txn, name, label_token, prop_key);
             (label_token, prop_key)
         };
@@ -4362,7 +4360,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // 2. Explicit-name global uniqueness (read-only). An omitted name is auto-generated in step 3
         //    (it needs the interned tokens for its deterministic collision suffix).
         if let Some(n) = name
-            && Self::name_in_use(&self.store.borrow(), n)
+            && Self::name_in_use(self.store.borrow(), n)
         {
             return if if_not_exists {
                 Ok(false)
@@ -4382,7 +4380,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             let type_token = match store.intern_token(Namespace::RelType, rel_type) {
                 Ok(t) => t,
                 Err(e) => {
-                    drop(store);
                     let _ = self.store.borrow_mut().rollback(txn);
                     return Err(e);
                 }
@@ -4390,7 +4387,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             let prop_key = match store.intern_token(Namespace::PropKey, property) {
                 Ok(t) => t,
                 Err(e) => {
-                    drop(store);
                     let _ = self.store.borrow_mut().rollback(txn);
                     return Err(e);
                 }
@@ -4398,7 +4394,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             let effective_name = match name {
                 Some(n) => n.to_owned(),
                 None => Self::unique_auto_rel_index_name(
-                    &store, rel_type, property, type_token, prop_key,
+                    store, rel_type, property, type_token, prop_key,
                 ),
             };
             store.set_rel_property_index(txn, type_token, prop_key, IndexState::Online);
@@ -4582,7 +4578,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ) -> Result<bool> {
         let resolved = {
             let store = self.store.borrow();
-            match Self::resolve_property_tokens(&store, label, properties) {
+            match Self::resolve_property_tokens(store, label, properties) {
                 Some((label_token, property_tokens)) => store
                     .composite_index_name_for(label_token, &property_tokens)
                     .map(|name| (name.to_owned(), label_token, property_tokens)),
@@ -4677,7 +4673,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ) -> Result<bool> {
         let resolved = {
             let store = self.store.borrow();
-            match Self::resolve_rel_property_tokens(&store, rel_type, properties) {
+            match Self::resolve_rel_property_tokens(store, rel_type, properties) {
                 Some((type_token, property_tokens)) => store
                     .rel_composite_index_name_for(type_token, &property_tokens)
                     .map(|name| (name.to_owned(), type_token, property_tokens)),
@@ -4804,7 +4800,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             let label_token = match store.intern_token(Namespace::Label, label) {
                 Ok(t) => t,
                 Err(e) => {
-                    drop(store);
                     let _ = self.store.borrow_mut().rollback(txn);
                     return Err(e);
                 }
@@ -4812,7 +4807,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             let prop_key = match store.intern_token(Namespace::PropKey, property) {
                 Ok(t) => t,
                 Err(e) => {
-                    drop(store);
                     let _ = self.store.borrow_mut().rollback(txn);
                     return Err(e);
                 }
@@ -4864,7 +4858,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             let label_token = match store.intern_token(Namespace::Label, label) {
                 Ok(t) => t,
                 Err(e) => {
-                    drop(store);
                     let _ = self.store.borrow_mut().rollback(txn);
                     return Err(e);
                 }
@@ -4872,7 +4865,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             let prop_key = match store.intern_token(Namespace::PropKey, property) {
                 Ok(t) => t,
                 Err(e) => {
-                    drop(store);
                     let _ = self.store.borrow_mut().rollback(txn);
                     return Err(e);
                 }
@@ -4947,7 +4939,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let store = self.store.borrow();
         let label_token = store.token_id(Namespace::Label, label)?;
         let prop_key = store.token_id(Namespace::PropKey, property)?;
-        drop(store);
         self.index
             .borrow()
             .seek_bitmap_eq(label_token, prop_key, value)
@@ -4970,7 +4961,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             let prop_key = store.token_id(Namespace::PropKey, property)?;
             resolved.push((prop_key, value));
         }
-        drop(store);
         self.index
             .borrow()
             .seek_bitmap_conjunction(label_token, &resolved)
@@ -4984,7 +4974,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let store = self.store.borrow();
         let label_token = store.token_id(Namespace::Label, label)?;
         let prop_key = store.token_id(Namespace::PropKey, property)?;
-        drop(store);
         self.index
             .borrow()
             .bitmap_serialized_bytes(label_token, prop_key)
@@ -5018,7 +5007,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             let label_token = match store.intern_token(Namespace::Label, label) {
                 Ok(t) => t,
                 Err(e) => {
-                    drop(store);
                     let _ = self.store.borrow_mut().rollback(txn);
                     return Err(e);
                 }
@@ -5026,7 +5014,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             let prop_key = match store.intern_token(Namespace::PropKey, property) {
                 Ok(t) => t,
                 Err(e) => {
-                    drop(store);
                     let _ = self.store.borrow_mut().rollback(txn);
                     return Err(e);
                 }
@@ -5089,7 +5076,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 let labels = match store.node_label_superset(id) {
                     Ok(l) => l,
                     Err(_) => {
-                        drop(store);
                         self.zones
                             .borrow_mut()
                             .abandon_column(label_token, prop_key);
@@ -5099,7 +5085,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 let chain = match store.superset_scan_node_property_values(id) {
                     Ok(c) => c,
                     Err(_) => {
-                        drop(store);
                         self.zones
                             .borrow_mut()
                             .abandon_column(label_token, prop_key);
@@ -5162,7 +5147,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// surviving candidate is then historical. Serving an older snapshot is not this structure's job —
     /// that reader's witness check fails and it falls back to the authoritative chain read.
     fn rebuild_columns(
-        store: &SharedCell<RecordStore<D, S>>,
+        store: &SharedRef<RecordStore<D, S>>,
         columns: &SharedCell<crate::column_cache::ColumnCache>,
     ) {
         // The declared columns, captured before the scan so the cache is not borrowed across a store
@@ -5261,7 +5246,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let store = self.store.borrow();
         let label_token = store.token_id(Namespace::Label, label)?;
         let prop_key = store.token_id(Namespace::PropKey, property)?;
-        drop(store);
         self.columns.borrow().column_len(label_token, prop_key)
     }
 
@@ -5420,7 +5404,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // 2. Explicit-name global uniqueness (read-only). An omitted name is auto-generated in step 3
         //    (it needs the interned tokens for its deterministic collision suffix).
         if let Some(n) = name
-            && Self::name_in_use(&self.store.borrow(), n)
+            && Self::name_in_use(self.store.borrow(), n)
         {
             return if if_not_exists {
                 Ok(false) // idempotent no-op: nothing was added.
@@ -5440,7 +5424,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             let label_token = match store.intern_token(Namespace::Label, label) {
                 Ok(t) => t,
                 Err(e) => {
-                    drop(store);
                     let _ = self.store.borrow_mut().rollback(txn);
                     return Err(e);
                 }
@@ -5448,16 +5431,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             let prop_key = match store.intern_token(Namespace::PropKey, property) {
                 Ok(t) => t,
                 Err(e) => {
-                    drop(store);
                     let _ = self.store.borrow_mut().rollback(txn);
                     return Err(e);
                 }
             };
             let effective_name = match name {
                 Some(n) => n.to_owned(),
-                None => {
-                    Self::unique_auto_index_name(&store, label, property, label_token, prop_key)
-                }
+                None => Self::unique_auto_index_name(store, label, property, label_token, prop_key),
             };
             store.set_node_property_index(txn, label_token, prop_key, IndexState::Populating);
             store.set_node_property_index_name(txn, effective_name, label_token, prop_key);
@@ -5547,7 +5527,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         //    cover this tuple, so no equivalent exists).
         let equivalent_exists = {
             let store = self.store.borrow();
-            match Self::resolve_property_tokens(&store, label, properties) {
+            match Self::resolve_property_tokens(store, label, properties) {
                 Some((label_token, property_tokens)) => store
                     .composite_index_name_for(label_token, &property_tokens)
                     .is_some(),
@@ -5564,7 +5544,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
 
         // 2. Explicit-name global uniqueness (read-only). An omitted name is auto-generated in step 3.
         if let Some(n) = name
-            && Self::name_in_use(&self.store.borrow(), n)
+            && Self::name_in_use(self.store.borrow(), n)
         {
             return if if_not_exists {
                 Ok(false)
@@ -5583,7 +5563,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             let label_token = match store.intern_token(Namespace::Label, label) {
                 Ok(t) => t,
                 Err(e) => {
-                    drop(store);
                     let _ = self.store.borrow_mut().rollback(txn);
                     return Err(e);
                 }
@@ -5593,7 +5572,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 match store.intern_token(Namespace::PropKey, property) {
                     Ok(t) => property_tokens.push(t),
                     Err(e) => {
-                        drop(store);
                         let _ = self.store.borrow_mut().rollback(txn);
                         return Err(e);
                     }
@@ -5602,7 +5580,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             let effective_name = match name {
                 Some(n) => n.to_owned(),
                 None => Self::unique_auto_composite_index_name(
-                    &store,
+                    store,
                     label,
                     properties,
                     label_token,
@@ -5775,7 +5753,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         //    cover this tuple, so no equivalent exists).
         let equivalent_exists = {
             let store = self.store.borrow();
-            match Self::resolve_rel_property_tokens(&store, rel_type, properties) {
+            match Self::resolve_rel_property_tokens(store, rel_type, properties) {
                 Some((type_token, property_tokens)) => store
                     .rel_composite_index_name_for(type_token, &property_tokens)
                     .is_some(),
@@ -5792,7 +5770,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
 
         // 2. Explicit-name global uniqueness (read-only). An omitted name is auto-generated in step 3.
         if let Some(n) = name
-            && Self::name_in_use(&self.store.borrow(), n)
+            && Self::name_in_use(self.store.borrow(), n)
         {
             return if if_not_exists {
                 Ok(false)
@@ -5811,7 +5789,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             let type_token = match store.intern_token(Namespace::RelType, rel_type) {
                 Ok(t) => t,
                 Err(e) => {
-                    drop(store);
                     let _ = self.store.borrow_mut().rollback(txn);
                     return Err(e);
                 }
@@ -5821,7 +5798,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 match store.intern_token(Namespace::PropKey, property) {
                     Ok(t) => property_tokens.push(t),
                     Err(e) => {
-                        drop(store);
                         let _ = self.store.borrow_mut().rollback(txn);
                         return Err(e);
                     }
@@ -5830,7 +5806,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             let effective_name = match name {
                 Some(n) => n.to_owned(),
                 None => Self::unique_auto_rel_composite_index_name(
-                    &store,
+                    store,
                     rel_type,
                     properties,
                     type_token,
@@ -5988,7 +5964,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // Names are globally unique across every schema catalog (`rmp` task #624): reject a name already
         // used by a *different* catalog. Re-declaring within the full-text catalog keeps its historical
         // replace semantics (a name it already owns is not "used by another catalog").
-        if Self::name_used_by_other_catalog(&self.store.borrow(), name, NameCatalog::Fulltext) {
+        if Self::name_used_by_other_catalog(self.store.borrow(), name, NameCatalog::Fulltext) {
             return Err(index_name_in_use(name));
         }
 
@@ -6009,7 +5985,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                         }
                     }
                     Err(e) => {
-                        drop(store);
                         let _ = self.store.borrow_mut().rollback(txn);
                         return Err(e);
                     }
@@ -6020,7 +5995,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 match store.intern_token(Namespace::PropKey, property) {
                     Ok(t) => property_tokens.push(t),
                     Err(e) => {
-                        drop(store);
                         let _ = self.store.borrow_mut().rollback(txn);
                         return Err(e);
                     }
@@ -6105,7 +6079,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         {
             return Ok(false);
         }
-        if Self::name_used_by_other_catalog(&self.store.borrow(), name, NameCatalog::Fulltext) {
+        if Self::name_used_by_other_catalog(self.store.borrow(), name, NameCatalog::Fulltext) {
             return Err(index_name_in_use(name));
         }
 
@@ -6123,7 +6097,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                         }
                     }
                     Err(e) => {
-                        drop(store);
                         let _ = self.store.borrow_mut().rollback(txn);
                         return Err(e);
                     }
@@ -6134,7 +6107,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 match store.intern_token(Namespace::PropKey, property) {
                     Ok(t) => property_tokens.push(t),
                     Err(e) => {
-                        drop(store);
                         let _ = self.store.borrow_mut().rollback(txn);
                         return Err(e);
                     }
@@ -6333,7 +6305,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         }
         // Names are globally unique across every schema catalog (`rmp` task #624): reject a name already
         // used by a *different* catalog (a re-declare within the spatial catalog keeps replace semantics).
-        if Self::name_used_by_other_catalog(&self.store.borrow(), name, NameCatalog::Spatial) {
+        if Self::name_used_by_other_catalog(self.store.borrow(), name, NameCatalog::Spatial) {
             return Err(index_name_in_use(name));
         }
         // Intern the label + property-key tokens and record the durable catalog entry `Populating`, in
@@ -6346,7 +6318,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             let label_token = match store.intern_token(Namespace::Label, label) {
                 Ok(t) => t,
                 Err(e) => {
-                    drop(store);
                     let _ = self.store.borrow_mut().rollback(txn);
                     return Err(e);
                 }
@@ -6354,7 +6325,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             let prop_key = match store.intern_token(Namespace::PropKey, property) {
                 Ok(t) => t,
                 Err(e) => {
-                    drop(store);
                     let _ = self.store.borrow_mut().rollback(txn);
                     return Err(e);
                 }
@@ -6432,7 +6402,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             return Ok(false);
         }
         // Names are globally unique across every schema catalog (`rmp` task #624).
-        if Self::name_used_by_other_catalog(&self.store.borrow(), name, NameCatalog::Spatial) {
+        if Self::name_used_by_other_catalog(self.store.borrow(), name, NameCatalog::Spatial) {
             return Err(index_name_in_use(name));
         }
         // Intern the rel-type + property-key tokens and record the durable catalog entry `Online`
@@ -6445,7 +6415,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             let type_token = match store.intern_token(Namespace::RelType, rel_type) {
                 Ok(t) => t,
                 Err(e) => {
-                    drop(store);
                     let _ = self.store.borrow_mut().rollback(txn);
                     return Err(e);
                 }
@@ -6453,7 +6422,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             let prop_key = match store.intern_token(Namespace::PropKey, property) {
                 Ok(t) => t,
                 Err(e) => {
-                    drop(store);
                     let _ = self.store.borrow_mut().rollback(txn);
                     return Err(e);
                 }
@@ -6507,7 +6475,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         }
         let props = [property.to_owned()];
         let Some((label_token, property_tokens)) =
-            Self::resolve_property_tokens(&store, label, &props)
+            Self::resolve_property_tokens(store, label, &props)
         else {
             return false;
         };
@@ -6692,7 +6660,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // 2. Names are globally unique across every schema catalog (`rmp` task #624): reject a name
         //    already used by a *different* catalog (a re-declare within the text catalog is caught by the
         //    equivalence check above, so it never reaches here).
-        if Self::name_used_by_other_catalog(&self.store.borrow(), name, NameCatalog::Text) {
+        if Self::name_used_by_other_catalog(self.store.borrow(), name, NameCatalog::Text) {
             return if if_not_exists {
                 Ok(false)
             } else {
@@ -6709,7 +6677,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             let label_token = match store.intern_token(Namespace::Label, label) {
                 Ok(t) => t,
                 Err(e) => {
-                    drop(store);
                     let _ = self.store.borrow_mut().rollback(txn);
                     return Err(e);
                 }
@@ -6717,7 +6684,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             let prop_key = match store.intern_token(Namespace::PropKey, property) {
                 Ok(t) => t,
                 Err(e) => {
-                    drop(store);
                     let _ = self.store.borrow_mut().rollback(txn);
                     return Err(e);
                 }
@@ -6807,7 +6773,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         }
         let props = [property.to_owned()];
         let Some((label_token, property_tokens)) =
-            Self::resolve_property_tokens(&store, label, &props)
+            Self::resolve_property_tokens(store, label, &props)
         else {
             return false;
         };
@@ -6956,7 +6922,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
 
         // 2. Explicit-name global uniqueness (read-only). An omitted name is auto-generated in step 3.
         if let Some(n) = name
-            && Self::name_in_use(&self.store.borrow(), n)
+            && Self::name_in_use(self.store.borrow(), n)
         {
             return if if_not_exists {
                 Ok(false)
@@ -6975,7 +6941,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             let token = match store.intern_token(namespace, covering) {
                 Ok(t) => t,
                 Err(e) => {
-                    drop(store);
                     let _ = self.store.borrow_mut().rollback(txn);
                     return Err(e);
                 }
@@ -6983,14 +6948,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             let prop_key = match store.intern_token(Namespace::PropKey, property) {
                 Ok(t) => t,
                 Err(e) => {
-                    drop(store);
                     let _ = self.store.borrow_mut().rollback(txn);
                     return Err(e);
                 }
             };
             let effective_name = match name {
                 Some(n) => n.to_owned(),
-                None => Self::unique_auto_vector_index_name(&store, entity, covering, property),
+                None => Self::unique_auto_vector_index_name(store, entity, covering, property),
             };
             store.set_vector_index(
                 txn,
@@ -7756,7 +7720,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // used by a *different* catalog (a re-declare within the constraint catalog keeps its semantics).
         // Checked BEFORE the concurrency guard below so a permanent error is reported as one, rather
         // than as a condition a retry could clear.
-        if Self::name_used_by_other_catalog(&self.store.borrow(), name, NameCatalog::Constraint) {
+        if Self::name_used_by_other_catalog(self.store.borrow(), name, NameCatalog::Constraint) {
             return Err(index_name_in_use(name));
         }
         // Never decide a constraint on data that is not yet decided (`rmp` task #902). Re-checked here
@@ -8396,7 +8360,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ) -> Result<Option<Value>> {
         let store = self.store.borrow();
         let decided = store.decision_scan_node_properties(id, snapshot)?;
-        Self::decided_value_for_key(&store, &decided, prop_key)
+        Self::decided_value_for_key(store, &decided, prop_key)
     }
 
     /// The value relationship `id` holds for property-key token `prop_key` as of `snapshot`
@@ -8415,7 +8379,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ) -> Result<Option<Value>> {
         let store = self.store.borrow();
         let decided = store.decision_scan_rel_properties(id, snapshot)?;
-        Self::decided_value_for_key(&store, &decided, prop_key)
+        Self::decided_value_for_key(store, &decided, prop_key)
     }
 
     /// Decodes the version of `prop_key` an already-narrowed [`DecidedProperties`] holds, or [`None`]
@@ -9308,7 +9272,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         if node_keys.is_empty() && rel_keys.is_empty() {
             return false;
         }
-        let resolved = |writers: &[TxnId], store: &SharedCell<RecordStore<D, S>>| {
+        let resolved = |writers: &[TxnId], store: &SharedRef<RecordStore<D, S>>| {
             let store = store.borrow();
             writers.iter().all(|&w| !store.is_txn_active(w))
         };
@@ -9514,7 +9478,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // `CommitRegistry::outcome` (see `active_writer_holds_newest_covered`). Here the naive predicate
         // would have been dead in the OPPOSITE direction: reporting every writer resolved would make the
         // repair fire immediately and re-park in a loop, re-scanning the store on every command.
-        let resolved = |writers: &[TxnId], store: &SharedCell<RecordStore<D, S>>| {
+        let resolved = |writers: &[TxnId], store: &SharedRef<RecordStore<D, S>>| {
             let store = store.borrow();
             writers.iter().all(|&w| !store.is_txn_active(w))
         };
@@ -10828,7 +10792,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 Some((type_token, prop_key, cx, cy, r))
             })
             .collect();
-        drop(store);
         // One `borrow_mut`, nine per-kind captures merged into one memo. RANGE/COMPOSITE (node and rel)
         // and equality ride the shared rebuild watermark; TEXT and SPATIAL ride the ft/spatial marker.
         let mut index = self.index.borrow_mut();
@@ -10910,7 +10873,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         }
         for label in node_requests {
             let count = match label.as_deref() {
-                Some(l) => crate::store_statistics::nodes_with_label(&store, l),
+                Some(l) => crate::store_statistics::nodes_with_label(store, l),
                 None => store.total_node_count(),
             };
             capture.insert_nodes(label, count);
@@ -10923,7 +10886,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             } else {
                 types
                     .iter()
-                    .map(|t| crate::store_statistics::relationships_with_type(&store, t))
+                    .map(|t| crate::store_statistics::relationships_with_type(store, t))
                     .sum()
             };
             capture.insert_rels(types, count);
@@ -11327,7 +11290,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // released, because the collection reads the store and then writes the index, and this engine
         // never holds those two at once (`record_graph::reindex_node`'s two-phase discipline).
         let dead = store.take_dead_index_keys();
-        drop(store);
         let collected = self.collect_dead_index_keys(gc_txn, &dead);
         let totals = &mut self.index_collection_totals;
         totals.entries_removed += collected.entries_removed as u64;
@@ -11448,7 +11410,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             let (evidence, ts_before, clock) = {
                 let store = self.store.borrow();
                 let before = store.snapshot_ts();
-                let evidence = Self::read_dead_key_evidence(&store, batch, &covered);
+                let evidence = Self::read_dead_key_evidence(store, batch, &covered);
                 // The clock handle, taken while the store is held; read again below WITHOUT it.
                 (evidence, before, store.commit_clock())
             };
@@ -11885,7 +11847,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// Runs `f` with **mutable** access to the underlying store, without consuming the coordinator.
     ///
     /// This is the lending counterpart to [`into_store`](Self::into_store): it gives storage-level
-    /// maintenance that needs `&mut RecordStore` (a backup capture, an explicit checkpoint) a way to
+    /// maintenance that needs `&RecordStore` (a backup capture, an explicit checkpoint) a way to
     /// run *between* commands on the single engine thread and leave the coordinator usable afterwards.
     /// The store is borrowed for exactly the duration of `f`; do not call back into the coordinator
     /// from within `f` (it would re-borrow the same `RefCell`).
@@ -11894,9 +11856,11 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// Panics if the store is already borrowed (a live statement seam from
     /// [`statement`](Self::statement) is held, or `f` re-enters the coordinator) — the same misuse
     /// [`into_store`](Self::into_store) rejects.
-    pub fn with_store_mut<R>(&self, f: impl FnOnce(&mut RecordStore<D, S>) -> R) -> R {
-        let mut store = self.store.borrow_mut();
-        f(&mut store)
+    pub fn with_store_mut<R>(&self, f: impl FnOnce(&RecordStore<D, S>) -> R) -> R {
+        // `&` rather than `&mut` since `rmp` #1032: the store's whole API takes `&self`, so exclusive
+        // access buys nothing and would re-serialise what layer 7b exists to unserialise. The name is
+        // unchanged because the callers' intent — reach the store to MUTATE it — is unchanged.
+        f(self.store.borrow_mut())
     }
 
     /// Mints one fresh, coordinator-issued [`TxnId`] from [`Self::next_txn_id`](Self#structfield.next_txn_id)
@@ -11928,11 +11892,10 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// # Panics
     /// Panics if the store is already borrowed (a live statement seam, or `f` re-enters the
     /// coordinator).
-    pub fn raw_txn<R>(&mut self, f: impl FnOnce(TxnId, &mut RecordStore<D, S>) -> R) -> R {
+    pub fn raw_txn<R>(&mut self, f: impl FnOnce(TxnId, &RecordStore<D, S>) -> R) -> R {
         self.next_txn_id += 1;
         let txn = TxnId(self.next_txn_id);
-        let mut store = self.store.borrow_mut();
-        f(txn, &mut store)
+        f(txn, self.store.borrow_mut())
     }
 
     /// Aborts `txn`: store undo, SSI forget, lock release, and removal from the open set.
@@ -12126,7 +12089,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
 /// drift.
 pub struct CoordinatorStatistics<D: BlockDevice, S: LogSink> {
     /// A clone of the coordinator's shared store handle (see the borrow-discipline doc above).
-    store: SharedCell<RecordStore<D, S>>,
+    store: SharedRef<RecordStore<D, S>>,
 }
 
 impl<D: BlockDevice, S: LogSink> CoordinatorStatistics<D, S> {
@@ -12135,7 +12098,7 @@ impl<D: BlockDevice, S: LogSink> CoordinatorStatistics<D, S> {
     /// fallback) because compile-time statistics are advisory and have no error channel — never a
     /// panic, never a failed compilation.
     fn decode_histogram(&self, label: &str, property: &str) -> Option<PropertyHistogram> {
-        store_statistics::decode_histogram(&self.store.borrow(), label, property)
+        store_statistics::decode_histogram(self.store.borrow(), label, property)
             .ok()
             .flatten()
     }
@@ -12150,7 +12113,7 @@ impl<D: BlockDevice, S: LogSink> Statistics for CoordinatorStatistics<D, S> {
         // Exact per-label catalogue counts (`rmp` task #79): a never-interned label is an exact
         // `Some(0)`, never the `None` "unknown" sentinel.
         Some(store_statistics::nodes_with_label(
-            &self.store.borrow(),
+            self.store.borrow(),
             label,
         ))
     }
@@ -12162,7 +12125,7 @@ impl<D: BlockDevice, S: LogSink> Statistics for CoordinatorStatistics<D, S> {
     fn relationships_with_type(&self, rel_type: &str) -> Option<u64> {
         // Exact per-relationship-type catalogue counts; a never-interned type is an exact 0.
         Some(store_statistics::relationships_with_type(
-            &self.store.borrow(),
+            self.store.borrow(),
             rel_type,
         ))
     }
@@ -12170,11 +12133,11 @@ impl<D: BlockDevice, S: LogSink> Statistics for CoordinatorStatistics<D, S> {
     fn rels_from_label_with_type(&self, start_label: &str, rel_type: &str) -> Option<u64> {
         // Exact `(startLabel, type)` directional counts (`rmp` task #856), or `None` when this
         // catalogue holds no directional projections at all — see `store_statistics`.
-        store_statistics::rels_from_label_with_type(&self.store.borrow(), start_label, rel_type)
+        store_statistics::rels_from_label_with_type(self.store.borrow(), start_label, rel_type)
     }
 
     fn rels_with_type_to_label(&self, rel_type: &str, end_label: &str) -> Option<u64> {
-        store_statistics::rels_with_type_to_label(&self.store.borrow(), rel_type, end_label)
+        store_statistics::rels_with_type_to_label(self.store.borrow(), rel_type, end_label)
     }
 
     fn estimate_nodes_label_property_eq(

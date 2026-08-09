@@ -27,7 +27,7 @@
 //! Plus focused guards that a restricted RBAC principal and `MemGraph` **decline** the morsel scan, that
 //! the purity gate rejects impure shapes, and that the stable k-way merge reproduces serial tie order.
 
-use graphus_cypher::shared_cell::SharedCell;
+use graphus_cypher::shared_cell::{SharedCell, SharedRef};
 
 use graphus_core::{TxnId, Value};
 use graphus_cypher::authorized_graph::{AuthorizedGraph, PrivilegeOracle};
@@ -255,7 +255,7 @@ fn run_write(coord: &mut TxnCoordinator<MemBlockDevice, MemLogSink>, src: &str) 
 /// SIREAD markers), the lock table, and the populated derived sidecars `attach` requires. Mirrors
 /// `tests/morsel_label_aggregate.rs::Coordinated`.
 struct Coordinated {
-    store: SharedCell<Store>,
+    store: SharedRef<Store>,
     ssi: SharedCell<SsiTracker>,
     index: SharedCell<IndexSet>,
     columns: SharedCell<graphus_cypher::column_cache::ColumnCache>,
@@ -277,7 +277,7 @@ impl Coordinated {
             }
         }
         Self {
-            store: SharedCell::new(store),
+            store: SharedRef::new(store),
             ssi: SharedCell::new(SsiTracker::new()),
             index,
             columns: SharedCell::new(graphus_cypher::column_cache::ColumnCache::new()),

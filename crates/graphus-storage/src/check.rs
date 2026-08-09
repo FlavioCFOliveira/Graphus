@@ -50,7 +50,7 @@
 //!
 //! # Read-only guarantee
 //!
-//! [`check_store`] takes `&mut RecordStore` only because reading a record pins/unpins a buffer-pool
+//! [`check_store`] takes `&RecordStore` only because reading a record pins/unpins a buffer-pool
 //! frame; it performs **no logical mutation** — no WAL append, no record write, no catalog change.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -640,7 +640,7 @@ pub fn assert_cold_open<D: BlockDevice, S: LogSink>(store: &RecordStore<D, S>) {
 }
 
 pub fn check_store<D: BlockDevice, S: LogSink>(
-    store: &mut RecordStore<D, S>,
+    store: &RecordStore<D, S>,
     indexes: &[IndexAgreement],
 ) -> Result<ConsistencyReport> {
     let mut report = ConsistencyReport::default();
@@ -698,7 +698,7 @@ pub fn check_store<D: BlockDevice, S: LogSink>(
 /// Panics (only when the `check-cold-assert` feature is enabled) if the store's buffer pool has
 /// dirty resident pages — i.e. it was not invoked cold-open. The default build does not check.
 pub fn verify_on_open<D: BlockDevice, S: LogSink>(
-    store: &mut RecordStore<D, S>,
+    store: &RecordStore<D, S>,
     indexes: &[IndexAgreement],
 ) -> Result<()> {
     assert_cold_open(store);
@@ -724,7 +724,7 @@ pub fn verify_on_open<D: BlockDevice, S: LogSink>(
 /// Returns [`GraphusError::Storage`] if any violation is found, or propagates a hard I/O failure
 /// from [`check_store`].
 pub fn verify_warm<D: BlockDevice, S: LogSink>(
-    store: &mut RecordStore<D, S>,
+    store: &RecordStore<D, S>,
     indexes: &[IndexAgreement],
 ) -> Result<()> {
     let report = check_store(store, indexes)?;
@@ -851,7 +851,7 @@ impl Scan {
 /// sets. A freed id whose record still reads `in_use` is **not** counted live (the free list is
 /// authoritative for "this slot is dead"); that contradiction is reported by the free-list check.
 fn scan_records<D: BlockDevice, S: LogSink>(
-    store: &mut RecordStore<D, S>,
+    store: &RecordStore<D, S>,
     cat: &Catalog,
     _report: &mut ConsistencyReport,
 ) -> Result<Scan> {
@@ -1019,7 +1019,7 @@ fn scan_records<D: BlockDevice, S: LogSink>(
 
 /// 1. Checksum integrity & page identity (`04 §4.6`, `05 §6`).
 fn check_checksums_and_page_ids<D: BlockDevice, S: LogSink>(
-    store: &mut RecordStore<D, S>,
+    store: &RecordStore<D, S>,
     cat: &Catalog,
     report: &mut ConsistencyReport,
 ) -> Result<()> {
@@ -1083,7 +1083,7 @@ fn check_referential(scan: &Scan, report: &mut ConsistencyReport) {
 /// identical walk over [`RelRecord::first_prop`](crate::record::RelRecord) as the node pass over
 /// `NodeRecord.first_prop`).
 fn check_property_chains<D: BlockDevice, S: LogSink>(
-    _store: &mut RecordStore<D, S>,
+    _store: &RecordStore<D, S>,
     cat: &Catalog,
     scan: &Scan,
     report: &mut ConsistencyReport,
@@ -1176,7 +1176,7 @@ fn check_property_chains<D: BlockDevice, S: LogSink>(
 ///   endpoints (a self-loop counted once per node) must equal the chain-walked incidence of every
 ///   node. This catches a relationship that *should* be in a chain but is missing, and vice-versa.
 fn check_adjacency<D: BlockDevice, S: LogSink>(
-    _store: &mut RecordStore<D, S>,
+    _store: &RecordStore<D, S>,
     cat: &Catalog,
     scan: &Scan,
     report: &mut ConsistencyReport,

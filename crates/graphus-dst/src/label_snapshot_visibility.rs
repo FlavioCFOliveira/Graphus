@@ -110,8 +110,7 @@ fn sees_label(store: &Store, n: u64, owner: TxnId, ts: u64) -> bool {
 fn drive_scenario() -> (Store, u64, LabelSnapshotReport) {
     let device = MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new()).expect("create wal");
-    let store: Store =
-        RecordStore::create(device, wal, POOL_CAPACITY, 1).expect("create store");
+    let store: Store = RecordStore::create(device, wal, POOL_CAPACITY, 1).expect("create store");
     let mut next = 1u64;
 
     // Seed: a committed node carrying the label.

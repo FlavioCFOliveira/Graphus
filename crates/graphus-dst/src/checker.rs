@@ -162,10 +162,7 @@ pub type CheckResult = std::result::Result<(), CheckFailure>;
 ///
 /// # Errors
 /// Returns the first [`CheckFailure`] discovered, or `Ok(())` if every invariant holds.
-pub fn verify<D: BlockDevice, S: LogSink>(
-    store: &mut RecordStore<D, S>,
-    model: &Model,
-) -> CheckResult {
+pub fn verify<D: BlockDevice, S: LogSink>(store: &RecordStore<D, S>, model: &Model) -> CheckResult {
     // --- Durability + atomicity: the recovered graph must equal the model exactly. ---
     // Every committed node is present and live, with the model's incidence, degree and properties.
     for &node in model.nodes() {
@@ -262,7 +259,7 @@ pub fn verify<D: BlockDevice, S: LogSink>(
 ///
 /// `read_device_page` itself errors on a checksum failure; we additionally recompute the checksum
 /// explicitly so a future change to `read_device_page` cannot quietly weaken this check.
-fn verify_page_checksums<D: BlockDevice, S: LogSink>(store: &mut RecordStore<D, S>) -> CheckResult {
+fn verify_page_checksums<D: BlockDevice, S: LogSink>(store: &RecordStore<D, S>) -> CheckResult {
     for page in store.mapped_pages() {
         let bytes = store
             .read_device_page(page)
@@ -292,14 +289,14 @@ fn verify_page_checksums<D: BlockDevice, S: LogSink>(store: &mut RecordStore<D, 
 /// live and genuinely incident); this walk's residual job is to guarantee the forward thread
 /// **terminates** (no cycle) and never revisits a live rel.
 fn check_chain_links<D: BlockDevice, S: LogSink>(
-    store: &mut RecordStore<D, S>,
+    store: &RecordStore<D, S>,
     node: u64,
 ) -> CheckResult {
     /// The forward pointer of relationship `rid` on the side facing `node`, arriving from link
     /// `from` (`0` at the head). For a self-loop both sides face `node`; pick the side whose `prev`
     /// matches `from` (the side we arrived through), exactly as `incident_rels` does.
     fn next_of<D: BlockDevice, S: LogSink>(
-        store: &mut RecordStore<D, S>,
+        store: &RecordStore<D, S>,
         rid: u64,
         node: u64,
         from: u64,

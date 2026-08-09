@@ -68,7 +68,7 @@ fn sealed_backup_round_trips_an_encrypted_store_without_leaking_pages() {
     let (a, b, r, rt) = write_graph(&mut store);
 
     // 1) The plaintext snapshot artifact (plaintext even though the store is encrypted).
-    let artifact = backup_store(&mut store).expect("backup_store");
+    let artifact = backup_store(&store).expect("backup_store");
     // Sanity: the artifact itself carries the label in the clear (it is above the device seam),
     // which is exactly why it must be sealed before it leaves the machine.
     assert!(
@@ -122,7 +122,7 @@ fn sealed_backup_round_trips_an_encrypted_store_without_leaking_pages() {
 fn a_wrong_master_key_cannot_open_a_sealed_backup() {
     let mut store = fresh_encrypted_store();
     let _ = write_graph(&mut store);
-    let artifact = backup_store(&mut store).expect("backup_store");
+    let artifact = backup_store(&store).expect("backup_store");
     let sealed = seal_backup(&artifact, &MASTER).expect("seal_backup");
 
     let wrong = [0x99u8; KEY_LEN];

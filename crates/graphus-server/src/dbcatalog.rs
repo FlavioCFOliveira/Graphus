@@ -712,7 +712,7 @@ fn open_or_create_coordinator(
 
     let device_existing = device_file.metadata().map(|m| m.len() > 0).unwrap_or(false);
 
-    let mut store = if device_existing {
+    let store = if device_existing {
         // Existing store: recover the WAL onto the device, then reopen. Both the device and the WAL
         // are (when a key is configured) encrypted; recovery and reopen run over the `BlockDevice`
         // and `LogSink` seams — transparently decrypted. The WAL subkey is derived from the SAME
@@ -800,7 +800,7 @@ fn open_or_create_coordinator(
     // skipped check but a faithful statement that "indexes are rebuilt, not verified, on the server open
     // path", so divergence is structurally impossible today. The
     // `secondary_indexes_are_rebuilt_not_verified_on_open` test pins this contract.
-    verify_on_open(&mut store, &[])?;
+    verify_on_open(&store, &[])?;
 
     // Hand the exclusive open-lock to the store so it is held for the store's entire lifetime and
     // released only when the store is fully closed (after the final flush), including a force-detached
@@ -2838,10 +2838,10 @@ fn verify_adopted_store(dir: &Path) -> Result<(u64, u64), CatalogError> {
     recover_device(&mut wal, &mut device).map_err(CatalogError::Engine)?;
     // Reopen the WAL fresh for serving (recovery consumed the recovery view), then open + verify.
     let wal = open_wal()?;
-    let mut store = RecordStore::open(device, wal, pool_pages).map_err(CatalogError::Engine)?;
+    let store = RecordStore::open(device, wal, pool_pages).map_err(CatalogError::Engine)?;
     // The inviolable integrity gate: refuse to certify a corrupt store (`&[]`: secondary indexes are
     // rebuilt on open, never separately durable — same rationale as `open_or_create_coordinator`).
-    verify_on_open(&mut store, &[]).map_err(CatalogError::Engine)?;
+    verify_on_open(&store, &[]).map_err(CatalogError::Engine)?;
 
     let nodes = store.scan_node_ids().map_err(CatalogError::Engine)?.len() as u64;
     let relationships = store.scan_rel_ids().map_err(CatalogError::Engine)?.len() as u64;

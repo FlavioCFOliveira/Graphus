@@ -142,12 +142,12 @@ fn import_csv(nodes: &[u8], rels: &[u8]) -> Store {
     let mut imp = BulkImporter::new(fresh_store(), DEFAULT_BATCH_SIZE, b',');
     imp.import_nodes(nodes).expect("import nodes");
     imp.import_relationships(rels).expect("import rels");
-    let (mut store, _stats) = imp.finish();
+    let (store, _stats) = imp.finish();
     // The importer has just written this store and nothing has flushed it, so its buffer pool is
     // WARM by construction (write-back is deferred to a checkpoint). The structural report is exactly
     // what is wanted here and is valid warm; `verify_on_open` is the COLD-open startup hook and
     // asserts the opposite precondition under `--features check-cold-assert`.
-    verify_warm(&mut store, &[]).expect("store consistent");
+    verify_warm(&store, &[]).expect("store consistent");
     store
 }
 

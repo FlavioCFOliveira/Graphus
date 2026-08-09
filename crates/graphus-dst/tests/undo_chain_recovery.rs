@@ -173,7 +173,7 @@ fn run_undo_chain_crash(seed: u64) -> UndoRecoveryReport {
     // redoes them and then undoes the loser, which is the state the chain assertions care about.
     store.with_wal(WalManager::flush);
 
-    let (mut store, recovery_losers) = if steal {
+    let (store, recovery_losers) = if steal {
         crash_steal(store)
     } else {
         crash_no_force(store)
@@ -195,7 +195,7 @@ fn run_undo_chain_crash(seed: u64) -> UndoRecoveryReport {
     // violation left at this point belongs to the incidence chain (the corpse class above); not one
     // of them may be an `UndoChain` / `UndoSlot` fault, because `05 §12.5` promises the undo area
     // needs no recovery path of its own — ARIES redo alone must leave it correct.
-    let pre_gc = graphus_storage::check::check_store(&mut store, &[]).expect("check runs");
+    let pre_gc = graphus_storage::check::check_store(&store, &[]).expect("check runs");
     let undo_faults: Vec<_> = pre_gc
         .violations
         .iter()
@@ -219,7 +219,7 @@ fn run_undo_chain_crash(seed: u64) -> UndoRecoveryReport {
     let gc_report = store.gc(gc, graphus_core::Timestamp(0)).expect("gc pass");
     store.commit(gc).expect("commit gc");
     store.flush().expect("flush");
-    verify_on_open(&mut store, &[]).expect("the recovered store must be consistent");
+    verify_on_open(&store, &[]).expect("the recovered store must be consistent");
 
     // ---- Every committed survivor's chain is intact and reachable. ----
     let mut survivor_chain_deltas = 0usize;

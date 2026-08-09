@@ -24,7 +24,7 @@
 //! Plus a focused guard that a restricted RBAC principal **declines** the morsel path (`None`) so it
 //! always runs serial, and that the knob (`morsel_threads`) gates the executor tier.
 
-use graphus_cypher::shared_cell::SharedCell;
+use graphus_cypher::shared_cell::{SharedCell, SharedRef};
 
 use graphus_core::{TxnId, Value};
 use graphus_cypher::authorized_graph::{AuthorizedGraph, PrivilegeOracle};
@@ -53,7 +53,7 @@ fn fresh() -> Store {
 /// SIREAD markers), the lock table, and the populated derived index/column/zone sidecars `attach`
 /// requires. Mirrors `tests/read_only_graph_equivalence.rs::Coordinated`.
 struct Coordinated {
-    store: SharedCell<Store>,
+    store: SharedRef<Store>,
     ssi: SharedCell<SsiTracker>,
     index: SharedCell<IndexSet>,
     columns: SharedCell<graphus_cypher::column_cache::ColumnCache>,
@@ -77,7 +77,7 @@ impl Coordinated {
             }
         }
         Self {
-            store: SharedCell::new(store),
+            store: SharedRef::new(store),
             ssi: SharedCell::new(SsiTracker::new()),
             index,
             columns: SharedCell::new(graphus_cypher::column_cache::ColumnCache::new()),

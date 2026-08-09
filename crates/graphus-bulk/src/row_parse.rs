@@ -5,7 +5,7 @@
 //! (`create_node`/`create_rel`) — never a raw [`graphus_storage::RecordStore`] call — so it cannot
 //! reuse [`crate::import::ingest_node_row`]/[`crate::import::ingest_rel_row`] (`08` §7.2: "a
 //! 'bulk-optimized' reimplementation that skips these calls for speed is explicitly disallowed").
-//! Those functions are store-coupled by construction: they take `&mut RecordStore`, a `TxnId`, and a
+//! Those functions are store-coupled by construction: they take `&RecordStore`, a `TxnId`, and a
 //! label/type token memo, and they write directly.
 //!
 //! This module extracts the **parsing** half only — walking a record's columns by [`ColumnRole`],

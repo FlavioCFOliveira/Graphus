@@ -200,7 +200,7 @@ pub fn run_selfloop_churn_crash(seed: u64) -> SelfLoopChurnReport {
     // them as corpses then undoes the loser — the state where `first_rel` can end on a corpse.
     store.with_wal(WalManager::flush);
 
-    let (mut store, recovery_losers) = if steal {
+    let (store, recovery_losers) = if steal {
         crash_steal(store)
     } else {
         crash_no_force(store)
@@ -212,7 +212,7 @@ pub fn run_selfloop_churn_crash(seed: u64) -> SelfLoopChurnReport {
     let head = store.node(shared).expect("node").first_rel;
     let head_pointed_at_corpse = head != 0 && !store.rel(head).expect("rel").mvcc.in_use();
 
-    let result = checker::verify(&mut store, &model);
+    let result = checker::verify(&store, &model);
 
     SelfLoopChurnReport {
         seed,

@@ -580,7 +580,7 @@ fn the_format_version_is_persisted_and_read_back_on_reopen() {
     let mut wal = WalManager::open(sink.clone()).expect("open wal");
     graphus_storage::recovery::recover_device(&mut wal, &mut device).expect("recover");
     let wal = WalManager::open(sink).expect("reopen wal");
-    let mut reopened: Store = RecordStore::open(device, wal, POOL).expect("reopen store");
+    let reopened: Store = RecordStore::open(device, wal, POOL).expect("reopen store");
 
     assert_eq!(
         reopened.opened_format_version(),
@@ -600,7 +600,7 @@ fn the_format_version_is_persisted_and_read_back_on_reopen() {
         1,
         "and the chain it anchors is still walkable"
     );
-    verify_on_open(&mut reopened, &[])
+    verify_on_open(&reopened, &[])
         .expect("a reopened store with live chains passes the startup integrity hook");
 }
 
@@ -729,7 +729,7 @@ fn an_orphan_undo_page_left_by_an_aborted_transaction_does_not_brick_open() {
     let mut wal = WalManager::open(sink.clone()).expect("open wal");
     graphus_storage::recovery::recover_device(&mut wal, &mut device).expect("recover");
     let wal = WalManager::open(sink).expect("reopen wal");
-    let mut reopened: Store = RecordStore::open(device, wal, POOL)
+    let reopened: Store = RecordStore::open(device, wal, POOL)
         .expect("an orphan undo page must be re-attributed, not treated as corruption");
 
     // The committed node and its chain survive, and the store is consistent.
@@ -740,7 +740,7 @@ fn an_orphan_undo_page_left_by_an_aborted_transaction_does_not_brick_open() {
             .len(),
         1
     );
-    verify_on_open(&mut reopened, &[]).expect("the reopened store must be consistent");
+    verify_on_open(&reopened, &[]).expect("the reopened store must be consistent");
 }
 
 // ============================================================================================

@@ -73,7 +73,7 @@ fn a_removed_node_property_is_not_dumped() {
     store.commit(txn).expect("commit removal");
 
     let mut out = Vec::new();
-    dump_nodes(&mut store, &mut out).expect("dump nodes");
+    dump_nodes(&store, &mut out).expect("dump nodes");
     let dump = String::from_utf8(out).expect("utf8 dump");
 
     assert!(
@@ -117,7 +117,7 @@ fn a_removed_relationship_property_is_not_dumped() {
     store.commit(txn).expect("commit removal");
 
     let mut out = Vec::new();
-    dump_relationships(&mut store, &mut out).expect("dump relationships");
+    dump_relationships(&store, &mut out).expect("dump relationships");
     let dump = String::from_utf8(out).expect("utf8 dump");
 
     assert!(
@@ -155,7 +155,7 @@ fn an_overwritten_property_dumps_only_its_newest_value() {
     store.commit(txn).expect("commit v2");
 
     let mut out = Vec::new();
-    dump_nodes(&mut store, &mut out).expect("dump nodes");
+    dump_nodes(&store, &mut out).expect("dump nodes");
     let dump = String::from_utf8(out).expect("utf8 dump");
 
     assert!(

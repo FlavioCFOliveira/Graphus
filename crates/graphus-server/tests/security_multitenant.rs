@@ -483,7 +483,7 @@ type MemStore = RecordStore<graphus_io::MemBlockDevice, MemLogSink>;
 /// Writes the shared "secret graph": two nodes, one `LINKS` rel, the sensitive token interned as a
 /// label on node `a` (so its plaintext bytes land on a device page).
 fn write_secret_graph<D: BlockDevice, S: graphus_wal::LogSink>(
-    store: &mut RecordStore<D, S>,
+    store: &RecordStore<D, S>,
 ) -> (u64, u64, u64, u32) {
     let txn = TxnId(1);
     store.begin(txn);
@@ -595,8 +595,8 @@ fn encryption_at_rest_ciphertext_rotation_backup_roundtrip() {
             EncryptedFileLogSink::create(wal_backing, &kr).expect("enc wal sink"),
         )
         .expect("wal mgr");
-        let mut store: EncFileStore = RecordStore::create(device, wal, 64, 1).expect("enc store");
-        let handles = write_secret_graph(&mut store);
+        let store: EncFileStore = RecordStore::create(device, wal, 64, 1).expect("enc store");
+        let handles = write_secret_graph(&store);
         store.flush().expect("flush enc");
         handles
     };
@@ -604,9 +604,9 @@ fn encryption_at_rest_ciphertext_rotation_backup_roundtrip() {
         let device = FileBlockDevice::open(&clear_store).expect("open clear dev");
         let wal_backing = FileLogSink::open(&clear_wal).expect("open clear wal");
         let wal = WalManager::create(wal_backing).expect("clear wal mgr");
-        let mut store: RecordStore<FileBlockDevice, FileLogSink> =
+        let store: RecordStore<FileBlockDevice, FileLogSink> =
             RecordStore::create(device, wal, 64, 1).expect("clear store");
-        write_secret_graph(&mut store);
+        write_secret_graph(&store);
         store.flush().expect("flush clear");
     }
 
@@ -668,13 +668,13 @@ fn encryption_at_rest_ciphertext_rotation_backup_roundtrip() {
     let mut src: MemStore = {
         let device = graphus_io::MemBlockDevice::new(0);
         let wal = WalManager::create(MemLogSink::new()).expect("mem wal");
-        let mut store: MemStore = RecordStore::create(device, wal, 64, 1).expect("mem store");
-        write_secret_graph(&mut store);
+        let store: MemStore = RecordStore::create(device, wal, 64, 1).expect("mem store");
+        write_secret_graph(&store);
         store
     };
     let src_snapshot = node_rel_summary(&mut src);
 
-    let artifact = backup_store(&mut src).expect("backup");
+    let artifact = backup_store(&src).expect("backup");
     assert!(
         contains(&artifact, SENSITIVE.as_bytes()),
         "the PLAINTEXT backup artifact must carry the secret (that is WHY it must be sealed)"

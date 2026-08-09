@@ -89,8 +89,7 @@ impl LabelRollbackReport {
 fn drive_scenario() -> (Store, u64, u64) {
     let device = MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new()).expect("create wal");
-    let store: Store =
-        RecordStore::create(device, wal, POOL_CAPACITY, 1).expect("create store");
+    let store: Store = RecordStore::create(device, wal, POOL_CAPACITY, 1).expect("create store");
     let mut next = 1u64;
 
     // Seed: a committed labelled node carrying `original@x.io`.

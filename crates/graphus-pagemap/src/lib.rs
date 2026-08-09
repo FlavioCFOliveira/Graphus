@@ -159,7 +159,7 @@ const MAX_ENTRIES: usize = ((1usize << MAX_CHUNKS) - 1) << CHUNK0_LOG2;
 ///
 /// It is **not** a single-writer contract, and there is no longer one to enforce (`rmp` #1012). This
 /// comment used to claim the borrow checker enforced one, on the strength of `push` taking `&mut self`
-/// and the token being reachable only through `&mut RecordStore`. Both halves are now false: `push`
+/// and the token being reachable only through `&RecordStore`. Both halves are now false: `push`
 /// takes `&self` since 37ecb26, and layer 4 of `rmp` #975 retired `RecordStore::store_mut` entirely,
 /// so a store handle is reached through `&self`. The safety of concurrent appends does not rest on
 /// exclusion at all — it rests on the index being claimed by `compare_exchange` and published in index

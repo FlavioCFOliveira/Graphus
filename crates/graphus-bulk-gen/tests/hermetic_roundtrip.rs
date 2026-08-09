@@ -57,7 +57,7 @@ fn assert_lossless_roundtrip(cfg: GenConfig, profile: &str) {
     let manifest = &dataset.manifest;
 
     // ----- Import A: the generated dataset into a fresh store. -----
-    let (mut store_a, nodes_a, rels_a) = import_dataset(&dataset);
+    let (store_a, nodes_a, rels_a) = import_dataset(&dataset);
     assert_eq!(
         nodes_a, manifest.total_nodes,
         "{profile}: imported node count must equal the manifest"
@@ -67,15 +67,15 @@ fn assert_lossless_roundtrip(cfg: GenConfig, profile: &str) {
         "{profile}: imported relationship count must equal the manifest"
     );
 
-    let hash_a = content_hash(&mut store_a);
+    let hash_a = content_hash(&store_a);
     assert_eq!(hash_a.nodes, manifest.total_nodes);
     assert_eq!(hash_a.relationships, manifest.total_relationships);
 
     // ----- Dump store A to CSV. -----
     let mut node_csv = Vec::new();
     let mut rel_csv = Vec::new();
-    dump_nodes(&mut store_a, &mut node_csv).expect("dump nodes");
-    dump_relationships(&mut store_a, &mut rel_csv).expect("dump rels");
+    dump_nodes(&store_a, &mut node_csv).expect("dump nodes");
+    dump_relationships(&store_a, &mut rel_csv).expect("dump rels");
     assert!(!node_csv.is_empty(), "{profile}: dumped node CSV is empty");
     assert!(!rel_csv.is_empty(), "{profile}: dumped rel CSV is empty");
 
@@ -87,7 +87,7 @@ fn assert_lossless_roundtrip(cfg: GenConfig, profile: &str) {
     importer_b
         .import_relationships(rel_csv.as_slice())
         .expect("re-import rels");
-    let (mut store_b, stats_b) = importer_b.finish();
+    let (store_b, stats_b) = importer_b.finish();
 
     assert_eq!(
         stats_b.nodes, manifest.total_nodes,
@@ -99,7 +99,7 @@ fn assert_lossless_roundtrip(cfg: GenConfig, profile: &str) {
     );
 
     // ----- The losslessness proof: id-independent content hash A == B. -----
-    let hash_b = content_hash(&mut store_b);
+    let hash_b = content_hash(&store_b);
     assert_eq!(
         hash_a.hex, hash_b.hex,
         "{profile}: import -> dump -> re-import must be LOSSLESS (content hash diverged: \

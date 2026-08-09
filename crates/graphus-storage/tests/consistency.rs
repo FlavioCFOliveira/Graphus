@@ -409,7 +409,7 @@ fn decode_element_id(kind: StoreKind, bytes: &[u8]) -> u128 {
 fn empty_store_passes() {
     let mut s = fresh(64);
     assert!(report(&mut s).is_consistent());
-    verify_on_open(&mut s, &[]).expect("empty store serves");
+    verify_on_open(&s, &[]).expect("empty store serves");
 }
 
 #[test]
@@ -506,7 +506,7 @@ fn random_histories_stay_consistent() {
             "seed={seed}: recovered store flagged: {:?}",
             r2.violations
         );
-        verify_on_open(&mut reopened, &[]).expect("recovered store serves");
+        verify_on_open(&reopened, &[]).expect("recovered store serves");
     }
 }
 
@@ -569,10 +569,7 @@ fn corrupt_checksum_is_flagged() {
         "expected a Checksum violation on page {page_id}: {:?}",
         r.violations
     );
-    assert!(
-        verify_on_open(&mut store, &[]).is_err(),
-        "must refuse to serve"
-    );
+    assert!(verify_on_open(&store, &[]).is_err(), "must refuse to serve");
 }
 
 /// #426: pins the **cold-open contract** of the checksum sub-pass. A freshly-opened (cold) store
@@ -624,7 +621,7 @@ fn check_store_cold_open_contract_holds_on_fresh_open() {
         r.violations
     );
     assert!(
-        verify_on_open(&mut store, &[]).is_err(),
+        verify_on_open(&store, &[]).is_err(),
         "verify_on_open refuses to serve the corrupt cold store (contract intact)"
     );
 }
@@ -681,7 +678,7 @@ fn corrupt_adjacency_dangling_link_is_flagged() {
         "expected an Adjacency violation: {:?}",
         r.violations
     );
-    assert!(verify_on_open(&mut store, &[]).is_err());
+    assert!(verify_on_open(&store, &[]).is_err());
 }
 
 /// (b') Adjacency: make a link asymmetric (a `next` whose successor's `prev` no longer points back)
@@ -758,7 +755,7 @@ fn corrupt_referential_endpoint_is_flagged() {
         "expected a Referential violation for node 4242: {:?}",
         r.violations
     );
-    assert!(verify_on_open(&mut store, &[]).is_err());
+    assert!(verify_on_open(&store, &[]).is_err());
 }
 
 /// (d) Property chain: make a node's property chain reference a dead/missing record → a
@@ -798,7 +795,7 @@ fn corrupt_property_chain_is_flagged() {
         "expected a PropertyChain violation: {:?}",
         r.violations
     );
-    assert!(verify_on_open(&mut store, &[]).is_err());
+    assert!(verify_on_open(&store, &[]).is_err());
 }
 
 /// (d2) Overflow heap chain: make an overflow property's `value_inline` (chain head) point at a
@@ -845,7 +842,7 @@ fn dangling_overflow_chain_is_flagged() {
         "expected a HeapChain violation for the dangling chain: {:?}",
         r.violations
     );
-    assert!(verify_on_open(&mut store, &[]).is_err());
+    assert!(verify_on_open(&store, &[]).is_err());
 }
 
 // ============================================================================================
@@ -887,7 +884,7 @@ fn mvcc_timestamp_inversion_is_flagged() {
         "expected a timestamp-inversion violation: {:?}",
         r.violations
     );
-    assert!(verify_on_open(&mut store, &[]).is_err());
+    assert!(verify_on_open(&store, &[]).is_err());
 }
 
 /// A live record whose `undo_ptr` (older-version back-pointer) dangles past its store's high-water
@@ -919,7 +916,7 @@ fn mvcc_dangling_undo_ptr_is_flagged() {
         "expected a dangling-undo_ptr violation: {:?}",
         r.violations
     );
-    assert!(verify_on_open(&mut store, &[]).is_err());
+    assert!(verify_on_open(&store, &[]).is_err());
 }
 
 /// A live record with no creator stamp (`created_ts`/`xmin` zeroed) is flagged — every version must
@@ -951,7 +948,7 @@ fn mvcc_missing_creator_is_flagged() {
         "expected a missing-creator violation: {:?}",
         r.violations
     );
-    assert!(verify_on_open(&mut store, &[]).is_err());
+    assert!(verify_on_open(&store, &[]).is_err());
 }
 
 // ============================================================================================
@@ -1003,7 +1000,7 @@ fn heap_block_aliased_by_two_chains_is_flagged() {
         "expected a shared-block violation: {:?}",
         r.violations
     );
-    assert!(verify_on_open(&mut store, &[]).is_err());
+    assert!(verify_on_open(&store, &[]).is_err());
 }
 
 /// A heap block whose `len` exceeds [`BLOCK_PAYLOAD`] is flagged — a corrupt length `HeapBlock::bytes`
@@ -1041,7 +1038,7 @@ fn heap_block_len_too_long_is_flagged() {
         "expected a block-len-too-long violation: {:?}",
         r.violations
     );
-    assert!(verify_on_open(&mut store, &[]).is_err());
+    assert!(verify_on_open(&store, &[]).is_err());
 }
 
 /// (d3) A healthy store whose **relationships carry properties** (inline scalar + a multi-block
@@ -1121,7 +1118,7 @@ fn corrupt_relationship_property_chain_is_flagged() {
         "expected a relationship PropertyChain violation: {:?}",
         r.violations
     );
-    assert!(verify_on_open(&mut store, &[]).is_err());
+    assert!(verify_on_open(&store, &[]).is_err());
 }
 
 /// (d5) Dangling **overflow** chain on a *relationship* property: corrupt the relationship's overflow
@@ -1172,14 +1169,14 @@ fn dangling_overflow_chain_on_a_rel_property_is_flagged() {
         "expected a HeapChain violation for the dangling rel overflow chain: {:?}",
         r.violations
     );
-    assert!(verify_on_open(&mut store, &[]).is_err());
+    assert!(verify_on_open(&store, &[]).is_err());
 }
 
 /// (e) Store/index agreement: an index entry pointing at a record whose value no longer matches
 /// (modelled as an entry absent from the expected set) and a missing expected entry.
 #[test]
 fn index_agreement_unexpected_and_missing_are_flagged() {
-    let mut s = fresh(64);
+    let s = fresh(64);
     let txn = TxnId(1);
     s.begin(txn);
     let (a, _) = s.create_node(txn).unwrap();
@@ -1194,7 +1191,7 @@ fn index_agreement_unexpected_and_missing_are_flagged() {
         entries: vec![IndexEntry::rid(a), IndexEntry::rid(b)],
         expected: Some([a, b].into_iter().collect::<BTreeSet<_>>()),
     };
-    let r_ok = graphus_storage::check::check_store(&mut s, std::slice::from_ref(&ok)).unwrap();
+    let r_ok = graphus_storage::check::check_store(&s, std::slice::from_ref(&ok)).unwrap();
     assert!(r_ok.is_consistent(), "healthy index: {:?}", r_ok.violations);
 
     // Stale entry (value no longer matches): index has {a, b} but expected {a, c}.
@@ -1205,7 +1202,7 @@ fn index_agreement_unexpected_and_missing_are_flagged() {
         entries: vec![IndexEntry::rid(a), IndexEntry::rid(b)],
         expected: Some([a, c].into_iter().collect::<BTreeSet<_>>()),
     };
-    let r = graphus_storage::check::check_store(&mut s, std::slice::from_ref(&bad)).unwrap();
+    let r = graphus_storage::check::check_store(&s, std::slice::from_ref(&bad)).unwrap();
     assert!(
         r.violations.iter().any(|v| matches!(
             v,
@@ -1246,7 +1243,7 @@ fn index_agreement_dead_record_is_flagged() {
         entries: vec![IndexEntry::rid(a), IndexEntry::rid(b)], // b is dead
         expected: None,
     };
-    let r = graphus_storage::check::check_store(&mut s, &[ix]).unwrap();
+    let r = graphus_storage::check::check_store(&s, &[ix]).unwrap();
     assert!(
         r.violations.iter().any(|v| matches!(
             v,
@@ -1403,7 +1400,7 @@ fn corrupt_strings_free_list_still_in_use_is_flagged() {
         "expected a StillInUse violation on the strings free list: {:?}",
         r.violations
     );
-    assert!(verify_on_open(&mut store, &[]).is_err());
+    assert!(verify_on_open(&store, &[]).is_err());
 }
 
 /// (h) Termination on corruption: a deliberately cyclic incidence-chain pointer must be reported as
@@ -1633,7 +1630,7 @@ fn undo_chain_reaching_an_empty_delta_slot_is_flagged() {
         r.violations
     );
     assert!(
-        verify_on_open(&mut store, &[]).is_err(),
+        verify_on_open(&store, &[]).is_err(),
         "and must refuse to serve"
     );
 }
@@ -1665,7 +1662,7 @@ fn a_cyclic_undo_chain_is_flagged() {
         "a self-referential chain must be flagged as a cycle: {:?}",
         r.violations
     );
-    assert!(verify_on_open(&mut store, &[]).is_err());
+    assert!(verify_on_open(&store, &[]).is_err());
 }
 
 /// A delta whose `commit_info` points outside `commit.store` is flagged.
@@ -1697,7 +1694,7 @@ fn a_delta_naming_an_out_of_range_commit_slot_is_flagged() {
         "an out-of-range `commit_info` must be flagged: {:?}",
         r.violations
     );
-    assert!(verify_on_open(&mut store, &[]).is_err());
+    assert!(verify_on_open(&store, &[]).is_err());
 }
 
 /// A commit slot that has been **erased while deltas still name it** is flagged: their
@@ -1732,7 +1729,7 @@ fn a_delta_whose_commit_slot_is_gone_is_flagged() {
         "a delta whose slot no longer exists must be flagged: {:?}",
         r.violations
     );
-    assert!(verify_on_open(&mut store, &[]).is_err());
+    assert!(verify_on_open(&store, &[]).is_err());
 }
 
 /// A committed slot whose `delta_count` disagrees with the number of unreclaimed deltas naming it is
@@ -1770,7 +1767,7 @@ fn a_commit_slot_with_a_wrong_delta_count_is_flagged() {
         "a mis-counted commit slot must be flagged: {:?}",
         r.violations
     );
-    assert!(verify_on_open(&mut store, &[]).is_err());
+    assert!(verify_on_open(&store, &[]).is_err());
 }
 
 /// A delta slot that is occupied but does not decode — here, a reserved word forged non-zero — is
@@ -1801,7 +1798,7 @@ fn an_undecodable_delta_slot_is_flagged() {
         "an undecodable delta must be flagged: {:?}",
         r.violations
     );
-    assert!(verify_on_open(&mut store, &[]).is_err());
+    assert!(verify_on_open(&store, &[]).is_err());
 }
 
 // ===========================================================================================
@@ -1881,7 +1878,7 @@ fn an_incidence_delta_with_an_unknown_rel_type_token_is_flagged() {
         "an incidence delta naming an unknown relationship type must be flagged: {:?}",
         r.violations
     );
-    assert!(verify_on_open(&mut store, &[]).is_err());
+    assert!(verify_on_open(&store, &[]).is_err());
 }
 
 /// An incidence delta whose `peer` was zeroed under it is flagged: physical ids start at `1`, so a
@@ -1919,7 +1916,7 @@ fn an_incidence_delta_with_a_null_target_is_flagged() {
         "an incidence delta with no peer must be flagged: {:?}",
         r.violations
     );
-    assert!(verify_on_open(&mut store, &[]).is_err());
+    assert!(verify_on_open(&store, &[]).is_err());
 }
 
 /// **The rule that matters**: an incidence delta whose payload is addressable and well-formed but
@@ -1956,5 +1953,5 @@ fn an_incidence_delta_contradicting_its_relationship_is_flagged() {
         "an incidence delta that disagrees with its relationship must be flagged: {:?}",
         r.violations
     );
-    assert!(verify_on_open(&mut store, &[]).is_err());
+    assert!(verify_on_open(&store, &[]).is_err());
 }

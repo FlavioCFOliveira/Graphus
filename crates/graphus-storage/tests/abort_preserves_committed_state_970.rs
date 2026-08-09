@@ -117,7 +117,7 @@ fn in_use_rels(s: &Store) -> usize {
 /// restore a `first_rel` word a concurrently-committed writer owned, collapsing the fan-out.
 #[test]
 fn aborting_a_prepend_leaves_a_shared_hubs_committed_fan_out_untouched() {
-    let mut s = fresh();
+    let s = fresh();
     let seed = TxnId(1);
     s.begin(seed);
     let rt = s.intern_token(Namespace::RelType, "R").expect("intern");
@@ -167,7 +167,7 @@ fn aborting_a_prepend_leaves_a_shared_hubs_committed_fan_out_untouched() {
         2,
         "non-vacuity: the aborting writer's own edge is gone"
     );
-    let report = check_store(&mut s, &[]).expect("check");
+    let report = check_store(&s, &[]).expect("check");
     assert!(
         report.is_consistent(),
         "store consistent after the abort: {:?}",
@@ -181,7 +181,7 @@ fn aborting_a_prepend_leaves_a_shared_hubs_committed_fan_out_untouched() {
 /// property-chain twin.
 #[test]
 fn aborting_property_and_label_writes_leaves_committed_values_untouched() {
-    let mut s = fresh();
+    let s = fresh();
     let seed = TxnId(1);
     s.begin(seed);
     let k1 = s.intern_token(Namespace::PropKey, "a").expect("intern");
@@ -242,7 +242,7 @@ fn aborting_property_and_label_writes_leaves_committed_values_untouched() {
         !s.node(a_node).expect("read").mvcc.in_use(),
         "non-vacuity: the aborting writer's own node is retired"
     );
-    let report = check_store(&mut s, &[]).expect("check");
+    let report = check_store(&s, &[]).expect("check");
     assert!(
         report.is_consistent(),
         "store consistent after the abort: {:?}",
@@ -255,7 +255,7 @@ fn aborting_property_and_label_writes_leaves_committed_values_untouched() {
 /// image must be untouched and the store must stay allocation-consistent.
 #[test]
 fn aborting_a_reused_slot_leaves_the_committed_image_and_the_allocator_sound() {
-    let mut s = fresh();
+    let s = fresh();
     let seed = TxnId(1);
     s.begin(seed);
     let rt = s.intern_token(Namespace::RelType, "R").expect("intern");
@@ -302,7 +302,7 @@ fn aborting_a_reused_slot_leaves_the_committed_image_and_the_allocator_sound() {
         s.rel(keeper).expect("read keeper").mvcc.in_use(),
         "the committed relationship keeps its slot"
     );
-    let report = check_store(&mut s, &[]).expect("check");
+    let report = check_store(&s, &[]).expect("check");
     assert!(
         report.is_consistent(),
         "store consistent after the abort: {:?}",
@@ -330,7 +330,7 @@ fn aborting_a_reused_slot_leaves_the_committed_image_and_the_allocator_sound() {
 /// there, before any assertion.
 #[test]
 fn a_key_set_removed_and_set_again_rolls_back() {
-    let mut s = fresh();
+    let s = fresh();
     let seed = TxnId(1);
     s.begin(seed);
     let k = s.intern_token(Namespace::PropKey, "k").expect("intern");
@@ -368,7 +368,7 @@ fn a_key_set_removed_and_set_again_rolls_back() {
         before,
         "rmp #970: the abort must leave the committed image untouched — the key was never committed"
     );
-    let report = check_store(&mut s, &[]).expect("check");
+    let report = check_store(&s, &[]).expect("check");
     assert!(
         report.is_consistent(),
         "store consistent after the abort: {:?}",
@@ -381,7 +381,7 @@ fn a_key_set_removed_and_set_again_rolls_back() {
     s.set_node_property_value(t, n, k, &Value::Integer(7))
         .expect("set after the abort");
     s.commit(t).expect("commit");
-    let report = check_store(&mut s, &[]).expect("check");
+    let report = check_store(&s, &[]).expect("check");
     assert!(
         report.is_consistent(),
         "store consistent after the retry commits: {:?}",
@@ -404,7 +404,7 @@ fn a_key_set_removed_and_set_again_rolls_back() {
 /// which it is not while the leak is present.
 #[test]
 fn aborting_an_overflow_write_frees_its_chain_even_when_the_ids_collide() {
-    let mut s = fresh();
+    let s = fresh();
     let seed = TxnId(1);
     s.begin(seed);
     let k = s.intern_token(Namespace::PropKey, "k").expect("intern");
@@ -438,7 +438,7 @@ fn aborting_an_overflow_write_frees_its_chain_even_when_the_ids_collide() {
          payload equals the chain's head id ({probe})"
     );
 
-    let report = check_store(&mut s, &[]).expect("check");
+    let report = check_store(&s, &[]).expect("check");
     assert!(
         report.is_consistent(),
         "store consistent after the abort: {:?}",

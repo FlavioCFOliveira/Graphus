@@ -26,7 +26,7 @@
 //!    to the serial single-morsel reference (the load-bearing ACID assertion — moving the
 //!    scan→expand→filter→aggregate onto morsels must not change which rw-edges form).
 
-use graphus_cypher::shared_cell::SharedCell;
+use graphus_cypher::shared_cell::{SharedCell, SharedRef};
 
 use graphus_core::{TxnId, Value};
 use graphus_cypher::ast::{Expr, RelDirection, RelType};
@@ -319,7 +319,7 @@ fn expand_group_tier_actually_engages() {
 /// A minimal coordinated harness owning the store + SSI tracker + label index, so a live
 /// [`RecordStoreGraph`] seam can be attached at a chosen snapshot and its morsel scan bundle driven.
 struct Coordinated {
-    store: SharedCell<Store>,
+    store: SharedRef<Store>,
     ssi: SharedCell<SsiTracker>,
     index: SharedCell<IndexSet>,
     columns: SharedCell<graphus_cypher::column_cache::ColumnCache>,
@@ -341,7 +341,7 @@ impl Coordinated {
             }
         }
         Self {
-            store: SharedCell::new(store),
+            store: SharedRef::new(store),
             ssi: SharedCell::new(SsiTracker::new()),
             index,
             columns: SharedCell::new(graphus_cypher::column_cache::ColumnCache::new()),

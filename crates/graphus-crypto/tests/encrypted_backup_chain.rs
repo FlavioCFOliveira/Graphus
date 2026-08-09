@@ -89,8 +89,8 @@ fn live_artifact(store: &mut Store, cap: usize) -> Vec<u8> {
 
 fn artifact_of_device(device: MemBlockDevice, cap: usize) -> Vec<u8> {
     let wal = WalManager::create(MemLogSink::new()).expect("wal");
-    let mut store = RecordStore::open(device, wal, cap).expect("open");
-    backup_store(&mut store).expect("backup")
+    let store = RecordStore::open(device, wal, cap).expect("open");
+    backup_store(&store).expect("backup")
 }
 
 /// The page-image section of a full backup artifact (header 40 bytes, trailer 4-byte digest).
@@ -104,7 +104,7 @@ fn page_section(artifact: &[u8]) -> &[u8] {
 fn sealed_chain(codec: &CryptoCodec) -> (graphus_storage::ChainManifest, ChainLinks, Vec<u8>) {
     let mut store = fresh(64);
     commit_edge(&mut store, TxnId(1), "SEED");
-    let (mut manifest, base) = begin_chain(&mut store, codec).expect("begin sealed chain");
+    let (mut manifest, base) = begin_chain(&store, codec).expect("begin sealed chain");
     let mut links = ChainLinks {
         base,
         increments: Vec::new(),
@@ -112,7 +112,7 @@ fn sealed_chain(codec: &CryptoCodec) -> (graphus_storage::ChainManifest, ChainLi
     commit_edge(&mut store, TxnId(2), "MORE");
     links
         .increments
-        .push(capture_increment(&mut store, &mut manifest, codec).expect("sealed increment"));
+        .push(capture_increment(&store, &mut manifest, codec).expect("sealed increment"));
     let live = live_artifact(&mut store, 64);
     (manifest, links, live)
 }
@@ -197,7 +197,7 @@ fn a_base_only_sealed_chain_round_trips() {
     let codec = CryptoCodec::new(MASTER_A);
     let mut store = fresh(64);
     commit_edge(&mut store, TxnId(1), "ONLY");
-    let (manifest, base) = begin_chain(&mut store, &codec).expect("begin");
+    let (manifest, base) = begin_chain(&store, &codec).expect("begin");
     let links = ChainLinks {
         base,
         increments: Vec::new(),

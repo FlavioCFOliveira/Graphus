@@ -33,7 +33,7 @@
 //!    restricted reader never bypasses per-relationship/endpoint RBAC through an off-thread expand), and
 //!    that knob=1 is serial-identical.
 
-use graphus_cypher::shared_cell::SharedCell;
+use graphus_cypher::shared_cell::{SharedCell, SharedRef};
 
 use graphus_core::{TxnId, Value};
 use graphus_cypher::authorized_graph::{AuthorizedGraph, PrivilegeOracle};
@@ -304,11 +304,11 @@ fn run_write(coord: &mut TxnCoordinator<MemBlockDevice, MemLogSink>, src: &str) 
 // SIREAD-marker UNION asserted byte-identical to serial (the ACID assertion).
 // =================================================================================================
 
-/// A coordinated harness over an `SharedCell<Store>` (so `morsel_label_scan` can capture a read view and
+/// A coordinated harness over an `SharedRef<Store>` (so `morsel_label_scan` can capture a read view and
 /// the equivalence test can drive an explicit anchor-morsel split through the production converge), with a
 /// shared `SsiTracker` so the serial reference's and the morsels' markers land in comparable buffers.
 struct Coordinated {
-    store: SharedCell<Store>,
+    store: SharedRef<Store>,
     ssi: SharedCell<SsiTracker>,
     index: SharedCell<IndexSet>,
     columns: SharedCell<graphus_cypher::column_cache::ColumnCache>,
@@ -330,7 +330,7 @@ impl Coordinated {
             }
         }
         Self {
-            store: SharedCell::new(store),
+            store: SharedRef::new(store),
             ssi: SharedCell::new(SsiTracker::new()),
             index,
             columns: SharedCell::new(graphus_cypher::column_cache::ColumnCache::new()),

@@ -261,10 +261,10 @@ fn run_double_crash(seed: u64) -> DoubleCrashReport {
 
     // --- Crash #2: replay the WAL prefix the FIRST recovery left behind (base + CLRs) onto a fresh
     //     device. This is the crash-during/after-recovery, before-checkpoint case. ---
-    let mut store2 = crash_no_force(store1);
+    let store2 = crash_no_force(store1);
 
     let result = (|| {
-        checker::verify(&mut store2, &model)?;
+        checker::verify(&store2, &model)?;
         let a = after_r1?;
         let b = observe(&store2, shared)?;
         if a != b {

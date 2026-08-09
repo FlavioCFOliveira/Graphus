@@ -29,9 +29,9 @@ fn import_node_and_dump(nodes_csv: &str) -> String {
     importer
         .import_nodes(nodes_csv.as_bytes())
         .expect("import nodes");
-    let (mut store, _stats) = importer.finish();
+    let (store, _stats) = importer.finish();
     let mut out = Vec::new();
-    dump_nodes(&mut store, &mut out).expect("dump nodes");
+    dump_nodes(&store, &mut out).expect("dump nodes");
     String::from_utf8(out).expect("utf8 dump")
 }
 
@@ -118,9 +118,9 @@ fn sec194_neutralisation_round_trips_logical_value() {
     let store = fresh_store();
     let mut imp1 = BulkImporter::new(store, DEFAULT_BATCH_SIZE, b',');
     imp1.import_nodes(nodes.as_bytes()).expect("import 1");
-    let (mut store1, _) = imp1.finish();
+    let (store1, _) = imp1.finish();
     let mut dump = Vec::new();
-    dump_nodes(&mut store1, &mut dump).expect("dump");
+    dump_nodes(&store1, &mut dump).expect("dump");
 
     // Re-import the dump into a fresh store.
     let store2 = fresh_store();

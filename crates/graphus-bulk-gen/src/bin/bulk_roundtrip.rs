@@ -294,8 +294,8 @@ fn parse_import_counts(stdout: &str) -> Result<ImportCounts, String> {
 /// Re-opens a store dir, verifies it is internally consistent (the ACID gate), asserts its
 /// node/relationship counts match the manifest, and returns its content hash.
 fn inspect_store(name: &str, db: &Path, manifest: &Manifest) -> Result<ContentHash, String> {
-    let mut store = open_store(db).map_err(|e| format!("{name}: opening store: {e}"))?;
-    verify_on_open(&mut store, &[]).map_err(|e| format!("{name}: store inconsistent: {e}"))?;
+    let store = open_store(db).map_err(|e| format!("{name}: opening store: {e}"))?;
+    verify_on_open(&store, &[]).map_err(|e| format!("{name}: store inconsistent: {e}"))?;
 
     let nodes = store
         .scan_node_ids()
@@ -316,7 +316,7 @@ fn inspect_store(name: &str, db: &Path, manifest: &Manifest) -> Result<ContentHa
         rels,
     )?;
 
-    let hash = content_hash(&mut store);
+    let hash = content_hash(&store);
     eprintln!(
         "  {name}: consistent, {} nodes, {} relationships, content_hash={}",
         hash.nodes, hash.relationships, hash.hex

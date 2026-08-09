@@ -295,7 +295,7 @@ fn create_mem_store_with_graph() -> Result<MemStore> {
 /// a label on node `a` (so its plaintext bytes land on a device page). Returns
 /// `(node_a, node_b, rel, sensitive_label_token)`.
 fn write_secret_graph<D: BlockDevice, S: graphus_wal::LogSink>(
-    store: &mut RecordStore<D, S>,
+    store: &RecordStore<D, S>,
 ) -> Result<(u64, u64, u64, u32)> {
     let txn = TxnId(1);
     store.begin(txn);

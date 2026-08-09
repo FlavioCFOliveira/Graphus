@@ -78,7 +78,7 @@ impl Fnv128 {
 }
 
 /// The canonical structural shape of one node: sorted labels + sorted `(key, value-repr)` pairs.
-fn node_shape_bytes<D: BlockDevice, S: LogSink>(store: &mut RecordStore<D, S>, id: u64) -> Vec<u8> {
+fn node_shape_bytes<D: BlockDevice, S: LogSink>(store: &RecordStore<D, S>, id: u64) -> Vec<u8> {
     let mut labels: Vec<String> = store
         .node_labels(id)
         .expect("labels")
@@ -160,7 +160,7 @@ fn is_empty_value(v: &Value) -> bool {
 /// Panics if the store's low-level scans fail — these are infallible on a consistent store and a
 /// failure here means the store is corrupt (the round-trip driver verifies consistency separately).
 #[must_use]
-pub fn content_hash<D: BlockDevice, S: LogSink>(store: &mut RecordStore<D, S>) -> ContentHash {
+pub fn content_hash<D: BlockDevice, S: LogSink>(store: &RecordStore<D, S>) -> ContentHash {
     // --- Node record hashes (sorted, so scan order is irrelevant). ---
     let node_ids = store.scan_node_ids().expect("scan node ids");
     let nodes = node_ids.len() as u64;
@@ -282,22 +282,22 @@ mod tests {
 
     #[test]
     fn round_trip_through_dump_preserves_the_content_hash() {
-        let mut original = load(NODES, RELS);
-        let before = content_hash(&mut original);
+        let original = load(NODES, RELS);
+        let before = content_hash(&original);
 
         // Dump, then re-import into a fresh store.
         let mut node_csv = Vec::new();
         let mut rel_csv = Vec::new();
-        dump_nodes(&mut original, &mut node_csv).expect("dump nodes");
-        dump_relationships(&mut original, &mut rel_csv).expect("dump rels");
+        dump_nodes(&original, &mut node_csv).expect("dump nodes");
+        dump_relationships(&original, &mut rel_csv).expect("dump rels");
 
         let mut imp = BulkImporter::new(fresh_store(), DEFAULT_BATCH_SIZE, b',');
         imp.import_nodes(node_csv.as_slice())
             .expect("re-import nodes");
         imp.import_relationships(rel_csv.as_slice())
             .expect("re-import rels");
-        let mut restored = imp.finish().0;
-        let after = content_hash(&mut restored);
+        let restored = imp.finish().0;
+        let after = content_hash(&restored);
 
         assert_eq!(before.hex, after.hex, "content hash must round-trip");
         assert_eq!(before.nodes, 3);
@@ -306,13 +306,13 @@ mod tests {
 
     #[test]
     fn a_different_graph_has_a_different_hash() {
-        let mut g1 = load(NODES, RELS);
+        let g1 = load(NODES, RELS);
         // Change one property value.
         let altered = NODES.replace("Ada,36", "Ada,99");
-        let mut g2 = load(&altered, RELS);
+        let g2 = load(&altered, RELS);
         assert_ne!(
-            content_hash(&mut g1).hex,
-            content_hash(&mut g2).hex,
+            content_hash(&g1).hex,
+            content_hash(&g2).hex,
             "a changed property must change the hash"
         );
     }
@@ -324,8 +324,8 @@ mod tests {
                          c,Person;Admin,Cara,41,z\n\
                          a,Person,Ada,36,x;y\n\
                          b,Person,Bob,28,\n";
-        let mut g1 = load(NODES, RELS);
-        let mut g2 = load(reordered, RELS);
-        assert_eq!(content_hash(&mut g1).hex, content_hash(&mut g2).hex);
+        let g1 = load(NODES, RELS);
+        let g2 = load(reordered, RELS);
+        assert_eq!(content_hash(&g1).hex, content_hash(&g2).hex);
     }
 }

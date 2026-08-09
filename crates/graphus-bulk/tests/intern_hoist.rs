@@ -77,12 +77,12 @@ fn bulk_etl_round_trip_is_byte_identical() {
     let mut imp1 = BulkImporter::new(fresh_store(), DEFAULT_BATCH_SIZE, b',');
     imp1.import_nodes(NODES.as_bytes()).expect("nodes");
     imp1.import_relationships(RELS.as_bytes()).expect("rels");
-    let (mut store1, _) = imp1.finish();
+    let (store1, _) = imp1.finish();
 
     let mut nodes1 = Vec::new();
     let mut rels1 = Vec::new();
-    dump_nodes(&mut store1, &mut nodes1).expect("dump nodes 1");
-    dump_relationships(&mut store1, &mut rels1).expect("dump rels 1");
+    dump_nodes(&store1, &mut nodes1).expect("dump nodes 1");
+    dump_relationships(&store1, &mut rels1).expect("dump rels 1");
 
     // Re-import the dump into a fresh store, then dump again.
     let mut imp2 = BulkImporter::new(fresh_store(), DEFAULT_BATCH_SIZE, b',');
@@ -90,12 +90,12 @@ fn bulk_etl_round_trip_is_byte_identical() {
         .expect("re-import nodes");
     imp2.import_relationships(rels1.as_slice())
         .expect("re-import rels");
-    let (mut store2, _) = imp2.finish();
+    let (store2, _) = imp2.finish();
 
     let mut nodes2 = Vec::new();
     let mut rels2 = Vec::new();
-    dump_nodes(&mut store2, &mut nodes2).expect("dump nodes 2");
-    dump_relationships(&mut store2, &mut rels2).expect("dump rels 2");
+    dump_nodes(&store2, &mut nodes2).expect("dump nodes 2");
+    dump_relationships(&store2, &mut rels2).expect("dump rels 2");
 
     // Hash-identical artifact: the two dumps are byte-for-byte equal.
     assert_eq!(

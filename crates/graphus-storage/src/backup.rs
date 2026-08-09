@@ -112,7 +112,7 @@ const DIGEST_LEN: usize = 4;
 /// # Panics
 /// Panics if the checkpoint's `fdatasync` fails (`04 §4.9`), inherited from
 /// [`WalManager::checkpoint`].
-pub fn backup_store<D: BlockDevice, S: LogSink>(store: &mut RecordStore<D, S>) -> Result<Vec<u8>> {
+pub fn backup_store<D: BlockDevice, S: LogSink>(store: &RecordStore<D, S>) -> Result<Vec<u8>> {
     // 0. Freeze every committed-but-unfrozen MVCC header so the captured image is **MVCC-resolvable
     //    without the WAL** (`rmp` task #149). A restored store opens with a fresh, empty WAL (the
     //    backup carries the data image, not the log), so a version still keyed by its writer's
@@ -379,9 +379,9 @@ pub fn restore<S: LogSink>(
 ) -> Result<RecordStore<MemBlockDevice, S>> {
     let mut device = MemBlockDevice::new(0);
     restore_onto(artifact, &mut device)?;
-    let mut store = RecordStore::open(device, wal, pool_capacity)?;
+    let store = RecordStore::open(device, wal, pool_capacity)?;
     let indexes: &[IndexAgreement] = &[];
-    verify_on_open(&mut store, indexes)?;
+    verify_on_open(&store, indexes)?;
     Ok(store)
 }
 
@@ -432,12 +432,12 @@ where
         // ⇒ no replay) and run the full checker; the open + check are read-only, so the temp's
         // on-disk bytes remain the durable image `restore_onto` synced. Dropping the store closes the
         // temp file descriptor before `atomic_replace_file` renames it.
-        let mut store = RecordStore::open(
+        let store = RecordStore::open(
             device,
             WalManager::create(MemLogSink::new())?,
             pool_capacity,
         )?;
-        verify_on_open(&mut store, &[])?;
+        verify_on_open(&store, &[])?;
         drop(store);
         Ok(())
     })

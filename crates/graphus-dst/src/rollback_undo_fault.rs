@@ -274,7 +274,7 @@ fn resolve_labels<D: graphus_io::BlockDevice, S: LogSink>(
 
 /// Seeds a committed `(:Person)` node and returns `(node id, its committed label bitmap, the bitmap a
 /// later `Archived` label change produces)`.
-fn seed<D: graphus_io::BlockDevice, S: LogSink>(store: &mut RecordStore<D, S>) -> (u64, u64, u64) {
+fn seed<D: graphus_io::BlockDevice, S: LogSink>(store: &RecordStore<D, S>) -> (u64, u64, u64) {
     let t0 = TxnId(1);
     store.begin(t0);
     let person = store
@@ -305,7 +305,7 @@ fn seed<D: graphus_io::BlockDevice, S: LogSink>(store: &mut RecordStore<D, S>) -
 /// separable — a scenario that also created a node would keep the guard closed through `created` and
 /// hide the `labelled_nodes` half entirely.
 fn relabel<D: graphus_io::BlockDevice, S: LogSink>(
-    store: &mut RecordStore<D, S>,
+    store: &RecordStore<D, S>,
     txn: TxnId,
     node: u64,
 ) {
@@ -332,14 +332,14 @@ fn relabel<D: graphus_io::BlockDevice, S: LogSink>(
 #[must_use]
 pub fn run_wal_sync_failure_during_rollback() -> RollbackFaultReport {
     let fail_sync = Arc::new(AtomicBool::new(false));
-    let mut store = create_fault_store(&fail_sync);
-    let (node, committed_labels, written) = seed(&mut store);
+    let store = create_fault_store(&fail_sync);
+    let (node, committed_labels, written) = seed(&store);
 
     // The writer takes the LOWER id, so `uncommitted_data_writer` — which reports the lowest open
     // data writer, deterministically — names it while it is open.
     let writer = TxnId(2);
     store.begin(writer);
-    relabel(&mut store, writer, node);
+    relabel(&store, writer, node);
 
     // A bystander that stays open across the whole fault. It is a data writer too, and its id is
     // HIGHER, so it is exactly what the guard falls back to naming the moment the writer vanishes.
@@ -390,12 +390,12 @@ pub fn run_wal_sync_failure_during_rollback() -> RollbackFaultReport {
 /// Panics if the store fixture cannot be built or the seed transaction cannot commit.
 #[must_use]
 pub fn run_io_error_at_commit_of_a_label_writer() -> CommitFaultReport {
-    let mut store = create_plain_store();
-    let (node, committed_labels, written) = seed(&mut store);
+    let store = create_plain_store();
+    let (node, committed_labels, written) = seed(&store);
 
     let writer = TxnId(2);
     store.begin(writer);
-    relabel(&mut store, writer, node);
+    relabel(&store, writer, node);
     // Force the catalog past one metadata page so `checkpoint_meta` must grow the chain (and therefore
     // must write to the device) before it can persist anything.
     for i in 0..CHAIN_GROWTH_TOKENS {
@@ -446,8 +446,8 @@ pub fn run_io_error_at_commit_of_a_label_writer() -> CommitFaultReport {
 #[must_use]
 pub fn run_bystander_survives_failed_rollback() -> (bool, bool) {
     let fail_sync = Arc::new(AtomicBool::new(false));
-    let mut store = create_fault_store(&fail_sync);
-    let (node, _committed, _written) = seed(&mut store);
+    let store = create_fault_store(&fail_sync);
+    let (node, _committed, _written) = seed(&store);
 
     // The bystander moves a counter (a fresh node) and interns a token, so it holds BOTH a pending
     // count delta and a pending catalog change.
@@ -460,7 +460,7 @@ pub fn run_bystander_survives_failed_rollback() -> (bool, bool) {
 
     let writer = TxnId(3);
     store.begin(writer);
-    relabel(&mut store, writer, node);
+    relabel(&store, writer, node);
 
     fail_sync.store(true, Ordering::SeqCst);
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -499,8 +499,8 @@ fn registry_says_committed<D: graphus_io::BlockDevice, S: LogSink>(
 /// Panics if the store fixture cannot be built or the seed transaction cannot commit.
 #[must_use]
 pub fn run_failed_commit_publishes_no_registry_entry() -> (bool, bool) {
-    let mut store = create_plain_store();
-    let (node, _committed, _written) = seed(&mut store);
+    let store = create_plain_store();
+    let (node, _committed, _written) = seed(&store);
 
     // Non-vacuity control: the SEED transaction committed, so the predicate below really does report
     // `true` for a transaction that committed. Without this, "the writer is not reported as committed"
@@ -513,7 +513,7 @@ pub fn run_failed_commit_publishes_no_registry_entry() -> (bool, bool) {
 
     let writer = TxnId(2);
     store.begin(writer);
-    relabel(&mut store, writer, node);
+    relabel(&store, writer, node);
     let (_created, _) = store.create_node(writer).expect("writer node");
     for i in 0..CHAIN_GROWTH_TOKENS {
         store
@@ -915,12 +915,12 @@ mod tests {
     /// transaction, still reverts the label word, and still leaves the guard open.
     #[test]
     fn a_successful_rollback_is_unchanged_by_the_reordering_955() {
-        let mut store = create_plain_store();
-        let (node, committed, written) = seed(&mut store);
+        let store = create_plain_store();
+        let (node, committed, written) = seed(&store);
 
         let writer = TxnId(2);
         store.begin(writer);
-        relabel(&mut store, writer, node);
+        relabel(&store, writer, node);
         let before = observe(&store, writer, node, written);
         assert!(
             before.is_active && before.is_uncommitted_data_writer,
@@ -1049,8 +1049,8 @@ mod tests {
     /// "invisible to the newest possible reader" rather than to an accidentally-stale one.
     #[test]
     fn the_oracle_snapshot_is_the_newest_possible_one_955() {
-        let mut store = create_plain_store();
-        let (_node, _committed, _written) = seed(&mut store);
+        let store = create_plain_store();
+        let (_node, _committed, _written) = seed(&store);
         assert!(
             store.snapshot_ts() > Timestamp(0),
             "the seed commit must have advanced the commit-timestamp oracle, else the oracle snapshot \

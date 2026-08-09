@@ -511,7 +511,7 @@ impl LinkCodec for Plain {
 /// Returns a storage error if the base backup fails (which also means the *source* store is corrupt,
 /// see [`backup_store`]), or if `codec.seal` fails.
 pub fn begin_chain<D: BlockDevice, S: LogSink, C: LinkCodec>(
-    store: &mut RecordStore<D, S>,
+    store: &RecordStore<D, S>,
     codec: &C,
 ) -> Result<(ChainManifest, Vec<u8>)> {
     // `backup_store` flushes (steal) + checkpoints first; read the watermark *after* the backup so
@@ -554,7 +554,7 @@ pub fn begin_chain<D: BlockDevice, S: LogSink, C: LinkCodec>(
 /// (a `durable_len < tip_lsn` — an impossible state that indicates a misuse / corrupt chain), or if
 /// `codec.seal` fails.
 pub fn capture_increment<D: BlockDevice, S: LogSink, C: LinkCodec>(
-    store: &mut RecordStore<D, S>,
+    store: &RecordStore<D, S>,
     manifest: &mut ChainManifest,
     codec: &C,
 ) -> Result<Vec<u8>> {
@@ -849,12 +849,12 @@ where
         outcome = Some(restore_to(manifest, links, target, &mut device, codec)?);
         // Prove the restored image is consistent before it replaces the target (read-only open over
         // the just-hardened device with a throwaway WAL; dropping it closes the temp fd pre-rename).
-        let mut store = RecordStore::open(
+        let store = RecordStore::open(
             device,
             WalManager::create(MemLogSink::new())?,
             pool_capacity,
         )?;
-        verify_on_open(&mut store, &[])?;
+        verify_on_open(&store, &[])?;
         drop(store);
         Ok(())
     })?;

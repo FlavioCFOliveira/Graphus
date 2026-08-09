@@ -145,14 +145,14 @@ fn run(seed: u64) -> Report {
     // Harden the tail so the crash WAL carries everything above.
     store.with_wal(WalManager::flush);
 
-    let mut store = if steal {
+    let store = if steal {
         crash_steal(store)
     } else {
         crash_no_force(store)
     };
 
     // ---- The recovered store must be structurally consistent, chains included. ----
-    verify_on_open(&mut store, &[]).expect("the recovered store must be consistent");
+    verify_on_open(&store, &[]).expect("the recovered store must be consistent");
 
     // ---- and every committed edge must still be reachable from the hub. ----
     let reachable: Vec<u64> = store

@@ -250,8 +250,8 @@ fn reopen_and_check(
     let mut dwb = Dwb::new(dwb_dev).expect("reopen DWB");
     recover_device_with_dwb(&mut wal, &mut device, &mut dwb).expect("recover device with DWB");
     let wal = WalManager::open(sink).expect("reopen WAL");
-    let mut store = RecordStore::open(store_dev, wal, pool).expect("open store");
-    let report = check_store(&mut store, &[]).expect("consistency check runs");
+    let store = RecordStore::open(store_dev, wal, pool).expect("open store");
+    let report = check_store(&store, &[]).expect("consistency check runs");
     (report.is_consistent(), report.live_nodes)
 }
 

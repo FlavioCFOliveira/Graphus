@@ -9,7 +9,7 @@
 //! [`graphus_bulk::intern_property_key_tokens`] / [`graphus_bulk::ingest_node_row`] /
 //! [`graphus_bulk::ingest_rel_row`] are the **exact** low-level per-record store-mutation logic the
 //! offline `BulkImporter` uses internally, extracted (`rmp` #519) into free functions parameterized
-//! over an externally-owned `&mut RecordStore` and an externally-supplied `TxnId` instead of an
+//! over an externally-owned `&RecordStore` and an externally-supplied `TxnId` instead of an
 //! owned importer. This module is the network-side caller: it borrows the store for the scope of one
 //! [`graphus_cypher::TxnCoordinator::raw_txn`] call per batch and drives the identical ingestion
 //! functions, so "shared, unmodified code between the offline tool and the network endpoint"
@@ -381,7 +381,7 @@ impl LoadingSession {
 ///
 /// Best-effort: the commit error is the primary failure being reported, and a rollback that fails on
 /// top of it has already left the store in a state only a controlled restart can resolve.
-fn roll_back_failed_commit<D: BlockDevice, S: LogSink>(store: &mut RecordStore<D, S>, txn: TxnId) {
+fn roll_back_failed_commit<D: BlockDevice, S: LogSink>(store: &RecordStore<D, S>, txn: TxnId) {
     if store.is_txn_active(txn) {
         let _ = store.rollback(txn);
     }
@@ -408,7 +408,7 @@ fn is_not_in_use(err: &graphus_core::GraphusError) -> bool {
 /// caller is responsible for rolling back `txn` on `Err` (mirrors `graphus_bulk::ingest_node_row`'s
 /// contract — this function never owns the transaction's lifecycle).
 fn checkpoint_sentinel<D: BlockDevice, S: LogSink>(
-    store: &mut RecordStore<D, S>,
+    store: &RecordStore<D, S>,
     txn: TxnId,
     sentinel_node_id: &mut Option<u64>,
     batch_seq: u64,

@@ -224,7 +224,7 @@ fn round_trip_preserves_the_graph_across_seeds() {
         let before = snapshot(&mut original);
         let marker = original.element_id_next();
 
-        let artifact = backup_store(&mut original).expect("backup");
+        let artifact = backup_store(&original).expect("backup");
         verify_backup(&artifact).expect("untampered artifact verifies");
         assert_eq!(
             backup_creation_marker(&artifact).unwrap(),
@@ -236,7 +236,7 @@ fn round_trip_preserves_the_graph_across_seeds() {
         let after = snapshot(&mut restored);
 
         assert_eq!(before, after, "seed={seed}: restored graph != original");
-        verify_on_open(&mut restored, &[]).expect("restored store is consistent");
+        verify_on_open(&restored, &[]).expect("restored store is consistent");
     }
 }
 
@@ -246,13 +246,13 @@ fn empty_store_round_trips() {
     let before = snapshot(&mut original);
     assert!(before.nodes.is_empty());
 
-    let artifact = backup_store(&mut original).expect("backup empty");
+    let artifact = backup_store(&original).expect("backup empty");
     verify_backup(&artifact).expect("empty artifact verifies");
 
     let mut restored = restore(&artifact, fresh_wal(), 16).expect("restore empty");
     let after = snapshot(&mut restored);
     assert_eq!(before, after);
-    verify_on_open(&mut restored, &[]).expect("restored empty store is consistent");
+    verify_on_open(&restored, &[]).expect("restored empty store is consistent");
 
     // A new node after restore continues element ids past the recovered high-water (never reused).
     let txn = TxnId(1);
@@ -270,7 +270,7 @@ fn empty_store_round_trips() {
 fn backup_does_not_mutate_the_source_graph() {
     let mut original = build_graph(7, 80);
     let before = snapshot(&mut original);
-    let _ = backup_store(&mut original).expect("backup");
+    let _ = backup_store(&original).expect("backup");
     let after = snapshot(&mut original);
     assert_eq!(before, after, "backup must be read-only w.r.t. the graph");
 }
@@ -297,7 +297,7 @@ fn self_loops_and_parallel_edges_survive_round_trip() {
         "a has two parallel edges and one self-loop incident"
     );
 
-    let artifact = backup_store(&mut original).expect("backup");
+    let artifact = backup_store(&original).expect("backup");
     let mut restored = restore(&artifact, fresh_wal(), 32).expect("restore");
     let after = snapshot(&mut restored);
     assert_eq!(before, after);
@@ -310,11 +310,11 @@ fn self_loops_and_parallel_edges_survive_round_trip() {
 /// Builds a representative artifact and confirms the *untampered* form verifies + restores cleanly,
 /// returning the artifact for a test to then tamper with.
 fn good_artifact() -> Vec<u8> {
-    let mut original = build_graph(3, 100);
-    let artifact = backup_store(&mut original).expect("backup");
+    let original = build_graph(3, 100);
+    let artifact = backup_store(&original).expect("backup");
     verify_backup(&artifact).expect("baseline: untampered artifact verifies");
-    let mut restored = restore(&artifact, fresh_wal(), 64).expect("baseline: untampered restores");
-    verify_on_open(&mut restored, &[]).expect("baseline: restored store is consistent");
+    let restored = restore(&artifact, fresh_wal(), 64).expect("baseline: untampered restores");
+    verify_on_open(&restored, &[]).expect("baseline: restored store is consistent");
     artifact
 }
 
@@ -439,7 +439,7 @@ fn restore_rejects_an_inconsistent_image_that_passes_both_digests() {
     // record so its incidence chain no longer matches the relationships (a structural inconsistency
     // the per-page CRC and the whole-payload digest both pass once re-faked). The post-restore
     // consistency check inside `restore` must reject it.
-    let mut original = fresh(64);
+    let original = fresh(64);
     let txn = TxnId(1);
     original.begin(txn);
     let rt = original.intern_token(Namespace::RelType, "E").unwrap();
@@ -448,7 +448,7 @@ fn restore_rejects_an_inconsistent_image_that_passes_both_digests() {
     let _r = original.create_rel(txn, rt, a, b).unwrap();
     original.commit(txn).unwrap();
 
-    let mut artifact = backup_store(&mut original).expect("backup");
+    let mut artifact = backup_store(&original).expect("backup");
     verify_backup(&artifact).expect("baseline verifies");
     restore(&artifact, fresh_wal(), 64).expect("baseline restores consistently");
 
@@ -482,8 +482,8 @@ fn verify_and_restore_reject_an_out_of_range_page_id() {
     // A crafted artifact whose first framed page claims page_id = u64::MAX must be rejected cleanly —
     // no overflow panic, no absurd device extend — by both verification and restore (storage audit
     // F10). A valid backup's page ids are dense in [0, page_count).
-    let mut original = build_graph(5, 60);
-    let mut artifact = backup_store(&mut original).expect("backup");
+    let original = build_graph(5, 60);
+    let mut artifact = backup_store(&original).expect("backup");
 
     // The first page entry's framed page_id is the 8 bytes immediately after the artifact header.
     let pid_off = ARTIFACT_HEADER_LEN;
@@ -579,7 +579,7 @@ fn snapshot_file(path: &std::path::Path) -> GraphSnapshot {
     use graphus_io::FileBlockDevice;
     let dev = FileBlockDevice::open(path).expect("open file device");
     let mut store = RecordStore::open(dev, fresh_wal(), 64).expect("open store from file");
-    verify_on_open(&mut store, &[]).expect("restored store is consistent");
+    verify_on_open(&store, &[]).expect("restored store is consistent");
     snapshot(&mut store)
 }
 
@@ -599,8 +599,8 @@ fn restore_file_atomic_creates_and_round_trips() {
     use graphus_io::FileBlockDevice;
     let path = unique_blk_path("create");
 
-    let mut original = build_graph(7, 120);
-    let artifact = backup_store(&mut original).expect("backup");
+    let original = build_graph(7, 120);
+    let artifact = backup_store(&original).expect("backup");
     let expected = snapshot(&mut restore(&artifact, fresh_wal(), 64).expect("in-memory restore"));
 
     assert!(!path.exists(), "target should not pre-exist");
@@ -629,15 +629,15 @@ fn restore_file_atomic_abort_leaves_the_original_intact() {
     let path = unique_blk_path("abort");
 
     // Seed the target with a valid ORIGINAL image (graph A) via a baseline atomic restore.
-    let mut graph_a = build_graph(11, 100);
-    let artifact_a = backup_store(&mut graph_a).expect("backup A");
+    let graph_a = build_graph(11, 100);
+    let artifact_a = backup_store(&graph_a).expect("backup A");
     restore_file_atomic(&artifact_a, &path, |p| FileBlockDevice::open(p), 64)
         .expect("seed original");
     let original_bytes = std::fs::read(&path).expect("read original");
     let original_snapshot = snapshot_file(&path);
 
     // Build an internally-inconsistent-but-CRC-valid artifact (graph B with a broken incidence chain).
-    let mut graph_b = fresh(64);
+    let graph_b = fresh(64);
     let txn = TxnId(1);
     graph_b.begin(txn);
     let rt = graph_b.intern_token(Namespace::RelType, "E").unwrap();
@@ -645,7 +645,7 @@ fn restore_file_atomic_abort_leaves_the_original_intact() {
     let (b, _) = graph_b.create_node(txn).unwrap();
     let _r = graph_b.create_rel(txn, rt, a, b).unwrap();
     graph_b.commit(txn).unwrap();
-    let mut bad = backup_store(&mut graph_b).expect("backup B");
+    let mut bad = backup_store(&graph_b).expect("backup B");
     let (page_body_start, in_page) = locate_record(&bad, eid_a.0, NODE_RECORD_SIZE);
     let first_rel_off = page_body_start + in_page + mvcc_plus_eid();
     bad[first_rel_off..first_rel_off + 8].copy_from_slice(&0u64.to_le_bytes());
@@ -686,14 +686,14 @@ fn restore_file_atomic_over_a_larger_image_leaves_no_stale_pages() {
     let path = unique_blk_path("stale");
 
     // First lay down a LARGE image.
-    let mut large = build_graph(3, 400);
-    let artifact_large = backup_store(&mut large).expect("backup large");
+    let large = build_graph(3, 400);
+    let artifact_large = backup_store(&large).expect("backup large");
     restore_file_atomic(&artifact_large, &path, |p| FileBlockDevice::open(p), 64)
         .expect("restore large");
 
     // Then atomically restore a SMALL image over it.
-    let mut small = build_graph(99, 20);
-    let artifact_small = backup_store(&mut small).expect("backup small");
+    let small = build_graph(99, 20);
+    let artifact_small = backup_store(&small).expect("backup small");
     let expected_small =
         snapshot(&mut restore(&artifact_small, fresh_wal(), 64).expect("restore small mem"));
     restore_file_atomic(&artifact_small, &path, |p| FileBlockDevice::open(p), 64)
@@ -711,8 +711,8 @@ fn restore_file_atomic_over_a_larger_image_leaves_no_stale_pages() {
 // Keep `restore_onto` exercised directly (the device-agnostic primitive) so its path is covered.
 #[test]
 fn restore_onto_a_caller_device_matches_restore() {
-    let mut original = build_graph(5, 90);
-    let artifact = backup_store(&mut original).expect("backup");
+    let original = build_graph(5, 90);
+    let artifact = backup_store(&original).expect("backup");
 
     // Restore via the high-level path.
     let mut via_restore = restore(&artifact, fresh_wal(), 64).expect("restore");
@@ -722,7 +722,7 @@ fn restore_onto_a_caller_device_matches_restore() {
     let mut device = MemBlockDevice::new(0);
     restore_onto(&artifact, &mut device).expect("restore_onto");
     let mut manual = RecordStore::open(device, fresh_wal(), 64).expect("open");
-    verify_on_open(&mut manual, &[]).expect("manual restore is consistent");
+    verify_on_open(&manual, &[]).expect("manual restore is consistent");
     let got = snapshot(&mut manual);
 
     assert_eq!(expected, got, "restore_onto + open must match restore");
@@ -740,8 +740,8 @@ fn restore_onto_a_file_device_round_trips() {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!("graphus-backup-{}-{n}.blk", std::process::id()));
 
-    let mut original = build_graph(9, 90);
-    let artifact = backup_store(&mut original).expect("backup");
+    let original = build_graph(9, 90);
+    let artifact = backup_store(&original).expect("backup");
     let mut via_restore = restore(&artifact, fresh_wal(), 64).expect("restore");
     let expected = snapshot(&mut via_restore);
 
@@ -752,7 +752,7 @@ fn restore_onto_a_file_device_round_trips() {
     }
     let file_dev = FileBlockDevice::open(&path).expect("reopen file device");
     let mut from_file = RecordStore::open(file_dev, fresh_wal(), 64).expect("open store from file");
-    verify_on_open(&mut from_file, &[]).expect("file-restored store is consistent");
+    verify_on_open(&from_file, &[]).expect("file-restored store is consistent");
     let got = snapshot(&mut from_file);
 
     assert_eq!(

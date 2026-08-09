@@ -575,7 +575,7 @@ fn crash_recovery_aborted_middle_rel_keeps_both_committed_edges() {
     s.commit(t1).unwrap();
     s.commit(t3).unwrap();
     // CRASH: t2 never commits. Recover the durable WAL prefix onto a fresh device.
-    let mut s = recover_no_force(&s);
+    let s = recover_no_force(&s);
 
     // Both committed edges survive; the loser r2 was undone to a transparent dead link, threaded
     // through by the forward walk. Recovery must reconstruct the exact same survivor set as live
@@ -626,7 +626,7 @@ fn crash_recovery_aborted_middle_rel_keeps_both_committed_edges() {
 
     // The store is structurally consistent after the splice (the checker enforces the doubly-linked
     // incidence invariants: head prev == NULL, back-pointer symmetry, independent re-derivation).
-    let report = graphus_storage::check::check_store(&mut s, &[]).unwrap();
+    let report = graphus_storage::check::check_store(&s, &[]).unwrap();
     assert!(
         report.is_consistent(),
         "store is consistent after corpse splice: {:?}",
@@ -644,7 +644,7 @@ fn crash_recovery_aborted_middle_rel_keeps_both_committed_edges() {
 /// as an idempotence check: a pass now finds nothing to splice.
 #[test]
 fn live_rollback_of_middle_prepend_reclaims_its_slot_at_once() {
-    let mut s = fresh();
+    let s = fresh();
     let rt = s.intern_token(Namespace::RelType, "R").unwrap();
 
     // Setup (committed): hub + three leaves.
@@ -683,7 +683,7 @@ fn live_rollback_of_middle_prepend_reclaims_its_slot_at_once() {
         !s.rel(r2).unwrap().mvcc.in_use(),
         "rmp #970: r2's record is retired by the abort itself — unlinked, header zeroed"
     );
-    let report = graphus_storage::check::check_store(&mut s, &[]).unwrap();
+    let report = graphus_storage::check::check_store(&s, &[]).unwrap();
     assert!(
         report.is_consistent(),
         "store is consistent right after the abort, with no GC pass: {:?}",
@@ -726,7 +726,7 @@ fn live_rollback_of_middle_prepend_reclaims_its_slot_at_once() {
         "a second GC pass reclaims nothing further"
     );
 
-    let report = graphus_storage::check::check_store(&mut s, &[]).unwrap();
+    let report = graphus_storage::check::check_store(&s, &[]).unwrap();
     assert!(
         report.is_consistent(),
         "store is consistent after corpse splice: {:?}",
@@ -742,7 +742,7 @@ fn live_rollback_of_middle_prepend_reclaims_its_slot_at_once() {
 /// regress. Before the fix, `used_rel_slots` grew by one per aborted creation, monotonically forever.
 #[test]
 fn churn_create_abort_keeps_rel_slots_bounded() {
-    let mut s = fresh();
+    let s = fresh();
     let rt = s.intern_token(Namespace::RelType, "R").unwrap();
 
     // Committed hub + three reusable leaves.
@@ -829,7 +829,7 @@ fn churn_create_abort_keeps_rel_slots_bounded() {
         "rel high-water is stable across rounds (no monotonic creep): {high_water_after_gc:?}"
     );
 
-    let report = graphus_storage::check::check_store(&mut s, &[]).unwrap();
+    let report = graphus_storage::check::check_store(&s, &[]).unwrap();
     assert!(
         report.is_consistent(),
         "store stays consistent across churn: {:?}",
@@ -848,7 +848,7 @@ fn churn_create_abort_keeps_rel_slots_bounded() {
 /// the new one: both slots are back at once, with no GC pass.
 #[test]
 fn consecutive_aborted_prepends_leave_no_corpse_run() {
-    let mut s = fresh();
+    let s = fresh();
     let rt = s.intern_token(Namespace::RelType, "R").unwrap();
 
     let setup = TxnId(1);
@@ -893,7 +893,7 @@ fn consecutive_aborted_prepends_leave_no_corpse_run() {
         "rmp #970: no corpse run — each abort retired its own record"
     );
     assert!(!s.rel(r3).unwrap().mvcc.in_use());
-    let report = graphus_storage::check::check_store(&mut s, &[]).unwrap();
+    let report = graphus_storage::check::check_store(&s, &[]).unwrap();
     assert!(
         report.is_consistent(),
         "store is consistent right after both aborts, with no GC pass: {:?}",
@@ -919,7 +919,7 @@ fn consecutive_aborted_prepends_leave_no_corpse_run() {
         "the orphan sweep returns both aborted slots"
     );
 
-    let report = graphus_storage::check::check_store(&mut s, &[]).unwrap();
+    let report = graphus_storage::check::check_store(&s, &[]).unwrap();
     assert!(
         report.is_consistent(),
         "store is consistent after the GC pass: {:?}",
@@ -934,7 +934,7 @@ fn consecutive_aborted_prepends_leave_no_corpse_run() {
 /// which is why a self-loop gets two deltas naming the same peer and differing only in direction.
 #[test]
 fn aborted_self_loop_is_unlinked_from_both_links() {
-    let mut s = fresh();
+    let s = fresh();
     let rt = s.intern_token(Namespace::RelType, "R").unwrap();
 
     let setup = TxnId(1);
@@ -972,7 +972,7 @@ fn aborted_self_loop_is_unlinked_from_both_links() {
         !s.rel(loop_corpse).unwrap().mvcc.in_use(),
         "rmp #970: both of the aborted self-loop's links are removed and its record retired"
     );
-    let report = graphus_storage::check::check_store(&mut s, &[]).unwrap();
+    let report = graphus_storage::check::check_store(&s, &[]).unwrap();
     assert!(
         report.is_consistent(),
         "store is consistent right after the abort, with no GC pass: {:?}",
@@ -998,7 +998,7 @@ fn aborted_self_loop_is_unlinked_from_both_links() {
         "the orphan sweep returns the aborted self-loop's single slot"
     );
 
-    let report = graphus_storage::check::check_store(&mut s, &[]).unwrap();
+    let report = graphus_storage::check::check_store(&s, &[]).unwrap();
     assert!(
         report.is_consistent(),
         "store is consistent after the GC pass: {:?}",

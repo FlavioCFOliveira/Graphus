@@ -272,13 +272,13 @@ fn run_read_only_recovery(seed: u64) -> ReadOnlyRecoveryReport {
     // then undoes them).
     store.with_wal(WalManager::flush);
 
-    let (mut store, recovery_losers) = if steal {
+    let (store, recovery_losers) = if steal {
         crash_steal(store)
     } else {
         crash_no_force(store)
     };
 
-    let result = checker::verify(&mut store, &model);
+    let result = checker::verify(&store, &model);
 
     ReadOnlyRecoveryReport {
         seed,
@@ -401,8 +401,7 @@ fn read_only_transactions_are_crash_neutral_across_many_seeds() {
 fn read_only_reader_does_not_floor_reclamation_but_a_writer_does() {
     let device = MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new()).expect("create wal");
-    let store: Store =
-        RecordStore::create(device, wal, POOL_CAPACITY, 1).expect("create store");
+    let store: Store = RecordStore::create(device, wal, POOL_CAPACITY, 1).expect("create store");
 
     // Commit a base node so there is committed data + a non-trivial WAL.
     let t0 = TxnId(1);
