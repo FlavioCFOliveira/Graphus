@@ -62,6 +62,7 @@
 //! `tests/read_polarity_census.rs`.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::shared_cell::{SharedCell, SharedRef};
 
@@ -1501,7 +1502,7 @@ pub struct TxnCoordinator<D: BlockDevice, S: LogSink> {
     /// Open transactions (begun, not yet committed/rolled back).
     active: HashMap<TxnId, ActiveTxn>,
     /// Monotonic transaction-id source (distinct from the commit timestamp, which the store issues).
-    next_txn_id: u64,
+    next_txn_id: AtomicU64,
     /// Queue of in-progress **non-blocking** index builds (`rmp` task #91), advanced in bounded
     /// chunks by [`advance_index_builds`](Self::advance_index_builds) between engine commands. The
     /// front build is the one currently being populated; each completes (durably promoted to
@@ -1522,10 +1523,10 @@ pub struct TxnCoordinator<D: BlockDevice, S: LogSink> {
     /// rather than staying scan-only until restart — but a rebuild is O(store), so a *persistent* fault
     /// must not re-scan every tick. The backoff doubles (1, 2, 4, … 1024) on each failed attempt and
     /// resets on success.
-    degraded_retry_skip: u32,
+    degraded_retry_skip: AtomicU32,
     /// The current retry backoff width, in ticks — see
     /// [`degraded_retry_skip`](Self#structfield.degraded_retry_skip).
-    degraded_retry_backoff: u32,
+    degraded_retry_backoff: AtomicU32,
     /// Builds **poisoned** by a storage fault they could not get past (`rmp` task #733, M1): dropped from
     /// the pending queue un-promoted, so the engine terminates instead of spinning, but NOT thrown away.
     ///
@@ -1570,33 +1571,33 @@ pub struct TxnCoordinator<D: BlockDevice, S: LogSink> {
     /// generation, sustained, on a database whose mandate is extreme write concurrency — and it thrashes
     /// every full-text index between `Online` and `Populating` while doing it. Backing off costs only
     /// latency on an index that is correct-but-unaccelerated meanwhile.
-    conflict_retry_skip: u32,
+    conflict_retry_skip: AtomicU32,
     /// The current backoff width for [`conflict_retry_skip`](Self#structfield.conflict_retry_skip).
-    conflict_retry_backoff: u32,
+    conflict_retry_backoff: AtomicU32,
     /// Drains still to skip before the next POISON-only full-text/spatial repair (`rmp` task #803) —
     /// see [`retry_degraded_index_rebuild`](Self::retry_degraded_index_rebuild). Kept separate from
     /// [`degraded_retry_skip`](Self#structfield.degraded_retry_skip) because the two throttle opposite
     /// failure modes: a degraded set is a storage fault whose repair keeps FAILING, while a poison
     /// repair always succeeds and the hazard is it being re-triggered.
-    ft_poison_repair_skip: u32,
+    ft_poison_repair_skip: AtomicU32,
     /// The current backoff width for
     /// [`ft_poison_repair_skip`](Self#structfield.ft_poison_repair_skip). Doubles on each successful
     /// poison-only repair and halves on every call that finds the engine healthy.
-    ft_poison_repair_backoff: u32,
+    ft_poison_repair_backoff: AtomicU32,
     /// How many POISON-driven full-store rebuilds this coordinator has actually run (`rmp` task #803)
     /// — monotonic. The repair is an O(store) rebuild of every index, so its RATE is the thing that
     /// must stay proportionate to the fault rather than to the traffic; a counter is the only way to
     /// hold that in a regression test.
-    ft_poison_repairs: u64,
+    ft_poison_repairs: AtomicU64,
     /// Drains still to skip before the next VECTOR conflict re-fill attempt (`rmp` task #780) — the
     /// vector twin of [`conflict_retry_skip`](Self#structfield.conflict_retry_skip), kept SEPARATE so a
     /// flapping full-text conflict cannot starve a vector re-fill (or the reverse): while an index is
     /// blocked its every read pays an O(entities x dim) exact scan, so its repair must not queue behind
     /// an unrelated kind's backoff.
-    vector_conflict_retry_skip: u32,
+    vector_conflict_retry_skip: AtomicU32,
     /// The current backoff width for
     /// [`vector_conflict_retry_skip`](Self#structfield.vector_conflict_retry_skip).
-    vector_conflict_retry_backoff: u32,
+    vector_conflict_retry_backoff: AtomicU32,
     /// What every GC-driven index collection has done over this coordinator's life (`rmp` #992) —
     /// monotonic totals of [`DeadKeyCollection`], summed across passes.
     ///
@@ -1613,12 +1614,12 @@ pub struct TxnCoordinator<D: BlockDevice, S: LogSink> {
     /// How many builds have been poisoned over this coordinator's life (`rmp` task #733, M1) — monotonic.
     /// The server samples it to log at `ERROR` and drive a metric: an index that quietly stopped being
     /// built is exactly the kind of degradation that otherwise passes for "healthy but slow".
-    poison_events: u64,
+    poison_events: AtomicU64,
     /// Drains still to skip before the next poisoned-build resurrection probe (`rmp` task #733) — the
     /// throttle that stops a permanently-broken store from making the engine re-scan every command. Its
     /// width comes from [`poison_backoff`] applied to
     /// [`poison_resurrect_attempts`](Self#structfield.poison_resurrect_attempts).
-    poison_retry_skip: u32,
+    poison_retry_skip: AtomicU32,
     /// How many times in a row a parked build has been **resurrected without completing** (`rmp` task
     /// #733, B2 — the fix for a defect the M1 resurrection introduced).
     ///
@@ -1630,7 +1631,7 @@ pub struct TxnCoordinator<D: BlockDevice, S: LogSink> {
     /// consecutive failed resurrections so the backoff can grow geometrically (`2^attempts`, capped),
     /// collapsing the retry *rate* toward zero; it resets to `0` the moment the graveyard clears (a
     /// resurrected build actually completed), so a genuinely-healed store returns to fast retries.
-    poison_resurrect_attempts: u32,
+    poison_resurrect_attempts: AtomicU32,
 }
 
 /// The deterministic, stable **auto-name** for a node-property index on `(label, property)`
@@ -1880,27 +1881,27 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             zones: SharedCell::new(crate::zone_map::ZoneMap::new()),
             csr,
             active: HashMap::new(),
-            next_txn_id,
+            next_txn_id: AtomicU64::new(next_txn_id),
             pending_builds: VecDeque::new(),
             pending_fulltext_builds: VecDeque::new(),
             pending_spatial_builds: VecDeque::new(),
-            degraded_retry_skip: 0,
-            degraded_retry_backoff: 1,
+            degraded_retry_skip: AtomicU32::new(0),
+            degraded_retry_backoff: AtomicU32::new(1),
             poisoned_builds: Vec::new(),
             poisoned_fulltext_builds: Vec::new(),
             conflicted_fulltext_builds: Vec::new(),
-            conflict_retry_skip: 0,
-            conflict_retry_backoff: 1,
-            ft_poison_repair_skip: 0,
-            ft_poison_repair_backoff: 1,
-            ft_poison_repairs: 0,
+            conflict_retry_skip: AtomicU32::new(0),
+            conflict_retry_backoff: AtomicU32::new(1),
+            ft_poison_repair_skip: AtomicU32::new(0),
+            ft_poison_repair_backoff: AtomicU32::new(1),
+            ft_poison_repairs: AtomicU64::new(0),
             index_collection_totals: IndexCollectionTotals::default(),
-            vector_conflict_retry_skip: 0,
-            vector_conflict_retry_backoff: 1,
+            vector_conflict_retry_skip: AtomicU32::new(0),
+            vector_conflict_retry_backoff: AtomicU32::new(1),
             poisoned_spatial_builds: Vec::new(),
-            poison_events: 0,
-            poison_retry_skip: 0,
-            poison_resurrect_attempts: 0,
+            poison_events: AtomicU64::new(0),
+            poison_retry_skip: AtomicU32::new(0),
+            poison_resurrect_attempts: AtomicU32::new(0),
         }
     }
 
@@ -2888,10 +2889,10 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// graveyard, counted (`rmp` task #733, M1). It is NOT discarded: once the store reads cleanly again,
     /// [`retry_poisoned_index_builds`](Self::retry_poisoned_index_builds) re-enqueues it from a fresh
     /// snapshot, so a transient fault costs a delay rather than a permanently dead index.
-    fn poison_front<B>(queue: &mut VecDeque<B>, graveyard: &mut Vec<B>, events: &mut u64) {
+    fn poison_front<B>(queue: &mut VecDeque<B>, graveyard: &mut Vec<B>, events: &AtomicU64) {
         if let Some(build) = queue.pop_front() {
             graveyard.push(build);
-            *events = events.saturating_add(1);
+            events.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -4217,8 +4218,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// the store's latest commit, registers SSI tracking, and inserts the active entry with its
     /// (optional) monotonic begin reading.
     fn begin_inner(&mut self, isolation: IsolationLevel, begin_nanos: Option<u64>) -> TxnId {
-        self.next_txn_id += 1;
-        let txn = TxnId(self.next_txn_id);
+        let txn = self.mint_txn();
         let begin_ts = self.store.borrow().snapshot_ts();
         self.store.borrow_mut().begin(txn);
         self.ssi.borrow_mut().register(txn, begin_ts);
@@ -4266,8 +4266,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // Intern the label + prop-key tokens and record the durable catalog entry in one dedicated
         // transaction so the schema change (tokens + registration) survives a crash atomically, even
         // if no node yet uses them.
-        self.next_txn_id += 1;
-        let txn = TxnId(self.next_txn_id);
+        let txn = self.mint_txn();
         self.store.borrow_mut().begin(txn);
         let (label_token, prop_key) = {
             let store = self.store.borrow_mut();
@@ -4372,8 +4371,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // 3. Intern the tokens and record the durable catalog entry (`Online`) + its name, in one
         //    committed transaction — so the schema change (tokens + registration) survives a crash
         //    atomically even if no relationship yet uses them.
-        self.next_txn_id += 1;
-        let txn = TxnId(self.next_txn_id);
+        let txn = self.mint_txn();
         self.store.borrow_mut().begin(txn);
         let (type_token, prop_key) = {
             let store = self.store.borrow_mut();
@@ -4444,8 +4442,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             return Ok(false); // no such index → clean no-op, nothing removed.
         };
 
-        self.next_txn_id += 1;
-        let txn = TxnId(self.next_txn_id);
+        let txn = self.mint_txn();
         self.store.borrow_mut().begin(txn);
         {
             let store = self.store.borrow_mut();
@@ -4482,8 +4479,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             };
         };
 
-        self.next_txn_id += 1;
-        let txn = TxnId(self.next_txn_id);
+        let txn = self.mint_txn();
         self.store.borrow_mut().begin(txn);
         {
             let store = self.store.borrow_mut();
@@ -4606,8 +4602,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         label_token: u32,
         property_tokens: &[u32],
     ) -> Result<()> {
-        self.next_txn_id += 1;
-        let txn = TxnId(self.next_txn_id);
+        let txn = self.mint_txn();
         self.store.borrow_mut().begin(txn);
         self.store.borrow_mut().remove_composite_index(txn, name);
         self.store.borrow_mut().commit(txn)?;
@@ -4701,8 +4696,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         type_token: u32,
         property_tokens: &[u32],
     ) -> Result<()> {
-        self.next_txn_id += 1;
-        let txn = TxnId(self.next_txn_id);
+        let txn = self.mint_txn();
         self.store.borrow_mut().begin(txn);
         self.store
             .borrow_mut()
@@ -4792,8 +4786,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     pub fn declare_columnar_cache(&mut self, label: &str, property: &str) -> Result<()> {
         // Intern the tokens in one committed transaction (the only durable effect — no columnar data
         // is persisted). Mirrors the token-minting prologue of `create_node_property_index`.
-        self.next_txn_id += 1;
-        let txn = TxnId(self.next_txn_id);
+        let txn = self.mint_txn();
         self.store.borrow_mut().begin(txn);
         let (label_token, prop_key) = {
             let store = self.store.borrow_mut();
@@ -4850,8 +4843,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ///   [`graphus_index::bitmap::MAX_DISTINCT_VALUES`] — the column is too high-cardinality for a
     ///   bitmap index (use the B+-tree node-property index instead).
     pub fn declare_bitmap_index(&mut self, label: &str, property: &str) -> Result<()> {
-        self.next_txn_id += 1;
-        let txn = TxnId(self.next_txn_id);
+        let txn = self.mint_txn();
         self.store.borrow_mut().begin(txn);
         let (label_token, prop_key) = {
             let store = self.store.borrow_mut();
@@ -4999,8 +4991,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// # Errors
     /// Returns a storage error if interning either token (or its committing transaction) fails.
     pub fn declare_zone_map(&mut self, label: &str, property: &str) -> Result<()> {
-        self.next_txn_id += 1;
-        let txn = TxnId(self.next_txn_id);
+        let txn = self.mint_txn();
         self.store.borrow_mut().begin(txn);
         let (label_token, prop_key) = {
             let store = self.store.borrow_mut();
@@ -5416,8 +5407,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // 3. Intern the tokens and record the durable catalog entry (`Populating`) + its name, in one
         //    committed transaction — so the schema change survives a crash atomically, and an interrupted
         //    build recovers `Populating` and is completed by the open-time rebuild.
-        self.next_txn_id += 1;
-        let txn = TxnId(self.next_txn_id);
+        let txn = self.mint_txn();
         self.store.borrow_mut().begin(txn);
         let (label_token, prop_key) = {
             let store = self.store.borrow_mut();
@@ -5555,8 +5545,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
 
         // 3. Intern the tokens and record the durable catalog entry (`Online`) in one committed
         //    transaction — so the schema change survives a crash atomically.
-        self.next_txn_id += 1;
-        let txn = TxnId(self.next_txn_id);
+        let txn = self.mint_txn();
         self.store.borrow_mut().begin(txn);
         let (label_token, property_tokens, effective_name) = {
             let store = self.store.borrow_mut();
@@ -5781,8 +5770,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
 
         // 3. Intern the tokens and record the durable catalog entry (`Online`) in one committed
         //    transaction — so the schema change survives a crash atomically.
-        self.next_txn_id += 1;
-        let txn = TxnId(self.next_txn_id);
+        let txn = self.mint_txn();
         self.store.borrow_mut().begin(txn);
         let (type_token, property_tokens, effective_name) = {
             let store = self.store.borrow_mut();
@@ -5970,8 +5958,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
 
         // Intern the label + property-key tokens and record the durable catalog entry `Populating`, in
         // one committed transaction (so the schema change survives a crash atomically).
-        self.next_txn_id += 1;
-        let txn = TxnId(self.next_txn_id);
+        let txn = self.mint_txn();
         self.store.borrow_mut().begin(txn);
         let entry = {
             let store = self.store.borrow_mut();
@@ -6083,8 +6070,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             return Err(index_name_in_use(name));
         }
 
-        self.next_txn_id += 1;
-        let txn = TxnId(self.next_txn_id);
+        let txn = self.mint_txn();
         self.store.borrow_mut().begin(txn);
         let entry = {
             let store = self.store.borrow_mut();
@@ -6210,8 +6196,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             self.index.borrow_mut().unregister_fulltext_rel(name);
             return Ok(false); // nothing removed.
         }
-        self.next_txn_id += 1;
-        let txn = TxnId(self.next_txn_id);
+        let txn = self.mint_txn();
         self.store.borrow_mut().begin(txn);
         self.store.borrow_mut().remove_fulltext_index(txn, name);
         self.store.borrow_mut().commit(txn)?;
@@ -6310,8 +6295,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         }
         // Intern the label + property-key tokens and record the durable catalog entry `Populating`, in
         // one committed transaction (so the schema change survives a crash atomically).
-        self.next_txn_id += 1;
-        let txn = TxnId(self.next_txn_id);
+        let txn = self.mint_txn();
         self.store.borrow_mut().begin(txn);
         let (label_token, prop_key) = {
             let store = self.store.borrow_mut();
@@ -6407,8 +6391,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         }
         // Intern the rel-type + property-key tokens and record the durable catalog entry `Online`
         // (synchronous build), in one committed transaction (so the schema change survives a crash).
-        self.next_txn_id += 1;
-        let txn = TxnId(self.next_txn_id);
+        let txn = self.mint_txn();
         self.store.borrow_mut().begin(txn);
         {
             let store = self.store.borrow_mut();
@@ -6537,8 +6520,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             return Ok(false); // nothing removed.
         };
 
-        self.next_txn_id += 1;
-        let txn = TxnId(self.next_txn_id);
+        let txn = self.mint_txn();
         self.store.borrow_mut().begin(txn);
         self.store.borrow_mut().remove_spatial_index(txn, name);
         self.store.borrow_mut().commit(txn)?;
@@ -6669,8 +6651,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         }
         // 3. Intern the label + property-key tokens and record the durable catalog entry `Online` in one
         //    committed transaction — so the schema change survives a crash atomically.
-        self.next_txn_id += 1;
-        let txn = TxnId(self.next_txn_id);
+        let txn = self.mint_txn();
         self.store.borrow_mut().begin(txn);
         let (label_token, prop_key) = {
             let store = self.store.borrow_mut();
@@ -6805,8 +6786,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             return Ok(false); // nothing removed.
         };
 
-        self.next_txn_id += 1;
-        let txn = TxnId(self.next_txn_id);
+        let txn = self.mint_txn();
         self.store.borrow_mut().begin(txn);
         self.store.borrow_mut().remove_text_index(txn, name);
         self.store.borrow_mut().commit(txn)?;
@@ -6933,8 +6913,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
 
         // 3. Intern the tokens and record the durable catalog entry (`Online`) in one committed
         //    transaction — so the schema change survives a crash atomically.
-        self.next_txn_id += 1;
-        let txn = TxnId(self.next_txn_id);
+        let txn = self.mint_txn();
         self.store.borrow_mut().begin(txn);
         let (token, prop_key) = {
             let store = self.store.borrow_mut();
@@ -7118,8 +7097,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             return Ok(false); // nothing removed.
         };
 
-        self.next_txn_id += 1;
-        let txn = TxnId(self.next_txn_id);
+        let txn = self.mint_txn();
         self.store.borrow_mut().begin(txn);
         self.store.borrow_mut().remove_vector_index(txn, name);
         self.store.borrow_mut().commit(txn)?;
@@ -8665,8 +8643,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             self.index.borrow_mut().unregister_constraint(name);
             return Ok(false); // nothing removed.
         };
-        self.next_txn_id += 1;
-        let txn = TxnId(self.next_txn_id);
+        let txn = self.mint_txn();
         self.store.borrow_mut().begin(txn);
         self.store.borrow_mut().remove_constraint(txn, name);
         self.store.borrow_mut().commit(txn)?;
@@ -8821,7 +8798,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// marker was POISONED: the gap between the two is exactly what the repair throttle is buying.
     #[must_use]
     pub fn ft_poison_repairs(&self) -> u64 {
-        self.ft_poison_repairs
+        self.ft_poison_repairs.load(Ordering::Relaxed)
     }
 
     /// How many times a VECTOR index has entered that blocked state over this coordinator's life
@@ -8847,7 +8824,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// again. The server samples this to log the event at `ERROR` and drive a metric.
     #[must_use]
     pub fn index_build_poison_events(&self) -> u64 {
-        self.poison_events
+        self.poison_events.load(Ordering::Relaxed)
     }
 
     /// How many poisoned builds are currently parked awaiting resurrection (`rmp` task #733, M1).
@@ -9064,19 +9041,23 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         if self.poisoned_index_builds() == 0 {
             // The graveyard is clear: either nothing was ever poisoned, or a resurrection's builds all
             // COMPLETED. Reset the throttle so a store that has genuinely healed retries promptly.
-            self.poison_resurrect_attempts = 0;
-            self.poison_retry_skip = 0;
+            self.poison_resurrect_attempts.store(0, Ordering::Relaxed);
+            self.poison_retry_skip.store(0, Ordering::Relaxed);
             return false;
         }
-        if self.poison_retry_skip > 0 {
-            self.poison_retry_skip -= 1;
+        if self.poison_retry_skip.load(Ordering::Relaxed) > 0 {
+            self.poison_retry_skip.fetch_sub(1, Ordering::Relaxed);
             return false;
         }
         // Probe: can the store even be scanned? If not, stay parked and back off (this is a *different*
         // failure — the slot pages themselves are unreadable — and it escalates like a re-poison).
         let Some(snapshot) = Self::resnapshot_build(&self.store) else {
-            self.poison_resurrect_attempts = self.poison_resurrect_attempts.saturating_add(1);
-            self.poison_retry_skip = poison_backoff(self.poison_resurrect_attempts);
+            self.poison_resurrect_attempts
+                .fetch_add(1, Ordering::Relaxed);
+            self.poison_retry_skip.store(
+                poison_backoff(self.poison_resurrect_attempts.load(Ordering::Relaxed)),
+                Ordering::Relaxed,
+            );
             return false;
         };
         let generation = self.index.borrow().wipe_generation();
@@ -9111,8 +9092,12 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // instead complete, the graveyard clears and the `== 0` branch above resets `attempts` to 0. So a
         // transient fault heals within one or two cycles while a permanent one has its retry rate decay
         // geometrically to one attempt per [`MAX_DEGRADED_RETRY_BACKOFF`] drains.
-        self.poison_resurrect_attempts = self.poison_resurrect_attempts.saturating_add(1);
-        self.poison_retry_skip = poison_backoff(self.poison_resurrect_attempts);
+        self.poison_resurrect_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        self.poison_retry_skip.store(
+            poison_backoff(self.poison_resurrect_attempts.load(Ordering::Relaxed)),
+            Ordering::Relaxed,
+        );
         true
     }
 
@@ -9184,22 +9169,25 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         if !degraded && !poisoned {
             // Nothing to repair. Decay the poison backoff so a burst of aborts throttles the repair but
             // a subsequent quiet period restores an immediate response to the next isolated poisoning.
-            self.ft_poison_repair_backoff = (self.ft_poison_repair_backoff / 2).max(1);
+            self.ft_poison_repair_backoff.store(
+                (self.ft_poison_repair_backoff.load(Ordering::Relaxed) / 2).max(1),
+                Ordering::Relaxed,
+            );
             return true;
         }
         // A poison-only repair waits its own turn. A DEGRADED set deliberately does not: that is a
         // storage fault that cost the engine its indexes, and its cadence stays exactly as `rmp` #733
         // set it.
-        if !degraded && self.ft_poison_repair_skip > 0 {
-            self.ft_poison_repair_skip -= 1;
+        if !degraded && self.ft_poison_repair_skip.load(Ordering::Relaxed) > 0 {
+            self.ft_poison_repair_skip.fetch_sub(1, Ordering::Relaxed);
             return false;
         }
-        if self.degraded_retry_skip > 0 {
-            self.degraded_retry_skip -= 1;
+        if self.degraded_retry_skip.load(Ordering::Relaxed) > 0 {
+            self.degraded_retry_skip.fetch_sub(1, Ordering::Relaxed);
             return false;
         }
         if !degraded {
-            self.ft_poison_repairs += 1;
+            self.ft_poison_repairs.fetch_add(1, Ordering::Relaxed);
         }
         Self::rebuild_index(&self.store, &self.index);
         // Repaired only if BOTH conditions cleared. `rebuild_index` ends in `reset_ft_spatial_marker`,
@@ -9208,11 +9196,17 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         if self.index.borrow().is_degraded() || self.index.borrow().ft_spatial_poisoned() {
             // Still faulting: back off so a permanently-broken store cannot make the engine thread burn
             // a whole store scan every tick (correctness is unaffected either way — reads are on scans).
-            self.degraded_retry_backoff = self
+            let doubled = self
                 .degraded_retry_backoff
+                .load(Ordering::Relaxed)
                 .saturating_mul(2)
                 .min(MAX_DEGRADED_RETRY_BACKOFF);
-            self.degraded_retry_skip = self.degraded_retry_backoff;
+            self.degraded_retry_backoff
+                .store(doubled, Ordering::Relaxed);
+            self.degraded_retry_skip.store(
+                self.degraded_retry_backoff.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
             false
         } else {
             // Repaired. The backoff is **halved**, not reset (`rmp` task #733, M3): an *intermittent*
@@ -9221,17 +9215,26 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             // thread and the engine spends its life re-scanning the store. Decaying the backoff lets a
             // genuinely-healed store return to a fast retry within a few cycles, while a flapping one
             // stays throttled.
-            self.degraded_retry_backoff = (self.degraded_retry_backoff / 2).max(1);
-            self.degraded_retry_skip = 0;
+            self.degraded_retry_backoff.store(
+                (self.degraded_retry_backoff.load(Ordering::Relaxed) / 2).max(1),
+                Ordering::Relaxed,
+            );
+            self.degraded_retry_skip.store(0, Ordering::Relaxed);
             if !degraded {
                 // A poison-only repair succeeded: arm and GROW its own backoff, so a workload that
                 // keeps re-poisoning cannot buy a whole-store rebuild per command. An isolated
                 // poisoning pays one skip and the decay above erases it within a few healthy commands.
-                self.ft_poison_repair_skip = self.ft_poison_repair_backoff;
-                self.ft_poison_repair_backoff = self
+                self.ft_poison_repair_skip.store(
+                    self.ft_poison_repair_backoff.load(Ordering::Relaxed),
+                    Ordering::Relaxed,
+                );
+                let doubled = self
                     .ft_poison_repair_backoff
+                    .load(Ordering::Relaxed)
                     .saturating_mul(2)
                     .min(MAX_DEGRADED_RETRY_BACKOFF);
+                self.ft_poison_repair_backoff
+                    .store(doubled, Ordering::Relaxed);
             }
             true
         }
@@ -9296,8 +9299,9 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             // Still blocked — not an attempt, so it neither spends nor arms the throttle.
             return false;
         }
-        if self.vector_conflict_retry_skip > 0 {
-            self.vector_conflict_retry_skip -= 1;
+        if self.vector_conflict_retry_skip.load(Ordering::Relaxed) > 0 {
+            self.vector_conflict_retry_skip
+                .fetch_sub(1, Ordering::Relaxed);
             return false;
         }
 
@@ -9424,18 +9428,27 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             // so the anti-hot-loop guard (`rmp` #733 / #780) that the backoff exists for is preserved: a
             // storm still climbs 1→2→4→…→cap and is never re-armed to a 1-drain window mid-storm.
             if self.index.borrow().blocked_vector_indexes() == 0 {
-                self.vector_conflict_retry_backoff = 1;
+                self.vector_conflict_retry_backoff
+                    .store(1, Ordering::Relaxed);
             } else {
-                self.vector_conflict_retry_backoff =
-                    (self.vector_conflict_retry_backoff / 2).max(1);
+                let halved =
+                    (self.vector_conflict_retry_backoff.load(Ordering::Relaxed) / 2).max(1);
+                self.vector_conflict_retry_backoff
+                    .store(halved, Ordering::Relaxed);
             }
-            self.vector_conflict_retry_skip = 0;
+            self.vector_conflict_retry_skip.store(0, Ordering::Relaxed);
         } else {
-            self.vector_conflict_retry_backoff = self
+            let doubled = self
                 .vector_conflict_retry_backoff
+                .load(Ordering::Relaxed)
                 .saturating_mul(2)
                 .min(MAX_DEGRADED_RETRY_BACKOFF);
-            self.vector_conflict_retry_skip = self.vector_conflict_retry_backoff;
+            self.vector_conflict_retry_backoff
+                .store(doubled, Ordering::Relaxed);
+            self.vector_conflict_retry_skip.store(
+                self.vector_conflict_retry_backoff.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
         }
         true
     }
@@ -9489,8 +9502,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             let writers: Vec<TxnId> = self.index.borrow().ft_demoted_blockers().to_vec();
             if !resolved(&writers, &self.store) {
                 // Still blocked — not an attempt, so it neither spends nor arms the throttle.
-            } else if self.conflict_retry_skip > 0 {
-                self.conflict_retry_skip -= 1;
+            } else if self.conflict_retry_skip.load(Ordering::Relaxed) > 0 {
+                self.conflict_retry_skip.fetch_sub(1, Ordering::Relaxed);
             } else {
                 // `rebuild_index` clears the record via `IndexSet::clear` and re-raises it if the conflict
                 // persists (a writer that opened since), so this cannot livelock: it re-runs only when the
@@ -9501,15 +9514,24 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     // documents: a flapping conflict — repair, re-conflict, repair — would otherwise
                     // re-arm a 1-drain backoff on every success, so the next overlapping writer buys
                     // another full store scan and the engine spends its life re-scanning.
-                    self.conflict_retry_backoff = (self.conflict_retry_backoff / 2).max(1);
-                    self.conflict_retry_skip = 0;
+                    self.conflict_retry_backoff.store(
+                        (self.conflict_retry_backoff.load(Ordering::Relaxed) / 2).max(1),
+                        Ordering::Relaxed,
+                    );
+                    self.conflict_retry_skip.store(0, Ordering::Relaxed);
                 } else {
                     // Re-conflicted with a writer that opened in the meantime: widen the window.
-                    self.conflict_retry_backoff = self
+                    let doubled = self
                         .conflict_retry_backoff
+                        .load(Ordering::Relaxed)
                         .saturating_mul(2)
                         .min(MAX_DEGRADED_RETRY_BACKOFF);
-                    self.conflict_retry_skip = self.conflict_retry_backoff;
+                    self.conflict_retry_backoff
+                        .store(doubled, Ordering::Relaxed);
+                    self.conflict_retry_skip.store(
+                        self.conflict_retry_backoff.load(Ordering::Relaxed),
+                        Ordering::Relaxed,
+                    );
                 }
                 acted = true;
             }
@@ -9528,8 +9550,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             // repair: a faulting store returns `None`, removes nothing, and would otherwise be re-probed
             // on every command forever (the guard `retry_poisoned_index_builds` applies to its identical
             // probe via `poison_retry_skip`).
-            if !ready.is_empty() && self.conflict_retry_skip > 0 {
-                self.conflict_retry_skip -= 1;
+            if !ready.is_empty() && self.conflict_retry_skip.load(Ordering::Relaxed) > 0 {
+                self.conflict_retry_skip.fetch_sub(1, Ordering::Relaxed);
             } else if !ready.is_empty()
                 && let Some(snapshot) = Self::resnapshot_build(&self.store)
             {
@@ -9672,7 +9694,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 Self::poison_front(
                     &mut self.pending_builds,
                     &mut self.poisoned_builds,
-                    &mut self.poison_events,
+                    &self.poison_events,
                 );
                 return;
             };
@@ -9729,7 +9751,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 Self::poison_front(
                     &mut self.pending_builds,
                     &mut self.poisoned_builds,
-                    &mut self.poison_events,
+                    &self.poison_events,
                 );
             }
             return;
@@ -9760,7 +9782,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 Self::poison_front(
                     &mut self.pending_builds,
                     &mut self.poisoned_builds,
-                    &mut self.poison_events,
+                    &self.poison_events,
                 );
             }
             return;
@@ -9771,8 +9793,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         };
         // The front build's snapshot is fully indexed: promote it durably to `Online`, then dequeue.
         let (label_token, prop_key) = (build.label_token, build.prop_key);
-        self.next_txn_id += 1;
-        let txn = TxnId(self.next_txn_id);
+        let txn = self.mint_txn();
         self.store.borrow_mut().begin(txn);
         self.store.borrow_mut().set_node_property_index(
             txn,
@@ -9818,7 +9839,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 Self::poison_front(
                     &mut self.pending_fulltext_builds,
                     &mut self.poisoned_fulltext_builds,
-                    &mut self.poison_events,
+                    &self.poison_events,
                 ); // poison: never resume a build we cannot re-base.
                 return;
             };
@@ -9876,7 +9897,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 Self::poison_front(
                     &mut self.pending_fulltext_builds,
                     &mut self.poisoned_fulltext_builds,
-                    &mut self.poison_events,
+                    &self.poison_events,
                 );
             } else if let Some(build) = self.pending_fulltext_builds.front_mut() {
                 build.cursor = start;
@@ -9921,7 +9942,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 Self::poison_front(
                     &mut self.pending_fulltext_builds,
                     &mut self.poisoned_fulltext_builds,
-                    &mut self.poison_events,
+                    &self.poison_events,
                 );
             }
             return;
@@ -9981,8 +10002,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // The snapshot is fully indexed: durably flip the catalog entry to `Online`, then dequeue.
         // Read the current entry in its own scope so the store borrow is released before the write.
         let entry = self.store.borrow().fulltext_index(&name);
-        self.next_txn_id += 1;
-        let txn = TxnId(self.next_txn_id);
+        let txn = self.mint_txn();
         self.store.borrow_mut().begin(txn);
         let promoted = if let Some(entry) = entry {
             self.store.borrow_mut().set_fulltext_index(
@@ -10031,7 +10051,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 Self::poison_front(
                     &mut self.pending_spatial_builds,
                     &mut self.poisoned_spatial_builds,
-                    &mut self.poison_events,
+                    &self.poison_events,
                 ); // poison: cannot re-base this build.
                 return;
             };
@@ -10070,7 +10090,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 Self::poison_front(
                     &mut self.pending_spatial_builds,
                     &mut self.poisoned_spatial_builds,
-                    &mut self.poison_events,
+                    &self.poison_events,
                 );
             } else if let Some(build) = self.pending_spatial_builds.front_mut() {
                 build.cursor = start;
@@ -10106,7 +10126,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 Self::poison_front(
                     &mut self.pending_spatial_builds,
                     &mut self.poisoned_spatial_builds,
-                    &mut self.poison_events,
+                    &self.poison_events,
                 );
             }
             return;
@@ -10115,8 +10135,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // The snapshot is fully indexed: durably flip the catalog entry to `Online`, then dequeue.
         // Read the current entry in its own scope so the store borrow is released before the write.
         let entry = self.store.borrow().spatial_index(&name);
-        self.next_txn_id += 1;
-        let txn = TxnId(self.next_txn_id);
+        let txn = self.mint_txn();
         self.store.borrow_mut().begin(txn);
         let promoted = if let Some(entry) = entry {
             self.store.borrow_mut().set_spatial_index(
@@ -10189,8 +10208,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // Remove the durable catalog entry AND its name entry in one committed transaction (mirrors the
         // create path, which records both). Clearing the name alongside the index keeps the two in sync
         // and frees the name for reuse.
-        self.next_txn_id += 1;
-        let txn = TxnId(self.next_txn_id);
+        let txn = self.mint_txn();
         self.store.borrow_mut().begin(txn);
         {
             let store = self.store.borrow_mut();
@@ -10249,8 +10267,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         };
 
         // Remove the durable index catalog entry + its name in one committed transaction.
-        self.next_txn_id += 1;
-        let txn = TxnId(self.next_txn_id);
+        let txn = self.mint_txn();
         self.store.borrow_mut().begin(txn);
         {
             let store = self.store.borrow_mut();
@@ -11227,8 +11244,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// [`checkpoint_reader_safe_freeze_only`](Self::checkpoint_reader_safe_freeze_only).
     fn gc_scoped(&mut self, freeze_only: bool) -> Result<GcPassReport> {
         let watermark = self.gc_watermark();
-        self.next_txn_id += 1;
-        let gc_txn = TxnId(self.next_txn_id);
+        self.next_txn_id.fetch_add(1, Ordering::Relaxed);
+        let gc_txn = TxnId(self.next_txn_id.load(Ordering::Relaxed));
         // `rmp` #992: tell the store what the derived indexes cover, so the pass reports the entries
         // the versions it destroys leave behind. Re-derived on every pass rather than kept in step
         // incrementally — a declaration that can drift is a declaration that will.
@@ -11856,6 +11873,23 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// Panics if the store is already borrowed (a live statement seam from
     /// [`statement`](Self::statement) is held, or `f` re-enters the coordinator) — the same misuse
     /// [`into_store`](Self::into_store) rejects.
+    /// Mints one fresh, coordinator-issued [`TxnId`] (`rmp` #1033).
+    ///
+    /// One `fetch_add`, and the single place the counter is touched. It used to be
+    /// `self.next_txn_id.fetch_add(1, Ordering::Relaxed); TxnId(self.next_txn_id.load(Ordering::Relaxed))` written out at thirty-one call sites — a
+    /// read-modify-write that was safe only because one thread ran them all. Under W workers two
+    /// writers would read the same value and mint the SAME transaction id: two live transactions
+    /// sharing an active-set entry, an undo log and a commit-registry slot, which no layer below could
+    /// detect because at that level they are one transaction.
+    ///
+    /// `Relaxed` is sufficient and is not laxity: the only requirement is that no two calls return the
+    /// same number, which `fetch_add` gives on its own. The id orders nothing by itself — a
+    /// transaction's visibility comes from its snapshot and its commit timestamp, never from the
+    /// ordering of its id against another's.
+    fn mint_txn(&self) -> TxnId {
+        TxnId(self.next_txn_id.fetch_add(1, Ordering::Relaxed) + 1)
+    }
+
     pub fn with_store_mut<R>(&self, f: impl FnOnce(&RecordStore<D, S>) -> R) -> R {
         // `&` rather than `&mut` since `rmp` #1032: the store's whole API takes `&self`, so exclusive
         // access buys nothing and would re-serialise what layer 7b exists to unserialise. The name is
@@ -11893,8 +11927,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// Panics if the store is already borrowed (a live statement seam, or `f` re-enters the
     /// coordinator).
     pub fn raw_txn<R>(&mut self, f: impl FnOnce(TxnId, &RecordStore<D, S>) -> R) -> R {
-        self.next_txn_id += 1;
-        let txn = TxnId(self.next_txn_id);
+        let txn = self.mint_txn();
         f(txn, self.store.borrow_mut())
     }
 
@@ -12793,6 +12826,7 @@ mod index_wipe_tests {
     use graphus_io::MemBlockDevice;
     use graphus_storage::{IndexState, Namespace, RecordStore};
     use graphus_wal::{MemLogSink, WalManager};
+    use std::sync::atomic::Ordering;
 
     use crate::binding::{Parameters, bind_parameters};
     use crate::coordinator::TxnCoordinator;
@@ -13122,9 +13156,9 @@ mod index_wipe_tests {
         let next = TxnCoordinator::promote_recovered_populating_indexes(
             &coord.store,
             &coord.index,
-            coord.next_txn_id,
+            coord.next_txn_id.load(Ordering::Relaxed),
         );
-        coord.next_txn_id = next;
+        coord.next_txn_id.store(next, Ordering::Relaxed);
 
         assert_eq!(
             coord.index.borrow().node_property_state(label, prop),
@@ -13166,9 +13200,9 @@ mod index_wipe_tests {
         let next = TxnCoordinator::promote_recovered_populating_indexes(
             &coord.store,
             &coord.index,
-            coord.next_txn_id,
+            coord.next_txn_id.load(Ordering::Relaxed),
         );
-        coord.next_txn_id = next;
+        coord.next_txn_id.store(next, Ordering::Relaxed);
 
         assert!(
             coord
