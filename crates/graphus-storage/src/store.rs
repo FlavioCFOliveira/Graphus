@@ -1324,8 +1324,92 @@ impl std::ops::Deref for StatisticsRef<'_> {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Maintenance {
+    /// **`rmp` #992.** The [`DeadIndexKey`]s the current GC pass has collected, cleared at the start of
+    /// every pass and drained by [`take_dead_index_keys`](RecordStore::take_dead_index_keys). Always empty
+    /// while `index_interest.is_idle()`.
+    dead_index_keys: Vec<DeadIndexKey>,
+    /// **`rmp` #992.** How many of `dead_index_keys` are the value-carrying
+    /// [`Property`](DeadIndexKey::Property) shape, so the two shapes can be budgeted separately (see
+    /// [`MAX_DEAD_PROPERTY_KEYS`]). Kept as a counter rather than recomputed, because it is consulted
+    /// on every push.
+    dead_property_keys: usize,
+    /// **`rmp` #992.** Dead keys this pass could NOT report: dropped at a shape's budget, or lost to a
+    /// store read that faulted. Non-zero means some orphaned index entries were left behind — safe,
+    /// but it is the only signal that distinguishes that from having found nothing to collect.
+    dead_index_keys_dropped: usize,
+    /// Forces the first [`gc`](RecordStore::gc) pass after [`open`](RecordStore::open) to run the FULL corpse walk and
+    /// property sweep (`rmp` #522), so any pre-existing on-disk corpses / tombstones a fresh process has
+    /// no in-memory record of are caught. Cleared after that first pass; thereafter the gated
+    /// incremental sweeps suffice because every new unit of work flows through the tracking above.
+    gc_full_scan_pending: bool,
+    /// Whether property dead-link corpses (`rmp` #172) may exist since the last property sweep (`rmp`
+    /// #522): set on [`rollback`](RecordStore::rollback) of a transaction that created properties, cleared when
+    /// the property sweep runs. Together with a non-empty `pending_tombstones[Prop]` it gates the
+    /// property-chain sweep so a workload with no property deletes/aborts skips it entirely.
+    pending_prop_corpses: bool,
+    /// **`rmp` #966.** Set when a rollback left one of its deltas threaded on an entity's chain as a
+    /// corpse (only possible when another transaction prepended onto the *same* entity in between),
+    /// which also strands that transaction's commit slot. The next full GC pass resolves it with a
+    /// reference sweep over `undo.store`; until then the slot is a bounded leak, never a hazard.
+    undo_orphan_slots_possible: bool,
+    gc_freeze_low_savepoint: Option<(TxnId, [u64; STORE_COUNT])>,
+    /// MVCC version history for the node **label bitmap** (`rmp` task #767).
+    ///
+    /// The label word is mutated IN PLACE inside the node record, so — unlike a property, which is a
+    /// separate MVCC-versioned `PropRecord` — it has no version for `graphus_txn::is_visible` to
+    /// filter. Without this, a label read returned whatever the word held at that instant: an
+    /// uncommitted writer's change was visible to a concurrent reader (a **dirty read**) and a
+    /// committed one was visible to a reader whose snapshot predated it (a **non-repeatable read**).
+    /// This supplies the "older versions as logical undo deltas" half of `04 §5.1`'s ratified scheme
+    /// that the in-place label write never had.
+    ///
+    /// `Arc`-shared with every [`StoreReadView`] so an off-thread reader resolves against the SAME
+    /// live history (the page cache it decodes from is itself live, `rmp` #721, so a change committed
+    /// after dispatch is already in the word it reads and only a live history can undo it).
+    /// The registry prune the last completed [`gc`](RecordStore::gc) freeze sweep scheduled, applied at
+    /// the GC transaction's [`commit`](RecordStore::commit) and discarded at its
+    /// [`rollback`](RecordStore::rollback) (`rmp` task #59). `None` while no GC pass is pending.
+    pending_gc_prune: Option<PendingGcPrune>,
+    /// The `(gc_txn, freeze_low-before-freeze)` savepoint of the in-progress GC pass (`rmp` #522). A GC
+    /// pass's freeze sweep advances [`freeze_low`](RecordStore::freeze_low), but a rollback of that pass's
+    /// transaction restores (via WAL undo) the in-flight stamps it had frozen — which now sit BELOW the
+    /// advanced frontier and would be skipped by the next sweep, silently stranding a committed writer's
+    /// stamp unfrozen (an unbounded Active/Recent-Transaction-Table leak). So [`gc`](RecordStore::gc) snapshots
+    /// the frontier here before freezing; [`rollback`](RecordStore::rollback) restores it if the aborting
+    /// transaction is this GC pass, and [`commit_prepare`](RecordStore::commit_prepare) clears it. `None`
+    /// outside a GC pass. Mirrors [`pending_gc_prune`](RecordStore::pending_gc_prune)'s lifecycle.
+    ///
+    /// **Audited for `rmp` #1011 (layer 3 of #975) and deliberately left SHARED.** It looks like the
+    /// `undo_slab` — one `Option` keyed by a `TxnId`, so it structurally admits exactly one owner —
+    /// but the conclusion is the opposite, and the reason is worth stating so the next reader does not
+    /// re-open it. Both consumers are guarded on `sp_txn == txn`
+    /// ([`settle_committed_txn`](RecordStore::settle_committed_txn) and [`rollback`](RecordStore::rollback)), so a
+    /// transaction that is *not* the GC pass provably leaves it alone; and the one-owner limit is not
+    /// a constraint to remove, because **GC stays a single actor** under N writers. Making it
+    /// per-transaction would model a concurrency that the design does not have and does not want:
+    /// two simultaneous freeze-frontier savepoints would mean two simultaneous freeze sweeps racing
+    /// on `freeze_low`, which is the `rmp` #522 silent-data-loss shape, not a scalability win.
+    /// **`rmp` #1011 — the partly-consumed undo slabs a finished transaction handed back.**
+    ///
+    /// A slab is one `undo.store` page's worth of ids, owned by ONE transaction while it is open (see
+    /// [`ActiveTxn::undo_slab`]). Ownership is what buys page locality and what keeps two writers off
+    /// one cursor — but if the remainder died with the transaction, every short transaction would burn
+    /// a whole page, the page list would grow once per commit, and the per-commit catalog image would
+    /// grow with it. That is not hypothetical: it is exactly what
+    /// `graphus-cypher/tests/wal_amplification.rs` measured when the remainder was dropped —
+    /// 1.00 undo pages per commit, and the reading's own records fell below half the commit.
+    ///
+    /// So the remainder comes back here when the transaction ends, and the next
+    /// [`refill_undo_slab`](RecordStore::refill_undo_slab) prefers it over growing the store. Sequential
+    /// transactions therefore reuse one page exactly as they did before the slab moved, while
+    /// concurrent ones still each hold their own.
+    ///
+    /// Bounded by [`MAX_SPARE_UNDO_SLABS`]: a spare is an optimisation, never a correctness
+    /// requirement, so dropping one past the cap costs at most that page's unused tail — the same
+    /// leak the field's predecessor already accepted, and now bounded rather than per-transaction.
+    spare_undo_slabs: Vec<(u64, u64)>,
     /// Reclaim candidates: per-kind physical ids of MVCC tombstones (`xmax` set) awaiting reclamation
     /// (`rmp` #522). The reclaim sweep iterates ONLY these ids instead of scanning the whole store —
     /// reclaiming those whose `xmax` has committed at or below the watermark and dropping entries that
@@ -1388,6 +1472,46 @@ struct Maintenance {
     /// commits, the pass defers the cell and disarms the gate, and the cell then survives every
     /// subsequent pass until an unrelated removal re-arms it or the store reopens.
     pending_empty_prop_cells: bool,
+}
+
+impl Default for Maintenance {
+    /// Hand-written, not derived, for ONE field: `gc_full_scan_pending` starts **`true`**.
+    ///
+    /// A derived `Default` gives it `false`, and the consequence is silent — the first GC pass after
+    /// `open` skips the full scan that is the only way a crash-recovered store rediscovers the work it
+    /// has to do (none of this state is durable; it is rebuilt from that scan). Nothing fails at the
+    /// point of the mistake: the store runs, the pass reports success, and a corpse left by an aborted
+    /// transaction before the crash is simply never reclaimed. Caught here by
+    /// `crash_recovery_aborted_middle_rel_keeps_both_committed_edges`, which counts the slots.
+    fn default() -> Self {
+        Self {
+            gc_full_scan_pending: true,
+            ..Self::empty()
+        }
+    }
+}
+
+impl Maintenance {
+    /// Every field at its zero value — the helper [`Default`] builds on, so the one field that is NOT
+    /// zero-valued is stated exactly once and cannot drift.
+    fn empty() -> Self {
+        Self {
+            pending_tombstones: Default::default(),
+            pending_undo_chains: Default::default(),
+            pending_corpse_rels: Default::default(),
+            pending_orphan_slots: Default::default(),
+            pending_empty_prop_cells: false,
+            dead_index_keys: Vec::new(),
+            dead_property_keys: 0,
+            dead_index_keys_dropped: 0,
+            gc_full_scan_pending: false,
+            pending_prop_corpses: false,
+            undo_orphan_slots_possible: false,
+            gc_freeze_low_savepoint: None,
+            pending_gc_prune: None,
+            spare_undo_slabs: Vec::new(),
+        }
+    }
 }
 
 /// A record store with index-free adjacency, over a buffer pool and the ARIES WAL.
@@ -1461,23 +1585,6 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// decision reads it, and only a commit writes. A `Mutex` would have serialised readers against
     /// each other for no reason; the whole point of layer 5a is that the hot read path stops queueing.
     commit_registry: RwLock<CommitRegistry>,
-    /// MVCC version history for the node **label bitmap** (`rmp` task #767).
-    ///
-    /// The label word is mutated IN PLACE inside the node record, so — unlike a property, which is a
-    /// separate MVCC-versioned `PropRecord` — it has no version for `graphus_txn::is_visible` to
-    /// filter. Without this, a label read returned whatever the word held at that instant: an
-    /// uncommitted writer's change was visible to a concurrent reader (a **dirty read**) and a
-    /// committed one was visible to a reader whose snapshot predated it (a **non-repeatable read**).
-    /// This supplies the "older versions as logical undo deltas" half of `04 §5.1`'s ratified scheme
-    /// that the in-place label write never had.
-    ///
-    /// `Arc`-shared with every [`StoreReadView`] so an off-thread reader resolves against the SAME
-    /// live history (the page cache it decodes from is itself live, `rmp` #721, so a change committed
-    /// after dispatch is already in the word it reads and only a live history can undo it).
-    /// The registry prune the last completed [`gc`](Self::gc) freeze sweep scheduled, applied at
-    /// the GC transaction's [`commit`](Self::commit) and discarded at its
-    /// [`rollback`](Self::rollback) (`rmp` task #59). `None` while no GC pass is pending.
-    pending_gc_prune: Option<PendingGcPrune>,
     /// **Incremental-GC state** (`rmp` #522). Before this, every maintenance [`gc`](Self::gc) pass
     /// re-scanned the ENTIRE store (freeze sweep, reclaim sweep, corpse walk, property sweep) even when
     /// almost nothing had changed since the last pass. On a monotonically growing store that made the
@@ -1530,55 +1637,6 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// The GC's pending-work sets (`rmp` #1014). See [`Maintenance`] for why they are one latch,
     /// and [`with_maintenance`](Self::with_maintenance) for the only way to reach them.
     maintenance: std::sync::Mutex<Maintenance>,
-    /// Whether property dead-link corpses (`rmp` #172) may exist since the last property sweep (`rmp`
-    /// #522): set on [`rollback`](Self::rollback) of a transaction that created properties, cleared when
-    /// the property sweep runs. Together with a non-empty `pending_tombstones[Prop]` it gates the
-    /// property-chain sweep so a workload with no property deletes/aborts skips it entirely.
-    pending_prop_corpses: bool,
-    /// Forces the first [`gc`](Self::gc) pass after [`open`](Self::open) to run the FULL corpse walk and
-    /// property sweep (`rmp` #522), so any pre-existing on-disk corpses / tombstones a fresh process has
-    /// no in-memory record of are caught. Cleared after that first pass; thereafter the gated
-    /// incremental sweeps suffice because every new unit of work flows through the tracking above.
-    gc_full_scan_pending: bool,
-    /// The `(gc_txn, freeze_low-before-freeze)` savepoint of the in-progress GC pass (`rmp` #522). A GC
-    /// pass's freeze sweep advances [`freeze_low`](Self::freeze_low), but a rollback of that pass's
-    /// transaction restores (via WAL undo) the in-flight stamps it had frozen — which now sit BELOW the
-    /// advanced frontier and would be skipped by the next sweep, silently stranding a committed writer's
-    /// stamp unfrozen (an unbounded Active/Recent-Transaction-Table leak). So [`gc`](Self::gc) snapshots
-    /// the frontier here before freezing; [`rollback`](Self::rollback) restores it if the aborting
-    /// transaction is this GC pass, and [`commit_prepare`](Self::commit_prepare) clears it. `None`
-    /// outside a GC pass. Mirrors [`pending_gc_prune`](Self::pending_gc_prune)'s lifecycle.
-    ///
-    /// **Audited for `rmp` #1011 (layer 3 of #975) and deliberately left SHARED.** It looks like the
-    /// `undo_slab` — one `Option` keyed by a `TxnId`, so it structurally admits exactly one owner —
-    /// but the conclusion is the opposite, and the reason is worth stating so the next reader does not
-    /// re-open it. Both consumers are guarded on `sp_txn == txn`
-    /// ([`settle_committed_txn`](Self::settle_committed_txn) and [`rollback`](Self::rollback)), so a
-    /// transaction that is *not* the GC pass provably leaves it alone; and the one-owner limit is not
-    /// a constraint to remove, because **GC stays a single actor** under N writers. Making it
-    /// per-transaction would model a concurrency that the design does not have and does not want:
-    /// two simultaneous freeze-frontier savepoints would mean two simultaneous freeze sweeps racing
-    /// on `freeze_low`, which is the `rmp` #522 silent-data-loss shape, not a scalability win.
-    /// **`rmp` #1011 — the partly-consumed undo slabs a finished transaction handed back.**
-    ///
-    /// A slab is one `undo.store` page's worth of ids, owned by ONE transaction while it is open (see
-    /// [`ActiveTxn::undo_slab`]). Ownership is what buys page locality and what keeps two writers off
-    /// one cursor — but if the remainder died with the transaction, every short transaction would burn
-    /// a whole page, the page list would grow once per commit, and the per-commit catalog image would
-    /// grow with it. That is not hypothetical: it is exactly what
-    /// `graphus-cypher/tests/wal_amplification.rs` measured when the remainder was dropped —
-    /// 1.00 undo pages per commit, and the reading's own records fell below half the commit.
-    ///
-    /// So the remainder comes back here when the transaction ends, and the next
-    /// [`refill_undo_slab`](Self::refill_undo_slab) prefers it over growing the store. Sequential
-    /// transactions therefore reuse one page exactly as they did before the slab moved, while
-    /// concurrent ones still each hold their own.
-    ///
-    /// Bounded by [`MAX_SPARE_UNDO_SLABS`]: a spare is an optimisation, never a correctness
-    /// requirement, so dropping one past the cap costs at most that page's unused tail — the same
-    /// leak the field's predecessor already accepted, and now bounded rather than per-transaction.
-    spare_undo_slabs: Vec<(u64, u64)>,
-    gc_freeze_low_savepoint: Option<(TxnId, [u64; STORE_COUNT])>,
     //
     // **`rmp` #588 (sprint-52 B1) — reader-safe physical-slot reuse.** The `held_slots` overlay and
     // the `reuse_barrier` that stamps it used to live here, as two more fields of the `RecordStore`.
@@ -1625,28 +1683,10 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// shard count is a contention parameter only — correctness needs just that the *same* head
     /// always maps to the *same* shard.
     chain_head_locks: Box<[Mutex<()>]>,
-    /// **`rmp` #966.** Set when a rollback left one of its deltas threaded on an entity's chain as a
-    /// corpse (only possible when another transaction prepended onto the *same* entity in between),
-    /// which also strands that transaction's commit slot. The next full GC pass resolves it with a
-    /// reference sweep over `undo.store`; until then the slot is a bounded leak, never a hazard.
-    undo_orphan_slots_possible: bool,
     /// **`rmp` #992.** What the derived-index layer asked this store to report about the versions its
     /// GC reclaims. Empty by default, replaced wholesale before each pass by the caller that owns the
     /// indexes; see [`IndexInterest`].
     index_interest: IndexInterest,
-    /// **`rmp` #992.** The [`DeadIndexKey`]s the current GC pass has collected, cleared at the start of
-    /// every pass and drained by [`take_dead_index_keys`](Self::take_dead_index_keys). Always empty
-    /// while `index_interest.is_idle()`.
-    dead_index_keys: Vec<DeadIndexKey>,
-    /// **`rmp` #992.** How many of `dead_index_keys` are the value-carrying
-    /// [`Property`](DeadIndexKey::Property) shape, so the two shapes can be budgeted separately (see
-    /// [`MAX_DEAD_PROPERTY_KEYS`]). Kept as a counter rather than recomputed, because it is consulted
-    /// on every push.
-    dead_property_keys: usize,
-    /// **`rmp` #992.** Dead keys this pass could NOT report: dropped at a shape's budget, or lost to a
-    /// store read that faulted. Non-zero means some orphaned index entries were left behind — safe,
-    /// but it is the only signal that distinguishes that from having found nothing to collect.
-    dead_index_keys_dropped: usize,
     /// Take an automatic checkpoint once this many WAL bytes have been appended since the last one
     /// (`04 §4.7`, `rmp` storage audit F3). `0` disables the automatic cadence (manual
     /// [`checkpoint`](Self::checkpoint) only). Bounds crash-recovery **redo** to roughly this much
@@ -1908,7 +1948,6 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 statistics: Arc::new(Statistics::new()),
             }),
             commit_registry: RwLock::new(CommitRegistry::new()),
-            pending_gc_prune: None,
             // `rmp` #522 incremental-GC state (pure in-memory; rebuilt from scratch every open). The
             // freeze frontier starts at `1` so the first pass fully settles every pre-existing on-disk
             // stamp; `gc_full_scan_pending` forces that first pass to also do the full corpse/property
@@ -1918,22 +1957,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // at id 1 (pure in-memory; rebuilt every open, so the on-disk format is unchanged).
             freeze_audit_from: [1; STORE_COUNT],
             maintenance: std::sync::Mutex::new(Maintenance::default()),
-            pending_prop_corpses: false,
-            gc_full_scan_pending: true,
-            gc_freeze_low_savepoint: None,
-            spare_undo_slabs: Vec::new(),
             // `rmp` #588: reader-safe slot-reuse overlay (in-memory; empty unless off-thread readers hold a slot).
             opened_format_version: graphus_core::constants::FORMAT_VERSION,
             // `rmp` #966 undo-area state: all in-memory, all rebuilt from scratch every open. The
             // chain sweep's pending set is reseeded by the first pass's full scan
             // (`gc_full_scan_pending`), so a crash-recovered store reclaims its chains normally.
             chain_head_locks: new_chain_head_locks(),
-            undo_orphan_slots_possible: false,
             // `rmp` #992: nothing is reported until a derived-index layer declares what it covers.
             index_interest: IndexInterest::default(),
-            dead_index_keys: Vec::new(),
-            dead_property_keys: 0,
-            dead_index_keys_dropped: 0,
             checkpoint_interval_bytes: DEFAULT_CHECKPOINT_INTERVAL_BYTES,
             wal_segment_sizing_adaptive: true,
             wal_len_at_last_checkpoint: 0,
@@ -2057,7 +2088,6 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 statistics: Arc::new(meta.statistics),
             }),
             commit_registry: RwLock::new(commit_registry),
-            pending_gc_prune: None,
             // `rmp` #522 incremental-GC state (pure in-memory; rebuilt from scratch every open). The
             // freeze frontier starts at `1` so the first pass fully settles every pre-existing on-disk
             // stamp; `gc_full_scan_pending` forces that first pass to also do the full corpse/property
@@ -2067,22 +2097,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // at id 1 (pure in-memory; rebuilt every open, so the on-disk format is unchanged).
             freeze_audit_from: [1; STORE_COUNT],
             maintenance: std::sync::Mutex::new(Maintenance::default()),
-            pending_prop_corpses: false,
-            gc_full_scan_pending: true,
-            gc_freeze_low_savepoint: None,
-            spare_undo_slabs: Vec::new(),
             // `rmp` #588: reader-safe slot-reuse overlay (in-memory; empty unless off-thread readers hold a slot).
             opened_format_version: store_format_version,
             // `rmp` #966 undo-area state: all in-memory, all rebuilt from scratch every open. The
             // chain sweep's pending set is reseeded by the first pass's full scan
             // (`gc_full_scan_pending`), so a crash-recovered store reclaims its chains normally.
             chain_head_locks: new_chain_head_locks(),
-            undo_orphan_slots_possible: false,
             // `rmp` #992: nothing is reported until a derived-index layer declares what it covers.
             index_interest: IndexInterest::default(),
-            dead_index_keys: Vec::new(),
-            dead_property_keys: 0,
-            dead_index_keys_dropped: 0,
             checkpoint_interval_bytes: DEFAULT_CHECKPOINT_INTERVAL_BYTES,
             wal_segment_sizing_adaptive: true,
             wal_len_at_last_checkpoint: shared_len,
@@ -3788,10 +3810,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // (`oldest_active_snapshot`) is a coordinator-level concern.
         // `commit_ts_hw` monotonicity across a later rollback's `reload_catalog` is preserved by that
         // method taking `max` (a read-only bump is not durable, so the persisted catalog lags it).
-        let is_gc_prune = self
-            .pending_gc_prune
-            .as_ref()
-            .is_some_and(|p| p.gc_txn == txn);
+        let is_gc_prune =
+            self.with_maintenance(|m| m.pending_gc_prune.as_ref().is_some_and(|p| p.gc_txn == txn));
         if !wrote_durable && !self.with_catalog(|c| c.catalog_dirty) && !is_gc_prune {
             // Nothing fallible remains, so the bookkeeping can go (`rmp` #866 / #955). A transaction on
             // this path wrote no record, so its count delta is empty and there is nothing to withdraw.
@@ -3908,8 +3928,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // still-durable writer commit records, so pruning here (pre-harden) cannot lose a needed entry.
         if is_gc_prune {
             let pending = self
-                .pending_gc_prune
-                .take()
+                .with_maintenance(|m| m.pending_gc_prune.take())
                 .expect("is_gc_prune ⇒ Some(gc_txn == txn)");
             for writer in pending.writers {
                 self.commit_registry
@@ -3949,11 +3968,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// 3. **Removes the active-set entry**, and with it the count delta (`rmp` #866) and the schema
     ///    undo log (`rmp` #734) a rollback would otherwise have withdrawn.
     fn settle_committed_txn(&mut self, txn: TxnId, _commit_ts: Timestamp) {
-        if self
-            .gc_freeze_low_savepoint
-            .is_some_and(|(sp_txn, _)| sp_txn == txn)
-        {
-            self.gc_freeze_low_savepoint = None;
+        if self.with_maintenance(|m| {
+            m.gc_freeze_low_savepoint
+                .is_some_and(|(sp_txn, _)| sp_txn == txn)
+        }) {
+            self.with_maintenance(|m| m.gc_freeze_low_savepoint = None);
         }
         // Hand the unconsumed undo slab back before the entry that owns it is dropped (`rmp` #1011).
         let slab = self.active.remove(txn).and_then(|a| a.undo_slab);
@@ -4615,7 +4634,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // Prefer a slab a finished transaction handed back over growing the store (`rmp` #1011). Its
         // page is already mapped and already counted in the catalog's page list, so this costs no WAL
         // and no page-list growth — which is the whole reason the pool exists.
-        if let Some((first, end)) = self.spare_undo_slabs.pop() {
+        if let Some((first, end)) = self.with_maintenance(|m| m.spare_undo_slabs.pop()) {
             self.active
                 .with_entry(txn, |a| a.undo_slab = Some((first, end)));
             return Ok((first, end));
@@ -4681,9 +4700,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     fn return_undo_slab(&mut self, slab: Option<(u64, u64)>) {
         if let Some((next, end)) = slab
             && next < end
-            && self.spare_undo_slabs.len() < MAX_SPARE_UNDO_SLABS
         {
-            self.spare_undo_slabs.push((next, end));
+            self.with_maintenance(|m| {
+                if m.spare_undo_slabs.len() < MAX_SPARE_UNDO_SLABS {
+                    m.spare_undo_slabs.push((next, end));
+                }
+            });
         }
     }
 
@@ -4933,9 +4955,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// observability record several callers compare and clone; a `Vec<Value>` field would cost it
     /// `Copy` and make its `Eq` meaningless. [`GcPassReport::dead_index_keys`] carries the count.
     #[must_use]
-    pub fn take_dead_index_keys(&mut self) -> Vec<DeadIndexKey> {
-        self.dead_property_keys = 0;
-        std::mem::take(&mut self.dead_index_keys)
+    pub fn take_dead_index_keys(&self) -> Vec<DeadIndexKey> {
+        self.with_maintenance(|m| {
+            m.dead_property_keys = 0;
+            std::mem::take(&mut m.dead_index_keys)
+        })
     }
 
     /// Queues one dead key, up to that key **shape's** own budget
@@ -4943,22 +4967,27 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// separate). Beyond the budget the key is dropped, which leaves its index entry in place: the
     /// safe direction, but a *silent* loss of precision, so every drop is counted into
     /// [`GcPassReport::dead_index_keys_dropped`].
-    fn push_dead_index_key(&mut self, key: DeadIndexKey) {
-        let (used, budget) = match key {
-            DeadIndexKey::Property { .. } => (self.dead_property_keys, MAX_DEAD_PROPERTY_KEYS),
-            DeadIndexKey::Label { .. } | DeadIndexKey::Entity { .. } => (
-                self.dead_index_keys.len() - self.dead_property_keys,
-                MAX_DEAD_ENTITY_KEYS,
-            ),
-        };
-        if used >= budget {
-            self.dead_index_keys_dropped += 1;
-            return;
-        }
-        if matches!(key, DeadIndexKey::Property { .. }) {
-            self.dead_property_keys += 1;
-        }
-        self.dead_index_keys.push(key);
+    fn push_dead_index_key(&self, key: DeadIndexKey) {
+        // ONE hold for the whole decision: the budget check reads the very counters the push then
+        // moves, and two holds would let a second GC pass admit a key this one had already budgeted
+        // for — the queue's bound is what keeps a faulting store from growing it without limit.
+        self.with_maintenance(|m| {
+            let (used, budget) = match key {
+                DeadIndexKey::Property { .. } => (m.dead_property_keys, MAX_DEAD_PROPERTY_KEYS),
+                DeadIndexKey::Label { .. } | DeadIndexKey::Entity { .. } => (
+                    m.dead_index_keys.len() - m.dead_property_keys,
+                    MAX_DEAD_ENTITY_KEYS,
+                ),
+            };
+            if used >= budget {
+                m.dead_index_keys_dropped += 1;
+                return;
+            }
+            if matches!(key, DeadIndexKey::Property { .. }) {
+                m.dead_property_keys += 1;
+            }
+            m.dead_index_keys.push(key);
+        });
     }
 
     /// Records that this pass could not report a dead key it would otherwise have reported — a store
@@ -4966,8 +4995,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// logger, and counted at all because the consequence is *invisible*: the orphaned entry simply
     /// stays in the tree, and only this number distinguishes "nothing was orphaned" from "we could not
     /// tell".
-    fn note_dead_index_key_unreported(&mut self) {
-        self.dead_index_keys_dropped += 1;
+    fn note_dead_index_key_unreported(&self) {
+        self.with_maintenance(|m| m.dead_index_keys_dropped += 1);
     }
 
     /// Reports the derived-index entries `delta` was the last warrant for, as its chain is freed
@@ -5203,7 +5232,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         if !rec.in_use() {
             // A corpse slot: its transaction aborted, so there is no count to decrement. Whether it is
             // still named by another corpse delta is a question only a reference sweep can answer.
-            self.undo_orphan_slots_possible = true;
+            self.with_maintenance(|m| m.undo_orphan_slots_possible = true);
             return Ok(());
         }
         let remaining = rec.delta_count.saturating_sub(1);
@@ -5805,7 +5834,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         match commit_slot {
             // A threaded corpse delta still names this slot, so the slot must outlive it (`05 §12.4`).
             // It carries no delta count (it never committed), so only a reference sweep can free it.
-            Some(_) if any_threaded => self.undo_orphan_slots_possible = true,
+            Some(_) if any_threaded => {
+                self.with_maintenance(|m| m.undo_orphan_slots_possible = true)
+            }
             Some(slot) => self.free_orphan_slot(StoreKind::Commit, slot),
             None => {}
         }
@@ -5861,7 +5892,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // The chain-head census, collected only on the pass that scans the record stores anyway. It is
         // what lets the orphan sweep below free a delta a CRASH stranded (see
         // [`gc_sweep_undo_orphans`](Self::gc_sweep_undo_orphans)).
-        let chain_heads = if self.gc_full_scan_pending {
+        let chain_heads = if self.with_maintenance(|m| m.gc_full_scan_pending) {
             Some(self.seed_pending_undo_chains()?)
         } else {
             None
@@ -5890,7 +5921,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // The reference sweep runs when something may have been stranded: a rollback that left a
         // threaded corpse, or the first pass after `open` (which is where a crash-stranded delta is
         // collected — and the only pass that holds the chain-head census it needs).
-        if self.undo_orphan_slots_possible || chain_heads.is_some() {
+        if self.with_maintenance(|m| m.undo_orphan_slots_possible) || chain_heads.is_some() {
             freed += self.gc_sweep_undo_orphans(txn, chain_heads.as_ref())?;
         }
         Ok(freed)
@@ -6084,7 +6115,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             self.write_region(dev, off, &[0u8; undo::COMMIT_RECORD_SIZE], txn)?;
             self.free_push(StoreKind::Commit, id, txn);
         }
-        self.undo_orphan_slots_possible = false;
+        self.with_maintenance(|m| m.undo_orphan_slots_possible = false);
         Ok(freed_deltas)
     }
 
@@ -6599,17 +6630,19 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
 
         // `rmp` #992: the dead-key queue describes exactly THIS pass, so a previous pass's leftovers
         // (a caller that never drained, or one whose pass rolled back) must not be attributed to it.
-        self.dead_index_keys.clear();
-        self.dead_property_keys = 0;
-        self.dead_index_keys_dropped = 0;
+        self.with_maintenance(|m| {
+            m.dead_index_keys.clear();
+            m.dead_property_keys = 0;
+            m.dead_index_keys_dropped = 0;
+        });
 
         // `rmp` #522: snapshot the freeze frontier BEFORE the freeze sweep advances it, so a rollback of
         // this GC pass (whose WAL undo restores the stamps it froze) can restore the frontier and not
         // strand those now-un-frozen stamps below it. Cleared at this pass's commit. No other transaction
         // runs between here and this pass's commit/rollback (the single engine thread holds the store), so
         // the savepoint's frontier is exactly the pre-freeze value.
-        self.gc_freeze_low_savepoint =
-            Some((txn, std::array::from_fn(|i| self.freeze_low[i].get())));
+        let savepoint = (txn, std::array::from_fn(|i| self.freeze_low[i].get()));
+        self.with_maintenance(|m| m.gc_freeze_low_savepoint = Some(savepoint));
 
         // `rmp` #563: heartbeat the drain-progress beacon across every phase of this GC pass so a
         // `STOP DATABASE` that races it sees a *progressing* engine and waits rather than force-detaching.
@@ -6639,8 +6672,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // corpse walk runs ONLY when a rolled-back creation may have left one (`pending_corpse_rels`
             // non-empty) or on the first post-open pass — a no-abort workload skips it entirely. The splice
             // is walk-driven (re-derives each corpse's true chain position), so it never severs a live chain.
-            if self.gc_full_scan_pending
-                || !self.with_maintenance(|m| m.pending_corpse_rels.is_empty())
+            if self
+                .with_maintenance(|m| m.gc_full_scan_pending || !m.pending_corpse_rels.is_empty())
             {
                 self.bump_drain_progress();
                 sched::yield_at(YieldSite::GcPhaseB, ResourceId::txn(txn.0));
@@ -6689,10 +6722,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // `pending_prop_corpses`, or the first post-open pass) — a workload with no property
             // removals or aborts skips it. A reclaimed owner's whole chain was already freed by its
             // reclamation, so re-checking liveness here reclaims each once.
-            if self.gc_full_scan_pending
-                || self.with_maintenance(|m| m.pending_empty_prop_cells)
-                || self.pending_prop_corpses
-            {
+            if self.with_maintenance(|m| {
+                m.gc_full_scan_pending || m.pending_empty_prop_cells || m.pending_prop_corpses
+            }) {
                 // The `rmp` #811 severance window: this sweep reclaims a tombstone sitting on a
                 // LIVE owner's chain, in place, while an off-thread reader may be mid-walk with a
                 // pointer to that very record already captured. Yielding immediately before it is
@@ -6708,7 +6740,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 // the cells stranded until an unrelated removal re-armed the flag or the store
                 // reopened). This is the on-disk-derived, self-healing signal the retired
                 // `pending_tombstones[Prop]` gate had, recovered without its per-id bookkeeping.
-                self.pending_prop_corpses = false;
+                self.with_maintenance(|m| m.pending_prop_corpses = false);
                 self.with_maintenance(|m| m.pending_empty_prop_cells = sweep.deferred_empty > 0);
                 self.prune_settled_tombstones(StoreKind::Prop)?;
             }
@@ -6738,7 +6770,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // the flag — the next FULL pass still owes the one-time seeding scan (a freeze-only pass never
         // relies on the tracking sets, since it reclaims nothing).
         if !freeze_only {
-            self.gc_full_scan_pending = false;
+            self.with_maintenance(|m| m.gc_full_scan_pending = false);
         }
 
         // `rmp` #522 (durability-audit W1 regression guard): before scheduling the prune that will
@@ -6768,9 +6800,15 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .committed_writers();
             let prune_scheduled = writers.len();
-            self.pending_gc_prune = Some(PendingGcPrune {
-                gc_txn: txn,
-                writers,
+            // Both counters under ONE hold: the pair is reported together, so reading them at two
+            // instants could report a queue length that never coexisted with that drop count.
+            let dead_keys =
+                self.with_maintenance(|m| (m.dead_index_keys.len(), m.dead_index_keys_dropped));
+            self.with_maintenance(|m| {
+                m.pending_gc_prune = Some(PendingGcPrune {
+                    gc_txn: txn,
+                    writers,
+                });
             });
             Ok(GcPassReport {
                 reclaimed,
@@ -6780,8 +6818,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 freeze_scanned,
                 freeze_violations: 0,
                 first_freeze_violation: None,
-                dead_index_keys: self.dead_index_keys.len(),
-                dead_index_keys_dropped: self.dead_index_keys_dropped,
+                dead_index_keys: dead_keys.0,
+                dead_index_keys_dropped: dead_keys.1,
             })
         } else {
             // `rmp` #809 fail-closed response: a committed stamp is stranded unfrozen below the frontier,
@@ -6792,6 +6830,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // pruning-then-losing-data, and safer than aborting the whole database on a durability path (a
             // false abort is itself a durability hazard); a later pass reprunes once the condition clears.
             // Not scheduling `pending_gc_prune` mirrors exactly what a rolled-back GC pass does.
+            let dead_keys =
+                self.with_maintenance(|m| (m.dead_index_keys.len(), m.dead_index_keys_dropped));
             Ok(GcPassReport {
                 reclaimed,
                 undo_deltas_reclaimed,
@@ -6800,8 +6840,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 freeze_scanned,
                 freeze_violations,
                 first_freeze_violation,
-                dead_index_keys: self.dead_index_keys.len(),
-                dead_index_keys_dropped: self.dead_index_keys_dropped,
+                dead_index_keys: dead_keys.0,
+                dead_index_keys_dropped: dead_keys.1,
             })
         }
     }
@@ -6992,9 +7032,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             .committed_writers();
         let prune_scheduled = writers.len();
         if prune_scheduled > 0 {
-            self.pending_gc_prune = Some(PendingGcPrune {
-                gc_txn: txn,
-                writers,
+            self.with_maintenance(|m| {
+                m.pending_gc_prune = Some(PendingGcPrune {
+                    gc_txn: txn,
+                    writers,
+                });
             });
         }
         Ok(frozen)
@@ -7151,7 +7193,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         txn: TxnId,
         watermark: Timestamp,
     ) -> Result<usize> {
-        let candidates: Vec<u64> = if self.gc_full_scan_pending {
+        let candidates: Vec<u64> = if self.with_maintenance(|m| m.gc_full_scan_pending) {
             // First post-open pass: discover every on-disk tombstone by a full scan (and seed the set).
             read_view::scan_in_use_mvcc(&self.pool, &self.stores, kind)?
                 .into_iter()
@@ -8089,21 +8131,26 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // stamps still need their Active/Recent Transaction Table entries to resolve. A rolled-back
         // GC pass must therefore prune NOTHING — otherwise a restored in-flight stamp would be
         // stranded as unresolvable (it would wrongly read as aborted).
-        if self
-            .pending_gc_prune
-            .as_ref()
-            .is_some_and(|p| p.gc_txn == txn)
-        {
-            self.pending_gc_prune = None;
-        }
+        // ONE hold: the test names the pass whose prune is being discarded, and a second hold could
+        // discard a prune scheduled by a *different* pass between the two.
+        self.with_maintenance(|m| {
+            if m.pending_gc_prune.as_ref().is_some_and(|p| p.gc_txn == txn) {
+                m.pending_gc_prune = None;
+            }
+        });
         // `rmp` #522: if `txn` is the in-progress GC pass, restore the freeze frontier its freeze sweep
         // advanced. The WAL undo above un-froze the stamps this pass had frozen (restoring them to
         // their in-flight form); without restoring the frontier those records would sit below it and the
         // next freeze sweep would skip them, stranding a committed writer's stamp unfrozen forever. Taken
         // (not just read) so a normal write transaction — whose savepoint this never is — leaves it be.
-        if let Some((sp_txn, saved)) = self.gc_freeze_low_savepoint
-            && sp_txn == txn
-        {
+        // Taken under the latch and only when it names this pass, so the savepoint of a concurrent
+        // pass is never consumed by this rollback.
+        let savepoint = self.with_maintenance(|m| {
+            m.gc_freeze_low_savepoint
+                .filter(|(sp_txn, _)| *sp_txn == txn)
+                .inspect(|_| m.gc_freeze_low_savepoint = None)
+        });
+        if let Some((_, saved)) = savepoint {
             // A DESCENT, not a store (`rmp` #1014). The saved value is the frontier as it stood before
             // this pass's sweep raised it, so restoring it can only ever lower the frontier — which is
             // exactly what `fetch_min` expresses. A plain store would additionally *raise* it over any
@@ -8113,7 +8160,6 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             for (slot, v) in self.freeze_low.iter().zip(saved) {
                 slot.descend(v);
             }
-            self.gc_freeze_low_savepoint = None;
         }
         self.with_catalog_mut(|c| c.tokens = pre_tokens);
         // Restore the live-record COUNTERS to their pre-rollback in-memory image, then withdraw
@@ -8237,7 +8283,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 StoreKind::Rel => {
                     self.with_maintenance(|m| m.pending_corpse_rels.insert(id));
                 }
-                StoreKind::Prop => self.pending_prop_corpses = true,
+                StoreKind::Prop => self.with_maintenance(|m| m.pending_prop_corpses = true),
                 _ => {}
             }
         }
@@ -14488,7 +14534,7 @@ mod tests {
         for slot in &s.freeze_low {
             slot.reset(1);
         }
-        s.gc_full_scan_pending = true;
+        s.with_maintenance(|m| m.gc_full_scan_pending = true);
         let wm = s.snapshot_ts();
         s.begin(TxnId(next));
         let full = s.gc(TxnId(next), wm).unwrap();
