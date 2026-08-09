@@ -6702,8 +6702,15 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // `rmp` #522: snapshot the freeze frontier BEFORE the freeze sweep advances it, so a rollback of
         // this GC pass (whose WAL undo restores the stamps it froze) can restore the frontier and not
         // strand those now-un-frozen stamps below it. Cleared at this pass's commit. No other transaction
-        // runs between here and this pass's commit/rollback (the single engine thread holds the store), so
-        // the savepoint's frontier is exactly the pre-freeze value.
+        // runs between here and this pass's commit/rollback (the single engine thread holds the store).
+        //
+        // THAT PREMISE NO LONGER HOLDS (`rmp` #1032): the store is `&self` throughout and several
+        // writers run at once, so a concurrent descent CAN land between this capture and the rollback
+        // that consumes it, making the savepoint HIGHER than the live frontier. The savepoint is
+        // still correct, and by construction rather than by luck: the restore is a `descend`
+        // (`fetch_min`, `rmp` #1014), so a savepoint above the live value restores nothing and the
+        // concurrent writer's lower claim survives untouched. Restoring with a plain store is what
+        // would need the single-thread premise — which is exactly why #1014 removed it.
         let savepoint = (txn, std::array::from_fn(|i| self.freeze_low[i].get()));
         self.with_maintenance(|m| m.gc_freeze_low_savepoint = Some(savepoint));
 

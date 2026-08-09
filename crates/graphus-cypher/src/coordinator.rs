@@ -12047,14 +12047,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ///
     /// This is the lending counterpart to [`into_store`](Self::into_store): it gives storage-level
     /// maintenance that needs `&RecordStore` (a backup capture, an explicit checkpoint) a way to
-    /// run *between* commands on the single engine thread and leave the coordinator usable afterwards.
-    /// The store is borrowed for exactly the duration of `f`; do not call back into the coordinator
-    /// from within `f` (it would re-borrow the same `RefCell`).
+    /// run *between* commands and leave the coordinator usable afterwards.
     ///
-    /// # Panics
-    /// Panics if the store is already borrowed (a live statement seam from
-    /// [`statement`](Self::statement) is held, or `f` re-enters the coordinator) — the same misuse
-    /// [`into_store`](Self::into_store) rejects.
+    /// **The single-engine-thread premise this used to rest on is gone** (`rmp` #1032/#1033). The
+    /// store handle is a lock-free `SharedRef` and every store method takes `&self`, so `f` gets `&`
+    /// rather than `&mut`, nothing is borrowed exclusively, and a concurrent statement on another
+    /// thread is not merely tolerated but expected. What remains true — and is now the store's own
+    /// business rather than this seam's — is that each operation `f` performs is ordered by the
+    /// store's internal latches, not by there being one caller.
     /// Runs `f` with the coordinator's open-transaction table held (`rmp` #1033).
     ///
     /// A closure rather than a guard, deliberately: this table is touched by every statement, so a
@@ -12339,15 +12339,18 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
 /// catalogue-count semantics of [`RecordStoreGraph`]'s own [`Statistics`] impl: cost estimation
 /// wants the aggregate shape of the data, not one transaction's MVCC view.
 ///
-/// # Borrow discipline (why this is safe on the single engine thread)
+/// # Borrow discipline (and what replaced the single-engine-thread premise)
 ///
-/// The seam holds an `Rc` clone of the coordinator's shared store and borrows it **briefly, per
-/// method call** — never across calls, and any decoded histogram is owned before the borrow is
-/// released. The other holders of this `Rc` ([`TxnCoordinator`] itself and every
-/// [`RecordStoreGraph`] statement seam) likewise borrow only for the duration of one call, so a
-/// `CoordinatorStatistics` may be held across an entire compilation — including while a transaction
-/// is open and while a statement seam exists — without ever overlapping a live borrow: the planner
-/// is pure and never re-enters the store while one of these calls is borrowing it.
+/// This used to be safe *because* one thread ran everything. It no longer rests on that
+/// (`rmp` #1032/#1033): the seam holds a lock-free [`SharedRef`](crate::shared_cell::SharedRef)
+/// clone of the store, every store method takes `&self`, and nothing here borrows exclusively — so
+/// a `CoordinatorStatistics` may be held across an entire compilation, on any thread, while other
+/// threads read and write the same store.
+///
+/// What the seam still owes, and still honours, is that any decoded value is **owned** before the
+/// call returns: the statistics catalogue is copy-on-write behind the store's rank-10 catalog latch
+/// (`rmp` #1015), so a borrow into it cannot outlive the call that took it. That is a property of
+/// this seam's code, not of how many threads exist, which is why it survived the change.
 ///
 /// # Error policy
 ///
