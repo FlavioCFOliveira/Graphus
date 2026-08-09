@@ -922,6 +922,8 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
         // under it — a fetch under the latch could evict, write home and harden, convoying every
         // publisher of the shard behind one `fdatasync`. Debug-only.
         graphus_core::latch::assert_no_chain_head_latch_held("BufferPool::fetch");
+        // Rank 22 (`rmp` #1014): a fetch can evict, and an eviction writes home and may harden.
+        graphus_core::latch::assert_no_maintenance_latch_held("BufferPool::fetch");
         // One backoff per `fetch` call: it escalates across the transient retries below (lost hit-race,
         // peer `Loading`, contended victim sweep) so a herd of concurrent fetchers spreads out in time
         // and the in-flight loader latches drain — instead of re-contending in lockstep, the

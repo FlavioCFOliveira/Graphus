@@ -760,6 +760,9 @@ impl<S: LogSink> WalManager<S> {
         // the allocator and this log for the same reason and carries the same never-across-I/O
         // promise. Debug-only.
         graphus_core::latch::assert_no_chain_head_latch_held("WalManager::harden");
+        // Rank 22, the maintenance latch (`rmp` #1014): a leaf, and hardening under it would put
+        // every writer with a record to tombstone behind this fdatasync.
+        graphus_core::latch::assert_no_maintenance_latch_held("WalManager::harden");
         if let Err(e) = self.sink.sync() {
             panic!("WAL fdatasync failed; aborting to avoid silent data loss (fsyncgate): {e}");
         }

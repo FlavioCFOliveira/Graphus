@@ -117,11 +117,24 @@ impl PhysicalAllocator {
     fn alloc_fresh(&self) -> Result<u64> {
         self.next
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-            .map_err(|_| {
-                GraphusError::Storage(
-                    "physical-id space exhausted: high-water mark at u64::MAX".to_owned(),
-                )
-            })
+            .map_err(|_| Self::exhausted())
+    }
+
+    /// Whether the mark can still be advanced — `false` exactly when [`alloc_fresh`](Self::alloc_fresh)
+    /// would fail.
+    ///
+    /// The ceiling is a property of the mark, not of the act of bumping it, so a caller that **peeks**
+    /// the mark instead of bumping it (see [`AllocGuard::allocate_within`]) can ask the same question
+    /// and fail closed identically. Advisory when read without the allocation latch — under the latch,
+    /// which is where both callers ask, it is exact.
+    fn can_alloc_fresh(&self) -> bool {
+        self.next.load(Ordering::Relaxed).checked_add(1).is_some()
+    }
+
+    /// The single definition of "the physical-id space is exhausted", shared by every path that has to
+    /// fail closed at the ceiling so they cannot drift apart (`rmp` #452, #1014).
+    fn exhausted() -> GraphusError {
+        GraphusError::Storage("physical-id space exhausted: high-water mark at u64::MAX".to_owned())
     }
 
     /// Lowers the mark from `from` to `to`, **only if it is still exactly `from`**; reports whether
@@ -322,17 +335,53 @@ impl FreeList {
 pub enum Allocation {
     /// A freed id popped off the free list. Its store page is already mapped.
     Reused(u64),
-    /// A fresh id taken by advancing the high-water mark. Its page must be mapped before the id is
-    /// used, and the caller must [`unbump_fresh`](AllocGuard::unbump_fresh) if that mapping fails.
+    /// A fresh id taken by advancing the high-water mark.
+    ///
+    /// Through [`allocate_within`](AllocGuard::allocate_within) — the production path since `rmp`
+    /// #1014 — this id is guaranteed to lie **inside the mapped capacity the caller supplied**, so the
+    /// catalog invariant `high_water <= addressable capacity` is never even momentarily false and
+    /// there is nothing to withdraw. Through the unbounded [`allocate`](AllocGuard::allocate) it
+    /// carries the older obligation: map the page before using the id, and
+    /// [`unbump_fresh`](AllocGuard::unbump_fresh) if that mapping fails.
     Fresh(u64),
+    /// **Nothing was allocated and the mark did not move** (`rmp` #1014): the free list offered
+    /// nothing reusable, and the next fresh id would fall at or beyond the capacity
+    /// [`allocate_within`](AllocGuard::allocate_within) was given.
+    ///
+    /// The caller maps the page holding `next` — with the latch released, because mapping grows the
+    /// device — and calls again. Declining to bump is the whole correction: a bump that has to be
+    /// undone is a bump that can fail to be undone.
+    Grow {
+        /// The physical id that would have been allocated, and hence the id whose store page must be
+        /// mapped before this allocation can succeed.
+        next: u64,
+    },
 }
 
 impl Allocation {
+    /// The allocated physical id, or `None` for [`Grow`](Allocation::Grow) — which allocated nothing.
+    #[must_use]
+    pub fn allocated_id(self) -> Option<u64> {
+        match self {
+            Allocation::Reused(id) | Allocation::Fresh(id) => Some(id),
+            Allocation::Grow { .. } => None,
+        }
+    }
+
     /// The allocated physical id, whichever way it was obtained.
+    ///
+    /// # Panics
+    /// Panics on [`Grow`](Allocation::Grow), which allocated nothing. Use
+    /// [`allocated_id`](Self::allocated_id) wherever that outcome is reachable — through
+    /// [`allocate`](AllocGuard::allocate) it is not.
     #[must_use]
     pub fn id(self) -> u64 {
         match self {
             Allocation::Reused(id) | Allocation::Fresh(id) => id,
+            Allocation::Grow { next } => panic!(
+                "Allocation::Grow {{ next: {next} }} allocated no id: the caller must map that id's \
+                 store page and retry (`rmp` #1014)"
+            ),
         }
     }
 }
@@ -651,6 +700,61 @@ impl AllocGuard<'_> {
     pub fn allocate(&mut self) -> Result<Allocation> {
         if let Some(id) = self.pop_reusable() {
             return Ok(Allocation::Reused(id));
+        }
+        Ok(Allocation::Fresh(self.alloc.alloc_fresh()?))
+    }
+
+    /// Allocates one physical id **without ever bumping the mark past `capacity`** — the production
+    /// allocation path since `rmp` #1014 (layer 5b of #975, acceptance criterion 6).
+    ///
+    /// `capacity` is the number of ids the store's currently mapped device pages can address. When the
+    /// free list offers nothing and the next fresh id would fall at or beyond it, this allocates
+    /// nothing, leaves the mark exactly where it was, and returns [`Allocation::Grow`] naming the id
+    /// whose page must be mapped. The caller maps it — with this guard dropped, because mapping grows
+    /// the device — and calls again.
+    ///
+    /// # Why declining beats undoing
+    ///
+    /// [`unbump_fresh`](Self::unbump_fresh) exists because the mark used to be advanced *before* the
+    /// id's page was mapped, so a failure between the two left the catalog invariant
+    /// `high_water <= addressable capacity` false and needing repair. Repair is the wrong shape here,
+    /// and conditionality only narrowed it: with two writers, A takes `id` and B takes `id + 1`, both
+    /// fail their mapping, and whichever withdraws second is *declined* — so the mark stays at
+    /// `id + 2` with pages for neither. That catalog is the one VOPR seed 5043221 surfaced, where a
+    /// later rollback's `reload_catalog` rejected the image, every store's page map was emptied, blank
+    /// pages were re-allocated over committed records, and committed data was silently lost.
+    ///
+    /// Not moving the mark until the page exists removes the repair rather than improving it: there is
+    /// no window in which the invariant is false, so there is nothing for a second writer's failure to
+    /// interfere with, and no ordering of two failures that can leave the mark above the capacity.
+    ///
+    /// # `capacity` may be stale, and that is safe
+    ///
+    /// The caller reads it from the store's page map without a hold, and a page map only ever grows.
+    /// A stale (smaller) capacity therefore makes this decline where it could have allocated — one
+    /// extra, idempotent mapping call — and can never make it allocate an id whose page is unmapped,
+    /// which is the direction that matters.
+    ///
+    /// # Errors
+    /// Returns a storage error if the physical-id space is exhausted (`rmp` #452).
+    pub fn allocate_within(&mut self, capacity: u64) -> Result<Allocation> {
+        if let Some(id) = self.pop_reusable() {
+            return Ok(Allocation::Reused(id));
+        }
+        // PEEK, do not bump: `high_water` is the id `alloc_fresh` would hand out next.
+        let next = self.alloc.high_water();
+        if next >= capacity {
+            // The ceiling is checked HERE, on the peek, and not left to the `alloc_fresh` below.
+            // Declining to bump must never become declining to CHECK: `alloc_fresh` is what fails
+            // closed at `u64::MAX` (`rmp` #452), and the `Grow` arm returns before reaching it. Without
+            // this the caller is handed `Grow { next: u64::MAX }` and dutifully goes off to map the
+            // store page holding it — a page index no device will ever reach, grown ONE PAGE AT A TIME
+            // by `ensure_store_page` until the machine's memory is gone and the process is killed.
+            // A fail-closed bound that a second allocation path can walk around is not a bound.
+            if !self.alloc.can_alloc_fresh() {
+                return Err(PhysicalAllocator::exhausted());
+            }
+            return Ok(Allocation::Grow { next });
         }
         Ok(Allocation::Fresh(self.alloc.alloc_fresh()?))
     }
@@ -1085,6 +1189,40 @@ mod tests {
         assert_ne!(a.high_water(), NULL_ID);
     }
 
+    /// **Regression (`rmp` #1014): the ceiling holds on the PEEK path too.**
+    ///
+    /// [`AllocGuard::allocate_within`] answers "the next fresh id is beyond your mapped capacity" with
+    /// [`Allocation::Grow`] — deliberately *without* calling [`PhysicalAllocator::alloc_fresh`], since
+    /// the whole point is not to move the mark. At the `u64::MAX` ceiling that is both conditions at
+    /// once, and the earlier shape returned `Grow { next: u64::MAX }`: nothing overflowed, nothing
+    /// failed, and the caller was sent to map the store page holding `u64::MAX`. `ensure_store_page`
+    /// grows a store one page at a time, so that instruction is an unbounded allocation loop — measured
+    /// at 24–30 GB of resident memory before the kernel's OOM killer ended the process.
+    ///
+    /// The exhaustion bound must therefore be reached by BOTH allocation paths. This test fails (with
+    /// `Grow`, not with an error) if the check is removed from the peek — it is the negative control
+    /// for the fix, not a restatement of it.
+    #[test]
+    fn allocate_within_at_the_ceiling_fails_closed_instead_of_demanding_growth() {
+        let s = StoreAllocator::restore(u64::MAX, FreeList::new());
+        // A capacity far below the mark: `next >= capacity`, so this takes the `Grow` branch.
+        let outcome = s.lock().allocate_within(1024);
+        match outcome {
+            Err(e) => assert!(
+                e.to_string().contains("physical-id space exhausted"),
+                "the peek path must fail with the SAME exhaustion error as `alloc_fresh`, got: {e}"
+            ),
+            Ok(Allocation::Grow { next }) => panic!(
+                "allocate_within returned Grow {{ next: {next} }} at the id ceiling: the caller would \
+                 map that id's store page, growing the device one page at a time until the process is \
+                 killed (`rmp` #1014)"
+            ),
+            Ok(other) => panic!("nothing is allocatable at the ceiling, got {other:?}"),
+        }
+        // The mark did not move: a refused allocation never wraps to the reserved NULL id.
+        assert_eq!(s.high_water(), u64::MAX);
+    }
+
     // ----------------------- StoreAllocator (`rmp` #1012) ------------------------
 
     /// **A withdrawal that would drop the mark below a live id is REFUSED** (`rmp` #1012).
@@ -1244,6 +1382,9 @@ mod tests {
             match alloc.allocate().expect("space") {
                 Allocation::Reused(id) => reused.push(id),
                 Allocation::Fresh(id) => panic!("expected reuse, grew to {id}"),
+                Allocation::Grow { next } => {
+                    unreachable!("`allocate` never declines; got Grow {next}")
+                }
             }
         }
         reused.sort_unstable();

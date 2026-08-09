@@ -1,0 +1,38 @@
+[package]
+name = "graphus-freezefloor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "The freeze frontier of the Graphus record stores: a floor that descends by fetch_min and rises only by compare-exchange."
+
+[dependencies]
+
+# `loom` model-checks the freeze frontier's descend/raise race (`rmp` #1014). Unlike
+# `graphus-chainhead`, this crate owns the shared cell itself, so the *library* needs the seam (the
+# `#[cfg(loom)]` arms at the top of `src/lib.rs`) and the *models* need it too — hence both a
+# dependency and a dev-dependency, exactly as `graphus-pagemap` declares them. Both are gated on
+# `--cfg loom`, so loom never enters a production build.
+#
+# This crate has NO dependencies, and that is deliberate: it is a LEAF. `--cfg loom` is a global
+# RUSTFLAG, so building a model flips the loom seam of EVERY crate in the dependency graph at once. A
+# frontier living inside `graphus-storage` (which depends on `graphus-bufpool`, itself carrying a loom
+# seam) therefore could not be model-checked at all: storage's `std::sync::Arc` would stop matching
+# bufpool's `loom::sync::Arc`. Having no edge to bufpool is precisely what makes the model check
+# possible — the same reason `graphus-pagemap` (`rmp` #721), `graphus-groupsync` (`rmp` #994) and
+# `graphus-chainhead` (`rmp` #1028) are leaves:
+#
+#   RUSTFLAGS="--cfg loom" cargo test -p graphus-freezefloor --test loom_freezefloor --release
+[target.'cfg(loom)'.dependencies]
+loom = "0.7.2"
+
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7.2"
+
+# `loom` is a known custom cfg the crate sets via RUSTFLAGS; register it so `unexpected_cfgs` does not
+# warn on the `#[cfg(loom)]` arms in `src/lib.rs` or the `#![cfg(loom)]` gate in
+# `tests/loom_freezefloor.rs`.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

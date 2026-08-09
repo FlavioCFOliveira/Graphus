@@ -1,12 +1,14 @@
 //! **Lock-held tripwires**: debug-build guards proving that no durability barrier is ever issued
 //! while a lock that must not span I/O is held.
 //!
-//! Three are defined here:
+//! Five are defined here:
 //!
 //! * the **frame-latch tripwire** ([`FrameLatchScope`], `rmp` #974) — the buffer pool's per-frame
 //!   latch;
 //! * the **doublewrite-lock tripwire** ([`DwbLockScope`], `rmp` #993) — the mutex guarding the
 //!   doublewrite buffer's device;
+//! * the **maintenance-latch tripwire** ([`MaintenanceLatchScope`], `rmp` #1014) — the single latch
+//!   over the GC's pending-work sets;
 //! * the **allocator-latch tripwire** ([`AllocLatchScope`], `rmp` #1012) — the per-store physical-id
 //!   allocation latch;
 //! * the **chain-head-latch tripwire** ([`ChainHeadLatchScope`], `rmp` #1028) — the sharded latch
@@ -266,10 +268,10 @@ thread_local! {
 /// # The rank, and the rule it encodes
 ///
 /// Graphus orders its latches by rank, innermost last: **10** catalog/DDL, **20** commit sequencer
-/// and active-transaction table, **25** the allocation latch, **27** the chain-head publication
-/// latch, **30** WAL, **40** buffer-pool frame latch, **50** page-table shard, **60** device and
-/// doublewrite stager. An acquisition out of rank order is permitted only as a `try_lock`, which
-/// creates no wait edge.
+/// and active-transaction table, **22** the maintenance latch, **25** the allocation latch, **27**
+/// the chain-head publication latch, **30** WAL, **40** buffer-pool frame latch, **50** page-table
+/// shard, **60** device and doublewrite stager. An acquisition out of rank order is permitted only as
+/// a `try_lock`, which creates no wait edge.
 ///
 /// Rank 25 says two things. Below the active-transaction table (20), because allocating or freeing an
 /// id happens inside a transaction that records the pop or push in that table. Above the WAL (30) and
@@ -305,6 +307,10 @@ impl AllocLatchScope {
     #[must_use]
     #[inline]
     pub fn new() -> Self {
+        // Rank 22 is a LEAF (`rmp` #1014): reaching an inner latch while holding it is a violation
+        // even though 22 < 25 makes the *order* legal. Checked here because this is the acquisition,
+        // and the acquisition is the only place that can see it.
+        assert_no_maintenance_latch_held("AllocLatchScope::new");
         #[cfg(debug_assertions)]
         ALLOC_DEPTH.with(|d| {
             // Rank 25 admits AT MOST ONE holder per thread, and this is where that is enforced
@@ -438,6 +444,9 @@ impl ChainHeadLatchScope {
     #[must_use]
     #[inline]
     pub fn new() -> Self {
+        // Rank 22 is a LEAF (`rmp` #1014); see `AllocLatchScope::new` for why the check belongs at the
+        // acquisition rather than at the barrier.
+        assert_no_maintenance_latch_held("ChainHeadLatchScope::new");
         #[cfg(debug_assertions)]
         CHAIN_HEAD_DEPTH.with(|d| {
             assert!(
@@ -489,6 +498,135 @@ pub fn assert_no_chain_head_latch_held(site: &str) {
              rank 27 and must be released before any I/O (`rmp` #1028): held across page growth, a \
              page fetch that can evict, or a durability barrier, it convoys every publisher of the \
              shard behind one fdatasync. Pin the page before taking it (see `graphus_core::latch`)."
+        );
+    }
+    let _ = site;
+}
+
+/// Whether the current thread holds the maintenance latch — `0` or `1`, never more (`rmp` #1014).
+///
+/// A flag rather than a nesting count, for the same reason as [`alloc_latch_depth`]: rank 22 admits
+/// at most one holder per thread. Always `0` in a release build.
+#[cfg(debug_assertions)]
+#[must_use]
+pub fn maintenance_latch_depth() -> u32 {
+    MAINTENANCE_DEPTH.with(std::cell::Cell::get)
+}
+
+/// Whether the current thread holds the maintenance latch. Always `0` in a release build.
+#[cfg(not(debug_assertions))]
+#[must_use]
+pub const fn maintenance_latch_depth() -> u32 {
+    0
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static MAINTENANCE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// An RAII marker for a region in which the current thread holds the **maintenance latch** — the
+/// single lock over the GC's pending-work sets (`rmp` #1014).
+///
+/// # What it guards, and why one latch is the right shape
+///
+/// The record stores keep a handful of in-memory sets naming work the next maintenance pass owes:
+/// tombstones awaiting reclamation, undo chains awaiting release, relationship dead-link corpses
+/// awaiting a splice, orphaned slots awaiting return to the free list, and a flag for unreclaimed
+/// empty property cells. None of it is durable state — it is all rebuilt from the store on
+/// `open` — and all of it moves at the cadence of **garbage collection**, not of OLTP: a writer
+/// touches it once per tombstoned record, and the GC pass drains it once per tick.
+///
+/// That is why it is ONE latch and not five, and not a sharded one. The sprint's mandate is to
+/// discard mechanisms that produce contention on the hot path, and this is not one of them: the
+/// critical section is a `BTreeSet` insert. Splitting it would multiply the ranks that have to be
+/// ordered against one another (see the "one holder per thread" rule below) and buy nothing
+/// measurable. Sharding a lock that is not contended is how a lock ordering acquires a deadlock it
+/// did not have.
+///
+/// # The rank, and the rule it encodes
+///
+/// Rank **22**, between the active-transaction table (20) and the allocation latch (25) — see
+/// [`AllocLatchScope`] for the full order. In practice it is stronger than its rank: it is a **leaf**.
+/// Nothing is acquired while it is held, and it is never held across I/O. Both obligations come from
+/// the same place — the sets are drained by *snapshotting* them under the latch and then doing the
+/// work with the latch released, because that work is page reads, WAL appends and slot frees. A pass
+/// that iterated a set while it worked would hold a lock shared with every writer across an
+/// `fdatasync`, which is the `rmp` #974 / #993 / #1012 convoy arriving by a fifth route.
+///
+/// As with ranks 25 and 27, **at most one holder per thread**: two locks of the same rank cannot be
+/// ordered by rank, so two threads acquiring a different pair in a different order deadlock. Nothing
+/// needs two — there is only one.
+///
+/// `!Send`/`!Sync` for the same reason as its siblings: the depth is a thread-local, and a scope
+/// created on one thread and dropped on another would corrupt both threads' counters.
+#[derive(Debug)]
+pub struct MaintenanceLatchScope {
+    _private: std::marker::PhantomData<*const ()>,
+}
+
+impl MaintenanceLatchScope {
+    /// Enters a maintenance-latch region on the current thread.
+    ///
+    /// # Panics
+    /// Panics in a debug build if this thread **already** holds the maintenance latch (rank 22 is not
+    /// re-entrant — see above). Compiled out in release.
+    #[must_use]
+    #[inline]
+    pub fn new() -> Self {
+        #[cfg(debug_assertions)]
+        MAINTENANCE_DEPTH.with(|d| {
+            assert!(
+                d.get() == 0,
+                "a second maintenance latch was taken while this thread already holds one. Rank 22 \
+                 is not re-entrant and admits one holder per thread (`rmp` #1014): two locks of the \
+                 same rank cannot be ordered by rank, so two threads acquiring a different pair in a \
+                 different order deadlock. Snapshot the set and drop the guard before doing the work \
+                 (see `graphus_core::latch`)."
+            );
+            d.set(1);
+        });
+        Self {
+            _private: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Default for MaintenanceLatchScope {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for MaintenanceLatchScope {
+    #[inline]
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        MAINTENANCE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// Panics (debug builds only) if the current thread holds the maintenance latch.
+///
+/// Call this wherever the latch must already have been released: the durability barrier, the
+/// store-growth and page-fetch paths that can evict, and the acquisition of any inner latch — rank 22
+/// is a leaf, so *every* one of those is a violation, not merely the I/O ones. `site` names the point
+/// so a failure points straight at the offending path.
+///
+/// # Panics
+/// Panics in a debug build if [`maintenance_latch_depth`] is non-zero. Compiled out in release.
+#[inline]
+pub fn assert_no_maintenance_latch_held(site: &str) {
+    #[cfg(debug_assertions)]
+    {
+        let depth = maintenance_latch_depth();
+        assert!(
+            depth == 0,
+            "{site}: reached while holding {depth} maintenance latch(es). That latch is rank 22 and \
+             is a LEAF (`rmp` #1014): nothing may be acquired while it is held, and it must never be \
+             held across I/O — a pass that works while holding it convoys every writer that has a \
+             record to tombstone behind one fdatasync. Snapshot the set, drop the guard, then work \
+             (see `graphus_core::latch`)."
         );
     }
     let _ = site;
@@ -624,6 +762,72 @@ mod tests {
         assert_no_frame_latch_held("unrelated barrier");
         assert_no_dwb_lock_held("unrelated barrier");
         assert_no_alloc_latch_held("unrelated barrier");
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "maintenance latch")]
+    fn maintenance_assert_fires_inside_a_latched_region() {
+        let _scope = MaintenanceLatchScope::new();
+        assert_no_maintenance_latch_held("test durability barrier");
+    }
+
+    #[test]
+    fn maintenance_assert_passes_outside_a_latched_region() {
+        assert_eq!(maintenance_latch_depth(), 0);
+        assert_no_maintenance_latch_held("test durability barrier");
+    }
+
+    /// **Positive control for the non-re-entrancy rule** (`rmp` #1014), the rank-22 twin of
+    /// [`a_second_alloc_scope_on_one_thread_is_refused`].
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "Rank 22 is not re-entrant")]
+    fn a_second_maintenance_scope_on_one_thread_is_refused() {
+        let _first = MaintenanceLatchScope::new();
+        let _second = MaintenanceLatchScope::new();
+    }
+
+    /// Sequential scopes are fine — a GC pass drains one set after another.
+    #[test]
+    fn maintenance_scopes_taken_one_after_another_are_fine() {
+        for _ in 0..3 {
+            let _s = MaintenanceLatchScope::new();
+        }
+        assert_eq!(maintenance_latch_depth(), 0);
+    }
+
+    /// **Positive control for the LEAF rule** (`rmp` #1014). Rank 22 sits *outside* rank 25, so the
+    /// lock order alone permits taking the allocation latch while holding the maintenance latch — and
+    /// permitting it is exactly the mistake: the allocator's holder goes on to grow the store. Without
+    /// this test the `assert_no_maintenance_latch_held` call in [`AllocLatchScope::new`] could be
+    /// deleted and nothing else in the suite would notice.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "AllocLatchScope::new")]
+    fn taking_the_allocation_latch_under_the_maintenance_latch_is_refused() {
+        let _maintenance = MaintenanceLatchScope::new();
+        let _alloc = AllocLatchScope::new();
+    }
+
+    /// The leaf rule's rank-27 twin.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "ChainHeadLatchScope::new")]
+    fn taking_the_chain_head_latch_under_the_maintenance_latch_is_refused() {
+        let _maintenance = MaintenanceLatchScope::new();
+        let _publish = ChainHeadLatchScope::new();
+    }
+
+    #[test]
+    fn maintenance_scope_does_not_trip_the_other_tripwires() {
+        let _scope = MaintenanceLatchScope::new();
+        #[cfg(debug_assertions)]
+        assert_eq!(maintenance_latch_depth(), 1);
+        assert_no_frame_latch_held("unrelated barrier");
+        assert_no_dwb_lock_held("unrelated barrier");
+        assert_no_alloc_latch_held("unrelated barrier");
+        assert_no_chain_head_latch_held("unrelated barrier");
     }
 
     /// The depth is **per thread**: one thread's latched region must not make another thread's

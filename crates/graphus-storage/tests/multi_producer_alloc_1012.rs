@@ -127,6 +127,9 @@ fn n_threads_never_receive_the_same_physical_id() {
         .filter_map(|a| match a {
             Allocation::Reused(id) => Some(*id),
             Allocation::Fresh(_) => None,
+            // Unreachable through the unbounded `allocate`, which never declines: only
+            // `allocate_within` can return `Grow` (`rmp` #1014).
+            Allocation::Grow { next } => unreachable!("`allocate` never declines; got Grow {next}"),
         })
         .collect();
     assert_eq!(

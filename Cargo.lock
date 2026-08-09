@@ -1277,6 +1277,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "graphus-freezefloor"
+version = "0.0.10"
+dependencies = [
+ "loom",
+]
+
+[[package]]
 name = "graphus-gds"
 version = "0.0.10"
 dependencies = [
@@ -1494,6 +1501,7 @@ dependencies = [
  "graphus-bufpool",
  "graphus-chainhead",
  "graphus-core",
+ "graphus-freezefloor",
  "graphus-groupsync",
  "graphus-index",
  "graphus-io",

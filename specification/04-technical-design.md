@@ -83,6 +83,7 @@ A single Cargo workspace, Edition 2024, 64-bit-only targets (`D-target-matrix`).
 | `graphus-wal` | lib | WAL record format, log writer with group commit, LSN allocation, checkpointer, ARIES analysis/redo/undo, recovery driver. |
 | `graphus-bufpool` | lib | Frame table, page latches, pin counts, eviction (CLOCK/2Q), prefetch, write-back coordination with WAL (WAL rule). |
 | `graphus-chainhead` | lib | The **prepend publication protocol** every chain head in the storage core shares — `first_rel`, `first_prop` and the MVCC `undo_ptr` (§5.7.1): the four ordered steps, the retry a refused publication demands, and the `ChainHead` trait that states the two obligations the underlying medium must honour. A true **leaf**: it depends on no other crate, and that is a requirement rather than an accident. `--cfg loom` is a global rustflag, so a protocol that must be model-checked cannot live in a crate that reaches `graphus-bufpool`, whose own loom seam would then stop matching. `#![forbid(unsafe_code)]`. |
+| `graphus-freezefloor` | lib | The **freeze frontier** of the fixed-record stores (§5.6): the lower bound below which the incremental GC's freeze sweep has already visited every record, and the three — and only three — operations its algebra admits. It **descends** by `fetch_min` (a writer announcing a stamp below it), it **rises** only by a compare-exchange against the value the sweep started from (so a descent that lands mid-sweep refuses the raise instead of being swallowed), and it is stored into only to initialise it. A plain store in either of the first two roles strands a committed writer's stamp below the frontier, where no later sweep visits it — the silent-data-loss shape of tasks `#522` and `#778`. A true **leaf** for the same reason as `graphus-chainhead`, and the type is the one `RecordStore` holds, so the `loom` models check the production cell rather than a copy of it. `#![forbid(unsafe_code)]`. |
 | `graphus-storage` | lib | Page formats; node/relationship/property/label record codecs; index-free adjacency chains; token/dictionary store; free-space management; element-ID→physical-ID map. |
 | `graphus-index` | lib | B+-tree, token-lookup index, composite & relationship-property indexes; constraint checks; index recovery. |
 | `graphus-txn` | lib | Transaction lifecycle, MVCC version chains and their undo deltas, visibility, SSI conflict tracker, timestamp oracle, version GC, write-conflict detection (§5.7), latch policy. |
@@ -2571,10 +2572,10 @@ of each level.
   rustflag, so building a model flips the loom seam of **every** crate in the dependency graph at
   once: a protocol living inside a crate that reaches `graphus-bufpool` could not be checked at all,
   because its `std::sync` types would stop matching that crate's `loom::sync` types. This is why
-  `graphus-pagemap` (task #721), `graphus-groupsync` (task #994) and `graphus-chainhead` (task #1028,
-  §1.2) carry **no edge to `graphus-bufpool`**: the first two depend on `graphus-core` alone, and
-  `graphus-chainhead` on nothing at all. It is a design constraint on where a model-checkable protocol
-  may live, not an accident of packaging.
+  `graphus-pagemap` (task #721), `graphus-groupsync` (task #994), `graphus-chainhead` (task #1028,
+  §1.2) and `graphus-freezefloor` (task #1014, §1.2) carry **no edge to `graphus-bufpool`**: the first
+  two depend on `graphus-core` alone, and the last two on nothing at all. It is a design constraint on
+  where a model-checkable protocol may live, not an accident of packaging.
 - **proptest:** for the high-value pure modules — the order-preserving key encoding (§6.2),
   three-valued logic / ordering / equivalence (§7.6), PackStream and Jolt/CBOR round-trips, temporal
   arithmetic, and record codecs (round-trip and invariant properties).

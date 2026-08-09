@@ -37,6 +37,7 @@ use graphus_core::sched::{self, ResourceId, YieldSite};
 use graphus_core::{
     CommandId, ElementId, Lsn, MAX_TIMESTAMP, PageId, Timestamp, TxnId, VersionStamp,
 };
+use graphus_freezefloor::FreezeFloor;
 use graphus_io::{BlockDevice, PAGE_SIZE};
 use graphus_pagemap::PageMapWriter;
 use graphus_txn::{CommitRegistry, Snapshot, TxnOutcome};
@@ -253,6 +254,19 @@ impl FixedStore {
             alloc: StoreAllocator::with_shared_barrier(barrier),
             device_pages: PageMapWriter::new(),
         }
+    }
+
+    /// The number of physical ids this store's currently mapped device pages can address:
+    /// `mapped pages * records per page` (`rmp` #1014).
+    ///
+    /// **Lock-free, and monotone.** The page map only ever grows, so this value only ever rises, and a
+    /// reader that observes a stale (smaller) one is merely behind — never wrong in the direction that
+    /// matters. That is what lets [`alloc_id`](RecordStore::alloc_id) read it *outside* the allocation
+    /// latch and still guarantee that no fresh id is handed out beyond it: understating the capacity
+    /// makes the allocator decline where it could have allocated (one extra, idempotent mapping),
+    /// while overstating it — the dangerous direction — cannot happen at all.
+    fn capacity(&self) -> u64 {
+        paging::capacity(self.device_pages.len() as u64, self.kind.record_size())
     }
 
     /// This store's durable catalog entry — **refusing** to produce one that is internally
@@ -1075,6 +1089,100 @@ pub type DirectionalRelCounts = (
     std::collections::BTreeMap<(u32, u32), u64>,
 );
 
+/// **The GC's pending-work sets, behind ONE maintenance latch** (`rmp` #1014, layer 5b of #975).
+///
+/// Every field here names work the next maintenance pass owes: records to reclaim, undo chains to
+/// release, dead-link corpses to splice, orphaned slots to hand back, empty property cells to drop.
+/// None of it is durable — all of it is rebuilt from the store by the first pass after
+/// [`RecordStore::open`], whose full scan is what makes a crash-recovered store's backlog
+/// discoverable without any of this state surviving.
+///
+/// # Why one latch, and why a latch at all
+///
+/// A latch at all, because the record write path populates these sets and the write path takes
+/// `&self` as of this task: [`RecordStore::note_expired`] adds a tombstone on the way to stamping an
+/// `xmax`, and under N writers two of those are simultaneous. A `BTreeSet` is not a place two threads
+/// may write.
+///
+/// ONE latch, because this is **GC cadence, not OLTP cadence**. A writer touches it once per
+/// tombstoned record and the pass drains it once per tick; the critical section is a set insert.
+/// Sharding it, or giving each set its own lock, would multiply the ranks that must be ordered
+/// against one another and buy nothing measurable — and adding locks to an uncontended path is how a
+/// lock ordering acquires a deadlock it did not have. The sprint's mandate is to discard the
+/// mechanisms that *do* contend; this is not one of them.
+///
+/// # The one rule
+///
+/// The latch is rank 22 and a **leaf**: nothing is acquired while it is held, and it is never held
+/// across I/O. Draining a set therefore means *snapshotting it under the latch and working with the
+/// latch dropped* — see [`RecordStore::with_maintenance`], and
+/// [`graphus_core::latch::MaintenanceLatchScope`] for the tripwire that enforces it.
+#[derive(Debug, Default)]
+struct Maintenance {
+    /// Reclaim candidates: per-kind physical ids of MVCC tombstones (`xmax` set) awaiting reclamation
+    /// (`rmp` #522). The reclaim sweep iterates ONLY these ids instead of scanning the whole store —
+    /// reclaiming those whose `xmax` has committed at or below the watermark and dropping entries that
+    /// are no longer in-use tombstones (reclaimed, or reverted-to-live by an abort). Populated by
+    /// [`note_expired`](RecordStore::note_expired) and by the first full freeze sweep (which observes every
+    /// pre-existing on-disk tombstone). `Node`/`Rel` drive the direct reclaim; `Prop` gates the
+    /// property-chain sweep (prop tombstones are reclaimed owner-side by
+    /// [`gc_property_chain`](RecordStore::gc_property_chain)). `Strings` is unused (heap blocks are freed with
+    /// their owning property, never tombstoned).
+    pending_tombstones: [std::collections::BTreeSet<u64>; STORE_COUNT],
+    /// **`rmp` #966.** Entities whose undo chain has grown since the last GC pass and may therefore
+    /// have become reclaimable: `(kind as u8, physical id)`. The GC chain sweep iterates exactly this
+    /// set instead of scanning the record stores, mirroring the `rmp` #522 pending-tombstone design.
+    /// Reseeded by a full scan on the first pass after [`open`](RecordStore::open)
+    /// (`gc_full_scan_pending`), which is what makes a crash-recovered store's chains reclaimable
+    /// without any of this in-memory state surviving.
+    pending_undo_chains: std::collections::BTreeSet<(u8, u64)>,
+    /// Relationship dead-link **corpse** candidates (`rmp` #220 / #522): rel ids a rolled-back creation
+    /// left `!in_use`-but-threaded. The corpse splice runs only when this is non-empty (or a full scan
+    /// is pending), so a no-abort workload skips the whole-store corpse walk. Populated on
+    /// [`rollback`](RecordStore::rollback) from the aborting transaction's created rels; crash-materialised
+    /// corpses are caught by the full first pass. Cleared when the splice runs (it collects every
+    /// corpse in one walk).
+    pending_corpse_rels: std::collections::BTreeSet<u64>,
+    /// Node / relationship slots a **logical rollback** retired: unlinked from every chain, header
+    /// zeroed, and belonging to no free list yet (`rmp` #970, acceptance criterion 7).
+    ///
+    /// The abort could return them to the free list itself — it knows they are unreachable, because it
+    /// is what unlinked them. It deliberately does not, and the reason is outside this crate: the
+    /// latest-state TEXT / FULLTEXT / SPATIAL indexes are in-memory, **not transactional**, and key
+    /// their documents by **physical node id** (`rmp` #467 / #756). An aborted node's posting survives
+    /// its rollback as a harmless, re-check-filterable false positive; handing the id straight back out
+    /// turns the next writer's *insert* into what the index sees as a **replace of a still-committed
+    /// document**, which is the one shape #756 must fail closed on — the freshness marker is poisoned
+    /// and every text/spatial seek in the database degrades to a full scan until a rebuild.
+    /// (Reproduced directly by
+    /// `graphus-cypher/tests/text_index.rs::rmp756_constraint_rejected_insert_keeps_the_text_seek_selective`,
+    /// where two constraint-rejected `CREATE`s in a row recycled one id.)
+    ///
+    /// Parking them until the GC pass keeps the space guarantee — the slots come back, so an
+    /// abort-heavy workload does not grow the store — while moving the recycle to a maintenance
+    /// boundary. When the indexes become version-aware (#992) the parking can go and the abort can free
+    /// the slot directly.
+    pending_orphan_slots: [std::collections::BTreeSet<u64>; STORE_COUNT],
+    /// Whether an **unreclaimed empty** property cell (`rmp` #967, `D-property-removal`) may exist:
+    /// set by [`empty_prop_cell`](RecordStore::empty_prop_cell), and **re-derived** after every property
+    /// sweep from what that sweep actually saw ([`PropChainSweep::deferred_empty`]) rather than
+    /// cleared unconditionally.
+    ///
+    /// This replaces `pending_tombstones[Prop]` as the property sweep's gate. It has to: after #967 a
+    /// property operation never stamps `xmax`, so that set is never populated again and gating on it
+    /// would have left the sweep permanently off — the property store would grow without bound on any
+    /// workload that removes properties, with every test still green because nothing asserts that a
+    /// sweep *ran*.
+    ///
+    /// The re-derivation restores the one property the retired set had for free: it was reseeded from
+    /// on-disk state by the freeze sweep every pass, so a pass that reclaimed nothing left the gate
+    /// armed. A plain "clear after every sweep" does not, and the resulting stranding is reachable
+    /// with one long-running reader (`rmp` #967 audit): the reader holds the watermark, a `REMOVE`
+    /// commits, the pass defers the cell and disarms the gate, and the cell then survives every
+    /// subsequent pass until an unrelated removal re-arms it or the store reopens.
+    pending_empty_prop_cells: bool,
+}
+
 /// A record store with index-free adjacency, over a buffer pool and the ARIES WAL.
 ///
 /// `RecordStore` is generic over the block device `D` and the WAL log sink `S` so it runs over
@@ -1220,14 +1328,29 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// `xmin`/`xmax` in-flight stamp at `id`) and RAISED by the freeze sweep to the smallest id in the
     /// range still bearing an in-flight-writer stamp (or `high_water` if none). Initialised to `1` on
     /// open, so the first pass is a full freeze that settles every pre-existing on-disk stamp.
-    /// `AtomicU64` since `rmp` #1014, and the atomic is the CORRECTION, not a way to change a
-    /// signature. The operation the semantics already asks for is "lower it if the new value is
-    /// smaller", and expressed as read-compare-write that is a lost update: two writers appending
-    /// records below the frontier both read the old value, both decide, and the later store discards
-    /// the earlier descent. A frontier that failed to descend means the freeze sweep never revisits
-    /// those ids, so a committed writer's stamp stays in-flight for ever — the `rmp` #522
-    /// silent-data-loss shape. `fetch_min` is that operation, and it cannot lose an update.
-    freeze_low: [AtomicU64; STORE_COUNT],
+    ///
+    /// [`FreezeFloor`] since `rmp` #1014, and the type is the CORRECTION, not a way to change a
+    /// signature. Each of the three operations has exactly one correct primitive, and each wrong one
+    /// strands a stamp by a different route:
+    ///
+    /// * **descend** must be `fetch_min`. Expressed as read-compare-write it is a lost update: two
+    ///   writers stamping records below the frontier both read the old value, both decide, and the
+    ///   later store discards the earlier descent.
+    /// * **raise** must be a compare-exchange against the value the sweep's scan started from. Its
+    ///   `new_low` is a statement about `[from, high_water)` and about nothing below `from`, so an
+    ///   unconditional store swallows any descent that landed under it while the pass ran.
+    /// * **a rolled-back sweep's restore** must descend to the savepoint, for the same reason.
+    ///
+    /// In every case the frontier stops covering an id, the freeze sweep never revisits it, and a
+    /// committed writer's stamp stays in-flight for ever — the `rmp` #522 silent-data-loss shape.
+    ///
+    /// The algebra lives in [`graphus_freezefloor`] rather than here, and this field **is** that type,
+    /// because a leaf crate is the only place it can be `loom`-model-checked (`--cfg loom` is a global
+    /// rustflag, so a crate with an edge to `graphus-bufpool` cannot be modelled at all). The models
+    /// there pair every property with a negative control that calls the naive alternative and requires
+    /// it to lose a descent — so the three sentences above are measured, not asserted. Same
+    /// arrangement as [`graphus_chainhead`] (`rmp` #1028).
+    freeze_low: [FreezeFloor; STORE_COUNT],
     /// **`rmp` #809 — release-active freeze-frontier audit cursor.** Per-kind resume id for the bounded
     /// rotating-window audit ([`audit_freeze_frontier_window`](Self::audit_freeze_frontier_window)) that
     /// runs on every GC pass in an ordinary release build. Each pass scans `[freeze_audit_from[kind],
@@ -1237,66 +1360,14 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// from `1` every open (no on-disk representation, so the store format and crash recovery are
     /// unchanged). Index `Strings` is unused (heap blocks carry no MVCC stamps).
     freeze_audit_from: [u64; STORE_COUNT],
-    /// Reclaim candidates: per-kind physical ids of MVCC tombstones (`xmax` set) awaiting reclamation
-    /// (`rmp` #522). The reclaim sweep iterates ONLY these ids instead of scanning the whole store —
-    /// reclaiming those whose `xmax` has committed at or below the watermark and dropping entries that
-    /// are no longer in-use tombstones (reclaimed, or reverted-to-live by an abort). Populated by
-    /// [`note_expired`](Self::note_expired) and by the first full freeze sweep (which observes every
-    /// pre-existing on-disk tombstone). `Node`/`Rel` drive the direct reclaim; `Prop` gates the
-    /// property-chain sweep (prop tombstones are reclaimed owner-side by
-    /// [`gc_property_chain`](Self::gc_property_chain)). `Strings` is unused (heap blocks are freed with
-    /// their owning property, never tombstoned).
-    pending_tombstones: [std::collections::BTreeSet<u64>; STORE_COUNT],
-    /// Relationship dead-link **corpse** candidates (`rmp` #220 / #522): rel ids a rolled-back creation
-    /// left `!in_use`-but-threaded. The corpse splice runs only when this is non-empty (or a full scan
-    /// is pending), so a no-abort workload skips the whole-store corpse walk. Populated on
-    /// [`rollback`](Self::rollback) from the aborting transaction's created rels; crash-materialised
-    /// corpses are caught by the full first pass. Cleared when the splice runs (it collects every
-    /// corpse in one walk).
-    pending_corpse_rels: std::collections::BTreeSet<u64>,
-    /// Node / relationship slots a **logical rollback** retired: unlinked from every chain, header
-    /// zeroed, and belonging to no free list yet (`rmp` #970, acceptance criterion 7).
-    ///
-    /// The abort could return them to the free list itself — it knows they are unreachable, because it
-    /// is what unlinked them. It deliberately does not, and the reason is outside this crate: the
-    /// latest-state TEXT / FULLTEXT / SPATIAL indexes are in-memory, **not transactional**, and key
-    /// their documents by **physical node id** (`rmp` #467 / #756). An aborted node's posting survives
-    /// its rollback as a harmless, re-check-filterable false positive; handing the id straight back out
-    /// turns the next writer's *insert* into what the index sees as a **replace of a still-committed
-    /// document**, which is the one shape #756 must fail closed on — the freshness marker is poisoned
-    /// and every text/spatial seek in the database degrades to a full scan until a rebuild.
-    /// (Reproduced directly by
-    /// `graphus-cypher/tests/text_index.rs::rmp756_constraint_rejected_insert_keeps_the_text_seek_selective`,
-    /// where two constraint-rejected `CREATE`s in a row recycled one id.)
-    ///
-    /// Parking them until the GC pass keeps the space guarantee — the slots come back, so an
-    /// abort-heavy workload does not grow the store — while moving the recycle to a maintenance
-    /// boundary. When the indexes become version-aware (#992) the parking can go and the abort can free
-    /// the slot directly.
-    pending_orphan_slots: [std::collections::BTreeSet<u64>; STORE_COUNT],
+    /// The GC's pending-work sets (`rmp` #1014). See [`Maintenance`] for why they are one latch,
+    /// and [`with_maintenance`](Self::with_maintenance) for the only way to reach them.
+    maintenance: std::sync::Mutex<Maintenance>,
     /// Whether property dead-link corpses (`rmp` #172) may exist since the last property sweep (`rmp`
     /// #522): set on [`rollback`](Self::rollback) of a transaction that created properties, cleared when
     /// the property sweep runs. Together with a non-empty `pending_tombstones[Prop]` it gates the
     /// property-chain sweep so a workload with no property deletes/aborts skips it entirely.
     pending_prop_corpses: bool,
-    /// Whether an **unreclaimed empty** property cell (`rmp` #967, `D-property-removal`) may exist:
-    /// set by [`empty_prop_cell`](Self::empty_prop_cell), and **re-derived** after every property
-    /// sweep from what that sweep actually saw ([`PropChainSweep::deferred_empty`]) rather than
-    /// cleared unconditionally.
-    ///
-    /// This replaces `pending_tombstones[Prop]` as the property sweep's gate. It has to: after #967 a
-    /// property operation never stamps `xmax`, so that set is never populated again and gating on it
-    /// would have left the sweep permanently off — the property store would grow without bound on any
-    /// workload that removes properties, with every test still green because nothing asserts that a
-    /// sweep *ran*.
-    ///
-    /// The re-derivation restores the one property the retired set had for free: it was reseeded from
-    /// on-disk state by the freeze sweep every pass, so a pass that reclaimed nothing left the gate
-    /// armed. A plain "clear after every sweep" does not, and the resulting stranding is reachable
-    /// with one long-running reader (`rmp` #967 audit): the reader holds the watermark, a `REMOVE`
-    /// commits, the pass defers the cell and disarms the gate, and the cell then survives every
-    /// subsequent pass until an unrelated removal re-arms it or the store reopens.
-    pending_empty_prop_cells: bool,
     /// Forces the first [`gc`](Self::gc) pass after [`open`](Self::open) to run the FULL corpse walk and
     /// property sweep (`rmp` #522), so any pre-existing on-disk corpses / tombstones a fresh process has
     /// no in-memory record of are caught. Cleared after that first pass; thereafter the gated
@@ -1368,13 +1439,6 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// created. Surfaced by [`opened_format_version`](Self::opened_format_version) so a caller can
     /// see that an upgrade happened; the store itself always writes the current version.
     opened_format_version: u32,
-    /// **`rmp` #966.** Entities whose undo chain has grown since the last GC pass and may therefore
-    /// have become reclaimable: `(kind as u8, physical id)`. The GC chain sweep iterates exactly this
-    /// set instead of scanning the record stores, mirroring the `rmp` #522 pending-tombstone design.
-    /// Reseeded by a full scan on the first pass after [`open`](Self::open)
-    /// (`gc_full_scan_pending`), which is what makes a crash-recovered store's chains reclaimable
-    /// without any of this in-memory state surviving.
-    pending_undo_chains: std::collections::BTreeSet<(u8, u64)>,
     /// **`rmp` #1028.** The sharded **chain-head publication latch** (rank 27, see
     /// [`graphus_core::latch::ChainHeadLatchScope`]), keyed by the record that owns the head.
     ///
@@ -1569,7 +1633,12 @@ struct ChainPrepend {
 /// model-checked, and `--cfg loom` is a global rustflag, so it cannot live in a crate that depends on
 /// `graphus-bufpool`. What stays here is the medium — pages, the WAL, the publication latch.
 struct PageChainHead<'a, D: BlockDevice, S: LogSink> {
-    store: &'a mut RecordStore<D, S>,
+    /// `&self` since `rmp` #1014: publishing a chain head is part of the record write path, and that
+    /// path no longer needs exclusive access to the store. The exclusion that makes a publication
+    /// indivisible is the rank-27 latch inside
+    /// [`compare_and_publish_chain_head`](RecordStore::compare_and_publish_chain_head), not the
+    /// borrow checker.
+    store: &'a RecordStore<D, S>,
     plan: ChainPrepend,
     txn: TxnId,
 }
@@ -1682,15 +1751,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // freeze frontier starts at `1` so the first pass fully settles every pre-existing on-disk
             // stamp; `gc_full_scan_pending` forces that first pass to also do the full corpse/property
             // sweep for anything a fresh process has no in-memory record of.
-            freeze_low: std::array::from_fn(|_| AtomicU64::new(1)),
+            freeze_low: std::array::from_fn(|_| FreezeFloor::new(1)),
             // `rmp` #809: the release-active freeze-frontier audit starts each store's rotating window
             // at id 1 (pure in-memory; rebuilt every open, so the on-disk format is unchanged).
             freeze_audit_from: [1; STORE_COUNT],
-            pending_tombstones: Default::default(),
-            pending_corpse_rels: std::collections::BTreeSet::new(),
-            pending_orphan_slots: std::array::from_fn(|_| std::collections::BTreeSet::new()),
+            maintenance: std::sync::Mutex::new(Maintenance::default()),
             pending_prop_corpses: false,
-            pending_empty_prop_cells: false,
             gc_full_scan_pending: true,
             gc_freeze_low_savepoint: None,
             spare_undo_slabs: Vec::new(),
@@ -1699,7 +1765,6 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // `rmp` #966 undo-area state: all in-memory, all rebuilt from scratch every open. The
             // chain sweep's pending set is reseeded by the first pass's full scan
             // (`gc_full_scan_pending`), so a crash-recovered store reclaims its chains normally.
-            pending_undo_chains: std::collections::BTreeSet::new(),
             chain_head_locks: new_chain_head_locks(),
             undo_orphan_slots_possible: false,
             // `rmp` #992: nothing is reported until a derived-index layer declares what it covers.
@@ -1833,15 +1898,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // freeze frontier starts at `1` so the first pass fully settles every pre-existing on-disk
             // stamp; `gc_full_scan_pending` forces that first pass to also do the full corpse/property
             // sweep for anything a fresh process has no in-memory record of.
-            freeze_low: std::array::from_fn(|_| AtomicU64::new(1)),
+            freeze_low: std::array::from_fn(|_| FreezeFloor::new(1)),
             // `rmp` #809: the release-active freeze-frontier audit starts each store's rotating window
             // at id 1 (pure in-memory; rebuilt every open, so the on-disk format is unchanged).
             freeze_audit_from: [1; STORE_COUNT],
-            pending_tombstones: Default::default(),
-            pending_corpse_rels: std::collections::BTreeSet::new(),
-            pending_orphan_slots: std::array::from_fn(|_| std::collections::BTreeSet::new()),
+            maintenance: std::sync::Mutex::new(Maintenance::default()),
             pending_prop_corpses: false,
-            pending_empty_prop_cells: false,
             gc_full_scan_pending: true,
             gc_freeze_low_savepoint: None,
             spare_undo_slabs: Vec::new(),
@@ -1850,7 +1912,6 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // `rmp` #966 undo-area state: all in-memory, all rebuilt from scratch every open. The
             // chain sweep's pending set is reseeded by the first pass's full scan
             // (`gc_full_scan_pending`), so a crash-recovered store reclaims its chains normally.
-            pending_undo_chains: std::collections::BTreeSet::new(),
             chain_head_locks: new_chain_head_locks(),
             undo_orphan_slots_possible: false,
             // `rmp` #992: nothing is reported until a derived-index layer declares what it covers.
@@ -1898,6 +1959,29 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
 
     fn store(&self, kind: StoreKind) -> &FixedStore {
         &self.stores[kind as usize]
+    }
+
+    /// Runs `f` with the GC's pending-work sets held under the **maintenance latch** (`rmp` #1014).
+    ///
+    /// This is the ONLY way to reach [`Maintenance`], and the narrowness is the point: the latch is
+    /// rank 22 and a leaf, so `f` must neither acquire another latch nor perform I/O. A pass that has
+    /// work to do therefore takes a *snapshot* here — `std::mem::take`, `iter().collect()` — and does
+    /// the work after this call returns, with the latch dropped. The scope arms the tripwire
+    /// ([`graphus_core::latch::MaintenanceLatchScope`]) so a future `f` that reaches for the buffer
+    /// pool, the WAL or an allocator fails loudly in a debug build instead of silently convoying every
+    /// writer in the database behind one `fdatasync`.
+    ///
+    /// # Panics
+    /// Panics if the latch is poisoned — a previous holder panicked mid-update, so the sets may name
+    /// work that was half-recorded. Continuing past that would let the next pass skip a tombstone or
+    /// double-free a slot; failing here is the fail-closed direction. (The store is already
+    /// unusable at that point: every other latch in this crate takes the same view.)
+    fn with_maintenance<R>(&self, f: impl FnOnce(&mut Maintenance) -> R) -> R {
+        let _scope = graphus_core::latch::MaintenanceLatchScope::new();
+        let mut guard = self.maintenance.lock().expect(
+            "INVARIANT: the maintenance latch is a leaf and its critical sections cannot panic",
+        );
+        f(&mut guard)
     }
 
     /// # Errors
@@ -2440,6 +2524,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// When `commit` is set, `txn` is begun and committed around the write (standalone catalog
     /// change, `04 §2.6`); otherwise the write joins the caller's open `txn`.
     fn checkpoint_meta(&mut self, txn: TxnId, commit: bool) -> Result<()> {
+        // Heal any store whose mark outruns its mapped pages BEFORE the image is built, so the floor
+        // in `to_meta` is a floor and not a trap (`rmp` #1014, criterion 7).
+        self.map_pages_up_to_high_water(txn)?;
         // The catalog is built (and its `high_water <= capacity` floor checked, `rmp` #1012) BEFORE
         // anything is written or the WAL is touched, so a refused image aborts the checkpoint having
         // changed nothing.
@@ -2509,11 +2596,79 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         Ok(())
     }
 
+    /// Maps every page a store's high-water mark implies but its page map lacks, so the catalog floor
+    /// **heals itself** instead of standing between the operator and their database (`rmp` #1014,
+    /// acceptance criterion 7).
+    ///
+    /// # The trap this removes
+    ///
+    /// [`FixedStore::to_meta`] holds the invariant `high_water <= capacity` — the same predicate
+    /// [`Meta::decode`](crate::meta::Meta::decode) has enforced since `rmp` #452. `rmp` #1012 made it
+    /// refuse to *write* such an image, and `rmp` #1027 softened the refusal to a clamp, which removed
+    /// the denial of service but not the underlying state: a store could sit with its mark above its
+    /// mapped pages indefinitely, its catalog quietly under-reporting the mark on every checkpoint.
+    /// Recovery was left to chance — only a *fresh successful allocation on that same store* maps the
+    /// missing page, so a broken `Node` store is not healed by creating relationships, and reopening
+    /// does not help either (the `observe` in
+    /// [`reconstruct_orphan_store_pages`](Self::reconstruct_orphan_store_pages) runs only for pages
+    /// that exist on the device and are orphaned, which these are not).
+    ///
+    /// # Why mapping is always safe here
+    ///
+    /// No id in `[capacity, high_water)` has ever been written. It cannot have been: an id is written
+    /// only after [`alloc_id`](Self::alloc_id) mapped its page, and a writer that had allocated above
+    /// the capacity would have mapped its page as part of doing so. So the missing pages hold nothing,
+    /// and materialising them is a pure catch-up — it adds zero-filled record pages that the very next
+    /// allocation would have added anyway, and changes not one byte of committed data.
+    ///
+    /// Mapping only the page containing `high_water - 1` is enough, because
+    /// [`ensure_store_page`](Self::ensure_store_page) fills the map up to the index it is given.
+    ///
+    /// # Ordering
+    ///
+    /// Called at the top of [`checkpoint_meta`](Self::checkpoint_meta), before the image is built, so
+    /// the catalog that gets written is the healed one. It is a no-op — six lock-free reads — on every
+    /// store that is already consistent, which after this task's criterion 6 is every store: the
+    /// allocator no longer publishes a bump it has not backed with a page, so this is defence in
+    /// depth against a catalog written by an older build (or by a path not yet routed through
+    /// `alloc_id`), not a routine repair.
+    ///
+    /// # Errors
+    /// Returns a storage error if the missing page cannot be mapped — the genuine "the device will not
+    /// grow" case, which the operator must act on. The message says what to do about it.
+    fn map_pages_up_to_high_water(&self, txn: TxnId) -> Result<()> {
+        for kind in ALL_STORE_KINDS {
+            let store = self.store(kind);
+            let high_water = store.alloc.high_water();
+            // `.max(1)`: a never-used store legitimately carries `high_water == 1` with no pages — the
+            // next id it *will* hand out is not an id it *has* handed out.
+            if high_water <= store.capacity().max(1) {
+                continue;
+            }
+            let (rel_page, _) = paging::record_location(high_water - 1, kind.record_size());
+            self.ensure_store_page(kind, rel_page, txn).map_err(|e| {
+                GraphusError::Storage(format!(
+                    "{kind:?} store: high_water {high_water} exceeds the {} ids its mapped pages can \
+                     address, and the missing store page {rel_page} could not be mapped: {e}. No id \
+                     in that range was ever written (a writer that allocated above the capacity would \
+                     have mapped its page), so mapping it is the whole repair and it is lossless — \
+                     but it needs the device to grow. TO RECOVER: free space on the volume holding \
+                     this database (the page is {PAGE_SIZE} bytes), then retry the operation; the \
+                     next checkpoint maps the page and the store resumes. Until then this store's \
+                     catalog persists the clamped mark and no committed data is at risk (`rmp` \
+                     #1014).",
+                    store.capacity()
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
     // ----------------------------- page writing -----------------------------
 
     /// Maps a store-relative page index to its device `PageId`, growing the store (extending the
     /// device, initialising a record-page header, recording the mapping) as needed, under `txn`.
-    fn ensure_store_page(&mut self, kind: StoreKind, rel_page: u64, txn: TxnId) -> Result<PageId> {
+    fn ensure_store_page(&self, kind: StoreKind, rel_page: u64, txn: TxnId) -> Result<PageId> {
         // `rmp` #1012, rank 25: the caller must have DROPPED the store's allocation latch before
         // getting here. Everything below grows the device, fetches pages, may evict and may harden
         // the log — holding a rank-25 latch across that takes rank 30..60 out of order and convoys
@@ -2521,6 +2676,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         graphus_core::latch::assert_no_alloc_latch_held("RecordStore::ensure_store_page");
         // Ditto for the rank-27 chain-head publication latch (`rmp` #1028). Debug-only.
         graphus_core::latch::assert_no_chain_head_latch_held("RecordStore::ensure_store_page");
+        // And for the rank-22 maintenance latch (`rmp` #1014), which is a leaf: a GC pass that grew
+        // the store while still holding the set it was draining would convoy every writer with a
+        // record to tombstone behind this growth. Debug-only.
+        graphus_core::latch::assert_no_maintenance_latch_held("RecordStore::ensure_store_page");
         let rel_page = rel_page as usize;
         while self.store(kind).device_pages.len() <= rel_page {
             let (f, dev_page) = self.pool.new_page()?;
@@ -2570,7 +2729,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// regardless of the writing transaction's outcome — currently the record-page type/subtype header
     /// stamp (`rmp` #239), since page growth is never undone.
     fn write_region_keep(
-        &mut self,
+        &self,
         page: PageId,
         offset: usize,
         bytes: &[u8],
@@ -2603,13 +2762,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///
     /// The WAL borrow is released before any pool write path runs, so the pool's WAL rule can
     /// re-borrow the shared manager safely (see [`crate::wal_rule`]).
-    fn write_region(
-        &mut self,
-        page: PageId,
-        offset: usize,
-        bytes: &[u8],
-        txn: TxnId,
-    ) -> Result<()> {
+    fn write_region(&self, page: PageId, offset: usize, bytes: &[u8], txn: TxnId) -> Result<()> {
         let end = offset + bytes.len();
         assert!(end <= PAGE_SIZE, "region runs past the page");
         let f = self.pool.fetch(page)?;
@@ -2682,7 +2835,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// this path: `expired_ts` is never written by a property operation after `D-property-removal`,
     /// and a `props.store` record never anchors an undo chain (the `SetProperty` delta anchors on the
     /// **owning** node/relationship). Writing either would build a second, invisible chain family.
-    fn write_prop_cell(&mut self, id: u64, cell: &PropRecord, txn: TxnId) -> Result<()> {
+    fn write_prop_cell(&self, id: u64, cell: &PropRecord, txn: TxnId) -> Result<()> {
         if cell.mvcc.expired_ts != 0 || cell.mvcc.undo_ptr != 0 {
             return Err(GraphusError::Storage(format!(
                 "property cell {id} would be written with expired_ts {} / undo_ptr {}; after `rmp` \
@@ -2720,7 +2873,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         )
     }
 
-    fn write_record(&mut self, kind: StoreKind, id: u64, buf: &[u8], txn: TxnId) -> Result<()> {
+    fn write_record(&self, kind: StoreKind, id: u64, buf: &[u8], txn: TxnId) -> Result<()> {
         let (rel_page, offset) = paging::record_location(id, kind.record_size());
         let dev_page = self.ensure_store_page(kind, rel_page, txn)?;
         self.write_region(dev_page, offset, buf, txn)
@@ -2789,7 +2942,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         }
     }
 
-    fn alloc_id(&mut self, kind: StoreKind, txn: TxnId) -> Result<u64> {
+    fn alloc_id(&self, kind: StoreKind, txn: TxnId) -> Result<u64> {
         // A freed id is reused first: its store page already exists (the record once lived there), so
         // no growth — and no fallibility — is needed. `rmp` #588: SKIP any freed id still shadow-held
         // for an in-flight off-thread reader (the `rmp` #588 shadow-hold overlay) — reusing
@@ -2802,39 +2955,64 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // reused slot starts at `undo_ptr == 0` with nothing to inherit.)
         //
         // `rmp` #1012: pop-or-grow is ONE operation under ONE hold on the store's allocation latch,
-        // which ends on the next line. "The list offered nothing reusable" and "so advance the mark"
-        // are a single decision; split across two holds, another allocator slips between them. The
-        // allocation fails closed at the `u64::MAX` ceiling (`rmp` #452), so we never compute a page
-        // index for an astronomically large id.
-        let allocated = self.store(kind).alloc.allocate()?;
-        let id = match allocated {
-            Allocation::Reused(id) => {
-                self.note_popped_id(txn, kind, id);
-                return Ok(id);
-            }
-            Allocation::Fresh(id) => id,
-        };
-        // Fresh id: the latch is RELEASED before its page is mapped, because growing the store touches
-        // the device, the buffer pool and the WAL (ranks 30..60) and rank 25 is never held across I/O.
-        // A within-page id finds its page already mapped (a cheap no-op); only a page-boundary crossing
-        // actually grows `device_pages` — exactly the growth `write_record` would have done, just up
-        // front.
-        let (rel_page, _) = paging::record_location(id, kind.record_size());
-        if let Err(e) = self.ensure_store_page(kind, rel_page, txn) {
-            // Mapping failed (e.g. ENOSPC growing the device): un-bump the high-water so it never
-            // exceeds the mapped capacity. `id` was never written, so re-handing it out is safe.
-            //
-            // CONDITIONALLY (`rmp` #1012). This was `alloc = PhysicalAllocator::restore(id)` — a
-            // read-then-replace that, with a second writer, drops the mark BELOW an id another writer
-            // is still holding, so the next allocation issues it a second time. `unbump_fresh` is a
-            // compare-exchange: it withdraws only if the mark is still exactly where we left it, and
-            // otherwise declines and burns `id` — the direction that cannot lose data. See
-            // `AllocGuard::unbump_fresh`, and `rmp` #1014 criterion 6 for the cure (map the page
-            // BEFORE publishing the bump, so there is nothing to withdraw).
-            self.store(kind).alloc.lock().unbump_fresh(id);
-            return Err(e);
+        // which ends when `allocate_within` returns. "The list offered nothing reusable" and "so
+        // advance the mark" are a single decision; split across two holds, another allocator slips
+        // between them. The allocation fails closed at the `u64::MAX` ceiling (`rmp` #452), so we never
+        // compute a page index for an astronomically large id.
+        //
+        // `rmp` #1014 (criterion 6): the mark is NEVER advanced past the mapped capacity. The
+        // allocator declines instead — `Allocation::Grow` allocates nothing and leaves the mark
+        // untouched — we map the page with the latch released, and retry. The old shape bumped first
+        // and repaired afterwards with `unbump_fresh`, which is unrepairable under two writers: A takes
+        // `id` and B takes `id + 1`, both fail their mapping, and the second withdrawal is *declined*,
+        // leaving the mark at `id + 2` with pages for neither. That is the inconsistent catalog of VOPR
+        // seed 5043221, whose downstream effect was silent loss of committed data. There is now no
+        // window in which `high_water > capacity`, so there is nothing to undo and nothing for a
+        // concurrent failure to interfere with.
+        //
+        // The loop terminates: every `Grow` is answered by a mapping that strictly extends the page map
+        // past `next`, and the mark only moves forward, so each turn either allocates or adds a page.
+        // The bound is not there to break a live-lock — it cannot happen — but so that a page map which
+        // reports growth it did not perform surfaces as an attributable failure instead of a spinning
+        // thread inside a database.
+        const MAX_GROWTH_TURNS: u32 = 1024;
+        for _ in 0..MAX_GROWTH_TURNS {
+            // Read the capacity WITHOUT the latch. The page map only grows, so a stale value can only
+            // make the allocator decline where it could have allocated — one extra, idempotent mapping
+            // — and never hand out an id whose page is unmapped.
+            let capacity = self.store(kind).capacity();
+            // Bound to a `let` so the guard's temporary dies HERE. Matching on `…lock().allocate…()`
+            // directly would keep the rank-25 guard alive for the whole `match`, and the `Grow` arm
+            // grows the store — the tripwire in `ensure_store_page` catches it, which is what it is
+            // for, but the shape is worth naming so it is not reintroduced.
+            let allocated = self.store(kind).alloc.lock().allocate_within(capacity)?;
+            let id = match allocated {
+                Allocation::Reused(id) => {
+                    self.note_popped_id(txn, kind, id);
+                    return Ok(id);
+                }
+                Allocation::Fresh(id) => id,
+                Allocation::Grow { next } => {
+                    // Nothing was allocated. Map `next`'s page with the latch released — growing the
+                    // store touches the device, the buffer pool and the WAL (ranks 30..60), and rank 25
+                    // is never held across I/O — then try again. A failure here leaves the allocator
+                    // exactly as it found it.
+                    let (rel_page, _) = paging::record_location(next, kind.record_size());
+                    self.ensure_store_page(kind, rel_page, txn)?;
+                    continue;
+                }
+            };
+            debug_assert!(
+                id < self.store(kind).capacity(),
+                "a fresh id must never be handed out beyond the mapped capacity (`rmp` #1014)"
+            );
+            return Ok(id);
         }
-        Ok(id)
+        Err(GraphusError::Storage(format!(
+            "{kind:?} store: {MAX_GROWTH_TURNS} consecutive allocation attempts were all answered by \
+             page growth without the mapped capacity advancing past the next fresh id. The store's \
+             page map is reporting growth it did not perform (`rmp` #1014)."
+        )))
     }
 
     // The read-decode methods below delegate to the single authoritative impl in
@@ -2859,25 +3037,25 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         read_view::read_block(&self.pool, &self.stores, id)
     }
 
-    fn write_block(&mut self, id: u64, rec: &HeapBlock, txn: TxnId) -> Result<()> {
+    fn write_block(&self, id: u64, rec: &HeapBlock, txn: TxnId) -> Result<()> {
         let mut buf = [0u8; STRINGS_RECORD_SIZE];
         rec.encode(&mut buf);
         self.write_record(StoreKind::Strings, id, &buf, txn)
     }
 
-    fn write_node(&mut self, id: u64, rec: &NodeRecord, txn: TxnId) -> Result<()> {
+    fn write_node(&self, id: u64, rec: &NodeRecord, txn: TxnId) -> Result<()> {
         let mut buf = [0u8; NODE_RECORD_SIZE];
         rec.encode(&mut buf);
         self.write_record(StoreKind::Node, id, &buf, txn)
     }
 
-    fn write_rel(&mut self, id: u64, rec: &RelRecord, txn: TxnId) -> Result<()> {
+    fn write_rel(&self, id: u64, rec: &RelRecord, txn: TxnId) -> Result<()> {
         let mut buf = [0u8; REL_RECORD_SIZE];
         rec.encode(&mut buf);
         self.write_record(StoreKind::Rel, id, &buf, txn)
     }
 
-    fn write_prop(&mut self, id: u64, rec: &PropRecord, txn: TxnId) -> Result<()> {
+    fn write_prop(&self, id: u64, rec: &PropRecord, txn: TxnId) -> Result<()> {
         let mut buf = [0u8; PROP_RECORD_SIZE];
         rec.encode(&mut buf);
         self.write_record(StoreKind::Prop, id, &buf, txn)
@@ -3769,7 +3947,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// update under `txn`. Used to stamp a tombstone (`xmax`) and to settle in-flight stamps at
     /// commit — both touch only the header word, never the record body.
     fn patch_header_word(
-        &mut self,
+        &self,
         kind: StoreKind,
         id: u64,
         field_off: usize,
@@ -3799,7 +3977,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// [`patch_header_word`](Self::patch_header_word): it runs only inside a GC pass that holds the
     /// store exclusively (no interleaving mutator), so its undo can never race a concurrent writer.
     fn patch_header_word_cas(
-        &mut self,
+        &self,
         kind: StoreKind,
         id: u64,
         field_off: usize,
@@ -3867,7 +4045,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// (`rmp` #970) — see the section note above. Touches exactly
     /// `[field_off, field_off + bytes.len())` and never the MVCC header.
     fn write_field_redo_only(
-        &mut self,
+        &self,
         kind: StoreKind,
         id: u64,
         field_off: usize,
@@ -3977,7 +4155,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// # Errors
     /// Returns a storage error if the record's page cannot be mapped or fetched.
     fn compare_and_publish_chain_head(
-        &mut self,
+        &self,
         kind: StoreKind,
         id: u64,
         field_off: usize,
@@ -4104,7 +4282,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// [`GraphusError::Transaction`]), or the publication is refused
     /// [`graphus_chainhead::MAX_ATTEMPTS`] times.
     fn prepend_chain_head(
-        &mut self,
+        &self,
         plan: ChainPrepend,
         observed: u64,
         entry: u64,
@@ -4394,7 +4572,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         });
         // The chain just grew, so it becomes a candidate for the GC chain sweep (`rmp` #522's
         // pending-set design, applied to chains): the sweep iterates this set instead of scanning.
-        self.pending_undo_chains.insert((kind as u8, entity));
+        self.with_maintenance(|m| m.pending_undo_chains.insert((kind as u8, entity)));
         Ok(id)
     }
 
@@ -5302,7 +5480,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 delta: delta_id,
             });
         });
-        self.pending_undo_chains.insert((kind as u8, id));
+        self.with_maintenance(|m| m.pending_undo_chains.insert((kind as u8, id)));
         Ok(delta_id)
     }
 
@@ -5375,7 +5553,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                     }
                     // The entity still has a chain, so at least one delta on it survived this abort —
                     // it belongs to another writer, or it is one of ours that a later prepend pinned.
-                    self.pending_undo_chains.insert((kind as u8, entity));
+                    self.with_maintenance(|m| m.pending_undo_chains.insert((kind as u8, entity)));
                     still_threaded.extend(chain.iter().map(|&(id, _)| id));
                 }
                 // Cannot prove the chain no longer reaches our deltas ⇒ free none of this entity's
@@ -5460,13 +5638,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         } else {
             None
         };
-        let candidates: Vec<(u8, u64)> = self.pending_undo_chains.iter().copied().collect();
+        let candidates: Vec<(u8, u64)> =
+            self.with_maintenance(|m| m.pending_undo_chains.iter().copied().collect());
         let mut freed = 0usize;
         for (kind_byte, entity) in candidates {
             let kind = ALL_STORE_KINDS[kind_byte as usize];
             let chain = self.undo_chain(kind, entity)?;
             if chain.is_empty() {
-                self.pending_undo_chains.remove(&(kind_byte, entity));
+                self.with_maintenance(|m| m.pending_undo_chains.remove(&(kind_byte, entity)));
                 continue;
             }
             let mut all_dead = true;
@@ -5534,7 +5713,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             for id in 1..hw {
                 let head = self.read_mvcc(kind, id)?.undo_ptr;
                 if head != NULL_ID {
-                    self.pending_undo_chains.insert((kind as u8, id));
+                    self.with_maintenance(|m| m.pending_undo_chains.insert((kind as u8, id)));
                     heads.insert(head);
                 }
             }
@@ -5757,7 +5936,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// stale (unlike the chain-head field, which IS concurrently shared — hence
     /// `compare_and_publish_chain_head`).
     fn write_record_header_undo(
-        &mut self,
+        &self,
         kind: StoreKind,
         id: u64,
         buf: &[u8],
@@ -5791,7 +5970,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
 
     /// First write of a freshly-created relationship record, with the header-only creation undo
     /// (`rmp` #220). See [`write_record_header_undo`](Self::write_record_header_undo).
-    fn write_rel_create(&mut self, id: u64, rec: &RelRecord, txn: TxnId) -> Result<()> {
+    fn write_rel_create(&self, id: u64, rec: &RelRecord, txn: TxnId) -> Result<()> {
         let mut buf = [0u8; REL_RECORD_SIZE];
         rec.encode(&mut buf);
         self.write_record_header_undo(StoreKind::Rel, id, &buf, txn)
@@ -5799,7 +5978,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
 
     /// First write of a freshly-created property record, with the header-only creation undo
     /// (`rmp` #172). See [`write_record_header_undo`](Self::write_record_header_undo).
-    fn write_prop_create(&mut self, id: u64, rec: &PropRecord, txn: TxnId) -> Result<()> {
+    fn write_prop_create(&self, id: u64, rec: &PropRecord, txn: TxnId) -> Result<()> {
         let mut buf = [0u8; PROP_RECORD_SIZE];
         rec.encode(&mut buf);
         self.write_record_header_undo(StoreKind::Prop, id, &buf, txn)
@@ -5807,7 +5986,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
 
     /// Records that `txn` version-stamped (created) record `id` in `kind`'s store, so `commit` can
     /// settle its `xmin`. A no-op for the reserved system transaction, which never creates records.
-    fn note_created(&mut self, txn: TxnId, kind: StoreKind, id: u64) {
+    fn note_created(&self, txn: TxnId, kind: StoreKind, id: u64) {
         // `rmp` #522: a fresh `xmin = in_flight(txn)` stamp at `id` needs freezing once `txn` commits.
         // Lower the freeze frontier so the next freeze sweep re-visits `id` (a no-op for the common case
         // where `id >= freeze_low[kind]` — a fresh append above the frontier — but load-bearing when a
@@ -5827,7 +6006,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// above it). See [`freeze_low`](Self::freeze_low).
     #[cfg(test)]
     pub(crate) fn freeze_frontier(&self, kind: StoreKind) -> u64 {
-        self.freeze_low[kind as usize].load(Ordering::Acquire)
+        self.freeze_low[kind as usize].get()
     }
 
     /// Lowers the `rmp` #522 freeze frontier for `kind` to cover `id`. Takes `&self` since `rmp` #1014.
@@ -5837,19 +6016,24 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     }
 
     fn lower_freeze_low(&self, kind: StoreKind, id: u64) {
-        // `fetch_min`, not read-compare-write: see the field's documentation for the lost update the
-        // latter admits and the `rmp` #522 stamp it strands.
-        self.freeze_low[kind as usize].fetch_min(id, Ordering::AcqRel);
+        // `descend` is `fetch_min`, not read-compare-write: see the field's documentation for the lost
+        // update the latter admits and the `rmp` #522 stamp it strands.
+        //
+        // Called AFTER the stamp at `id` has been written, which is `descend`'s documented obligation
+        // on its caller: a sweep that observes the lowered frontier and scans `id` must find the stamp
+        // there. Both call sites — `note_created` and `note_expired` — are reached from the write path
+        // once the header word is already in the page.
+        self.freeze_low[kind as usize].descend(id);
     }
 
     /// Records that `txn` tombstoned (expired) record `id` in `kind`'s store, so `commit` can settle
     /// its `xmax`.
-    fn note_expired(&mut self, txn: TxnId, kind: StoreKind, id: u64) {
+    fn note_expired(&self, txn: TxnId, kind: StoreKind, id: u64) {
         // `rmp` #522: a fresh `xmax = in_flight(txn)` stamp both needs freezing (lower the frontier) and
         // makes `id` a reclaim candidate once the tombstone commits at or below the GC watermark. The
         // reclaim sweep iterates this set instead of scanning the whole store.
         self.lower_freeze_low(kind, id);
-        self.pending_tombstones[kind as usize].insert(id);
+        self.with_maintenance(|m| m.pending_tombstones[kind as usize].insert(id));
         if txn != SYSTEM_TXN {
             self.active.with_entry(txn, |a| a.expired.push((kind, id)));
         }
@@ -6196,10 +6380,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // strand those now-un-frozen stamps below it. Cleared at this pass's commit. No other transaction
         // runs between here and this pass's commit/rollback (the single engine thread holds the store), so
         // the savepoint's frontier is exactly the pre-freeze value.
-        self.gc_freeze_low_savepoint = Some((
-            txn,
-            std::array::from_fn(|i| self.freeze_low[i].load(Ordering::Acquire)),
-        ));
+        self.gc_freeze_low_savepoint =
+            Some((txn, std::array::from_fn(|i| self.freeze_low[i].get())));
 
         // `rmp` #563: heartbeat the drain-progress beacon across every phase of this GC pass so a
         // `STOP DATABASE` that races it sees a *progressing* engine and waits rather than force-detaching.
@@ -6229,11 +6411,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // corpse walk runs ONLY when a rolled-back creation may have left one (`pending_corpse_rels`
             // non-empty) or on the first post-open pass — a no-abort workload skips it entirely. The splice
             // is walk-driven (re-derives each corpse's true chain position), so it never severs a live chain.
-            if self.gc_full_scan_pending || !self.pending_corpse_rels.is_empty() {
+            if self.gc_full_scan_pending
+                || !self.with_maintenance(|m| m.pending_corpse_rels.is_empty())
+            {
                 self.bump_drain_progress();
                 sched::yield_at(YieldSite::GcPhaseB, ResourceId::txn(txn.0));
                 reclaimed += self.gc_splice_corpses(txn)?;
-                self.pending_corpse_rels.clear();
+                self.with_maintenance(|m| m.pending_corpse_rels.clear());
             }
 
             // ---- Phase C: reclaim reclaimable NODE tombstones (pending-set driven). ----
@@ -6278,7 +6462,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // removals or aborts skips it. A reclaimed owner's whole chain was already freed by its
             // reclamation, so re-checking liveness here reclaims each once.
             if self.gc_full_scan_pending
-                || self.pending_empty_prop_cells
+                || self.with_maintenance(|m| m.pending_empty_prop_cells)
                 || self.pending_prop_corpses
             {
                 // The `rmp` #811 severance window: this sweep reclaims a tombstone sitting on a
@@ -6297,7 +6481,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 // reopened). This is the on-disk-derived, self-healing signal the retired
                 // `pending_tombstones[Prop]` gate had, recovered without its per-id bookkeeping.
                 self.pending_prop_corpses = false;
-                self.pending_empty_prop_cells = sweep.deferred_empty > 0;
+                self.with_maintenance(|m| m.pending_empty_prop_cells = sweep.deferred_empty > 0);
                 self.prune_settled_tombstones(StoreKind::Prop)?;
             }
         }
@@ -6642,7 +6826,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         txn: TxnId,
         kind: StoreKind,
     ) -> Result<(usize, u64)> {
-        let from = self.freeze_low[kind as usize].load(Ordering::Acquire);
+        let from = self.freeze_low[kind as usize].get();
         let high_water = self.store(kind).alloc.high_water();
         let scanned = high_water.saturating_sub(from.max(1));
         let in_use = read_view::scan_in_use_mvcc_from(&self.pool, &self.stores, kind, from)?;
@@ -6661,7 +6845,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             }
             // A tombstone (in-use, `xmax` set) is a reclaim candidate — seed the reclaim set (idempotent).
             if mvcc.expired_ts != 0 {
-                self.pending_tombstones[kind as usize].insert(id);
+                self.with_maintenance(|m| m.pending_tombstones[kind as usize].insert(id));
             }
             // Still bearing an in-flight-writer stamp (a committed writer's stamp was just frozen above,
             // so it no longer counts)? Then it must stay covered by the frontier for a later pass.
@@ -6674,12 +6858,29 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 self.bump_drain_progress();
             }
         }
-        // The sweep ADVANCES the frontier, which `fetch_min` cannot express (it only lowers). A plain
-        // store is right here and not a lost update in waiting: `new_low` was computed from a scan of
-        // `[from, high_water)` under this pass's hold, and any concurrent `lower_freeze_low` naming an
-        // id below it re-lowers the frontier afterwards by `fetch_min`. The order of the two is
-        // immaterial — a frontier that ends lower than necessary costs a re-scan, never a missed stamp.
-        self.freeze_low[kind as usize].store(new_low, Ordering::Release);
+        // The sweep ADVANCES the frontier, which `fetch_min` cannot express (it only lowers) — so it is
+        // a COMPARE-EXCHANGE against the value the scan started from, never a plain store (`rmp` #1014).
+        //
+        // A plain store here is a lost update in exactly the shape this task exists to remove, and the
+        // claim that it is not — "any concurrent descent re-lowers the frontier afterwards, so the
+        // order is immaterial" — is false in one of the two orders. Take the frontier at 1000, and a
+        // writer reusing freed id 100 (`note_created`'s documented "load-bearing" case, since a reused
+        // id can land anywhere in the space):
+        //
+        //     sweep:  from = 1000; scans [1000, high_water); computes new_low = 1500
+        //     writer: lower_freeze_low(100)          -> frontier = 100
+        //     sweep:  store(1500)                    -> frontier = 1500, the descent is GONE
+        //
+        // Record 100 was never scanned — the scan started at 1000 — and is now below the frontier for
+        // ever, so no future sweep will visit it and its committed writer's stamp stays in-flight
+        // permanently. That is the `rmp` #522 silent-data-loss shape, not a re-scan.
+        //
+        // The compare-exchange makes the raise conditional on nothing having moved the frontier since
+        // the scan read it. Only descents can have moved it (GC is a single actor — see
+        // `gc_freeze_low_savepoint` — so no second sweep raises it), and a descent is precisely the
+        // event that invalidates this raise. Declining therefore keeps the lower value, which costs one
+        // wider scan next pass and cannot strand a stamp. That is the fail-closed direction.
+        let _ = self.freeze_low[kind as usize].try_raise(from, new_low);
         Ok((frozen, scanned))
     }
 
@@ -6730,17 +6931,19 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 .map(|(id, _)| id)
                 .collect()
         } else {
-            self.pending_tombstones[kind as usize]
-                .iter()
-                .copied()
-                .collect()
+            self.with_maintenance(|m| {
+                m.pending_tombstones[kind as usize]
+                    .iter()
+                    .copied()
+                    .collect()
+            })
         };
         let mut reclaimed = 0usize;
         for (i, id) in candidates.into_iter().enumerate() {
             let mvcc = self.read_mvcc(kind, id)?;
             // Not (any longer) an in-use tombstone: drop the stale entry.
             if !(mvcc.in_use() && mvcc.expired_ts != 0) {
-                self.pending_tombstones[kind as usize].remove(&id);
+                self.with_maintenance(|m| m.pending_tombstones[kind as usize].remove(&id));
                 continue;
             }
             let reclaimable = Self::is_reclaimable(
@@ -6760,12 +6963,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                     // carry no visibility of their own and are freed with whatever owns them.
                     StoreKind::Prop | StoreKind::Strings | StoreKind::Undo | StoreKind::Commit => {}
                 }
-                self.pending_tombstones[kind as usize].remove(&id);
+                self.with_maintenance(|m| m.pending_tombstones[kind as usize].remove(&id));
                 reclaimed += 1;
             } else {
                 // Still a tombstone but not yet reclaimable (watermark hasn't passed, or a live node
                 // still references it): keep it pending. `insert` seeds it on the full-scan path.
-                self.pending_tombstones[kind as usize].insert(id);
+                self.with_maintenance(|m| m.pending_tombstones[kind as usize].insert(id));
             }
             if i % 4096 == 0 {
                 self.bump_drain_progress();
@@ -6816,14 +7019,16 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// longer an in-use tombstone (`rmp` #522) — reclaimed (by the property sweep) or reverted to live
     /// by an abort. Keeps the pending set bounded to the still-pending tombstones.
     fn prune_settled_tombstones(&mut self, kind: StoreKind) -> Result<()> {
-        let ids: Vec<u64> = self.pending_tombstones[kind as usize]
-            .iter()
-            .copied()
-            .collect();
+        let ids: Vec<u64> = self.with_maintenance(|m| {
+            m.pending_tombstones[kind as usize]
+                .iter()
+                .copied()
+                .collect()
+        });
         for id in ids {
             let mvcc = self.read_mvcc(kind, id)?;
             if !(mvcc.in_use() && mvcc.expired_ts != 0) {
-                self.pending_tombstones[kind as usize].remove(&id);
+                self.with_maintenance(|m| m.pending_tombstones[kind as usize].remove(&id));
             }
         }
         Ok(())
@@ -7160,7 +7365,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // The slot is unreachable — this rollback is what unlinked it — but it is **parked**, not
         // freed, so the next allocation does not recycle a physical id the in-memory latest-state
         // indexes still hold a document for. See `pending_orphan_slots`. The GC pass returns it.
-        self.pending_orphan_slots[kind as usize].insert(entity);
+        self.with_maintenance(|m| m.pending_orphan_slots[kind as usize].insert(entity));
         Ok(())
     }
 
@@ -7271,7 +7476,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     fn gc_reclaim_orphan_slots(&mut self, txn: TxnId) -> Result<usize> {
         let mut reclaimed = 0usize;
         for kind in [StoreKind::Node, StoreKind::Rel] {
-            let ids: Vec<u64> = std::mem::take(&mut self.pending_orphan_slots[kind as usize])
+            let ids: Vec<u64> = self
+                .with_maintenance(|m| std::mem::take(&mut m.pending_orphan_slots[kind as usize]))
                 .into_iter()
                 .collect();
             for id in ids {
@@ -7659,8 +7865,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         if let Some((sp_txn, saved)) = self.gc_freeze_low_savepoint
             && sp_txn == txn
         {
+            // A DESCENT, not a store (`rmp` #1014). The saved value is the frontier as it stood before
+            // this pass's sweep raised it, so restoring it can only ever lower the frontier — which is
+            // exactly what `fetch_min` expresses. A plain store would additionally *raise* it over any
+            // descent a concurrent writer landed while the pass ran, discarding that writer's claim on
+            // a range this rollback knows nothing about and stranding its stamp below the frontier for
+            // ever: the same `rmp` #522 loss the sweep's own raise had to be made conditional to avoid.
             for (slot, v) in self.freeze_low.iter().zip(saved) {
-                slot.store(v, Ordering::Release);
+                slot.descend(v);
             }
             self.gc_freeze_low_savepoint = None;
         }
@@ -7780,7 +7992,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         for (kind, id) in aborted_created {
             match kind {
                 StoreKind::Rel => {
-                    self.pending_corpse_rels.insert(id);
+                    self.with_maintenance(|m| m.pending_corpse_rels.insert(id));
                 }
                 StoreKind::Prop => self.pending_prop_corpses = true,
                 _ => {}
@@ -10021,7 +10233,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         empty.value_inline = NULL_ID;
         self.write_prop_cell(pid, &empty, txn)?;
         // An empty cell is what GC's property sweep now reclaims, so gate the sweep on one existing.
-        self.pending_empty_prop_cells = true;
+        self.with_maintenance(|m| m.pending_empty_prop_cells = true);
         Ok(())
     }
 
@@ -13977,7 +14189,7 @@ mod tests {
         // Force a FULL-scan GC pass at the SAME watermark: reset the freeze frontier and the full-scan
         // flag (the child test module reaches the private incremental-GC state directly).
         for slot in &s.freeze_low {
-            slot.store(1, Ordering::Release);
+            slot.reset(1);
         }
         s.gc_full_scan_pending = true;
         let wm = s.snapshot_ts();
@@ -14058,13 +14270,13 @@ mod tests {
 
         // Model the #522 stranding: raise the freeze frontier PAST the node, so the (frontier-bounded)
         // incremental freeze sweep would skip it, leaving the committed stamp unfrozen forever.
-        s.freeze_low[StoreKind::Node as usize].store(nid + 1, Ordering::Release);
+        s.freeze_low[StoreKind::Node as usize].reset(nid + 1);
         // Prove the frontier-bounded sweep really does MISS it (it scans only `[freeze_low, high_water)`).
         let (missed, _) = read_view::scan_in_use_mvcc_from(
             &s.pool,
             &s.stores,
             StoreKind::Node,
-            s.freeze_low[0].load(Ordering::Acquire),
+            s.freeze_low[0].get(),
         )
         .map(|v| (v.iter().any(|&(id, _)| id == nid), v))
         .unwrap();
@@ -14092,7 +14304,7 @@ mod tests {
 
         // Now settle the stamp properly (a real full freeze) and re-audit: it must go SILENT. Reset the
         // frontier so the sweep actually visits the node, then freeze under a fresh GC-style txn.
-        s.freeze_low[StoreKind::Node as usize].store(1, Ordering::Release);
+        s.freeze_low[StoreKind::Node as usize].reset(1);
         let g = TxnId(2);
         s.begin(g);
         let (frozen, _) = s
@@ -14143,7 +14355,7 @@ mod tests {
         s.begin(t);
         let (nid2, _) = s.create_node(t).unwrap();
         s.commit(t).unwrap();
-        s.freeze_low[StoreKind::Node as usize].store(nid2 + 1, Ordering::Release);
+        s.freeze_low[StoreKind::Node as usize].reset(nid2 + 1);
         // Aim the audit window at the node store so this pass definitely covers the stranded id.
         s.freeze_audit_from = [1; STORE_COUNT];
 
@@ -14814,20 +15026,30 @@ mod tests {
     /// **clamp**, because refusing fails the wrong transaction: `alloc_id` publishes the bump before
     /// mapping the page, so a checkpoint landing in that window aborts some *other* transaction's
     /// commit over an allocation it has nothing to do with — and with `N` writers a declined un-bump
-    /// leaves the state standing, failing every writing commit from then on. What is asserted here is
-    /// therefore both halves: the image is written, and it is written **consistent**.
+    /// leaves the state standing, failing every writing commit from then on.
     ///
-    /// With one writer the state is unreachable (`alloc_id` maps the page before returning the id and
-    /// un-bumps if it cannot), so it is installed directly, exactly as the ceiling test above installs
+    /// **`rmp` #1014 (criterion 7) makes the repair lossless.** A clamp keeps the image consistent by
+    /// lowering the mark, which is consistency bought by *forgetting ids*; and it is not self-healing —
+    /// once the state exists, every checkpoint of that store clamps again, and the operator has no way
+    /// to know what to do about it. So `checkpoint_meta` now heals first: no id in
+    /// `[capacity, high_water)` was ever written (a writer that allocated above the capacity would have
+    /// mapped its page), so **mapping the missing page is the whole repair, and it loses nothing**.
+    /// The mark is then persisted untouched, and the invariant holds because the *capacity* rose to
+    /// meet it rather than the mark falling to meet the capacity. The clamp survives underneath as a
+    /// floor for the one case healing cannot fix — a device that will not grow — and is asserted
+    /// directly in [`the floor test`](to_meta_still_clamps_when_the_page_could_not_be_mapped_1027).
+    ///
+    /// With one writer the state is unreachable (`alloc_id` maps the page before it publishes the bump
+    /// since criterion 6), so it is installed directly, exactly as the ceiling test above installs
     /// `u64::MAX`.
     #[test]
-    fn a_checkpoint_clamps_a_catalog_whose_high_water_outruns_its_mapped_pages_1027() {
+    fn a_checkpoint_heals_a_catalog_whose_high_water_outruns_its_mapped_pages_1014() {
         /// Runs one committing transaction with the Node store's mark forced to `mark`, and returns
         /// what the commit did. Everything but `mark` is identical between the two calls below, so the
         /// difference in outcome can only be the invariant.
         fn commit_with_node_high_water(
             mark_from_capacity: impl Fn(u64) -> u64,
-        ) -> (Result<()>, u64, u64) {
+        ) -> (Result<()>, u64, u64, u64) {
             let mut s = fresh();
             let t0 = TxnId(1);
             s.begin(t0);
@@ -14856,37 +15078,69 @@ mod tests {
                 .restore(mark_from_capacity(capacity), free);
             let outcome = s.commit(t1);
             // What actually reached the device, read back so the assertions below are about the
-            // persisted image and not about memory.
-            let persisted = Store::read_meta(&s.pool)
-                .map(|(m, _)| m.stores[StoreKind::Node as usize].high_water)
-                .unwrap_or(0);
-            (outcome, capacity, persisted)
+            // persisted image and not about memory. The persisted CAPACITY comes back too: the repair
+            // works by raising it, so an assertion that only looked at the mark could not tell healing
+            // apart from clamping.
+            let (persisted, persisted_capacity) = Store::read_meta(&s.pool)
+                .map(|(m, _)| {
+                    let store_meta = &m.stores[StoreKind::Node as usize];
+                    (
+                        store_meta.high_water,
+                        paging::capacity(
+                            store_meta.device_pages.len() as u64,
+                            StoreKind::Node.record_size(),
+                        ),
+                    )
+                })
+                .unwrap_or((0, 0));
+            (outcome, capacity, persisted, persisted_capacity)
         }
 
         // One id past the last addressable slot: the commit SUCCEEDS (it is another transaction's
         // allocation window, not this transaction's fault)...
-        let (outcome, capacity, persisted) = commit_with_node_high_water(|capacity| capacity + 1);
+        let (outcome, capacity, persisted, persisted_capacity) =
+            commit_with_node_high_water(|capacity| capacity + 1);
         outcome.expect(
             "a checkpoint landing inside another writer's bump window must not fail this \
              transaction's commit (`rmp` #1027)",
         );
-        // ...and what it wrote is consistent, which is the half that keeps `rmp` #479 closed.
+        // ...what it wrote is consistent, which is the half that keeps `rmp` #479 closed: an image with
+        // `high_water > capacity` is one this build's own decoder rejects on reopen (`rmp` #452), so
+        // the store would be unrecoverable.
+        assert!(
+            persisted <= persisted_capacity,
+            "the persisted image must satisfy the decoder's own invariant: high_water {persisted} \
+             must not exceed the {persisted_capacity} ids its persisted pages can address"
+        );
+        // ...and it got there by RAISING the capacity, not by lowering the mark. This is the half
+        // `rmp` #1014 criterion 7 adds: the repair is lossless, so the id survives the checkpoint.
         assert_eq!(
-            persisted, capacity,
-            "the persisted mark must be clamped to the mapped capacity, never the raw mark: an \
-             image with high_water > capacity is one this build's own decoder rejects on reopen \
-             (`rmp` #452), so the store would be unrecoverable"
+            persisted,
+            capacity + 1,
+            "the mark must be persisted untouched: healing maps the missing page, and an id that was \
+             clamped away here is an id a later `observe` cannot restore (`rmp` #1014)"
+        );
+        assert!(
+            persisted_capacity > capacity,
+            "the missing store page must have been mapped — capacity {persisted_capacity} should \
+             have grown past the {capacity} the store had before the checkpoint"
         );
 
         // Exactly AT capacity is the boundary and is legal — the last addressable slot is
         // `capacity - 1`, and `high_water` is one past the largest id. The identical commit goes
-        // through and is NOT clamped, which is what says the clamp binds on the inconsistency itself
-        // and not on the path around it (an off-by-one would silently shrink every full page).
-        let (outcome, capacity, persisted) = commit_with_node_high_water(|capacity| capacity);
+        // through untouched and grows NOTHING, which is what says the repair binds on the
+        // inconsistency itself and not on the path around it (an off-by-one would map a spurious page
+        // for every store whose last page is exactly full).
+        let (outcome, capacity, persisted, persisted_capacity) =
+            commit_with_node_high_water(|capacity| capacity);
         outcome.expect("a catalog exactly at capacity is consistent and must checkpoint normally");
         assert_eq!(
             persisted, capacity,
             "a mark exactly at capacity is already consistent and must be persisted untouched"
+        );
+        assert_eq!(
+            persisted_capacity, capacity,
+            "a consistent catalog must not grow the store: nothing needed repairing"
         );
     }
 
@@ -14916,6 +15170,34 @@ mod tests {
             .to_meta()
             .expect("a never-used store is consistent");
         assert_eq!(meta.high_water, 1);
+    }
+
+    /// **The floor beneath the repair** (`rmp` #1027, kept by `rmp` #1014 criterion 7).
+    ///
+    /// `checkpoint_meta` now heals this state before `to_meta` ever sees it, by mapping the missing
+    /// page — so the production path no longer reaches the clamp, and the commit-path test above
+    /// asserts healing rather than clamping. The clamp stays because healing needs the device to
+    /// **grow**, and a device that will not grow (a full volume) is precisely when a checkpoint must
+    /// still write a *consistent* image instead of an unrecoverable one. Asserted directly on
+    /// `to_meta`, which is now the only way to reach it: a floor no test can reach is a floor that
+    /// rots.
+    #[test]
+    fn to_meta_still_clamps_when_the_page_could_not_be_mapped_1027() {
+        let s = FixedStore::empty(StoreKind::Node, Arc::default());
+        s.device_pages.push(PageId(7)).expect("one mapped page");
+        let capacity = paging::capacity(1, StoreKind::Node.record_size());
+        // A mark past that page's last slot: the state healing repairs, here reached with healing
+        // unavailable.
+        s.alloc.lock().restore(capacity + 3, FreeList::new());
+        let meta = s
+            .to_meta()
+            .expect("the floor writes a consistent image, it does not refuse");
+        assert_eq!(
+            meta.high_water, capacity,
+            "with the missing page unmappable the image must be clamped to what the mapped pages \
+             address, never the raw mark: `Meta::decode` rejects the latter on reopen (`rmp` #452), \
+             leaving the store unopenable"
+        );
     }
 
     /// `rmp` #821 (deterministic RED→GREEN for the property-chain `rmp` #811 severance): a reclaimable
@@ -15422,7 +15704,7 @@ mod tests {
 
         for _ in 0..ROUNDS {
             // Re-arm above both proposals. Written directly: `lower_freeze_frontier` only descends.
-            s.freeze_low[StoreKind::Node as usize].store(HIGH, Ordering::Release);
+            s.freeze_low[StoreKind::Node as usize].reset(HIGH);
             gate.wait();
             s.lower_freeze_frontier(StoreKind::Node, 1);
             // Both proposals are in; the frontier must be the smaller of them. Anything else is a

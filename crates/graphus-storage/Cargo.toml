@@ -62,6 +62,11 @@ graphus-bufpool = { path = "../graphus-bufpool" }
 # The prepend publication protocol shared by every chain head (`rmp` #1028). A leaf crate, so it can
 # be model-checked under the global `--cfg loom` rustflag; see its `Cargo.toml`.
 graphus-chainhead = { path = "../graphus-chainhead" }
+# The freeze frontier's algebra — descend by `fetch_min`, raise by compare-exchange, and nothing else
+# (`rmp` #1014). A leaf crate for the same reason as its siblings: so the three operations can be
+# model-checked under the global `--cfg loom` rustflag. The field in `FixedStores` IS this type, so the
+# model checks the production cell rather than a copy of it.
+graphus-freezefloor = { path = "../graphus-freezefloor" }
 # The live, append-only, lock-free device-page map every fixed-record store's location oracle is built
 # on (`rmp` #721). A LEAF crate (graphus-core only), which is what lets it be `loom` model-checked in
 # isolation — see its Cargo.toml. Acyclic: it never depends on storage.
