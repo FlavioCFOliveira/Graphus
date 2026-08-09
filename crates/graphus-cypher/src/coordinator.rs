@@ -1456,6 +1456,115 @@ const _: () = {
     let _ = assert_read_task_inputs;
 };
 
+/// **The index-build queues, behind one latch** (`rmp` #1033, layer 7b of #975).
+///
+/// Eight collections that are one piece of state, because a build is *moved* between them: off
+/// `pending` into `poisoned` when the store cannot be scanned, out of `poisoned` back into `pending`
+/// once it reads cleanly, into `conflicted` when a concurrent writer wins the declaration. Each of
+/// those is a move, so a reader that caught two collections at different instants would see one build
+/// in both queues or in neither — and `has_pending_index_builds()`, which the engine polls to decide
+/// whether it still has work to drive, would answer from a state that never existed.
+///
+/// One latch, because this is **index-build cadence**: a declaration enqueues, and the engine drains a
+/// bounded slice per tick. Nothing here is on the row path.
+// No `Debug`: the build structs carry index snapshots, and a derived `Debug` on those would render
+// whole trees. `Default` only.
+#[derive(Default)]
+struct IndexBuilds {
+    /// Queue of in-progress **non-blocking** index builds (`rmp` task #91), advanced in bounded
+    /// chunks by [`advance_index_builds`](TxnCoordinator::advance_index_builds) between engine commands. The
+    /// front build is the one currently being populated; each completes (durably promoted to
+    /// [`IndexState::Online`]) before the next starts, so the queue is processed in declaration order.
+    pending_builds: VecDeque<PendingIndexBuild>,
+    /// Queue of in-progress **non-blocking** full-text index builds (`rmp` task #72), the analogue of
+    /// [`pending_builds`](Self#structfield.pending_builds) for the inverted index, advanced by
+    /// [`advance_index_builds`](TxnCoordinator::advance_index_builds) alongside the node-property builds.
+    pending_fulltext_builds: VecDeque<PendingFulltextBuild>,
+    /// Queue of in-progress **non-blocking** spatial (point) index builds (`rmp` task #98), the
+    /// analogue of [`pending_fulltext_builds`](Self#structfield.pending_fulltext_builds) for the grid
+    /// spatial index, advanced by [`advance_index_builds`](TxnCoordinator::advance_index_builds) alongside the
+    /// other build kinds.
+    pending_spatial_builds: VecDeque<PendingSpatialBuild>,
+    /// Builds **poisoned** by a storage fault they could not get past (`rmp` task #733, M1): dropped from
+    /// the pending queue un-promoted, so the engine terminates instead of spinning, but NOT thrown away.
+    ///
+    /// Poisoning used to be a one-way door: the index was left `Populating` (in memory *and* durably) with
+    /// nothing in the process able to bring it back — `retry_degraded_index_rebuild` only runs while the
+    /// set is degraded (which poisoning does not set), and the recovery promotion only runs in `new()`. So
+    /// 32 unlucky chunks meant a dead index until someone restarted the server, with no log and no metric
+    /// to say so. They are parked here instead and re-enqueued by
+    /// [`retry_poisoned_index_builds`](TxnCoordinator::retry_poisoned_index_builds) once the store reads cleanly
+    /// again.
+    poisoned_builds: Vec<PendingIndexBuild>,
+    /// Poisoned full-text builds — see [`poisoned_builds`](Self#structfield.poisoned_builds).
+    poisoned_fulltext_builds: Vec<PendingFulltextBuild>,
+    /// Poisoned spatial builds — see [`poisoned_builds`](Self#structfield.poisoned_builds).
+    poisoned_spatial_builds: Vec<PendingSpatialBuild>,
+    /// Full-text builds parked because an in-flight writer held the newest version of a covered property
+    /// on a node they had to skip (`rmp` task #778) — each carrying, in its
+    /// [`conflict_writers`](PendingFulltextBuild#structfield.conflict_writers), the transactions whose
+    /// resolution unblocks it. Their index stays `Populating`, so every reader is on the
+    /// snapshot-correct scan until then.
+    ///
+    /// Deliberately NOT [`poisoned_fulltext_builds`](Self#structfield.poisoned_fulltext_builds), for two
+    /// reasons. It is not a *fault*: no storage read failed, nothing is broken, and it must not count
+    /// toward [`poison_events`](Self#structfield.poison_events) (an operator alert for an index that
+    /// silently stopped being built) or burn the poison backoff. And the graveyard's resurrection,
+    /// `retry_poisoned_index_builds`, is driven on the threaded engine only by the idle tick — whose gate
+    /// does not count parked builds (`rmp` #763) — so a build parked there while the engine is otherwise
+    /// idle is never resurrected. This queue is drained by
+    /// [`retry_conflicted_fulltext_builds`](TxnCoordinator::retry_conflicted_fulltext_builds), which
+    /// [`advance_index_builds`](TxnCoordinator::advance_index_builds) — and therefore every command — drives.
+    ///
+    /// Excluded from [`has_pending_index_builds`](TxnCoordinator::has_pending_index_builds), exactly like the
+    /// graveyard: `LocalEngine::drain_index_builds` spins `while has_pending_index_builds()`, so a build
+    /// waiting on a writer that stays open would otherwise spin the engine forever.
+    conflicted_fulltext_builds: Vec<PendingFulltextBuild>,
+    /// What every GC-driven index collection has done over this coordinator's life (`rmp` #992) —
+    /// monotonic totals of [`DeadKeyCollection`], summed across passes.
+    ///
+    /// The pass report ([`GcPassReport::dead_index_keys`]) counts what the store **reported**, which
+    /// is a different question from what the index layer **did** with it: a mechanism that reports
+    /// thousands of dead keys and removes none of them looks identical, from the report alone, to one
+    /// that has nothing to collect. `keys_retained` climbing while `entries_removed` stays flat is the
+    /// signature of the re-check refusing everything, and `abandonments` is the concurrency gate in
+    /// [`collect_dead_index_keys`](TxnCoordinator::collect_dead_index_keys) firing — nil today, and the first
+    /// number to look at once the engine has more than one writer.
+    index_collection_totals: IndexCollectionTotals,
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    /// Whether this thread holds the index-build latch — see [`TxnCoordinator::builds`].
+    static BUILDS_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The index-build latch's guard, which clears the re-entrancy tripwire on drop (`rmp` #1033).
+struct BuildsGuard<'a> {
+    inner: std::sync::MutexGuard<'a, IndexBuilds>,
+}
+
+impl std::ops::Deref for BuildsGuard<'_> {
+    type Target = IndexBuilds;
+
+    fn deref(&self) -> &IndexBuilds {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for BuildsGuard<'_> {
+    fn deref_mut(&mut self) -> &mut IndexBuilds {
+        &mut self.inner
+    }
+}
+
+impl Drop for BuildsGuard<'_> {
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        BUILDS_HELD.with(|held| held.set(false));
+    }
+}
+
 /// Drives concurrent, serializable Cypher transactions over one shared [`RecordStore`] (`04 §5`).
 pub struct TxnCoordinator<D: BlockDevice, S: LogSink> {
     /// The one shared store, behind a [`SharedCell`] so each statement seam borrows it for the
@@ -1503,20 +1612,9 @@ pub struct TxnCoordinator<D: BlockDevice, S: LogSink> {
     active: HashMap<TxnId, ActiveTxn>,
     /// Monotonic transaction-id source (distinct from the commit timestamp, which the store issues).
     next_txn_id: AtomicU64,
-    /// Queue of in-progress **non-blocking** index builds (`rmp` task #91), advanced in bounded
-    /// chunks by [`advance_index_builds`](Self::advance_index_builds) between engine commands. The
-    /// front build is the one currently being populated; each completes (durably promoted to
-    /// [`IndexState::Online`]) before the next starts, so the queue is processed in declaration order.
-    pending_builds: VecDeque<PendingIndexBuild>,
-    /// Queue of in-progress **non-blocking** full-text index builds (`rmp` task #72), the analogue of
-    /// [`pending_builds`](Self#structfield.pending_builds) for the inverted index, advanced by
-    /// [`advance_index_builds`](Self::advance_index_builds) alongside the node-property builds.
-    pending_fulltext_builds: VecDeque<PendingFulltextBuild>,
-    /// Queue of in-progress **non-blocking** spatial (point) index builds (`rmp` task #98), the
-    /// analogue of [`pending_fulltext_builds`](Self#structfield.pending_fulltext_builds) for the grid
-    /// spatial index, advanced by [`advance_index_builds`](Self::advance_index_builds) alongside the
-    /// other build kinds.
-    pending_spatial_builds: VecDeque<PendingSpatialBuild>,
+    /// **Every pending / poisoned / conflicted index build, behind one latch** (`rmp` #1033).
+    /// See [`IndexBuilds`] for why the eight collections share it.
+    builds: std::sync::Mutex<IndexBuilds>,
     /// Ticks still to skip before the next degraded-index rebuild attempt (`rmp` task #733), and the
     /// current backoff width. A `fail_closed` is usually transient, so the engine retries the rebuild
     /// from its tick ([`retry_degraded_index_rebuild`](TxnCoordinator::retry_degraded_index_rebuild))
@@ -1527,39 +1625,6 @@ pub struct TxnCoordinator<D: BlockDevice, S: LogSink> {
     /// The current retry backoff width, in ticks — see
     /// [`degraded_retry_skip`](Self#structfield.degraded_retry_skip).
     degraded_retry_backoff: AtomicU32,
-    /// Builds **poisoned** by a storage fault they could not get past (`rmp` task #733, M1): dropped from
-    /// the pending queue un-promoted, so the engine terminates instead of spinning, but NOT thrown away.
-    ///
-    /// Poisoning used to be a one-way door: the index was left `Populating` (in memory *and* durably) with
-    /// nothing in the process able to bring it back — `retry_degraded_index_rebuild` only runs while the
-    /// set is degraded (which poisoning does not set), and the recovery promotion only runs in `new()`. So
-    /// 32 unlucky chunks meant a dead index until someone restarted the server, with no log and no metric
-    /// to say so. They are parked here instead and re-enqueued by
-    /// [`retry_poisoned_index_builds`](Self::retry_poisoned_index_builds) once the store reads cleanly
-    /// again.
-    poisoned_builds: Vec<PendingIndexBuild>,
-    /// Poisoned full-text builds — see [`poisoned_builds`](Self#structfield.poisoned_builds).
-    poisoned_fulltext_builds: Vec<PendingFulltextBuild>,
-    /// Full-text builds parked because an in-flight writer held the newest version of a covered property
-    /// on a node they had to skip (`rmp` task #778) — each carrying, in its
-    /// [`conflict_writers`](PendingFulltextBuild#structfield.conflict_writers), the transactions whose
-    /// resolution unblocks it. Their index stays `Populating`, so every reader is on the
-    /// snapshot-correct scan until then.
-    ///
-    /// Deliberately NOT [`poisoned_fulltext_builds`](Self#structfield.poisoned_fulltext_builds), for two
-    /// reasons. It is not a *fault*: no storage read failed, nothing is broken, and it must not count
-    /// toward [`poison_events`](Self#structfield.poison_events) (an operator alert for an index that
-    /// silently stopped being built) or burn the poison backoff. And the graveyard's resurrection,
-    /// `retry_poisoned_index_builds`, is driven on the threaded engine only by the idle tick — whose gate
-    /// does not count parked builds (`rmp` #763) — so a build parked there while the engine is otherwise
-    /// idle is never resurrected. This queue is drained by
-    /// [`retry_conflicted_fulltext_builds`](Self::retry_conflicted_fulltext_builds), which
-    /// [`advance_index_builds`](Self::advance_index_builds) — and therefore every command — drives.
-    ///
-    /// Excluded from [`has_pending_index_builds`](Self::has_pending_index_builds), exactly like the
-    /// graveyard: `LocalEngine::drain_index_builds` spins `while has_pending_index_builds()`, so a build
-    /// waiting on a writer that stays open would otherwise spin the engine forever.
-    conflicted_fulltext_builds: Vec<PendingFulltextBuild>,
     /// Drains still to skip before the next `rmp` #778 conflict-repair attempt, and its current width —
     /// the exact throttle discipline [`retry_degraded_index_rebuild`](Self::retry_degraded_index_rebuild)
     /// applies, for a sharper version of the same reason.
@@ -1598,19 +1663,6 @@ pub struct TxnCoordinator<D: BlockDevice, S: LogSink> {
     /// The current backoff width for
     /// [`vector_conflict_retry_skip`](Self#structfield.vector_conflict_retry_skip).
     vector_conflict_retry_backoff: AtomicU32,
-    /// What every GC-driven index collection has done over this coordinator's life (`rmp` #992) —
-    /// monotonic totals of [`DeadKeyCollection`], summed across passes.
-    ///
-    /// The pass report ([`GcPassReport::dead_index_keys`]) counts what the store **reported**, which
-    /// is a different question from what the index layer **did** with it: a mechanism that reports
-    /// thousands of dead keys and removes none of them looks identical, from the report alone, to one
-    /// that has nothing to collect. `keys_retained` climbing while `entries_removed` stays flat is the
-    /// signature of the re-check refusing everything, and `abandonments` is the concurrency gate in
-    /// [`collect_dead_index_keys`](Self::collect_dead_index_keys) firing — nil today, and the first
-    /// number to look at once the engine has more than one writer.
-    index_collection_totals: IndexCollectionTotals,
-    /// Poisoned spatial builds — see [`poisoned_builds`](Self#structfield.poisoned_builds).
-    poisoned_spatial_builds: Vec<PendingSpatialBuild>,
     /// How many builds have been poisoned over this coordinator's life (`rmp` task #733, M1) — monotonic.
     /// The server samples it to log at `ERROR` and drive a metric: an index that quietly stopped being
     /// built is exactly the kind of degradation that otherwise passes for "healthy but slow".
@@ -1882,23 +1934,16 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             csr,
             active: HashMap::new(),
             next_txn_id: AtomicU64::new(next_txn_id),
-            pending_builds: VecDeque::new(),
-            pending_fulltext_builds: VecDeque::new(),
-            pending_spatial_builds: VecDeque::new(),
+            builds: std::sync::Mutex::new(IndexBuilds::default()),
             degraded_retry_skip: AtomicU32::new(0),
             degraded_retry_backoff: AtomicU32::new(1),
-            poisoned_builds: Vec::new(),
-            poisoned_fulltext_builds: Vec::new(),
-            conflicted_fulltext_builds: Vec::new(),
             conflict_retry_skip: AtomicU32::new(0),
             conflict_retry_backoff: AtomicU32::new(1),
             ft_poison_repair_skip: AtomicU32::new(0),
             ft_poison_repair_backoff: AtomicU32::new(1),
             ft_poison_repairs: AtomicU64::new(0),
-            index_collection_totals: IndexCollectionTotals::default(),
             vector_conflict_retry_skip: AtomicU32::new(0),
             vector_conflict_retry_backoff: AtomicU32::new(1),
-            poisoned_spatial_builds: Vec::new(),
             poison_events: AtomicU64::new(0),
             poison_retry_skip: AtomicU32::new(0),
             poison_resurrect_attempts: AtomicU32::new(0),
@@ -5373,6 +5418,12 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         property: &str,
         if_not_exists: bool,
     ) -> Result<bool> {
+        // ONE hold for this whole operation (`rmp` #1033): a build moves between queues,
+        // and two holds would let a reader see it on both or on neither.
+        let mut guard = self.builds();
+        // Reborrowed once: taking two disjoint fields mutably in one call needs a single
+        // `DerefMut` through the guard, not one per field.
+        let builds = &mut *guard;
         // 1. Equivalent-index check (read-only, by token *lookup* — an absent token means no index).
         let equivalent_exists = {
             let store = self.store.borrow();
@@ -5446,7 +5497,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // Snapshot the current live node-id list and enqueue the pending build. The scan is the only
         // store walk here; the per-node indexing is deferred to `advance_index_builds`.
         let snapshot = self.store.borrow_mut().scan_node_ids()?;
-        self.pending_builds.push_back(PendingIndexBuild {
+        builds.pending_builds.push_back(PendingIndexBuild {
             label_token,
             prop_key,
             snapshot,
@@ -5931,6 +5982,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         analyzer: Analyzer,
         if_not_exists: bool,
     ) -> Result<bool> {
+        // ONE hold for this whole operation (`rmp` #1033): a build moves between queues,
+        // and two holds would let a reader see it on both or on neither.
         if properties.is_empty() {
             return Err(GraphusError::Storage(
                 "a full-text index must cover at least one property".to_owned(),
@@ -6011,8 +6064,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // Cancel any prior build of the same name — pending OR parked poisoned (`rmp` task #573) — then
         // enqueue this one. A parked build left behind would be resurrected later and race this one.
         self.cancel_fulltext_builds(name);
+        let mut guard = self.builds();
+        // Reborrowed once: taking two disjoint fields mutably in one call needs a single
+        // `DerefMut` through the guard, not one per field.
+        let builds = &mut *guard;
         let snapshot = self.store.borrow_mut().scan_node_ids()?;
-        self.pending_fulltext_builds
+        builds
+            .pending_fulltext_builds
             .push_back(PendingFulltextBuild {
                 name: name.to_owned(),
                 snapshot,
@@ -6282,6 +6340,12 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         property: &str,
         if_not_exists: bool,
     ) -> Result<bool> {
+        // ONE hold for this whole operation (`rmp` #1033): a build moves between queues,
+        // and two holds would let a reader see it on both or on neither.
+        let mut guard = self.builds();
+        // Reborrowed once: taking two disjoint fields mutably in one call needs a single
+        // `DerefMut` through the guard, not one per field.
+        let builds = &mut *guard;
         // `IF NOT EXISTS` (`rmp` #661): an equivalent index — the same `name` in the spatial catalog, or
         // the same covered `(label, property)` under any name — makes this an idempotent no-op (nothing
         // added), mirroring the node-property path.
@@ -6338,21 +6402,23 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // Cancel any prior build of the same name — pending OR parked poisoned (`rmp` task #573) — then
         // enqueue this one. A parked build left behind would be resurrected later and race this one.
         Self::cancel_named_builds(
-            &mut self.pending_spatial_builds,
-            &mut self.poisoned_spatial_builds,
+            &mut builds.pending_spatial_builds,
+            &mut builds.poisoned_spatial_builds,
             name,
             |b| &b.name,
         );
         let snapshot = self.store.borrow_mut().scan_node_ids()?;
-        self.pending_spatial_builds.push_back(PendingSpatialBuild {
-            name: name.to_owned(),
-            label_token,
-            prop_key,
-            snapshot,
-            cursor: 0,
-            generation: self.index.borrow().wipe_generation(),
-            stall: BUILD_STALL_BUDGET,
-        });
+        builds
+            .pending_spatial_builds
+            .push_back(PendingSpatialBuild {
+                name: name.to_owned(),
+                label_token,
+                prop_key,
+                snapshot,
+                cursor: 0,
+                generation: self.index.borrow().wipe_generation(),
+                stall: BUILD_STALL_BUDGET,
+            });
         Ok(true)
     }
 
@@ -6501,6 +6567,12 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// # Errors
     /// Returns a storage error if the committing transaction fails.
     pub fn drop_point_index(&mut self, name: &str, if_exists: bool) -> Result<bool> {
+        // ONE hold for this whole operation (`rmp` #1033): a build moves between queues,
+        // and two holds would let a reader see it on both or on neither.
+        let mut guard = self.builds();
+        // Reborrowed once: taking two disjoint fields mutably in one call needs a single
+        // `DerefMut` through the guard, not one per field.
+        let builds = &mut *guard;
         // Resolve the covered `(label_token, prop_key)` from the durable entry so we can unregister the
         // right grid from the in-memory set (which is keyed by tokens, not by name).
         let entry = self.store.borrow().spatial_index(name);
@@ -6512,8 +6584,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 return Err(index_drop_not_found(name));
             }
             Self::cancel_named_builds(
-                &mut self.pending_spatial_builds,
-                &mut self.poisoned_spatial_builds,
+                &mut builds.pending_spatial_builds,
+                &mut builds.poisoned_spatial_builds,
                 name,
                 |b| &b.name,
             );
@@ -6526,8 +6598,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.store.borrow_mut().commit(txn)?;
 
         Self::cancel_named_builds(
-            &mut self.pending_spatial_builds,
-            &mut self.poisoned_spatial_builds,
+            &mut builds.pending_spatial_builds,
+            &mut builds.poisoned_spatial_builds,
             name,
             |b| &b.name,
         );
@@ -8724,9 +8796,10 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// back-off-limited.
     #[must_use]
     pub fn has_pending_index_builds(&self) -> bool {
-        !self.pending_builds.is_empty()
-            || !self.pending_fulltext_builds.is_empty()
-            || !self.pending_spatial_builds.is_empty()
+        let builds = self.builds();
+        !builds.pending_builds.is_empty()
+            || !builds.pending_fulltext_builds.is_empty()
+            || !builds.pending_spatial_builds.is_empty()
             // A queued `db.resampleIndex` (`rmp` task #572) is pending index work too. Reporting it
             // here is what makes the drain UNMISSABLE: every existing driver — the server's
             // `drive_index_build` after each command, the DST `LocalEngine::drain_index_builds` spin —
@@ -8830,9 +8903,10 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// How many poisoned builds are currently parked awaiting resurrection (`rmp` task #733, M1).
     #[must_use]
     pub fn poisoned_index_builds(&self) -> usize {
-        self.poisoned_builds.len()
-            + self.poisoned_fulltext_builds.len()
-            + self.poisoned_spatial_builds.len()
+        let builds = self.builds();
+        builds.poisoned_builds.len()
+            + builds.poisoned_fulltext_builds.len()
+            + builds.poisoned_spatial_builds.len()
     }
 
     /// Cancels every build — in flight **or parked poisoned** — covering the node-property index
@@ -8877,13 +8951,19 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// that outlives its index is resurrected later — here as soon as its blocking writer commits — and
     /// durably re-creates an index the user dropped, or races the fresh build of a re-declared one.
     fn cancel_fulltext_builds(&mut self, name: &str) {
+        // ONE hold for this whole operation (`rmp` #1033): a build moves between queues,
+        // and two holds would let a reader see it on both or on neither.
+        let mut guard = self.builds();
+        // Reborrowed once: taking two disjoint fields mutably in one call needs a single
+        // `DerefMut` through the guard, not one per field.
+        let builds = &mut *guard;
         Self::cancel_named_builds(
-            &mut self.pending_fulltext_builds,
-            &mut self.poisoned_fulltext_builds,
+            &mut builds.pending_fulltext_builds,
+            &mut builds.poisoned_fulltext_builds,
             name,
             |b| &b.name,
         );
-        self.conflicted_fulltext_builds.retain(|b| b.name != name);
+        builds.conflicted_fulltext_builds.retain(|b| b.name != name);
     }
 
     /// The aggregate index-build numbers (`rmp` task #573) — in-flight and parked build counts, and the
@@ -8902,25 +8982,38 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// in-flight build would misread as a stalled build to anyone watching the gauge.
     #[must_use]
     pub fn index_build_totals(&self) -> IndexBuildTotals {
+        // ONE hold for this whole operation (`rmp` #1033): a build moves between queues,
+        // and two holds would let a reader see it on both or on neither.
+        let mut guard = self.builds();
+        // Reborrowed once: taking two disjoint fields mutably in one call needs a single
+        // `DerefMut` through the guard, not one per field.
+        let builds = &mut *guard;
         // `saturating_sub` on every remainder: a cursor cannot legitimately outrun its snapshot, but a
         // gauge must never underflow into a nonsense value if one ever did.
         let remaining = |cursor: usize, len: usize| len.saturating_sub(cursor);
         IndexBuildTotals {
-            pending: self.pending_builds.len()
-                + self.pending_fulltext_builds.len()
-                + self.pending_spatial_builds.len(),
-            parked: self.poisoned_index_builds() + self.conflicted_fulltext_builds.len(),
-            entities_remaining: self
+            pending: builds.pending_builds.len()
+                + builds.pending_fulltext_builds.len()
+                + builds.pending_spatial_builds.len(),
+            // The three poisoned queues counted from the local, not through
+            // `poisoned_index_builds()`, which takes the latch this function already holds.
+            parked: builds.poisoned_builds.len()
+                + builds.poisoned_fulltext_builds.len()
+                + builds.poisoned_spatial_builds.len()
+                + builds.conflicted_fulltext_builds.len(),
+            entities_remaining: builds
                 .pending_builds
                 .iter()
                 .map(|b| remaining(b.cursor, b.snapshot.len()))
                 .chain(
-                    self.pending_fulltext_builds
+                    builds
+                        .pending_fulltext_builds
                         .iter()
                         .map(|b| remaining(b.cursor, b.snapshot.len())),
                 )
                 .chain(
-                    self.pending_spatial_builds
+                    builds
+                        .pending_spatial_builds
                         .iter()
                         .map(|b| remaining(b.cursor, b.snapshot.len())),
                 )
@@ -8945,6 +9038,12 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// length may be smaller than `pending + parked`. Callers must not treat the two as interchangeable.
     #[must_use]
     pub fn index_build_progress(&self) -> Vec<IndexBuildProgress> {
+        // ONE hold for this whole operation (`rmp` #1033): a build moves between queues,
+        // and two holds would let a reader see it on both or on neither.
+        let mut guard = self.builds();
+        // Reborrowed once: taking two disjoint fields mutably in one call needs a single
+        // `DerefMut` through the guard, not one per field.
+        let builds = &mut *guard;
         let store = self.store.borrow();
 
         // A node-property build is keyed by its `(label_token, prop_key)` tokens, not by a name, so the
@@ -8961,10 +9060,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         };
 
         let mut out = Vec::with_capacity(
-            self.pending_builds.len()
-                + self.pending_fulltext_builds.len()
-                + self.pending_spatial_builds.len()
-                + self.poisoned_index_builds(),
+            builds.pending_builds.len()
+                + builds.pending_fulltext_builds.len()
+                + builds.pending_spatial_builds.len()
+                // Counted from the local: `poisoned_index_builds()` takes the latch already held.
+                + builds.poisoned_builds.len()
+                + builds.poisoned_fulltext_builds.len()
+                + builds.poisoned_spatial_builds.len(),
         );
         let mut push = |name: String, done: usize, total: usize, poisoned: bool| {
             out.push(IndexBuildProgress {
@@ -8980,26 +9082,26 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
 
         // Pending first, then parked — the `poisoned` flag comes from WHICH collection the build sits in,
         // so each collection is walked separately with the flag it implies.
-        for b in &self.pending_builds {
+        for b in &builds.pending_builds {
             if let Some(name) = node_name(b) {
                 push(name, b.cursor, b.snapshot.len(), false);
             }
         }
-        for b in &self.poisoned_builds {
+        for b in &builds.poisoned_builds {
             if let Some(name) = node_name(b) {
                 push(name, b.cursor, b.snapshot.len(), true);
             }
         }
-        for b in &self.pending_fulltext_builds {
+        for b in &builds.pending_fulltext_builds {
             push(b.name.clone(), b.cursor, b.snapshot.len(), false);
         }
-        for b in &self.poisoned_fulltext_builds {
+        for b in &builds.poisoned_fulltext_builds {
             push(b.name.clone(), b.cursor, b.snapshot.len(), true);
         }
-        for b in &self.pending_spatial_builds {
+        for b in &builds.pending_spatial_builds {
             push(b.name.clone(), b.cursor, b.snapshot.len(), false);
         }
-        for b in &self.poisoned_spatial_builds {
+        for b in &builds.poisoned_spatial_builds {
             push(b.name.clone(), b.cursor, b.snapshot.len(), true);
         }
         out
@@ -9038,7 +9140,19 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// store returns to a fast retry while a permanently-broken one has its retry rate collapse
     /// geometrically to one attempt per [`MAX_DEGRADED_RETRY_BACKOFF`] drains.
     pub fn retry_poisoned_index_builds(&mut self) -> bool {
-        if self.poisoned_index_builds() == 0 {
+        // ONE hold for this whole operation (`rmp` #1033): a build moves between queues,
+        // and two holds would let a reader see it on both or on neither.
+        let mut guard = self.builds();
+        // Reborrowed once: taking two disjoint fields mutably in one call needs a single
+        // `DerefMut` through the guard, not one per field.
+        let builds = &mut *guard;
+        // The local, not the accessor: `poisoned_index_builds()` takes the latch this function
+        // already holds.
+        if builds.poisoned_builds.len()
+            + builds.poisoned_fulltext_builds.len()
+            + builds.poisoned_spatial_builds.len()
+            == 0
+        {
             // The graveyard is clear: either nothing was ever poisoned, or a resurrection's builds all
             // COMPLETED. Reset the throttle so a store that has genuinely healed retries promptly.
             self.poison_resurrect_attempts.store(0, Ordering::Relaxed);
@@ -9061,14 +9175,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             return false;
         };
         let generation = self.index.borrow().wipe_generation();
-        for mut build in self.poisoned_builds.drain(..) {
+        for mut build in builds.poisoned_builds.drain(..) {
             build.snapshot.clone_from(&snapshot);
             build.cursor = 0;
             build.stall = BUILD_STALL_BUDGET;
             build.generation = generation;
-            self.pending_builds.push_back(build);
+            builds.pending_builds.push_back(build);
         }
-        for mut build in self.poisoned_fulltext_builds.drain(..) {
+        for mut build in builds.poisoned_fulltext_builds.drain(..) {
             build.snapshot.clone_from(&snapshot);
             build.cursor = 0;
             build.stall = BUILD_STALL_BUDGET;
@@ -9076,14 +9190,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             // Fresh snapshot from cursor 0: drop any stale `rmp` #778 conflict record for the same reason
             // the epoch re-snapshot does.
             build.conflict_writers.clear();
-            self.pending_fulltext_builds.push_back(build);
+            builds.pending_fulltext_builds.push_back(build);
         }
-        for mut build in self.poisoned_spatial_builds.drain(..) {
+        for mut build in builds.poisoned_spatial_builds.drain(..) {
             build.snapshot.clone_from(&snapshot);
             build.cursor = 0;
             build.stall = BUILD_STALL_BUDGET;
             build.generation = generation;
-            self.pending_spatial_builds.push_back(build);
+            builds.pending_spatial_builds.push_back(build);
         }
         // Count this resurrection and ARM the throttle for the NEXT one (`rmp` task #733, B2). The FIRST
         // resurrection after a poisoning is immediate (`attempts` was 0, so this is attempt 1); if these
@@ -9483,8 +9597,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// inherently flapping — overlapping write transactions resolve one after another — so an unthrottled
     /// repair would run one O(store) rebuild per writer generation, on the engine thread, forever.
     fn retry_conflicted_fulltext_builds(&mut self) -> bool {
+        // ONE hold for this whole operation (`rmp` #1033): a build moves between queues,
+        // and two holds would let a reader see it on both or on neither.
+        let mut guard = self.builds();
+        // Reborrowed once: taking two disjoint fields mutably in one call needs a single
+        // `DerefMut` through the guard, not one per field.
+        let builds = &mut *guard;
         let rebuild_blocked = !self.index.borrow().ft_demoted_blockers().is_empty();
-        if self.conflicted_fulltext_builds.is_empty() && !rebuild_blocked {
+        if builds.conflicted_fulltext_builds.is_empty() && !rebuild_blocked {
             return false;
         }
         // The same liveness signal the gate used — the Active Transaction Table, never
@@ -9538,8 +9658,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         }
 
         // (2) The chunked node-build shape.
-        if !self.conflicted_fulltext_builds.is_empty() {
-            let ready: Vec<usize> = self
+        if !builds.conflicted_fulltext_builds.is_empty() {
+            let ready: Vec<usize> = builds
                 .conflicted_fulltext_builds
                 .iter()
                 .enumerate()
@@ -9558,13 +9678,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 let generation = self.index.borrow().wipe_generation();
                 // Descending, so each removal leaves the lower indices valid.
                 for i in ready.into_iter().rev() {
-                    let mut build = self.conflicted_fulltext_builds.swap_remove(i);
+                    let mut build = builds.conflicted_fulltext_builds.swap_remove(i);
                     build.snapshot.clone_from(&snapshot);
                     build.cursor = 0;
                     build.stall = BUILD_STALL_BUDGET;
                     build.generation = generation;
                     build.conflict_writers.clear();
-                    self.pending_fulltext_builds.push_back(build);
+                    builds.pending_fulltext_builds.push_back(build);
                     acted = true;
                 }
             }
@@ -9621,9 +9741,19 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let _refilled = self.retry_conflicted_vector_builds();
         // Drive a node-property build first if one is pending; then a full-text build; then a spatial
         // build. Processing one queue per call keeps the per-call work bounded by `budget` for any kind.
-        if !self.pending_builds.is_empty() {
+        // Read the two predicates under a SHORT hold and drop it before dispatching: each
+        // `advance_*` takes the latch itself, and holding it across the call is the re-entrancy the
+        // tripwire in `builds()` refuses.
+        let (node_pending, fulltext_pending) = {
+            let builds = self.builds();
+            (
+                !builds.pending_builds.is_empty(),
+                !builds.pending_fulltext_builds.is_empty(),
+            )
+        };
+        if node_pending {
             self.advance_node_property_build(budget);
-        } else if !self.pending_fulltext_builds.is_empty() {
+        } else if fulltext_pending {
             self.advance_fulltext_build(budget);
         } else {
             self.advance_spatial_build(budget);
@@ -9674,6 +9804,12 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         D: Send + Sync + 'static,
         S: Send + Sync + 'static,
     {
+        // ONE hold for this whole operation (`rmp` #1033): a build moves between queues,
+        // and two holds would let a reader see it on both or on neither.
+        let mut guard = self.builds();
+        // Reborrowed once: taking two disjoint fields mutably in one call needs a single
+        // `DerefMut` through the guard, not one per field.
+        let builds = &mut *guard;
         // (1) EPOCH CHECK (`rmp` task #733). Was the index set wiped by a `fail_closed` since this build
         // last ran? The build queues live on the coordinator, out of `IndexSet`'s reach, so a wipe empties
         // the half-built tree without telling the build. Resuming from the old cursor would index only the
@@ -9682,7 +9818,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // maintenance writes for rows created after the snapshot — so the snapshot itself is re-taken.
         // See `resnapshot_build`.
         let generation = self.index.borrow().wipe_generation();
-        if self
+        if builds
             .pending_builds
             .front()
             .is_some_and(|b| b.generation != generation)
@@ -9692,13 +9828,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 // `Populating`, so it is never served — correct, just unaccelerated — and the degraded
                 // rebuild retry will repopulate its tree. Never resume a build we cannot re-base.
                 Self::poison_front(
-                    &mut self.pending_builds,
-                    &mut self.poisoned_builds,
+                    &mut builds.pending_builds,
+                    &mut builds.poisoned_builds,
                     &self.poison_events,
                 );
                 return;
             };
-            if let Some(build) = self.pending_builds.front_mut() {
+            if let Some(build) = builds.pending_builds.front_mut() {
                 build.snapshot = fresh;
                 build.cursor = 0;
                 build.generation = generation;
@@ -9706,7 +9842,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             }
         }
 
-        let Some(build) = self.pending_builds.front_mut() else {
+        let Some(build) = builds.pending_builds.front_mut() else {
             return;
         };
 
@@ -9747,17 +9883,17 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // never served). Terminates, never holes, never spins.
         if self.index.borrow().rebuild_gap() {
             self.index.borrow_mut().clear_rebuild_gap();
-            if Self::stall_or_poison(&mut self.pending_builds, |b| &mut b.stall) {
+            if Self::stall_or_poison(&mut builds.pending_builds, |b| &mut b.stall) {
                 Self::poison_front(
-                    &mut self.pending_builds,
-                    &mut self.poisoned_builds,
+                    &mut builds.pending_builds,
+                    &mut builds.poisoned_builds,
                     &self.poison_events,
                 );
             }
             return;
         }
 
-        let Some(build) = self.pending_builds.front_mut() else {
+        let Some(build) = builds.pending_builds.front_mut() else {
             return;
         };
         build.cursor = end;
@@ -9778,17 +9914,17 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // promotion now could only be a claim we cannot back. Stall (bounded) and let the repair run
         // first; on exhaustion the build is poisoned rather than promoted.
         if self.index.borrow().is_degraded() {
-            if Self::stall_or_poison(&mut self.pending_builds, |b| &mut b.stall) {
+            if Self::stall_or_poison(&mut builds.pending_builds, |b| &mut b.stall) {
                 Self::poison_front(
-                    &mut self.pending_builds,
-                    &mut self.poisoned_builds,
+                    &mut builds.pending_builds,
+                    &mut builds.poisoned_builds,
                     &self.poison_events,
                 );
             }
             return;
         }
 
-        let Some(build) = self.pending_builds.front_mut() else {
+        let Some(build) = builds.pending_builds.front_mut() else {
             return;
         };
         // The front build's snapshot is fully indexed: promote it durably to `Online`, then dequeue.
@@ -9808,13 +9944,16 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.index
             .borrow_mut()
             .set_node_property_state(label_token, prop_key, IndexState::Online);
-        self.pending_builds.pop_front();
+        builds.pending_builds.pop_front();
         // The build is complete and the index is durably Online: seed its selectivity histogram
         // (`rmp` task #572). This is the production `CREATE INDEX` completion point — the server drives
         // `begin_online_node_composite_index_named`, whose arity-1 case is this non-blocking build — so
         // this is what makes a declared index born with real statistics. Done *after* `pop_front` so no
         // build borrow is outstanding across the statement seam, and only on the promotion tick (once
         // per created index), never per chunk.
+        // The build is off the queue; release the latch BEFORE seeding the histogram, which writes
+        // through the store and must not run with an index-build hold outstanding.
+        drop(guard);
         self.seed_index_histogram(label_token, prop_key);
     }
 
@@ -9825,25 +9964,31 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// [`index_one_node_fulltext`](Self::index_one_node_fulltext) helper, then on completion the named
     /// catalog entry is durably flipped to [`IndexState::Online`].
     fn advance_fulltext_build(&mut self, budget: usize) {
+        // ONE hold for this whole operation (`rmp` #1033): a build moves between queues,
+        // and two holds would let a reader see it on both or on neither.
+        let mut guard = self.builds();
+        // Reborrowed once: taking two disjoint fields mutably in one call needs a single
+        // `DerefMut` through the guard, not one per field.
+        let builds = &mut *guard;
         // (1) EPOCH CHECK + RE-SNAPSHOT, exactly as `advance_node_property_build` documents (`rmp` #733).
         // The full-text index escapes the worst of a stale resume by accident (the `rmp` #467 marker
         // poison keeps readers off a wiped inverted index), but it must not be left half-filled-and-
         // `Online` either — and the marker is cleared by the very rebuild that repairs the set.
         let generation = self.index.borrow().wipe_generation();
-        if self
+        if builds
             .pending_fulltext_builds
             .front()
             .is_some_and(|b| b.generation != generation)
         {
             let Some(fresh) = Self::resnapshot_build(&self.store) else {
                 Self::poison_front(
-                    &mut self.pending_fulltext_builds,
-                    &mut self.poisoned_fulltext_builds,
+                    &mut builds.pending_fulltext_builds,
+                    &mut builds.poisoned_fulltext_builds,
                     &self.poison_events,
                 ); // poison: never resume a build we cannot re-base.
                 return;
             };
-            if let Some(build) = self.pending_fulltext_builds.front_mut() {
+            if let Some(build) = builds.pending_fulltext_builds.front_mut() {
                 build.snapshot = fresh;
                 build.cursor = 0;
                 build.generation = generation;
@@ -9855,7 +10000,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 build.conflict_writers.clear();
             }
         }
-        let Some(build) = self.pending_fulltext_builds.front_mut() else {
+        let Some(build) = builds.pending_fulltext_builds.front_mut() else {
             return;
         };
         let total = build.snapshot.len();
@@ -9880,7 +10025,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let chunk_blockers: Vec<TxnId> = self.index.borrow().ft_build_conflict_writers().to_vec();
         if !chunk_blockers.is_empty() {
             self.index.borrow_mut().clear_ft_build_conflict();
-            if let Some(build) = self.pending_fulltext_builds.front_mut() {
+            if let Some(build) = builds.pending_fulltext_builds.front_mut() {
                 for w in chunk_blockers {
                     if !build.conflict_writers.contains(&w) {
                         build.conflict_writers.push(w);
@@ -9893,13 +10038,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // persistent fault poisons the build instead of spinning the engine forever (`rmp` task #733).
         if self.index.borrow().rebuild_gap() {
             self.index.borrow_mut().clear_rebuild_gap();
-            if Self::stall_or_poison(&mut self.pending_fulltext_builds, |b| &mut b.stall) {
+            if Self::stall_or_poison(&mut builds.pending_fulltext_builds, |b| &mut b.stall) {
                 Self::poison_front(
-                    &mut self.pending_fulltext_builds,
-                    &mut self.poisoned_fulltext_builds,
+                    &mut builds.pending_fulltext_builds,
+                    &mut builds.poisoned_fulltext_builds,
                     &self.poison_events,
                 );
-            } else if let Some(build) = self.pending_fulltext_builds.front_mut() {
+            } else if let Some(build) = builds.pending_fulltext_builds.front_mut() {
                 build.cursor = start;
             }
             // `rmp` #803: this rewind is AFTER the chunk loop, which raised the transient dirty flag.
@@ -9908,7 +10053,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             return;
         }
         if end > start
-            && let Some(build) = self.pending_fulltext_builds.front_mut()
+            && let Some(build) = builds.pending_fulltext_builds.front_mut()
         {
             build.stall = BUILD_STALL_BUDGET; // real progress: refill the budget.
         }
@@ -9938,10 +10083,10 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // nothing: the chunk's entries are already in the tree, and if the set is wiped again the epoch
         // check re-snapshots and rebuilds from scratch anyway.
         if self.index.borrow().is_degraded() {
-            if Self::stall_or_poison(&mut self.pending_fulltext_builds, |b| &mut b.stall) {
+            if Self::stall_or_poison(&mut builds.pending_fulltext_builds, |b| &mut b.stall) {
                 Self::poison_front(
-                    &mut self.pending_fulltext_builds,
-                    &mut self.poisoned_fulltext_builds,
+                    &mut builds.pending_fulltext_builds,
+                    &mut builds.poisoned_fulltext_builds,
                     &self.poison_events,
                 );
             }
@@ -9980,13 +10125,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // record alone — would promote `Online` over the hole, with the #467 marker already raised so
         // readers trust it. That is the #766 loss re-entering through the promotion door.
         let blocked_by_rebuild: Vec<TxnId> = self.index.borrow().ft_demoted_blockers().to_vec();
-        if self
+        if builds
             .pending_fulltext_builds
             .front()
             .is_some_and(|b| !b.conflict_writers.is_empty())
             || !blocked_by_rebuild.is_empty()
         {
-            if let Some(mut build) = self.pending_fulltext_builds.pop_front() {
+            if let Some(mut build) = builds.pending_fulltext_builds.pop_front() {
                 // Adopt the rebuild's blockers too, so this build is re-driven once EVERY writer that
                 // holed it — its own and the rebuild's — has resolved.
                 for w in blocked_by_rebuild {
@@ -9994,7 +10139,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                         build.conflict_writers.push(w);
                     }
                 }
-                self.conflicted_fulltext_builds.push(build);
+                builds.conflicted_fulltext_builds.push(build);
             }
             return;
         }
@@ -10029,7 +10174,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.index
             .borrow_mut()
             .set_fulltext_state(&name, IndexState::Online);
-        self.pending_fulltext_builds.pop_front();
+        builds.pending_fulltext_builds.pop_front();
     }
 
     /// Advances the front **spatial** build by up to `budget` nodes (`rmp` task #98), promoting +
@@ -10040,29 +10185,35 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// catalog entry is durably flipped to [`IndexState::Online`] (after which the planner begins
     /// routing proximity seeks to it).
     fn advance_spatial_build(&mut self, budget: usize) {
+        // ONE hold for this whole operation (`rmp` #1033): a build moves between queues,
+        // and two holds would let a reader see it on both or on neither.
+        let mut guard = self.builds();
+        // Reborrowed once: taking two disjoint fields mutably in one call needs a single
+        // `DerefMut` through the guard, not one per field.
+        let builds = &mut *guard;
         // (1) EPOCH CHECK + RE-SNAPSHOT — the spatial twin of `advance_node_property_build` (`rmp` #733).
         let generation = self.index.borrow().wipe_generation();
-        if self
+        if builds
             .pending_spatial_builds
             .front()
             .is_some_and(|b| b.generation != generation)
         {
             let Some(fresh) = Self::resnapshot_build(&self.store) else {
                 Self::poison_front(
-                    &mut self.pending_spatial_builds,
-                    &mut self.poisoned_spatial_builds,
+                    &mut builds.pending_spatial_builds,
+                    &mut builds.poisoned_spatial_builds,
                     &self.poison_events,
                 ); // poison: cannot re-base this build.
                 return;
             };
-            if let Some(build) = self.pending_spatial_builds.front_mut() {
+            if let Some(build) = builds.pending_spatial_builds.front_mut() {
                 build.snapshot = fresh;
                 build.cursor = 0;
                 build.generation = generation;
                 build.stall = BUILD_STALL_BUDGET;
             }
         }
-        let Some(build) = self.pending_spatial_builds.front_mut() else {
+        let Some(build) = builds.pending_spatial_builds.front_mut() else {
             return;
         };
         let total = build.snapshot.len();
@@ -10086,13 +10237,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // bounded by the stall budget so a persistent fault poisons the build (`rmp` task #733).
         if self.index.borrow().rebuild_gap() {
             self.index.borrow_mut().clear_rebuild_gap();
-            if Self::stall_or_poison(&mut self.pending_spatial_builds, |b| &mut b.stall) {
+            if Self::stall_or_poison(&mut builds.pending_spatial_builds, |b| &mut b.stall) {
                 Self::poison_front(
-                    &mut self.pending_spatial_builds,
-                    &mut self.poisoned_spatial_builds,
+                    &mut builds.pending_spatial_builds,
+                    &mut builds.poisoned_spatial_builds,
                     &self.poison_events,
                 );
-            } else if let Some(build) = self.pending_spatial_builds.front_mut() {
+            } else if let Some(build) = builds.pending_spatial_builds.front_mut() {
                 build.cursor = start;
             }
             // `rmp` #803: this rewind is AFTER the chunk loop, which raised the transient dirty flag.
@@ -10101,7 +10252,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             return;
         }
         if end > start
-            && let Some(build) = self.pending_spatial_builds.front_mut()
+            && let Some(build) = builds.pending_spatial_builds.front_mut()
         {
             build.stall = BUILD_STALL_BUDGET; // real progress: refill the budget.
         }
@@ -10122,10 +10273,10 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // (3) BELT AND BRACES: never publish into a WIPED index set (`rmp` task #733). The cursor is not
         // rewound — see `advance_fulltext_build` for why rewinding here defeats the stall budget.
         if self.index.borrow().is_degraded() {
-            if Self::stall_or_poison(&mut self.pending_spatial_builds, |b| &mut b.stall) {
+            if Self::stall_or_poison(&mut builds.pending_spatial_builds, |b| &mut b.stall) {
                 Self::poison_front(
-                    &mut self.pending_spatial_builds,
-                    &mut self.poisoned_spatial_builds,
+                    &mut builds.pending_spatial_builds,
+                    &mut builds.poisoned_spatial_builds,
                     &self.poison_events,
                 );
             }
@@ -10164,7 +10315,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             registered[0].1,
             IndexState::Online,
         );
-        self.pending_spatial_builds.pop_front();
+        builds.pending_spatial_builds.pop_front();
     }
 
     /// Drops the node-property index on `(label, property)` (`rmp` task #91): removes its durable
@@ -10183,6 +10334,12 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// # Errors
     /// Returns a storage error if the committing transaction fails.
     pub fn drop_node_property_index(&mut self, label: &str, property: &str) -> Result<bool> {
+        // ONE hold for this whole operation (`rmp` #1033): a build moves between queues,
+        // and two holds would let a reader see it on both or on neither.
+        let mut guard = self.builds();
+        // Reborrowed once: taking two disjoint fields mutably in one call needs a single
+        // `DerefMut` through the guard, not one per field.
+        let builds = &mut *guard;
         // Resolve the tokens by lookup only; a missing token means the index cannot exist.
         let tokens = {
             let store = self.store.borrow();
@@ -10225,8 +10382,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // durably RE-CREATES the index this call just dropped — nameless, and surviving a restart, because
         // a reopen rebuilds the in-memory set from the catalog. `DROP INDEX` would be silently undone.
         Self::cancel_node_property_builds(
-            &mut self.pending_builds,
-            &mut self.poisoned_builds,
+            &mut builds.pending_builds,
+            &mut builds.poisoned_builds,
             label_token,
             prop_key,
         );
@@ -10257,6 +10414,12 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         name: &str,
         if_exists: bool,
     ) -> Result<bool> {
+        // ONE hold for this whole operation (`rmp` #1033): a build moves between queues,
+        // and two holds would let a reader see it on both or on neither.
+        let mut guard = self.builds();
+        // Reborrowed once: taking two disjoint fields mutably in one call needs a single
+        // `DerefMut` through the guard, not one per field.
+        let builds = &mut *guard;
         let target = self.store.borrow().node_property_index_name(name);
         let Some((label_token, prop_key)) = target else {
             return if if_exists {
@@ -10284,8 +10447,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // durably RE-CREATES the index this call just dropped — nameless, and surviving a restart, because
         // a reopen rebuilds the in-memory set from the catalog. `DROP INDEX` would be silently undone.
         Self::cancel_node_property_builds(
-            &mut self.pending_builds,
-            &mut self.poisoned_builds,
+            &mut builds.pending_builds,
+            &mut builds.poisoned_builds,
             label_token,
             prop_key,
         );
@@ -11243,6 +11406,12 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// paying the `O(store)` reclamation sweeps. Used only by the mid-bulk-load maintenance cadence — see
     /// [`checkpoint_reader_safe_freeze_only`](Self::checkpoint_reader_safe_freeze_only).
     fn gc_scoped(&mut self, freeze_only: bool) -> Result<GcPassReport> {
+        // ONE hold for this whole operation (`rmp` #1033): a build moves between queues,
+        // and two holds would let a reader see it on both or on neither.
+        let mut guard = self.builds();
+        // Reborrowed once: taking two disjoint fields mutably in one call needs a single
+        // `DerefMut` through the guard, not one per field.
+        let builds = &mut *guard;
         let watermark = self.gc_watermark();
         self.next_txn_id.fetch_add(1, Ordering::Relaxed);
         let gc_txn = TxnId(self.next_txn_id.load(Ordering::Relaxed));
@@ -11308,7 +11477,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // never holds those two at once (`record_graph::reindex_node`'s two-phase discipline).
         let dead = store.take_dead_index_keys();
         let collected = self.collect_dead_index_keys(gc_txn, &dead);
-        let totals = &mut self.index_collection_totals;
+        let totals = &mut builds.index_collection_totals;
         totals.entries_removed += collected.entries_removed as u64;
         totals.entities_purged += collected.entities_purged as u64;
         totals.keys_retained += collected.keys_retained as u64;
@@ -11636,7 +11805,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// in particular why the pass report's `dead_index_keys` does not answer the same question.
     #[must_use]
     pub fn index_collection_totals(&self) -> IndexCollectionTotals {
-        self.index_collection_totals
+        // ONE hold for this whole operation (`rmp` #1033): a build moves between queues,
+        // and two holds would let a reader see it on both or on neither.
+        let mut guard = self.builds();
+        // Reborrowed once: taking two disjoint fields mutably in one call needs a single
+        // `DerefMut` through the guard, not one per field.
+        let builds = &mut *guard;
+        builds.index_collection_totals
     }
 
     /// **`rmp` #588** (observability): physical slots currently shadow-held from reuse (see
@@ -11873,6 +12048,38 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// Panics if the store is already borrowed (a live statement seam from
     /// [`statement`](Self::statement) is held, or `f` re-enters the coordinator) — the same misuse
     /// [`into_store`](Self::into_store) rejects.
+    /// Takes the builds latch and hands back the guard, for the callers a closure cannot serve
+    /// (`rmp` #1033).
+    ///
+    /// [`with_builds`](Self::with_builds) is the form to reach for. This one exists because most of
+    /// the build machinery also touches the store, the index set or the counters, and a closure
+    /// borrowing `&mut IndexBuilds` cannot also borrow `self`. Holding the guard in a local leaves the
+    /// rest of `self` borrowable.
+    ///
+    /// # Panics
+    /// Panics if the latch is poisoned — see [`with_builds`](Self::with_builds).
+    fn builds(&self) -> BuildsGuard<'_> {
+        // Re-entrancy tripwire (debug only), the discipline the storage latches already follow: this
+        // `Mutex` is NOT re-entrant, so a second acquisition on one thread deadlocks with no
+        // diagnostic whatsoever — the process simply stops. That is how this was first met: a test
+        // binary sitting in `futex_wait` for ten minutes with nothing to point at. Failing loudly
+        // names the offending path instead.
+        #[cfg(debug_assertions)]
+        BUILDS_HELD.with(|held| {
+            assert!(
+                !held.get(),
+                "the index-build latch was taken twice on this thread (`rmp` #1033). It is not \
+                 re-entrant: drop the guard before calling anything that takes it again."
+            );
+            held.set(true);
+        });
+        BuildsGuard {
+            inner: self.builds.lock().expect(
+                "INVARIANT: a poisoned builds latch means a build is on both queues or neither",
+            ),
+        }
+    }
+
     /// Mints one fresh, coordinator-issued [`TxnId`] (`rmp` #1033).
     ///
     /// One `fetch_add`, and the single place the counter is touched. It used to be
