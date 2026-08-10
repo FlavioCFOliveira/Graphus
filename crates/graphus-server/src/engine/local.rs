@@ -108,7 +108,7 @@ pub struct LocalEngine<D: BlockDevice, S: LogSink> {
     /// single-threaded by construction, so the same reuse + schema-version invalidation applies, and
     /// the same seed still yields the same execution (the cache changes *how fast* a plan is obtained,
     /// never *which* plan — exact-text keying is deterministic).
-    plan_cache: super::exec::EnginePlanCache,
+    plan_cache: std::sync::Mutex<super::exec::EnginePlanCache>,
     /// Observability counters (a private registry; the simulator may read it for liveness checks).
     metrics: Arc<Metrics>,
     /// This inline engine's own degraded flag (`rmp` #414), mirroring the threaded engine. Single-
@@ -154,7 +154,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             // Inline (deterministic) read dispatch — never a pool. See the field docs.
             dispatch: ReadDispatch::Inline,
             readers_inflight: std::sync::atomic::AtomicU64::new(0),
-            plan_cache: super::exec::EnginePlanCache::new(),
+            plan_cache: std::sync::Mutex::new(super::exec::EnginePlanCache::new()),
             degraded: super::EngineDegraded::new(),
             maintenance_degraded: super::MaintenanceDegraded::new(),
             transactions: Arc::new(crate::txn_registry::TransactionRegistry::new()),
@@ -215,7 +215,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             &mut self.coordinator,
             &self.open,
             &self.next_ticket,
-            &mut self.plan_cache,
+            &self.plan_cache,
             &self.extensions,
             &self.dispatch,
             &self.readers_inflight,
@@ -434,7 +434,10 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     /// misses / current size / capacity. Lets a test observe that a repeated query text reuses a cached
     /// plan (a hit) and that a schema change invalidates it (the next compile is a miss again).
     pub fn plan_cache_stats(&self) -> graphus_cypher::CacheStats {
-        self.plan_cache.stats()
+        self.plan_cache
+            .lock()
+            .expect("INVARIANT: the plan-cache latch is not poisoned")
+            .stats()
     }
 
     /// Captures an online backup chain artifact of the live store, returning its plaintext bytes.

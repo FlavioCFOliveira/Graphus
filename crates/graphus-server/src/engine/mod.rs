@@ -1019,10 +1019,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // (and `&mut`-borrowed on) this single engine thread, so its single-threaded contract holds with no
     // synchronisation. Invalidated by a schema-version bump on any planner-visible catalog change (DDL
     // or an online index build promoting `Populating`→`Online`).
-    let mut plan_cache = shared
-        .plan_cache
-        .lock()
-        .expect("INVARIANT: the plan cache's latch is not poisoned");
+
     // Whether an index build was pending at the end of the previous tick. A `true`→`false` transition
     // means a build just completed (an index promoted `Populating`→`Online`), which changes the
     // planner-visible catalog (`TxnCoordinator::catalog` now exposes the new index) and so must
@@ -1064,10 +1061,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // dispatching new commands while statements are parked (the #372 no-head-of-line-block property) —
     // so this is a FIFO `VecDeque`, bounded by `max_parked_inline`. The historical single-`Option` slot
     // silently clobbered the first parked statement when a second suspended (`rmp` #485 finding B1).
-    let mut parked = shared
-        .parked
-        .lock()
-        .expect("INVARIANT: the parked-statement latch is not poisoned");
+
     // Held in an `Option` so the terminal `Shutdown` can move the coordinator out to consume it for
     // the final flush (`TxnCoordinator::into_store` is by-value). It is always `Some` while the loop
     // is processing commands.
@@ -1147,7 +1141,10 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                 .open
                 .lock()
                 .expect("INVARIANT: the open-tx latch is not poisoned"),
-            &parked,
+            &shared
+                .parked
+                .lock()
+                .expect("INVARIANT: the parked latch is not poisoned"),
             max_transaction_age,
             &clock,
             &metrics,
@@ -1163,7 +1160,10 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         // a panic-isolation boundary (`rmp` #485 B2): a panic on a resumed batch rolls that statement
         // back and keeps the engine alive instead of unwinding the single engine thread.
         resume_parked_statements(
-            &mut parked,
+            &mut shared
+                .parked
+                .lock()
+                .expect("INVARIANT: the parked latch is not poisoned"),
             &coordinator,
             &mut shared
                 .open
@@ -1195,11 +1195,11 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                 coordinator: &mut coordinator,
                 open: &shared.open,
                 next_ticket: &shared.next_ticket,
-                plan_cache: &mut plan_cache,
+                plan_cache: &shared.plan_cache,
                 extensions: &extensions,
                 dispatch: &dispatch,
                 readers_inflight: &shared.readers_inflight,
-                parked: &mut parked,
+                parked: &shared.parked,
                 max_parked_inline,
                 result_buffer_capacity,
                 metrics: &metrics,
@@ -1285,7 +1285,11 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             || vector_blocked
             || ft_spatial_poisoned
             || shared.readers_inflight.load(Ordering::Relaxed) > 0
-            || !parked.is_empty();
+            || !shared
+                .parked
+                .lock()
+                .expect("INVARIANT: the parked latch is not poisoned")
+                .is_empty();
 
         let cmd = if timed {
             match rx.recv_timeout(INDEX_BUILD_TICK) {
@@ -1303,11 +1307,18 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                         &db_name,
                         &mut index_health_seen,
                     ) {
-                        plan_cache.bump_schema();
+                        shared
+                            .plan_cache
+                            .lock()
+                            .expect("INVARIANT: the plan-cache latch is not poisoned")
+                            .bump_schema();
                     }
                     invalidate_cache_on_build_completion(
                         &coordinator,
-                        &mut plan_cache,
+                        &mut shared
+                            .plan_cache
+                            .lock()
+                            .expect("INVARIANT: the plan-cache latch is not poisoned"),
                         &mut builds_were_pending,
                     );
                     continue 'engine;
@@ -1339,11 +1350,11 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             coordinator: &mut coordinator,
             open: &shared.open,
             next_ticket: &shared.next_ticket,
-            plan_cache: &mut plan_cache,
+            plan_cache: &shared.plan_cache,
             extensions: &extensions,
             dispatch: &dispatch,
             readers_inflight: &shared.readers_inflight,
-            parked: &mut parked,
+            parked: &shared.parked,
             max_parked_inline,
             result_buffer_capacity,
             metrics: &metrics,
@@ -2415,11 +2426,11 @@ struct ProcessCtx<'a, D: BlockDevice + Send + Sync + 'static, S: LogSink + Send 
     /// for its own duration — `O(1)` for the short commands, and released before execution for `RUN`.
     open: &'a std::sync::Mutex<OpenTxTable>,
     next_ticket: &'a AtomicU64,
-    plan_cache: &'a mut exec::EnginePlanCache,
+    plan_cache: &'a std::sync::Mutex<exec::EnginePlanCache>,
     extensions: &'a Arc<graphus_cypher::extension::ExtensionRegistry>,
     dispatch: &'a read_pool::ReadDispatch<D, S>,
     readers_inflight: &'a AtomicU64,
-    parked: &'a mut VecDeque<exec::InFlightInline>,
+    parked: &'a std::sync::Mutex<VecDeque<exec::InFlightInline>>,
     max_parked_inline: usize,
     result_buffer_capacity: usize,
     metrics: &'a Arc<Metrics>,
@@ -2566,7 +2577,9 @@ fn process_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     }
 
     enqueue_suspended(
-        parked,
+        &mut parked
+            .lock()
+            .expect("INVARIANT: the parked latch is not poisoned"),
         &mut just_suspended,
         max_parked_inline,
         coordinator,
@@ -2578,7 +2591,13 @@ fn process_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         degraded,
     );
     drive_index_build(coordinator);
-    invalidate_cache_on_build_completion(coordinator, plan_cache, builds_were_pending);
+    invalidate_cache_on_build_completion(
+        coordinator,
+        &mut plan_cache
+            .lock()
+            .expect("INVARIANT: the plan-cache latch is not poisoned"),
+        builds_were_pending,
+    );
     // The loading→not-loading edge (`rmp` #565): a bulk-import session that was active before this
     // command is now gone — this command was the `End`. On that edge `maybe_run_maintenance` re-anchors
     // its watermark and skips the O(N) GC pass so it cannot block the `Shutdown` a `STOP DATABASE` queues
@@ -2628,7 +2647,7 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
     // release the table before execution rather than hold it across one.
     open: &std::sync::Mutex<OpenTxTable>,
     next_ticket: &AtomicU64,
-    plan_cache: &mut exec::EnginePlanCache,
+    plan_cache: &std::sync::Mutex<exec::EnginePlanCache>,
     extensions: &Arc<graphus_cypher::extension::ExtensionRegistry>,
     dispatch: &read_pool::ReadDispatch<D, S>,
     readers_inflight: &AtomicU64,
@@ -2726,7 +2745,9 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
                 &mut open
                     .lock()
                     .expect("INVARIANT: the open-tx latch is not poisoned"),
-                plan_cache,
+                &mut plan_cache
+                    .lock()
+                    .expect("INVARIANT: the plan-cache latch is not poisoned"),
                 ticket,
                 &query,
                 params,
@@ -2793,7 +2814,10 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             // harmless (it just recompiles against the unchanged catalog once) and keeps the rule
             // simple: any mutating DDL bumps the version.
             if mutating && out.is_ok() {
-                plan_cache.bump_schema();
+                plan_cache
+                    .lock()
+                    .expect("INVARIANT: the plan-cache latch is not poisoned")
+                    .bump_schema();
             }
             // `rmp` #813: a schema DDL is a committing transaction, so — like a real Neo4j server — it
             // carries the DB's durable-write bookmark on its terminal `PULL` `SUCCESS`. A CREATE/DROP is
@@ -2823,7 +2847,10 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             // node-key/property-type rule) — invalidate so no plan compiled under the old schema is
             // reused (`rmp` task #322).
             if mutating && out.is_ok() {
-                plan_cache.bump_schema();
+                plan_cache
+                    .lock()
+                    .expect("INVARIANT: the plan-cache latch is not poisoned")
+                    .bump_schema();
             }
             // `rmp` #813: a constraint DDL is a committing transaction — carry the DB's durable-write
             // bookmark on its terminal `PULL` `SUCCESS`, exactly as Neo4j does (the seam copies it onto
@@ -4039,13 +4066,13 @@ fn pipelined_group_commit<
     // The latch: this path re-enters the dispatch (`rmp` #1033).
     open: &std::sync::Mutex<OpenTxTable>,
     next_ticket: &AtomicU64,
-    plan_cache: &mut exec::EnginePlanCache,
+    plan_cache: &std::sync::Mutex<exec::EnginePlanCache>,
     extensions: &Arc<graphus_cypher::extension::ExtensionRegistry>,
     dispatch: &read_pool::ReadDispatch<D, S>,
     readers_inflight: &AtomicU64,
     commit_batch: &mut Vec<PendingCommit>,
     pending_cmd: &mut Option<EngineCommand>,
-    parked: &mut VecDeque<exec::InFlightInline>,
+    parked: &std::sync::Mutex<VecDeque<exec::InFlightInline>>,
     max_parked_inline: usize,
     result_buffer_capacity: usize,
     metrics: &Arc<Metrics>,
@@ -4175,7 +4202,9 @@ fn pipelined_group_commit<
         // re-suspends is pushed to the back and only gets its next batch on the following pass (its own
         // budget snapshot), so this never spins on one fast-refilling consumer.
         resume_parked_statements(
-            parked,
+            &mut parked
+                .lock()
+                .expect("INVARIANT: the parked latch is not poisoned"),
             coordinator,
             &mut open
                 .lock()
@@ -4270,13 +4299,13 @@ fn drain_commit_batch<
     // The latch, for the same reason as `dispatch_command` (`rmp` #1033).
     open: &std::sync::Mutex<OpenTxTable>,
     next_ticket: &AtomicU64,
-    plan_cache: &mut exec::EnginePlanCache,
+    plan_cache: &std::sync::Mutex<exec::EnginePlanCache>,
     extensions: &Arc<graphus_cypher::extension::ExtensionRegistry>,
     dispatch: &read_pool::ReadDispatch<D, S>,
     readers_inflight: &AtomicU64,
     commit_batch: &mut Vec<PendingCommit>,
     pending_cmd: &mut Option<EngineCommand>,
-    parked: &mut VecDeque<exec::InFlightInline>,
+    parked: &std::sync::Mutex<VecDeque<exec::InFlightInline>>,
     max_parked_inline: usize,
     result_buffer_capacity: usize,
     metrics: &Arc<Metrics>,
@@ -4334,7 +4363,9 @@ fn drain_commit_batch<
                 // it — it has NOT committed (mid-stream), so it never joined the batch; its later resume
                 // finalises it inline. A `Commit` never suspends, so this is a no-op for that arm.
                 enqueue_suspended(
-                    parked,
+                    &mut parked
+                        .lock()
+                        .expect("INVARIANT: the parked latch is not poisoned"),
                     &mut just_suspended,
                     max_parked_inline,
                     coordinator,
