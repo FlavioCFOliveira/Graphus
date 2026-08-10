@@ -474,6 +474,9 @@ pub struct EngineParams {
     /// Resolved from [`AdmissionConfig::reader_threads`](crate::config::AdmissionConfig::reader_threads)
     /// (already auto-sized when `0`).
     pub reader_threads: usize,
+    /// Resolved from [`AdmissionConfig::engine_workers`](crate::config::AdmissionConfig::engine_workers):
+    /// how many engine workers serve this database's command queues (`rmp` #1033/#1035).
+    pub engine_workers: usize,
     /// The encryption-at-rest master key (rmp #85), or `None` for the plaintext store path. When
     /// set, every database's store is an encrypted device (a per-store salted subkey is derived at
     /// create/open). When `None`, the store path is byte-identical to before encryption existed.
@@ -606,6 +609,7 @@ impl EngineParams {
             result_buffer_capacity: config.admission.result_buffer_capacity,
             max_concurrent_queries: config.admission.max_concurrent_queries,
             reader_threads: config.admission.reader_threads(),
+            engine_workers: config.admission.engine_workers.max(1),
             master_key,
             clock: std::sync::Arc::new(crate::server::SystemClock),
             engine_shutdown_timeout: config.timing.shutdown_drain_deadline(),
@@ -986,9 +990,7 @@ fn spawn_db_engine(
         params.engine_queue_capacity,
         params.result_buffer_capacity,
         params.reader_threads,
-        // One engine worker for now (`rmp` #1033): the knob is threaded but the default is the
-        // historical single-worker engine until the measurement of #1034 says otherwise.
-        1,
+        params.engine_workers,
         metrics,
         std::sync::Arc::clone(&params.clock),
         params.statement_timeout,
@@ -2905,6 +2907,7 @@ mod tests {
             result_buffer_capacity: 32,
             max_concurrent_queries: 16,
             reader_threads: 2,
+            engine_workers: 1,
             master_key: None,
             clock: std::sync::Arc::new(crate::server::SystemClock),
             engine_shutdown_timeout: std::time::Duration::from_secs(10),

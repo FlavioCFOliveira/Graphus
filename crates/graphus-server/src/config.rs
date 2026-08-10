@@ -189,6 +189,17 @@ pub struct AdmissionConfig {
     /// [`engine_queue_capacity`](Self::engine_queue_capacity) (which bounds the *command* channel); a
     /// full reader queue falls back to the inline engine-thread path (still correct, just serial).
     pub reader_threads: usize,
+    /// Number of **engine worker threads** serving the command queue (`rmp` #1033/#1035): each
+    /// serves one queue, and a session is routed always to the same worker so its commands keep
+    /// their order. Worker 0 additionally drives the maintenance cadence, so a checkpoint or GC pass
+    /// happens once rather than once per worker.
+    ///
+    /// `0` (the default) selects the automatic size, which is **1 for now** — deliberately, and not
+    /// for want of the machinery: the affinity that makes `> 1` correct landed with `rmp` #1035, but
+    /// the value that is actually *better* is a measurement (`rmp` #1034), and this project does not
+    /// pick performance defaults ahead of the evidence. Any value `> 0` pins the count exactly, so
+    /// the measurement — and anyone wanting to A/B it — can ask for four or sixteen today.
+    pub engine_workers: usize,
     /// Number of **morsel worker threads** for intra-query parallelism (`rmp` task #339): a single
     /// large analytical aggregation (`MATCH (n:Label) RETURN <exact-agg>(n.p)`) splits its label scan
     /// into contiguous morsels read concurrently on a dedicated pool, so one heavy query scales past one
@@ -252,6 +263,7 @@ impl Default for AdmissionConfig {
             // (the NAT/load-balancer/reverse-proxy setting where all clients share one source IP).
             max_connections_per_ip: 256,
             reader_threads: 0,
+            engine_workers: 0,
             morsel_parallelism: 0,
             max_open_transactions: graphus_rest::registry::DEFAULT_MAX_OPEN_TRANSACTIONS,
             csr_adjacency: false,
@@ -1374,6 +1386,12 @@ impl ServerConfig {
             self.buffer_pool_pages = auto_buffer_pool_pages(hw);
         }
         let cpu_pool = hw.logical_cpus.clamp(1, AUTO_CPU_POOL_CAP);
+        if self.admission.engine_workers == 0 {
+            // Auto resolves to ONE until `rmp` #1034 measures the curve. The engine is correct at
+            // any W since #1035; what is unknown is which W is fastest, and a default chosen without
+            // the measurement would be a guess wearing the authority of a default.
+            self.admission.engine_workers = 1;
+        }
         if self.admission.reader_threads == 0 {
             self.admission.reader_threads = cpu_pool;
         }
