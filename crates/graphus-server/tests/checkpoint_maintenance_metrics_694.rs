@@ -58,11 +58,13 @@ fn threaded_engine(metrics: Arc<Metrics>) -> Engine {
 fn teardown(engine: Engine, handle: EngineHandle) {
     let Engine {
         handle: inner,
-        join,
+        joins,
     } = engine;
     drop(handle);
     drop(inner);
-    join.join().expect("engine thread joins");
+    for join in joins {
+        join.join().expect("engine worker joins");
+    }
 }
 
 /// Runs one auto-commit write statement to completion, draining its rows.

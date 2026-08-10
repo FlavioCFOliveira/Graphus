@@ -212,7 +212,11 @@ fn shutdown(engine: Engine) {
         .expect("build shutdown runtime");
     rt.block_on(engine.handle.shutdown())
         .expect("graceful shutdown");
-    engine.join.join().expect("engine thread joins");
+    {
+        for j in engine.joins {
+            let _ = j.join();
+        }
+    }
 }
 
 /// **The certification.** Over a workload that seals WAL segments and then RECLAIMS them, the counter's

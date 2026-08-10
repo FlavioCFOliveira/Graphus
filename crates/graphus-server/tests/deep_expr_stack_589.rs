@@ -42,11 +42,13 @@ fn threaded_engine() -> Engine {
 fn teardown(engine: Engine, handle: EngineHandle) {
     let Engine {
         handle: inner,
-        join,
+        joins,
     } = engine;
     drop(handle);
     drop(inner);
-    join.join().expect("engine thread joins");
+    for join in joins {
+        join.join().expect("engine worker joins");
+    }
 }
 
 fn run(handle: &EngineHandle, stmt: &str) -> (bool, Option<i64>) {

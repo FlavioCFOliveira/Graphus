@@ -222,7 +222,11 @@ fn graceful_shutdown(engine: Engine) {
         .expect("build shutdown runtime");
     rt.block_on(engine.handle.shutdown())
         .expect("graceful shutdown");
-    engine.join.join().expect("engine thread joins");
+    {
+        for j in engine.joins {
+            let _ = j.join();
+        }
+    }
 }
 
 /// Under concurrency, many auto-commit writers' `fdatasync`s coalesce behind FEW shared hardens (`rmp`

@@ -80,6 +80,8 @@ fn engine_with_timeout(statement_timeout: Option<Duration>) -> Engine {
         // Two reader workers, so an auto-commit read genuinely dispatches off-thread and the deadline
         // is exercised on the `ReadTask` path as well as the inline one.
         2,
+        // One engine worker (`rmp` #1033).
+        1,
         metrics,
         clock,
         statement_timeout,
@@ -130,11 +132,13 @@ fn run_with_budget(handle: &EngineHandle, stmt: &str, budget: Option<Duration>) 
 fn shutdown(engine: Engine, handle: EngineHandle) {
     let Engine {
         handle: inner,
-        join,
+        joins,
     } = engine;
     drop(handle);
     drop(inner);
-    join.join().expect("engine thread joins cleanly");
+    for join in joins {
+        join.join().expect("engine worker joins cleanly");
+    }
 }
 
 #[test]

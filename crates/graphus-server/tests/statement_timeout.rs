@@ -56,6 +56,8 @@ fn engine_with_timeout(statement_timeout: Option<Duration>) -> Engine {
         // Two reader workers so an auto-commit read genuinely dispatches off-thread (exercising the
         // `ReadTask` deadline path), while an explicit-transaction read still runs inline.
         2,
+        // One engine worker (`rmp` #1033).
+        1,
         metrics,
         clock,
         statement_timeout,
@@ -128,11 +130,13 @@ fn run_explicit_read(handle: &EngineHandle, stmt: &str) -> Result<(), ()> {
 fn shutdown(engine: Engine, handle: EngineHandle) {
     let Engine {
         handle: inner,
-        join,
+        joins,
     } = engine;
     drop(handle);
     drop(inner);
-    join.join().expect("engine thread joins cleanly");
+    for join in joins {
+        join.join().expect("engine worker joins cleanly");
+    }
 }
 
 /// A 3-way cartesian product over the seeded `:N` set, aggregated — `n^3` intermediate rows. With a

@@ -642,7 +642,7 @@ const FORCE_DETACH_WATCHDOG_MAX_REMINDERS: u32 = 20;
 /// wedged engine), so tracking it would add lifecycle machinery for no benefit.
 fn spawn_force_detached_watchdog(
     db: String,
-    join: std::thread::JoinHandle<()>,
+    joins: Vec<std::thread::JoinHandle<()>>,
     window: std::time::Duration,
     metrics: Arc<Metrics>,
 ) {
@@ -652,7 +652,7 @@ fn spawn_force_detached_watchdog(
         let started = std::time::Instant::now();
         for reminder in 1..=FORCE_DETACH_WATCHDOG_MAX_REMINDERS {
             tokio::time::sleep(poll).await;
-            if join.is_finished() {
+            if joins.iter().all(std::thread::JoinHandle::is_finished) {
                 metrics.clear_engine_force_detached();
                 tracing::info!(
                     db = %db,
@@ -986,6 +986,9 @@ fn spawn_db_engine(
         params.engine_queue_capacity,
         params.result_buffer_capacity,
         params.reader_threads,
+        // One engine worker for now (`rmp` #1033): the knob is threaded but the default is the
+        // historical single-worker engine until the measurement of #1034 says otherwise.
+        1,
         metrics,
         std::sync::Arc::clone(&params.clock),
         params.statement_timeout,
@@ -1179,8 +1182,8 @@ pub struct DbInfo {
 struct RunningEngine {
     /// The handle handed to consumers (already carrying the per-database admission limit).
     handle: EngineHandle,
-    /// The engine thread, joined when the database stops.
-    join: std::thread::JoinHandle<()>,
+    /// The engine worker threads, joined when the database stops (`rmp` #1033).
+    joins: Vec<std::thread::JoinHandle<()>>,
 }
 
 /// The mutable catalog state, owned by the admin mutex (module docs: locking design).
@@ -2069,7 +2072,7 @@ impl DatabaseCatalog {
             name.to_owned(),
             RunningEngine {
                 handle: handle.clone(),
-                join: engine.join,
+                joins: engine.joins,
             },
         );
         state.failed.remove(name);
@@ -2092,7 +2095,7 @@ impl DatabaseCatalog {
             name.to_owned(),
             RunningEngine {
                 handle: handle.clone(),
-                join: engine.join,
+                joins: engine.joins,
             },
         );
         state.failed.remove(name);
@@ -2142,7 +2145,7 @@ impl DatabaseCatalog {
         // now-dead engine in `loading_handles`.
         self.write_loading_handles().remove(name);
         let no_progress = self.params.engine_shutdown_timeout;
-        let RunningEngine { handle, join } = engine;
+        let RunningEngine { handle, joins } = engine;
 
         // Progress-aware drain (`rmp` #563). Re-poll the SAME `shutdown()` future across no-progress
         // windows; between windows compare the drain-progress beacon to decide "healthy-but-slow" vs
@@ -2193,7 +2196,7 @@ impl DatabaseCatalog {
                     self.metrics.record_engine_force_detached();
                     spawn_force_detached_watchdog(
                         name.to_owned(),
-                        join,
+                        joins,
                         no_progress,
                         Arc::clone(&self.metrics),
                     );
@@ -2207,12 +2210,25 @@ impl DatabaseCatalog {
         // (the store-open lock is released only when the thread finishes, so no reopen can race).
         match tokio::time::timeout(
             no_progress,
-            tokio::task::spawn_blocking(move || join.join()),
+            tokio::task::spawn_blocking(move || {
+                // Every worker, not just one (`rmp` #1033). A panicked worker is reported and
+                // the rest are still joined: leaving one un-joined is a detached thread holding
+                // the store-open lock, which is the very hang the force-detach watchdog exists for.
+                let mut panicked = 0usize;
+                for join in joins {
+                    if join.join().is_err() {
+                        panicked += 1;
+                    }
+                }
+                panicked
+            }),
         )
         .await
         {
-            Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(_panic))) => tracing::error!(db = %name, "engine thread panicked"),
+            Ok(Ok(0)) => {}
+            Ok(Ok(panicked)) => {
+                tracing::error!(db = %name, panicked, "engine worker thread(s) panicked");
+            }
             Ok(Err(e)) => tracing::error!(db = %name, error = %e, "joining engine thread"),
             Err(_elapsed) => tracing::error!(
                 db = %name,

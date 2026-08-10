@@ -265,11 +265,13 @@ fn graceful_shutdown(engine: Engine, handle: EngineHandle) {
     let _ = rt.block_on(handle.shutdown());
     let Engine {
         handle: owned,
-        join,
+        joins,
     } = engine;
     drop(handle);
     drop(owned);
-    join.join().expect("engine thread joins");
+    for join in joins {
+        join.join().expect("engine worker joins");
+    }
 }
 
 /// A device write error during a **checkpoint flush** is surfaced as a clean error (not a panic, not

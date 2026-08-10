@@ -980,7 +980,7 @@ impl PendingCommit {
 #[allow(clippy::too_many_arguments)] // The engine loop threads its whole execution context here.
 fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>(
     db_name: Arc<str>,
-    coordinator: TxnCoordinator<D, S>,
+    coordinator: Arc<TxnCoordinator<D, S>>,
     // The command queue, shared by every worker (`rmp` #1033). `std::sync::mpsc::Receiver` is
     // `!Sync`, so the workers dequeue under a brief lock — the same MPMC-over-mpsc shape the
     // reader pool uses, where the lock covers only the dequeue and never the work that follows.
@@ -1089,7 +1089,9 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // `Arc` since `rmp` #1033: the coordinator is `Send + Sync` and every method takes `&self`, so
     // several engine workers can hold it at once. The `Option` remains because `Shutdown` must take
     // SOLE ownership back — `into_store` is by-value — which is what `Arc::try_unwrap` below asserts.
-    let mut coordinator: Option<Arc<TxnCoordinator<D, S>>> = Some(Arc::new(coordinator));
+    // The share this worker holds. The `Option` remains because `Shutdown` takes it back to consume
+    // it — and by then this worker is the last one, so the `Arc::try_unwrap` below succeeds.
+    let mut coordinator: Option<Arc<TxnCoordinator<D, S>>> = Some(coordinator);
     // The WAL `durable_len` captured at the last background maintenance checkpoint (`rmp` #305). The
     // cadence fires when growth past it crosses `MAINTENANCE_CHECKPOINT_INTERVAL_BYTES`, reclaiming
     // RAM/disk/version slots without an operator trigger. Seeded from the current WAL length so a
@@ -1371,16 +1373,27 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break 'engine,
             }
         } else {
-            // No build pending and no readers in flight: a plain blocking receive (the original
-            // behaviour). `Err` is the closed-channel EOF the old `while let Ok(..)` terminated on.
+            // This WAS a plain blocking `recv`, and with more than one worker that is a deadlock
+            // (`rmp` #1033): a worker parked in `recv` never observes `stopping`, so the worker
+            // handling `Shutdown` waits for it to leave while it waits for a command that will never
+            // come. Found by running the multi-stream gate with four workers, where it hung — with
+            // W = 1 it cannot happen, which is exactly why the knob had to be exercised rather than
+            // merely threaded.
+            //
+            // A bounded wait costs one wake per idle worker per tick and makes the stop observable.
             let received = {
                 let guard = rx
                     .lock()
                     .expect("INVARIANT: the command-queue latch is not poisoned");
-                guard.recv()
+                guard.recv_timeout(INDEX_BUILD_TICK)
             };
-            let Ok(cmd) = received else { break 'engine };
-            cmd
+            match received {
+                Ok(cmd) => cmd,
+                // Nothing this tick: loop round, re-check `stopping`, and wait again.
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue 'engine,
+                // Channel closed (every client sender dropped): stop serving.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break 'engine,
+            }
         };
         // A `Shutdown` is intercepted BEFORE it is dispatched (`rmp` #1033). The dispatch's
         // shutdown path consumes the coordinator for the final flush, and `Arc::try_unwrap` needs
@@ -4626,8 +4639,12 @@ fn harden_store<D: BlockDevice, S: LogSink>(
 pub struct Engine {
     /// The shared, cloneable client every connection task uses.
     pub handle: EngineHandle,
-    /// The engine thread, joined at shutdown (after [`EngineHandle::shutdown`] returns).
-    pub join: std::thread::JoinHandle<()>,
+    /// The engine worker threads, joined at shutdown (after [`EngineHandle::shutdown`] returns).
+    ///
+    /// A `Vec` since `rmp` #1033: the loop body is a worker body and the engine runs W of them over
+    /// one command queue. Every one must be joined, and the shutdown path already guarantees the
+    /// order — the worker handling `Shutdown` waits to be the last inside the loop.
+    pub joins: Vec<std::thread::JoinHandle<()>>,
 }
 
 /// Spawns the engine on a dedicated OS thread, constructing the coordinator inside that thread from
@@ -4695,6 +4712,9 @@ where
         engine_queue_capacity,
         result_buffer_capacity,
         reader_threads,
+        // `spawn_engine` keeps the historical single-worker engine; the multi-worker knob is opted
+        // into through `spawn_engine_with_timeout` (`rmp` #1033).
+        1,
         metrics,
         clock,
         None,
@@ -4727,6 +4747,20 @@ pub fn spawn_engine_with_timeout<D, S, B>(
     engine_queue_capacity: usize,
     result_buffer_capacity: usize,
     reader_threads: usize,
+    // How many engine WORKERS serve the command queue (`rmp` #1033). Worker 0 additionally drives
+    // the maintenance cadence, so a checkpoint or GC pass still happens once, not W times.
+    //
+    // MUST BE 1 UNTIL SESSION AFFINITY EXISTS. Measured, not assumed: running the multi-stream gate
+    // (`rmp` #907) with four workers fails with `TransactionNotFound` on a `RUN` that follows its
+    // own session's `BEGIN`. One shared queue means two consecutive commands OF ONE SESSION can be
+    // dequeued by different workers and run out of order, and no amount of latching under them fixes
+    // that — the ordering was supplied by there being one consumer.
+    //
+    // This is why both reference engines bind a session (Memgraph) or a transaction (Neo4j) to a
+    // thread rather than sharing one queue: the affinity IS the ordering. The queue therefore has to
+    // become per-worker with sessions hashed onto workers, which is a design change to #1016, not a
+    // parameter change here.
+    engine_workers: usize,
     metrics: Arc<Metrics>,
     clock: Arc<dyn graphus_core::capability::Clock + Send + Sync>,
     statement_timeout: Option<std::time::Duration>,
@@ -4740,9 +4774,10 @@ where
     B: FnOnce() -> Result<TxnCoordinator<D, S>> + Send + 'static,
 {
     let (tx, rx) = std::sync::mpsc::sync_channel::<EngineCommand>(engine_queue_capacity);
-    // Report startup success/failure back from the thread (a `Send` `Result`), so the coordinator
-    // itself never crosses the boundary.
-    let (init_tx, init_rx) = std::sync::mpsc::sync_channel::<Result<()>>(1);
+    // No startup channel (`rmp` #1033): the coordinator is built HERE, before any worker exists, so
+    // a build failure is simply this function's `Err`. The channel existed only to carry a `Send`
+    // `Result` back out of the thread that built it — necessary while the coordinator itself could
+    // not cross a thread boundary, which layer 7b ended.
     let loop_metrics = Arc::clone(&metrics);
     // This engine's OWN degraded flag (`rmp` #414): shared (cloned) between the engine thread's
     // recovery boundary (the sole writer) and the `EngineHandle` clones + `/health/ready` readers, so a
@@ -4761,34 +4796,50 @@ where
     // (which `stop_engine` polls) share the SAME `AtomicU64`.
     let drain_progress = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let loop_drain_progress = Arc::clone(&drain_progress);
-    let join = std::thread::Builder::new()
-        .name("graphus-engine".to_owned())
-        // A large stack: query compile/execute recurses on AST depth (`rmp` #473). See
-        // [`QUERY_ENGINE_STACK_SIZE`] — the default ~2 MiB stack overflows on a legal at-the-limit
-        // query, and a stack overflow aborts the whole process.
-        .stack_size(QUERY_ENGINE_STACK_SIZE)
-        .spawn(move || match build() {
-            Ok(coordinator) => {
-                // `rmp` #973: the server's engine thread is deliberately OUTSIDE the deterministic
-                // scheduler. Bringing the server engine under it needs the blocking command/reply
-                // channels handled first (a thread parked in `recv()` holding the token freezes the
+    // The command queue is shared by every worker: `Receiver` is `!Sync`, so it goes behind a latch
+    // that each worker takes only to dequeue (`rmp` #1033).
+    let rx = Arc::new(std::sync::Mutex::new(rx));
+    // The coordinator is built ONCE, here, and shared. It used to be built inside the thread — the
+    // comment said "so the coordinator itself never crosses the boundary", which was true while it
+    // was `!Send`. Layer 7b made it `Send + Sync`, so the premise is gone and every worker can hold
+    // a share of one coordinator instead of there being only one thread that may touch it.
+    let coordinator = match build() {
+        Ok(coordinator) => Arc::new(coordinator),
+        // Startup failed (e.g. corrupt store): report it without spawning anything.
+        Err(e) => return Err(e),
+    };
+    // The drain-progress beacon is installed once, on the shared coordinator.
+    coordinator.set_drain_progress(loop_drain_progress);
+
+    let mut joins = Vec::with_capacity(engine_workers);
+    for worker_id in 0..engine_workers {
+        let db_name = Arc::clone(&db_name);
+        let coordinator = Arc::clone(&coordinator);
+        let rx = Arc::clone(&rx);
+        let loop_metrics = Arc::clone(&loop_metrics);
+        let loop_degraded = loop_degraded.clone();
+        let loop_maintenance_degraded = loop_maintenance_degraded.clone();
+        let clock = Arc::clone(&clock);
+        let transactions = Arc::clone(&transactions);
+        let join = std::thread::Builder::new()
+            .name(format!("graphus-engine-{worker_id}"))
+            // A large stack: query compile/execute recurses on AST depth (`rmp` #473). See
+            // [`QUERY_ENGINE_STACK_SIZE`] — the default ~2 MiB stack overflows on a legal
+            // at-the-limit query, and a stack overflow aborts the whole process.
+            .stack_size(QUERY_ENGINE_STACK_SIZE)
+            .spawn(move || {
+                // `rmp` #973: the server's engine threads are deliberately OUTSIDE the deterministic
+                // scheduler. Bringing them under it needs the blocking command/reply channels
+                // handled first (a thread parked in `recv()` holding the execution token freezes the
                 // run), which is its own task; the DST drives `LocalEngine` inline instead. Marked
                 // explicitly so it never reaches a yield point unregistered.
                 graphus_core::sched::exempt();
-                // Install the shared drain-progress beacon into the store (`rmp` #563) so its long GC
-                // and flush loops heartbeat the SAME `AtomicU64` the handle exposes to `stop_engine`.
-                coordinator.set_drain_progress(loop_drain_progress);
-                // Startup succeeded: signal readiness, then run the loop until Shutdown. The loop
-                // spawns the off-thread reader pool internally (`rmp` task #336, Slice 3b-ii).
-                let _ = init_tx.send(Ok(()));
                 run_engine_loop(
                     db_name,
                     coordinator,
-                    std::sync::Arc::new(std::sync::Mutex::new(rx)),
-                    // Worker 0 of one: the maintenance cadence rides on this worker, and the
-                    // shared state is sized for a single loop (`rmp` #1033).
-                    0,
-                    1,
+                    rx,
+                    worker_id,
+                    engine_workers,
                     result_buffer_capacity,
                     reader_threads,
                     loop_metrics,
@@ -4798,39 +4849,23 @@ where
                     statement_timeout,
                     max_transaction_age,
                     egress_stall_timeout,
-                    // Bound on concurrently parked (suspended) inline statements (`rmp` #485 B1). The
-                    // command channel is sized `engine_queue_capacity`, which in any sane config is ≥
-                    // `max_concurrent_queries` (the admission limit that actually bounds how many
-                    // statements can be parked at once), so this is a generous never-reached ceiling.
+                    // Bound on concurrently parked (suspended) inline statements (`rmp` #485 B1).
                     engine_queue_capacity,
                     transactions,
                 );
-            }
-            Err(e) => {
-                // Startup failed (e.g. corrupt store): report it and exit without serving.
-                let _ = init_tx.send(Err(e));
-            }
-        })
-        .map_err(|e| GraphusError::Storage(format!("spawning engine thread: {e}")))?;
-
-    // Wait for the thread's startup result before returning a usable handle.
-    match init_rx.recv() {
-        Ok(Ok(())) => Ok(Engine {
-            handle: EngineHandle::new(tx, metrics, degraded, maintenance_degraded, drain_progress),
-            join,
-        }),
-        Ok(Err(e)) => {
-            // The thread already exited; join it to avoid a detached thread, then surface the error.
-            let _ = join.join();
-            Err(e)
-        }
-        Err(_) => {
-            let _ = join.join();
-            Err(GraphusError::Storage(
-                "engine thread exited before reporting startup".to_owned(),
-            ))
-        }
+            })
+            .map_err(|e| {
+                GraphusError::Storage(format!("spawning engine worker {worker_id}: {e}"))
+            })?;
+        joins.push(join);
     }
+
+    // Startup already succeeded: the coordinator was built above, before any worker existed, so
+    // there is no thread whose startup result has to be waited for (`rmp` #1033).
+    Ok(Engine {
+        handle: EngineHandle::new(tx, metrics, degraded, maintenance_degraded, drain_progress),
+        joins,
+    })
 }
 
 #[cfg(test)]

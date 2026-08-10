@@ -215,11 +215,13 @@ fn run_explicit(
 fn shutdown(eng: Engine, handle: EngineHandle) {
     let Engine {
         handle: inner,
-        join,
+        joins,
     } = eng;
     drop(handle);
     drop(inner);
-    join.join().expect("engine joins");
+    for join in joins {
+        join.join().expect("engine worker joins");
+    }
 }
 
 /// (1) Correctness + engagement, always runs. A lone auto-commit `r3_fof3` read dispatched off-thread

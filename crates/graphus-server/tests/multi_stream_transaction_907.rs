@@ -77,6 +77,8 @@ fn engine() -> Engine {
         // statement never uses it (only auto-commit reads are dispatched off-thread), which is
         // precisely why these in-transaction statements exercise the parked inline path.
         2,
+        // One engine worker (`rmp` #1033).
+        1,
         Arc::clone(&metrics),
         clock,
         // No statement timeout and no transaction-age cap: the point is to prove the engine keeps
@@ -91,9 +93,11 @@ fn engine() -> Engine {
 
 /// Drops every handle and joins the engine thread, so a wedged engine also fails the teardown.
 fn stop(engine: Engine) {
-    let Engine { handle, join } = engine;
+    let Engine { handle, joins } = engine;
     drop(handle);
-    join.join().expect("engine thread joins cleanly");
+    for join in joins {
+        join.join().expect("engine worker joins cleanly");
+    }
 }
 
 /// Runs `body` on a worker thread under [`WATCHDOG`]. A body that wedges — the exact regression these

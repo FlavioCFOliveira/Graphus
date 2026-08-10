@@ -159,11 +159,13 @@ fn preload_social(handle: &EngineHandle, n: i64) {
 fn shutdown(eng: Engine, handle: EngineHandle) {
     let Engine {
         handle: inner,
-        join,
+        joins,
     } = eng;
     drop(handle);
     drop(inner);
-    join.join().expect("engine joins");
+    for join in joins {
+        join.join().expect("engine worker joins");
+    }
 }
 
 /// (1) Deterministic dispatch oracle: a reader-safe procedure runs on the reader pool when auto-commit,

@@ -226,11 +226,13 @@ fn write_mode_autocommit_read_dispatches_off_thread() {
 
     let Engine {
         handle: inner,
-        join,
+        joins,
     } = eng;
     drop(handle);
     drop(inner);
-    join.join().expect("engine joins");
+    for join in joins {
+        join.join().expect("engine worker joins");
+    }
 }
 
 /// `rmp` task #377 (deterministic correctness gate, not a measurement): the reader-pool morsel
@@ -326,11 +328,13 @@ fn reader_pool_suppresses_morsel_no_oversubscription() {
 
     let Engine {
         handle: inner,
-        join,
+        joins,
     } = eng;
     drop(handle);
     drop(inner);
-    join.join().expect("engine joins");
+    for join in joins {
+        join.join().expect("engine worker joins");
+    }
 }
 
 /// The concurrent-MATCH scaling measurement. Ignored (multi-second). See the module docs for how to run
@@ -419,11 +423,13 @@ fn concurrent_match_scaling() {
         // would leave a live sender and hang the join (see the `teardown` note in the sibling test).
         let Engine {
             handle: inner,
-            join,
+            joins,
         } = eng;
         drop(handle);
         drop(inner);
-        join.join().expect("engine joins");
+        for join in joins {
+            join.join().expect("engine worker joins");
+        }
     }
     println!(
         "\nMean cores = (User+Sys)/Wall — read from `/usr/bin/time -v` around this binary; \

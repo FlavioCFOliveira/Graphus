@@ -534,11 +534,13 @@ fn run_one_crash_recovery(iter: usize, w: usize, m: i64, sentinel: i64) -> i64 {
     let _ = rt.block_on(handle.shutdown());
     let Engine {
         handle: owned,
-        join,
+        joins,
     } = engine;
     drop(handle);
     drop(owned);
-    join.join().expect("engine thread joins");
+    for join in joins {
+        join.join().expect("engine worker joins");
+    }
 
     acked_total
 }

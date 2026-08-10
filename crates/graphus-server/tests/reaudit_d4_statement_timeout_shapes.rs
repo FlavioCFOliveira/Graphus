@@ -64,6 +64,8 @@ fn engine_with_timeout(timeout: Option<Duration>) -> Engine {
         4096,
         256,
         2,
+        // One engine worker (`rmp` #1033).
+        1,
         metrics,
         clock,
         timeout,
@@ -130,11 +132,13 @@ fn seed_clique(handle: &EngineHandle, n: usize) {
 fn shutdown(engine: Engine, handle: EngineHandle) {
     let Engine {
         handle: inner,
-        join,
+        joins,
     } = engine;
     drop(handle);
     drop(inner);
-    join.join().expect("engine thread joins cleanly");
+    for join in joins {
+        join.join().expect("engine worker joins cleanly");
+    }
 }
 
 /// Runs `body` on a worker thread and waits up to `PROMPT_CEILING`. Returns `(outcome, elapsed)`.

@@ -66,11 +66,13 @@ fn threaded_engine(reader_threads: usize) -> Engine {
 fn teardown(engine: Engine, handle: EngineHandle) {
     let Engine {
         handle: inner,
-        join,
+        joins,
     } = engine;
     drop(handle);
     drop(inner);
-    join.join().expect("engine thread joins");
+    for join in joins {
+        join.join().expect("engine worker joins");
+    }
 }
 
 /// Runs `stmt` in `ticket`, draining its rows; returns `(ok, rows, err)` where `err` is the failure

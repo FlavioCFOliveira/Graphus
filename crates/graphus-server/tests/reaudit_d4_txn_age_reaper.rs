@@ -64,6 +64,8 @@ fn engine_with_age_cap(clock: &SharedClock, max_age: Option<Duration>) -> (Engin
         // Two reader workers, matching the production auto-size shape (auto-commit reads can dispatch
         // off-thread). Explicit-transaction reads still run inline.
         2,
+        // One engine worker (`rmp` #1033).
+        1,
         Arc::clone(&metrics),
         engine_clock,
         None,
@@ -149,11 +151,13 @@ fn settle_active_txns(metrics: &Metrics, expected: u64) -> u64 {
 fn shutdown(engine: Engine, handle: EngineHandle) {
     let Engine {
         handle: inner,
-        join,
+        joins,
     } = engine;
     drop(handle);
     drop(inner);
-    join.join().expect("engine thread joins cleanly");
+    for join in joins {
+        join.join().expect("engine worker joins cleanly");
+    }
 }
 
 /// GATE 1 — the keep-alive evasion fails: an explicit transaction that a client keeps **active** by

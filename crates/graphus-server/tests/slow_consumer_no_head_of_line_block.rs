@@ -180,11 +180,13 @@ fn slow_consumer_does_not_block_a_concurrent_command() {
     // join the engine thread (a lingering clone would keep a live sender and hang the join).
     let Engine {
         handle: inner,
-        join,
+        joins,
     } = engine;
     drop(handle);
     drop(inner);
-    join.join().expect("engine thread joins");
+    for join in joins {
+        join.join().expect("engine worker joins");
+    }
 }
 
 /// A slowly-drained **auto-commit write-with-RETURN** (always inline, since it writes) must commit
@@ -266,11 +268,13 @@ fn suspended_autocommit_write_still_commits() {
 
     let Engine {
         handle: inner,
-        join,
+        joins,
     } = engine;
     drop(handle);
     drop(inner);
-    join.join().expect("engine thread joins");
+    for join in joins {
+        join.join().expect("engine worker joins");
+    }
 }
 
 /// A runtime error that occurs **mid-stream** (after several rows already streamed, across a
@@ -330,9 +334,11 @@ fn mid_stream_error_is_terminal_after_suspension() {
 
     let Engine {
         handle: inner,
-        join,
+        joins,
     } = engine;
     drop(handle);
     drop(inner);
-    join.join().expect("engine thread joins");
+    for join in joins {
+        join.join().expect("engine worker joins");
+    }
 }

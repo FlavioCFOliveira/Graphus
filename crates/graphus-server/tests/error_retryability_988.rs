@@ -635,6 +635,8 @@ fn a_transaction_reaped_for_age_says_it_timed_out_not_that_it_never_existed() {
         4096,
         256,
         2,
+        // One engine worker (`rmp` #1033).
+        1,
         Arc::clone(&metrics),
         engine_clock,
         None,
@@ -731,11 +733,13 @@ fn a_transaction_reaped_for_age_says_it_timed_out_not_that_it_never_existed() {
     // Dropping both handles closes the command channel, so the engine thread exits and joins.
     let graphus_server::engine::Engine {
         handle: inner,
-        join,
+        joins,
     } = eng;
     drop(handle);
     drop(inner);
-    join.join().expect("engine thread joins cleanly");
+    for join in joins {
+        join.join().expect("engine worker joins cleanly");
+    }
 }
 
 /// Asserts the full client-observable contract for a transaction stopped by the **server-configured**

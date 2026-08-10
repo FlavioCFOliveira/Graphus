@@ -73,6 +73,8 @@ fn engine_with(
         256,
         // Two reader workers so an auto-commit read genuinely dispatches off-thread.
         2,
+        // One engine worker (`rmp` #1033).
+        1,
         Arc::clone(&metrics),
         clock,
         statement_timeout,
@@ -134,11 +136,13 @@ fn wait_until(mut cond: impl FnMut() -> bool, msg: &str) {
 fn shutdown(engine: Engine, handle: EngineHandle) {
     let Engine {
         handle: inner,
-        join,
+        joins,
     } = engine;
     drop(handle);
     drop(inner);
-    join.join().expect("engine thread joins cleanly");
+    for join in joins {
+        join.join().expect("engine worker joins cleanly");
+    }
 }
 
 /// C-F1 (the primary regression): with the per-statement timeout DISABLED (`statement_timeout = None`),

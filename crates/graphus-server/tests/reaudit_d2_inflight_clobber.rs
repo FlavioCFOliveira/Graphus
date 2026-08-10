@@ -299,9 +299,11 @@ fn two_concurrent_suspended_inline_statements_must_not_clobber() {
     // assert on it here because the row-count assertions above are the primary teeth.
     let Engine {
         handle: inner,
-        join,
+        joins,
     } = engine;
     drop(handle);
     drop(inner);
-    let _ = join.join();
+    for join in joins {
+        let _ = join.join();
+    }
 }

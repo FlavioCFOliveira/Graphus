@@ -76,11 +76,13 @@ fn threaded_engine(reader_threads: usize) -> Engine {
 fn teardown(engine: Engine, handle: EngineHandle) {
     let Engine {
         handle: inner,
-        join,
+        joins,
     } = engine;
     drop(handle);
     drop(inner);
-    join.join().expect("engine thread joins");
+    for join in joins {
+        join.join().expect("engine worker joins");
+    }
 }
 
 /// Runs an auto-commit statement to completion through `handle`, returning the first integer scalar of

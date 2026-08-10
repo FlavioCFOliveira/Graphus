@@ -156,11 +156,13 @@ fn run_collect(handle: &EngineHandle, mode: AccessMode, stmt: &str) -> Result<Op
 fn shutdown(engine: Engine, handle: EngineHandle) {
     let Engine {
         handle: inner,
-        join,
+        joins,
     } = engine;
     drop(handle);
     drop(inner);
-    join.join().expect("engine thread joins cleanly");
+    for join in joins {
+        join.join().expect("engine worker joins cleanly");
+    }
 }
 
 /// Suppresses the test panic's default hook so the deliberate `ext.panic` does not spam the test log

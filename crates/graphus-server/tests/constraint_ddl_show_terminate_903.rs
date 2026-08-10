@@ -90,6 +90,8 @@ fn engine_sharing(transactions: &Arc<TransactionRegistry>) -> Engine {
         4096,
         256,
         2,
+        // One engine worker (`rmp` #1033).
+        1,
         metrics,
         clock,
         // No statement timeout: the only thing that may stop the DDL in these gates is the operator.
@@ -124,11 +126,13 @@ fn seed_people(handle: &EngineHandle, n: usize) {
 fn shutdown(engine: Engine, handle: EngineHandle) {
     let Engine {
         handle: inner,
-        join,
+        joins,
     } = engine;
     drop(handle);
     drop(inner);
-    join.join().expect("engine thread joins cleanly");
+    for join in joins {
+        join.join().expect("engine worker joins cleanly");
+    }
 }
 
 /// A `CREATE CONSTRAINT … IS UNIQUE` over `(:P.email)`.
