@@ -42,7 +42,7 @@ pub mod stream;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use graphus_core::error::{GraphusError, Result};
 use graphus_cypher::{IndexBuildTotals, IndexCollectionTotals, TxnCoordinator};
@@ -807,6 +807,11 @@ impl ReapedTickets {
 /// * `plan_cache` is consulted once per statement to look a plan up, and once to install one.
 /// * `parked` is touched only when a statement suspends or resumes.
 struct EngineShared {
+    /// How many workers are still inside the loop (`rmp` #1033). The worker that handles `Shutdown`
+    /// must be the LAST one out, because the shutdown path consumes the coordinator for the final
+    /// flush and `Arc::try_unwrap` needs sole ownership. It raises `stopping`, waits for this to
+    /// reach one, and only then drains and hardens.
+    live_workers: AtomicUsize,
     /// Raised by whichever worker handles `Shutdown` (`rmp` #1033). Every worker checks it before
     /// blocking on the queue, so a stop reaches all of them and not only the one that was handed the
     /// command. Without it the others would sit in `recv` until the last client sender dropped —
@@ -826,8 +831,9 @@ struct EngineShared {
 }
 
 impl EngineShared {
-    fn new() -> Self {
+    fn new(workers: usize) -> Self {
         Self {
+            live_workers: AtomicUsize::new(workers),
             stopping: AtomicBool::new(false),
             open: std::sync::Mutex::new(OpenTxTable::new()),
             plan_cache: std::sync::Mutex::new(exec::EnginePlanCache::new()),
@@ -982,6 +988,9 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // Which worker this is. Worker 0 additionally drives the maintenance cadence; the others only
     // serve commands, so a GC pass or a checkpoint never runs W times over.
     worker_id: usize,
+    // How many workers share this queue. Needed here so the shared state knows when the last one has
+    // left — the shutdown path consumes the coordinator and must be the last out (`rmp` #1033).
+    engine_workers: usize,
     result_buffer_capacity: usize,
     reader_threads: usize,
     metrics: Arc<Metrics>,
@@ -1024,7 +1033,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // The loop's shared state (`rmp` #1033). Declared once and reached through guards below, so the
     // body can be replicated across W workers without any of it being duplicated per worker. With
     // one worker the guards are uncontended and the behaviour is exactly what the locals gave.
-    let shared = EngineShared::new();
+    let shared = EngineShared::new(engine_workers);
 
     // The engine's compiled-plan cache (`rmp` task #322): reuses a compiled `PhysicalPlan` for an
     // identical query text instead of re-running the ~7–9 µs compile pipeline on every `Run`. Owned by
@@ -1310,7 +1319,9 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                     .expect("INVARIANT: the parked latch is not poisoned")
                     .is_empty());
 
-        // A stop raised by another worker ends this one too, checked before it blocks.
+        // A stop raised by another worker ends this one too, checked before it blocks. The
+        // decrement happens at the single exit below, so a worker that leaves here is counted out
+        // exactly once.
         if shared.stopping.load(Ordering::Acquire) {
             break 'engine;
         }
@@ -1371,6 +1382,18 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             let Ok(cmd) = received else { break 'engine };
             cmd
         };
+        // A `Shutdown` is intercepted BEFORE it is dispatched (`rmp` #1033). The dispatch's
+        // shutdown path consumes the coordinator for the final flush, and `Arc::try_unwrap` needs
+        // sole ownership — so this worker must be the LAST one inside the loop before it runs.
+        // Raise the stop, then wait for the others to leave. Every worker checks `stopping` before
+        // it blocks, so a worker sitting in `recv` leaves on its next turn; one executing a
+        // statement leaves when that statement finishes, which is what a graceful stop means.
+        if matches!(cmd, Cmd::Shutdown { .. }) {
+            shared.stopping.store(true, Ordering::Release);
+            while shared.live_workers.load(Ordering::Acquire) > 1 {
+                std::thread::yield_now();
+            }
+        }
         // Test-only (`rmp` #435): intercept the simulated-maintenance driver here in the loop, where the
         // per-engine flag + the consecutive-failure streak live, so it exercises the REAL escalation
         // path confined to this engine. Returns the original command in production builds (identity).
@@ -1418,6 +1441,11 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             break 'engine; // Shutdown handled (drained + hardened) inside the dispatch.
         }
     }
+
+    // Counted out exactly once, at the single exit, and BEFORE the reader pool teardown below: the
+    // worker running `Shutdown` waits on this count, so decrementing after a slow teardown would
+    // hold the whole stop behind this worker's cleanup (`rmp` #1033).
+    shared.live_workers.fetch_sub(1, Ordering::AcqRel);
 
     // The loop has exited (Shutdown or channel close): tear down the reader pool so no worker thread
     // outlives the engine. `shutdown` drops the work-queue sender (ending each worker's `recv`) and
@@ -4757,9 +4785,10 @@ where
                     db_name,
                     coordinator,
                     std::sync::Arc::new(std::sync::Mutex::new(rx)),
-                    // Worker 0: the only engine thread today, and the one that will keep the
-                    // maintenance cadence once the body is replicated (`rmp` #1033).
+                    // Worker 0 of one: the maintenance cadence rides on this worker, and the
+                    // shared state is sized for a single loop (`rmp` #1033).
                     0,
+                    1,
                     result_buffer_capacity,
                     reader_threads,
                     loop_metrics,
