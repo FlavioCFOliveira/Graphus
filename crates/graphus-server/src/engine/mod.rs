@@ -969,7 +969,13 @@ impl PendingCommit {
 fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>(
     db_name: Arc<str>,
     coordinator: TxnCoordinator<D, S>,
-    rx: std::sync::mpsc::Receiver<EngineCommand>,
+    // The command queue, shared by every worker (`rmp` #1033). `std::sync::mpsc::Receiver` is
+    // `!Sync`, so the workers dequeue under a brief lock — the same MPMC-over-mpsc shape the
+    // reader pool uses, where the lock covers only the dequeue and never the work that follows.
+    rx: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<EngineCommand>>>,
+    // Which worker this is. Worker 0 additionally drives the maintenance cadence; the others only
+    // serve commands, so a GC pass or a checkpoint never runs W times over.
+    worker_id: usize,
     result_buffer_capacity: usize,
     reader_threads: usize,
     metrics: Arc<Metrics>,
@@ -1280,19 +1286,34 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                 .expect("INVARIANT: coordinator is Some until Shutdown breaks the loop")
                 .index_build_totals(),
         );
-        let timed = building
-            || indexes_degraded
-            || vector_blocked
-            || ft_spatial_poisoned
-            || shared.readers_inflight.load(Ordering::Relaxed) > 0
-            || !shared
-                .parked
-                .lock()
-                .expect("INVARIANT: the parked latch is not poisoned")
-                .is_empty();
+        // ONLY worker 0 takes the timed tick (`rmp` #1033). The tick is what drives the
+        // maintenance cadence — index builds, degraded-index repair, the checkpoint/GC pass — and
+        // running it on W workers would run W passes over the same store, each doing the others'
+        // work again. Every other worker blocks on `recv` and serves commands only, which is the
+        // shape Neo4j and Memgraph both use: maintenance off the transaction path, in its own
+        // thread. Worker 0 still serves commands too; the tick only decides how it WAITS for one.
+        let timed = worker_id == 0
+            && (building
+                || indexes_degraded
+                || vector_blocked
+                || ft_spatial_poisoned
+                || shared.readers_inflight.load(Ordering::Relaxed) > 0
+                || !shared
+                    .parked
+                    .lock()
+                    .expect("INVARIANT: the parked latch is not poisoned")
+                    .is_empty());
 
         let cmd = if timed {
-            match rx.recv_timeout(INDEX_BUILD_TICK) {
+            // The lock covers the DEQUEUE only — it is released the moment a command is in
+            // hand, so the work that follows runs with no worker waiting on this one.
+            let received = {
+                let guard = rx
+                    .lock()
+                    .expect("INVARIANT: the command-queue latch is not poisoned");
+                guard.recv_timeout(INDEX_BUILD_TICK)
+            };
+            match received {
                 Ok(cmd) => cmd,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     // No command this tick: advance any build, then loop (which drains retirements).
@@ -1330,7 +1351,13 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         } else {
             // No build pending and no readers in flight: a plain blocking receive (the original
             // behaviour). `Err` is the closed-channel EOF the old `while let Ok(..)` terminated on.
-            let Ok(cmd) = rx.recv() else { break 'engine };
+            let received = {
+                let guard = rx
+                    .lock()
+                    .expect("INVARIANT: the command-queue latch is not poisoned");
+                guard.recv()
+            };
+            let Ok(cmd) = received else { break 'engine };
             cmd
         };
         // Test-only (`rmp` #435): intercept the simulated-maintenance driver here in the loop, where the
@@ -2419,7 +2446,7 @@ fn reply_engine_degraded(cmd: EngineCommand) -> Option<EngineCommand> {
 struct ProcessCtx<'a, D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static> {
     cmd: EngineCommand,
     /// The command channel, so a group-commit batch can non-blockingly drain further queued commits.
-    rx: &'a std::sync::mpsc::Receiver<EngineCommand>,
+    rx: &'a std::sync::Mutex<std::sync::mpsc::Receiver<EngineCommand>>,
     coordinator: &'a mut Option<Arc<TxnCoordinator<D, S>>>,
     /// The LATCH, not a borrow of the table (`rmp` #1033): dispatching a command runs a statement,
     /// and holding the table across that is exactly what would serialise W workers. Each arm takes it
@@ -4061,7 +4088,7 @@ fn pipelined_group_commit<
     S: LogSink + Send + Sync + 'static,
 >(
     wal_sync: &WalSyncThread,
-    rx: &std::sync::mpsc::Receiver<EngineCommand>,
+    rx: &std::sync::Mutex<std::sync::mpsc::Receiver<EngineCommand>>,
     coordinator: &mut Option<Arc<TxnCoordinator<D, S>>>,
     // The latch: this path re-enters the dispatch (`rmp` #1033).
     open: &std::sync::Mutex<OpenTxTable>,
@@ -4294,7 +4321,7 @@ fn drain_commit_batch<
     D: BlockDevice + Send + Sync + 'static,
     S: LogSink + Send + Sync + 'static,
 >(
-    rx: &std::sync::mpsc::Receiver<EngineCommand>,
+    rx: &std::sync::Mutex<std::sync::mpsc::Receiver<EngineCommand>>,
     coordinator: &mut Option<Arc<TxnCoordinator<D, S>>>,
     // The latch, for the same reason as `dispatch_command` (`rmp` #1033).
     open: &std::sync::Mutex<OpenTxTable>,
@@ -4323,7 +4350,15 @@ fn drain_commit_batch<
     // does not bound the drain length under a concurrent read/open burst (see `MAX_DRAIN_COMMANDS`).
     let mut processed = 0usize;
     while commit_batch.len() < MAX_COMMIT_BATCH && processed < MAX_DRAIN_COMMANDS {
-        match rx.try_recv() {
+        // Dequeue under the latch, act outside it: the batch this builds is committed with the
+        // queue free, so another worker can keep serving while this one hardens.
+        let received = {
+            let guard = rx
+                .lock()
+                .expect("INVARIANT: the command-queue latch is not poisoned");
+            guard.try_recv()
+        };
+        match received {
             // An explicit COMMIT (`rmp` #528) OR an auto-commit statement (`rmp` #566): dispatch it into
             // the SAME batch. An explicit `Commit` PREPAREs (cheap, never suspends). An auto-commit `Run`
             // EXECUTES then — if it is a durable write — PREPAREs + defers its ack into the batch; an
@@ -4706,7 +4741,10 @@ where
                 run_engine_loop(
                     db_name,
                     coordinator,
-                    rx,
+                    std::sync::Arc::new(std::sync::Mutex::new(rx)),
+                    // Worker 0: the only engine thread today, and the one that will keep the
+                    // maintenance cadence once the body is replicated (`rmp` #1033).
+                    0,
                     result_buffer_capacity,
                     reader_threads,
                     loop_metrics,
