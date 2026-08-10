@@ -88,7 +88,7 @@ pub struct LocalEngine<D: BlockDevice, S: LogSink> {
     /// loop). `Some` until shutdown.
     coordinator: Option<Arc<TxnCoordinator<D, S>>>,
     /// Open transactions, keyed by the ticket id the engine mints (same bookkeeping the loop keeps).
-    open: OpenTxTable,
+    open: std::sync::Mutex<OpenTxTable>,
     /// Monotonic ticket counter (same as the loop's).
     next_ticket: std::sync::atomic::AtomicU64,
     /// The compiled-in UDF/UDP + GDS registry, built once (as the engine thread does). `Arc`-wrapped to
@@ -148,7 +148,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         let db_name: Arc<str> = Arc::from("local");
         Self {
             coordinator: Some(Arc::new(coordinator)),
-            open: OpenTxTable::new(),
+            open: std::sync::Mutex::new(OpenTxTable::new()),
             next_ticket: std::sync::atomic::AtomicU64::new(0),
             extensions: Arc::new(super::exec::install_extensions()),
             // Inline (deterministic) read dispatch — never a pool. See the field docs.
@@ -213,7 +213,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         let live = dispatch_command(
             cmd,
             &mut self.coordinator,
-            &mut self.open,
+            &self.open,
             &self.next_ticket,
             &mut self.plan_cache,
             &self.extensions,

@@ -1013,10 +1013,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // body can be replicated across W workers without any of it being duplicated per worker. With
     // one worker the guards are uncontended and the behaviour is exactly what the locals gave.
     let shared = EngineShared::new();
-    let mut open = shared
-        .open
-        .lock()
-        .expect("INVARIANT: the open-tx table's latch is not poisoned");
+
     // The engine's compiled-plan cache (`rmp` task #322): reuses a compiled `PhysicalPlan` for an
     // identical query text instead of re-running the ~7–9 µs compile pipeline on every `Run`. Owned by
     // (and `&mut`-borrowed on) this single engine thread, so its single-threaded contract holds with no
@@ -1124,7 +1121,10 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         process_retirements(
             &retire_rx,
             &coordinator,
-            &mut open,
+            &mut shared
+                .open
+                .lock()
+                .expect("INVARIANT: the open-tx latch is not poisoned"),
             &shared.readers_inflight,
             &metrics,
             &db_name,
@@ -1143,7 +1143,10 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         // so a reap never races a live read.
         maybe_reap_aged(
             &coordinator,
-            &mut open,
+            &mut shared
+                .open
+                .lock()
+                .expect("INVARIANT: the open-tx latch is not poisoned"),
             &parked,
             max_transaction_age,
             &clock,
@@ -1162,7 +1165,10 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         resume_parked_statements(
             &mut parked,
             &coordinator,
-            &mut open,
+            &mut shared
+                .open
+                .lock()
+                .expect("INVARIANT: the open-tx latch is not poisoned"),
             &extensions,
             &metrics,
             &db_name,
@@ -1187,7 +1193,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                 cmd,
                 rx: &rx,
                 coordinator: &mut coordinator,
-                open: &mut open,
+                open: &shared.open,
                 next_ticket: &shared.next_ticket,
                 plan_cache: &mut plan_cache,
                 extensions: &extensions,
@@ -1331,7 +1337,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             cmd,
             rx: &rx,
             coordinator: &mut coordinator,
-            open: &mut open,
+            open: &shared.open,
             next_ticket: &shared.next_ticket,
             plan_cache: &mut plan_cache,
             extensions: &extensions,
@@ -2404,7 +2410,10 @@ struct ProcessCtx<'a, D: BlockDevice + Send + Sync + 'static, S: LogSink + Send 
     /// The command channel, so a group-commit batch can non-blockingly drain further queued commits.
     rx: &'a std::sync::mpsc::Receiver<EngineCommand>,
     coordinator: &'a mut Option<Arc<TxnCoordinator<D, S>>>,
-    open: &'a mut OpenTxTable,
+    /// The LATCH, not a borrow of the table (`rmp` #1033): dispatching a command runs a statement,
+    /// and holding the table across that is exactly what would serialise W workers. Each arm takes it
+    /// for its own duration — `O(1)` for the short commands, and released before execution for `RUN`.
+    open: &'a std::sync::Mutex<OpenTxTable>,
     next_ticket: &'a AtomicU64,
     plan_cache: &'a mut exec::EnginePlanCache,
     extensions: &'a Arc<graphus_cypher::extension::ExtensionRegistry>,
@@ -2561,7 +2570,9 @@ fn process_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         &mut just_suspended,
         max_parked_inline,
         coordinator,
-        open,
+        &mut open
+            .lock()
+            .expect("INVARIANT: the open-tx latch is not poisoned"),
         metrics,
         db,
         degraded,
@@ -2582,7 +2593,13 @@ fn process_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         next_ticket.load(Ordering::Relaxed),
         readers_inflight.load(Ordering::Relaxed),
     );
-    let oldest_open_ticket = open.keys().copied().min().unwrap_or(u64::MAX);
+    let oldest_open_ticket = open
+        .lock()
+        .expect("INVARIANT: the open-tx latch is not poisoned")
+        .keys()
+        .copied()
+        .min()
+        .unwrap_or(u64::MAX);
     maybe_run_maintenance(
         coordinator,
         wal_at_last_maintenance,
@@ -2607,7 +2624,9 @@ fn process_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
 fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>(
     cmd: EngineCommand,
     coordinator: &mut Option<Arc<TxnCoordinator<D, S>>>,
-    open: &mut OpenTxTable,
+    // The LATCH (`rmp` #1033): this function runs statements, so it must be free to
+    // release the table before execution rather than hold it across one.
+    open: &std::sync::Mutex<OpenTxTable>,
     next_ticket: &AtomicU64,
     plan_cache: &mut exec::EnginePlanCache,
     extensions: &Arc<graphus_cypher::extension::ExtensionRegistry>,
@@ -2657,12 +2676,30 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
         .expect("INVARIANT: coordinator is Some until Shutdown breaks the loop");
     match cmd {
         Cmd::Begin { mode, reply } => {
-            let ticket = open_tx(coord, open, next_ticket, mode, false, clock.now_nanos());
+            let ticket = open_tx(
+                coord,
+                &mut open
+                    .lock()
+                    .expect("INVARIANT: the open-tx latch is not poisoned"),
+                next_ticket,
+                mode,
+                false,
+                clock.now_nanos(),
+            );
             active_txns.publish(coord.active_count(), coord.ssi_tracked_len());
             let _ = reply.send(Ok(ticket));
         }
         Cmd::BeginAutoCommit { mode, reply } => {
-            let ticket = open_tx(coord, open, next_ticket, mode, true, clock.now_nanos());
+            let ticket = open_tx(
+                coord,
+                &mut open
+                    .lock()
+                    .expect("INVARIANT: the open-tx latch is not poisoned"),
+                next_ticket,
+                mode,
+                true,
+                clock.now_nanos(),
+            );
             active_txns.publish(coord.active_count(), coord.ssi_tracked_len());
             let _ = reply.send(Ok(ticket));
         }
@@ -2686,7 +2723,9 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
                 .expect("INVARIANT: coordinator is Some until Shutdown breaks the loop");
             run_statement_isolated(
                 coord,
-                open,
+                &mut open
+                    .lock()
+                    .expect("INVARIANT: the open-tx latch is not poisoned"),
                 plan_cache,
                 ticket,
                 &query,
@@ -2715,7 +2754,9 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             // then replies. A read-only or SSI-aborted commit is answered here and never batched.
             commit_prepare_tx(
                 coord,
-                open,
+                &mut open
+                    .lock()
+                    .expect("INVARIANT: the open-tx latch is not poisoned"),
                 ticket,
                 reply,
                 commit_batch,
@@ -2726,7 +2767,16 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             active_txns.publish(coord.active_count(), coord.ssi_tracked_len());
         }
         Cmd::Rollback { ticket, reply } => {
-            let out = rollback_tx(coord, open, ticket, metrics, db, degraded);
+            let out = rollback_tx(
+                coord,
+                &mut open
+                    .lock()
+                    .expect("INVARIANT: the open-tx latch is not poisoned"),
+                ticket,
+                metrics,
+                db,
+                degraded,
+            );
             active_txns.publish(coord.active_count(), coord.ssi_tracked_len());
             let _ = reply.send(out);
         }
@@ -2796,7 +2846,13 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
                 next_ticket.load(Ordering::Relaxed),
                 readers_inflight.load(Ordering::Relaxed),
             );
-            let oldest_open_ticket = open.keys().copied().min().unwrap_or(u64::MAX);
+            let oldest_open_ticket = open
+                .lock()
+                .expect("INVARIANT: the open-tx latch is not poisoned")
+                .keys()
+                .copied()
+                .min()
+                .unwrap_or(u64::MAX);
             let out = handle_checkpoint(coord, reuse_barrier, oldest_open_ticket, metrics, db);
             // A manual (admin-triggered) checkpoint that succeeds is proof reclamation is making
             // progress again, so clear **this engine's own** maintenance-degraded flag (`rmp` #435 —
@@ -2839,7 +2895,13 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
                 next_ticket.load(Ordering::Relaxed),
                 readers_inflight.load(Ordering::Relaxed),
             );
-            let oldest_open_ticket = open.keys().copied().min().unwrap_or(u64::MAX);
+            let oldest_open_ticket = open
+                .lock()
+                .expect("INVARIANT: the open-tx latch is not poisoned")
+                .keys()
+                .copied()
+                .min()
+                .unwrap_or(u64::MAX);
             coord.set_reuse_barrier(reuse_barrier);
             let out = bulk_load::handle_bulk_import_batch(coord, loading_session, batch);
             coord.set_reuse_barrier(None);
@@ -2850,9 +2912,18 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             ticket,
             chunk,
             reply,
-        } => {
-            run_mode_b_chunk_isolated(coord, open, ticket, chunk, metrics, db, degraded, reply);
-        }
+        } => run_mode_b_chunk_isolated(
+            coord,
+            &mut open
+                .lock()
+                .expect("INVARIANT: the open-tx latch is not poisoned"),
+            ticket,
+            chunk,
+            metrics,
+            db,
+            degraded,
+            reply,
+        ),
         // Test-only (`rmp` #435): the threaded engine loop intercepts this before dispatch, so it only
         // reaches here on the `LocalEngine` inline path — drive the same real per-engine escalation.
         #[cfg(feature = "internal-test-udf")]
@@ -2876,7 +2947,14 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             // in-flight index build is left durably `Populating`: it resumes and completes on the
             // next open via `TxnCoordinator::new`'s crash-recovery path (no force-drain needed —
             // re-deriving the candidate index is cheap and always correct).
-            drain_inflight(coord, open, metrics, db);
+            drain_inflight(
+                coord,
+                &mut open
+                    .lock()
+                    .expect("INVARIANT: the open-tx latch is not poisoned"),
+                metrics,
+                db,
+            );
             let coordinator = coordinator
                 .take()
                 .expect("INVARIANT: coordinator is Some at Shutdown");
@@ -3958,7 +4036,8 @@ fn pipelined_group_commit<
     wal_sync: &WalSyncThread,
     rx: &std::sync::mpsc::Receiver<EngineCommand>,
     coordinator: &mut Option<Arc<TxnCoordinator<D, S>>>,
-    open: &mut OpenTxTable,
+    // The latch: this path re-enters the dispatch (`rmp` #1033).
+    open: &std::sync::Mutex<OpenTxTable>,
     next_ticket: &AtomicU64,
     plan_cache: &mut exec::EnginePlanCache,
     extensions: &Arc<graphus_cypher::extension::ExtensionRegistry>,
@@ -4074,7 +4153,9 @@ fn pipelined_group_commit<
         process_retirements(
             retire_rx,
             coordinator,
-            open,
+            &mut open
+                .lock()
+                .expect("INVARIANT: the open-tx latch is not poisoned"),
             readers_inflight,
             metrics,
             db,
@@ -4096,7 +4177,9 @@ fn pipelined_group_commit<
         resume_parked_statements(
             parked,
             coordinator,
-            open,
+            &mut open
+                .lock()
+                .expect("INVARIANT: the open-tx latch is not poisoned"),
             extensions,
             metrics,
             db,
@@ -4184,7 +4267,8 @@ fn drain_commit_batch<
 >(
     rx: &std::sync::mpsc::Receiver<EngineCommand>,
     coordinator: &mut Option<Arc<TxnCoordinator<D, S>>>,
-    open: &mut OpenTxTable,
+    // The latch, for the same reason as `dispatch_command` (`rmp` #1033).
+    open: &std::sync::Mutex<OpenTxTable>,
     next_ticket: &AtomicU64,
     plan_cache: &mut exec::EnginePlanCache,
     extensions: &Arc<graphus_cypher::extension::ExtensionRegistry>,
@@ -4254,7 +4338,9 @@ fn drain_commit_batch<
                     &mut just_suspended,
                     max_parked_inline,
                     coordinator,
-                    open,
+                    &mut open
+                        .lock()
+                        .expect("INVARIANT: the open-tx latch is not poisoned"),
                     metrics,
                     db,
                     degraded,
