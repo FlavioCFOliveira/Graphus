@@ -29,12 +29,17 @@
 //! Be exact about what that cost, because the honest version is the more alarming one. Measured
 //! (`tests/engine_latch_scaling_1038.rs`): a lock held across a whole statement costs *nothing* while
 //! each worker holds its own — 3.95 of 4 cores, indistinguishable from correct code — and collapses to
-//! 1.00 core the instant the lock is shared. `EngineShared` is built inside `run_engine_loop`, so the
+//! 1.00 core the instant the lock is shared. The tables were built inside `run_engine_loop`, so the
 //! old guards were per worker and the defect was **latent**. It was not a slowdown waiting to be
 //! measured; it was a deadlock and a one-core engine waiting for `rmp` #1041 to share the tables, at
 //! which point the symptom would have appeared in a task that changed none of this code. A defect that
 //! is invisible to results, invisible to throughput, and lethal on somebody else's commit is exactly
 //! the kind that has to be made structurally unwritable rather than fixed and remembered.
+//!
+//! `rmp` #1041 has since landed: the three tables live in `EngineSessions`, built once per engine and
+//! shared by every worker. The measured consequence is the third run recorded in that gate — sharing
+//! plus the restructured critical sections is still 3.95 of 4 cores. This module is what made that
+//! true, and the tripwire is what keeps it true.
 //!
 //! [`EngineLatchGuard`] cannot be handed to a function that takes `&mut OpenTxTable` without a named
 //! binding, and if one is held when execution starts the tripwire fires — so the shape is refused

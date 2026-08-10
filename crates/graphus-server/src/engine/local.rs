@@ -149,8 +149,10 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         Self {
             coordinator: Some(Arc::new(coordinator)),
             open: super::latch::EngineLatch::new(OpenTxTable::new()),
-            // A single inline worker: stride 1, seeded at 0 (`rmp` #1035).
-            next_ticket: super::TicketMinter::new(0, 1),
+            // A single inline worker: stride 1, seeded at 0 (`rmp` #1035). One worker owns every
+            // ticket, so the affinity tests the shared-table passes perform in the threaded engine
+            // (`rmp` #1041) are unconditionally true here and the inline trace is unchanged.
+            next_ticket: super::TicketMinter::new(super::WorkerAffinity::new(0, 1)),
             extensions: Arc::new(super::exec::install_extensions()),
             // Inline (deterministic) read dispatch — never a pool. See the field docs.
             dispatch: ReadDispatch::Inline,
@@ -226,7 +228,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             &self.db_name,
             &self.degraded,
             &self.maintenance_degraded,
-            &mut self.active_txns,
+            &self.active_txns,
             &self.clock,
             // The deterministic DST driver runs statements with **no** wall-clock timeout (`rmp` #476):
             // a per-statement deadline would read `Instant::now()` and leak non-determinism into the

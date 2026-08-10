@@ -3,8 +3,18 @@
 //! commit when the stream is drained (`04-technical-design.md` §1.3 request lifecycle, §7.1 pipeline,
 //! §7.7 streaming).
 //!
-//! All of this runs on the **single engine thread** (see [`super`]), so it may block freely (storage
-//! I/O, the WAL group-commit `fdatasync`) without touching a Tokio runtime worker (`04 §9.1`).
+//! All of this runs on an **engine worker thread** (see [`super`]), so it may block freely (storage
+//! I/O, the WAL group-commit `fdatasync`) without touching a Tokio runtime worker (`04 §9.1`). That is
+//! what the blocking is licensed by, and it is the part that has not changed.
+//!
+//! What HAS changed is the count. This said "the single engine thread" until `rmp` #1041, and by then
+//! the engine had been running `engine_workers` of them since `rmp` #1033 — a statement here can be
+//! concurrent with another statement of the same database. Nothing in this module may therefore rely on
+//! being alone: the session state it reaches (the open-transaction table and the plan cache) is
+//! engine-wide and latched, and each latch is taken where it is used rather than held across the query
+//! (`rmp` #1038). A *transaction*, on the other hand, still meets exactly one thread — session affinity
+//! routes every command of a session to one worker (`rmp` #1035), and the engine loop's two passes over
+//! the shared tables decline anything they do not own.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -38,7 +48,7 @@ use crate::metrics::Metrics;
 /// the least-recently-used plan past this.
 const PLAN_CACHE_CAPACITY: usize = 512;
 
-/// The engine's per-thread compiled-plan cache plus the **schema version** the cache is keyed against
+/// The engine's compiled-plan cache plus the **schema version** the cache is keyed against
 /// (`rmp` task #322; `04 §7.5`).
 ///
 /// The server's RUN path used to re-run the *entire* compile pipeline
@@ -76,8 +86,21 @@ const PLAN_CACHE_CAPACITY: usize = 512;
 /// produces. A schema change (the thing that *can* change results, e.g. a new unique constraint or a
 /// usable index) bumps the version and invalidates.
 ///
-/// This lives on the **single engine thread** and is borrowed `&mut` per `Run`, so the underlying
-/// [`PlanCache`]'s documented single-threaded contract holds with no synchronisation.
+/// **One per ENGINE, behind a rank-5 [`EngineLatch`], since `rmp` #1041.** This used to say it lived
+/// on "the single engine thread" and needed no synchronisation, which stopped being true when the loop
+/// body became a worker body: the cache was then built per worker, and a `DROP INDEX` that landed on
+/// one of them left every other worker serving the plan it had just invalidated — measured at
+/// `engine_workers = 4` as the same query text being ACCEPTED on one connection and REJECTED on
+/// another, permanently. The underlying [`PlanCache`]'s single-threaded contract is now satisfied by
+/// the latch rather than by an assumption about how many threads exist.
+///
+/// One cache for the engine rather than one per worker was decided by measurement, not by symmetry
+/// with the other session tables. On the workload most dominated by the cache (`RETURN 1 AS x`, eight
+/// workers, both shapes alternated inside one process) the shared latch cost 0.33 % against a 1.3 %
+/// run-to-run spread — nothing. On a cold workload of 400 distinct texts the per-worker shape cost
+/// 6.2 % more engine CPU, because a text compiled on one worker is a miss on every other and the
+/// engine compiles it up to `W` times instead of once. See the note at the binding in
+/// `run_engine_loop` for the full comparison.
 pub(super) struct EnginePlanCache {
     cache: PlanCache<Arc<PhysicalPlan>>,
     schema_version: SchemaVersion,
@@ -394,10 +417,11 @@ pub(super) fn handle_run<
 
     // Resolve the open transaction. Both fields are `Copy`, so the whole of what execution needs from
     // the table is two words, lifted out here and the latch released — the shape the struct docs on
-    // `EngineShared` always claimed and, until `rmp` #1038, only the *borrow* obeyed while the *guard*
-    // stayed alive for the entire query. The failed lookup and its diagnosis share the critical
-    // section: `unknown_ticket_error` consumes the reap record, so reading it must be part of the same
-    // step that observed the ticket missing.
+    // `EngineSessions` always claimed and, until `rmp` #1038, only the *borrow* obeyed while the
+    // *guard* stayed alive for the entire query. Since `rmp` #1041 the table is engine-wide, so this
+    // critical section is now genuinely contended and its length is the thing that matters. The failed
+    // lookup and its diagnosis share it: `unknown_ticket_error` consumes the reap record, so reading it
+    // must be part of the same step that observed the ticket missing.
     let resolved = {
         let mut open = open.lock();
         match open.get(&ticket.0).map(|tx| (tx.txn, tx.mode)) {
@@ -1318,6 +1342,17 @@ impl InFlightInline {
     /// executing inline (a reap mid-statement would pull the seam out from under the live cursor).
     pub(super) fn txn(&self) -> graphus_core::TxnId {
         self.txn
+    }
+
+    /// The open-transaction ticket this suspended statement belongs to.
+    ///
+    /// Read by the engine loop's resume pass (`rmp` #1041) to tell its own parked statements from the
+    /// rest, now that the parked queue is engine-wide rather than per worker: the ticket names the
+    /// worker that owns the session (`ticket % W`, `rmp` #1035), and a transaction must only ever be
+    /// driven by that worker. Returned rather than exposing the field so the queue cannot be
+    /// re-partitioned on anything but the identity the routing itself uses.
+    pub(super) fn ticket(&self) -> TxTicket {
+        self.ticket
     }
 
     /// Delivers a **terminal error** to the consumer through the still-open egress channel (`rmp` #485

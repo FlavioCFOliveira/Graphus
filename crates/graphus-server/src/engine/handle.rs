@@ -546,26 +546,78 @@ impl EngineHandle {
     ///
     /// Three classes, and each routes for its own reason:
     ///
-    /// * **Named by a ticket** (`Run`, `Commit`, `Rollback`, `BulkImportBatch`) — the ticket IS the
-    ///   session key, and it encodes its worker: a worker mints `worker_id + W*n`, so `ticket % W`
+    /// * **Named by a ticket** (`Run`, `Commit`, `Rollback`, `BulkImportModeBChunk`) — the ticket IS
+    ///   the session key, and it encodes its worker: a worker mints `worker_id + W*n`, so `ticket % W`
     ///   names the owner with no routing table, no shared state, and no second source of truth that
     ///   could drift from the first.
     /// * **Creating a ticket** (`Begin`, `BeginAutoCommit`) — no session yet, so any worker will do;
     ///   round-robin, and the ticket it mints carries the worker back to the client.
+    /// * **Session state with no ticket** (`BulkImportBatch`) — a Mode A bulk-import session's state
+    ///   is a `loading_session` local of the engine loop, so it lives on ONE worker with nothing in
+    ///   the message to say which. Pinned to worker 0: every batch of every Mode A session therefore
+    ///   meets the session the previous batch created. Mode A takes the whole database into
+    ///   `DbState::Loading`, so there is at most one such session and pinning costs no concurrency.
     /// * **Administrative** (`Shutdown`, `Status`, the DDL and maintenance commands) — belong to no
-    ///   session. They round-robin too: the catalog is behind its own rank-10 latch since `rmp`
-    ///   #1015, so DDL concurrent with writes is already safe.
+    ///   session. They round-robin: the catalog is behind its own rank-10 latch since `rmp` #1015, so
+    ///   DDL concurrent with writes is already safe.
+    ///
+    /// The first bullet used to name `BulkImportBatch` and the code never routed it — nor
+    /// `BulkImportModeBChunk`, which really does carry a ticket. Both were harmless at `W = 1`, where
+    /// every route is worker 0. `rmp` #1041 makes the Mode B one dangerous rather than merely wrong:
+    /// with the open-transaction table engine-wide, a mis-routed chunk no longer fails to find its
+    /// ticket — it FINDS it, and applies rows into a transaction whose owning worker may be running a
+    /// statement in it at that moment.
+    ///
+    /// # Why the match is exhaustive
+    ///
+    /// It had a `_` arm, and a `_` arm is how a command that names a ticket comes to be routed as if it
+    /// named nothing: the variant is added, the catch-all swallows it, and the only thing that says
+    /// otherwise is a doc comment nobody re-reads. Every variant is now listed, so a new command is a
+    /// compile error here until somebody decides which of the four classes it belongs to. That decision
+    /// is cheap to make and expensive to discover, which is the whole argument for spending a line per
+    /// variant.
     fn route(&self, cmd: &EngineCommand) -> &std::sync::mpsc::SyncSender<EngineCommand> {
         let workers = self.tx.len();
+        let round_robin = || {
+            self.next_worker
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                % workers
+        };
         let idx = match cmd {
+            // Named by a ticket: the ticket names its owner.
             EngineCommand::Run { ticket, .. }
             | EngineCommand::Commit { ticket, .. }
-            | EngineCommand::Rollback { ticket, .. } => (ticket.0 as usize) % workers,
-            _ => {
-                self.next_worker
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    % workers
+            | EngineCommand::Rollback { ticket, .. }
+            | EngineCommand::BulkImportModeBChunk { ticket, .. } => {
+                // The modulus is taken in `u64`, the width the ticket was MINTED in. Reducing first
+                // and casting after is not a style choice: `(t as usize) % W` agrees with `t % W` only
+                // while `usize` is as wide as `u64`, and on a 32-bit target it differs for every `W`
+                // that is not a power of two — while the residue class is the ONLY thing that says
+                // which worker owns a transaction. The `as usize` here is lossless because the
+                // modulus already reduced the value below `workers`, which is itself a `usize`; a
+                // `try_from(..).unwrap_or(0)` would be worse than the cast it replaced, being an
+                // unreachable fallback that silently routes to the wrong worker.
+                (ticket.0 % workers as u64) as usize
             }
+            // Session state with no ticket. Worker 0 always exists, and is the same worker for every
+            // batch of the session. Note what this does NOT pin: `maybe_run_maintenance` runs on every
+            // worker against its OWN `loading_session`, so at `W > 1` a sibling can still run a full
+            // (non-freeze-only) maintenance pass during a Mode A load — the O(store) sweep `rmp`
+            // #565/#590 exist to keep off that path. Pre-existing, and one for the task that shares
+            // the loading session rather than for the routing.
+            EngineCommand::BulkImportBatch { .. } => 0,
+            // Creating a ticket: no session yet, so any worker will do.
+            EngineCommand::Begin { .. } | EngineCommand::BeginAutoCommit { .. } => round_robin(),
+            // Administrative: belong to no session.
+            EngineCommand::Shutdown { .. }
+            | EngineCommand::Status { .. }
+            | EngineCommand::IndexDdl { .. }
+            | EngineCommand::ConstraintDdl { .. }
+            | EngineCommand::Backup { .. }
+            | EngineCommand::Checkpoint { .. } => round_robin(),
+            // Test-only (`rmp` #435): a control-class driver, routed like the administrative commands.
+            #[cfg(feature = "internal-test-udf")]
+            EngineCommand::SimulateMaintenance { .. } => round_robin(),
         };
         &self.tx[idx]
     }

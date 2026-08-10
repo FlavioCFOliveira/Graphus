@@ -1388,10 +1388,10 @@ impl ServerConfig {
         let cpu_pool = hw.logical_cpus.clamp(1, AUTO_CPU_POOL_CAP);
         if self.admission.engine_workers == 0 {
             // Auto resolves to ONE, and for a stronger reason than "unmeasured". The engine is NOT
-            // yet correct above one worker: `rmp` #1036 found the per-worker `EngineShared`, whose
-            // `readers_inflight` lets the slot-reuse barrier free a live reader's slot. `validate`
-            // refuses any configured value above one for that reason; this resolution only decides
-            // what `auto` means, and one is the only value that is both safe and measured.
+            // yet correct above one worker: `readers_inflight` is still per worker (`rmp` #1037), so
+            // the slot-reuse barrier can free a slot a different worker's reader is still walking.
+            // `validate` refuses any configured value above one for that reason; this resolution only
+            // decides what `auto` means, and one is the only value that is both safe and measured.
             self.admission.engine_workers = 1;
         }
         if self.admission.reader_threads == 0 {
@@ -1683,28 +1683,27 @@ impl ServerConfig {
                 "admission.engine_queue_capacity must be > 0".to_owned(),
             ));
         }
-        // FAIL-CLOSED until the multi-writer engine is certified (`rmp` #1036 and its siblings).
+        // FAIL-CLOSED until the multi-writer engine is certified (`rmp` #1034).
         //
-        // The engine runs `engine_workers` threads over the loop body, but the state those threads
-        // must agree on is still built per worker inside `run_engine_loop`. Two of the consequences
-        // are not degradations, they are faults: (1) `readers_inflight` is per worker, so the
-        // slot-reuse barrier (`rmp` #588) can see zero while ANOTHER worker has reads in flight and
-        // hand a live reader's slot back to a writer — a silently wrong read, the `rmp` #811 class;
-        // (2) the worker handling `Shutdown` waits on a per-worker `live_workers` counter nobody
-        // else decrements, so a `STOP DATABASE` spins for ever, is force-detached, and the zombie
-        // keeps the exclusive store-open lock for the life of the process.
+        // The engine runs `engine_workers` threads over the loop body, and the state those threads
+        // must agree on has been hoisted out of the per-worker struct one piece at a time: the stop
+        // protocol (`rmp` #1036), then the open-transaction table, the parked-statement queue and the
+        // plan cache (`rmp` #1041). ONE piece is still per worker, and it is a fault rather than a
+        // degradation: `readers_inflight`, so the slot-reuse barrier (`rmp` #588) can read zero while
+        // ANOTHER worker has reads in flight and hand a live reader's slot back to a writer — a
+        // silently wrong read, the `rmp` #811 class. That is `rmp` #1037.
         //
         // Refusing the value is the honest option: silent corruption must never be reachable from a
         // configuration file. Tests still spawn multi-worker engines directly through
         // `spawn_engine_with_timeout`, so the path stays exercised while the gate is up — this
-        // bounds who can reach it, not whether it is developed. Lift this when the certification
-        // measured by `rmp` #1034 passes.
+        // bounds who can reach it, not whether it is developed. Lift this when `rmp` #1037 closes and
+        // the certification measured by `rmp` #1034 passes.
         if self.admission.engine_workers > 1 {
             return Err(ConfigError::Invalid(format!(
                 "admission.engine_workers must be 1 (got {}): the multi-writer engine is not yet \
                  certified — with more than one worker the slot-reuse barrier can free a live \
-                 reader's slot (silently wrong reads) and a graceful stop never converges. Leave it \
-                 unset (auto) or set it to 1",
+                 reader's slot, which reads silently wrong data (rmp #1037). Leave it unset (auto) \
+                 or set it to 1",
                 self.admission.engine_workers
             )));
         }

@@ -16,17 +16,22 @@
 //!
 //! Measured, not assumed: with a lock held across the whole statement, the engine still occupies 3.95
 //! of 4 cores **provided each worker holds its own lock**, and collapses to 1.00 the moment the lock is
-//! shared. `EngineShared` is constructed inside `run_engine_loop`, so today it is one per worker — the
-//! pre-#1038 guards therefore did not contend, and this gate would have passed over them. The defect
-//! was **latent, not active**: it becomes a hang, not a slowdown, the moment `rmp` #1041 shares the
-//! tables between workers, which is exactly why #1041 is blocked on #1038.
+//! shared. When this was written the tables were constructed inside `run_engine_loop`, one per worker —
+//! the pre-#1038 guards therefore did not contend, and this gate would have passed over them. The
+//! defect was **latent, not active**: it becomes a hang, not a slowdown, the moment the tables are
+//! shared between workers, which is exactly why `rmp` #1041 was blocked on #1038.
 //!
-//! So the live gate for the latch discipline is the *tripwire*
-//! (`engine_latch_order_1038.rs` — a rank-5 scope alive when a statement starts is a panic), not this
-//! measurement. What this test contributes is the complementary end-to-end fact, and the one `rmp`
-//! #1034 needs a floor for: **W workers really do execute statements at the same time**, and the
-//! restructured critical sections are short enough not to get in the way. It becomes the direct gate
-//! for the sharing hazard the moment #1041 lands, with no change to the test.
+//! `rmp` #1041 has since landed. The three tables live in `EngineSessions`, built once per engine and
+//! shared by every worker, so **this measurement is now the direct gate for the sharing hazard** and no
+//! longer only a prediction about it — unchanged in a single line, which was the point of writing it
+//! this way. Observed after the sharing landed: 0.99 cores at `engine_workers = 1` against 3.93 at
+//! `engine_workers = 4`, i.e. exactly the third run below rather than the collapse.
+//!
+//! The complementary live gate for the latch *discipline* remains the tripwire
+//! (`engine_latch_order_1038.rs` — a rank-5 scope alive when a statement starts is a panic). What this
+//! test contributes is the end-to-end fact, and the one `rmp` #1034 needs a floor for: **W workers
+//! really do execute statements at the same time**, and the restructured critical sections are short
+//! enough not to get in the way.
 //!
 //! # The experiment
 //!
@@ -50,11 +55,12 @@
 //! were run. The pair is what tells this gate apart from a test that would pass whatever the engine
 //! did, and it is where the "latent, not active" conclusion above comes from.
 //!
-//! A third run answers the question the fix exists for. With the three session tables hoisted into
-//! process-wide statics — every worker of the engine sharing one of each, which is what `rmp` #1041
-//! will do — the restructured code still occupies **3.95 of 4 cores**. Sharing plus a critical section
-//! that spans a statement is 1.00 core (the shared-lock run above); sharing plus critical sections that
-//! span a table operation is 3.95. That difference is the whole of `rmp` #1038.
+//! A third run answered the question the fix exists for, before the sharing landed. With the three
+//! session tables hoisted into process-wide statics — every worker of the engine sharing one of each,
+//! which is what `rmp` #1041 then did for real — the restructured code still occupied **3.95 of 4
+//! cores**. Sharing plus a critical section that spans a statement is 1.00 core (the shared-lock run
+//! above); sharing plus critical sections that span a table operation is 3.95. That difference is the
+//! whole of `rmp` #1038, and the prediction held: the real sharing measures 3.93.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

@@ -537,17 +537,35 @@ impl MaintenanceDegraded {
 /// SUM across every database engine — not whichever engine `store`d last (the pre-`rmp`-#418 bug that
 /// made the `rmp` #386 leak oracle unsound under multi-DB). On drop (engine teardown) it retracts its
 /// whole remaining contribution so a stopped engine leaves no phantom open-transaction count behind.
+///
+/// **One per ENGINE, not per worker** (`rmp` #1041). "Each engine owns one" was the intent from the
+/// day it was written and stopped being true when the loop body became a worker body: it was
+/// constructed inside `run_engine_loop`, so W workers each held one, and each folded the same
+/// coordinator-wide `active_count` into the same additive gauge. The server-wide series then read up
+/// to W times the truth for as long as transactions stayed open — self-correcting once they closed,
+/// which is precisely what makes that kind of defect survive a glance at a dashboard. It is now built
+/// once by [`spawn_engine_with_timeout`] and shared, which is also why `publish` takes `&self` and
+/// swaps rather than read-compare-writing.
 struct ActiveTxnGauge {
     metrics: Arc<Metrics>,
     /// The database name labelling this engine's per-database open-transaction gauge (`rmp` #463).
     db_name: Arc<str>,
-    /// The open-transaction count this engine last contributed to the shared gauge.
-    last: u64,
-    /// The retained-SSI-conflict-record count this engine last contributed to the shared
-    /// `graphus_ssi_tracked_transactions` gauge (`rmp` #591 D-#1). Published additively at the SAME
-    /// cadence as `last` (every begin/commit/rollback/retire/reap/maintenance publish), so the gauge is
-    /// never stale and equals the SUM across databases.
-    last_ssi: u64,
+    /// What this engine last contributed: `(open transactions, retained SSI conflict records)`.
+    ///
+    /// The second is the `graphus_ssi_tracked_transactions` gauge (`rmp` #591 D-#1), published at the
+    /// SAME cadence as the first — every begin/commit/rollback/retire/reap/maintenance publish — so the
+    /// gauge is never stale and equals the SUM across databases.
+    ///
+    /// Behind ONE lock, and the fold happens under it. Atomics are not enough here, which is worth
+    /// spelling out because the lock-free version looks obviously correct and is not. Swapping the
+    /// remembered value and folding the delta are two steps, so two workers can swap in one order and
+    /// fold in the other — and `Metrics::add_delta` **saturates at zero** on a decrement. A `-3` that
+    /// lands before the `+3` it was computed against is therefore clamped away and never recovered:
+    /// `publish(3)` then `publish(0)`, folded in the reverse order, leaves the gauge permanently
+    /// reading 3 against a truth of 0. The sum of the deltas telescopes; the gauge does not, because
+    /// the clamp is not linear. Holding the lock across the fold makes the fold order the swap order,
+    /// which is the property the telescoping argument actually needs.
+    last: std::sync::Mutex<(u64, u64)>,
 }
 
 impl ActiveTxnGauge {
@@ -555,8 +573,7 @@ impl ActiveTxnGauge {
         Self {
             metrics,
             db_name,
-            last: 0,
-            last_ssi: 0,
+            last: std::sync::Mutex::new((0, 0)),
         }
     }
 
@@ -565,18 +582,27 @@ impl ActiveTxnGauge {
     /// gauge(s): the open-transaction count into BOTH the aggregate and this database's per-database gauge
     /// (`rmp` #463), and the SSI-tracked count into the aggregate `graphus_ssi_tracked_transactions`
     /// gauge (`rmp` #591 D-#1). Both are cheap O(1) coordinator reads taken by the caller.
-    fn publish(&mut self, active: usize, ssi_tracked: usize) {
+    fn publish(&self, active: usize, ssi_tracked: usize) {
         let active = active as u64;
-        if active != self.last {
-            self.metrics
-                .add_active_txns_delta_for(&self.db_name, signed_delta(active, self.last));
-            self.last = active;
-        }
+        // The counts published here are the COORDINATOR's — engine-wide figures every worker reads and
+        // republishes — so with W workers this is called concurrently, with values that differ only by
+        // how recently each worker looked. Remembering and folding under ONE lock is what makes each
+        // call fold exactly the change from the value it replaced, IN THAT ORDER; see the field docs
+        // for why doing those two steps separately is unsound rather than merely racy.
+        let mut last = self
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (prev, prev_ssi) = *last;
         let ssi_tracked = ssi_tracked as u64;
-        if ssi_tracked != self.last_ssi {
+        *last = (active, ssi_tracked);
+        if active != prev {
             self.metrics
-                .add_ssi_tracked_delta(signed_delta(ssi_tracked, self.last_ssi));
-            self.last_ssi = ssi_tracked;
+                .add_active_txns_delta_for(&self.db_name, signed_delta(active, prev));
+        }
+        if ssi_tracked != prev_ssi {
+            self.metrics
+                .add_ssi_tracked_delta(signed_delta(ssi_tracked, prev_ssi));
         }
     }
 }
@@ -601,17 +627,26 @@ impl Drop for ActiveTxnGauge {
         // Retract this engine's whole remaining contribution so a stopped/torn-down engine never
         // leaves a phantom count in the server-wide gauge(s) OR this database's per-database gauge
         // (`rmp` #418/#463/#591).
-        if self.last != 0 {
+        // Same lock, same reason — and it must not be the thing that turns a teardown into an abort: a
+        // poisoned lock here guards two counters with no invariant a panic could have broken, so the
+        // value is recovered rather than propagated. `Drop` is the one place where refusing to unwrap
+        // aborts the process instead of reporting anything.
+        let (last, last_ssi) = {
+            let mut guard = self
+                .last
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut *guard)
+        };
+        if last != 0 {
             self.metrics.add_active_txns_delta_for(
                 &self.db_name,
-                -(i64::try_from(self.last).unwrap_or(i64::MAX)),
+                -(i64::try_from(last).unwrap_or(i64::MAX)),
             );
-            self.last = 0;
         }
-        if self.last_ssi != 0 {
+        if last_ssi != 0 {
             self.metrics
-                .add_ssi_tracked_delta(-(i64::try_from(self.last_ssi).unwrap_or(i64::MAX)));
-            self.last_ssi = 0;
+                .add_ssi_tracked_delta(-(i64::try_from(last_ssi).unwrap_or(i64::MAX)));
         }
         // `rmp` #992: withdraw this database's derived-index footprint too. Its trees are in-memory and
         // die with the engine, so a `STOP`/`DROP DATABASE` that left the last published count standing
@@ -626,17 +661,29 @@ impl Drop for ActiveTxnGauge {
 /// of [`ActiveTxnGauge`], following the same additive discipline for the same reason (`rmp` #418): with
 /// `N` database engines sharing one gauge, a last-writer-wins `store` would report whichever engine wrote
 /// last instead of the fleet total, so each engine folds in only the delta since its own last publish.
+///
+/// Its sibling's `rmp` #1041 correction applies here identically, and the exposure was larger: this one
+/// republishes on EVERY loop iteration, so with a gauge per worker each of the W workers folded the
+/// same engine-wide `index_build_totals` every tick. `parked` is an alerting signal, which makes a
+/// W-fold reading an operator-facing fault rather than a cosmetic one. Built once per engine and
+/// shared, so `publish` takes `&self`.
 struct IndexBuildGauge {
     metrics: Arc<Metrics>,
     /// The counts this engine last contributed to each shared gauge (pending, parked, remaining).
-    last: IndexBuildTotals,
+    ///
+    /// Behind a plain `Mutex` because the three fields must move together: `publish` compares all
+    /// three and folds all three, and with W workers republishing the same engine-wide totals every
+    /// tick a per-field atomic would let two workers interleave into a fold neither of them intended.
+    /// Deliberately NOT an [`EngineLatch`] — rank 5 is the engine's session state, and this is a
+    /// metrics fold held for three integer comparisons and never across any work.
+    last: std::sync::Mutex<IndexBuildTotals>,
 }
 
 impl IndexBuildGauge {
     fn new(metrics: Arc<Metrics>) -> Self {
         Self {
             metrics,
-            last: IndexBuildTotals::default(),
+            last: std::sync::Mutex::new(IndexBuildTotals::default()),
         }
     }
 
@@ -647,8 +694,15 @@ impl IndexBuildGauge {
     /// Both sides are **destructured** deliberately: a field added to [`IndexBuildTotals`] must not be
     /// able to slip through un-published (and, via [`Drop`], un-retracted) while the derived `PartialEq`
     /// above quietly keeps comparing it. Destructuring turns that omission into a compile error.
-    fn publish(&mut self, totals: IndexBuildTotals) {
-        if totals == self.last {
+    fn publish(&self, totals: IndexBuildTotals) {
+        // A poisoned lock guards three counters with no invariant a panic could have broken, and this
+        // is reached from `Drop` — where refusing to unwrap would turn engine teardown into a double
+        // panic and abort the process. Recover the value instead.
+        let mut last = self
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if totals == *last {
             return;
         }
         let IndexBuildTotals {
@@ -660,13 +714,13 @@ impl IndexBuildGauge {
             pending: was_pending,
             parked: was_parked,
             entities_remaining: was_remaining,
-        } = self.last;
+        } = *last;
         self.metrics.add_index_build_deltas(
             signed_delta(pending as u64, was_pending as u64),
             signed_delta(parked as u64, was_parked as u64),
             signed_delta(entities_remaining as u64, was_remaining as u64),
         );
-        self.last = totals;
+        *last = totals;
     }
 }
 
@@ -781,45 +835,92 @@ impl ReapedTickets {
     }
 }
 
-/// The engine's open-transaction table, plus the [`ReapedTickets`] ledger that travels with it.
+/// **Which worker owns a ticket** (`rmp` #1035, load-bearing since `rmp` #1041).
 ///
-/// The ledger is bundled here rather than threaded as a separate argument because it is needed at
-/// exactly the three places the table already reaches — the age sweep that writes it, and the `RUN`
-/// and `COMMIT` unknown-ticket paths that read it — and every one of those already receives `open`.
-/// [`Deref`]/[`DerefMut`] to the underlying map keep every existing `open.get` / `open.insert` /
-/// `open.remove` / `open.iter` call site working unchanged; only the sites that care about *reaping*
-/// use the two inherent methods, so an ordinary `remove` (a normal commit or rollback) can never
-/// accidentally record a reap.
+/// A worker mints `worker_id + W·n`, so `ticket % W` names its owner: routing, uniqueness and
+/// ownership all come from one fact instead of from a table that could disagree with it.
+///
+/// Until `rmp` #1041 this was only the *handle's* concern — the engine side could not get it wrong,
+/// because each worker's open-transaction table held only tickets that worker had minted, so a
+/// foreign ticket was invisible rather than merely unclaimed. Sharing the table removed that
+/// accident: every worker now sees every transaction, and the two passes that walk the table looking
+/// for work to do — the age sweep and the parked-statement resume — must ask this question out loud.
+/// The invariant they are protecting is that **a transaction is only ever touched by the worker that
+/// owns its session**, which is what makes one transaction single-threaded in a multi-worker engine.
+#[derive(Debug, Clone, Copy)]
+struct WorkerAffinity {
+    /// This worker's id, and the residue class of every ticket it mints.
+    id: u64,
+    /// How many workers the engine runs: the modulus, and the minting stride.
+    workers: u64,
+}
+
+impl WorkerAffinity {
+    /// `workers` is floored at one: a zero modulus is a division by zero, and an engine always has at
+    /// least the worker asking the question.
+    fn new(worker_id: usize, workers: usize) -> Self {
+        Self {
+            id: worker_id as u64,
+            workers: workers.max(1) as u64,
+        }
+    }
+
+    /// Whether `ticket` was minted by — and therefore belongs to — this worker.
+    ///
+    /// `true` for every ticket when the engine runs one worker, which is what keeps the single-worker
+    /// engine byte-identical to its pre-`rmp` #1041 behaviour: every pass still considers everything.
+    fn owns(self, ticket: u64) -> bool {
+        ticket % self.workers == self.id
+    }
+}
+
 /// This worker's ticket source (`rmp` #1035).
 ///
 /// Every ticket satisfies `ticket % W == worker_id`, so a ticket names the worker that owns its
 /// session and the handle can route by arithmetic, with no lookup table and therefore no second
 /// source of truth that could drift from the first. Keeping the stride WITH the counter is the point: a
-/// caller cannot mint a ticket in the wrong residue class by forgetting an argument.
+/// caller cannot mint a ticket in the wrong residue class by forgetting an argument — and the same
+/// [`WorkerAffinity`] the minter strides by is the one the engine's cross-worker passes ask for
+/// ownership, so the two can never be derived from different numbers.
 #[derive(Debug)]
 struct TicketMinter {
-    /// The next ticket this worker will hand out.
+    /// The LAST ticket this worker handed out — [`mint`](Self::mint) is `fetch_add(W) + W`, so the
+    /// counter trails the ticket it produced by exactly one stride and [`peek`](Self::peek) reads it
+    /// directly.
+    ///
+    /// It is named `next` and was documented as "the next ticket this worker will hand out", which is
+    /// the opposite of what it holds — and the difference is load-bearing: [`gc_reuse_barrier`]'s
+    /// `+ 1` is justified by the newest open transaction's ticket EQUALLING this value, not by this
+    /// value already being one ahead of it.
     next: AtomicU64,
-    /// The stride between them: the worker count.
-    step: u64,
+    /// Whose tickets these are: the seed, the stride, and the ownership test, in one value.
+    affinity: WorkerAffinity,
 }
 
 impl TicketMinter {
-    fn new(worker_id: usize, workers: usize) -> Self {
+    fn new(affinity: WorkerAffinity) -> Self {
         Self {
-            next: AtomicU64::new(worker_id as u64),
-            step: workers.max(1) as u64,
+            next: AtomicU64::new(affinity.id),
+            affinity,
         }
     }
 
     /// The next ticket, never zero — zero is the unused value the open-table tests rely on.
     fn mint(&self) -> u64 {
-        self.next.fetch_add(self.step, Ordering::Relaxed) + self.step
+        self.next
+            .fetch_add(self.affinity.workers, Ordering::Relaxed)
+            + self.affinity.workers
     }
 
     /// The last ticket handed out, for the GC reuse barrier's floor.
     fn peek(&self) -> u64 {
         self.next.load(Ordering::Relaxed)
+    }
+
+    /// Whose tickets these are. Read by the passes that walk the engine-wide session tables, so the
+    /// ownership test and the minting stride can only ever come from the same number (`rmp` #1041).
+    fn affinity(&self) -> WorkerAffinity {
+        self.affinity
     }
 }
 
@@ -827,11 +928,11 @@ impl TicketMinter {
 ///
 /// This is the state that has no meaning per worker: a worker cannot count how many *other* workers
 /// are still running, and a stop that only one worker can see is not a stop. It is therefore built
-/// once in [`spawn_engine_with_timeout`] and handed to each worker as an `Arc` — unlike
-/// [`EngineShared`], which is still per worker and says so.
+/// once in [`spawn_engine_with_timeout`] and handed to each worker as an `Arc` — the shape
+/// [`EngineSessions`] took for the session tables in `rmp` #1041, for the same reason.
 ///
-/// It was originally a pair of fields inside [`EngineShared`], whose doc-comment claimed the struct
-/// was "declared once … without any of it being duplicated per worker" while the code constructed it
+/// It was originally a pair of fields inside the per-worker struct, whose doc-comment claimed it was
+/// "declared once … without any of it being duplicated per worker" while the code constructed it
 /// *inside* `run_engine_loop`. Every worker therefore counted itself and W−1 phantoms, so the worker
 /// handling `Shutdown` waited for a number that nobody else could ever move, and spun for the life
 /// of the process. In a server that is not a hang but a permanent one: `stop_engine` observes no
@@ -864,37 +965,46 @@ impl EngineStop {
     }
 }
 
-/// **The engine loop's per-worker state** (`rmp` #1033, layer 7b of #975; corrected by `rmp` #1036).
+/// **The engine's SESSION state, shared by every worker of one engine** (`rmp` #1041).
 ///
-/// Every field here was a local `let mut` of [`run_engine_loop`], which is exactly what made the
-/// loop un-replicable. They are grouped so the loop body can be run by W threads.
+/// This is the state a worker cannot keep a private copy of and still be right. It is built once in
+/// [`spawn_engine_with_timeout`] and handed to each worker as an `Arc` — like [`EngineStop`], and for
+/// the same reason: a table only one worker can see answers questions about that worker, and every
+/// consumer below asks about the *engine*.
 ///
-/// # This is ONE PER WORKER, and that is a statement of fact, not of design
+/// # What was wrong while each worker had its own, stated as measurements
 ///
-/// The struct is constructed inside `run_engine_loop`, so each worker gets its own. For
-/// `next_ticket` that is correct and required — the minter's residue class *is* `rmp` #1035's
-/// routing. For the rest it is a defect under repair, and each has its own task because each needs
-/// its own care:
-///
-/// * `open` and `parked` — the session path is legitimately per worker (affinity routes a ticket
-///   only to its owner), but four consumers cross workers: the `Shutdown` drain, the GC's oldest
-///   open ticket, the age sweep and reader retirement. `rmp` #1041, which had to wait for `rmp`
-///   #1038: these two were acquired in both orders, so sharing them first would have deadlocked. That
-///   blocker is now cleared — see the rank-5 note at the end of this comment.
-/// * `plan_cache` — a fail-closed index repair bumps the schema on worker 0 only, leaving the others
-///   serving plans compiled while degraded (`rmp` #1041).
-/// * `readers_inflight` — feeds the `rmp` #588 slot-reuse barrier, which can therefore free a slot a
-///   *different* worker's reader is still walking (`rmp` #1037). This is why
-///   `admission.engine_workers` above one is refused by configuration.
+/// * **The `Shutdown` drain reached one worker.** [`drain_inflight`] rolls back every still-open
+///   transaction so a clean stop leaves recovery nothing to undo. Over a per-worker table it drained
+///   the table of whichever worker happened to receive `Shutdown` — measured with
+///   `graphus_transactions_aborted_total`, which it increments once per rollback: **one of four at
+///   `W = 4`, one of one at `W = 1`, and the shutdown reported success either way**. Durability
+///   survived (no `COMMIT` record was ever written, so ARIES undoes the rest on reopen), but the
+///   property the code documents — a clean stop leaves nothing to undo — was false,
+///   `record_abort_for` under-counted, and the next open paid for undo it should never have faced.
+/// * **Plan-cache invalidation reached one worker.** Measured with `engine_workers = 4`, on one
+///   engine and one query text: a `USING INDEX` plan compiled and cached on worker 0 was still
+///   ACCEPTED after a `DROP INDEX` that landed on worker 1, which rejected it with "planner hint
+///   cannot be satisfied". The same query was therefore accepted on one connection and rejected on
+///   another, for as long as the process lived. Whether a query is *accepted* must not depend on which
+///   connection served it — a Cypher-conformance property, not a performance one. Only the
+///   ASYNCHRONOUS property-index build self-healed, because [`invalidate_cache_on_build_completion`]
+///   reads the *shared* `has_pending_index_builds`; every synchronous DDL (any `DROP INDEX`,
+///   `CREATE`/`DROP` of FULLTEXT/POINT/TEXT/VECTOR, and all constraint DDL) and the `rmp` #733
+///   fail-closed index repair diverged permanently, and only a restart cleared it.
+/// * **`open` and `parked` cannot be separated.** The age sweep excludes suspended statements by
+///   testing them against the parked queue, so sharing `open` alone would let a worker reap a
+///   transaction whose suspended cursor is alive on another. They are shared together — and because a
+///   statement *executing* inline is in neither table, that exclusion is not sufficient on its own:
+///   the sweep also reaps only what this worker [`owns`](WorkerAffinity::owns). See
+///   [`maybe_reap_aged`].
 ///
 /// # Why each is latched separately, and why that is the whole design
 ///
-/// One lock around the whole struct — or, worse, held around the command dispatch — is how W threads end
-/// up taking turns: *apparent* parallelism, indistinguishable from a multi-writer engine except by CPU
-/// occupancy, which then reads one core however many workers the engine was given. That is a statement
-/// about the day these tables are SHARED (`rmp` #1041), because a lock only one thread can reach costs
-/// nothing — measured, not assumed, in `tests/engine_latch_scaling_1038.rs`. The separation is what
-/// keeps the long part of a statement outside every lock on that day:
+/// One lock around this struct — or, worse, held around the command dispatch — is how W threads end up
+/// taking turns: *apparent* parallelism, indistinguishable from a multi-writer engine except by CPU
+/// occupancy, which then reads one core however many workers the engine was given. The separation is
+/// what keeps the long part of a statement outside every lock:
 ///
 /// * `open` is consulted by `exec::handle_run` to copy the entry's two `Copy` fields, and again when
 ///   the statement finalises. Nothing between those two points touches it. Short commands (`BEGIN`,
@@ -906,46 +1016,81 @@ impl EngineStop {
 /// Until `rmp` #1038 that was true of the *data* and false of the *guards*, which is not a distinction
 /// the machine makes. Every execution call site passed its guard in argument position — and a Rust
 /// temporary lives to the end of the statement that created it, so each of those guards spanned the
-/// query it was nominally protecting a table lookup for. The tables are now [`EngineLatch`]es
-/// (rank 5), which cannot be handed over that way and whose tripwire fires if one is still held when
-/// execution begins.
+/// query it was nominally protecting a table lookup for. The tables are [`EngineLatch`]es (rank 5),
+/// which cannot be handed over that way and whose tripwire fires if one is still held when execution
+/// begins. That work had to land first: sharing tables that were acquired in two opposite orders (the
+/// age sweep took *open -> parked*, the resume and park paths took *parked -> open*) would have turned
+/// a latent ABBA into a real deadlock on the day of this change. Rank 5 refuses the second acquisition
+/// outright, so the cycle cannot be re-formed by a later edit either.
 ///
-/// The rank also settles which of `open` and `parked` is taken first: neither, ever. They shared a
-/// thread in two opposite orders (the age sweep took *open → parked*, the resume and park paths took
-/// *parked → open*) — invisible while each worker had its own pair, a silent deadlock the moment
-/// `rmp` #1041 shares them. Every site that needed both was restructured to need one at a time, and
-/// rank 5 refuses the second.
-struct EngineShared {
-    /// The explicit transactions this engine has open, keyed by ticket.
+/// Measured, in `tests/engine_latch_scaling_1038.rs`. That gate predicted this change before it landed,
+/// by hoisting the three tables into process-wide statics: **3.95 of 4 cores**. Run against the real
+/// sharing it reports **3.93 of 4**, against 0.99 for a single worker. Sharing is not what costs;
+/// holding a latch across a statement is, and `rmp` #1038 is what stopped that.
+struct EngineSessions {
+    /// The explicit transactions this ENGINE has open, keyed by ticket.
     open: EngineLatch<OpenTxTable>,
     /// Compiled plans, keyed by query text and schema generation.
     plan_cache: EngineLatch<exec::EnginePlanCache>,
-    /// Statements suspended mid-execution, oldest first (`rmp` #485).
+    /// Statements suspended mid-execution, oldest first (`rmp` #485). Engine-wide, so
+    /// `max_parked_inline` now bounds the ENGINE rather than each worker separately.
     parked: EngineLatch<VecDeque<exec::InFlightInline>>,
-    /// The next explicit-transaction ticket for THIS worker. An atomic, not a latched counter: it
-    /// orders nothing and only has to be unique.
-    ///
-    /// Seeded with the worker's id and advanced by [`ticket_step`](Self::ticket_step), so every
-    /// ticket satisfies `ticket % W == worker_id` (`rmp` #1035). The ticket therefore names the
-    /// worker that owns its session, and the handle routes by arithmetic instead of by a lookup
-    /// table that could disagree with the truth.
+}
+
+impl EngineSessions {
+    fn new() -> Self {
+        Self {
+            open: EngineLatch::new(OpenTxTable::new()),
+            plan_cache: EngineLatch::new(exec::EnginePlanCache::new()),
+            parked: EngineLatch::new(VecDeque::new()),
+        }
+    }
+}
+
+/// **The engine loop's state that is genuinely per worker** (`rmp` #1033, layer 7b of #975).
+///
+/// What is left after [`EngineStop`] (`rmp` #1036) and [`EngineSessions`] (`rmp` #1041) took away the
+/// state that has no per-worker meaning. This one is still constructed inside [`run_engine_loop`],
+/// which is why it must be exactly these two fields:
+///
+/// * `next_ticket` is per worker **by design** — the minter's residue class *is* `rmp` #1035's
+///   routing, and an engine minting from one counter would destroy it.
+/// * `readers_inflight` is per worker **by defect** (`rmp` #1037): it feeds the `rmp` #588 slot-reuse
+///   barrier, which can therefore free a slot a *different* worker's reader is still walking. That
+///   task is why `admission.engine_workers` above one is still refused by configuration.
+struct EngineWorkerState {
+    /// The next explicit-transaction ticket for THIS worker, together with the affinity that defines
+    /// its residue class. An atomic, not a latched counter: it orders nothing and only has to be
+    /// unique.
     next_ticket: TicketMinter,
     /// Off-thread reads currently in flight (`rmp` #336), for the gauge and the drain barrier.
     readers_inflight: AtomicU64,
 }
 
-impl EngineShared {
-    fn new(workers: usize, worker_id: usize) -> Self {
+impl EngineWorkerState {
+    fn new(affinity: WorkerAffinity) -> Self {
         Self {
-            open: EngineLatch::new(OpenTxTable::new()),
-            plan_cache: EngineLatch::new(exec::EnginePlanCache::new()),
-            parked: EngineLatch::new(VecDeque::new()),
-            next_ticket: TicketMinter::new(worker_id, workers),
+            next_ticket: TicketMinter::new(affinity),
             readers_inflight: AtomicU64::new(0),
         }
     }
+
+    /// Which tickets this worker owns — the one question the cross-worker passes must ask before they
+    /// touch a transaction they found in the now-shared open table.
+    fn affinity(&self) -> WorkerAffinity {
+        self.next_ticket.affinity()
+    }
 }
 
+/// The engine's open-transaction table, plus the [`ReapedTickets`] ledger that travels with it.
+///
+/// The ledger is bundled here rather than threaded as a separate argument because it is needed at
+/// exactly the three places the table already reaches — the age sweep that writes it, and the `RUN`
+/// and `COMMIT` unknown-ticket paths that read it — and every one of those already receives `open`.
+/// [`Deref`]/[`DerefMut`] to the underlying map keep every existing `open.get` / `open.insert` /
+/// `open.remove` / `open.iter` call site working unchanged; only the sites that care about *reaping*
+/// use the two inherent methods, so an ordinary `remove` (a normal commit or rollback) can never
+/// accidentally record a reap.
 #[derive(Default)]
 struct OpenTxTable {
     live: HashMap<u64, OpenTx>,
@@ -1099,11 +1244,17 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // spawner: a worker cannot count how many *others* are still running, and a stop only one worker
     // can see is not a stop.
     stop: Arc<EngineStop>,
+    // The session state, shared by every worker of this engine (`rmp` #1041). Built once by the
+    // spawner for the same reason the stop protocol is: the `Shutdown` drain, the plan cache and the
+    // age sweep are all statements about the ENGINE, and a per-worker copy of any of them answers a
+    // different question — see [`EngineSessions`] for what each of those answered wrongly.
+    sessions: Arc<EngineSessions>,
     // Which worker this is. Worker 0 additionally drives the idle maintenance tick; the others only
     // serve commands.
     worker_id: usize,
     // How many workers this engine runs. Seeds the ticket minter's stride, so every ticket this
-    // worker mints satisfies `ticket % W == worker_id` (`rmp` #1035).
+    // worker mints satisfies `ticket % W == worker_id` (`rmp` #1035), and is the modulus the two
+    // cross-worker passes over the shared tables use to tell their own transactions from the rest.
     engine_workers: usize,
     result_buffer_capacity: usize,
     reader_threads: usize,
@@ -1129,6 +1280,9 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // sized with `engine_queue_capacity` (≥ `max_concurrent_queries` in any sane config), so this cap is
     // a never-reached defense-in-depth ceiling against an admission bypass — not a routine limit.
     max_parked_inline: usize,
+    // This engine's gauge folds, shared by every worker (`rmp` #1041) — see the binding below.
+    active_txns: Arc<ActiveTxnGauge>,
+    index_builds: Arc<IndexBuildGauge>,
     // The server-wide live-transaction registry (`rmp` #637/#903), shared with both connectivity seams.
     // The engine registers its **own** validating `CREATE CONSTRAINT` transactions here so they appear
     // in `SHOW TRANSACTIONS` while they run and can be stopped by `TERMINATE TRANSACTIONS`. It is
@@ -1136,32 +1290,46 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // which is precisely the failure mode this wiring exists to remove, so the type system requires one.
     transactions: Arc<crate::txn_registry::TransactionRegistry>,
 ) {
-    // This engine's contribution to the server-wide open-transaction gauge (`rmp` #418): published
-    // additively so the gauge sums across every database engine. Also folds the same delta into THIS
-    // database's per-database gauge (`rmp` #463). Dropped (retracting its contribution from both) when the
-    // loop exits. `db_name` labels the per-database series for every metric family below.
-    let mut active_txns = ActiveTxnGauge::new(Arc::clone(&metrics), Arc::clone(&db_name));
-    // This engine's contribution to the server-wide index-build gauges (`rmp` task #573), republished
-    // every loop iteration so a build's start, progress, completion and parking are all visible.
-    let mut index_builds = IndexBuildGauge::new(Arc::clone(&metrics));
-    // The loop's latched state (`rmp` #1033). Constructed HERE, so there is one of these PER WORKER —
-    // see [`EngineShared`], which says so and lists which fields that is right for and which are a
-    // defect awaiting `rmp` #1041. This comment used to claim the opposite ("without any of it being
-    // duplicated per worker"), which was false the day it was written and is the same false-sharing
-    // claim `rmp` #1036 had to correct for the stop protocol; the two fields that genuinely have no
-    // per-worker meaning were moved out to [`EngineStop`] then.
+    // This ENGINE's contribution to the two gauge families, shared by every worker (`rmp` #1041).
+    // Both publish figures the coordinator computes for the whole engine — `active_count`,
+    // `ssi_tracked_len`, `index_build_totals` — so one fold per engine is the correct number of folds.
+    // Constructed per worker, each one folded the same engine-wide value into the same additive gauge,
+    // and the server-wide series read up to W times the truth until the counts came back to rest.
+    // Retracted when the LAST worker drops its share, which is what keeps a stopped engine from
+    // leaving a phantom count behind (`rmp` #418/#463/#573).
+    let active_txns = &*active_txns;
+    let index_builds = &*index_builds;
+    // What is left of the loop's state once the parts that have no per-worker meaning have been taken
+    // out to [`EngineStop`] (`rmp` #1036) and [`EngineSessions`] (`rmp` #1041): a ticket minter whose
+    // residue class IS this worker's identity, and a reader counter that is still per worker only
+    // because `rmp` #1037 has not moved it yet. Constructed HERE, and that is now a design statement
+    // rather than the accident it used to be.
+    let worker = EngineWorkerState::new(WorkerAffinity::new(worker_id, engine_workers));
+    // Which tickets this worker owns. Read once: the modulus never changes for the life of a worker,
+    // and the two passes that walk the shared tables (the age sweep and the parked-statement resume)
+    // both need it on every tick.
+    let affinity = worker.affinity();
+    // The engine's ONE plan cache, named locally because the loop reaches it from a dozen places.
     //
-    // The consequence for `rmp` #1038 is worth stating plainly: because each worker holds its own
-    // latches, a guard held across a statement does not *contend* today — it would the moment the
-    // tables are shared. That is why the discipline is enforced by a tripwire rather than measured by
-    // a throughput test, which could only observe it after `rmp` #1041 had already shipped the hang.
-    let shared = EngineShared::new(engine_workers, worker_id);
+    // Shared rather than per worker, decided by measurement (`rmp` #1041) against the alternative of a
+    // cache per worker with the schema version in a shared atomic. Both are correct; the shared one is
+    // faster where it was expected to be slower and simpler where it matters. On the workload most
+    // dominated by the cache — `RETURN 1 AS x`, W = 8, both shapes alternated inside one process so
+    // host drift hits them equally — the shared latch cost 174 780 against 175 349 statements per
+    // second, a 0.33 % difference inside a 1.3 % run-to-run spread. On a COLD workload of 400 distinct
+    // texts the per-worker shape cost 6.2 % more engine CPU and 5.8 % more wall time, because a text
+    // compiled on one worker is a miss on every other and the engine compiles it up to W times instead
+    // of once. It would also hold W x 512 plans instead of 512, and it needs a second coherence
+    // protocol — a shared version plus a sync-on-use step — whose failure mode is a stale plan served
+    // silently, which is the defect this task exists to remove, and which fails OPEN.
+    let plan_cache = &sessions.plan_cache;
 
     // The engine's compiled-plan cache (`rmp` task #322): reuses a compiled `PhysicalPlan` for an
-    // identical query text instead of re-running the ~7–9 µs compile pipeline on every `Run`. Owned by
-    // (and `&mut`-borrowed on) this single engine thread, so its single-threaded contract holds with no
-    // synchronisation. Invalidated by a schema-version bump on any planner-visible catalog change (DDL
-    // or an online index build promoting `Populating`→`Online`).
+    // identical query text instead of re-running the ~7–9 µs compile pipeline on every `Run`. Shared by
+    // every worker of this engine since `rmp` #1041, behind its own rank-5 latch, so a DDL on one
+    // worker invalidates the plans every other worker is serving. Invalidated by a schema-version bump
+    // on any planner-visible catalog change (DDL, the `rmp` #733 fail-closed index repair, or an online
+    // index build promoting `Populating`→`Online`).
 
     // Whether an index build was pending at the end of the previous tick. A `true`→`false` transition
     // means a build just completed (an index promoted `Populating`→`Online`), which changes the
@@ -1260,12 +1428,12 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         process_retirements(
             &retire_rx,
             &coordinator,
-            &shared.open,
-            &shared.readers_inflight,
+            &sessions.open,
+            &worker.readers_inflight,
             &metrics,
             &db_name,
             &degraded,
-            &mut active_txns,
+            active_txns,
         );
 
         // Maximum-transaction-age sweep (`rmp` #477): reap any **explicit** transaction whose lifetime
@@ -1274,37 +1442,40 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         // exactly when the denial of service it guards against can manifest: a long-running reader pins
         // the MVCC GC low-water mark, but dead versions only *accumulate* (so the pin only *costs*) under
         // other transactions' write traffic, and that traffic is what wakes this loop. Disabled (`None`)
-        // ⇒ a cheap no-op. Skips the one statement executing inline and excludes auto-commit statements
-        // (transient, bounded by the per-statement timeout, possibly mid-flight on an off-thread reader),
-        // so a reap never races a live read.
+        // ⇒ a cheap no-op. Excludes auto-commit statements (transient, bounded by the per-statement
+        // timeout, possibly mid-flight on an off-thread reader), every parked statement, and — since the
+        // table became engine-wide (`rmp` #1041) — every transaction another worker owns, so a reap
+        // never races a live read or a live statement.
         maybe_reap_aged(
             &coordinator,
-            &shared.open,
-            &shared.parked,
+            &sessions.open,
+            &sessions.parked,
+            affinity,
             max_transaction_age,
             &clock,
             &metrics,
             &db_name,
-            &mut active_txns,
+            active_txns,
         );
 
-        // Resume ONE batch of EACH suspended inline statement (`rmp` task #372; round-robin over the
-        // bounded queue per `rmp` #485 B1). Done each tick — before the (timed) command receive — so
-        // every draining consumer makes progress promptly even when no client command arrives, and a
-        // concurrent write/command on the SAME database is still serviced on the very next tick (the
-        // head-of-line block stays gone for N parked statements, not just one). Each resume runs behind
-        // a panic-isolation boundary (`rmp` #485 B2): a panic on a resumed batch rolls that statement
-        // back and keeps the engine alive instead of unwinding the single engine thread.
+        // Resume ONE batch of EACH suspended inline statement THIS worker owns (`rmp` task #372;
+        // round-robin over the bounded queue per `rmp` #485 B1). Done each tick — before the (timed)
+        // command receive — so every draining consumer makes progress promptly even when no client
+        // command arrives, and a concurrent write/command on the SAME database is still serviced on the
+        // very next tick (the head-of-line block stays gone for N parked statements, not just one).
+        // Each resume runs behind a panic-isolation boundary (`rmp` #485 B2): a panic on a resumed batch
+        // rolls that statement back and keeps the engine alive instead of unwinding the engine thread.
         resume_parked_statements(
-            &shared.parked,
+            &sessions.parked,
             &coordinator,
-            &shared.open,
+            &sessions.open,
+            affinity,
             &extensions,
             &metrics,
             &db_name,
             &degraded,
             &clock,
-            &mut active_txns,
+            active_txns,
         );
 
         // Prefer a command a group-commit batch drain stashed (a non-`Commit` command that ended the
@@ -1323,20 +1494,20 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                 cmd,
                 rx: &rx,
                 coordinator: &mut coordinator,
-                open: &shared.open,
-                next_ticket: &shared.next_ticket,
-                plan_cache: &shared.plan_cache,
+                open: &sessions.open,
+                next_ticket: &worker.next_ticket,
+                plan_cache,
                 extensions: &extensions,
                 dispatch: &dispatch,
-                readers_inflight: &shared.readers_inflight,
-                parked: &shared.parked,
+                readers_inflight: &worker.readers_inflight,
+                parked: &sessions.parked,
                 max_parked_inline,
                 result_buffer_capacity,
                 metrics: &metrics,
                 db: &db_name,
                 degraded: &degraded,
                 maintenance_degraded: &maintenance_degraded,
-                active_txns: &mut active_txns,
+                active_txns,
                 clock: &clock,
                 statement_timeout,
                 loading_session: &mut loading_session,
@@ -1421,8 +1592,8 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                 || indexes_degraded
                 || vector_blocked
                 || ft_spatial_poisoned
-                || shared.readers_inflight.load(Ordering::Relaxed) > 0
-                || !shared.parked.lock().is_empty());
+                || worker.readers_inflight.load(Ordering::Relaxed) > 0
+                || !sessions.parked.lock().is_empty());
 
         // A stop raised by another worker ends this one too, checked before it blocks. The
         // decrement happens at the single exit below, so a worker that leaves here is counted out
@@ -1459,11 +1630,11 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                         &db_name,
                         &mut index_health_seen,
                     ) {
-                        shared.plan_cache.lock().bump_schema();
+                        plan_cache.lock().bump_schema();
                     }
                     invalidate_cache_on_build_completion(
                         &coordinator,
-                        &shared.plan_cache,
+                        plan_cache,
                         &mut builds_were_pending,
                     );
                     continue 'engine;
@@ -1523,20 +1694,20 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             cmd,
             rx: &rx,
             coordinator: &mut coordinator,
-            open: &shared.open,
-            next_ticket: &shared.next_ticket,
-            plan_cache: &shared.plan_cache,
+            open: &sessions.open,
+            next_ticket: &worker.next_ticket,
+            plan_cache,
             extensions: &extensions,
             dispatch: &dispatch,
-            readers_inflight: &shared.readers_inflight,
-            parked: &shared.parked,
+            readers_inflight: &worker.readers_inflight,
+            parked: &sessions.parked,
             max_parked_inline,
             result_buffer_capacity,
             metrics: &metrics,
             db: &db_name,
             degraded: &degraded,
             maintenance_degraded: &maintenance_degraded,
-            active_txns: &mut active_txns,
+            active_txns,
             clock: &clock,
             statement_timeout,
             loading_session: &mut loading_session,
@@ -1567,8 +1738,13 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     //    `recv`) and joins them, so no reader of THIS worker survives into the final flush — which
     //    consumes the store the readers read. A retirement that arrives after the loop exited is
     //    dropped: its transaction is rolled back by `Shutdown`'s `drain_inflight`, never left
-    //    half-applied. (With `W > 1` that drain only reaches this worker's own table, which is `rmp`
-    //    #1041 and one of the reasons configuration refuses more than one worker for now.)
+    //    half-applied. That justification is only sound because the open-transaction table is
+    //    engine-wide (`rmp` #1041): the dropped retirement belongs to a reader THIS worker dispatched,
+    //    so its ticket lives in this worker's residue class — and until the table was shared, the
+    //    drain ran over the table of whichever worker received `Shutdown` and reached this one's
+    //    transactions only when they happened to be the same worker. The order below is what makes
+    //    the timing work: every other worker has left the loop before the shutdown worker passes its
+    //    barrier, so every late retirement has already been dropped when the drain runs.
     // 2. Then this worker's share of the coordinator is released.
     // 3. Only then is the exit announced.
     //
@@ -1597,7 +1773,7 @@ fn process_retirements<D: BlockDevice, S: LogSink>(
     metrics: &Metrics,
     db: &str,
     degraded: &EngineDegraded,
-    active_txns: &mut ActiveTxnGauge,
+    active_txns: &ActiveTxnGauge,
 ) {
     let mut any_retired = false;
     while let Ok(retirement) = retire_rx.try_recv() {
@@ -1638,8 +1814,13 @@ fn process_retirements<D: BlockDevice, S: LogSink>(
 ///
 /// 1. **Merge (M1):** fold the reader's SIREAD buffer into the shared SSI tracker *before* the
 ///    auto-commit's `detect_pivot_abort`, so the reader's rw-edges are present when its (or a
-///    concurrent writer's) pivot is checked. Because this runs on the single engine thread, in the
-///    retirement channel's arrival order, the no-lost-edge proof reduces to in-order event processing.
+///    concurrent writer's) pivot is checked. Because this runs on ONE thread — the worker that
+///    dispatched the reader, in its own retirement channel's arrival order — the no-lost-edge proof
+///    reduces to in-order event processing. That premise survived `rmp` #1033: the retirement channel
+///    is per worker and a reader retires to the worker that dispatched it, so the ordering is still a
+///    single thread's. What W > 1 does put in question is step (1)'s ordering against a commit on
+///    ANOTHER worker, which is the multi-writer commit path (`rmp` #1037 and its siblings) and is why
+///    `admission.engine_workers` above one is still refused.
 /// 2. **Auto-commit (the terminal-error contract):** on a clean `outcome`, `commit` the reader — which
 ///    may itself SSI-abort it (a writeless reader can be another transaction's pivot-victim). A commit
 ///    failure is sent as a **terminal error** through the still-open egress channel `row_tx`, exactly
@@ -1666,7 +1847,8 @@ fn finish_reader<D: BlockDevice, S: LogSink>(
     } = retirement;
 
     // (1) M1: merge the reader's SIREAD markers into the shared tracker BEFORE any commit's pivot
-    // detection. On the single engine thread, so it is correctly ordered w.r.t. every other commit.
+    // detection. Ordered w.r.t. every commit THIS worker performs, because it is the same thread; see
+    // the ordering note in the doc comment for what more than one worker would add to that claim.
     coordinator.merge_read_buffer(buffer);
 
     // Remove the open-tx ticket (the engine owns its lifecycle now). A reader that the client
@@ -1801,6 +1983,14 @@ fn maintenance_interval_bytes(store_bytes: u64) -> u64 {
 /// and reopens #588). Gating on `readers_inflight` keeps the hold to the only regime that needs it: when
 /// no off-thread reader is in flight (the inline/DST driver never dispatches one) the barrier is `None`,
 /// so `held_slots` stays empty and the freed-id reuse order — hence the DST golden trace — is unchanged.
+///
+/// **What `rmp` #1037 has to fix here is wider than the reader counter.** Both arguments come from
+/// per-worker state: `readers_inflight` is the known half, and `next_ticket` is the other. The minter
+/// counts in ONE worker's residue class, so `peek() + 1` does not dominate a sibling's tickets — worker
+/// 0 with `peek = 0` yields a barrier of 1, which another worker's already-open ticket 5 satisfies
+/// immediately. The barrier therefore needs an engine-wide ticket high-water, not only a shared reader
+/// count. `rmp` #1041 did not make this worse: it made `oldest_open_ticket` engine-wide, and a minimum
+/// over more transactions can only fall, so `release_held` fires later than before and never earlier.
 fn gc_reuse_barrier(next_ticket: u64, readers_inflight: u64) -> Option<u64> {
     (readers_inflight > 0).then(|| next_ticket + 1)
 }
@@ -1941,20 +2131,44 @@ fn maybe_run_maintenance<D: BlockDevice, S: LogSink>(
 ///   off-thread reader** (`rmp` #336) whose retirement still merges its SIREAD buffer back — reaping it
 ///   would resurrect a forgotten reader in the conflict graph. The age cap targets *explicit*
 ///   `BEGIN … COMMIT` transactions, which are the only ones a client can hold open across statements.
-/// - **Every statement currently parked/executing inline** (`parked`) is skipped: reaping one would
-///   pull the per-statement seam out from under a live (suspended) cursor. Several can be parked at
-///   once (`rmp` #485 B1), so ALL of their transactions are excluded, not just one. Each is reaped on a
+/// - **Every statement currently parked** (`parked`) is skipped: reaping one would pull the
+///   per-statement seam out from under a live (suspended) cursor. Several can be parked at once
+///   (`rmp` #485 B1), so ALL of their transactions are excluded, not just one. Each is reaped on a
 ///   later tick once idle (and is itself bounded by the per-statement timeout meanwhile).
+/// - **Every transaction this worker does not own** is skipped (`rmp` #1041). This is the exclusion
+///   that replaced an accident, and it is worth being exact about which one. The list above used to
+///   read "parked/executing inline", crediting the parked queue with covering both — but a statement
+///   that is *executing* is in neither `parked` nor anywhere else the sweep can see. What actually
+///   protected it was that `open` held only this worker's transactions, so a foreign one was invisible
+///   rather than merely unclaimed, and this worker cannot be sweeping and executing at the same time.
+///   Sharing `open` removed exactly that, and a shared `parked` does not put it back: it makes
+///   suspended cursors visible, not running ones. So the sweep asks
+///   [`WorkerAffinity::owns`] and reaps only its own, which restores the property by stating it —
+///   every worker still sweeps, and between them they still cover every transaction.
+///
+///   Be exact about what that reap costs, because it is not what the parked case costs and the
+///   difference decides how it can be tested. Measured with the affinity test removed
+///   (`tests/engine_shared_sessions_1041.rs`): a sibling worker rolled the transaction back 100 ms
+///   into a 700 ms statement, and the statement then ran to completion, produced the correct
+///   aggregate, and reported SUCCESS — because it read no store data, so nothing it did afterwards
+///   consulted the transaction that no longer existed. A reaped *parked* statement fails loudly
+///   ("statement in inactive txn"); a reaped *executing* one can be entirely silent, and the client
+///   is told its statement succeeded inside a transaction that was destroyed while it ran. That is
+///   why the gate for this exclusion asserts on `graphus_transactions_aborted_total` and not on the
+///   statement's result.
 #[allow(clippy::too_many_arguments)] // the engine loop threads its execution context through here
 fn maybe_reap_aged<D: BlockDevice, S: LogSink>(
     coordinator: &Option<Arc<TxnCoordinator<D, S>>>,
     open: &EngineLatch<OpenTxTable>,
     parked: &EngineLatch<VecDeque<exec::InFlightInline>>,
+    // Whose transactions this sweep may reap. One worker owns every ticket, so a single-worker engine
+    // sweeps exactly what it always did.
+    affinity: WorkerAffinity,
     max_transaction_age: Option<std::time::Duration>,
     clock: &Arc<dyn graphus_core::capability::Clock + Send + Sync>,
     metrics: &Metrics,
     db: &str,
-    active_txns: &mut ActiveTxnGauge,
+    active_txns: &ActiveTxnGauge,
 ) {
     let Some(max_age) = max_transaction_age else {
         return; // cap disabled — opt-out, unbounded lifetime
@@ -1997,10 +2211,20 @@ fn maybe_reap_aged<D: BlockDevice, S: LogSink>(
                 .find(|(_, t)| t.txn == txn)
                 .map(|(ticket, t)| (*ticket, t.auto_commit))
             {
-                // Not engine-tracked (an internal maintenance txn) — leave it to its owner. A
-                // transient auto-commit unit is never the idle-holder threat, so it is skipped too.
+                // NOT IN THE TABLE AT ALL: an internal maintenance transaction the coordinator runs
+                // for itself, which no ticket names — leave it to its owner. Since `rmp` #1041 this
+                // arm no longer also absorbs "belongs to another worker": the table is shared, so a
+                // sibling's transaction IS found here, and it is the `owns` test below that declines
+                // it. Reading the two cases as one is how a foreign transaction would be reaped while
+                // its owner ran a statement in it.
                 None => None,
+                // A transient auto-commit unit is never the idle-holder threat, and may be mid-flight
+                // on an off-thread reader.
                 Some((_, true)) => None,
+                // Another worker's session. Its owner sweeps on its own tick with the same cap, so
+                // nothing goes unswept; what would go wrong here is claiming a transaction whose
+                // owner may be executing a statement in it right now.
+                Some((ticket, false)) if !affinity.owns(ticket) => None,
                 Some((ticket, false)) => {
                     open.remove(&ticket);
                     Some(ticket)
@@ -2030,8 +2254,9 @@ fn maybe_reap_aged<D: BlockDevice, S: LogSink>(
     }
 }
 
-/// Resumes ONE batch of EACH currently-parked inline statement (`rmp` task #372; bounded-queue
-/// round-robin generalization per `rmp` #485 B1), each behind a panic-isolation boundary (`rmp` #485 B2).
+/// Resumes ONE batch of EACH currently-parked inline statement **this worker owns** (`rmp` task #372;
+/// bounded-queue round-robin generalization per `rmp` #485 B1), each behind a panic-isolation boundary
+/// (`rmp` #485 B2).
 ///
 /// Only the statements parked at entry get a turn this tick (a re-suspended one is appended and waits
 /// for the next tick), so the pass is bounded and fair across N slow consumers. For each statement:
@@ -2048,6 +2273,18 @@ fn maybe_reap_aged<D: BlockDevice, S: LogSink>(
 /// panic no partially-mutated coordinator state is observed on any success path — the statement is
 /// rolled back via ARIES undo, and the per-statement seam's `RefCell` borrows are released by
 /// unwinding RAII guards before this frame regains control.
+///
+/// ## Why a shared queue is still resumed by the owner only (`rmp` #1041)
+///
+/// The queue became engine-wide with the open-transaction table, because the age sweep has to see
+/// every suspended cursor to avoid reaping one. Resuming is a different matter: a resumed batch runs
+/// real operators against the statement's transaction, and the transaction is the unit `rmp` #1035's
+/// session affinity keeps single-threaded. A client may hold several results open in one transaction
+/// (see `InFlightInline::pending_error`), so its owning worker can be running a second statement in
+/// that very transaction while this pass looks at the first. Resuming a foreign statement would put two
+/// threads inside one transaction's write buffer and SSI footprint — with no lock between them, because
+/// there has never needed to be one. A statement that is not this worker's is therefore returned to the
+/// queue untouched, and its owner picks it up on its own tick.
 #[allow(clippy::too_many_arguments)] // the engine loop threads its execution context through here
 fn resume_parked_statements<
     D: BlockDevice + Send + Sync + 'static,
@@ -2056,33 +2293,62 @@ fn resume_parked_statements<
     parked: &EngineLatch<VecDeque<exec::InFlightInline>>,
     coordinator: &Option<Arc<TxnCoordinator<D, S>>>,
     open: &EngineLatch<OpenTxTable>,
+    // Whose parked statements this pass may resume. One worker owns every ticket, so a single-worker
+    // engine resumes exactly what it always did, in exactly the same order.
+    affinity: WorkerAffinity,
     extensions: &Arc<graphus_cypher::extension::ExtensionRegistry>,
     metrics: &Arc<Metrics>,
     db: &str,
     degraded: &EngineDegraded,
     clock: &Arc<dyn graphus_core::capability::Clock + Send + Sync>,
-    active_txns: &mut ActiveTxnGauge,
+    active_txns: &ActiveTxnGauge,
 ) {
     use std::panic::{AssertUnwindSafe, catch_unwind};
     let mut finalized_any = false;
-    // Snapshot the count at entry: a statement that re-suspends is pushed to the back and only gets its
-    // next batch on the following tick, so this never spins on one fast-refilling consumer.
-    let mut budget = parked.lock().len();
+    // The budget: how many statements THIS WORKER owns, snapshotted at entry. A statement that
+    // re-suspends is pushed to the back and only gets its next batch on the following tick, so the pass
+    // never spins on one fast-refilling consumer.
+    //
+    // Counting only our own is the `rmp` #1041 half. The queue is engine-wide now, and a budget of
+    // `len()` would grant this worker's statements one extra turn for every sibling's statement sitting
+    // beside them — quietly undoing the "one batch each per tick" fairness the whole loop exists to
+    // provide. At `W = 1` every entry is owned and this is `len()`, exactly as it always was.
+    let mut budget = parked
+        .lock()
+        .iter()
+        .filter(|stmt| affinity.owns(stmt.ticket().0))
+        .count();
     while budget > 0 {
         budget -= 1;
-        // POP under the latch, RESUME with it released. The pop is what takes ownership of the
-        // statement — it is out of the queue, so no other worker can reach it — and resuming it runs a
-        // batch of a real query. Holding the queue across that was one half of the `rmp` #1038 defect
-        // and, with `open` held too, the other half of its ABBA. The pop is deliberately its own `let`
+        // TAKE under the latch, RESUME with it released. Removing the statement is what takes ownership
+        // of it — it is out of the queue, so no other worker can reach it — and resuming it runs a batch
+        // of a real query. Holding the queue across that was one half of the `rmp` #1038 defect and,
+        // with `open` held too, the other half of its ABBA. The removal is deliberately its own `let`
         // statement rather than a `let … else` scrutinee, so the guard's release is visibly bound to a
         // statement end instead of resting on the temporary-scope rules for `let`-`else`.
-        let popped = parked.lock().pop_front();
+        //
+        // It takes the OLDEST statement this worker owns and leaves every sibling's where it is. The
+        // obvious alternative — pop the head, and push it back if it turns out to belong to someone
+        // else — reorders the queue as a side effect of looking at it: two workers doing that at the
+        // same moment can swap the relative order of a THIRD worker's statements, and the order of the
+        // queue is precisely what the fairness claim above is made of. Scanning costs a walk of a queue
+        // whose length is bounded by `max_parked_inline` and is empty in the ordinary case.
+        let popped = {
+            let mut queue = parked.lock();
+            queue
+                .iter()
+                .position(|stmt| affinity.owns(stmt.ticket().0))
+                .and_then(|i| queue.remove(i))
+        };
         let Some(mut stmt) = popped else {
-            break;
+            break; // nothing of ours left this tick
         };
         let Some(coord) = coordinator.as_deref() else {
             // Coordinator already consumed (Shutdown in progress): put it back and stop; Shutdown's
-            // `drain_inflight` rolls its transaction back and the queue drops at loop exit.
+            // `drain_inflight` rolls its transaction back — every worker's, since `rmp` #1041 — and the
+            // queue drops when the last worker releases the session state. At the head rather than at
+            // the index it came from, which is a position this pass no longer strictly owns; on the
+            // shutdown path there is no next tick for the order to matter to.
             parked.lock().push_front(stmt);
             break;
         };
@@ -2686,13 +2952,22 @@ struct ProcessCtx<'a, D: BlockDevice + Send + Sync + 'static, S: LogSink + Send 
     /// for its own duration — an `O(1)` table operation for the short commands, and for `RUN` only at
     /// the two edges of the statement, never across it. Between `rmp` #1033 and #1038 that was the
     /// intent and not the code: `RUN` handed a *guard* to the executor, which held the table for the
-    /// whole query.
+    /// whole query. Since `rmp` #1041 the table behind it is the ENGINE's, so those critical sections
+    /// are contended for real and their length is no longer a hypothetical.
     open: &'a EngineLatch<OpenTxTable>,
+    /// THIS worker's ticket minter (`rmp` #1035) — the one piece of session state that must not be
+    /// shared, because its residue class is what routes a session back to this worker.
     next_ticket: &'a TicketMinter,
+    /// The ENGINE's plan cache (`rmp` #1041), so a DDL dispatched here invalidates the plans every
+    /// other worker is serving and not only this one's.
     plan_cache: &'a EngineLatch<exec::EnginePlanCache>,
     extensions: &'a Arc<graphus_cypher::extension::ExtensionRegistry>,
     dispatch: &'a read_pool::ReadDispatch<D, S>,
+    /// THIS worker's in-flight off-thread read count — still per worker, and still a defect for it
+    /// (`rmp` #1037): the `rmp` #588 slot-reuse barrier derived from it cannot see a sibling's readers.
     readers_inflight: &'a AtomicU64,
+    /// The ENGINE's parked-statement queue (`rmp` #1041), so the age sweep sees every suspended cursor.
+    /// A statement is still only ever RESUMED by the worker that owns its session.
     parked: &'a EngineLatch<VecDeque<exec::InFlightInline>>,
     max_parked_inline: usize,
     result_buffer_capacity: usize,
@@ -2700,7 +2975,7 @@ struct ProcessCtx<'a, D: BlockDevice + Send + Sync + 'static, S: LogSink + Send 
     db: &'a Arc<str>,
     degraded: &'a EngineDegraded,
     maintenance_degraded: &'a MaintenanceDegraded,
-    active_txns: &'a mut ActiveTxnGauge,
+    active_txns: &'a ActiveTxnGauge,
     clock: &'a Arc<dyn graphus_core::capability::Clock + Send + Sync>,
     statement_timeout: Option<std::time::Duration>,
     loading_session: &'a mut Option<bulk_load::LoadingSession>,
@@ -2902,7 +3177,7 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
     db: &str,
     degraded: &EngineDegraded,
     maintenance_degraded: &MaintenanceDegraded,
-    active_txns: &mut ActiveTxnGauge,
+    active_txns: &ActiveTxnGauge,
     clock: &Arc<dyn graphus_core::capability::Clock + Send + Sync>,
     statement_timeout: Option<std::time::Duration>,
     loading_session: &mut Option<bulk_load::LoadingSession>,
@@ -3998,7 +4273,7 @@ fn handle_constraint_ddl<D: BlockDevice, S: LogSink>(
     transactions: &Arc<crate::txn_registry::TransactionRegistry>,
     db: &str,
     principal: Option<&str>,
-    active_txns: &mut ActiveTxnGauge,
+    active_txns: &ActiveTxnGauge,
 ) -> Result<IndexDdlReply> {
     // A `CREATE CONSTRAINT` validates by walking every entity carrying the covered token — work of
     // unbounded duration, so no engine session latch may be held here (`rmp` #1038).
@@ -4297,7 +4572,7 @@ fn pipelined_group_commit<
     db: &str,
     degraded: &EngineDegraded,
     maintenance_degraded: &MaintenanceDegraded,
-    active_txns: &mut ActiveTxnGauge,
+    active_txns: &ActiveTxnGauge,
     clock: &Arc<dyn graphus_core::capability::Clock + Send + Sync>,
     statement_timeout: Option<std::time::Duration>,
     loading_session: &mut Option<bulk_load::LoadingSession>,
@@ -4392,7 +4667,7 @@ fn pipelined_group_commit<
         // (`rmp` #543) that finished mid-pipeline would keep pinning `oldest_active_snapshot` for the whole
         // storm — letting dead versions accumulate in proportion to its duration. Draining retirements here
         // finalises each finished reader (M1 merge + auto-commit) so its snapshot stops pinning the GC
-        // watermark within one batch. Safe: this is the SAME single engine thread, and the retirements are
+        // watermark within one batch. Safe: this is the SAME engine worker thread, and the retirements are
         // processed in channel arrival order, so [`finish_reader`]'s in-order no-lost-edge SSI guarantee is
         // unchanged — this is exactly the top-of-loop sweep, run at a finer granularity.
         process_retirements(
@@ -4414,13 +4689,18 @@ fn pipelined_group_commit<
         // `… RETURN`-bearing write whose consumer briefly filled its bounded egress) would starve for the
         // whole storm: its consumer stalled, its transaction's GC-pin held, and its per-statement deadline
         // unenforced (cooperative, checked only on resume). Resuming here delivers each parked statement's
-        // next batch within one hardened batch. Safe: same single engine thread; a statement that
+        // next batch within one hardened batch. Safe: same engine worker thread; a statement that
         // re-suspends is pushed to the back and only gets its next batch on the following pass (its own
-        // budget snapshot), so this never spins on one fast-refilling consumer.
+        // budget snapshot), so this never spins on one fast-refilling consumer. Same worker, so the
+        // affinity test inside the pass admits exactly the statements this drain could have parked.
         resume_parked_statements(
             parked,
             coordinator,
             open,
+            // The affinity comes from the minter rather than from a parameter of its own: the stride
+            // that produced a ticket and the modulus that claims it must be one number, not two that a
+            // future signature change could set apart.
+            next_ticket.affinity(),
             extensions,
             metrics,
             db,
@@ -4524,7 +4804,7 @@ fn drain_commit_batch<
     db: &str,
     degraded: &EngineDegraded,
     maintenance_degraded: &MaintenanceDegraded,
-    active_txns: &mut ActiveTxnGauge,
+    active_txns: &ActiveTxnGauge,
     clock: &Arc<dyn graphus_core::capability::Clock + Send + Sync>,
     statement_timeout: Option<std::time::Duration>,
     loading_session: &mut Option<bulk_load::LoadingSession>,
@@ -4718,10 +4998,17 @@ fn rollback_tx<D: BlockDevice, S: LogSink>(
     }
 }
 
-/// Graceful-shutdown drain (`04 §9.4`), part 1: roll back every still-open transaction. Uncommitted
-/// work is always safe to undo — recovery would undo it anyway — so a hard deadline upstream can
-/// force this without risking durability. Runs through `&mut` so the coordinator can then be consumed
-/// for the final flush.
+/// Graceful-shutdown drain (`04 §9.4`), part 1: roll back every still-open transaction **of the
+/// engine**. Uncommitted work is always safe to undo — recovery would undo it anyway — so a hard
+/// deadline upstream can force this without risking durability.
+///
+/// "Of the engine" is the whole of `rmp` #1041 in three words. While the open-transaction table was
+/// built per worker this drained the table of whichever worker received `Shutdown`, and reported
+/// success having rolled back one of `W` workers' transactions — measured with
+/// `graphus_transactions_aborted_total`, which the loop below increments once per rollback: one of
+/// four at `W = 4`. Nothing became *corrupt* (no `COMMIT` record exists for an undrained transaction,
+/// so ARIES undoes it on reopen), but the guarantee [`harden_store`] rests on — that a clean stop
+/// leaves recovery nothing to do — was simply not true, and the next open silently paid for the undo.
 fn drain_inflight<D: BlockDevice, S: LogSink>(
     coordinator: &TxnCoordinator<D, S>,
     open: &EngineLatch<OpenTxTable>,
@@ -4731,7 +5018,9 @@ fn drain_inflight<D: BlockDevice, S: LogSink>(
     // Drain the whole table in ONE critical section and roll the stragglers back outside it. Draining
     // rather than iterating is what makes each undo a claim: this runs on the worker that intercepted
     // `Shutdown`, and by then every other worker has left the loop, but a drain states the exclusivity
-    // instead of inheriting it from the shutdown barrier's current shape.
+    // instead of inheriting it from the shutdown barrier's current shape. No affinity test here, and
+    // that is the point of the pass — the age sweep declines another worker's transaction because its
+    // owner may be inside it, while here there is no owner left to be inside anything.
     let stragglers: Vec<OpenTx> = {
         let mut open = open.lock();
         let tickets: Vec<u64> = open.keys().copied().collect();
@@ -4763,7 +5052,9 @@ fn drain_inflight<D: BlockDevice, S: LogSink>(
 fn harden_store<D: BlockDevice, S: LogSink>(
     coordinator: TxnCoordinator<D, S>,
 ) -> (Result<()>, u64) {
-    // Safe: `drain_inflight` left no open transaction and no statement seam is live here.
+    // Safe: `drain_inflight` left no open transaction — of ANY worker, since `rmp` #1041 made the
+    // table it drains engine-wide — and no statement seam is live here, because the shutdown worker
+    // only reaches this point once every other worker has left the loop.
     let store: RecordStore<D, S> = coordinator.into_store();
     let out = store.flush();
     // Safe: `flush` has returned, so nothing holds the WAL lock this re-takes (no re-entrancy).
@@ -4884,19 +5175,20 @@ pub fn spawn_engine_with_timeout<D, S, B>(
     engine_queue_capacity: usize,
     result_buffer_capacity: usize,
     reader_threads: usize,
-    // How many engine WORKERS serve the command queue (`rmp` #1033). Worker 0 additionally drives
+    // How many engine WORKERS serve the command queues (`rmp` #1033). Worker 0 additionally drives
     // the maintenance cadence, so a checkpoint or GC pass still happens once, not W times.
     //
-    // MUST BE 1 UNTIL SESSION AFFINITY EXISTS. Measured, not assumed: running the multi-stream gate
-    // (`rmp` #907) with four workers fails with `TransactionNotFound` on a `RUN` that follows its
-    // own session's `BEGIN`. One shared queue means two consecutive commands OF ONE SESSION can be
-    // dequeued by different workers and run out of order, and no amount of latching under them fixes
-    // that — the ordering was supplied by there being one consumer.
+    // Session affinity now exists (`rmp` #1035): there is one queue PER WORKER and a session always
+    // reaches the same one, because a shared queue does not preserve the order of one session's
+    // commands. Measured before that landed: the multi-stream gate (`rmp` #907) with four workers
+    // failed with `TransactionNotFound` on a `RUN` that followed its own session's `BEGIN`, and no
+    // amount of latching underneath fixes it — the ordering came from having a single consumer. Both
+    // reference engines reach the same conclusion by binding a session (Memgraph) or a transaction
+    // (Neo4j) to a thread: the affinity IS the ordering.
     //
-    // This is why both reference engines bind a session (Memgraph) or a transaction (Neo4j) to a
-    // thread rather than sharing one queue: the affinity IS the ordering. The queue therefore has to
-    // become per-worker with sessions hashed onto workers, which is a design change to #1016, not a
-    // parameter change here.
+    // `admission.engine_workers` above one is nevertheless still refused by configuration — see
+    // `Config::validate` — because `readers_inflight` remains per worker (`rmp` #1037). This
+    // parameter is exercised above one by tests, which is what keeps the path honest.
     engine_workers: usize,
     metrics: Arc<Metrics>,
     clock: Arc<dyn graphus_core::capability::Clock + Send + Sync>,
@@ -4957,16 +5249,32 @@ where
     };
     // The drain-progress beacon is installed once, on the shared coordinator.
     coordinator.set_drain_progress(loop_drain_progress);
-    // The stop protocol, built HERE and shared by every worker (`rmp` #1036). It used to live inside
-    // `EngineShared`, which `run_engine_loop` constructs per worker — so each worker counted itself
-    // plus W−1 phantoms, and the `Shutdown` barrier waited on a number nobody else could move.
+    // The stop protocol, built HERE and shared by every worker (`rmp` #1036). It used to live in the
+    // per-worker struct `run_engine_loop` constructs — so each worker counted itself plus W−1
+    // phantoms, and the `Shutdown` barrier waited on a number nobody else could move.
     let stop = Arc::new(EngineStop::new(engine_workers));
+    // The session state, built HERE for the same reason (`rmp` #1041): the open-transaction table, the
+    // parked-statement queue and the plan cache describe the ENGINE, so a copy per worker gives W
+    // partial answers and no whole one. `run_engine_loop` used to construct them, which is how the
+    // `Shutdown` drain came to reach one worker's transactions and a `DROP INDEX` on one worker left
+    // every other worker serving the plan it invalidated.
+    let sessions = Arc::new(EngineSessions::new());
+    // The gauge folds, likewise once per engine (`rmp` #1041). They publish engine-wide counts, so W
+    // folds of the same value inflate the server-wide series W-fold until it settles.
+    let active_txns = Arc::new(ActiveTxnGauge::new(
+        Arc::clone(&metrics),
+        Arc::clone(&db_name),
+    ));
+    let index_builds = Arc::new(IndexBuildGauge::new(Arc::clone(&metrics)));
 
     let mut joins = Vec::with_capacity(engine_workers);
     for (worker_id, rx) in receivers.into_iter().enumerate() {
         let db_name = Arc::clone(&db_name);
         let coordinator = Arc::clone(&coordinator);
         let stop = Arc::clone(&stop);
+        let sessions = Arc::clone(&sessions);
+        let active_txns = Arc::clone(&active_txns);
+        let index_builds = Arc::clone(&index_builds);
         // Its OWN queue: no latch, because no other worker reads it (`rmp` #1035).
         let rx = Arc::new(std::sync::Mutex::new(rx));
         let loop_metrics = Arc::clone(&loop_metrics);
@@ -4992,6 +5300,7 @@ where
                     coordinator,
                     rx,
                     stop,
+                    sessions,
                     worker_id,
                     engine_workers,
                     result_buffer_capacity,
@@ -5004,7 +5313,15 @@ where
                     max_transaction_age,
                     egress_stall_timeout,
                     // Bound on concurrently parked (suspended) inline statements (`rmp` #485 B1).
+                    // Since `rmp` #1041 the queue is engine-wide, so this bounds the ENGINE rather
+                    // than each worker — while the command queues it is derived from are
+                    // `engine_queue_capacity / W` each. Total admitted work is unchanged; the parked
+                    // ceiling is now tighter relative to admission at `W > 1`. It remains a
+                    // defence-in-depth ceiling that correct admission keeps far out of reach, not a
+                    // routine limit, so the tightening costs nothing that is reachable.
                     engine_queue_capacity,
+                    active_txns,
+                    index_builds,
                     transactions,
                 );
             })
@@ -5013,6 +5330,12 @@ where
             })?;
         joins.push(join);
     }
+    // Release the spawner's own shares, so the retraction in each gauge's `Drop` runs when the LAST
+    // WORKER exits rather than when this `Engine` value is eventually dropped. Holding one here would
+    // keep a stopped engine's contribution standing in the server-wide gauges for as long as the
+    // catalog kept the handle — the phantom-count failure the retraction exists to prevent.
+    drop(active_txns);
+    drop(index_builds);
 
     // Startup already succeeded: the coordinator was built above, before any worker existed, so
     // there is no thread whose startup result has to be waited for (`rmp` #1033).
@@ -5042,7 +5365,7 @@ mod ticket_affinity_1035 {
     fn every_ticket_names_its_own_worker() {
         const WORKERS: usize = 4;
         for worker_id in 0..WORKERS {
-            let minter = TicketMinter::new(worker_id, WORKERS);
+            let minter = TicketMinter::new(WorkerAffinity::new(worker_id, WORKERS));
             for _ in 0..64 {
                 let ticket = minter.mint();
                 assert_ne!(
@@ -5068,7 +5391,7 @@ mod ticket_affinity_1035 {
     fn workers_never_collide() {
         const WORKERS: usize = 8;
         let minters: Vec<_> = (0..WORKERS)
-            .map(|w| TicketMinter::new(w, WORKERS))
+            .map(|w| TicketMinter::new(WorkerAffinity::new(w, WORKERS)))
             .collect();
         let mut seen = std::collections::HashSet::new();
         for _ in 0..128 {
@@ -5085,7 +5408,7 @@ mod ticket_affinity_1035 {
     /// The single-worker case stays exactly what it was: stride 1, tickets 1, 2, 3, …
     #[test]
     fn one_worker_is_the_historical_sequence() {
-        let minter = TicketMinter::new(0, 1);
+        let minter = TicketMinter::new(WorkerAffinity::new(0, 1));
         assert_eq!(
             (1..=5).map(|_| minter.mint()).collect::<Vec<_>>(),
             vec![1, 2, 3, 4, 5]
@@ -5407,13 +5730,14 @@ mod max_transaction_age_tests {
     fn reaps_over_age_explicit_txn_only() {
         let coord = fresh_coord();
         let open: EngineLatch<OpenTxTable> = EngineLatch::new(OpenTxTable::new());
-        // A single worker in the fixture: stride 1 (`rmp` #1035).
-        let next_ticket = TicketMinter::new(0, 1);
+        // A single worker in the fixture: stride 1 (`rmp` #1035), which owns every ticket.
+        let affinity = WorkerAffinity::new(0, 1);
+        let next_ticket = TicketMinter::new(affinity);
         let cap = std::time::Duration::from_secs(60);
         let now = 61 * 1_000_000_000u64; // 61s in nanos — past the cap
         let clock = clock_at(now);
         let metrics = Arc::new(Metrics::new());
-        let mut gauge = ActiveTxnGauge::new(Arc::clone(&metrics), Arc::from("test"));
+        let gauge = ActiveTxnGauge::new(Arc::clone(&metrics), Arc::from("test"));
 
         // Over-age explicit reader (begin at t=0 ⇒ age 61s ≥ cap).
         let aged_explicit = open_tx(&coord, &open, &next_ticket, AccessMode::Read, false, 0);
@@ -5435,11 +5759,12 @@ mod max_transaction_age_tests {
             &coordinator,
             &open,
             &EngineLatch::new(VecDeque::new()), // nothing parked inline
+            affinity,
             Some(cap),
             &clock,
             &metrics,
             "test",
-            &mut gauge,
+            &gauge,
         );
         let coord = coordinator
             .as_ref()
@@ -5466,11 +5791,12 @@ mod max_transaction_age_tests {
     fn disabled_cap_reaps_nothing() {
         let coord = fresh_coord();
         let open: EngineLatch<OpenTxTable> = EngineLatch::new(OpenTxTable::new());
-        // A single worker in the fixture: stride 1 (`rmp` #1035).
-        let next_ticket = TicketMinter::new(0, 1);
+        // A single worker in the fixture: stride 1 (`rmp` #1035), which owns every ticket.
+        let affinity = WorkerAffinity::new(0, 1);
+        let next_ticket = TicketMinter::new(affinity);
         let clock = clock_at(u64::MAX); // arbitrarily far in the future
         let metrics = Arc::new(Metrics::new());
-        let mut gauge = ActiveTxnGauge::new(Arc::clone(&metrics), Arc::from("test"));
+        let gauge = ActiveTxnGauge::new(Arc::clone(&metrics), Arc::from("test"));
 
         let _ = open_tx(&coord, &open, &next_ticket, AccessMode::Read, false, 0);
         assert_eq!(coord.active_count(), 1);
@@ -5480,11 +5806,12 @@ mod max_transaction_age_tests {
             &coordinator,
             &open,
             &EngineLatch::new(VecDeque::new()),
+            affinity,
             None, // cap disabled
             &clock,
             &metrics,
             "test",
-            &mut gauge,
+            &gauge,
         );
         assert_eq!(
             coordinator.as_ref().unwrap().active_count(),
@@ -5525,7 +5852,7 @@ mod index_build_gauge_tests {
     #[test]
     fn publishing_tracks_the_totals_in_both_directions() {
         let metrics = Arc::new(Metrics::new());
-        let mut gauge = IndexBuildGauge::new(Arc::clone(&metrics));
+        let gauge = IndexBuildGauge::new(Arc::clone(&metrics));
         assert_eq!(metrics.index_builds_pending(), 0, "starts empty");
 
         // A build starts.
@@ -5554,8 +5881,8 @@ mod index_build_gauge_tests {
     #[test]
     fn gauges_sum_across_engines_rather_than_last_writer_wins() {
         let metrics = Arc::new(Metrics::new());
-        let mut a = IndexBuildGauge::new(Arc::clone(&metrics));
-        let mut b = IndexBuildGauge::new(Arc::clone(&metrics));
+        let a = IndexBuildGauge::new(Arc::clone(&metrics));
+        let b = IndexBuildGauge::new(Arc::clone(&metrics));
 
         a.publish(totals(1, 0, 100));
         b.publish(totals(2, 1, 300));
@@ -5578,10 +5905,10 @@ mod index_build_gauge_tests {
     #[test]
     fn dropping_an_engines_gauge_retracts_its_contribution() {
         let metrics = Arc::new(Metrics::new());
-        let mut survivor = IndexBuildGauge::new(Arc::clone(&metrics));
+        let survivor = IndexBuildGauge::new(Arc::clone(&metrics));
         survivor.publish(totals(1, 0, 50));
         {
-            let mut dying = IndexBuildGauge::new(Arc::clone(&metrics));
+            let dying = IndexBuildGauge::new(Arc::clone(&metrics));
             dying.publish(totals(3, 2, 900));
             assert_eq!(metrics.index_builds_parked(), 2);
         } // `dying` is dropped here.
@@ -5602,7 +5929,7 @@ mod index_build_gauge_tests {
     #[test]
     fn gauges_render_in_the_prometheus_exposition() {
         let metrics = Arc::new(Metrics::new());
-        let mut gauge = IndexBuildGauge::new(Arc::clone(&metrics));
+        let gauge = IndexBuildGauge::new(Arc::clone(&metrics));
         gauge.publish(totals(1, 2, 42));
         let out = metrics.render_prometheus();
         for name in [
@@ -5619,6 +5946,77 @@ mod index_build_gauge_tests {
         assert!(
             out.contains("\ngraphus_index_build_entities_remaining 42\n"),
             "{out}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod active_txn_gauge_tests {
+    //! **The additive fold must be ordered with the value it remembers** (`rmp` #1041).
+    //!
+    //! [`ActiveTxnGauge`] became one per ENGINE when the engine became several workers, so `publish`
+    //! is now called concurrently — by workers reporting the same coordinator-wide count, each having
+    //! read it at a slightly different moment. Each call folds the signed delta between what it
+    //! publishes and what the gauge last remembered.
+    //!
+    //! The obvious implementation remembers with an atomic swap and then folds. That is unsound, and
+    //! not merely racy, because [`crate::metrics`]'s `add_delta` **saturates at zero** on a decrement:
+    //! if two workers swap in one order and fold in the other, a decrement can land while the gauge is
+    //! still below it, be clamped, and never be recovered by the increment it was computed against.
+    //! The sum of the deltas telescopes; the gauge does not, because the clamp is not linear. The
+    //! residue is permanent — a restart is the only cure — which is exactly the phantom count the
+    //! additive discipline (`rmp` #418/#463) exists to prevent.
+    //!
+    //! This is tested here rather than through the engine because the window is a handful of
+    //! instructions: the end-to-end gate can drive a few thousand publishes, this one drives a few
+    //! hundred thousand, and only the second reliably catches the swap-then-fold shape (verified —
+    //! the end-to-end test passes with it, this one fails).
+
+    use super::*;
+
+    /// Every publisher ends on the same value, so the gauge must end on it too — whatever order the
+    /// folds took. Threads deliberately publish DIFFERENT values along the way: identical values fold
+    /// nothing and would make the test agree with any implementation.
+    #[test]
+    fn concurrent_publishes_leave_the_gauge_on_the_last_value() {
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 40_000;
+        let metrics = Arc::new(Metrics::new());
+        let gauge = Arc::new(ActiveTxnGauge::new(
+            Arc::clone(&metrics),
+            Arc::from("gaugetest"),
+        ));
+
+        let threads: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let gauge = Arc::clone(&gauge);
+                std::thread::spawn(move || {
+                    for round in 0..ROUNDS {
+                        // Small counts that cross zero constantly: a decrement is only *clamped* when
+                        // it exceeds the gauge, so a defect needs the gauge to spend time near zero.
+                        gauge.publish((round + t) % 4, (round + t) % 3);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("publisher joins");
+        }
+
+        // Quiesce: one last publish, from one thread, is what every engine does when its last
+        // transaction closes.
+        gauge.publish(0, 0);
+        assert_eq!(
+            metrics.active_txns(),
+            0,
+            "the open-transaction gauge did not return to the last published value: a fold was \
+             applied out of order with the value it was computed against, and the saturating \
+             decrement discarded it permanently (rmp #1041)"
+        );
+        assert_eq!(
+            metrics.ssi_tracked(),
+            0,
+            "the SSI-tracked gauge has the same fold and the same failure mode"
         );
     }
 }
