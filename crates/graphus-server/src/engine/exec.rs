@@ -25,6 +25,7 @@ use graphus_io::BlockDevice;
 use graphus_wal::LogSink;
 
 use super::command::{AccessMode, QueryPlan, Reply};
+use super::latch::EngineLatch;
 use super::privileges::EffectivePrivileges;
 use super::read_pool::{ReadDispatch, ReadTask};
 use super::stream::{RowReceiver, RowSender, SummarySink};
@@ -332,8 +333,11 @@ pub(super) fn handle_run<
     S: LogSink + Send + Sync + 'static,
 >(
     coordinator: &TxnCoordinator<D, S>,
-    open: &mut OpenTxTable,
-    plan_cache: &mut EnginePlanCache,
+    // The LATCHES, never guards (`rmp` #1038): each is taken where it is used and released before the
+    // next thing happens. See the acquisition sites below for what "where it is used" means here —
+    // three `O(1)` table operations and two cache operations, in a function that runs a whole query.
+    open: &EngineLatch<OpenTxTable>,
+    plan_cache: &EngineLatch<EnginePlanCache>,
     ticket: TxTicket,
     query: &str,
     params: Vec<(String, graphus_core::Value)>,
@@ -388,20 +392,31 @@ pub(super) fn handle_run<
     let deadline: Option<Instant> = effective_statement_timeout(statement_timeout, client_timeout)
         .and_then(|d| Instant::now().checked_add(d));
 
-    // Resolve the open transaction.
-    // Both fields are `Copy`, so they are lifted out of the entry here: that ends the immutable borrow
-    // of `open` immediately, leaving the `else` arm free to take the `&mut` its error path needs.
-    let Some((txn, mode)) = open.get(&ticket.0).map(|tx| (tx.txn, tx.mode)) else {
+    // Resolve the open transaction. Both fields are `Copy`, so the whole of what execution needs from
+    // the table is two words, lifted out here and the latch released — the shape the struct docs on
+    // `EngineShared` always claimed and, until `rmp` #1038, only the *borrow* obeyed while the *guard*
+    // stayed alive for the entire query. The failed lookup and its diagnosis share the critical
+    // section: `unknown_ticket_error` consumes the reap record, so reading it must be part of the same
+    // step that observed the ticket missing.
+    let resolved = {
+        let mut open = open.lock();
+        match open.get(&ticket.0).map(|tx| (tx.txn, tx.mode)) {
+            Some(found) => Ok(found),
+            None => Err(open.unknown_ticket_error(ticket.0, "RUN in transaction")),
+        }
+    };
+    let (txn, mode) = match resolved {
+        Ok(found) => found,
         // A permanent, NON-retryable client fault (`rmp` #988): the ticket names a transaction the
         // engine does not have. Replaying this RUN against this ticket can never find it, so it must
         // NOT be announced as the retryable serialization-abort class, which used to send the driver's
         // managed-transaction loop round for its full 30 s budget. `unknown_ticket_error` separates
         // "the age sweep stopped it" (`TransactionTimedOut`) from "it never existed / is spent"
         // (`TransactionNotFound`) — same class either way, but only one of them tells an operator why.
-        let _ = reply.send(Err(
-            open.unknown_ticket_error(ticket.0, "RUN in transaction")
-        ));
-        return RunOutcome::Done;
+        Err(unknown) => {
+            let _ = reply.send(Err(unknown));
+            return RunOutcome::Done;
+        }
     };
 
     // Compile + bind off any store borrow (pure pipeline). A compile error is raised before any side
@@ -847,22 +862,46 @@ fn open_and_drive_first(
 /// clone of that `Arc` is returned (again no deep clone). Reuse is sound because the key pairs the
 /// verbatim text with the current schema version (see [`EnginePlanCache`]); a compile error is never
 /// cached (only a successful plan is inserted).
+/// ## Consult, release, compile, re-take (`rmp` #1038)
+///
+/// The compile pipeline — tokenize, parse, analyse, plan, cost — is the most expensive thing that
+/// happens on a cache miss, and it needs nothing from the cache. It therefore runs with the latch
+/// released, between a lookup that takes it and an insert that re-takes it. Two workers that miss on
+/// the same text at the same moment will both compile, and the second insert simply replaces an
+/// identical plan: compilation is a pure function of `(text, catalog, statistics, extensions)`, so a
+/// duplicated compile costs work and changes nothing. Holding the latch to avoid that would trade a
+/// rare few microseconds of duplicated work for every worker in the engine waiting on every compile.
+///
+/// The key is re-derived under the second acquisition and the insert is **skipped if it changed**. A
+/// key carries the schema version, so a DDL that lands during the compile means this plan was built
+/// against a catalog that is no longer current — inserting it would publish a plan under a version it
+/// was not compiled for, which is precisely what `bump_schema` exists to prevent. Dropping it is
+/// correct and costs one recompile.
 fn compile_cached<D: BlockDevice, S: LogSink>(
-    plan_cache: &mut EnginePlanCache,
+    plan_cache: &EngineLatch<EnginePlanCache>,
     query: &str,
     coordinator: &TxnCoordinator<D, S>,
     extensions: &ExtensionRegistry,
 ) -> Result<Arc<PhysicalPlan>, GraphusError> {
-    let key = plan_cache.key(query);
-    if let Some(plan) = plan_cache.cache.get(&key) {
-        return Ok(Arc::clone(plan));
-    }
+    let key = {
+        let mut cache = plan_cache.lock();
+        let key = cache.key(query);
+        if let Some(plan) = cache.cache.get(&key) {
+            return Ok(Arc::clone(plan));
+        }
+        key
+    };
     // Miss: compile against the current catalog + statistics, wrap in an `Arc`, then cache. Inserting a
     // clone of the `Arc` (not a deep clone of the plan) keeps the insert-and-return path clone-free too.
     let catalog = coordinator.catalog();
     let stats = coordinator.statistics();
     let plan = Arc::new(compile(query, &catalog, Some(&stats), extensions)?);
-    plan_cache.cache.insert(key, Arc::clone(&plan));
+    {
+        let mut cache = plan_cache.lock();
+        if cache.key(query) == key {
+            cache.cache.insert(key, Arc::clone(&plan));
+        }
+    }
     Ok(plan)
 }
 
@@ -1393,7 +1432,7 @@ pub(super) fn resume_inflight<
 >(
     inflight: &mut InFlightInline,
     coordinator: &TxnCoordinator<D, S>,
-    open: &mut OpenTxTable,
+    open: &EngineLatch<OpenTxTable>,
     extensions: &ExtensionRegistry,
     metrics: &Metrics,
     db: &str,
@@ -1618,7 +1657,7 @@ fn unwrap_row(item: super::stream::RowItem) -> Vec<graphus_cypher::MaterializedV
 fn finalize_inflight<D: BlockDevice, S: LogSink>(
     inflight: &mut InFlightInline,
     coordinator: &TxnCoordinator<D, S>,
-    open: &mut OpenTxTable,
+    open: &EngineLatch<OpenTxTable>,
     produced_ok: bool,
     metrics: &Metrics,
     db: &str,
@@ -1814,7 +1853,7 @@ fn to_parameters(params: Vec<(String, graphus_core::Value)>) -> Parameters {
 #[allow(clippy::too_many_arguments)] // commit bookkeeping + the #566 group-commit batch, all positional
 fn finish_autocommit<D: BlockDevice, S: LogSink>(
     coordinator: &TxnCoordinator<D, S>,
-    open: &mut OpenTxTable,
+    open: &EngineLatch<OpenTxTable>,
     ticket: TxTicket,
     produced_ok: bool,
     row_tx: &RowSender,
@@ -1823,7 +1862,10 @@ fn finish_autocommit<D: BlockDevice, S: LogSink>(
     degraded: &super::EngineDegraded,
     commit_batch: Option<&mut Vec<super::PendingCommit>>,
 ) -> Option<String> {
-    let tx = open.remove(&ticket.0)?;
+    // The removal claims this auto-commit: whoever takes the ticket out owns the commit or rollback
+    // that follows, and everything that follows — SSI validation, a WAL append, possibly an
+    // `fdatasync` — runs with the latch released (`rmp` #1038).
+    let tx = open.lock().remove(&ticket.0)?;
     if !produced_ok {
         // A runtime/deferral error terminated the stream: roll back (no commit, nothing durable).
         let _ = coordinator.rollback(tx.txn);
@@ -1914,7 +1956,7 @@ pub(super) fn bookmark_token(db: &str, commit_ts: graphus_core::Timestamp) -> St
 /// for an explicit transaction (the caller still owns it).
 fn finish_failed_autocommit<D: BlockDevice, S: LogSink>(
     coordinator: &TxnCoordinator<D, S>,
-    open: &mut OpenTxTable,
+    open: &EngineLatch<OpenTxTable>,
     ticket: TxTicket,
     auto_commit: bool,
     metrics: &Metrics,
@@ -1923,7 +1965,9 @@ fn finish_failed_autocommit<D: BlockDevice, S: LogSink>(
     if !auto_commit {
         return;
     }
-    if let Some(tx) = open.remove(&ticket.0) {
+    // The removal claims the rollback; the undo runs with the latch released (`rmp` #1038).
+    let claimed = open.lock().remove(&ticket.0);
+    if let Some(tx) = claimed {
         let _ = coordinator.rollback(tx.txn);
         metrics.record_abort_for(db);
     }

@@ -31,6 +31,7 @@ pub(crate) mod constraint_show;
 mod exec;
 mod handle;
 pub(crate) mod index_show;
+mod latch;
 mod local;
 mod managed;
 pub mod privileges;
@@ -67,8 +68,10 @@ pub use seam_rest::{RestAuthObserver, RestEngineAdapter};
 
 use crate::metrics::Metrics;
 use command::EngineCommand as Cmd;
+use graphus_core::latch::assert_no_engine_latch_held;
 use graphus_core::{TxnId, Value};
 use graphus_storage::ConstraintKind;
+use latch::EngineLatch;
 
 /// How many nodes a single [`TxnCoordinator::advance_index_builds`] call indexes per tick while a
 /// non-blocking index build is in progress (`rmp` task #91).
@@ -875,9 +878,9 @@ impl EngineStop {
 ///
 /// * `open` and `parked` — the session path is legitimately per worker (affinity routes a ticket
 ///   only to its owner), but four consumers cross workers: the `Shutdown` drain, the GC's oldest
-///   open ticket, the age sweep and reader retirement. `rmp` #1041, which must wait for `rmp` #1038
-///   because these two are acquired in both orders today and sharing them before the order is
-///   imposed would deadlock.
+///   open ticket, the age sweep and reader retirement. `rmp` #1041, which had to wait for `rmp`
+///   #1038: these two were acquired in both orders, so sharing them first would have deadlocked. That
+///   blocker is now cleared — see the rank-5 note at the end of this comment.
 /// * `plan_cache` — a fail-closed index repair bumps the schema on worker 0 only, leaving the others
 ///   serving plans compiled while degraded (`rmp` #1041).
 /// * `readers_inflight` — feeds the `rmp` #588 slot-reuse barrier, which can therefore free a slot a
@@ -886,25 +889,39 @@ impl EngineStop {
 ///
 /// # Why each is latched separately, and why that is the whole design
 ///
-/// A single lock around the whole struct — or, worse, held around the command dispatch — would give
-/// W threads that take turns: *apparent* parallelism, indistinguishable from a multi-writer engine
-/// until `rmp` #1034 measures CPU occupancy and finds one core. (Today several call sites do hold a
-/// guard across a whole statement by passing it in argument position; that is `rmp` #1038.) The
-/// separation is what keeps the long part of a statement outside every lock:
+/// One lock around the whole struct — or, worse, held around the command dispatch — is how W threads end
+/// up taking turns: *apparent* parallelism, indistinguishable from a multi-writer engine except by CPU
+/// occupancy, which then reads one core however many workers the engine was given. That is a statement
+/// about the day these tables are SHARED (`rmp` #1041), because a lock only one thread can reach costs
+/// nothing — measured, not assumed, in `tests/engine_latch_scaling_1038.rs`. The separation is what
+/// keeps the long part of a statement outside every lock on that day:
 ///
-/// * `open` is read by `exec::handle_run` in its first useful instruction, which copies the entry's
-///   two `Copy` fields and ends the borrow there; the execution that follows never touches it. Short
-///   commands (`BEGIN`, `COMMIT`, `ROLLBACK`, `STATUS`) may hold it for their whole handling, since
-///   each is `O(1)` over the table.
-/// * `plan_cache` is consulted once per statement to look a plan up, and once to install one.
+/// * `open` is consulted by `exec::handle_run` to copy the entry's two `Copy` fields, and again when
+///   the statement finalises. Nothing between those two points touches it. Short commands (`BEGIN`,
+///   `COMMIT`, `ROLLBACK`, `STATUS`) reach it once, for an `O(1)` table operation.
+/// * `plan_cache` is consulted once per statement to look a plan up, and once to install one. The
+///   compile between them runs unlatched.
 /// * `parked` is touched only when a statement suspends or resumes.
+///
+/// Until `rmp` #1038 that was true of the *data* and false of the *guards*, which is not a distinction
+/// the machine makes. Every execution call site passed its guard in argument position — and a Rust
+/// temporary lives to the end of the statement that created it, so each of those guards spanned the
+/// query it was nominally protecting a table lookup for. The tables are now [`EngineLatch`]es
+/// (rank 5), which cannot be handed over that way and whose tripwire fires if one is still held when
+/// execution begins.
+///
+/// The rank also settles which of `open` and `parked` is taken first: neither, ever. They shared a
+/// thread in two opposite orders (the age sweep took *open → parked*, the resume and park paths took
+/// *parked → open*) — invisible while each worker had its own pair, a silent deadlock the moment
+/// `rmp` #1041 shares them. Every site that needed both was restructured to need one at a time, and
+/// rank 5 refuses the second.
 struct EngineShared {
     /// The explicit transactions this engine has open, keyed by ticket.
-    open: std::sync::Mutex<OpenTxTable>,
+    open: EngineLatch<OpenTxTable>,
     /// Compiled plans, keyed by query text and schema generation.
-    plan_cache: std::sync::Mutex<exec::EnginePlanCache>,
+    plan_cache: EngineLatch<exec::EnginePlanCache>,
     /// Statements suspended mid-execution, oldest first (`rmp` #485).
-    parked: std::sync::Mutex<VecDeque<exec::InFlightInline>>,
+    parked: EngineLatch<VecDeque<exec::InFlightInline>>,
     /// The next explicit-transaction ticket for THIS worker. An atomic, not a latched counter: it
     /// orders nothing and only has to be unique.
     ///
@@ -920,9 +937,9 @@ struct EngineShared {
 impl EngineShared {
     fn new(workers: usize, worker_id: usize) -> Self {
         Self {
-            open: std::sync::Mutex::new(OpenTxTable::new()),
-            plan_cache: std::sync::Mutex::new(exec::EnginePlanCache::new()),
-            parked: std::sync::Mutex::new(VecDeque::new()),
+            open: EngineLatch::new(OpenTxTable::new()),
+            plan_cache: EngineLatch::new(exec::EnginePlanCache::new()),
+            parked: EngineLatch::new(VecDeque::new()),
             next_ticket: TicketMinter::new(worker_id, workers),
             readers_inflight: AtomicU64::new(0),
         }
@@ -1070,6 +1087,13 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // to the same one, because a shared queue does not preserve the order of one session's commands.
     // `std::sync::mpsc::Receiver` is `!Sync`, so it is still reached under a lock — uncontended, as
     // no other worker reads it — and the lock covers only the dequeue, never the work that follows.
+    //
+    // Deliberately a plain `Mutex` and NOT an [`EngineLatch`] (`rmp` #1038). Rank 5 is the engine's
+    // *session state*, and its rules do not fit this: the receive legitimately BLOCKS for up to a tick
+    // with the lock held, which is the opposite of a rank whose whole point is short critical sections.
+    // What matters at the receive is the complementary property — that no session latch is held while
+    // this thread waits for a command that may never arrive — and that is asserted directly at both
+    // receive sites rather than inferred from a rank the lock does not belong to.
     rx: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<EngineCommand>>>,
     // The stop protocol, shared by every worker of this engine (`rmp` #1036). Built once by the
     // spawner: a worker cannot count how many *others* are still running, and a stop only one worker
@@ -1120,9 +1144,17 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // This engine's contribution to the server-wide index-build gauges (`rmp` task #573), republished
     // every loop iteration so a build's start, progress, completion and parking are all visible.
     let mut index_builds = IndexBuildGauge::new(Arc::clone(&metrics));
-    // The loop's shared state (`rmp` #1033). Declared once and reached through guards below, so the
-    // body can be replicated across W workers without any of it being duplicated per worker. With
-    // one worker the guards are uncontended and the behaviour is exactly what the locals gave.
+    // The loop's latched state (`rmp` #1033). Constructed HERE, so there is one of these PER WORKER —
+    // see [`EngineShared`], which says so and lists which fields that is right for and which are a
+    // defect awaiting `rmp` #1041. This comment used to claim the opposite ("without any of it being
+    // duplicated per worker"), which was false the day it was written and is the same false-sharing
+    // claim `rmp` #1036 had to correct for the stop protocol; the two fields that genuinely have no
+    // per-worker meaning were moved out to [`EngineStop`] then.
+    //
+    // The consequence for `rmp` #1038 is worth stating plainly: because each worker holds its own
+    // latches, a guard held across a statement does not *contend* today — it would the moment the
+    // tables are shared. That is why the discipline is enforced by a tripwire rather than measured by
+    // a throughput test, which could only observe it after `rmp` #1041 had already shipped the hang.
     let shared = EngineShared::new(engine_workers, worker_id);
 
     // The engine's compiled-plan cache (`rmp` task #322): reuses a compiled `PhysicalPlan` for an
@@ -1228,10 +1260,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         process_retirements(
             &retire_rx,
             &coordinator,
-            &mut shared
-                .open
-                .lock()
-                .expect("INVARIANT: the open-tx latch is not poisoned"),
+            &shared.open,
             &shared.readers_inflight,
             &metrics,
             &db_name,
@@ -1250,14 +1279,8 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         // so a reap never races a live read.
         maybe_reap_aged(
             &coordinator,
-            &mut shared
-                .open
-                .lock()
-                .expect("INVARIANT: the open-tx latch is not poisoned"),
-            &shared
-                .parked
-                .lock()
-                .expect("INVARIANT: the parked latch is not poisoned"),
+            &shared.open,
+            &shared.parked,
             max_transaction_age,
             &clock,
             &metrics,
@@ -1273,15 +1296,9 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         // a panic-isolation boundary (`rmp` #485 B2): a panic on a resumed batch rolls that statement
         // back and keeps the engine alive instead of unwinding the single engine thread.
         resume_parked_statements(
-            &mut shared
-                .parked
-                .lock()
-                .expect("INVARIANT: the parked latch is not poisoned"),
+            &shared.parked,
             &coordinator,
-            &mut shared
-                .open
-                .lock()
-                .expect("INVARIANT: the open-tx latch is not poisoned"),
+            &shared.open,
             &extensions,
             &metrics,
             &db_name,
@@ -1405,11 +1422,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                 || vector_blocked
                 || ft_spatial_poisoned
                 || shared.readers_inflight.load(Ordering::Relaxed) > 0
-                || !shared
-                    .parked
-                    .lock()
-                    .expect("INVARIANT: the parked latch is not poisoned")
-                    .is_empty());
+                || !shared.parked.lock().is_empty());
 
         // A stop raised by another worker ends this one too, checked before it blocks. The
         // decrement happens at the single exit below, so a worker that leaves here is counted out
@@ -1420,7 +1433,11 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
 
         let cmd = if timed {
             // The lock covers the DEQUEUE only — it is released the moment a command is in
-            // hand, so the work that follows runs with no worker waiting on this one.
+            // hand, so the work that follows runs with no worker waiting on this one. And no engine
+            // session latch may be held while this thread parks for up to a tick (`rmp` #1038):
+            // waiting for a command with the open-transaction table in hand would stall every other
+            // worker on an event that may never come.
+            assert_no_engine_latch_held("engine command receive (timed)");
             let received = {
                 let guard = rx
                     .lock()
@@ -1442,18 +1459,11 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                         &db_name,
                         &mut index_health_seen,
                     ) {
-                        shared
-                            .plan_cache
-                            .lock()
-                            .expect("INVARIANT: the plan-cache latch is not poisoned")
-                            .bump_schema();
+                        shared.plan_cache.lock().bump_schema();
                     }
                     invalidate_cache_on_build_completion(
                         &coordinator,
-                        &mut shared
-                            .plan_cache
-                            .lock()
-                            .expect("INVARIANT: the plan-cache latch is not poisoned"),
+                        &shared.plan_cache,
                         &mut builds_were_pending,
                     );
                     continue 'engine;
@@ -1471,6 +1481,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             // merely threaded.
             //
             // A bounded wait costs one wake per idle worker per tick and makes the stop observable.
+            assert_no_engine_latch_held("engine command receive");
             let received = {
                 let guard = rx
                     .lock()
@@ -1581,7 +1592,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
 fn process_retirements<D: BlockDevice, S: LogSink>(
     retire_rx: &std::sync::mpsc::Receiver<read_pool::ReadRetirement>,
     coordinator: &Option<Arc<TxnCoordinator<D, S>>>,
-    open: &mut OpenTxTable,
+    open: &EngineLatch<OpenTxTable>,
     readers_inflight: &AtomicU64,
     metrics: &Metrics,
     db: &str,
@@ -1614,7 +1625,10 @@ fn process_retirements<D: BlockDevice, S: LogSink>(
     // freed slot becomes reusable promptly rather than waiting for the next maintenance pass. Cheap: a
     // no-op when nothing is shadow-held.
     if any_retired && let Some(coord) = coordinator.as_deref() {
-        let oldest_open_ticket = open.keys().copied().min().unwrap_or(u64::MAX);
+        // Read the watermark under the latch, release, then act on it: `release_reusable_slots` walks
+        // the store's shadow-held slots, which is store work of unbounded size and has no business
+        // running at rank 5.
+        let oldest_open_ticket = { open.lock().keys().copied().min().unwrap_or(u64::MAX) };
         coord.release_reusable_slots(oldest_open_ticket);
     }
 }
@@ -1637,7 +1651,7 @@ fn process_retirements<D: BlockDevice, S: LogSink>(
 ///    fully drained (the reader sent this retirement post-drain). The `open` ticket is removed too.
 fn finish_reader<D: BlockDevice, S: LogSink>(
     coordinator: &TxnCoordinator<D, S>,
-    open: &mut OpenTxTable,
+    open: &EngineLatch<OpenTxTable>,
     retirement: read_pool::ReadRetirement,
     metrics: &Metrics,
     db: &str,
@@ -1657,7 +1671,11 @@ fn finish_reader<D: BlockDevice, S: LogSink>(
 
     // Remove the open-tx ticket (the engine owns its lifecycle now). A reader that the client
     // disconnected from mid-stream still retires here and is finalised exactly once.
-    let still_open = open.remove(&ticket.0).is_some();
+    // Removing the ticket IS the claim on this retirement: whoever takes it out of the table owns the
+    // commit/rollback that follows, and exactly one caller can. So the latch covers the claim and
+    // nothing else — the commit below is a WAL append plus a possible `fdatasync`, which at rank 5
+    // would convoy every worker of the engine behind one reader's durability barrier.
+    let still_open = { open.lock().remove(&ticket.0).is_some() };
 
     if !still_open {
         // The ticket was already finalised (e.g. an explicit rollback raced the retirement). The
@@ -1930,8 +1948,8 @@ fn maybe_run_maintenance<D: BlockDevice, S: LogSink>(
 #[allow(clippy::too_many_arguments)] // the engine loop threads its execution context through here
 fn maybe_reap_aged<D: BlockDevice, S: LogSink>(
     coordinator: &Option<Arc<TxnCoordinator<D, S>>>,
-    open: &mut OpenTxTable,
-    parked: &VecDeque<exec::InFlightInline>,
+    open: &EngineLatch<OpenTxTable>,
+    parked: &EngineLatch<VecDeque<exec::InFlightInline>>,
     max_transaction_age: Option<std::time::Duration>,
     clock: &Arc<dyn graphus_core::capability::Clock + Send + Sync>,
     metrics: &Metrics,
@@ -1949,35 +1967,59 @@ fn maybe_reap_aged<D: BlockDevice, S: LogSink>(
     if aged.is_empty() {
         return; // the common case: nothing over-age
     }
+    // SNAPSHOT the parked transactions, then release the queue. This pass used to hold `parked` and
+    // `open` at the same time, in that order, while the resume and park paths held them the other way
+    // round — the `rmp` #1038 ABBA. Rank 5 now refuses the pair outright, and this is why it can: the
+    // queue is read for one thing only, the set of transactions that must be skipped, and a `Vec` of
+    // `TxnId` answers that question for the whole pass. It is a snapshot of a moment, which is all the
+    // old code had too: a statement could park or resume between two iterations of the loop below.
+    let parked_txns: Vec<TxnId> = {
+        parked
+            .lock()
+            .iter()
+            .map(exec::InFlightInline::txn)
+            .collect()
+    };
     let mut reaped = 0u64;
     for txn in aged {
         // Any inline statement currently parked (suspended mid-stream) must not be reaped: it holds a
         // live cursor that resumes on a later tick. Several can be parked at once (`rmp` #485 B1).
-        if parked.iter().any(|p| p.txn() == txn) {
+        if parked_txns.contains(&txn) {
             continue; // executing/parked inline now — reap on a later (idle) tick
         }
-        // Reverse-map txn -> ticket and read its auto-commit flag in one immutable borrow, so the
-        // subsequent `open.remove` mutable borrow is unobstructed. Reap only explicit transactions.
-        let Some((ticket, auto_commit)) = open
-            .iter()
-            .find(|(_, t)| t.txn == txn)
-            .map(|(ticket, t)| (*ticket, t.auto_commit))
-        else {
-            continue; // not engine-tracked (an internal maintenance txn) — leave it to its owner
+        // Reverse-map txn -> ticket, read its auto-commit flag, and remove it — ONE critical section,
+        // because the find and the remove together are what claims this transaction. Split across two
+        // acquisitions, two workers could both find the same ticket and both go on to roll it back.
+        let claimed = {
+            let mut open = open.lock();
+            match open
+                .iter()
+                .find(|(_, t)| t.txn == txn)
+                .map(|(ticket, t)| (*ticket, t.auto_commit))
+            {
+                // Not engine-tracked (an internal maintenance txn) — leave it to its owner. A
+                // transient auto-commit unit is never the idle-holder threat, so it is skipped too.
+                None => None,
+                Some((_, true)) => None,
+                Some((ticket, false)) => {
+                    open.remove(&ticket);
+                    Some(ticket)
+                }
+            }
         };
-        if auto_commit {
-            continue; // transient single-statement unit — never the idle-holder threat
-        }
-        open.remove(&ticket);
+        let Some(ticket) = claimed else {
+            continue;
+        };
         // A clean rollback: discards the transaction's writes/locks/SSI footprint atomically and removes
         // it from the active set so `oldest_active_snapshot` advances. Idempotent-safe: `rollback` only
-        // errs for an already-inactive txn, which cannot happen here (we just observed it active).
+        // errs for an already-inactive txn, which cannot happen here (we just observed it active). It is
+        // an ARIES undo of everything the transaction wrote, so it runs with the latch released.
         if coord.rollback(txn).is_ok() {
             // Remember WHY this ticket vanished (`rmp` #988). Without this the owner's next `RUN` or
             // `COMMIT` could only be told "no such transaction", which is a different fact and sends
             // an operator hunting a lifecycle bug instead of reading `timing.max_transaction_age_ms`.
             // The record is consumed the first time it is delivered.
-            open.record_reaped(ticket);
+            open.lock().record_reaped(ticket);
             metrics.record_abort_for(db);
             reaped += 1;
         }
@@ -2011,9 +2053,9 @@ fn resume_parked_statements<
     D: BlockDevice + Send + Sync + 'static,
     S: LogSink + Send + Sync + 'static,
 >(
-    parked: &mut VecDeque<exec::InFlightInline>,
+    parked: &EngineLatch<VecDeque<exec::InFlightInline>>,
     coordinator: &Option<Arc<TxnCoordinator<D, S>>>,
-    open: &mut OpenTxTable,
+    open: &EngineLatch<OpenTxTable>,
     extensions: &Arc<graphus_cypher::extension::ExtensionRegistry>,
     metrics: &Arc<Metrics>,
     db: &str,
@@ -2025,19 +2067,29 @@ fn resume_parked_statements<
     let mut finalized_any = false;
     // Snapshot the count at entry: a statement that re-suspends is pushed to the back and only gets its
     // next batch on the following tick, so this never spins on one fast-refilling consumer.
-    let mut budget = parked.len();
+    let mut budget = parked.lock().len();
     while budget > 0 {
         budget -= 1;
-        let Some(mut stmt) = parked.pop_front() else {
+        // POP under the latch, RESUME with it released. The pop is what takes ownership of the
+        // statement — it is out of the queue, so no other worker can reach it — and resuming it runs a
+        // batch of a real query. Holding the queue across that was one half of the `rmp` #1038 defect
+        // and, with `open` held too, the other half of its ABBA. The pop is deliberately its own `let`
+        // statement rather than a `let … else` scrutinee, so the guard's release is visibly bound to a
+        // statement end instead of resting on the temporary-scope rules for `let`-`else`.
+        let popped = parked.lock().pop_front();
+        let Some(mut stmt) = popped else {
             break;
         };
         let Some(coord) = coordinator.as_deref() else {
             // Coordinator already consumed (Shutdown in progress): put it back and stop; Shutdown's
             // `drain_inflight` rolls its transaction back and the queue drops at loop exit.
-            parked.push_front(stmt);
+            parked.lock().push_front(stmt);
             break;
         };
         let txn = stmt.txn();
+        // Outside the panic boundary, as in [`run_statement_isolated`]: a resumed batch runs a real
+        // query, and the queue guard that popped this statement must already be gone (`rmp` #1038).
+        assert_no_engine_latch_held("resume_parked_statements");
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             exec::resume_inflight(
                 &mut stmt, coord, open, extensions, metrics, db, degraded, clock,
@@ -2045,7 +2097,7 @@ fn resume_parked_statements<
         }));
         match outcome {
             // Re-suspended: round-robin to the back of the queue for the next tick.
-            Ok(true) => parked.push_back(stmt),
+            Ok(true) => parked.lock().push_back(stmt),
             // Finalised (committed/rolled back inside `resume_inflight`): drop `stmt` (closes egress).
             Ok(false) => finalized_any = true,
             // Panicked on this resumed batch (`rmp` #485 B2): roll the txn back, deliver a terminal
@@ -2106,7 +2158,7 @@ fn resume_parked_statements<
 /// over a partial result (`rmp` #485 B2).
 fn recover_panicked_resume<D: BlockDevice, S: LogSink>(
     coord: &TxnCoordinator<D, S>,
-    open: &mut OpenTxTable,
+    open: &EngineLatch<OpenTxTable>,
     txn: TxnId,
     metrics: &Metrics,
     db: &str,
@@ -2121,9 +2173,13 @@ fn recover_panicked_resume<D: BlockDevice, S: LogSink>(
          engine alive (rmp #386/#485 B2)",
     );
     // `InFlightInline.ticket` is private to `exec`; reverse-map txn → ticket via `open` (as
-    // `maybe_reap_aged` does) so the open-tx entry is removed exactly once.
-    if let Some(ticket) = open.iter().find(|(_, t)| t.txn == txn).map(|(k, _)| *k) {
-        open.remove(&ticket);
+    // `maybe_reap_aged` does) so the open-tx entry is removed exactly once. Find and remove share ONE
+    // critical section — together they are the claim — and the ARIES undo below runs outside it.
+    {
+        let mut open = open.lock();
+        if let Some(ticket) = open.iter().find(|(_, t)| t.txn == txn).map(|(k, _)| *k) {
+            open.remove(&ticket);
+        }
     }
     recovery_rollback(
         coord,
@@ -2144,11 +2200,11 @@ fn recover_panicked_resume<D: BlockDevice, S: LogSink>(
 /// already-parked statement) is rolled back and dropped, preserving all existing parked work.
 #[allow(clippy::too_many_arguments)] // the engine loop threads its execution context through here
 fn enqueue_suspended<D: BlockDevice, S: LogSink>(
-    parked: &mut VecDeque<exec::InFlightInline>,
+    parked: &EngineLatch<VecDeque<exec::InFlightInline>>,
     just_suspended: &mut Option<exec::InFlightInline>,
     max_parked: usize,
     coordinator: &Option<Arc<TxnCoordinator<D, S>>>,
-    open: &mut OpenTxTable,
+    open: &EngineLatch<OpenTxTable>,
     metrics: &Metrics,
     db: &str,
     degraded: &EngineDegraded,
@@ -2156,18 +2212,33 @@ fn enqueue_suspended<D: BlockDevice, S: LogSink>(
     let Some(stmt) = just_suspended.take() else {
         return; // the common case: the dispatch ran to completion / off-thread, nothing to park
     };
-    if parked.len() < max_parked.max(1) {
-        parked.push_back(stmt);
-        return;
-    }
+    // The capacity test and the push are ONE critical section: they are a check-then-act, and split in
+    // two they stop bounding anything — W workers each read a length below the cap and each push, so
+    // the queue overshoots by up to W. The statement is handed back out of the block when there is no
+    // room, which is also how the latch is released before the overflow path below does real work.
+    let overflowed = {
+        let mut queue = parked.lock();
+        if queue.len() < max_parked.max(1) {
+            queue.push_back(stmt);
+            return;
+        }
+        (stmt, queue.len())
+    };
+    let (stmt, parked_len) = overflowed;
     // Overflow — unreachable under correct admission. Roll back the NEWCOMER (never an existing parked
     // statement) so the bound holds without losing already-parked work, then deliver a clean retriable
     // FAILURE to its consumer (rollback → terminal error → drop) so it is reported as busy/aborted, not
     // a partial result over a successful end-of-stream (the CWE-393 class).
     let txn = stmt.txn();
     if let Some(coord) = coordinator.as_deref() {
-        if let Some(ticket) = open.iter().find(|(_, t)| t.txn == txn).map(|(k, _)| *k) {
-            open.remove(&ticket);
+        // Find + remove in one critical section (the claim); the undo runs with the latch released.
+        // This is also the path whose *parked → open* order, against the age sweep's *open → parked*,
+        // was the `rmp` #1038 ABBA — gone now that the queue is released before the table is touched.
+        {
+            let mut open = open.lock();
+            if let Some(ticket) = open.iter().find(|(_, t)| t.txn == txn).map(|(k, _)| *k) {
+                open.remove(&ticket);
+            }
         }
         recovery_rollback(
             coord,
@@ -2183,7 +2254,7 @@ fn enqueue_suspended<D: BlockDevice, S: LogSink>(
     ));
     tracing::warn!(
         target: "graphus::engine",
-        parked = parked.len(),
+        parked = parked_len,
         "parked-inline-statement queue at capacity; rolled back a newly-suspended statement (rmp #485 \
          B1) — admission did not bound concurrency as expected",
     );
@@ -2521,15 +2592,17 @@ fn maintain_degraded_indexes<D: BlockDevice, S: LogSink>(
 /// drains, bump the schema version. `builds_were_pending` is updated in place to track the edge.
 fn invalidate_cache_on_build_completion<D: BlockDevice, S: LogSink>(
     coordinator: &Option<Arc<TxnCoordinator<D, S>>>,
-    plan_cache: &mut exec::EnginePlanCache,
+    plan_cache: &EngineLatch<exec::EnginePlanCache>,
     builds_were_pending: &mut bool,
 ) {
+    // The coordinator is asked FIRST, unlatched: `has_pending_index_builds` reads the build registry,
+    // which is not the plan cache's business, and the latch is only needed for the bump it may lead to.
     let now_pending = coordinator
         .as_deref()
         .is_some_and(TxnCoordinator::has_pending_index_builds);
     if *builds_were_pending && !now_pending {
         // The last in-flight build just promoted to `Online`: the catalog changed, so invalidate.
-        plan_cache.bump_schema();
+        plan_cache.lock().bump_schema();
     }
     *builds_were_pending = now_pending;
 }
@@ -2610,14 +2683,17 @@ struct ProcessCtx<'a, D: BlockDevice + Send + Sync + 'static, S: LogSink + Send 
     coordinator: &'a mut Option<Arc<TxnCoordinator<D, S>>>,
     /// The LATCH, not a borrow of the table (`rmp` #1033): dispatching a command runs a statement,
     /// and holding the table across that is exactly what would serialise W workers. Each arm takes it
-    /// for its own duration — `O(1)` for the short commands, and released before execution for `RUN`.
-    open: &'a std::sync::Mutex<OpenTxTable>,
+    /// for its own duration — an `O(1)` table operation for the short commands, and for `RUN` only at
+    /// the two edges of the statement, never across it. Between `rmp` #1033 and #1038 that was the
+    /// intent and not the code: `RUN` handed a *guard* to the executor, which held the table for the
+    /// whole query.
+    open: &'a EngineLatch<OpenTxTable>,
     next_ticket: &'a TicketMinter,
-    plan_cache: &'a std::sync::Mutex<exec::EnginePlanCache>,
+    plan_cache: &'a EngineLatch<exec::EnginePlanCache>,
     extensions: &'a Arc<graphus_cypher::extension::ExtensionRegistry>,
     dispatch: &'a read_pool::ReadDispatch<D, S>,
     readers_inflight: &'a AtomicU64,
-    parked: &'a std::sync::Mutex<VecDeque<exec::InFlightInline>>,
+    parked: &'a EngineLatch<VecDeque<exec::InFlightInline>>,
     max_parked_inline: usize,
     result_buffer_capacity: usize,
     metrics: &'a Arc<Metrics>,
@@ -2764,27 +2840,17 @@ fn process_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     }
 
     enqueue_suspended(
-        &mut parked
-            .lock()
-            .expect("INVARIANT: the parked latch is not poisoned"),
+        parked,
         &mut just_suspended,
         max_parked_inline,
         coordinator,
-        &mut open
-            .lock()
-            .expect("INVARIANT: the open-tx latch is not poisoned"),
+        open,
         metrics,
         db,
         degraded,
     );
     drive_index_build(coordinator);
-    invalidate_cache_on_build_completion(
-        coordinator,
-        &mut plan_cache
-            .lock()
-            .expect("INVARIANT: the plan-cache latch is not poisoned"),
-        builds_were_pending,
-    );
+    invalidate_cache_on_build_completion(coordinator, plan_cache, builds_were_pending);
     // The loading→not-loading edge (`rmp` #565): a bulk-import session that was active before this
     // command is now gone — this command was the `End`. On that edge `maybe_run_maintenance` re-anchors
     // its watermark and skips the O(N) GC pass so it cannot block the `Shutdown` a `STOP DATABASE` queues
@@ -2797,13 +2863,7 @@ fn process_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // the free is still walking a chain through it.
     let reuse_barrier =
         gc_reuse_barrier(next_ticket.peek(), readers_inflight.load(Ordering::Relaxed));
-    let oldest_open_ticket = open
-        .lock()
-        .expect("INVARIANT: the open-tx latch is not poisoned")
-        .keys()
-        .copied()
-        .min()
-        .unwrap_or(u64::MAX);
+    let oldest_open_ticket = open.lock().keys().copied().min().unwrap_or(u64::MAX);
     maybe_run_maintenance(
         coordinator,
         wal_at_last_maintenance,
@@ -2830,9 +2890,9 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
     coordinator: &mut Option<Arc<TxnCoordinator<D, S>>>,
     // The LATCH (`rmp` #1033): this function runs statements, so it must be free to
     // release the table before execution rather than hold it across one.
-    open: &std::sync::Mutex<OpenTxTable>,
+    open: &EngineLatch<OpenTxTable>,
     next_ticket: &TicketMinter,
-    plan_cache: &std::sync::Mutex<exec::EnginePlanCache>,
+    plan_cache: &EngineLatch<exec::EnginePlanCache>,
     extensions: &Arc<graphus_cypher::extension::ExtensionRegistry>,
     dispatch: &read_pool::ReadDispatch<D, S>,
     readers_inflight: &AtomicU64,
@@ -2880,30 +2940,12 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
         .expect("INVARIANT: coordinator is Some until Shutdown breaks the loop");
     match cmd {
         Cmd::Begin { mode, reply } => {
-            let ticket = open_tx(
-                coord,
-                &mut open
-                    .lock()
-                    .expect("INVARIANT: the open-tx latch is not poisoned"),
-                next_ticket,
-                mode,
-                false,
-                clock.now_nanos(),
-            );
+            let ticket = open_tx(coord, open, next_ticket, mode, false, clock.now_nanos());
             active_txns.publish(coord.active_count(), coord.ssi_tracked_len());
             let _ = reply.send(Ok(ticket));
         }
         Cmd::BeginAutoCommit { mode, reply } => {
-            let ticket = open_tx(
-                coord,
-                &mut open
-                    .lock()
-                    .expect("INVARIANT: the open-tx latch is not poisoned"),
-                next_ticket,
-                mode,
-                true,
-                clock.now_nanos(),
-            );
+            let ticket = open_tx(coord, open, next_ticket, mode, true, clock.now_nanos());
             active_txns.publish(coord.active_count(), coord.ssi_tracked_len());
             let _ = reply.send(Ok(ticket));
         }
@@ -2927,12 +2969,8 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
                 .expect("INVARIANT: coordinator is Some until Shutdown breaks the loop");
             run_statement_isolated(
                 coord,
-                &mut open
-                    .lock()
-                    .expect("INVARIANT: the open-tx latch is not poisoned"),
-                &mut plan_cache
-                    .lock()
-                    .expect("INVARIANT: the plan-cache latch is not poisoned"),
+                open,
+                plan_cache,
                 ticket,
                 &query,
                 params,
@@ -2960,9 +2998,7 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             // then replies. A read-only or SSI-aborted commit is answered here and never batched.
             commit_prepare_tx(
                 coord,
-                &mut open
-                    .lock()
-                    .expect("INVARIANT: the open-tx latch is not poisoned"),
+                open,
                 ticket,
                 reply,
                 commit_batch,
@@ -2973,16 +3009,7 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             active_txns.publish(coord.active_count(), coord.ssi_tracked_len());
         }
         Cmd::Rollback { ticket, reply } => {
-            let out = rollback_tx(
-                coord,
-                &mut open
-                    .lock()
-                    .expect("INVARIANT: the open-tx latch is not poisoned"),
-                ticket,
-                metrics,
-                db,
-                degraded,
-            );
+            let out = rollback_tx(coord, open, ticket, metrics, db, degraded);
             active_txns.publish(coord.active_count(), coord.ssi_tracked_len());
             let _ = reply.send(out);
         }
@@ -2999,10 +3026,7 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             // harmless (it just recompiles against the unchanged catalog once) and keeps the rule
             // simple: any mutating DDL bumps the version.
             if mutating && out.is_ok() {
-                plan_cache
-                    .lock()
-                    .expect("INVARIANT: the plan-cache latch is not poisoned")
-                    .bump_schema();
+                plan_cache.lock().bump_schema();
             }
             // `rmp` #813: a schema DDL is a committing transaction, so — like a real Neo4j server — it
             // carries the DB's durable-write bookmark on its terminal `PULL` `SUCCESS`. A CREATE/DROP is
@@ -3032,10 +3056,7 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             // node-key/property-type rule) — invalidate so no plan compiled under the old schema is
             // reused (`rmp` task #322).
             if mutating && out.is_ok() {
-                plan_cache
-                    .lock()
-                    .expect("INVARIANT: the plan-cache latch is not poisoned")
-                    .bump_schema();
+                plan_cache.lock().bump_schema();
             }
             // `rmp` #813: a constraint DDL is a committing transaction — carry the DB's durable-write
             // bookmark on its terminal `PULL` `SUCCESS`, exactly as Neo4j does (the seam copies it onto
@@ -3056,13 +3077,7 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             // slot it frees could be reused while a concurrent off-thread reader walks a chain through it.
             let reuse_barrier =
                 gc_reuse_barrier(next_ticket.peek(), readers_inflight.load(Ordering::Relaxed));
-            let oldest_open_ticket = open
-                .lock()
-                .expect("INVARIANT: the open-tx latch is not poisoned")
-                .keys()
-                .copied()
-                .min()
-                .unwrap_or(u64::MAX);
+            let oldest_open_ticket = open.lock().keys().copied().min().unwrap_or(u64::MAX);
             let out = handle_checkpoint(coord, reuse_barrier, oldest_open_ticket, metrics, db);
             // A manual (admin-triggered) checkpoint that succeeds is proof reclamation is making
             // progress again, so clear **this engine's own** maintenance-degraded flag (`rmp` #435 —
@@ -3103,13 +3118,7 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             // frees nothing, so the barrier only bites at the reclaiming `End`).
             let reuse_barrier =
                 gc_reuse_barrier(next_ticket.peek(), readers_inflight.load(Ordering::Relaxed));
-            let oldest_open_ticket = open
-                .lock()
-                .expect("INVARIANT: the open-tx latch is not poisoned")
-                .keys()
-                .copied()
-                .min()
-                .unwrap_or(u64::MAX);
+            let oldest_open_ticket = open.lock().keys().copied().min().unwrap_or(u64::MAX);
             coord.set_reuse_barrier(reuse_barrier);
             let out = bulk_load::handle_bulk_import_batch(coord, loading_session, batch);
             coord.set_reuse_barrier(None);
@@ -3120,18 +3129,7 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             ticket,
             chunk,
             reply,
-        } => run_mode_b_chunk_isolated(
-            coord,
-            &mut open
-                .lock()
-                .expect("INVARIANT: the open-tx latch is not poisoned"),
-            ticket,
-            chunk,
-            metrics,
-            db,
-            degraded,
-            reply,
-        ),
+        } => run_mode_b_chunk_isolated(coord, open, ticket, chunk, metrics, db, degraded, reply),
         // Test-only (`rmp` #435): the threaded engine loop intercepts this before dispatch, so it only
         // reaches here on the `LocalEngine` inline path — drive the same real per-engine escalation.
         #[cfg(feature = "internal-test-udf")]
@@ -3155,14 +3153,7 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             // in-flight index build is left durably `Populating`: it resumes and completes on the
             // next open via `TxnCoordinator::new`'s crash-recovery path (no force-drain needed —
             // re-deriving the candidate index is cheap and always correct).
-            drain_inflight(
-                coord,
-                &mut open
-                    .lock()
-                    .expect("INVARIANT: the open-tx latch is not poisoned"),
-                metrics,
-                db,
-            );
+            drain_inflight(coord, open, metrics, db);
             let coordinator = coordinator
                 .take()
                 .expect("INVARIANT: coordinator is Some at Shutdown");
@@ -3246,8 +3237,12 @@ fn run_statement_isolated<
     S: LogSink + Send + Sync + 'static,
 >(
     coord: &TxnCoordinator<D, S>,
-    open: &mut OpenTxTable,
-    plan_cache: &mut exec::EnginePlanCache,
+    // The LATCHES, never guards (`rmp` #1038). This function runs a whole query — compile, execute,
+    // materialise, morsel, GDS — and the two tables it forwards are consulted for a handful of `O(1)`
+    // operations at its edges. Taking them here, or receiving guards taken by the caller, would put the
+    // entire query inside both critical sections; `exec::handle_run` takes each one where it uses it.
+    open: &EngineLatch<OpenTxTable>,
+    plan_cache: &EngineLatch<exec::EnginePlanCache>,
     ticket: TxTicket,
     query: &str,
     params: Vec<(String, Value)>,
@@ -3275,6 +3270,15 @@ fn run_statement_isolated<
     reply: command::Reply<std::result::Result<RunReply, GraphusError>>,
 ) {
     use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    // THE rank-5 tripwire (`rmp` #1038), and note WHERE it is: immediately OUTSIDE the panic boundary
+    // below. That boundary exists to turn a fault in the executor — a bug in a query's execution — into
+    // a clean terminal error for that one statement. A latch held across a statement is not that: it is
+    // an engine-discipline violation that would silently serialise every worker, and laundering it into
+    // one client's error message is precisely how it would go unnoticed. Placed here rather than inside
+    // `exec::handle_run` for the same reason, and only here, so the check has exactly one home and a
+    // test that exercises it cannot be satisfied by a second copy.
+    assert_no_engine_latch_held("run_statement_isolated");
 
     // A second handle on the same one-shot reply channel, kept *outside* the catch boundary so that a
     // panic *before* the executor delivered its reply can still hand the waiting consumer a clean
@@ -3365,7 +3369,9 @@ fn run_mode_b_chunk_isolated<
     S: LogSink + Send + Sync + 'static,
 >(
     coord: &TxnCoordinator<D, S>,
-    open: &mut OpenTxTable,
+    // The LATCH, not a guard (`rmp` #1038): a Mode B chunk ingests a whole batch of rows, and the
+    // table is consulted only to resolve the ticket at the start and to claim the rollback on a panic.
+    open: &EngineLatch<OpenTxTable>,
     ticket: TxTicket,
     chunk: bulk_load_b::BulkImportModeBChunkInput,
     metrics: &Metrics,
@@ -3377,6 +3383,9 @@ fn run_mode_b_chunk_isolated<
 ) {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
+    // Outside the panic boundary, for the reason given in [`run_statement_isolated`]: ingesting a chunk
+    // is work of unbounded duration and must not begin with an engine latch held (`rmp` #1038).
+    assert_no_engine_latch_held("run_mode_b_chunk_isolated");
     let fallback = reply.fallback();
     let result = catch_unwind(AssertUnwindSafe(|| {
         bulk_load_b::ingest_mode_b_chunk(coord, open, ticket, chunk)
@@ -3395,7 +3404,8 @@ fn run_mode_b_chunk_isolated<
                 "bulk-import Mode B chunk panicked; rolling back its transaction and keeping the \
                  engine alive (rmp #386/#520)",
             );
-            if let Some(tx) = open.remove(&ticket.0) {
+            let claimed = open.lock().remove(&ticket.0);
+            if let Some(tx) = claimed {
                 recovery_rollback(
                     coord,
                     tx.txn,
@@ -3426,7 +3436,7 @@ fn run_mode_b_chunk_isolated<
 #[allow(clippy::too_many_arguments)] // The recovery path threads its execution context here.
 fn rollback_panicked_statement<D: BlockDevice, S: LogSink>(
     coord: &TxnCoordinator<D, S>,
-    open: &mut OpenTxTable,
+    open: &EngineLatch<OpenTxTable>,
     ticket: TxTicket,
     metrics: &Metrics,
     db: &str,
@@ -3441,7 +3451,8 @@ fn rollback_panicked_statement<D: BlockDevice, S: LogSink>(
         panic = %detail,
         "statement panicked; rolling back its transaction and keeping the engine alive (rmp #386)",
     );
-    if let Some(tx) = open.remove(&ticket.0) {
+    let claimed = open.lock().remove(&ticket.0);
+    if let Some(tx) = claimed {
         // Discard the entire half-applied write buffer (ARIES undo). A failure here is itself
         // best-effort: the txn is being torn down regardless and recovery would undo it anyway.
         //
@@ -3647,6 +3658,9 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
     coordinator: &TxnCoordinator<D, S>,
     command: &IndexCommand,
 ) -> Result<IndexDdlReply> {
+    // A synchronous index build (full-text, spatial, vector) scans the store, and `SHOW INDEXES`
+    // renders the whole catalogue: neither belongs inside a rank-5 critical section (`rmp` #1038).
+    assert_no_engine_latch_held("handle_index_ddl");
     match command {
         IndexCommand::CreateNodePropertyIndex {
             name,
@@ -3986,6 +4000,9 @@ fn handle_constraint_ddl<D: BlockDevice, S: LogSink>(
     principal: Option<&str>,
     active_txns: &mut ActiveTxnGauge,
 ) -> Result<IndexDdlReply> {
+    // A `CREATE CONSTRAINT` validates by walking every entity carrying the covered token — work of
+    // unbounded duration, so no engine session latch may be held here (`rmp` #1038).
+    assert_no_engine_latch_held("handle_constraint_ddl");
     match command {
         ConstraintCommand::Create(create) => {
             let (kind, descriptor) = constraint_storage_kind(create);
@@ -4083,17 +4100,21 @@ fn handle_constraint_ddl<D: BlockDevice, S: LogSink>(
 /// (excluded from the age sweep) or an explicit `BEGIN … COMMIT` (the sweep's target).
 fn open_tx<D: BlockDevice, S: LogSink>(
     coordinator: &TxnCoordinator<D, S>,
-    open: &mut OpenTxTable,
+    open: &EngineLatch<OpenTxTable>,
     next_ticket: &TicketMinter,
     mode: AccessMode,
     auto_commit: bool,
     begin_nanos: u64,
 ) -> TxTicket {
+    // Both of these happen BEFORE the latch. `begin_at` mints a transaction id, registers it with the
+    // SSI tracker and inserts it into the active set — it descends through ranks 20 and below, and
+    // there is no reason for the engine's table to be held while it does. Minting the ticket is an
+    // atomic fetch-add on this worker's own counter.
     let txn = coordinator.begin_at(mode.isolation(), begin_nanos);
     // `+ step` rather than `+ 1`: the ticket must stay in this worker's residue class, and it must
     // never be zero (an unused ticket value the tests rely on).
     let ticket = next_ticket.mint();
-    open.insert(
+    open.lock().insert(
         ticket,
         OpenTx {
             txn,
@@ -4119,7 +4140,7 @@ fn open_tx<D: BlockDevice, S: LogSink>(
 #[allow(clippy::too_many_arguments)] // the commit path threads its execution context here
 fn commit_prepare_tx<D: BlockDevice, S: LogSink>(
     coordinator: &TxnCoordinator<D, S>,
-    open: &mut OpenTxTable,
+    open: &EngineLatch<OpenTxTable>,
     ticket: TxTicket,
     reply: command::Reply<Result<RunSummary>>,
     commit_batch: &mut Vec<PendingCommit>,
@@ -4127,16 +4148,30 @@ fn commit_prepare_tx<D: BlockDevice, S: LogSink>(
     db: &str,
     degraded: &EngineDegraded,
 ) {
-    let Some(tx) = open.remove(&ticket.0) else {
+    // The removal is the claim on this commit, and the diagnosis of a ticket that is not there has to
+    // share its critical section: `unknown_ticket_error` CONSUMES the reap record, so the failed remove
+    // and the reason for it must be read as one step or a concurrent second attempt could take the
+    // record and leave this one saying "never existed" about a transaction the age sweep stopped.
+    let claimed = {
+        let mut open = open.lock();
+        match open.remove(&ticket.0) {
+            Some(tx) => Ok(tx),
+            None => Err(open.unknown_ticket_error(ticket.0, "COMMIT of transaction")),
+        }
+    };
+    let tx = match claimed {
+        Ok(tx) => tx,
         // The COMMIT twin of the unknown-ticket RUN in `exec.rs`: a permanent, NON-retryable client
         // fault (`rmp` #988), not a serialization abort. `unknown_ticket_error` separates the two
         // causes — a transaction the age sweep stopped (`TransactionTimedOut`, which says why) from
         // one that never existed or is already spent (`TransactionNotFound`).
-        let _ = reply.send(Err(
-            open.unknown_ticket_error(ticket.0, "COMMIT of transaction")
-        ));
-        return;
+        Err(e) => {
+            let _ = reply.send(Err(e));
+            return;
+        }
     };
+    // SSI validation plus a `COMMIT` record appended to the WAL — real work, run with the latch
+    // released so a commit never stands between another worker and its own table lookup.
     match coordinator.commit_prepare(tx.txn) {
         // A durable write commit: defer the ack until the batch `fdatasync` covers `commit_lsn`. Mint
         // the causal bookmark now from the commit timestamp (`rmp` #807) — monotonic per database — and
@@ -4247,15 +4282,15 @@ fn pipelined_group_commit<
     rx: &std::sync::Mutex<std::sync::mpsc::Receiver<EngineCommand>>,
     coordinator: &mut Option<Arc<TxnCoordinator<D, S>>>,
     // The latch: this path re-enters the dispatch (`rmp` #1033).
-    open: &std::sync::Mutex<OpenTxTable>,
+    open: &EngineLatch<OpenTxTable>,
     next_ticket: &TicketMinter,
-    plan_cache: &std::sync::Mutex<exec::EnginePlanCache>,
+    plan_cache: &EngineLatch<exec::EnginePlanCache>,
     extensions: &Arc<graphus_cypher::extension::ExtensionRegistry>,
     dispatch: &read_pool::ReadDispatch<D, S>,
     readers_inflight: &AtomicU64,
     commit_batch: &mut Vec<PendingCommit>,
     pending_cmd: &mut Option<EngineCommand>,
-    parked: &std::sync::Mutex<VecDeque<exec::InFlightInline>>,
+    parked: &EngineLatch<VecDeque<exec::InFlightInline>>,
     max_parked_inline: usize,
     result_buffer_capacity: usize,
     metrics: &Arc<Metrics>,
@@ -4363,9 +4398,7 @@ fn pipelined_group_commit<
         process_retirements(
             retire_rx,
             coordinator,
-            &mut open
-                .lock()
-                .expect("INVARIANT: the open-tx latch is not poisoned"),
+            open,
             readers_inflight,
             metrics,
             db,
@@ -4385,13 +4418,9 @@ fn pipelined_group_commit<
         // re-suspends is pushed to the back and only gets its next batch on the following pass (its own
         // budget snapshot), so this never spins on one fast-refilling consumer.
         resume_parked_statements(
-            &mut parked
-                .lock()
-                .expect("INVARIANT: the parked latch is not poisoned"),
+            parked,
             coordinator,
-            &mut open
-                .lock()
-                .expect("INVARIANT: the open-tx latch is not poisoned"),
+            open,
             extensions,
             metrics,
             db,
@@ -4480,15 +4509,15 @@ fn drain_commit_batch<
     rx: &std::sync::Mutex<std::sync::mpsc::Receiver<EngineCommand>>,
     coordinator: &mut Option<Arc<TxnCoordinator<D, S>>>,
     // The latch, for the same reason as `dispatch_command` (`rmp` #1033).
-    open: &std::sync::Mutex<OpenTxTable>,
+    open: &EngineLatch<OpenTxTable>,
     next_ticket: &TicketMinter,
-    plan_cache: &std::sync::Mutex<exec::EnginePlanCache>,
+    plan_cache: &EngineLatch<exec::EnginePlanCache>,
     extensions: &Arc<graphus_cypher::extension::ExtensionRegistry>,
     dispatch: &read_pool::ReadDispatch<D, S>,
     readers_inflight: &AtomicU64,
     commit_batch: &mut Vec<PendingCommit>,
     pending_cmd: &mut Option<EngineCommand>,
-    parked: &std::sync::Mutex<VecDeque<exec::InFlightInline>>,
+    parked: &EngineLatch<VecDeque<exec::InFlightInline>>,
     max_parked_inline: usize,
     result_buffer_capacity: usize,
     metrics: &Arc<Metrics>,
@@ -4508,6 +4537,7 @@ fn drain_commit_batch<
     while commit_batch.len() < MAX_COMMIT_BATCH && processed < MAX_DRAIN_COMMANDS {
         // Dequeue under the latch, act outside it: the batch this builds is committed with the
         // queue free, so another worker can keep serving while this one hardens.
+        assert_no_engine_latch_held("group-commit batch drain");
         let received = {
             let guard = rx
                 .lock()
@@ -4554,15 +4584,11 @@ fn drain_commit_batch<
                 // it — it has NOT committed (mid-stream), so it never joined the batch; its later resume
                 // finalises it inline. A `Commit` never suspends, so this is a no-op for that arm.
                 enqueue_suspended(
-                    &mut parked
-                        .lock()
-                        .expect("INVARIANT: the parked latch is not poisoned"),
+                    parked,
                     &mut just_suspended,
                     max_parked_inline,
                     coordinator,
-                    &mut open
-                        .lock()
-                        .expect("INVARIANT: the open-tx latch is not poisoned"),
+                    open,
                     metrics,
                     db,
                     degraded,
@@ -4658,13 +4684,16 @@ fn checkpoint_after_batch<D: BlockDevice, S: LogSink>(
 /// failure of the statement, not only of the engine.
 fn rollback_tx<D: BlockDevice, S: LogSink>(
     coordinator: &TxnCoordinator<D, S>,
-    open: &mut OpenTxTable,
+    open: &EngineLatch<OpenTxTable>,
     ticket: TxTicket,
     metrics: &Metrics,
     db: &str,
     degraded: &EngineDegraded,
 ) -> Result<()> {
-    let Some(tx) = open.remove(&ticket.0) else {
+    // The removal claims the rollback; the ARIES undo below is unbounded in the size of the write
+    // buffer it discards and runs with the latch released.
+    let claimed = open.lock().remove(&ticket.0);
+    let Some(tx) = claimed else {
         // Idempotent no-op.
         return Ok(());
     };
@@ -4695,18 +4724,26 @@ fn rollback_tx<D: BlockDevice, S: LogSink>(
 /// for the final flush.
 fn drain_inflight<D: BlockDevice, S: LogSink>(
     coordinator: &TxnCoordinator<D, S>,
-    open: &mut OpenTxTable,
+    open: &EngineLatch<OpenTxTable>,
     metrics: &Metrics,
     db: &str,
 ) {
-    // Collect tickets first to avoid borrowing `open` across the mutation.
-    let tickets: Vec<u64> = open.keys().copied().collect();
-    for t in tickets {
-        if let Some(tx) = open.remove(&t) {
-            // Best-effort: a rollback error on one straggler should not block hardening the rest.
-            if coordinator.rollback(tx.txn).is_ok() {
-                metrics.record_abort_for(db);
-            }
+    // Drain the whole table in ONE critical section and roll the stragglers back outside it. Draining
+    // rather than iterating is what makes each undo a claim: this runs on the worker that intercepted
+    // `Shutdown`, and by then every other worker has left the loop, but a drain states the exclusivity
+    // instead of inheriting it from the shutdown barrier's current shape.
+    let stragglers: Vec<OpenTx> = {
+        let mut open = open.lock();
+        let tickets: Vec<u64> = open.keys().copied().collect();
+        tickets
+            .into_iter()
+            .filter_map(|t| open.remove(&t))
+            .collect()
+    };
+    for tx in stragglers {
+        // Best-effort: a rollback error on one straggler should not block hardening the rest.
+        if coordinator.rollback(tx.txn).is_ok() {
+            metrics.record_abort_for(db);
         }
     }
 }
@@ -5369,7 +5406,7 @@ mod max_transaction_age_tests {
     #[test]
     fn reaps_over_age_explicit_txn_only() {
         let coord = fresh_coord();
-        let mut open: OpenTxTable = OpenTxTable::new();
+        let open: EngineLatch<OpenTxTable> = EngineLatch::new(OpenTxTable::new());
         // A single worker in the fixture: stride 1 (`rmp` #1035).
         let next_ticket = TicketMinter::new(0, 1);
         let cap = std::time::Duration::from_secs(60);
@@ -5379,13 +5416,13 @@ mod max_transaction_age_tests {
         let mut gauge = ActiveTxnGauge::new(Arc::clone(&metrics), Arc::from("test"));
 
         // Over-age explicit reader (begin at t=0 ⇒ age 61s ≥ cap).
-        let aged_explicit = open_tx(&coord, &mut open, &next_ticket, AccessMode::Read, false, 0);
+        let aged_explicit = open_tx(&coord, &open, &next_ticket, AccessMode::Read, false, 0);
         // Over-age auto-commit statement (same age, but excluded from the sweep).
-        let aged_auto = open_tx(&coord, &mut open, &next_ticket, AccessMode::Read, true, 0);
+        let aged_auto = open_tx(&coord, &open, &next_ticket, AccessMode::Read, true, 0);
         // Young explicit reader (begin just now ⇒ age 1ns ≪ cap).
         let young_explicit = open_tx(
             &coord,
-            &mut open,
+            &open,
             &next_ticket,
             AccessMode::Read,
             false,
@@ -5396,8 +5433,8 @@ mod max_transaction_age_tests {
         let coordinator = Some(Arc::new(coord));
         maybe_reap_aged(
             &coordinator,
-            &mut open,
-            &VecDeque::new(), // nothing parked inline
+            &open,
+            &EngineLatch::new(VecDeque::new()), // nothing parked inline
             Some(cap),
             &clock,
             &metrics,
@@ -5411,15 +5448,15 @@ mod max_transaction_age_tests {
         // Only the over-age explicit transaction was reaped (the `open` map is keyed by ticket).
         assert_eq!(coord.active_count(), 2, "exactly one transaction reaped");
         assert!(
-            !open.contains_key(&aged_explicit.0),
+            !open.lock().contains_key(&aged_explicit.0),
             "the over-age explicit transaction must be removed from the open map"
         );
         assert!(
-            open.contains_key(&aged_auto.0),
+            open.lock().contains_key(&aged_auto.0),
             "the over-age auto-commit statement must be left alone (transient / possibly mid-flight)"
         );
         assert!(
-            open.contains_key(&young_explicit.0),
+            open.lock().contains_key(&young_explicit.0),
             "the young explicit transaction (under the cap) must be untouched"
         );
     }
@@ -5428,21 +5465,21 @@ mod max_transaction_age_tests {
     #[test]
     fn disabled_cap_reaps_nothing() {
         let coord = fresh_coord();
-        let mut open: OpenTxTable = OpenTxTable::new();
+        let open: EngineLatch<OpenTxTable> = EngineLatch::new(OpenTxTable::new());
         // A single worker in the fixture: stride 1 (`rmp` #1035).
         let next_ticket = TicketMinter::new(0, 1);
         let clock = clock_at(u64::MAX); // arbitrarily far in the future
         let metrics = Arc::new(Metrics::new());
         let mut gauge = ActiveTxnGauge::new(Arc::clone(&metrics), Arc::from("test"));
 
-        let _ = open_tx(&coord, &mut open, &next_ticket, AccessMode::Read, false, 0);
+        let _ = open_tx(&coord, &open, &next_ticket, AccessMode::Read, false, 0);
         assert_eq!(coord.active_count(), 1);
 
         let coordinator = Some(Arc::new(coord));
         maybe_reap_aged(
             &coordinator,
-            &mut open,
-            &VecDeque::new(),
+            &open,
+            &EngineLatch::new(VecDeque::new()),
             None, // cap disabled
             &clock,
             &metrics,
@@ -5455,7 +5492,7 @@ mod max_transaction_age_tests {
             "a disabled cap must never reap"
         );
         assert_eq!(
-            open.len(),
+            open.lock().len(),
             1,
             "the open map is untouched when the cap is disabled"
         );

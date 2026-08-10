@@ -88,7 +88,7 @@ pub struct LocalEngine<D: BlockDevice, S: LogSink> {
     /// loop). `Some` until shutdown.
     coordinator: Option<Arc<TxnCoordinator<D, S>>>,
     /// Open transactions, keyed by the ticket id the engine mints (same bookkeeping the loop keeps).
-    open: std::sync::Mutex<OpenTxTable>,
+    open: super::latch::EngineLatch<OpenTxTable>,
     /// Monotonic ticket counter (same as the loop's).
     next_ticket: super::TicketMinter,
     /// The compiled-in UDF/UDP + GDS registry, built once (as the engine thread does). `Arc`-wrapped to
@@ -108,7 +108,7 @@ pub struct LocalEngine<D: BlockDevice, S: LogSink> {
     /// single-threaded by construction, so the same reuse + schema-version invalidation applies, and
     /// the same seed still yields the same execution (the cache changes *how fast* a plan is obtained,
     /// never *which* plan — exact-text keying is deterministic).
-    plan_cache: std::sync::Mutex<super::exec::EnginePlanCache>,
+    plan_cache: super::latch::EngineLatch<super::exec::EnginePlanCache>,
     /// Observability counters (a private registry; the simulator may read it for liveness checks).
     metrics: Arc<Metrics>,
     /// This inline engine's own degraded flag (`rmp` #414), mirroring the threaded engine. Single-
@@ -148,14 +148,14 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         let db_name: Arc<str> = Arc::from("local");
         Self {
             coordinator: Some(Arc::new(coordinator)),
-            open: std::sync::Mutex::new(OpenTxTable::new()),
+            open: super::latch::EngineLatch::new(OpenTxTable::new()),
             // A single inline worker: stride 1, seeded at 0 (`rmp` #1035).
             next_ticket: super::TicketMinter::new(0, 1),
             extensions: Arc::new(super::exec::install_extensions()),
             // Inline (deterministic) read dispatch — never a pool. See the field docs.
             dispatch: ReadDispatch::Inline,
             readers_inflight: std::sync::atomic::AtomicU64::new(0),
-            plan_cache: std::sync::Mutex::new(super::exec::EnginePlanCache::new()),
+            plan_cache: super::latch::EngineLatch::new(super::exec::EnginePlanCache::new()),
             degraded: super::EngineDegraded::new(),
             maintenance_degraded: super::MaintenanceDegraded::new(),
             transactions: Arc::new(crate::txn_registry::TransactionRegistry::new()),
@@ -435,10 +435,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     /// misses / current size / capacity. Lets a test observe that a repeated query text reuses a cached
     /// plan (a hit) and that a schema change invalidates it (the next compile is a miss again).
     pub fn plan_cache_stats(&self) -> graphus_cypher::CacheStats {
-        self.plan_cache
-            .lock()
-            .expect("INVARIANT: the plan-cache latch is not poisoned")
-            .stats()
+        self.plan_cache.lock().stats()
     }
 
     /// Captures an online backup chain artifact of the live store, returning its plaintext bytes.

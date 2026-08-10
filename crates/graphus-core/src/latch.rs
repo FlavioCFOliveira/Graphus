@@ -1,10 +1,12 @@
 //! **Lock-held tripwires**: debug-build guards proving that no durability barrier is ever issued
 //! while a lock that must not span I/O is held.
 //!
-//! Six are defined here:
+//! Seven are defined here:
 //!
-//! * the **catalog-latch tripwire** ([`CatalogLatchScope`], `rmp` #1015) — the outermost latch, over
-//!   the tokens, the schema counters, the metadata page chain and the DDL catalog;
+//! * the **engine-latch tripwire** ([`EngineLatchScope`], `rmp` #1038) — the server's per-engine
+//!   session latches (the open-transaction table, the parked-statement queue, the plan cache);
+//! * the **catalog-latch tripwire** ([`CatalogLatchScope`], `rmp` #1015) — the outermost latch of the
+//!   storage stack, over the tokens, the schema counters, the metadata page chain and the DDL catalog;
 //! * the **frame-latch tripwire** ([`FrameLatchScope`], `rmp` #974) — the buffer pool's per-frame
 //!   latch;
 //! * the **doublewrite-lock tripwire** ([`DwbLockScope`], `rmp` #993) — the mutex guarding the
@@ -16,10 +18,12 @@
 //! * the **chain-head-latch tripwire** ([`ChainHeadLatchScope`], `rmp` #1028) — the sharded latch
 //!   that makes one chain-head publication atomic.
 //!
-//! The first two were each *measured* to convoy behind a barrier and then hoisted out. The third is
-//! the same guarantee stated **before** the convoy can be built: the allocation latch is new, and it
-//! sits at rank 25 of the lock order (see [`AllocLatchScope`]) precisely on the promise that it is
-//! never held across I/O. A promise nobody checks is a promise that lasts until the next refactor.
+//! [`FrameLatchScope`] and [`DwbLockScope`] were each *measured* to convoy behind a barrier and then
+//! hoisted out. The rest state the same guarantee **before** the convoy can be built: each of those
+//! latches was new, and each sits at its rank precisely on a promise about what it is not held across.
+//! A promise nobody checks is a promise that lasts until the next refactor — and [`EngineLatchScope`]
+//! is the case that proves it, since the promise it now checks had been written in a doc-comment and
+//! broken by every call site the same comment described.
 //!
 //! # Why this exists
 //!
@@ -269,11 +273,11 @@ thread_local! {
 ///
 /// # The rank, and the rule it encodes
 ///
-/// Graphus orders its latches by rank, innermost last: **10** catalog/DDL, **20** commit sequencer
-/// and active-transaction table, **22** the maintenance latch, **25** the allocation latch, **27**
-/// the chain-head publication latch, **30** WAL, **40** buffer-pool frame latch, **50** page-table
-/// shard, **60** device and doublewrite stager. An acquisition out of rank order is permitted only as
-/// a `try_lock`, which creates no wait edge.
+/// Graphus orders its latches by rank, innermost last: **5** the engine's session latches, **10**
+/// catalog/DDL, **20** commit sequencer and active-transaction table, **22** the maintenance latch,
+/// **25** the allocation latch, **27** the chain-head publication latch, **30** WAL, **40**
+/// buffer-pool frame latch, **50** page-table shard, **60** device and doublewrite stager. An
+/// acquisition out of rank order is permitted only as a `try_lock`, which creates no wait edge.
 ///
 /// Rank 25 says two things. Below the active-transaction table (20), because allocating or freeing an
 /// id happens inside a transaction that records the pop or push in that table. Above the WAL (30) and
@@ -636,6 +640,152 @@ pub fn assert_no_maintenance_latch_held(site: &str) {
 
 #[cfg(debug_assertions)]
 thread_local! {
+    static ENGINE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether the current thread holds one of the engine's session latches — `0` or `1`, never more
+/// (`rmp` #1038). Always `0` in a release build.
+#[cfg(debug_assertions)]
+#[must_use]
+pub fn engine_latch_depth() -> u32 {
+    ENGINE_DEPTH.with(std::cell::Cell::get)
+}
+
+/// Whether the current thread holds an engine session latch. Always `0` in a release build.
+#[cfg(not(debug_assertions))]
+#[must_use]
+pub const fn engine_latch_depth() -> u32 {
+    0
+}
+
+/// An RAII marker for a region in which the current thread holds one of the **engine's session
+/// latches** (`rmp` #1038): the server's open-transaction table, its parked-statement queue, and its
+/// compiled-plan cache — the state an engine worker consults to serve one client command.
+///
+/// # The rank, and the two rules it encodes
+///
+/// Rank **5** — OUTSIDE everything (see [`AllocLatchScope`] for the full order). A command handler
+/// takes a session latch and then, if it needs to, descends into the storage stack: the catalog (10),
+/// the active-transaction table (20), the WAL (30), the device (60). Every acquisition from rank 5 is
+/// therefore *inward*, and nothing below it can reach back out — the storage layer holds no reference
+/// to the engine's tables. Entering this scope while ANY inner latch is held is a rank inversion and
+/// panics in a debug build, which is what makes that direction checked rather than assumed.
+///
+/// The two obligations of rank 5 need different mechanisms, exactly as at ranks 22/25/27:
+///
+/// * *at most one holder per thread* — the assertion in [`new`](Self::new). This is not a stylistic
+///   preference, it is the whole point. The three latches sit at ONE rank rather than three ordered
+///   ranks precisely so that nesting them is illegal: distinct ranks would legalise nesting, and
+///   nesting is what produced the deadlock this scope was created to make impossible. The engine's age
+///   sweep took *open → parked* while its resume and park paths took *parked → open*. With one table
+///   per worker that inversion was invisible; the moment the tables are shared between workers
+///   (`rmp` #1041) two workers close the cycle and the engine stops with no message at all. One rank
+///   plus this assertion turns that silent two-thread hang into a loud, deterministic, single-threaded
+///   panic at the second acquisition.
+/// * *never held across statement execution* — [`assert_no_engine_latch_held`], called where a worker
+///   begins running arbitrary work: a Cypher statement, a resumed batch, a bulk-import chunk, a
+///   constraint validation that scans the data, and the blocking wait for the next command. A guard
+///   that spans a statement is not a data-race hazard — it is a *throughput* hazard, and the worst
+///   kind, because it is invisible to every test that only checks results: W workers still produce
+///   correct answers while taking strict turns. Once the tables are shared it costs the whole of the
+///   engine's parallelism (measured at 3.95 cores → 1.00 in
+///   `graphus-server/tests/engine_latch_scaling_1038.rs`); while each worker owns its own it costs
+///   nothing at all, which is the trap — the mistake is free until the commit that shares the state,
+///   and that commit will look like the cause. In Rust it is also one character wide, since a
+///   temporary guard created in argument position lives to the end of the enclosing statement —
+///   which, for a call that runs a query, is the whole query.
+///
+/// `!Send`/`!Sync` like its siblings: the depth is a thread-local, so a scope created on one thread
+/// and dropped on another would leave the first thread permanently latched and saturate the second at
+/// zero. The `MutexGuard` it accompanies is already `!Send`, so nothing is lost.
+#[derive(Debug)]
+pub struct EngineLatchScope {
+    _private: std::marker::PhantomData<*const ()>,
+}
+
+impl EngineLatchScope {
+    /// Enters an engine-session-latch region on the current thread.
+    ///
+    /// # Panics
+    /// Panics in a debug build if this thread already holds an engine session latch (rank 5 admits one
+    /// holder per thread — see above), or if it holds any inner latch, which would mean rank 5 was
+    /// taken second. Compiled out in release.
+    #[must_use]
+    #[inline]
+    pub fn new() -> Self {
+        #[cfg(debug_assertions)]
+        {
+            assert_no_frame_latch_held("EngineLatchScope::new");
+            assert_no_maintenance_latch_held("EngineLatchScope::new");
+            assert_no_alloc_latch_held("EngineLatchScope::new");
+            assert_no_chain_head_latch_held("EngineLatchScope::new");
+            assert!(
+                catalog_latch_depth() == 0,
+                "EngineLatchScope::new: an engine session latch was taken while this thread holds the \
+                 catalog latch. Rank 5 is OUTSIDE rank 10 (`rmp` #1038), so it is taken first or not \
+                 at all; reaching back out for it from inside the storage stack is the one direction \
+                 that closes a cycle (see `graphus_core::latch`)."
+            );
+            ENGINE_DEPTH.with(|d| {
+                assert!(
+                    d.get() == 0,
+                    "a second engine session latch was taken while this thread already holds one. \
+                     Rank 5 is not re-entrant and admits one holder per thread (`rmp` #1038): the \
+                     open-transaction table, the parked-statement queue and the plan cache share one \
+                     rank exactly so that nesting them is illegal, because two threads nesting a \
+                     different pair in a different order deadlock. Take one, finish with it, release \
+                     it, then take the next (see `graphus_core::latch`)."
+                );
+                d.set(1);
+            });
+        }
+        Self {
+            _private: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Default for EngineLatchScope {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for EngineLatchScope {
+    #[inline]
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        ENGINE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// Panics (debug builds only) if the current thread holds an engine session latch.
+///
+/// Call this wherever a worker is about to run work of unbounded duration — a statement, a resumed
+/// batch, a bulk-import chunk, a data-scanning DDL validation — or to block waiting for its next
+/// command. `site` names the point so a failure names the path that held on too long.
+///
+/// # Panics
+/// Panics in a debug build if [`engine_latch_depth`] is non-zero. Compiled out in release.
+#[inline]
+pub fn assert_no_engine_latch_held(site: &str) {
+    #[cfg(debug_assertions)]
+    {
+        let depth = engine_latch_depth();
+        assert!(
+            depth == 0,
+            "{site}: reached while holding {depth} engine session latch(es). That latch is rank 5 and \
+             must be released before any work of unbounded duration (`rmp` #1038): held across a \
+             statement it serialises every worker of the engine onto one core while every result stays \
+             correct, so no test that checks answers can see it. Copy what you need out of the table \
+             under the latch, drop the guard, then execute (see `graphus_core::latch`)."
+        );
+    }
+    let _ = site;
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
     static CATALOG_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
@@ -933,6 +1083,82 @@ mod tests {
         assert_no_dwb_lock_held("unrelated barrier");
         assert_no_alloc_latch_held("unrelated barrier");
         assert_no_chain_head_latch_held("unrelated barrier");
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "engine session latch")]
+    fn engine_assert_fires_inside_a_latched_region() {
+        let _scope = EngineLatchScope::new();
+        assert_no_engine_latch_held("test statement execution");
+    }
+
+    #[test]
+    fn engine_assert_passes_outside_a_latched_region() {
+        assert_eq!(engine_latch_depth(), 0);
+        assert_no_engine_latch_held("test statement execution");
+    }
+
+    /// **Positive control for the non-re-entrancy rule** (`rmp` #1038) — the rank-5 twin of
+    /// [`a_second_alloc_scope_on_one_thread_is_refused`], and the one that stands in for the ABBA the
+    /// engine actually had: its age sweep took *open → parked* while its resume path took
+    /// *parked → open*. Both are rank 5, so the second acquisition panics here on ONE thread instead
+    /// of hanging two.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "Rank 5 is not re-entrant")]
+    fn a_second_engine_scope_on_one_thread_is_refused() {
+        let _first = EngineLatchScope::new();
+        let _second = EngineLatchScope::new();
+    }
+
+    /// Sequential scopes are fine — the rule forbids *simultaneous* holders, not consulting one table
+    /// after another. (A rule against the latter would outlaw the age sweep, which reads the parked
+    /// queue and then mutates the open-transaction table.)
+    #[test]
+    fn engine_scopes_taken_one_after_another_are_fine() {
+        for _ in 0..3 {
+            let _s = EngineLatchScope::new();
+        }
+        assert_eq!(engine_latch_depth(), 0);
+    }
+
+    /// **Positive control for the outermost rule** (`rmp` #1038). Rank 5 sits outside rank 10, so an
+    /// engine latch taken while the catalog latch is held is the one direction that closes a cycle.
+    /// Without this test the `catalog_latch_depth` assertion in [`EngineLatchScope::new`] could be
+    /// deleted and nothing else in the suite would notice.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "EngineLatchScope::new")]
+    fn taking_an_engine_latch_under_the_catalog_latch_is_refused() {
+        let _catalog = CatalogLatchScope::new();
+        let _engine = EngineLatchScope::new();
+    }
+
+    /// The legal direction, and the reason the previous test is about direction rather than about the
+    /// pair: rank 5 first, then rank 10, is exactly what a DDL command does.
+    #[test]
+    fn taking_the_catalog_latch_under_an_engine_latch_is_allowed() {
+        let engine = EngineLatchScope::new();
+        {
+            let _catalog = CatalogLatchScope::new();
+            #[cfg(debug_assertions)]
+            assert_eq!(catalog_latch_depth(), 1);
+        }
+        drop(engine);
+        assert_eq!(engine_latch_depth(), 0);
+    }
+
+    #[test]
+    fn engine_scope_does_not_trip_the_other_tripwires() {
+        let _scope = EngineLatchScope::new();
+        #[cfg(debug_assertions)]
+        assert_eq!(engine_latch_depth(), 1);
+        assert_no_frame_latch_held("unrelated barrier");
+        assert_no_dwb_lock_held("unrelated barrier");
+        assert_no_alloc_latch_held("unrelated barrier");
+        assert_no_chain_head_latch_held("unrelated barrier");
+        assert_no_maintenance_latch_held("unrelated barrier");
     }
 
     /// The depth is **per thread**: one thread's latched region must not make another thread's

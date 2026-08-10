@@ -65,6 +65,7 @@ use graphus_cypher::{GraphAccess, NodeId, TxnCoordinator};
 use graphus_io::BlockDevice;
 use graphus_wal::LogSink;
 
+use super::latch::EngineLatch;
 use super::{OpenTxTable, TxTicket};
 
 /// One chunk of already-parsed CSV rows submitted to the engine for Mode B ingestion (`rmp` #520).
@@ -136,7 +137,9 @@ pub struct BulkImportModeBChunkOutcome {
 ///   `matches!(err, GraphusError::Transaction(_))`.
 pub(super) fn ingest_mode_b_chunk<D, S>(
     coordinator: &TxnCoordinator<D, S>,
-    open: &OpenTxTable,
+    // The LATCH, not a guard (`rmp` #1038): the table is consulted for one `Copy` field, and the
+    // ingestion that follows walks a whole chunk of rows.
+    open: &EngineLatch<OpenTxTable>,
     ticket: TxTicket,
     chunk: BulkImportModeBChunkInput,
 ) -> Result<BulkImportModeBChunkOutcome>
@@ -144,7 +147,8 @@ where
     D: BlockDevice + Send + Sync + 'static,
     S: LogSink + Send + Sync + 'static,
 {
-    let txn = open.get(&ticket.0).map(|t| t.txn).ok_or_else(|| {
+    let resolved = open.lock().get(&ticket.0).map(|t| t.txn);
+    let txn = resolved.ok_or_else(|| {
         GraphusError::Transaction(format!(
             "bulk-import Mode B chunk: unknown or inactive transaction ticket {}",
             ticket.0
@@ -263,11 +267,12 @@ mod tests {
 
     fn open_txn(
         coord: &TxnCoordinator<MemBlockDevice, MemLogSink>,
-        open: &mut OpenTxTable,
+        open: &EngineLatch<OpenTxTable>,
         next_ticket: &AtomicU64,
     ) -> TxTicket {
         let txn = coord.begin(IsolationLevel::Serializable);
         let ticket = next_ticket.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut open = open.lock();
         // `OpenTx`'s fields are module-private but visible here: this test module is a descendant of
         // `crate::engine`, where `OpenTx` is defined (ordinary Rust privacy — private items are
         // visible in the defining module and all its descendants).
@@ -285,7 +290,7 @@ mod tests {
     #[test]
     fn unknown_ticket_is_a_clean_transaction_error() {
         let coord = coordinator();
-        let open = OpenTxTable::new();
+        let open = EngineLatch::new(OpenTxTable::new());
         let err = ingest_mode_b_chunk(
             &coord,
             &open,
@@ -302,9 +307,9 @@ mod tests {
     #[test]
     fn ingests_node_chunk_through_the_graph_access_seam() {
         let coord = coordinator();
-        let mut open = OpenTxTable::new();
+        let open = EngineLatch::new(OpenTxTable::new());
         let next_ticket = AtomicU64::new(0);
-        let ticket = open_txn(&coord, &mut open, &next_ticket);
+        let ticket = open_txn(&coord, &open, &next_ticket);
 
         let out = ingest_mode_b_chunk(
             &coord,
@@ -329,9 +334,9 @@ mod tests {
     #[test]
     fn ingests_rel_chunk_resolving_against_the_confirmed_id_map() {
         let coord = coordinator();
-        let mut open = OpenTxTable::new();
+        let open = EngineLatch::new(OpenTxTable::new());
         let next_ticket = AtomicU64::new(0);
-        let ticket = open_txn(&coord, &mut open, &next_ticket);
+        let ticket = open_txn(&coord, &open, &next_ticket);
 
         let node_out = ingest_mode_b_chunk(
             &coord,
@@ -368,9 +373,9 @@ mod tests {
     #[test]
     fn unknown_endpoint_is_a_terminal_storage_error() {
         let coord = coordinator();
-        let mut open = OpenTxTable::new();
+        let open = EngineLatch::new(OpenTxTable::new());
         let next_ticket = AtomicU64::new(0);
-        let ticket = open_txn(&coord, &mut open, &next_ticket);
+        let ticket = open_txn(&coord, &open, &next_ticket);
 
         let err = ingest_mode_b_chunk(
             &coord,
@@ -389,9 +394,9 @@ mod tests {
     #[test]
     fn malformed_typed_cell_is_a_terminal_parse_error() {
         let coord = coordinator();
-        let mut open = OpenTxTable::new();
+        let open = EngineLatch::new(OpenTxTable::new());
         let next_ticket = AtomicU64::new(0);
-        let ticket = open_txn(&coord, &mut open, &next_ticket);
+        let ticket = open_txn(&coord, &open, &next_ticket);
 
         let bad_header = Arc::new(NodeHeader {
             columns: vec![
