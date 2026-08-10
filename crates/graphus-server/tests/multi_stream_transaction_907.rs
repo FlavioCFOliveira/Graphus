@@ -77,8 +77,12 @@ fn engine() -> Engine {
         // statement never uses it (only auto-commit reads are dispatched off-thread), which is
         // precisely why these in-transaction statements exercise the parked inline path.
         2,
-        // One engine worker (`rmp` #1033).
-        1,
+        // FOUR engine workers, and that is the point of running this gate (`rmp` #1035): a session's
+        // commands must reach the same worker in the order they were sent. With one shared queue
+        // this file failed with `TransactionNotFound` on the `RUN` that follows its own `BEGIN`,
+        // because two consecutive commands were dequeued by different workers. Set to 1 and the
+        // gate proves nothing about ordering — it is the multi-worker run that binds.
+        4,
         Arc::clone(&metrics),
         clock,
         // No statement timeout and no transaction-age cap: the point is to prove the engine keeps

@@ -787,6 +787,39 @@ impl ReapedTickets {
 /// `open.remove` / `open.iter` call site working unchanged; only the sites that care about *reaping*
 /// use the two inherent methods, so an ordinary `remove` (a normal commit or rollback) can never
 /// accidentally record a reap.
+/// This worker's ticket source (`rmp` #1035).
+///
+/// Every ticket satisfies `ticket % W == worker_id`, so a ticket names the worker that owns its
+/// session and the handle can route by arithmetic, with no lookup table and therefore no second
+/// source of truth that could drift from the first. Keeping the stride WITH the counter is the point: a
+/// caller cannot mint a ticket in the wrong residue class by forgetting an argument.
+#[derive(Debug)]
+struct TicketMinter {
+    /// The next ticket this worker will hand out.
+    next: AtomicU64,
+    /// The stride between them: the worker count.
+    step: u64,
+}
+
+impl TicketMinter {
+    fn new(worker_id: usize, workers: usize) -> Self {
+        Self {
+            next: AtomicU64::new(worker_id as u64),
+            step: workers.max(1) as u64,
+        }
+    }
+
+    /// The next ticket, never zero — zero is the unused value the open-table tests rely on.
+    fn mint(&self) -> u64 {
+        self.next.fetch_add(self.step, Ordering::Relaxed) + self.step
+    }
+
+    /// The last ticket handed out, for the GC reuse barrier's floor.
+    fn peek(&self) -> u64 {
+        self.next.load(Ordering::Relaxed)
+    }
+}
+
 /// **The engine loop's shared state** (`rmp` #1033, layer 7b of #975).
 ///
 /// Every field here was a local `let mut` of [`run_engine_loop`], which is exactly what made the
@@ -823,22 +856,27 @@ struct EngineShared {
     plan_cache: std::sync::Mutex<exec::EnginePlanCache>,
     /// Statements suspended mid-execution, oldest first (`rmp` #485).
     parked: std::sync::Mutex<VecDeque<exec::InFlightInline>>,
-    /// The next explicit-transaction ticket. An atomic, not a latched counter: it orders nothing and
-    /// only has to be unique, which `fetch_add` gives on its own.
-    next_ticket: AtomicU64,
+    /// The next explicit-transaction ticket for THIS worker. An atomic, not a latched counter: it
+    /// orders nothing and only has to be unique.
+    ///
+    /// Seeded with the worker's id and advanced by [`ticket_step`](Self::ticket_step), so every
+    /// ticket satisfies `ticket % W == worker_id` (`rmp` #1035). The ticket therefore names the
+    /// worker that owns its session, and the handle routes by arithmetic instead of by a lookup
+    /// table that could disagree with the truth.
+    next_ticket: TicketMinter,
     /// Off-thread reads currently in flight (`rmp` #336), for the gauge and the drain barrier.
     readers_inflight: AtomicU64,
 }
 
 impl EngineShared {
-    fn new(workers: usize) -> Self {
+    fn new(workers: usize, worker_id: usize) -> Self {
         Self {
             live_workers: AtomicUsize::new(workers),
             stopping: AtomicBool::new(false),
             open: std::sync::Mutex::new(OpenTxTable::new()),
             plan_cache: std::sync::Mutex::new(exec::EnginePlanCache::new()),
             parked: std::sync::Mutex::new(VecDeque::new()),
-            next_ticket: AtomicU64::new(0),
+            next_ticket: TicketMinter::new(worker_id, workers),
             readers_inflight: AtomicU64::new(0),
         }
     }
@@ -1033,7 +1071,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // The loop's shared state (`rmp` #1033). Declared once and reached through guards below, so the
     // body can be replicated across W workers without any of it being duplicated per worker. With
     // one worker the guards are uncontended and the behaviour is exactly what the locals gave.
-    let shared = EngineShared::new(engine_workers);
+    let shared = EngineShared::new(engine_workers, worker_id);
 
     // The engine's compiled-plan cache (`rmp` task #322): reuses a compiled `PhysicalPlan` for an
     // identical query text instead of re-running the ~7–9 µs compile pipeline on every `Run`. Owned by
@@ -1672,7 +1710,7 @@ fn maintenance_interval_bytes(store_bytes: u64) -> u64 {
 ///
 /// Returns `Some(next_ticket + 1)` when `readers_inflight > 0`, and `None` otherwise. The `+ 1` is
 /// load-bearing: [`open_tx`] issues a ticket **post-increment** (`*next_ticket += 1; ticket =
-/// next_ticket.load(Ordering::Relaxed)`), so the newest open transaction's ticket **equals** `next_ticket`; the barrier must be
+/// next_ticket.peek()`), so the newest open transaction's ticket **equals** `next_ticket`; the barrier must be
 /// strictly greater so that [`RecordStore::release_held`](graphus_storage::RecordStore::release_held) —
 /// which releases a held slot once `oldest_open_ticket >= barrier` — keeps the slot held while that
 /// newest reader is still the oldest open (a lost `+ 1` releases the slot under the newest reader's feet
@@ -2508,7 +2546,7 @@ struct ProcessCtx<'a, D: BlockDevice + Send + Sync + 'static, S: LogSink + Send 
     /// and holding the table across that is exactly what would serialise W workers. Each arm takes it
     /// for its own duration — `O(1)` for the short commands, and released before execution for `RUN`.
     open: &'a std::sync::Mutex<OpenTxTable>,
-    next_ticket: &'a AtomicU64,
+    next_ticket: &'a TicketMinter,
     plan_cache: &'a std::sync::Mutex<exec::EnginePlanCache>,
     extensions: &'a Arc<graphus_cypher::extension::ExtensionRegistry>,
     dispatch: &'a read_pool::ReadDispatch<D, S>,
@@ -2691,10 +2729,8 @@ fn process_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // freed slots are immediately reusable). Both are read here where `open`/`next_ticket`/
     // `readers_inflight` are in scope, so a GC-freed slot cannot be reused while a reader that predates
     // the free is still walking a chain through it.
-    let reuse_barrier = gc_reuse_barrier(
-        next_ticket.load(Ordering::Relaxed),
-        readers_inflight.load(Ordering::Relaxed),
-    );
+    let reuse_barrier =
+        gc_reuse_barrier(next_ticket.peek(), readers_inflight.load(Ordering::Relaxed));
     let oldest_open_ticket = open
         .lock()
         .expect("INVARIANT: the open-tx latch is not poisoned")
@@ -2729,7 +2765,7 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
     // The LATCH (`rmp` #1033): this function runs statements, so it must be free to
     // release the table before execution rather than hold it across one.
     open: &std::sync::Mutex<OpenTxTable>,
-    next_ticket: &AtomicU64,
+    next_ticket: &TicketMinter,
     plan_cache: &std::sync::Mutex<exec::EnginePlanCache>,
     extensions: &Arc<graphus_cypher::extension::ExtensionRegistry>,
     dispatch: &read_pool::ReadDispatch<D, S>,
@@ -2952,10 +2988,8 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             // `rmp` #588: an explicit `CHECKPOINT DATABASE` runs the same reader-unsafe GC reclaim as the
             // background cadence, so it must bracket the pass with the reuse barrier too — otherwise a
             // slot it frees could be reused while a concurrent off-thread reader walks a chain through it.
-            let reuse_barrier = gc_reuse_barrier(
-                next_ticket.load(Ordering::Relaxed),
-                readers_inflight.load(Ordering::Relaxed),
-            );
+            let reuse_barrier =
+                gc_reuse_barrier(next_ticket.peek(), readers_inflight.load(Ordering::Relaxed));
             let oldest_open_ticket = open
                 .lock()
                 .expect("INVARIANT: the open-tx latch is not poisoned")
@@ -3001,10 +3035,8 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             // off-thread reader could still be walking through. Bracket the batch with the reuse barrier
             // so any freed slot is shadow-held from reuse until predating readers retire (ingest itself
             // frees nothing, so the barrier only bites at the reclaiming `End`).
-            let reuse_barrier = gc_reuse_barrier(
-                next_ticket.load(Ordering::Relaxed),
-                readers_inflight.load(Ordering::Relaxed),
-            );
+            let reuse_barrier =
+                gc_reuse_barrier(next_ticket.peek(), readers_inflight.load(Ordering::Relaxed));
             let oldest_open_ticket = open
                 .lock()
                 .expect("INVARIANT: the open-tx latch is not poisoned")
@@ -3986,13 +4018,15 @@ fn handle_constraint_ddl<D: BlockDevice, S: LogSink>(
 fn open_tx<D: BlockDevice, S: LogSink>(
     coordinator: &TxnCoordinator<D, S>,
     open: &mut OpenTxTable,
-    next_ticket: &AtomicU64,
+    next_ticket: &TicketMinter,
     mode: AccessMode,
     auto_commit: bool,
     begin_nanos: u64,
 ) -> TxTicket {
     let txn = coordinator.begin_at(mode.isolation(), begin_nanos);
-    let ticket = next_ticket.fetch_add(1, Ordering::Relaxed) + 1;
+    // `+ step` rather than `+ 1`: the ticket must stay in this worker's residue class, and it must
+    // never be zero (an unused ticket value the tests rely on).
+    let ticket = next_ticket.mint();
     open.insert(
         ticket,
         OpenTx {
@@ -4148,7 +4182,7 @@ fn pipelined_group_commit<
     coordinator: &mut Option<Arc<TxnCoordinator<D, S>>>,
     // The latch: this path re-enters the dispatch (`rmp` #1033).
     open: &std::sync::Mutex<OpenTxTable>,
-    next_ticket: &AtomicU64,
+    next_ticket: &TicketMinter,
     plan_cache: &std::sync::Mutex<exec::EnginePlanCache>,
     extensions: &Arc<graphus_cypher::extension::ExtensionRegistry>,
     dispatch: &read_pool::ReadDispatch<D, S>,
@@ -4381,7 +4415,7 @@ fn drain_commit_batch<
     coordinator: &mut Option<Arc<TxnCoordinator<D, S>>>,
     // The latch, for the same reason as `dispatch_command` (`rmp` #1033).
     open: &std::sync::Mutex<OpenTxTable>,
-    next_ticket: &AtomicU64,
+    next_ticket: &TicketMinter,
     plan_cache: &std::sync::Mutex<exec::EnginePlanCache>,
     extensions: &Arc<graphus_cypher::extension::ExtensionRegistry>,
     dispatch: &read_pool::ReadDispatch<D, S>,
@@ -4773,7 +4807,20 @@ where
     S: LogSink + Send + Sync + 'static,
     B: FnOnce() -> Result<TxnCoordinator<D, S>> + Send + 'static,
 {
-    let (tx, rx) = std::sync::mpsc::sync_channel::<EngineCommand>(engine_queue_capacity);
+    // ONE QUEUE PER WORKER (`rmp` #1035), not one shared queue. A shared queue does not preserve the
+    // order of one session's commands — two consecutive ones can be dequeued by different workers —
+    // and no latch underneath fixes that, because the ordering came from having a single consumer.
+    // The handle routes a session always to the same worker, so the order is restored by
+    // construction. The capacity is split across the queues so the engine's total admission is
+    // unchanged, with a floor of one so a tiny configured capacity still yields a usable queue.
+    let per_worker_capacity = (engine_queue_capacity / engine_workers.max(1)).max(1);
+    let mut senders = Vec::with_capacity(engine_workers);
+    let mut receivers = Vec::with_capacity(engine_workers);
+    for _ in 0..engine_workers {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<EngineCommand>(per_worker_capacity);
+        senders.push(tx);
+        receivers.push(rx);
+    }
     // No startup channel (`rmp` #1033): the coordinator is built HERE, before any worker exists, so
     // a build failure is simply this function's `Err`. The channel existed only to carry a `Send`
     // `Result` back out of the thread that built it — necessary while the coordinator itself could
@@ -4796,9 +4843,6 @@ where
     // (which `stop_engine` polls) share the SAME `AtomicU64`.
     let drain_progress = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let loop_drain_progress = Arc::clone(&drain_progress);
-    // The command queue is shared by every worker: `Receiver` is `!Sync`, so it goes behind a latch
-    // that each worker takes only to dequeue (`rmp` #1033).
-    let rx = Arc::new(std::sync::Mutex::new(rx));
     // The coordinator is built ONCE, here, and shared. It used to be built inside the thread — the
     // comment said "so the coordinator itself never crosses the boundary", which was true while it
     // was `!Send`. Layer 7b made it `Send + Sync`, so the premise is gone and every worker can hold
@@ -4812,10 +4856,11 @@ where
     coordinator.set_drain_progress(loop_drain_progress);
 
     let mut joins = Vec::with_capacity(engine_workers);
-    for worker_id in 0..engine_workers {
+    for (worker_id, rx) in receivers.into_iter().enumerate() {
         let db_name = Arc::clone(&db_name);
         let coordinator = Arc::clone(&coordinator);
-        let rx = Arc::clone(&rx);
+        // Its OWN queue: no latch, because no other worker reads it (`rmp` #1035).
+        let rx = Arc::new(std::sync::Mutex::new(rx));
         let loop_metrics = Arc::clone(&loop_metrics);
         let loop_degraded = loop_degraded.clone();
         let loop_maintenance_degraded = loop_maintenance_degraded.clone();
@@ -4863,9 +4908,80 @@ where
     // Startup already succeeded: the coordinator was built above, before any worker existed, so
     // there is no thread whose startup result has to be waited for (`rmp` #1033).
     Ok(Engine {
-        handle: EngineHandle::new(tx, metrics, degraded, maintenance_degraded, drain_progress),
+        handle: EngineHandle::new(
+            senders,
+            metrics,
+            degraded,
+            maintenance_degraded,
+            drain_progress,
+        ),
         joins,
     })
+}
+
+#[cfg(test)]
+mod ticket_affinity_1035 {
+    use super::*;
+
+    /// **A worker's tickets are exactly its residue class, and never zero.**
+    ///
+    /// This is what makes the handle's routing correct: it computes `ticket % W` and expects the
+    /// owning worker back. If a minter ever handed out a ticket outside its class, the command would
+    /// be routed to a worker that has never heard of that transaction — the `TransactionNotFound`
+    /// that a shared queue produced before `rmp` #1035, arriving by a different road.
+    #[test]
+    fn every_ticket_names_its_own_worker() {
+        const WORKERS: usize = 4;
+        for worker_id in 0..WORKERS {
+            let minter = TicketMinter::new(worker_id, WORKERS);
+            for _ in 0..64 {
+                let ticket = minter.mint();
+                assert_ne!(
+                    ticket, 0,
+                    "ticket 0 is the unused value the open table relies on"
+                );
+                assert_eq!(
+                    ticket as usize % WORKERS,
+                    worker_id,
+                    "worker {worker_id} minted {ticket}, which routes to worker {}",
+                    ticket as usize % WORKERS
+                );
+            }
+        }
+    }
+
+    /// **No two workers ever mint the same ticket.**
+    ///
+    /// Distinct residue classes give this for free — which is the reason to encode the worker in the
+    /// ticket rather than keep a routing table beside it: uniqueness and routing come from one fact
+    /// instead of two that could disagree.
+    #[test]
+    fn workers_never_collide() {
+        const WORKERS: usize = 8;
+        let minters: Vec<_> = (0..WORKERS)
+            .map(|w| TicketMinter::new(w, WORKERS))
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..128 {
+            for minter in &minters {
+                assert!(
+                    seen.insert(minter.mint()),
+                    "two workers minted the same ticket"
+                );
+            }
+        }
+        assert_eq!(seen.len(), WORKERS * 128);
+    }
+
+    /// The single-worker case stays exactly what it was: stride 1, tickets 1, 2, 3, …
+    #[test]
+    fn one_worker_is_the_historical_sequence() {
+        let minter = TicketMinter::new(0, 1);
+        assert_eq!(
+            (1..=5).map(|_| minter.mint()).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -4875,7 +4991,7 @@ mod maintenance_tests {
     /// `rmp` #588 (sprint-52 B1) GATE: the GC reuse barrier must **strictly exceed** the newest open
     /// transaction's ticket, and must be `None` when no off-thread reader is in flight.
     ///
-    /// [`open_tx`] issues a ticket **post-increment** (`*next_ticket += 1; ticket = next_ticket.load(Ordering::Relaxed)`), so
+    /// [`open_tx`] issues a ticket **post-increment** (`*next_ticket += 1; ticket = next_ticket.peek()`), so
     /// the newest open transaction's ticket EQUALS `next_ticket`. [`RecordStore::release_held`] releases
     /// a slot held at barrier `b` once `oldest_open_ticket >= b`; if the barrier merely equalled the
     /// newest ticket, that reader — while it is the oldest open — would release the slot under its own
@@ -5182,7 +5298,8 @@ mod max_transaction_age_tests {
     fn reaps_over_age_explicit_txn_only() {
         let coord = fresh_coord();
         let mut open: OpenTxTable = OpenTxTable::new();
-        let next_ticket = AtomicU64::new(0);
+        // A single worker in the fixture: stride 1 (`rmp` #1035).
+        let next_ticket = TicketMinter::new(0, 1);
         let cap = std::time::Duration::from_secs(60);
         let now = 61 * 1_000_000_000u64; // 61s in nanos — past the cap
         let clock = clock_at(now);
@@ -5240,7 +5357,8 @@ mod max_transaction_age_tests {
     fn disabled_cap_reaps_nothing() {
         let coord = fresh_coord();
         let mut open: OpenTxTable = OpenTxTable::new();
-        let next_ticket = AtomicU64::new(0);
+        // A single worker in the fixture: stride 1 (`rmp` #1035).
+        let next_ticket = TicketMinter::new(0, 1);
         let clock = clock_at(u64::MAX); // arbitrarily far in the future
         let metrics = Arc::new(Metrics::new());
         let mut gauge = ActiveTxnGauge::new(Arc::clone(&metrics), Arc::from("test"));

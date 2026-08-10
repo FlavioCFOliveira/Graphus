@@ -58,8 +58,19 @@ impl std::error::Error for ServerBusy {}
 /// The shared, cloneable client of the engine task.
 #[derive(Clone)]
 pub struct EngineHandle {
-    /// Bounded command channel to the engine thread.
-    tx: std::sync::mpsc::SyncSender<EngineCommand>,
+    /// One bounded command channel PER ENGINE WORKER (`rmp` #1035).
+    ///
+    /// Not one shared queue: with W workers pulling from a single queue, two consecutive commands of
+    /// ONE SESSION can be dequeued by different workers and run out of order — measured, with W = 4,
+    /// as a `RUN` failing `TransactionNotFound` right after its own session's `BEGIN` (`rmp` #1033).
+    /// Ordering was being supplied by there being a single consumer, and nothing else was providing
+    /// it. Routing a session always to the same worker restores it by construction rather than by
+    /// latch, which is what both reference engines do: Neo4j binds a transaction to a thread,
+    /// Memgraph binds a session to one.
+    tx: Vec<std::sync::mpsc::SyncSender<EngineCommand>>,
+    /// Round-robin cursor for the commands that do not yet name a session (`BEGIN`) and for the
+    /// administrative ones that belong to none.
+    next_worker: Arc<std::sync::atomic::AtomicUsize>,
     /// Global admission control: a bounded count of concurrently-executing queries (`04 §9.3`).
     admission: Arc<Semaphore>,
     /// Observability counters.
@@ -93,7 +104,7 @@ impl EngineHandle {
     /// then a generous default is used so unit tests need no setup.
     #[must_use]
     pub(super) fn new(
-        tx: std::sync::mpsc::SyncSender<EngineCommand>,
+        tx: Vec<std::sync::mpsc::SyncSender<EngineCommand>>,
         metrics: Arc<Metrics>,
         degraded: EngineDegraded,
         maintenance_degraded: MaintenanceDegraded,
@@ -101,6 +112,7 @@ impl EngineHandle {
     ) -> Self {
         Self {
             tx,
+            next_worker: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             admission: Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
             metrics,
             degraded,
@@ -127,6 +139,7 @@ impl EngineHandle {
     pub fn with_admission_limit(&self, max_concurrent: usize) -> Self {
         Self {
             tx: self.tx.clone(),
+            next_worker: Arc::clone(&self.next_worker),
             admission: Arc::new(Semaphore::new(max_concurrent.max(1))),
             metrics: Arc::clone(&self.metrics),
             degraded: self.degraded.clone(),
@@ -529,16 +542,45 @@ impl EngineHandle {
 
     // ---- internals ------------------------------------------------------------------------------
 
+    /// The worker a command belongs to (`rmp` #1035).
+    ///
+    /// Three classes, and each routes for its own reason:
+    ///
+    /// * **Named by a ticket** (`Run`, `Commit`, `Rollback`, `BulkImportBatch`) — the ticket IS the
+    ///   session key, and it encodes its worker: a worker mints `worker_id + W*n`, so `ticket % W`
+    ///   names the owner with no routing table, no shared state, and no second source of truth that
+    ///   could drift from the first.
+    /// * **Creating a ticket** (`Begin`, `BeginAutoCommit`) — no session yet, so any worker will do;
+    ///   round-robin, and the ticket it mints carries the worker back to the client.
+    /// * **Administrative** (`Shutdown`, `Status`, the DDL and maintenance commands) — belong to no
+    ///   session. They round-robin too: the catalog is behind its own rank-10 latch since `rmp`
+    ///   #1015, so DDL concurrent with writes is already safe.
+    fn route(&self, cmd: &EngineCommand) -> &std::sync::mpsc::SyncSender<EngineCommand> {
+        let workers = self.tx.len();
+        let idx = match cmd {
+            EngineCommand::Run { ticket, .. }
+            | EngineCommand::Commit { ticket, .. }
+            | EngineCommand::Rollback { ticket, .. } => (ticket.0 as usize) % workers,
+            _ => {
+                self.next_worker
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    % workers
+            }
+        };
+        &self.tx[idx]
+    }
+
     /// Sends a command to the engine from an async context without blocking a runtime worker.
     ///
     /// A non-full bounded channel sends immediately. On the rare full-channel case the blocking
     /// `send` is offloaded to `spawn_blocking` so the worker is never parked on the channel (the same
     /// pattern `graphus_io::FsyncPool` uses for its bounded submit path — `04 §9.3`).
     async fn submit(&self, cmd: EngineCommand) -> Result<(), GraphusError> {
-        match self.tx.try_send(cmd) {
+        let tx = self.route(&cmd);
+        match tx.try_send(cmd) {
             Ok(()) => Ok(()),
             Err(std::sync::mpsc::TrySendError::Full(cmd)) => {
-                let tx = self.tx.clone();
+                let tx = tx.clone();
                 // Collapse the blocking `send`'s `SendError<EngineCommand>` to `()` *inside* the
                 // closure: the disconnected case maps to `engine_gone()` regardless, and a small Err
                 // keeps the `spawn_blocking` future off clippy's `result_large_err` (the command enum
@@ -555,7 +597,7 @@ impl EngineHandle {
     /// Blocking send for the synchronous (Bolt) seam: parks the calling blocking thread on a full
     /// bounded channel (the intended submission backpressure), never a runtime worker.
     fn submit_blocking(&self, cmd: EngineCommand) -> Result<(), GraphusError> {
-        self.tx.send(cmd).map_err(|_| engine_gone())
+        self.route(&cmd).send(cmd).map_err(|_| engine_gone())
     }
 }
 

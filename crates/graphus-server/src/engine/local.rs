@@ -90,7 +90,7 @@ pub struct LocalEngine<D: BlockDevice, S: LogSink> {
     /// Open transactions, keyed by the ticket id the engine mints (same bookkeeping the loop keeps).
     open: std::sync::Mutex<OpenTxTable>,
     /// Monotonic ticket counter (same as the loop's).
-    next_ticket: std::sync::atomic::AtomicU64,
+    next_ticket: super::TicketMinter,
     /// The compiled-in UDF/UDP + GDS registry, built once (as the engine thread does). `Arc`-wrapped to
     /// match the threaded engine's shape (`rmp` task #336); the inline driver never moves it to a
     /// thread, but the shared signature keeps one execution path.
@@ -149,7 +149,8 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         Self {
             coordinator: Some(Arc::new(coordinator)),
             open: std::sync::Mutex::new(OpenTxTable::new()),
-            next_ticket: std::sync::atomic::AtomicU64::new(0),
+            // A single inline worker: stride 1, seeded at 0 (`rmp` #1035).
+            next_ticket: super::TicketMinter::new(0, 1),
             extensions: Arc::new(super::exec::install_extensions()),
             // Inline (deterministic) read dispatch — never a pool. See the field docs.
             dispatch: ReadDispatch::Inline,
