@@ -807,6 +807,11 @@ impl ReapedTickets {
 /// * `plan_cache` is consulted once per statement to look a plan up, and once to install one.
 /// * `parked` is touched only when a statement suspends or resumes.
 struct EngineShared {
+    /// Raised by whichever worker handles `Shutdown` (`rmp` #1033). Every worker checks it before
+    /// blocking on the queue, so a stop reaches all of them and not only the one that was handed the
+    /// command. Without it the others would sit in `recv` until the last client sender dropped —
+    /// which is a different, later, and unrelated event.
+    stopping: AtomicBool,
     /// The explicit transactions this engine has open, keyed by ticket.
     open: std::sync::Mutex<OpenTxTable>,
     /// Compiled plans, keyed by query text and schema generation.
@@ -823,6 +828,7 @@ struct EngineShared {
 impl EngineShared {
     fn new() -> Self {
         Self {
+            stopping: AtomicBool::new(false),
             open: std::sync::Mutex::new(OpenTxTable::new()),
             plan_cache: std::sync::Mutex::new(exec::EnginePlanCache::new()),
             parked: std::sync::Mutex::new(VecDeque::new()),
@@ -1304,6 +1310,11 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                     .expect("INVARIANT: the parked latch is not poisoned")
                     .is_empty());
 
+        // A stop raised by another worker ends this one too, checked before it blocks.
+        if shared.stopping.load(Ordering::Acquire) {
+            break 'engine;
+        }
+
         let cmd = if timed {
             // The lock covers the DEQUEUE only — it is released the moment a command is in
             // hand, so the work that follows runs with no worker waiting on this one.
@@ -1400,6 +1411,10 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             retire_rx: &retire_rx,
             transactions: &transactions,
         }) {
+            // Tell every other worker to stop before leaving: they are blocked in `recv` and
+            // would otherwise wait for the last client sender to drop, which is a later and
+            // unrelated event (`rmp` #1033).
+            shared.stopping.store(true, Ordering::Release);
             break 'engine; // Shutdown handled (drained + hardened) inside the dispatch.
         }
     }
