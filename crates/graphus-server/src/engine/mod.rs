@@ -874,51 +874,103 @@ impl WorkerAffinity {
     }
 }
 
-/// This worker's ticket source (`rmp` #1035).
+/// **The engine's ONE ticket sequence** (`rmp` #1035, re-seated by `rmp` #1037).
 ///
 /// Every ticket satisfies `ticket % W == worker_id`, so a ticket names the worker that owns its
 /// session and the handle can route by arithmetic, with no lookup table and therefore no second
-/// source of truth that could drift from the first. Keeping the stride WITH the counter is the point: a
-/// caller cannot mint a ticket in the wrong residue class by forgetting an argument — and the same
-/// [`WorkerAffinity`] the minter strides by is the one the engine's cross-worker passes ask for
-/// ownership, so the two can never be derived from different numbers.
+/// source of truth that could drift from the first. That part is `rmp` #1035's and it is right.
+///
+/// # Why the counter is the engine's and not each worker's
+///
+/// `rmp` #1035 gave each worker its own counter striding by `W`. The residue class came out correct,
+/// and — silently — the one property every OTHER consumer of a ticket depends on did not: that ticket
+/// order is TIME order. A per-worker counter advances only when its own worker mints, so worker 1's
+/// brand-new ticket `3` is *smaller* than worker 0's hour-old ticket `2000`. Comparing two workers'
+/// tickets then answers nothing at all, and two things compare them:
+///
+/// * [`gc_reuse_barrier`], whose floor has to exceed EVERY open ticket. Taken from one worker's
+///   counter it exceeded that worker's tickets and nobody else's — worker 0 with an untouched counter
+///   produced a barrier of `1`, which a sibling's already-open ticket `5` satisfies immediately, so
+///   [`RecordStore::release_held`](graphus_storage::RecordStore::release_held) hands a live reader's
+///   slot straight back to the allocator. That is `rmp` #1037's second defect, and it is the reason
+///   this task is wider than sharing the reader counter.
+/// * `oldest_open_ticket`, the release threshold, which since `rmp` #1041 is a MINIMUM over the
+///   engine-wide open table and therefore mixes the residue classes on every read.
+///
+/// One shared sequence restores the premise rather than patching each consumer: the `n`-th ticket the
+/// ENGINE issues is `(n + 1)·W + worker`. It is still exactly the owner's residue class (`worker < W`),
+/// still never zero, and now strictly increasing in issue order across every worker, since
+/// `(n+1)·W + w < (n+2)·W + w'` for any `w, w' < W`. At `W = 1` it is the historical sequence
+/// 1, 2, 3, … — byte-identical, which is what keeps the single-worker engine and the DST golden traces
+/// untouched.
+#[derive(Debug)]
+struct TicketSequencer {
+    /// How many tickets this ENGINE has issued: the index of the next one.
+    issued: AtomicU64,
+    /// How many workers the engine runs: the stride, and the width of one issue slot.
+    workers: u64,
+}
+
+impl TicketSequencer {
+    fn new(workers: usize) -> Self {
+        Self {
+            issued: AtomicU64::new(0),
+            // Floored at one for the same reason [`WorkerAffinity::new`] floors it: a zero stride
+            // collapses every worker onto ticket `worker`, and a zero modulus is a division by zero.
+            workers: workers.max(1) as u64,
+        }
+    }
+
+    /// Issues the next ticket for `worker`, in that worker's residue class and never zero.
+    fn issue(&self, worker: u64) -> u64 {
+        (self.issued.fetch_add(1, Ordering::Relaxed) + 1) * self.workers + worker
+    }
+
+    /// The engine-wide ticket **high-water**: a value no ticket issued so far exceeds.
+    ///
+    /// With `n` tickets issued the occupied slots are `1..=n`, so the largest ticket that can exist is
+    /// `n·W + (W − 1)` — slot `n` taken by the highest-numbered worker. Reading `issued` instead of
+    /// remembering the maximum actually handed out is what makes this correct without a second atomic
+    /// and without a per-worker scan: the barrier needs an UPPER bound, and this is one.
+    ///
+    /// Saturating, and the direction is chosen rather than inherited: a saturated high-water yields a
+    /// barrier that holds slots for longer, where a wrapped one would release them early.
+    fn high_water(&self) -> u64 {
+        self.issued
+            .load(Ordering::Relaxed)
+            .saturating_mul(self.workers)
+            .saturating_add(self.workers - 1)
+    }
+}
+
+/// This worker's window onto the engine's [`TicketSequencer`] (`rmp` #1035).
+///
+/// Keeping the affinity WITH the sequence is the point: a caller cannot mint a ticket in the wrong
+/// residue class by forgetting an argument — and the same [`WorkerAffinity`] the minter issues in is
+/// the one the engine's cross-worker passes ask for ownership, so the two can never be derived from
+/// different numbers.
 #[derive(Debug)]
 struct TicketMinter {
-    /// The LAST ticket this worker handed out — [`mint`](Self::mint) is `fetch_add(W) + W`, so the
-    /// counter trails the ticket it produced by exactly one stride and [`peek`](Self::peek) reads it
-    /// directly.
-    ///
-    /// It is named `next` and was documented as "the next ticket this worker will hand out", which is
-    /// the opposite of what it holds — and the difference is load-bearing: [`gc_reuse_barrier`]'s
-    /// `+ 1` is justified by the newest open transaction's ticket EQUALLING this value, not by this
-    /// value already being one ahead of it.
-    next: AtomicU64,
-    /// Whose tickets these are: the seed, the stride, and the ownership test, in one value.
+    /// The ENGINE's sequence, shared by every worker. See [`TicketSequencer`] for why one worker's
+    /// own counter cannot answer any question that spans workers.
+    seq: Arc<TicketSequencer>,
+    /// Whose tickets these are: the residue class and the ownership test, in one value.
     affinity: WorkerAffinity,
 }
 
 impl TicketMinter {
-    fn new(affinity: WorkerAffinity) -> Self {
-        Self {
-            next: AtomicU64::new(affinity.id),
-            affinity,
-        }
+    fn new(affinity: WorkerAffinity, seq: Arc<TicketSequencer>) -> Self {
+        Self { seq, affinity }
     }
 
     /// The next ticket, never zero — zero is the unused value the open-table tests rely on.
     fn mint(&self) -> u64 {
-        self.next
-            .fetch_add(self.affinity.workers, Ordering::Relaxed)
-            + self.affinity.workers
-    }
-
-    /// The last ticket handed out, for the GC reuse barrier's floor.
-    fn peek(&self) -> u64 {
-        self.next.load(Ordering::Relaxed)
+        self.seq.issue(self.affinity.id)
     }
 
     /// Whose tickets these are. Read by the passes that walk the engine-wide session tables, so the
-    /// ownership test and the minting stride can only ever come from the same number (`rmp` #1041).
+    /// ownership test and the issuing residue class can only ever come from the same number
+    /// (`rmp` #1041).
     fn affinity(&self) -> WorkerAffinity {
         self.affinity
     }
@@ -1047,39 +1099,348 @@ impl EngineSessions {
     }
 }
 
-/// **The engine loop's state that is genuinely per worker** (`rmp` #1033, layer 7b of #975).
-///
-/// What is left after [`EngineStop`] (`rmp` #1036) and [`EngineSessions`] (`rmp` #1041) took away the
-/// state that has no per-worker meaning. This one is still constructed inside [`run_engine_loop`],
-/// which is why it must be exactly these two fields:
-///
-/// * `next_ticket` is per worker **by design** — the minter's residue class *is* `rmp` #1035's
-///   routing, and an engine minting from one counter would destroy it.
-/// * `readers_inflight` is per worker **by defect** (`rmp` #1037): it feeds the `rmp` #588 slot-reuse
-///   barrier, which can therefore free a slot a *different* worker's reader is still walking. That
-///   task is why `admission.engine_workers` above one is still refused by configuration.
-struct EngineWorkerState {
-    /// The next explicit-transaction ticket for THIS worker, together with the affinity that defines
-    /// its residue class. An atomic, not a latched counter: it orders nothing and only has to be
-    /// unique.
-    next_ticket: TicketMinter,
-    /// Off-thread reads currently in flight (`rmp` #336), for the gauge and the drain barrier.
-    readers_inflight: AtomicU64,
+// The current thread's reclaim-gate nesting depth (`rmp` #1037). Always absent in a release build:
+// the whole tripwire is `debug_assertions`-only, so production pays nothing for it.
+#[cfg(debug_assertions)]
+thread_local! {
+    static RECLAIM_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
-impl EngineWorkerState {
-    fn new(affinity: WorkerAffinity) -> Self {
+/// The debug-only half of [`ReclaimPassGuard`]: proves the reclaim gate is never re-entered.
+///
+/// `std::sync::Mutex` is not reentrant, so a second acquisition on a thread that already holds it is
+/// a silent, permanent hang for [`EngineReclaim::enter_pass`] and a wrong `None` for
+/// [`EngineReclaim::try_enter_pass`] — the second of which is worse, because it looks like "another
+/// worker is reclaiming" and simply skips the pass forever. Today the four doors into the gate cannot
+/// nest, which is a fact about four call sites in this file and not about the type. This makes it a
+/// fact about the type: the assertion fires at the acquisition that commits the error, in every debug
+/// build, including the whole workspace test suite and the DST batteries.
+///
+/// It is NOT one of `graphus_core::latch`'s ranked tripwires, and the difference is the point. Every
+/// scope in that module asserts that its lock does not span a durability barrier. This gate exists
+/// precisely to span one — it is held across the reclaim pass's own `fdatasync` — so arming a scope
+/// that promises the opposite would be a false statement, not a stronger one.
+#[cfg(debug_assertions)]
+struct ReclaimDepth;
+
+#[cfg(debug_assertions)]
+impl ReclaimDepth {
+    fn enter() -> Self {
+        RECLAIM_DEPTH.with(|d| d.set(1));
+        Self
+    }
+}
+
+/// Refuses a reclaim-gate acquisition by a thread that is already inside one.
+///
+/// Called at BOTH doors, and BEFORE either of them touches the mutex — which is the only placement
+/// that catches the dangerous half. Arming the tripwire when the guard is constructed catches the
+/// `enter_pass` hang (a hang reports nothing, but at least the thread never gets a guard to arm), and
+/// misses `try_enter_pass` entirely: that door returns `None` without constructing anything, so a
+/// self-inflicted refusal is indistinguishable from a sibling's legitimate one and the maintenance
+/// cadence is skipped for the life of the process, silently. The check has to be at the door.
+///
+/// Compiles away entirely in a release build.
+fn assert_not_already_reclaiming() {
+    #[cfg(debug_assertions)]
+    RECLAIM_DEPTH.with(|d| {
+        assert_eq!(
+            d.get(),
+            0,
+            "the engine reclaim gate is not re-entrant: this thread is already inside a reclaim \
+             section, so `enter_pass` would hang here and `try_enter_pass` would answer `None` — \
+             indistinguishable from a sibling's pass, and skipping this one forever (rmp #1037)"
+        );
+    });
+}
+
+#[cfg(debug_assertions)]
+impl Drop for ReclaimDepth {
+    fn drop(&mut self) {
+        RECLAIM_DEPTH.with(|d| d.set(0));
+    }
+}
+
+/// The right to be the engine's reclaiming worker, for as long as this guard lives (`rmp` #1037).
+///
+/// Field order is the release order and it is chosen rather than inherited: struct fields drop in
+/// declaration order, so the mutex is released first and only then does this thread stop counting as
+/// the holder. That is the same RAII discipline [`latch::EngineLatchGuard`] follows, and stating it is
+/// what makes a future reordering a decision instead of an accident.
+struct ReclaimPassGuard<'a> {
+    _guard: std::sync::MutexGuard<'a, ()>,
+    #[cfg(debug_assertions)]
+    _depth: ReclaimDepth,
+}
+
+impl<'a> ReclaimPassGuard<'a> {
+    fn new(guard: std::sync::MutexGuard<'a, ()>) -> Self {
         Self {
-            next_ticket: TicketMinter::new(affinity),
+            _guard: guard,
+            #[cfg(debug_assertions)]
+            _depth: ReclaimDepth::enter(),
+        }
+    }
+}
+
+/// **The engine's RECLAMATION state, shared by every worker of one engine** (`rmp` #1037).
+///
+/// The last piece of [`run_engine_loop`]'s state that had no per-worker meaning, after [`EngineStop`]
+/// (`rmp` #1036) and [`EngineSessions`] (`rmp` #1041). What is left genuinely per worker is one value:
+/// the [`TicketMinter`], because its residue class *is* `rmp` #1035's routing — and even that now
+/// issues from the engine's one [`TicketSequencer`], because the ticket ORDER belongs to the engine
+/// even though the residue class belongs to the worker.
+///
+/// # What was wrong while each worker had its own, stated as the failure it produced
+///
+/// * **The slot-reuse barrier read one worker's reader count.** `readers_inflight` gates the `rmp`
+///   #588 barrier. Worker A ran a maintenance pass, saw its own count at zero, armed nothing, and the
+///   slots that pass freed were immediately reusable — while worker B had off-thread reads walking
+///   incidence chains through them. The next write takes the slot and the reader in flight reads a
+///   stranger's record: a silently wrong answer, the `rmp` #811 class, with nothing in the log.
+/// * **The barrier's floor came from one worker's counter.** See [`TicketSequencer`]: with per-worker
+///   counters a barrier derived from worker A's counter does not dominate worker B's open tickets, so
+///   `release_held` fires under a live reader even when the barrier IS armed. Sharing the reader
+///   count alone would have fixed the first half and left this one standing.
+/// * **The maintenance cadence ran W times.** `maybe_run_maintenance` is called from the tail of
+///   `process_command`, which every worker runs, each against its own WAL watermark — so `W`
+///   independent cadences, each deciding on its own numbers. Worse than redundant: the reuse barrier
+///   is ONE atomic shared by all six stores (`graphus_storage::idalloc::SharedReuseBarrier`,
+///   `rmp` #1025) and `TxnCoordinator::checkpoint_reader_safe` disarms it unconditionally when its
+///   pass ends, so two overlapping passes make the first one's disarm leave the second one's frees
+///   UNSTAMPED — the exact hole `rmp` #1025 closed, re-opened from above.
+///
+/// # The release floor, and why the barrier alone is not enough above one worker
+///
+/// At `W = 1` arming, freeing and minting all happen on the same thread, so no transaction can be
+/// born between the arm and the last free and `high_water + 1` dominates every ticket that could be
+/// walking a chain. Above one worker that is false: a sibling opens transactions *while* the pass
+/// runs, and those tickets are above the barrier, so they do not hold anything back — yet their read
+/// views can predate a free.
+///
+/// [`release_floor`](Self::release_floor) closes that by reasoning at the END of the pass instead of
+/// at its start: the engine records the ticket high-water once the pass has finished freeing, and
+/// releases NOTHING until the oldest open transaction has passed that mark. Every transaction alive
+/// at any instant of the pass was issued before that mark (its ticket is published by
+/// [`TicketSequencer::issue`] before `open_tx` returns, and no read view is captured until after it
+/// returns), so the gate is exactly "everyone who could have been walking has retired". Anything
+/// issued after the mark took its read view after the last free and is not at risk.
+///
+/// The floor is raised only at `W > 1`: at one worker it stays `0`, every real ticket exceeds `0`, and
+/// the gate is transparent — which is what keeps the single-worker engine byte-identical.
+/// Marks a transaction that has begun opening and is not yet visible in the open table
+/// (`rmp` #1037). See [`EngineReclaim::opening`] and [`open_tx`].
+struct OpeningGuard<'a> {
+    reclaim: &'a EngineReclaim,
+}
+
+impl Drop for OpeningGuard<'_> {
+    fn drop(&mut self) {
+        // `fetch_sub`, and it cannot underflow: every decrement is paired with the increment that
+        // created this guard, and the guard is the only way to make one.
+        self.reclaim.opens_in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct EngineReclaim {
+    /// The engine's one ticket sequence, shared with every worker's [`TicketMinter`].
+    tickets: Arc<TicketSequencer>,
+    /// Off-thread reads currently in flight across the WHOLE engine (`rmp` #336) — the reuse
+    /// barrier's gate at `W = 1`, the adaptive morsel width's divisor, and the tick condition.
+    readers_inflight: AtomicU64,
+    /// **The single-flight gate over every reuse-barrier-armed section**: the background maintenance
+    /// cadence, `CHECKPOINT DATABASE`, and a Mode A bulk-import batch. One at a time per engine,
+    /// because the barrier they arm is one shared atomic and each disarms it on the way out.
+    ///
+    /// A plain `Mutex<()>`: it guards no data, only the right to be the engine's reclaiming worker,
+    /// and it is deliberately held across the pass's own I/O and durability barriers — which is why it
+    /// is NOT one of the ranked latches (nothing in `graphus_core::latch` may span a barrier). It is
+    /// the outermost lock a worker takes: [`enter_pass`](Self::enter_pass) asserts that no rank-5
+    /// engine session latch is held, so the order *session latch → reclaim gate* can never form and
+    /// the gate cannot take part in a cycle.
+    pass: std::sync::Mutex<()>,
+    /// The WAL `durable_len` at the last maintenance checkpoint — ONE cadence for the engine. Read and
+    /// written only under [`pass`](Self#structfield.pass), which is what makes the read-decide-write
+    /// of the cadence atomic and stops `W` workers from each firing the same pass.
+    wal_at_last_maintenance: AtomicU64,
+    /// The engine-wide ticket high-water at the END of the last reclaim pass. Nothing shadow-held is
+    /// released until the oldest open transaction has passed it. `0` (transparent) at `W = 1`.
+    release_floor: AtomicU64,
+    /// How many transactions are between "about to be minted" and "visible in the open table"
+    /// (`rmp` #1037). Non-zero means the open table is NOT a complete census, so
+    /// [`release_threshold`](Self::release_threshold) refuses to release anything — see [`open_tx`],
+    /// which explains why the window exists at all and why it is invisible at one worker.
+    opens_in_flight: AtomicUsize,
+    /// How many workers this engine runs. Decides whether the barrier is armed unconditionally and
+    /// whether the release floor is raised at all.
+    workers: u64,
+}
+
+impl EngineReclaim {
+    /// `wal_at_open` is the store's WAL `durable_len` at the moment the engine opened, so a freshly
+    /// opened engine does not immediately fire a (no-op) maintenance pass.
+    fn new(workers: usize, wal_at_open: u64) -> Self {
+        Self {
+            tickets: Arc::new(TicketSequencer::new(workers)),
             readers_inflight: AtomicU64::new(0),
+            pass: std::sync::Mutex::new(()),
+            wal_at_last_maintenance: AtomicU64::new(wal_at_open),
+            release_floor: AtomicU64::new(0),
+            opens_in_flight: AtomicUsize::new(0),
+            workers: workers.max(1) as u64,
         }
     }
 
-    /// Which tickets this worker owns — the one question the cross-worker passes must ask before they
-    /// touch a transaction they found in the now-shared open table.
-    fn affinity(&self) -> WorkerAffinity {
-        self.next_ticket.affinity()
+    /// This engine's ticket sequence, for a worker building its [`TicketMinter`].
+    fn tickets(&self) -> Arc<TicketSequencer> {
+        Arc::clone(&self.tickets)
     }
+
+    /// Marks this thread as OPENING a transaction until the returned guard drops.
+    ///
+    /// RAII rather than a bare pair of calls because the middle of the window is
+    /// `TxnCoordinator::begin_at`, which can panic (the recovery boundary above it is what makes that
+    /// survivable) — and a leaked count here does not fail loudly, it silently stops the engine ever
+    /// releasing a shadow-held slot again. Unwinding restores it.
+    fn opening(&self) -> OpeningGuard<'_> {
+        self.opens_in_flight.fetch_add(1, Ordering::AcqRel);
+        OpeningGuard { reclaim: self }
+    }
+
+    /// Becomes the engine's reclaiming worker, blocking until the current pass (if any) ends.
+    ///
+    /// Poison is recovered rather than propagated: the gate guards `()`, so there is no state a panic
+    /// could have left inconsistent, and refusing every later pass would turn one panic into a
+    /// permanent reclamation stall — a slow-motion OOM behind a green readiness probe, which is the
+    /// failure `rmp` #394 exists to make loud rather than to cause.
+    fn enter_pass(&self) -> ReclaimPassGuard<'_> {
+        graphus_core::latch::assert_no_engine_latch_held("engine reclaim pass");
+        assert_not_already_reclaiming();
+        // The depth is armed AFTER the lock is in hand, not before: a thread that is about to block
+        // here is not yet a holder, and arming first would report the re-entry against itself.
+        ReclaimPassGuard::new(
+            self.pass
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Becomes the engine's reclaiming worker, or declines because another worker already is.
+    ///
+    /// The background cadence uses this: a pass another worker is already running does the same work,
+    /// so waiting for it would only park a worker that could be serving commands.
+    fn try_enter_pass(&self) -> Option<ReclaimPassGuard<'_>> {
+        graphus_core::latch::assert_no_engine_latch_held("engine reclaim pass (try)");
+        assert_not_already_reclaiming();
+        match self.pass.try_lock() {
+            Ok(guard) => Some(ReclaimPassGuard::new(guard)),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                Some(ReclaimPassGuard::new(poisoned.into_inner()))
+            }
+            // A `None` here means ANOTHER worker is reclaiming. It cannot mean "this thread already
+            // is", because the tripwire above refuses that outright in a debug build — which is the
+            // whole reason it exists: a self-inflicted `None` is indistinguishable from a legitimate
+            // decline and would skip the maintenance cadence for the life of the process.
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+
+    /// The reuse barrier for a pass starting now — see [`gc_reuse_barrier`].
+    fn reuse_barrier(&self) -> Option<u64> {
+        gc_reuse_barrier(
+            self.tickets.high_water(),
+            self.readers_inflight.load(Ordering::Relaxed),
+            self.workers,
+        )
+    }
+
+    /// Records that a reclaim pass has just finished freeing, so nothing it shadow-held is released
+    /// until every transaction that could have been walking during it has retired.
+    ///
+    /// Monotone (`fetch_max`): two passes can only raise the bar, never lower it, so a slot held by an
+    /// older pass is covered by the newer pass's floor as well — conservative in the one direction
+    /// that is safe.
+    fn note_pass_finished(&self) {
+        if self.workers > 1 {
+            self.release_floor
+                .fetch_max(self.tickets.high_water(), Ordering::AcqRel);
+        }
+    }
+
+    /// The threshold to hand [`RecordStore::release_held`](graphus_storage::RecordStore::release_held).
+    ///
+    /// `oldest_open_ticket` when the engine is provably past the last pass's floor, and `0` otherwise.
+    /// `0` releases nothing at all — every barrier is `high_water + 1 >= 1` — so this expresses "hold
+    /// everything" without a second code path, and without the storage layer needing to know that a
+    /// multi-worker engine exists.
+    fn release_threshold(&self, oldest_open_ticket: u64) -> u64 {
+        // The census must be COMPLETE before its minimum means anything (`rmp` #1037). A transaction
+        // that has begun opening is in no table yet, so a minimum taken now can miss it — and when it
+        // is the only transaction that minimum is `u64::MAX`, which releases every shadow-held slot.
+        // Read BEFORE the floor: if this is zero now, every snapshot that exists is already in the
+        // table (the count is raised before the ticket is minted, and the ticket before the snapshot),
+        // and a transaction that starts after this read takes its snapshot after the pass that armed
+        // the hold had finished freeing. At one worker this is always zero here — opening and
+        // releasing are the same thread — so the whole check is transparent.
+        if self.opens_in_flight.load(Ordering::Acquire) != 0 {
+            return 0;
+        }
+        if oldest_open_ticket > self.release_floor.load(Ordering::Acquire) {
+            oldest_open_ticket
+        } else {
+            0
+        }
+    }
+
+    /// Whether the release must be DEFERRED until after the pass that is about to run.
+    ///
+    /// At one worker it must not be: the pass's own release runs with `oldest_open_ticket` sampled
+    /// before it started, and on one thread nothing can open a transaction in between, so that sample
+    /// describes the whole pass. Keeping that path is what makes `W = 1` byte-identical.
+    ///
+    /// Above one worker that sample is a statement about one instant, not about the pass. In
+    /// particular a pre-pass reading of "no transaction is open" (`u64::MAX`, the threshold that
+    /// releases EVERYTHING) can be true at the arm and false a microsecond later, while the pass is
+    /// still freeing — so the pass's own release would hand back the very slots it had just held, to a
+    /// sibling's transaction that opened while it ran. The release therefore moves after
+    /// [`note_pass_finished`](Self::note_pass_finished), where the floor already covers that
+    /// transaction. See [`release_after_pass`].
+    fn defers_release(&self) -> bool {
+        self.workers > 1
+    }
+
+    /// The threshold for the release the PASS ITSELF performs, from a value sampled before it ran.
+    fn in_pass_release_threshold(&self, oldest_open_ticket: u64) -> u64 {
+        if self.defers_release() {
+            0
+        } else {
+            oldest_open_ticket
+        }
+    }
+}
+
+/// Lifts the reuse hold on every slot the engine is provably past, after a reclaim pass has ended
+/// (`rmp` #1037).
+///
+/// A no-op at one worker, where the pass's own release already did this with a threshold that was
+/// correct for the whole of the pass — see [`EngineReclaim::defers_release`] for why that stops being
+/// true above one worker, and why doing it here instead is what makes the difference.
+///
+/// The caller must still be inside the reclaim section: the floor has to be raised, and this release
+/// has to happen, before another worker's pass can start stamping slots that this threshold was not
+/// computed for.
+fn release_after_pass<D: BlockDevice, S: LogSink>(
+    coord: &TxnCoordinator<D, S>,
+    open: &EngineLatch<OpenTxTable>,
+    reclaim: &EngineReclaim,
+) {
+    if !reclaim.defers_release() {
+        return;
+    }
+    // Read under the latch, release it, then act: `release_reusable_slots` walks the store's held
+    // overlay, which is store work and has no business running at rank 5.
+    let oldest_open_ticket = { open.lock().keys().copied().min().unwrap_or(u64::MAX) };
+    coord.release_reusable_slots(reclaim.release_threshold(oldest_open_ticket));
 }
 
 /// The engine's open-transaction table, plus the [`ReapedTickets`] ledger that travels with it.
@@ -1249,8 +1610,17 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // age sweep are all statements about the ENGINE, and a per-worker copy of any of them answers a
     // different question — see [`EngineSessions`] for what each of those answered wrongly.
     sessions: Arc<EngineSessions>,
-    // Which worker this is. Worker 0 additionally drives the idle maintenance tick; the others only
-    // serve commands.
+    // The reclamation state, shared by every worker of this engine (`rmp` #1037). Built once by the
+    // spawner, for the third instance of the same reason: the reuse barrier, the ticket order it takes
+    // its floor from, and the maintenance cadence are all statements about the ENGINE and its ONE
+    // store. See [`EngineReclaim`] for what each per-worker copy got wrong — the first of them
+    // silently, by handing a live reader's slot back to a writer.
+    reclaim: Arc<EngineReclaim>,
+    // Which worker this is. Worker 0's idle timeout additionally drives index builds and the
+    // degraded-index/vector/full-text repairs; every worker's timeout is bounded either way, so every
+    // worker drains its own reader retirements and resumes its own parked statements regardless. The
+    // maintenance cadence is NOT tied to worker 0 — see [`maybe_run_maintenance`], which every worker
+    // calls and exactly one at a time runs.
     worker_id: usize,
     // How many workers this engine runs. Seeds the ticket minter's stride, so every ticket this
     // worker mints satisfies `ticket % W == worker_id` (`rmp` #1035), and is the modulus the two
@@ -1299,16 +1669,19 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // leaving a phantom count behind (`rmp` #418/#463/#573).
     let active_txns = &*active_txns;
     let index_builds = &*index_builds;
-    // What is left of the loop's state once the parts that have no per-worker meaning have been taken
-    // out to [`EngineStop`] (`rmp` #1036) and [`EngineSessions`] (`rmp` #1041): a ticket minter whose
-    // residue class IS this worker's identity, and a reader counter that is still per worker only
-    // because `rmp` #1037 has not moved it yet. Constructed HERE, and that is now a design statement
-    // rather than the accident it used to be.
-    let worker = EngineWorkerState::new(WorkerAffinity::new(worker_id, engine_workers));
+    // ALL that is left of the loop's state with no engine-wide meaning, once [`EngineStop`]
+    // (`rmp` #1036), [`EngineSessions`] (`rmp` #1041) and [`EngineReclaim`] (`rmp` #1037) have taken
+    // the rest: this worker's window onto the engine's ticket sequence. The residue class it issues in
+    // IS this worker's identity (`rmp` #1035), which is the whole reason it is not shared — while the
+    // ORDER the tickets come in belongs to the engine, which is why the counter behind it is.
+    let minter = TicketMinter::new(
+        WorkerAffinity::new(worker_id, engine_workers),
+        reclaim.tickets(),
+    );
     // Which tickets this worker owns. Read once: the modulus never changes for the life of a worker,
     // and the two passes that walk the shared tables (the age sweep and the parked-statement resume)
     // both need it on every tick.
-    let affinity = worker.affinity();
+    let affinity = minter.affinity();
     // The engine's ONE plan cache, named locally because the loop reaches it from a dozen places.
     //
     // Shared rather than per worker, decided by measurement (`rmp` #1041) against the alternative of a
@@ -1384,12 +1757,14 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     let mut coordinator: Option<Arc<TxnCoordinator<D, S>>> = Some(coordinator);
     // The WAL `durable_len` captured at the last background maintenance checkpoint (`rmp` #305). The
     // cadence fires when growth past it crosses `MAINTENANCE_CHECKPOINT_INTERVAL_BYTES`, reclaiming
-    // RAM/disk/version slots without an operator trigger. Seeded from the current WAL length so a
-    // freshly-opened engine does not immediately run a (no-op) pass.
-    let mut wal_at_last_maintenance: u64 = coordinator
-        .as_ref()
-        .expect("INVARIANT: coordinator is Some at startup")
-        .wal_durable_len();
+    // RAM/disk/version slots without an operator trigger.
+    //
+    // It lives in [`EngineReclaim`] since `rmp` #1037 and is seeded ONCE, in
+    // [`spawn_engine_with_timeout`], from the store this engine just opened. It used to be a local
+    // seeded here — so every worker seeded its own copy and the engine ran W independent cadences.
+    // Read here only to baseline the metric below, which every worker may do because the baseline is a
+    // `store` of the same absolute offset, not a fold.
+    let wal_at_last_maintenance: u64 = reclaim.wal_at_last_maintenance.load(Ordering::Relaxed);
     // Seed this database's WAL-volume fold baseline (`rmp` #745) from the SAME already-computed offset,
     // BEFORE the loop accepts a single command. `graphus_wal_bytes_written_total` counts bytes *this
     // process wrote*, so the WAL history this database already had on disk (which can be gigabytes) must
@@ -1429,7 +1804,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             &retire_rx,
             &coordinator,
             &sessions.open,
-            &worker.readers_inflight,
+            &reclaim,
             &metrics,
             &db_name,
             &degraded,
@@ -1495,11 +1870,11 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                 rx: &rx,
                 coordinator: &mut coordinator,
                 open: &sessions.open,
-                next_ticket: &worker.next_ticket,
+                next_ticket: &minter,
                 plan_cache,
                 extensions: &extensions,
                 dispatch: &dispatch,
-                readers_inflight: &worker.readers_inflight,
+                reclaim: &reclaim,
                 parked: &sessions.parked,
                 max_parked_inline,
                 result_buffer_capacity,
@@ -1511,7 +1886,6 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                 clock: &clock,
                 statement_timeout,
                 loading_session: &mut loading_session,
-                wal_at_last_maintenance: &mut wal_at_last_maintenance,
                 maintenance_consecutive_failures: &mut maintenance_consecutive_failures,
                 builds_were_pending: &mut builds_were_pending,
                 pending_cmd: &mut pending_cmd,
@@ -1581,18 +1955,39 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                 .expect("INVARIANT: coordinator is Some until Shutdown breaks the loop")
                 .index_build_totals(),
         );
-        // ONLY worker 0 takes the timed tick (`rmp` #1033). The tick is what drives the
-        // maintenance cadence — index builds, degraded-index repair, the checkpoint/GC pass — and
-        // running it on W workers would run W passes over the same store, each doing the others'
-        // work again. Every other worker blocks on `recv` and serves commands only, which is the
-        // shape Neo4j and Memgraph both use: maintenance off the transaction path, in its own
-        // thread. Worker 0 still serves commands too; the tick only decides how it WAITS for one.
+        // Whether this worker's timeout does MAINTENANCE WORK, and nothing else (`rmp` #1033).
+        //
+        // Be exact about what this flag does not decide, because the comment here used to say the
+        // opposite and it is the kind of claim that gets built on. It said only worker 0 "takes the
+        // timed tick" while "every other worker blocks on `recv` and serves commands only", and that
+        // every worker's tick would "run W passes over the same store". Neither is what the code below
+        // does. BOTH branches of the receive are `recv_timeout(INDEX_BUILD_TICK)` — `rmp` #1033 made
+        // the other one bounded too, because a worker parked in a plain `recv` never observes
+        // `stopping` and hangs the shutdown. So every worker wakes every tick either way, and every
+        // worker therefore drains its own reader retirements and resumes its own parked statements at
+        // the top of the loop, whatever this flag says. Verified by execution while `rmp` #1037 was
+        // reworking this: with the flag forced false for every worker but 0, a read dispatched by
+        // worker 1 still retired promptly and its transaction still closed with no further command.
+        //
+        // What the flag actually selects is the CONTENT of the timeout arm: `drive_index_build`, the
+        // `rmp` #733 degraded-index repair, and the plan-cache invalidation that follows them. Those
+        // are engine-wide repairs over one store, and running them on W workers would run each of them
+        // W times — so they stay worker 0's. The reader/parked conditions are here because they make
+        // the timeout arm's work worth doing at all on an otherwise idle engine, not because a worker
+        // would fail to wake without them.
+        //
+        // The maintenance CADENCE is not decided here at all — see [`maybe_run_maintenance`], which
+        // every worker calls from the tail of `process_command` and exactly one at a time runs.
+        //
+        // `readers_inflight` is the engine's since `rmp` #1037, so worker 0 now ticks for any worker's
+        // in-flight read rather than only its own — which is the correct reading of a question about
+        // the engine.
         let timed = worker_id == 0
             && (building
                 || indexes_degraded
                 || vector_blocked
                 || ft_spatial_poisoned
-                || worker.readers_inflight.load(Ordering::Relaxed) > 0
+                || reclaim.readers_inflight.load(Ordering::Relaxed) > 0
                 || !sessions.parked.lock().is_empty());
 
         // A stop raised by another worker ends this one too, checked before it blocks. The
@@ -1695,11 +2090,11 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             rx: &rx,
             coordinator: &mut coordinator,
             open: &sessions.open,
-            next_ticket: &worker.next_ticket,
+            next_ticket: &minter,
             plan_cache,
             extensions: &extensions,
             dispatch: &dispatch,
-            readers_inflight: &worker.readers_inflight,
+            reclaim: &reclaim,
             parked: &sessions.parked,
             max_parked_inline,
             result_buffer_capacity,
@@ -1711,7 +2106,6 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             clock: &clock,
             statement_timeout,
             loading_session: &mut loading_session,
-            wal_at_last_maintenance: &mut wal_at_last_maintenance,
             maintenance_consecutive_failures: &mut maintenance_consecutive_failures,
             builds_were_pending: &mut builds_were_pending,
             pending_cmd: &mut pending_cmd,
@@ -1769,7 +2163,7 @@ fn process_retirements<D: BlockDevice, S: LogSink>(
     retire_rx: &std::sync::mpsc::Receiver<read_pool::ReadRetirement>,
     coordinator: &Option<Arc<TxnCoordinator<D, S>>>,
     open: &EngineLatch<OpenTxTable>,
-    readers_inflight: &AtomicU64,
+    reclaim: &EngineReclaim,
     metrics: &Metrics,
     db: &str,
     degraded: &EngineDegraded,
@@ -1783,9 +2177,11 @@ fn process_retirements<D: BlockDevice, S: LogSink>(
         // `fetch_update`, not `fetch_sub`: the original was a `saturating_sub`, and the two differ
         // exactly at zero — `fetch_sub` wraps to `u64::MAX`, which would report an engine with
         // eighteen quintillion readers in flight and make the drain barrier never finish.
-        let _ = readers_inflight.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-            Some(n.saturating_sub(1))
-        });
+        let _ = reclaim
+            .readers_inflight
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(1))
+            });
         active_txns.publish(
             coordinator
                 .as_deref()
@@ -1804,8 +2200,29 @@ fn process_retirements<D: BlockDevice, S: LogSink>(
         // Read the watermark under the latch, release, then act on it: `release_reusable_slots` walks
         // the store's shadow-held slots, which is store work of unbounded size and has no business
         // running at rank 5.
-        let oldest_open_ticket = { open.lock().keys().copied().min().unwrap_or(u64::MAX) };
-        coord.release_reusable_slots(oldest_open_ticket);
+        //
+        // Under the reclaim gate (`rmp` #1037), and declining rather than waiting. A release that runs
+        // WHILE another worker's pass is freeing would judge that pass's fresh stamps against a
+        // threshold computed for the world before it — and at `oldest == u64::MAX` (nothing open at
+        // this instant) that threshold releases everything, including what the pass has just held.
+        // Skipping is free: the pass ends with a release of its own.
+        //
+        // At one worker the gate is never contended here (this runs between commands, never inside a
+        // pass), so this is the same unconditional release it has always been.
+        //
+        // `release_threshold`, not the raw minimum: above one worker a slot may only be released once
+        // the oldest open transaction has passed the ticket high-water the last reclaim pass ENDED at,
+        // because a sibling can open a transaction — and take its read view — while that pass is still
+        // freeing. At one worker the floor is `0` and this is the identity.
+        if let Some(_pass) = reclaim.try_enter_pass() {
+            let oldest_open_ticket = { open.lock().keys().copied().min().unwrap_or(u64::MAX) };
+            coord.release_reusable_slots(reclaim.release_threshold(oldest_open_ticket));
+            // Republish here too (`rmp` #1037): a retirement is the OTHER thing that opens the hold,
+            // and without this the gauge kept reporting the pre-release figure until the next reclaim
+            // pass happened to run — so the one number an operator has for deferred reuse read high
+            // for exactly as long as nothing was reclaiming.
+            metrics.publish_held_slots_for(db, coord.held_slots_len() as u64);
+        }
     }
 }
 
@@ -1974,31 +2391,70 @@ fn maintenance_interval_bytes(store_bytes: u64) -> u64 {
 /// **`rmp` #588 (sprint-52 B1).** The reuse barrier for a GC pass that may free record slots while an
 /// off-thread reader (`rmp` #336) is walking a chain through them.
 ///
-/// Returns `Some(next_ticket + 1)` when `readers_inflight > 0`, and `None` otherwise. The `+ 1` is
-/// load-bearing: [`open_tx`] issues a ticket **post-increment** (`*next_ticket += 1; ticket =
-/// next_ticket.peek()`), so the newest open transaction's ticket **equals** `next_ticket`; the barrier must be
-/// strictly greater so that [`RecordStore::release_held`](graphus_storage::RecordStore::release_held) —
-/// which releases a held slot once `oldest_open_ticket >= barrier` — keeps the slot held while that
-/// newest reader is still the oldest open (a lost `+ 1` releases the slot under the newest reader's feet
-/// and reopens #588). Gating on `readers_inflight` keeps the hold to the only regime that needs it: when
-/// no off-thread reader is in flight (the inline/DST driver never dispatches one) the barrier is `None`,
-/// so `held_slots` stays empty and the freed-id reuse order — hence the DST golden trace — is unchanged.
+/// Returns `Some(ticket_high_water + 1)` when the barrier must be armed, and `None` otherwise. The
+/// `+ 1` is load-bearing: [`TicketSequencer::high_water`] is an upper bound that an issued ticket may
+/// EQUAL, and [`RecordStore::release_held`](graphus_storage::RecordStore::release_held) releases a
+/// held slot once `oldest_open_ticket >= barrier`, so a barrier that merely equalled the newest open
+/// ticket would let that reader — while it is the oldest open — release the slot under its own feet
+/// and reopen #588.
 ///
-/// **What `rmp` #1037 has to fix here is wider than the reader counter.** Both arguments come from
-/// per-worker state: `readers_inflight` is the known half, and `next_ticket` is the other. The minter
-/// counts in ONE worker's residue class, so `peek() + 1` does not dominate a sibling's tickets — worker
-/// 0 with `peek = 0` yields a barrier of 1, which another worker's already-open ticket 5 satisfies
-/// immediately. The barrier therefore needs an engine-wide ticket high-water, not only a shared reader
-/// count. `rmp` #1041 did not make this worse: it made `oldest_open_ticket` engine-wide, and a minimum
-/// over more transactions can only fall, so `release_held` fires later than before and never earlier.
-fn gc_reuse_barrier(next_ticket: u64, readers_inflight: u64) -> Option<u64> {
-    (readers_inflight > 0).then(|| next_ticket + 1)
+/// At `W = 1` the gate is unchanged: `readers_inflight == 0` (the inline/DST driver never dispatches
+/// an off-thread reader) gives `None`, so `held_slots` stays empty and the freed-id reuse order —
+/// hence the DST golden trace — is byte-identical to before this task.
+///
+/// # Above one worker (`rmp` #1037)
+///
+/// Both inputs used to come from per-worker state, and both were wrong for it.
+///
+/// `ticket_high_water` is now the ENGINE's (see [`TicketSequencer::high_water`]). A floor taken from
+/// one worker's counter dominated that worker's tickets and nobody else's — worker 0 with an untouched
+/// counter produced a barrier of `1`, which a sibling's already-open ticket `5` satisfies at once.
+///
+/// `readers_inflight` is now the ENGINE's too, and above one worker it no longer decides anything:
+/// **at `W > 1` the barrier is armed unconditionally.** Three code-level facts force that, and each
+/// one is sufficient on its own.
+///
+/// 1. Off-thread readers are no longer the only concurrent chain-walkers. A sibling worker runs
+///    explicit-transaction reads, writes and resumed parked batches INLINE, against the same store,
+///    at the same time as this pass. At `W = 1` those were the pass's own thread and could not race
+///    it; above one worker they are exactly the `rmp` #588 hazard with a different thread on it, and
+///    `readers_inflight` does not count them.
+/// 2. The counter is incremented AFTER `ReadDispatch::try_submit` returns, so an off-thread reader is
+///    already running while it still reads zero. At `W = 1` that window closes before the same thread
+///    reaches its maintenance tail; above one worker nothing closes it.
+/// 3. A reader may be dispatched by a sibling at any point *during* the pass, so no value sampled
+///    when the pass begins can characterise the whole of it.
+///
+/// The cost is deferred reuse, paid only at `W > 1`: freed slots (including a concurrent rollback's,
+/// which the armed barrier also stamps) stay shadow-held until `EngineReclaim::release_threshold`
+/// opens. The cost of the other direction is a silently wrong row, so this is not a trade that has two
+/// sides. `EngineReclaim::release_floor` is what stops the hold from becoming a leak.
+fn gc_reuse_barrier(ticket_high_water: u64, readers_inflight: u64, workers: u64) -> Option<u64> {
+    // `saturating_add`: at the u64 ceiling a wrap would produce `0`, which `release_held` treats as
+    // "release everything". Saturating holds instead, which is the direction that costs space rather
+    // than correctness.
+    (workers > 1 || readers_inflight > 0).then(|| ticket_high_water.saturating_add(1))
 }
 
+/// **ONE cadence per engine** (`rmp` #1037). This is called from the tail of `process_command`, which
+/// EVERY worker runs — the comment that said only worker 0 drives maintenance described the idle tick,
+/// not this. It used to read and write a `wal_at_last_maintenance` local of each worker, so a
+/// `W`-worker engine ran `W` independent cadences, each deciding on its own numbers and all of them
+/// arming the ONE shared reuse barrier (`graphus_storage::idalloc::SharedReuseBarrier`) that each
+/// disarms on the way out — so an overlapping pass's frees went unstamped.
+///
+/// Both halves are fixed by the same lock: the cadence watermark lives in [`EngineReclaim`] and is
+/// read-decided-written under its single-flight gate, so the pass runs once. `try_enter_pass` rather
+/// than `enter_pass`: a worker that finds the gate taken has nothing to add — the pass in progress is
+/// the pass it wanted — and must go back to serving commands rather than park behind an O(store)
+/// sweep.
 #[allow(clippy::too_many_arguments)] // the engine loop threads its maintenance context through here
 fn maybe_run_maintenance<D: BlockDevice, S: LogSink>(
     coordinator: &Option<Arc<TxnCoordinator<D, S>>>,
-    wal_at_last_maintenance: &mut u64,
+    reclaim: &EngineReclaim,
+    // The ENGINE's open-transaction table (`rmp` #1041), for the release threshold. Sampled INSIDE the
+    // reclaim gate rather than handed in: the value has to describe the same pass it is used for.
+    open: &EngineLatch<OpenTxTable>,
     consecutive_failures: &mut u32,
     metrics: &Metrics,
     // The database name labelling this engine's per-database series (`rmp` #463) — needed here so the
@@ -2007,15 +2463,21 @@ fn maybe_run_maintenance<D: BlockDevice, S: LogSink>(
     maintenance_degraded: &MaintenanceDegraded,
     loading_session_active: bool,
     loading_just_ended: bool,
-    // `rmp` #588: the reuse barrier for this pass's GC frees (`Some(next_ticket + 1)` when an off-thread
-    // reader is in flight, else `None`) and the oldest open transaction's ticket (the release threshold,
-    // or `u64::MAX` when none is open). See [`gc_reuse_barrier`] and `RecordStore`.
-    reuse_barrier: Option<u64>,
-    oldest_open_ticket: u64,
 ) {
     let Some(coord) = coordinator.as_deref() else {
         return;
     };
+    // Another worker is already reclaiming for this engine: its pass does this one's work.
+    let Some(_pass) = reclaim.try_enter_pass() else {
+        return;
+    };
+    // The engine's cadence watermark. Read here and written back below, both under the gate, so the
+    // read-decide-write that used to be a per-worker local is now one indivisible decision.
+    let wal_at_last_maintenance = reclaim.wal_at_last_maintenance.load(Ordering::Relaxed);
+    // `rmp` #588: the oldest open transaction's ticket (`u64::MAX` when none is open), which becomes
+    // the release threshold once `EngineReclaim` has decided whether the engine is past the last
+    // pass's floor. Read under the rank-5 latch and released at once — never held across the pass.
+    let oldest_open_ticket = { open.lock().keys().copied().min().unwrap_or(u64::MAX) };
     // `rmp` #565 — do NOT fire a maintenance GC pass on the loading→not-loading edge. When a Mode A
     // network bulk-import session ends (`End`), the session flag has just cleared, so this tick would
     // otherwise run a FULL `coord.checkpoint()` — and while the freeze sweep is O(Δ) (`rmp` #522) and the
@@ -2036,8 +2498,11 @@ fn maybe_run_maintenance<D: BlockDevice, S: LogSink>(
     // progress-aware drain (`rmp` #563) is the general safety net for any *other* long maintenance pass that
     // a `STOP` may still race; this removes the specific, reproducible bulk-import trigger.
     if loading_just_ended {
-        *wal_at_last_maintenance = coord.wal_durable_len();
-        metrics.publish_wal_bytes_for(db, *wal_at_last_maintenance);
+        let anchored = coord.wal_durable_len();
+        reclaim
+            .wal_at_last_maintenance
+            .store(anchored, Ordering::Relaxed);
+        metrics.publish_wal_bytes_for(db, anchored);
         return;
     }
     // Size the reclaim interval against the live store (`rmp` #556): a cheap, non-allocating page count.
@@ -2051,7 +2516,7 @@ fn maybe_run_maintenance<D: BlockDevice, S: LogSink>(
     // flat counter until its end-of-load checkpoint, which is exactly the kind of measurement blind spot
     // this metric exists to remove.
     metrics.publish_wal_bytes_for(db, durable);
-    if durable.saturating_sub(*wal_at_last_maintenance) < interval {
+    if durable.saturating_sub(wal_at_last_maintenance) < interval {
         return;
     }
     // `rmp` #588 (sprint-52 B1): reader-safe reclaim — shadow-hold the slots this pass frees from reuse
@@ -2068,11 +2533,24 @@ fn maybe_run_maintenance<D: BlockDevice, S: LogSink>(
     // O(N²) cost `rmp` #556/#565 had widened the loading cadence to avoid). The few dead property versions
     // the load defers are reclaimed by the ordinary full cadence after `START`, or by the FULL end-of-load
     // checkpoint (`rmp` #579) at a clean `End`. Ordinary traffic uses the full reclaim.
+    //
+    // The barrier is derived HERE, inside the gate, from the ENGINE's ticket high-water — never from
+    // the calling worker's own counter, which dominates nobody else's tickets (`rmp` #1037). The
+    // release threshold is likewise the engine's decision, not the raw minimum: see
+    // [`EngineReclaim::release_threshold`].
+    let reuse_barrier = reclaim.reuse_barrier();
+    let in_pass_release = reclaim.in_pass_release_threshold(oldest_open_ticket);
     let outcome = if loading_session_active {
-        coord.checkpoint_reader_safe_freeze_only(reuse_barrier, oldest_open_ticket)
+        coord.checkpoint_reader_safe_freeze_only(reuse_barrier, in_pass_release)
     } else {
-        coord.checkpoint_reader_safe(reuse_barrier, oldest_open_ticket)
+        coord.checkpoint_reader_safe(reuse_barrier, in_pass_release)
     };
+    // The pass has finished freeing: fix the mark that every later release has to clear, so a
+    // transaction a sibling opened WHILE the pass ran still holds this pass's slots back. Raised on
+    // both outcomes — a failed pass may still have freed slots before it failed. Then do the release
+    // the pass deferred, still inside the gate, so no other worker's pass can stamp slots in between.
+    reclaim.note_pass_finished();
+    release_after_pass(coord, open, reclaim);
     match outcome {
         Ok(report) => {
             // Success: record progress (aggregate observability counters) and clear **this engine's
@@ -2100,13 +2578,21 @@ fn maybe_run_maintenance<D: BlockDevice, S: LogSink>(
     }
     // Re-read: a successful checkpoint reclaimed the WAL prefix, so anchor the next interval at the new
     // length. On failure the length is unchanged, so the next tick re-attempts immediately.
-    *wal_at_last_maintenance = coord.wal_durable_len();
+    let anchored = coord.wal_durable_len();
+    reclaim
+        .wal_at_last_maintenance
+        .store(anchored, Ordering::Relaxed);
     // The checkpoint itself appended WAL (its checkpoint record), and it RECLAIMED sealed segments —
     // deleting files without moving the byte offset. Publishing the re-read offset here (`rmp` #745) is
     // the seam that proves the point of the whole metric: the counter keeps climbing across exactly the
     // event where an external, poll-the-directory reconstruction loses whole segments and silently
     // under-counts.
-    metrics.publish_wal_bytes_for(db, *wal_at_last_maintenance);
+    metrics.publish_wal_bytes_for(db, anchored);
+    // `rmp` #1037: how many physical slots this engine is still shadow-holding from reuse. Published
+    // here because a pass is the only thing that adds to the hold, and because above one worker the
+    // barrier is armed unconditionally — deferred reuse is then a resource the server is carrying, and
+    // a resource an operator cannot see is one nobody can size.
+    metrics.publish_held_slots_for(db, coord.held_slots_len() as u64);
 }
 
 /// The **maximum-transaction-age sweep** (`rmp` #477): aborts any open **explicit** transaction whose
@@ -2963,9 +3449,10 @@ struct ProcessCtx<'a, D: BlockDevice + Send + Sync + 'static, S: LogSink + Send 
     plan_cache: &'a EngineLatch<exec::EnginePlanCache>,
     extensions: &'a Arc<graphus_cypher::extension::ExtensionRegistry>,
     dispatch: &'a read_pool::ReadDispatch<D, S>,
-    /// THIS worker's in-flight off-thread read count — still per worker, and still a defect for it
-    /// (`rmp` #1037): the `rmp` #588 slot-reuse barrier derived from it cannot see a sibling's readers.
-    readers_inflight: &'a AtomicU64,
+    /// The ENGINE's reclamation state (`rmp` #1037): the shared in-flight reader count, the one ticket
+    /// sequence the `rmp` #588 barrier's floor comes from, the single-flight gate every
+    /// reuse-barrier-armed section takes, and the release floor nothing is freed below.
+    reclaim: &'a EngineReclaim,
     /// The ENGINE's parked-statement queue (`rmp` #1041), so the age sweep sees every suspended cursor.
     /// A statement is still only ever RESUMED by the worker that owns its session.
     parked: &'a EngineLatch<VecDeque<exec::InFlightInline>>,
@@ -2979,7 +3466,6 @@ struct ProcessCtx<'a, D: BlockDevice + Send + Sync + 'static, S: LogSink + Send 
     clock: &'a Arc<dyn graphus_core::capability::Clock + Send + Sync>,
     statement_timeout: Option<std::time::Duration>,
     loading_session: &'a mut Option<bulk_load::LoadingSession>,
-    wal_at_last_maintenance: &'a mut u64,
     maintenance_consecutive_failures: &'a mut u32,
     builds_were_pending: &'a mut bool,
     /// A command a group-commit batch drain pulled but did not batch, stashed for the loop's next tick.
@@ -3022,7 +3508,7 @@ fn process_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         plan_cache,
         extensions,
         dispatch,
-        readers_inflight,
+        reclaim,
         parked,
         max_parked_inline,
         result_buffer_capacity,
@@ -3034,7 +3520,6 @@ fn process_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         clock,
         statement_timeout,
         loading_session,
-        wal_at_last_maintenance,
         maintenance_consecutive_failures,
         builds_were_pending,
         pending_cmd,
@@ -3060,7 +3545,7 @@ fn process_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         plan_cache,
         extensions,
         dispatch,
-        readers_inflight,
+        reclaim,
         &mut just_suspended,
         result_buffer_capacity,
         metrics,
@@ -3093,7 +3578,7 @@ fn process_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             plan_cache,
             extensions,
             dispatch,
-            readers_inflight,
+            reclaim,
             &mut commit_batch,
             pending_cmd,
             parked,
@@ -3131,25 +3616,20 @@ fn process_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // its watermark and skips the O(N) GC pass so it cannot block the `Shutdown` a `STOP DATABASE` queues
     // right after `End` (the force-detach trigger).
     let loading_just_ended = was_loading && loading_session.is_none();
-    // `rmp` #588: the reuse barrier (`Some(next_ticket + 1)` iff an off-thread reader is in flight) and
-    // the release threshold (the oldest open transaction's ticket, or `u64::MAX` when none is open, so
-    // freed slots are immediately reusable). Both are read here where `open`/`next_ticket`/
-    // `readers_inflight` are in scope, so a GC-freed slot cannot be reused while a reader that predates
-    // the free is still walking a chain through it.
-    let reuse_barrier =
-        gc_reuse_barrier(next_ticket.peek(), readers_inflight.load(Ordering::Relaxed));
-    let oldest_open_ticket = open.lock().keys().copied().min().unwrap_or(u64::MAX);
+    // `rmp` #588 / `rmp` #1037: the barrier and the release threshold are BOTH derived inside
+    // `maybe_run_maintenance` now, under the engine's reclaim gate — the barrier from the ENGINE's
+    // ticket high-water rather than from a counter that dominates only the calling worker's tickets,
+    // and the threshold from a sample of the open table taken for the same pass it is used for.
     maybe_run_maintenance(
         coordinator,
-        wal_at_last_maintenance,
+        reclaim,
+        open,
         maintenance_consecutive_failures,
         metrics,
         db,
         maintenance_degraded,
         loading_session.is_some(),
         loading_just_ended,
-        reuse_barrier,
-        oldest_open_ticket,
     );
     true
 }
@@ -3170,7 +3650,7 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
     plan_cache: &EngineLatch<exec::EnginePlanCache>,
     extensions: &Arc<graphus_cypher::extension::ExtensionRegistry>,
     dispatch: &read_pool::ReadDispatch<D, S>,
-    readers_inflight: &AtomicU64,
+    reclaim: &EngineReclaim,
     inflight: &mut Option<exec::InFlightInline>,
     result_buffer_capacity: usize,
     metrics: &Arc<Metrics>,
@@ -3215,12 +3695,28 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
         .expect("INVARIANT: coordinator is Some until Shutdown breaks the loop");
     match cmd {
         Cmd::Begin { mode, reply } => {
-            let ticket = open_tx(coord, open, next_ticket, mode, false, clock.now_nanos());
+            let ticket = open_tx(
+                coord,
+                open,
+                next_ticket,
+                reclaim,
+                mode,
+                false,
+                clock.now_nanos(),
+            );
             active_txns.publish(coord.active_count(), coord.ssi_tracked_len());
             let _ = reply.send(Ok(ticket));
         }
         Cmd::BeginAutoCommit { mode, reply } => {
-            let ticket = open_tx(coord, open, next_ticket, mode, true, clock.now_nanos());
+            let ticket = open_tx(
+                coord,
+                open,
+                next_ticket,
+                reclaim,
+                mode,
+                true,
+                clock.now_nanos(),
+            );
             active_txns.publish(coord.active_count(), coord.ssi_tracked_len());
             let _ = reply.send(Ok(ticket));
         }
@@ -3253,7 +3749,7 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
                 privileges.map(|p| *p),
                 extensions,
                 dispatch,
-                readers_inflight,
+                reclaim,
                 inflight,
                 result_buffer_capacity,
                 metrics,
@@ -3350,10 +3846,28 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             // `rmp` #588: an explicit `CHECKPOINT DATABASE` runs the same reader-unsafe GC reclaim as the
             // background cadence, so it must bracket the pass with the reuse barrier too — otherwise a
             // slot it frees could be reused while a concurrent off-thread reader walks a chain through it.
-            let reuse_barrier =
-                gc_reuse_barrier(next_ticket.peek(), readers_inflight.load(Ordering::Relaxed));
-            let oldest_open_ticket = open.lock().keys().copied().min().unwrap_or(u64::MAX);
-            let out = handle_checkpoint(coord, reuse_barrier, oldest_open_ticket, metrics, db);
+            //
+            // `rmp` #1037: and it must take the engine's reclaim gate, for the same reason the cadence
+            // does. The barrier is ONE shared atomic and every armed section disarms it on the way out,
+            // so an operator checkpoint overlapping a background pass on another worker would leave that
+            // pass's remaining frees unstamped. `enter_pass`, not `try_enter_pass`: an operator asked for
+            // this pass and must get it, so it waits for the one in progress rather than declining.
+            let out = {
+                let _pass = reclaim.enter_pass();
+                let reuse_barrier = reclaim.reuse_barrier();
+                let oldest_open_ticket = open.lock().keys().copied().min().unwrap_or(u64::MAX);
+                let out = handle_checkpoint(
+                    coord,
+                    reuse_barrier,
+                    reclaim.in_pass_release_threshold(oldest_open_ticket),
+                    metrics,
+                    db,
+                );
+                reclaim.note_pass_finished();
+                release_after_pass(coord, open, reclaim);
+                metrics.publish_held_slots_for(db, coord.held_slots_len() as u64);
+                out
+            };
             // A manual (admin-triggered) checkpoint that succeeds is proof reclamation is making
             // progress again, so clear **this engine's own** maintenance-degraded flag (`rmp` #435 —
             // never another engine's). On failure the flag is left as-is (an operator's manual probe
@@ -3391,13 +3905,22 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             // off-thread reader could still be walking through. Bracket the batch with the reuse barrier
             // so any freed slot is shadow-held from reuse until predating readers retire (ingest itself
             // frees nothing, so the barrier only bites at the reclaiming `End`).
-            let reuse_barrier =
-                gc_reuse_barrier(next_ticket.peek(), readers_inflight.load(Ordering::Relaxed));
+            //
+            // `rmp` #1037: under the engine's reclaim gate, because the barrier it arms is the same one
+            // atomic the maintenance cadence and `CHECKPOINT DATABASE` arm — two overlapping armed
+            // sections and the first disarm silently unstamps the second's frees.
+            let _pass = reclaim.enter_pass();
+            let reuse_barrier = reclaim.reuse_barrier();
             let oldest_open_ticket = open.lock().keys().copied().min().unwrap_or(u64::MAX);
             coord.set_reuse_barrier(reuse_barrier);
             let out = bulk_load::handle_bulk_import_batch(coord, loading_session, batch);
             coord.set_reuse_barrier(None);
-            coord.release_reusable_slots(oldest_open_ticket);
+            reclaim.note_pass_finished();
+            if reclaim.defers_release() {
+                release_after_pass(coord, open, reclaim);
+            } else {
+                coord.release_reusable_slots(oldest_open_ticket);
+            }
             let _ = reply.send(out);
         }
         Cmd::BulkImportModeBChunk {
@@ -3525,7 +4048,7 @@ fn run_statement_isolated<
     privileges: Option<EffectivePrivileges>,
     extensions: &Arc<graphus_cypher::extension::ExtensionRegistry>,
     dispatch: &read_pool::ReadDispatch<D, S>,
-    readers_inflight: &AtomicU64,
+    reclaim: &EngineReclaim,
     inflight: &mut Option<exec::InFlightInline>,
     result_buffer_capacity: usize,
     metrics: &Arc<Metrics>,
@@ -3576,7 +4099,7 @@ fn run_statement_isolated<
             // `rmp` task #575-g.1: the count of reads already in flight, so the dispatch site can size
             // this read's adaptive morsel width (a snapshot BEFORE this read is counted — it becomes the
             // `+ 1` in `reader_pool_morsel_width`). Read on the engine thread; never mutated here.
-            readers_inflight.load(Ordering::Relaxed),
+            reclaim.readers_inflight.load(Ordering::Relaxed),
             result_buffer_capacity,
             metrics,
             db,
@@ -3594,7 +4117,7 @@ fn run_statement_isolated<
             // A read dispatched off-thread retires later (it is not yet finalised); track it so the
             // engine loop polls the retirement channel until it returns.
             exec::RunOutcome::OffThreadReader => {
-                readers_inflight.fetch_add(1, Ordering::Relaxed);
+                reclaim.readers_inflight.fetch_add(1, Ordering::Relaxed);
             }
             // The egress channel filled with a slow consumer draining (`rmp` task #372): hand the
             // suspended statement back through this dispatch's `inflight` slot. `inflight` is a
@@ -4377,18 +4900,41 @@ fn open_tx<D: BlockDevice, S: LogSink>(
     coordinator: &TxnCoordinator<D, S>,
     open: &EngineLatch<OpenTxTable>,
     next_ticket: &TicketMinter,
+    // `rmp` #1037: the engine's reclamation state, for the OPENING guard below. A transaction is
+    // "opening" from before its ticket exists until it is visible in `open`, and the reuse-barrier
+    // release refuses to run while any transaction is in that state.
+    reclaim: &EngineReclaim,
     mode: AccessMode,
     auto_commit: bool,
     begin_nanos: u64,
 ) -> TxTicket {
-    // Both of these happen BEFORE the latch. `begin_at` mints a transaction id, registers it with the
-    // SSI tracker and inserts it into the active set — it descends through ranks 20 and below, and
-    // there is no reason for the engine's table to be held while it does. Minting the ticket is an
-    // atomic fetch-add on this worker's own counter.
-    let txn = coordinator.begin_at(mode.isolation(), begin_nanos);
+    // **The order of these three steps is the release rule's proof, and it was wrong** (`rmp` #1037).
+    //
+    // The `rmp` #588 reuse barrier releases a shadow-held slot once the OLDEST OPEN TICKET has passed
+    // the mark, which is only sound if the open table is a complete census of everything that can walk
+    // a chain. Two gaps had to close for that to be true, and `_opening` plus this ordering are what
+    // close them.
+    //
+    // 1. `begin_at` registers the transaction in the active set WITH ITS SNAPSHOT. Minting after it —
+    //    which is what this used to do — left a window in which a live MVCC snapshot existed and no
+    //    ticket did, so `TicketSequencer::high_water` did not dominate it and the pass-end floor did
+    //    not cover it. Minting FIRST makes "every snapshot that exists has a ticket at or below the
+    //    high-water" a fact about this function rather than a claim about it.
+    // 2. Between the mint and the insert the transaction is in NO table, so a concurrent
+    //    `release_after_pass` on a sibling worker takes a minimum that does not see it — and if it is
+    //    the only transaction, that minimum is `u64::MAX`, the threshold that releases EVERYTHING. The
+    //    `_opening` guard is what makes that window visible: `EngineReclaim::release_threshold` holds
+    //    everything while it is non-zero, so a census is only ever taken when it is complete.
+    //
+    // Neither gap could be reached at one worker, where opening and releasing are the same thread.
+    let _opening = reclaim.opening();
     // `+ step` rather than `+ 1`: the ticket must stay in this worker's residue class, and it must
     // never be zero (an unused ticket value the tests rely on).
     let ticket = next_ticket.mint();
+    // `begin_at` mints a transaction id, registers it with the SSI tracker and inserts it into the
+    // active set — it descends through ranks 20 and below, and there is no reason for the engine's
+    // table to be held while it does.
+    let txn = coordinator.begin_at(mode.isolation(), begin_nanos);
     open.lock().insert(
         ticket,
         OpenTx {
@@ -4562,7 +5108,7 @@ fn pipelined_group_commit<
     plan_cache: &EngineLatch<exec::EnginePlanCache>,
     extensions: &Arc<graphus_cypher::extension::ExtensionRegistry>,
     dispatch: &read_pool::ReadDispatch<D, S>,
-    readers_inflight: &AtomicU64,
+    reclaim: &EngineReclaim,
     commit_batch: &mut Vec<PendingCommit>,
     pending_cmd: &mut Option<EngineCommand>,
     parked: &EngineLatch<VecDeque<exec::InFlightInline>>,
@@ -4592,7 +5138,7 @@ fn pipelined_group_commit<
             plan_cache,
             extensions,
             dispatch,
-            readers_inflight,
+            reclaim,
             &mut batch,
             pending_cmd,
             parked,
@@ -4633,7 +5179,7 @@ fn pipelined_group_commit<
                 plan_cache,
                 extensions,
                 dispatch,
-                readers_inflight,
+                reclaim,
                 &mut next_batch,
                 pending_cmd,
                 parked,
@@ -4674,7 +5220,7 @@ fn pipelined_group_commit<
             retire_rx,
             coordinator,
             open,
-            readers_inflight,
+            reclaim,
             metrics,
             db,
             degraded,
@@ -4794,7 +5340,7 @@ fn drain_commit_batch<
     plan_cache: &EngineLatch<exec::EnginePlanCache>,
     extensions: &Arc<graphus_cypher::extension::ExtensionRegistry>,
     dispatch: &read_pool::ReadDispatch<D, S>,
-    readers_inflight: &AtomicU64,
+    reclaim: &EngineReclaim,
     commit_batch: &mut Vec<PendingCommit>,
     pending_cmd: &mut Option<EngineCommand>,
     parked: &EngineLatch<VecDeque<exec::InFlightInline>>,
@@ -4846,7 +5392,7 @@ fn drain_commit_batch<
                     plan_cache,
                     extensions,
                     dispatch,
-                    readers_inflight,
+                    reclaim,
                     &mut just_suspended,
                     result_buffer_capacity,
                     metrics,
@@ -4903,7 +5449,7 @@ fn drain_commit_batch<
                     plan_cache,
                     extensions,
                     dispatch,
-                    readers_inflight,
+                    reclaim,
                     &mut ignored,
                     result_buffer_capacity,
                     metrics,
@@ -5175,8 +5721,14 @@ pub fn spawn_engine_with_timeout<D, S, B>(
     engine_queue_capacity: usize,
     result_buffer_capacity: usize,
     reader_threads: usize,
-    // How many engine WORKERS serve the command queues (`rmp` #1033). Worker 0 additionally drives
-    // the maintenance cadence, so a checkpoint or GC pass still happens once, not W times.
+    // How many engine WORKERS serve the command queues (`rmp` #1033).
+    //
+    // The maintenance cadence is NOT worker 0's. This said it was, and the code never made it so:
+    // `maybe_run_maintenance` is called from the tail of `process_command`, which every worker runs.
+    // What worker 0 owns is the IDLE TICK that drives index builds and the degraded-index / vector /
+    // full-text repairs. Since `rmp` #1037 the cadence is single-flight over the engine's reclaim
+    // gate, so a checkpoint or GC pass does happen once and not W times — by exclusion, which is
+    // enforceable, rather than by a worker id, which was not.
     //
     // Session affinity now exists (`rmp` #1035): there is one queue PER WORKER and a session always
     // reaches the same one, because a shared queue does not preserve the order of one session's
@@ -5187,8 +5739,9 @@ pub fn spawn_engine_with_timeout<D, S, B>(
     // (Neo4j) to a thread: the affinity IS the ordering.
     //
     // `admission.engine_workers` above one is nevertheless still refused by configuration — see
-    // `Config::validate` — because `readers_inflight` remains per worker (`rmp` #1037). This
-    // parameter is exercised above one by tests, which is what keeps the path honest.
+    // `Config::validate`, which lists what remains — because the multi-worker engine is not yet
+    // certified (`rmp` #1034). This parameter is exercised above one by tests, which is what keeps
+    // the path honest.
     engine_workers: usize,
     metrics: Arc<Metrics>,
     clock: Arc<dyn graphus_core::capability::Clock + Send + Sync>,
@@ -5259,6 +5812,15 @@ where
     // `Shutdown` drain came to reach one worker's transactions and a `DROP INDEX` on one worker left
     // every other worker serving the plan it invalidated.
     let sessions = Arc::new(EngineSessions::new());
+    // The reclamation state, built HERE and shared for the third time and the third reason
+    // (`rmp` #1037): the `rmp` #588 reuse barrier, the ticket ORDER its floor is taken from, and the
+    // maintenance cadence all describe the engine's ONE store. Seeded with the WAL length the store
+    // opened at, so a freshly opened engine does not immediately fire a no-op pass — the seed used to
+    // be taken independently by each worker, which is how the engine came to run W cadences.
+    let reclaim = Arc::new(EngineReclaim::new(
+        engine_workers,
+        coordinator.wal_durable_len(),
+    ));
     // The gauge folds, likewise once per engine (`rmp` #1041). They publish engine-wide counts, so W
     // folds of the same value inflate the server-wide series W-fold until it settles.
     let active_txns = Arc::new(ActiveTxnGauge::new(
@@ -5273,6 +5835,7 @@ where
         let coordinator = Arc::clone(&coordinator);
         let stop = Arc::clone(&stop);
         let sessions = Arc::clone(&sessions);
+        let reclaim = Arc::clone(&reclaim);
         let active_txns = Arc::clone(&active_txns);
         let index_builds = Arc::clone(&index_builds);
         // Its OWN queue: no latch, because no other worker reads it (`rmp` #1035).
@@ -5301,6 +5864,7 @@ where
                     rx,
                     stop,
                     sessions,
+                    reclaim,
                     worker_id,
                     engine_workers,
                     result_buffer_capacity,
@@ -5364,8 +5928,10 @@ mod ticket_affinity_1035 {
     #[test]
     fn every_ticket_names_its_own_worker() {
         const WORKERS: usize = 4;
+        let seq = Arc::new(TicketSequencer::new(WORKERS));
         for worker_id in 0..WORKERS {
-            let minter = TicketMinter::new(WorkerAffinity::new(worker_id, WORKERS));
+            let minter =
+                TicketMinter::new(WorkerAffinity::new(worker_id, WORKERS), Arc::clone(&seq));
             for _ in 0..64 {
                 let ticket = minter.mint();
                 assert_ne!(
@@ -5390,8 +5956,9 @@ mod ticket_affinity_1035 {
     #[test]
     fn workers_never_collide() {
         const WORKERS: usize = 8;
+        let seq = Arc::new(TicketSequencer::new(WORKERS));
         let minters: Vec<_> = (0..WORKERS)
-            .map(|w| TicketMinter::new(WorkerAffinity::new(w, WORKERS)))
+            .map(|w| TicketMinter::new(WorkerAffinity::new(w, WORKERS), Arc::clone(&seq)))
             .collect();
         let mut seen = std::collections::HashSet::new();
         for _ in 0..128 {
@@ -5408,11 +5975,83 @@ mod ticket_affinity_1035 {
     /// The single-worker case stays exactly what it was: stride 1, tickets 1, 2, 3, …
     #[test]
     fn one_worker_is_the_historical_sequence() {
-        let minter = TicketMinter::new(WorkerAffinity::new(0, 1));
+        let minter =
+            TicketMinter::new(WorkerAffinity::new(0, 1), Arc::new(TicketSequencer::new(1)));
         assert_eq!(
             (1..=5).map(|_| minter.mint()).collect::<Vec<_>>(),
             vec![1, 2, 3, 4, 5]
         );
+    }
+
+    /// **`rmp` #1037 GATE — a ticket's order is the ENGINE's, not its worker's.**
+    ///
+    /// `rmp` #1035's per-worker counters made ticket order meaningless across workers: a counter
+    /// advances only when its own worker mints, so a busy worker's old ticket is numerically far above
+    /// an idle worker's new one. Every consumer that compares two workers' tickets is then wrong, and
+    /// two do — the `rmp` #588 reuse barrier and `oldest_open_ticket`.
+    ///
+    /// **Non-vacuity, measured.** Minting is deliberately interleaved unevenly (worker 0 mints a
+    /// hundred times before worker 1 mints once), which is exactly the shape the old code got wrong.
+    /// With `TicketSequencer::issue` reverted to `rmp` #1035's per-worker counters this fails:
+    /// `ticket 261 from worker 1 does not follow 676`.
+    #[test]
+    fn issue_order_is_ticket_order_across_workers() {
+        const WORKERS: usize = 4;
+        let seq = Arc::new(TicketSequencer::new(WORKERS));
+        let minters: Vec<_> = (0..WORKERS)
+            .map(|w| TicketMinter::new(WorkerAffinity::new(w, WORKERS), Arc::clone(&seq)))
+            .collect();
+        let mut previous = 0u64;
+        // A deliberately lopsided schedule: worker 0 races ahead, then a laggard mints.
+        let schedule = (0..100)
+            .map(|_| 0usize)
+            .chain([1, 0, 0, 3, 2, 1, 1, 0, 3, 3, 2]);
+        for worker in schedule {
+            let ticket = minters[worker].mint();
+            assert!(
+                ticket > previous,
+                "ticket {ticket} from worker {worker} does not follow {previous}: issue order must \
+                 BE ticket order, else the reuse barrier's floor dominates only its own worker"
+            );
+            assert_eq!(ticket as usize % WORKERS, worker, "residue class lost");
+            previous = ticket;
+        }
+    }
+
+    /// **`rmp` #1037 GATE — the engine's high-water dominates every issued ticket.**
+    ///
+    /// This is the property the `rmp` #588 barrier is built on: `high_water + 1` must strictly exceed
+    /// every ticket that can be open, whichever worker issued it. Checked after each mint, so a worker
+    /// that has just taken the top slot of the current issue index is covered too.
+    ///
+    /// **Non-vacuity, measured.** With `TicketSequencer::issue` reverted to `rmp` #1035's per-worker
+    /// counters, this gate fails — `issued ticket 676 exceeds the engine high-water …` — as does
+    /// [`issue_order_is_ticket_order_across_workers`] (`ticket 261 from worker 1 does not follow 676`).
+    #[test]
+    fn the_high_water_dominates_every_workers_ticket() {
+        const WORKERS: usize = 3;
+        let seq = Arc::new(TicketSequencer::new(WORKERS));
+        let minters: Vec<_> = (0..WORKERS)
+            .map(|w| TicketMinter::new(WorkerAffinity::new(w, WORKERS), Arc::clone(&seq)))
+            .collect();
+        // Nothing issued yet: any barrier is above every (absent) ticket.
+        let mut issued: Vec<u64> = Vec::new();
+        for round in 0..20 {
+            // An uneven schedule again: not every worker mints in every round.
+            for (w, minter) in minters.iter().enumerate() {
+                if (round + w) % 3 == 0 {
+                    issued.push(minter.mint());
+                }
+            }
+            let high_water = seq.high_water();
+            for &ticket in &issued {
+                assert!(
+                    ticket <= high_water,
+                    "issued ticket {ticket} exceeds the engine high-water {high_water}: the barrier \
+                     derived from it would not hold that transaction's slots"
+                );
+            }
+        }
     }
 }
 
@@ -5421,32 +6060,148 @@ mod maintenance_tests {
     use super::*;
 
     /// `rmp` #588 (sprint-52 B1) GATE: the GC reuse barrier must **strictly exceed** the newest open
-    /// transaction's ticket, and must be `None` when no off-thread reader is in flight.
+    /// transaction's ticket, and — at one worker — must be `None` when no off-thread reader is in
+    /// flight.
     ///
-    /// [`open_tx`] issues a ticket **post-increment** (`*next_ticket += 1; ticket = next_ticket.peek()`), so
-    /// the newest open transaction's ticket EQUALS `next_ticket`. [`RecordStore::release_held`] releases
-    /// a slot held at barrier `b` once `oldest_open_ticket >= b`; if the barrier merely equalled the
-    /// newest ticket, that reader — while it is the oldest open — would release the slot under its own
-    /// feet and reopen #588. The `+ 1` (this test's invariant) makes `barrier > oldest_open_ticket` hold
-    /// while the newest reader is still open. Gating on `readers_inflight` keeps `held_slots` empty on
-    /// the inline/DST path (no off-thread reader), preserving the deterministic golden trace.
+    /// [`TicketSequencer::high_water`] is an upper bound an issued ticket may EQUAL, and
+    /// [`RecordStore::release_held`] releases a slot held at barrier `b` once `oldest_open_ticket >= b`;
+    /// if the barrier merely equalled the newest ticket, that reader — while it is the oldest open —
+    /// would release the slot under its own feet and reopen #588. The `+ 1` (this test's invariant)
+    /// makes `barrier > oldest_open_ticket` hold while the newest reader is still open. Gating on
+    /// `readers_inflight` keeps `held_slots` empty on the inline/DST path (no off-thread reader),
+    /// preserving the deterministic golden trace.
     #[test]
     fn gc_reuse_barrier_strictly_exceeds_the_newest_open_ticket() {
-        // A reader opened when `next_ticket` becomes `N` has ticket `N` (post-increment), and is the
-        // newest — hence the oldest open when it is the only one. The barrier must be `> N`.
-        for next_ticket in [1u64, 2, 7, 1000, u64::MAX - 1] {
-            let barrier = gc_reuse_barrier(next_ticket, 1).expect("a reader is in flight");
+        // A reader holding the top ticket of the current issue index has ticket == high_water, and is
+        // the newest — hence the oldest open when it is the only one. The barrier must be `> N`.
+        for high_water in [1u64, 2, 7, 1000, u64::MAX - 1] {
+            let barrier = gc_reuse_barrier(high_water, 1, 1).expect("a reader is in flight");
             assert!(
-                barrier > next_ticket,
+                barrier > high_water,
                 "#588 off-by-one: barrier {barrier} must strictly exceed the newest open ticket \
-                 {next_ticket}, else release_held frees the slot under the newest reader"
+                 {high_water}, else release_held frees the slot under the newest reader"
             );
         }
-        // No off-thread reader in flight => no hold (the inline/DST path stays byte-identical).
-        assert_eq!(gc_reuse_barrier(42, 0), None);
-        assert_eq!(gc_reuse_barrier(0, 0), None);
+        // No off-thread reader in flight AT ONE WORKER => no hold (the inline/DST path stays
+        // byte-identical, and `held_slots` stays empty).
+        assert_eq!(gc_reuse_barrier(42, 0, 1), None);
+        assert_eq!(gc_reuse_barrier(0, 0, 1), None);
         // Any positive reader count arms the barrier.
-        assert_eq!(gc_reuse_barrier(5, 3), Some(6));
+        assert_eq!(gc_reuse_barrier(5, 3, 1), Some(6));
+    }
+
+    /// **`rmp` #1037 GATE — above one worker the barrier is armed whether or not a reader is counted.**
+    ///
+    /// `readers_inflight` counts off-thread reads only. Above one worker a sibling runs
+    /// explicit-transaction reads, writes and resumed parked batches INLINE against the same store, and
+    /// the counter is incremented only after `try_submit` returns, so zero readers counted does not
+    /// mean nobody is walking a chain. See [`gc_reuse_barrier`] for the three facts.
+    #[test]
+    fn above_one_worker_the_barrier_does_not_trust_the_reader_count() {
+        for workers in [2u64, 4, 16] {
+            assert_eq!(
+                gc_reuse_barrier(42, 0, workers),
+                Some(43),
+                "at W = {workers} a pass with no COUNTED reader must still hold what it frees: a \
+                 sibling worker executes statements inline against the same store"
+            );
+        }
+        // And the single-worker gate is untouched by the same call.
+        assert_eq!(gc_reuse_barrier(42, 0, 1), None);
+    }
+
+    /// **`rmp` #1037 GATE — the release floor, and why `0` is how it says "hold everything".**
+    ///
+    /// Non-vacuity is carried by the end-to-end gate in `tests/engine_reclaim_barrier_1037.rs`: with
+    /// `release_threshold` forced to `0`, 3404 slots stayed shadow-held for a reader that had long
+    /// since retired and the hold never opened.
+    ///
+    /// Above one worker a transaction opened WHILE a pass runs takes a ticket above that pass's
+    /// barrier, so it holds nothing back — yet its read view can predate a free. The engine therefore
+    /// records the ticket high-water at the END of the pass and releases nothing until the oldest open
+    /// transaction has passed it. `0` is the threshold that releases nothing at all, because every
+    /// barrier is `high_water + 1 >= 1`; expressing "hold everything" that way is what keeps the
+    /// storage layer ignorant of how many workers the engine runs.
+    #[test]
+    fn the_release_floor_holds_everything_until_the_pass_is_cleared() {
+        let reclaim = EngineReclaim::new(4, 0);
+        // Nothing reclaimed yet: the floor is transparent.
+        assert_eq!(reclaim.release_threshold(7), 7);
+        // Issue some tickets, then finish a pass: the floor is now the high-water.
+        let minter = TicketMinter::new(WorkerAffinity::new(1, 4), reclaim.tickets());
+        let ticket = minter.mint();
+        reclaim.note_pass_finished();
+        let floor = reclaim.release_floor.load(Ordering::Acquire);
+        assert!(
+            floor >= ticket,
+            "the floor {floor} must cover the ticket {ticket} that was open across the pass"
+        );
+        // A transaction that was alive across the pass cannot open the gate ...
+        assert_eq!(reclaim.release_threshold(ticket), 0);
+        assert_eq!(reclaim.release_threshold(floor), 0);
+        // ... and quiescence (no open transaction) always can, so the hold is never a leak.
+        assert_eq!(reclaim.release_threshold(u64::MAX), u64::MAX);
+        assert_eq!(reclaim.release_threshold(floor + 1), floor + 1);
+
+        // At ONE worker the floor is never raised, so this whole mechanism is the identity — which is
+        // what keeps the single-worker engine byte-identical to its pre-#1037 behaviour.
+        let single = EngineReclaim::new(1, 0);
+        let minter = TicketMinter::new(WorkerAffinity::new(0, 1), single.tickets());
+        let ticket = minter.mint();
+        single.note_pass_finished();
+        assert_eq!(single.release_threshold(ticket), ticket);
+        assert_eq!(single.release_floor.load(Ordering::Acquire), 0);
+    }
+
+    /// **`rmp` #1037 GATE — the reclaim gate refuses re-entry from the thread that holds it.**
+    ///
+    /// Without this, a future call site that reaches a reclaim section from inside one gets a silent
+    /// hang from `enter_pass` or — worse — a `None` from `try_enter_pass` that reads as "another
+    /// worker is already reclaiming" and skips the maintenance cadence forever.
+    ///
+    /// **Non-vacuity.** This is a positive control for the tripwire: it fails (no panic) if
+    /// `ReclaimDepth::enter` is removed or if either door stops arming it.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "the engine reclaim gate is not re-entrant")]
+    fn the_reclaim_gate_refuses_re_entry() {
+        let reclaim = EngineReclaim::new(4, 0);
+        let _held = reclaim.try_enter_pass().expect("the gate starts open");
+        // A second door, on a thread that is already inside: `try_enter_pass` would otherwise answer
+        // `None` and be indistinguishable from a sibling's pass.
+        let _second = reclaim.try_enter_pass();
+    }
+
+    /// **`rmp` #1037 GATE — the reclaim gate admits exactly one worker at a time.**
+    ///
+    /// Two overlapping reuse-barrier-armed sections is not a redundancy, it is a correctness hole: the
+    /// barrier is ONE shared atomic (`graphus_storage::idalloc::SharedReuseBarrier`, `rmp` #1025) and
+    /// each section disarms it on the way out, so the first disarm leaves the second's remaining frees
+    /// unstamped and immediately reusable.
+    ///
+    /// **Non-vacuity, measured.** With `try_enter_pass` handing out a fresh lock per caller instead of
+    /// the engine's one gate, this fails on its own message: `a second worker must not enter a reclaim
+    /// section while one is in progress`.
+    #[test]
+    fn only_one_worker_reclaims_at_a_time() {
+        let reclaim = Arc::new(EngineReclaim::new(4, 0));
+        let held = reclaim.try_enter_pass().expect("the gate starts open");
+        // A real second THREAD, because a second worker IS one — and because the re-entrancy tripwire
+        // correctly refuses a same-thread second acquisition, which would be a different fault.
+        let sibling = Arc::clone(&reclaim);
+        let refused = std::thread::spawn(move || sibling.try_enter_pass().is_none())
+            .join()
+            .expect("the sibling thread does not panic");
+        assert!(
+            refused,
+            "a second worker must not enter a reclaim section while one is in progress"
+        );
+        drop(held);
+        let sibling = Arc::clone(&reclaim);
+        let admitted = std::thread::spawn(move || sibling.try_enter_pass().is_some())
+            .join()
+            .expect("the sibling thread does not panic");
+        assert!(admitted, "the gate must reopen once the pass ends");
     }
 
     /// rmp #556 GATE: traffic uses an **adaptive** cadence proportional to the live store size, clamped
@@ -5526,7 +6281,11 @@ mod maintenance_tests {
         let store: RecordStore<graphus_io::MemBlockDevice, graphus_wal::MemLogSink> =
             RecordStore::create(device, wal, 256, 1).expect("store");
         let coordinator = Some(Arc::new(TxnCoordinator::new(store)));
-        let mut wal_at_last_maintenance = 0u64;
+        // One worker, watermark pinned at 0 — the shape the pre-`rmp` #1037 local had.
+        let reclaim = EngineReclaim::new(1, 0);
+        // No transaction open, so the release threshold the pass computes is `u64::MAX` (release
+        // everything) — the `rmp` #588 no-hold fast path this unit test exercises.
+        let open: EngineLatch<OpenTxTable> = EngineLatch::new(OpenTxTable::new());
         let mut consecutive_failures = 0u32;
         let metrics = Metrics::new();
         let maintenance_degraded = MaintenanceDegraded::new();
@@ -5535,22 +6294,21 @@ mod maintenance_tests {
         for loading in [false, true] {
             maybe_run_maintenance(
                 &coordinator,
-                &mut wal_at_last_maintenance,
+                &reclaim,
+                &open,
                 &mut consecutive_failures,
                 &metrics,
                 "test",
                 &maintenance_degraded,
                 loading,
                 false,
-                None,     // `rmp` #588: no off-thread reader in this unit test => no hold ...
-                u64::MAX, // ... and oldest-open = MAX releases immediately.
             );
         }
 
         // A near-empty store's WAL is far below even the narrow interval, so neither call should have
-        // run a checkpoint (no growth requiring reclamation) — `wal_at_last_maintenance` stays at its
+        // run a checkpoint (no growth requiring reclamation) — the engine's watermark stays at its
         // initial value and the WAL length itself is unchanged.
-        assert_eq!(wal_at_last_maintenance, 0);
+        assert_eq!(reclaim.wal_at_last_maintenance.load(Ordering::Relaxed), 0);
         assert_eq!(coordinator.as_ref().unwrap().wal_durable_len(), before);
     }
 
@@ -5571,7 +6329,8 @@ mod maintenance_tests {
         let coordinator = Some(Arc::new(TxnCoordinator::new(store)));
         // Pretend the WAL has grown a full interval past the last maintenance (a freshly loaded store),
         // so the ordinary path WOULD fire a checkpoint. The edge guard must override that.
-        let mut wal_at_last_maintenance = 0u64;
+        let reclaim = EngineReclaim::new(1, 0);
+        let open: EngineLatch<OpenTxTable> = EngineLatch::new(OpenTxTable::new());
         let mut consecutive_failures = 0u32;
         let metrics = Metrics::new();
         let maintenance_degraded = MaintenanceDegraded::new();
@@ -5579,20 +6338,20 @@ mod maintenance_tests {
 
         maybe_run_maintenance(
             &coordinator,
-            &mut wal_at_last_maintenance,
+            &reclaim,
+            &open,
             &mut consecutive_failures,
             &metrics,
             "test",
             &maintenance_degraded,
-            false,    // session already cleared by the `End` handler
-            true,     // ...but it JUST ended: this is the edge
-            None,     // `rmp` #588: no off-thread reader here — no hold,
-            u64::MAX, // oldest-open = MAX => immediate release.
+            false, // session already cleared by the `End` handler
+            true,  // ...but it JUST ended: this is the edge
         );
 
         // Watermark re-anchored to the live WAL length (the pass was skipped, not run).
         assert_eq!(
-            wal_at_last_maintenance, live,
+            reclaim.wal_at_last_maintenance.load(Ordering::Relaxed),
+            live,
             "the loading-ended edge must re-anchor the maintenance watermark to the live WAL length"
         );
     }
@@ -5732,7 +6491,8 @@ mod max_transaction_age_tests {
         let open: EngineLatch<OpenTxTable> = EngineLatch::new(OpenTxTable::new());
         // A single worker in the fixture: stride 1 (`rmp` #1035), which owns every ticket.
         let affinity = WorkerAffinity::new(0, 1);
-        let next_ticket = TicketMinter::new(affinity);
+        let reclaim = EngineReclaim::new(1, 0);
+        let next_ticket = TicketMinter::new(affinity, reclaim.tickets());
         let cap = std::time::Duration::from_secs(60);
         let now = 61 * 1_000_000_000u64; // 61s in nanos — past the cap
         let clock = clock_at(now);
@@ -5740,14 +6500,31 @@ mod max_transaction_age_tests {
         let gauge = ActiveTxnGauge::new(Arc::clone(&metrics), Arc::from("test"));
 
         // Over-age explicit reader (begin at t=0 ⇒ age 61s ≥ cap).
-        let aged_explicit = open_tx(&coord, &open, &next_ticket, AccessMode::Read, false, 0);
+        let aged_explicit = open_tx(
+            &coord,
+            &open,
+            &next_ticket,
+            &reclaim,
+            AccessMode::Read,
+            false,
+            0,
+        );
         // Over-age auto-commit statement (same age, but excluded from the sweep).
-        let aged_auto = open_tx(&coord, &open, &next_ticket, AccessMode::Read, true, 0);
+        let aged_auto = open_tx(
+            &coord,
+            &open,
+            &next_ticket,
+            &reclaim,
+            AccessMode::Read,
+            true,
+            0,
+        );
         // Young explicit reader (begin just now ⇒ age 1ns ≪ cap).
         let young_explicit = open_tx(
             &coord,
             &open,
             &next_ticket,
+            &reclaim,
             AccessMode::Read,
             false,
             now - 1,
@@ -5793,12 +6570,21 @@ mod max_transaction_age_tests {
         let open: EngineLatch<OpenTxTable> = EngineLatch::new(OpenTxTable::new());
         // A single worker in the fixture: stride 1 (`rmp` #1035), which owns every ticket.
         let affinity = WorkerAffinity::new(0, 1);
-        let next_ticket = TicketMinter::new(affinity);
+        let reclaim = EngineReclaim::new(1, 0);
+        let next_ticket = TicketMinter::new(affinity, reclaim.tickets());
         let clock = clock_at(u64::MAX); // arbitrarily far in the future
         let metrics = Arc::new(Metrics::new());
         let gauge = ActiveTxnGauge::new(Arc::clone(&metrics), Arc::from("test"));
 
-        let _ = open_tx(&coord, &open, &next_ticket, AccessMode::Read, false, 0);
+        let _ = open_tx(
+            &coord,
+            &open,
+            &next_ticket,
+            &reclaim,
+            AccessMode::Read,
+            false,
+            0,
+        );
         assert_eq!(coord.active_count(), 1);
 
         let coordinator = Some(Arc::new(coord));

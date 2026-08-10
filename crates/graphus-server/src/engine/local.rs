@@ -101,9 +101,13 @@ pub struct LocalEngine<D: BlockDevice, S: LogSink> {
     /// the DST/VOPR/Elle harness bit-deterministic. This is the load-bearing duality: production injects
     /// [`ReadDispatch::Threaded`]; the simulator injects [`ReadDispatch::Inline`].
     dispatch: ReadDispatch<D, S>,
-    /// A throwaway in-flight-reader counter `dispatch_command` writes through; under inline dispatch a
-    /// read never dispatches off-thread, so this stays `0` (every statement finalises synchronously).
-    readers_inflight: std::sync::atomic::AtomicU64,
+    /// The engine's reclamation state (`rmp` #1037), mirroring the threaded loop's `EngineReclaim`.
+    /// Built for ONE worker, which is what makes the deterministic driver's behaviour identical to the
+    /// pre-#1037 locals it replaced: the in-flight-reader count stays `0` (inline dispatch never sends
+    /// a read off-thread, so every statement finalises synchronously), the reuse barrier is therefore
+    /// never armed, the release floor is never raised, and the ticket sequence is 1, 2, 3, … — so the
+    /// freed-id reuse order, and with it the golden trace, is unchanged.
+    reclaim: super::EngineReclaim,
     /// The engine's compiled-plan cache (`rmp` task #322), mirroring the threaded loop. Inline and
     /// single-threaded by construction, so the same reuse + schema-version invalidation applies, and
     /// the same seed still yields the same execution (the cache changes *how fast* a plan is obtained,
@@ -146,17 +150,25 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // The single-database DST driver labels its per-database metric series with a fixed name
         // (`rmp` #463); the inline engine never multiplexes databases.
         let db_name: Arc<str> = Arc::from("local");
+        // ONE worker, and the WAL seed the threaded engine takes from the store it just opened
+        // (`rmp` #1037). The inline driver never runs the background cadence — `dispatch_command` is
+        // called directly, not through `process_command`'s maintenance tail — so the seed only has to
+        // be the same shape, not the same schedule.
+        let reclaim = super::EngineReclaim::new(1, coordinator.wal_durable_len());
         Self {
             coordinator: Some(Arc::new(coordinator)),
             open: super::latch::EngineLatch::new(OpenTxTable::new()),
             // A single inline worker: stride 1, seeded at 0 (`rmp` #1035). One worker owns every
             // ticket, so the affinity tests the shared-table passes perform in the threaded engine
             // (`rmp` #1041) are unconditionally true here and the inline trace is unchanged.
-            next_ticket: super::TicketMinter::new(super::WorkerAffinity::new(0, 1)),
+            next_ticket: super::TicketMinter::new(
+                super::WorkerAffinity::new(0, 1),
+                reclaim.tickets(),
+            ),
             extensions: Arc::new(super::exec::install_extensions()),
             // Inline (deterministic) read dispatch — never a pool. See the field docs.
             dispatch: ReadDispatch::Inline,
-            readers_inflight: std::sync::atomic::AtomicU64::new(0),
+            reclaim,
             plan_cache: super::latch::EngineLatch::new(super::exec::EnginePlanCache::new()),
             degraded: super::EngineDegraded::new(),
             maintenance_degraded: super::MaintenanceDegraded::new(),
@@ -221,7 +233,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             &self.plan_cache,
             &self.extensions,
             &self.dispatch,
-            &self.readers_inflight,
+            &self.reclaim,
             &mut inflight,
             LOCAL_RESULT_BUFFER,
             &self.metrics,

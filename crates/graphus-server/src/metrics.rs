@@ -165,6 +165,10 @@ struct PerDbCounters {
     /// gauge (`rmp` #992), so a republish folds only the signed change. Single-writer (the engine
     /// thread), like every other per-database counter here.
     derived_index_entries_last: AtomicU64,
+    /// The value this database last contributed to the server-wide `graphus_held_slots` gauge
+    /// (`rmp` #1037), so a republish folds only the signed change. Same single-writer discipline as
+    /// the rest of this struct: only a worker inside the engine's reclaim gate publishes it.
+    held_slots_last: AtomicU64,
     /// The index-collection lifetime totals this database last published (`rmp` #992), so each
     /// republish folds only the increment. The coordinator's totals are monotonic, so these only ever
     /// rise — but they still need a baseline, because the server-wide counters aggregate several
@@ -185,6 +189,7 @@ impl PerDbCounters {
             wal_bytes_written: AtomicU64::new(0),
             wal_offset_last: AtomicU64::new(0),
             derived_index_entries_last: AtomicU64::new(0),
+            held_slots_last: AtomicU64::new(0),
             index_entries_collected_last: AtomicU64::new(0),
             index_keys_retained_last: AtomicU64::new(0),
             index_collections_abandoned_last: AtomicU64::new(0),
@@ -296,6 +301,17 @@ pub struct Metrics {
     /// reconstruct). Composite trees therefore still grow with the version count, and this gauge
     /// honestly shows it — which is the point of counting them rather than quietly excluding them.
     derived_index_entries: AtomicU64,
+    /// Physical record slots currently **shadow-held from reuse**, server-wide (`rmp` #588/#1037).
+    ///
+    /// A GC pass that frees a slot while a reader may still be walking a chain through it does not
+    /// hand the slot back to the allocator immediately; it holds it until every transaction that could
+    /// have been walking has retired. Above one engine worker the barrier that does this is armed on
+    /// EVERY reclaim pass rather than only when an off-thread reader is counted, because a sibling
+    /// worker executes statements inline against the same store — so deferred reuse becomes a resource
+    /// the server carries under ordinary load, and a resource nobody can see is a resource nobody can
+    /// size. A value that climbs and does not come back down means something is holding a transaction
+    /// open (see `graphus_open_transactions`), not that reclamation has failed.
+    held_slots: AtomicU64,
     /// Derived-index entries the GC-driven collection has removed, server-wide (`rmp` #992). See
     /// [`publish_index_collection_for`](Self::publish_index_collection_for) for why the three
     /// collection counters exist alongside the footprint gauge.
@@ -502,6 +518,7 @@ impl Metrics {
             maintenance_versions_reclaimed: AtomicU64::new(0),
             maintenance_stamps_frozen: AtomicU64::new(0),
             derived_index_entries: AtomicU64::new(0),
+            held_slots: AtomicU64::new(0),
             index_entries_collected: AtomicU64::new(0),
             index_keys_retained: AtomicU64::new(0),
             index_collections_abandoned: AtomicU64::new(0),
@@ -1044,6 +1061,31 @@ impl Metrics {
         self.derived_index_entries.load(Ordering::Relaxed)
     }
 
+    /// Publishes `db`'s count of physical slots shadow-held from reuse (`rmp` #588/#1037), folding the
+    /// signed change into the server-wide `graphus_held_slots` gauge.
+    ///
+    /// Folded rather than stored for the same reason every other per-database gauge here is: the
+    /// server-wide series aggregates several databases, and a plain `store` would report whichever
+    /// engine published last. Called from inside the engine's reclaim gate, which is the only place
+    /// the number changes for a reason worth reporting — a pass has just decided what to hold.
+    pub fn publish_held_slots_for(&self, db: &str, held: u64) {
+        let c = self.per_db_entry(db);
+        let last = c.held_slots_last.load(Ordering::Relaxed);
+        if held == last {
+            return;
+        }
+        c.held_slots_last.store(held, Ordering::Relaxed);
+        let delta = (i128::from(held) - i128::from(last))
+            .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+        add_delta(&self.held_slots, delta);
+    }
+
+    /// The current server-wide shadow-held slot gauge (`rmp` #1037) — observability / tests.
+    #[must_use]
+    pub fn held_slots(&self) -> u64 {
+        self.held_slots.load(Ordering::Relaxed)
+    }
+
     /// Publishes this database's lifetime index-collection totals (`rmp` #992): entries the GC-driven
     /// collection actually removed, dead keys it kept, and batches it abandoned.
     ///
@@ -1236,6 +1278,12 @@ impl Metrics {
             "graphus_derived_index_entries",
             "Entries held by the in-memory value-keyed derived indexes (rmp #992).",
             self.derived_index_entries.load(Ordering::Relaxed),
+        );
+        gauge(
+            &mut out,
+            "graphus_held_slots",
+            "Physical record slots shadow-held from reuse while a reader may still walk them (rmp #588/#1037).",
+            self.held_slots.load(Ordering::Relaxed),
         );
         counter(
             &mut out,

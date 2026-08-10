@@ -191,14 +191,16 @@ pub struct AdmissionConfig {
     pub reader_threads: usize,
     /// Number of **engine worker threads** serving the command queue (`rmp` #1033/#1035): each
     /// serves one queue, and a session is routed always to the same worker so its commands keep
-    /// their order. Worker 0 additionally drives the maintenance cadence, so a checkpoint or GC pass
-    /// happens once rather than once per worker.
+    /// their order. The maintenance cadence is single-flight across the engine (`rmp` #1037), so a
+    /// checkpoint or GC pass happens once rather than once per worker — by exclusion on a shared gate,
+    /// not by pinning it to worker 0, which is what this said and the code never did.
     ///
-    /// `0` (the default) selects the automatic size, which is **1 for now** — deliberately, and not
-    /// for want of the machinery: the affinity that makes `> 1` correct landed with `rmp` #1035, but
-    /// the value that is actually *better* is a measurement (`rmp` #1034), and this project does not
-    /// pick performance defaults ahead of the evidence. Any value `> 0` pins the count exactly, so
-    /// the measurement — and anyone wanting to A/B it — can ask for four or sixteen today.
+    /// `0` (the default) selects the automatic size, which is **1**, and
+    /// [`validate`](Config::validate) currently REFUSES any other value: the multi-worker engine is
+    /// not yet certified (`rmp` #1034) — every worker still drives index builds and spawns its own
+    /// reader pool and WAL fsync thread, and its throughput has never been measured. The knob is
+    /// exercised above one by the engine's own tests, which spawn engines directly; it is not yet
+    /// something an operator may ask for.
     pub engine_workers: usize,
     /// Number of **morsel worker threads** for intra-query parallelism (`rmp` task #339): a single
     /// large analytical aggregation (`MATCH (n:Label) RETURN <exact-agg>(n.p)`) splits its label scan
@@ -1387,11 +1389,12 @@ impl ServerConfig {
         }
         let cpu_pool = hw.logical_cpus.clamp(1, AUTO_CPU_POOL_CAP);
         if self.admission.engine_workers == 0 {
-            // Auto resolves to ONE, and for a stronger reason than "unmeasured". The engine is NOT
-            // yet correct above one worker: `readers_inflight` is still per worker (`rmp` #1037), so
-            // the slot-reuse barrier can free a slot a different worker's reader is still walking.
-            // `validate` refuses any configured value above one for that reason; this resolution only
-            // decides what `auto` means, and one is the only value that is both safe and measured.
+            // Auto resolves to ONE, and for a stronger reason than "unmeasured". The multi-worker
+            // engine is not yet CERTIFIED (`rmp` #1034): `rmp` #1037 closed the slot-reuse barrier's
+            // hole, but the index-build drive still runs on every worker's command tail and each
+            // worker still spawns its own reader pool and WAL fsync thread. `validate` refuses any
+            // configured value above one for that reason; this resolution only decides what `auto`
+            // means, and one is the only value that is both safe and measured.
             self.admission.engine_workers = 1;
         }
         if self.admission.reader_threads == 0 {
@@ -1688,22 +1691,35 @@ impl ServerConfig {
         // The engine runs `engine_workers` threads over the loop body, and the state those threads
         // must agree on has been hoisted out of the per-worker struct one piece at a time: the stop
         // protocol (`rmp` #1036), then the open-transaction table, the parked-statement queue and the
-        // plan cache (`rmp` #1041). ONE piece is still per worker, and it is a fault rather than a
-        // degradation: `readers_inflight`, so the slot-reuse barrier (`rmp` #588) can read zero while
-        // ANOTHER worker has reads in flight and hand a live reader's slot back to a writer — a
-        // silently wrong read, the `rmp` #811 class. That is `rmp` #1037.
+        // plan cache (`rmp` #1041), then the reader count, the ticket sequence and the reclamation
+        // cadence (`rmp` #1037). The state hoisting is done; the CERTIFICATION is not, and this gate
+        // is answerable to the certification and not to any one task.
         //
-        // Refusing the value is the honest option: silent corruption must never be reachable from a
+        // What is known to remain, each verified in the code rather than presumed:
+        //
+        // * `drive_index_build` is called from the tail of `process_command`, which every worker runs
+        //   — so `W` workers drive the same index build concurrently. `rmp` #1037 gave the GC pass a
+        //   single-flight gate; the build pass has none, and whether it needs one is unmeasured.
+        // * Every worker spawns its OWN reader pool (`reader_threads` threads) and its own WAL fsync
+        //   thread, so a `W`-worker engine creates `W × reader_threads` reader threads and `W` fsync
+        //   threads over one `WalManager`. Neither the oversubscription nor the depth-1 fsync
+        //   invariant that assumed one such thread has been measured above one worker.
+        // * No throughput or stability measurement of the multi-worker engine exists at all, which is
+        //   what `rmp` #1034 is for. `rmp` #1037's own fix DEFERS slot reuse above one worker (the
+        //   barrier is armed on every pass), and the size of that deferral under sustained load is
+        //   exactly the kind of thing that has to be measured before it is offered to an operator.
+        //
+        // Refusing the value is the honest option: an uncertified engine must not be reachable from a
         // configuration file. Tests still spawn multi-worker engines directly through
         // `spawn_engine_with_timeout`, so the path stays exercised while the gate is up — this
-        // bounds who can reach it, not whether it is developed. Lift this when `rmp` #1037 closes and
-        // the certification measured by `rmp` #1034 passes.
+        // bounds who can reach it, not whether it is developed. Lift this when the certification
+        // measured by `rmp` #1034 passes.
         if self.admission.engine_workers > 1 {
             return Err(ConfigError::Invalid(format!(
                 "admission.engine_workers must be 1 (got {}): the multi-writer engine is not yet \
-                 certified — with more than one worker the slot-reuse barrier can free a live \
-                 reader's slot, which reads silently wrong data (rmp #1037). Leave it unset (auto) \
-                 or set it to 1",
+                 certified — every worker still drives index builds and spawns its own reader pool \
+                 and WAL fsync thread, and its throughput has never been measured (rmp #1034). \
+                 Leave it unset (auto) or set it to 1",
                 self.admission.engine_workers
             )));
         }
