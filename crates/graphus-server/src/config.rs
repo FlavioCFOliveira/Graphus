@@ -1387,9 +1387,11 @@ impl ServerConfig {
         }
         let cpu_pool = hw.logical_cpus.clamp(1, AUTO_CPU_POOL_CAP);
         if self.admission.engine_workers == 0 {
-            // Auto resolves to ONE until `rmp` #1034 measures the curve. The engine is correct at
-            // any W since #1035; what is unknown is which W is fastest, and a default chosen without
-            // the measurement would be a guess wearing the authority of a default.
+            // Auto resolves to ONE, and for a stronger reason than "unmeasured". The engine is NOT
+            // yet correct above one worker: `rmp` #1036 found the per-worker `EngineShared`, whose
+            // `readers_inflight` lets the slot-reuse barrier free a live reader's slot. `validate`
+            // refuses any configured value above one for that reason; this resolution only decides
+            // what `auto` means, and one is the only value that is both safe and measured.
             self.admission.engine_workers = 1;
         }
         if self.admission.reader_threads == 0 {
@@ -1680,6 +1682,31 @@ impl ServerConfig {
             return Err(ConfigError::Invalid(
                 "admission.engine_queue_capacity must be > 0".to_owned(),
             ));
+        }
+        // FAIL-CLOSED until the multi-writer engine is certified (`rmp` #1036 and its siblings).
+        //
+        // The engine runs `engine_workers` threads over the loop body, but the state those threads
+        // must agree on is still built per worker inside `run_engine_loop`. Two of the consequences
+        // are not degradations, they are faults: (1) `readers_inflight` is per worker, so the
+        // slot-reuse barrier (`rmp` #588) can see zero while ANOTHER worker has reads in flight and
+        // hand a live reader's slot back to a writer — a silently wrong read, the `rmp` #811 class;
+        // (2) the worker handling `Shutdown` waits on a per-worker `live_workers` counter nobody
+        // else decrements, so a `STOP DATABASE` spins for ever, is force-detached, and the zombie
+        // keeps the exclusive store-open lock for the life of the process.
+        //
+        // Refusing the value is the honest option: silent corruption must never be reachable from a
+        // configuration file. Tests still spawn multi-worker engines directly through
+        // `spawn_engine_with_timeout`, so the path stays exercised while the gate is up — this
+        // bounds who can reach it, not whether it is developed. Lift this when the certification
+        // measured by `rmp` #1034 passes.
+        if self.admission.engine_workers > 1 {
+            return Err(ConfigError::Invalid(format!(
+                "admission.engine_workers must be 1 (got {}): the multi-writer engine is not yet \
+                 certified — with more than one worker the slot-reuse barrier can free a live \
+                 reader's slot (silently wrong reads) and a graceful stop never converges. Leave it \
+                 unset (auto) or set it to 1",
+                self.admission.engine_workers
+            )));
         }
         if self.admission.result_buffer_capacity == 0 {
             return Err(ConfigError::Invalid(
@@ -2055,6 +2082,61 @@ mod tests {
             ..ServerConfig::default()
         };
         assert!(matches!(cfg.validate(), Err(ConfigError::Invalid(_))));
+    }
+
+    /// More than one engine worker is refused while the multi-writer engine is uncertified
+    /// (`rmp` #1036): with `W > 1` the slot-reuse barrier can free a live reader's slot and a
+    /// graceful stop never converges, and neither failure announces itself.
+    ///
+    /// Non-vacuity: the same config with `engine_workers = 1` validates, and `auto` (0) resolves to
+    /// 1 and then validates — so the assertion below discriminates the value rather than rejecting
+    /// the whole fixture.
+    #[test]
+    fn more_than_one_engine_worker_is_rejected_until_certified() {
+        let base = ServerConfig {
+            rest_addr: None,
+            bolt_tcp_addr: None,
+            uds_path: Some(PathBuf::from("x.sock")),
+            ..ServerConfig::default()
+        };
+        let refused = ServerConfig {
+            admission: AdmissionConfig {
+                engine_workers: 2,
+                ..AdmissionConfig::default()
+            },
+            ..base.clone()
+        };
+        let Err(ConfigError::Invalid(message)) = refused.validate() else {
+            panic!("engine_workers = 2 must be refused while the engine is uncertified");
+        };
+        assert!(
+            message.contains("engine_workers"),
+            "the refusal must name the setting it is about, got: {message}"
+        );
+
+        let allowed = ServerConfig {
+            admission: AdmissionConfig {
+                engine_workers: 1,
+                ..AdmissionConfig::default()
+            },
+            ..base.clone()
+        };
+        allowed.validate().expect("one worker is the allowed value");
+
+        // `auto` is not a bypass: it resolves to one, and the resolved value validates.
+        let mut auto = ServerConfig {
+            admission: AdmissionConfig {
+                engine_workers: 0,
+                ..AdmissionConfig::default()
+            },
+            ..base
+        };
+        auto.apply_hardware_defaults(&hw(16, Some(8 * GIB), Some(16 * GIB)));
+        assert_eq!(
+            auto.admission.engine_workers, 1,
+            "auto resolves to one worker"
+        );
+        auto.validate().expect("the resolved auto value validates");
     }
 
     #[test]

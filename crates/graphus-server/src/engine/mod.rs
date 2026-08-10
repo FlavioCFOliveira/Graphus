@@ -820,18 +820,77 @@ impl TicketMinter {
     }
 }
 
-/// **The engine loop's shared state** (`rmp` #1033, layer 7b of #975).
+/// **The stop protocol, shared by every worker of one engine** (`rmp` #1036).
+///
+/// This is the state that has no meaning per worker: a worker cannot count how many *other* workers
+/// are still running, and a stop that only one worker can see is not a stop. It is therefore built
+/// once in [`spawn_engine_with_timeout`] and handed to each worker as an `Arc` — unlike
+/// [`EngineShared`], which is still per worker and says so.
+///
+/// It was originally a pair of fields inside [`EngineShared`], whose doc-comment claimed the struct
+/// was "declared once … without any of it being duplicated per worker" while the code constructed it
+/// *inside* `run_engine_loop`. Every worker therefore counted itself and W−1 phantoms, so the worker
+/// handling `Shutdown` waited for a number that nobody else could ever move, and spun for the life
+/// of the process. In a server that is not a hang but a permanent one: `stop_engine` observes no
+/// drain progress, force-detaches, and the spinning zombie keeps the exclusive store-open lock, so
+/// every later `START DATABASE` for that store fails.
+struct EngineStop {
+    /// How many workers are still inside the loop. The worker that handles `Shutdown` must be the
+    /// LAST one out, because the shutdown path consumes the coordinator for the final flush and
+    /// `Arc::try_unwrap` needs sole ownership. It raises `stopping`, waits for this to reach one,
+    /// and only then drains and hardens.
+    ///
+    /// The count means **"workers that may still hold a share of the coordinator"**, not "workers
+    /// that are still looping" — see the exit sequence at the end of [`run_engine_loop`], which
+    /// releases the share *before* decrementing. A counter decremented any earlier cannot support
+    /// the `try_unwrap`, which is the whole reason the barrier exists.
+    live_workers: AtomicUsize,
+    /// Raised by whichever worker handles `Shutdown`. Every worker checks it before blocking on its
+    /// queue, so a stop reaches all of them and not only the one that was handed the command.
+    /// Without it the others would sit in `recv` until the last client sender dropped — which is a
+    /// different, later, and unrelated event.
+    stopping: AtomicBool,
+}
+
+impl EngineStop {
+    fn new(workers: usize) -> Self {
+        Self {
+            live_workers: AtomicUsize::new(workers),
+            stopping: AtomicBool::new(false),
+        }
+    }
+}
+
+/// **The engine loop's per-worker state** (`rmp` #1033, layer 7b of #975; corrected by `rmp` #1036).
 ///
 /// Every field here was a local `let mut` of [`run_engine_loop`], which is exactly what made the
-/// loop un-replicable: a second worker would have needed its own copy of state that must be one.
-/// They are grouped so the loop body can be run by W threads over one shared value.
+/// loop un-replicable. They are grouped so the loop body can be run by W threads.
+///
+/// # This is ONE PER WORKER, and that is a statement of fact, not of design
+///
+/// The struct is constructed inside `run_engine_loop`, so each worker gets its own. For
+/// `next_ticket` that is correct and required — the minter's residue class *is* `rmp` #1035's
+/// routing. For the rest it is a defect under repair, and each has its own task because each needs
+/// its own care:
+///
+/// * `open` and `parked` — the session path is legitimately per worker (affinity routes a ticket
+///   only to its owner), but four consumers cross workers: the `Shutdown` drain, the GC's oldest
+///   open ticket, the age sweep and reader retirement. `rmp` #1041, which must wait for `rmp` #1038
+///   because these two are acquired in both orders today and sharing them before the order is
+///   imposed would deadlock.
+/// * `plan_cache` — a fail-closed index repair bumps the schema on worker 0 only, leaving the others
+///   serving plans compiled while degraded (`rmp` #1041).
+/// * `readers_inflight` — feeds the `rmp` #588 slot-reuse barrier, which can therefore free a slot a
+///   *different* worker's reader is still walking (`rmp` #1037). This is why
+///   `admission.engine_workers` above one is refused by configuration.
 ///
 /// # Why each is latched separately, and why that is the whole design
 ///
 /// A single lock around the whole struct — or, worse, held around the command dispatch — would give
 /// W threads that take turns: *apparent* parallelism, indistinguishable from a multi-writer engine
-/// until `rmp` #1034 measures CPU occupancy and finds one core. The separation is what keeps the
-/// long part of a statement outside every lock:
+/// until `rmp` #1034 measures CPU occupancy and finds one core. (Today several call sites do hold a
+/// guard across a whole statement by passing it in argument position; that is `rmp` #1038.) The
+/// separation is what keeps the long part of a statement outside every lock:
 ///
 /// * `open` is read by `exec::handle_run` in its first useful instruction, which copies the entry's
 ///   two `Copy` fields and ends the borrow there; the execution that follows never touches it. Short
@@ -840,16 +899,6 @@ impl TicketMinter {
 /// * `plan_cache` is consulted once per statement to look a plan up, and once to install one.
 /// * `parked` is touched only when a statement suspends or resumes.
 struct EngineShared {
-    /// How many workers are still inside the loop (`rmp` #1033). The worker that handles `Shutdown`
-    /// must be the LAST one out, because the shutdown path consumes the coordinator for the final
-    /// flush and `Arc::try_unwrap` needs sole ownership. It raises `stopping`, waits for this to
-    /// reach one, and only then drains and hardens.
-    live_workers: AtomicUsize,
-    /// Raised by whichever worker handles `Shutdown` (`rmp` #1033). Every worker checks it before
-    /// blocking on the queue, so a stop reaches all of them and not only the one that was handed the
-    /// command. Without it the others would sit in `recv` until the last client sender dropped —
-    /// which is a different, later, and unrelated event.
-    stopping: AtomicBool,
     /// The explicit transactions this engine has open, keyed by ticket.
     open: std::sync::Mutex<OpenTxTable>,
     /// Compiled plans, keyed by query text and schema generation.
@@ -871,8 +920,6 @@ struct EngineShared {
 impl EngineShared {
     fn new(workers: usize, worker_id: usize) -> Self {
         Self {
-            live_workers: AtomicUsize::new(workers),
-            stopping: AtomicBool::new(false),
             open: std::sync::Mutex::new(OpenTxTable::new()),
             plan_cache: std::sync::Mutex::new(exec::EnginePlanCache::new()),
             parked: std::sync::Mutex::new(VecDeque::new()),
@@ -1019,15 +1066,20 @@ impl PendingCommit {
 fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>(
     db_name: Arc<str>,
     coordinator: Arc<TxnCoordinator<D, S>>,
-    // The command queue, shared by every worker (`rmp` #1033). `std::sync::mpsc::Receiver` is
-    // `!Sync`, so the workers dequeue under a brief lock — the same MPMC-over-mpsc shape the
-    // reader pool uses, where the lock covers only the dequeue and never the work that follows.
+    // THIS worker's command queue (`rmp` #1035): one queue per worker, with a session always routed
+    // to the same one, because a shared queue does not preserve the order of one session's commands.
+    // `std::sync::mpsc::Receiver` is `!Sync`, so it is still reached under a lock — uncontended, as
+    // no other worker reads it — and the lock covers only the dequeue, never the work that follows.
     rx: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<EngineCommand>>>,
-    // Which worker this is. Worker 0 additionally drives the maintenance cadence; the others only
-    // serve commands, so a GC pass or a checkpoint never runs W times over.
+    // The stop protocol, shared by every worker of this engine (`rmp` #1036). Built once by the
+    // spawner: a worker cannot count how many *others* are still running, and a stop only one worker
+    // can see is not a stop.
+    stop: Arc<EngineStop>,
+    // Which worker this is. Worker 0 additionally drives the idle maintenance tick; the others only
+    // serve commands.
     worker_id: usize,
-    // How many workers share this queue. Needed here so the shared state knows when the last one has
-    // left — the shutdown path consumes the coordinator and must be the last out (`rmp` #1033).
+    // How many workers this engine runs. Seeds the ticket minter's stride, so every ticket this
+    // worker mints satisfies `ticket % W == worker_id` (`rmp` #1035).
     engine_workers: usize,
     result_buffer_capacity: usize,
     reader_threads: usize,
@@ -1362,7 +1414,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         // A stop raised by another worker ends this one too, checked before it blocks. The
         // decrement happens at the single exit below, so a worker that leaves here is counted out
         // exactly once.
-        if shared.stopping.load(Ordering::Acquire) {
+        if stop.stopping.load(Ordering::Acquire) {
             break 'engine;
         }
 
@@ -1440,8 +1492,8 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         // it blocks, so a worker sitting in `recv` leaves on its next turn; one executing a
         // statement leaves when that statement finishes, which is what a graceful stop means.
         if matches!(cmd, Cmd::Shutdown { .. }) {
-            shared.stopping.store(true, Ordering::Release);
-            while shared.live_workers.load(Ordering::Acquire) > 1 {
+            stop.stopping.store(true, Ordering::Release);
+            while stop.live_workers.load(Ordering::Acquire) > 1 {
                 std::thread::yield_now();
             }
         }
@@ -1488,24 +1540,38 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             // Tell every other worker to stop before leaving: they are blocked in `recv` and
             // would otherwise wait for the last client sender to drop, which is a later and
             // unrelated event (`rmp` #1033).
-            shared.stopping.store(true, Ordering::Release);
+            stop.stopping.store(true, Ordering::Release);
             break 'engine; // Shutdown handled (drained + hardened) inside the dispatch.
         }
     }
 
-    // Counted out exactly once, at the single exit, and BEFORE the reader pool teardown below: the
-    // worker running `Shutdown` waits on this count, so decrementing after a slow teardown would
-    // hold the whole stop behind this worker's cleanup (`rmp` #1033).
-    shared.live_workers.fetch_sub(1, Ordering::AcqRel);
-
-    // The loop has exited (Shutdown or channel close): tear down the reader pool so no worker thread
-    // outlives the engine. `shutdown` drops the work-queue sender (ending each worker's `recv`) and
-    // joins them. Any reader still in flight finished its rows already (it sends the retirement after
-    // its cursor drains); a retirement that arrives after the loop exited is dropped here — its
-    // transaction was already rolled back by `Shutdown`'s `drain_inflight`, never left half-applied.
+    // ---- the exit sequence, and why its ORDER is the whole correctness argument (`rmp` #1036) ----
+    //
+    // The worker running `Shutdown` waits for `live_workers` to reach one and then calls
+    // `Arc::try_unwrap` on the coordinator, which needs sole ownership and PANICS without it. So the
+    // count this worker decrements must mean "I no longer hold anything that shares the coordinator"
+    // — which makes the release of those things part of the protocol, not cleanup that may follow it.
+    //
+    // 1. The reader pool goes first. `shutdown` drops the work-queue sender (ending each reader's
+    //    `recv`) and joins them, so no reader of THIS worker survives into the final flush — which
+    //    consumes the store the readers read. A retirement that arrives after the loop exited is
+    //    dropped: its transaction is rolled back by `Shutdown`'s `drain_inflight`, never left
+    //    half-applied. (With `W > 1` that drain only reaches this worker's own table, which is `rmp`
+    //    #1041 and one of the reasons configuration refuses more than one worker for now.)
+    // 2. Then this worker's share of the coordinator is released.
+    // 3. Only then is the exit announced.
+    //
+    // The previous order decremented FIRST, to avoid holding the stop behind a slow teardown. That
+    // reasoning was sound while `live_workers` was per worker and the barrier could never fire; the
+    // moment the counter became real, the same order would let `try_unwrap` run against a share this
+    // worker still held. A slower stop is the price, and it is bounded by a join of threads that
+    // have already been told to finish.
     if let read_pool::ReadDispatch::Threaded(pool) = dispatch {
         pool.shutdown();
     }
+    drop(coordinator.take());
+    // Counted out exactly once, at the single exit, after everything above has been released.
+    stop.live_workers.fetch_sub(1, Ordering::AcqRel);
 }
 
 /// Drains and processes every reader retirement currently available on `retire_rx` (`rmp` task #336,
@@ -4854,11 +4920,16 @@ where
     };
     // The drain-progress beacon is installed once, on the shared coordinator.
     coordinator.set_drain_progress(loop_drain_progress);
+    // The stop protocol, built HERE and shared by every worker (`rmp` #1036). It used to live inside
+    // `EngineShared`, which `run_engine_loop` constructs per worker — so each worker counted itself
+    // plus W−1 phantoms, and the `Shutdown` barrier waited on a number nobody else could move.
+    let stop = Arc::new(EngineStop::new(engine_workers));
 
     let mut joins = Vec::with_capacity(engine_workers);
     for (worker_id, rx) in receivers.into_iter().enumerate() {
         let db_name = Arc::clone(&db_name);
         let coordinator = Arc::clone(&coordinator);
+        let stop = Arc::clone(&stop);
         // Its OWN queue: no latch, because no other worker reads it (`rmp` #1035).
         let rx = Arc::new(std::sync::Mutex::new(rx));
         let loop_metrics = Arc::clone(&loop_metrics);
@@ -4883,6 +4954,7 @@ where
                     db_name,
                     coordinator,
                     rx,
+                    stop,
                     worker_id,
                     engine_workers,
                     result_buffer_capacity,
