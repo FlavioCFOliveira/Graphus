@@ -216,6 +216,7 @@ mod tests {
     use graphus_storage::RecordStore;
     use graphus_txn::IsolationLevel;
     use graphus_wal::{MemLogSink, WalManager};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn coordinator() -> TxnCoordinator<MemBlockDevice, MemLogSink> {
         let device = MemBlockDevice::new(0);
@@ -263,11 +264,10 @@ mod tests {
     fn open_txn(
         coord: &TxnCoordinator<MemBlockDevice, MemLogSink>,
         open: &mut OpenTxTable,
-        next_ticket: &mut u64,
+        next_ticket: &AtomicU64,
     ) -> TxTicket {
         let txn = coord.begin(IsolationLevel::Serializable);
-        *next_ticket += 1;
-        let ticket = *next_ticket;
+        let ticket = next_ticket.fetch_add(1, Ordering::Relaxed) + 1;
         // `OpenTx`'s fields are module-private but visible here: this test module is a descendant of
         // `crate::engine`, where `OpenTx` is defined (ordinary Rust privacy — private items are
         // visible in the defining module and all its descendants).
@@ -303,8 +303,8 @@ mod tests {
     fn ingests_node_chunk_through_the_graph_access_seam() {
         let coord = coordinator();
         let mut open = OpenTxTable::new();
-        let mut next_ticket = 0u64;
-        let ticket = open_txn(&coord, &mut open, &mut next_ticket);
+        let next_ticket = AtomicU64::new(0);
+        let ticket = open_txn(&coord, &mut open, &next_ticket);
 
         let out = ingest_mode_b_chunk(
             &coord,
@@ -330,8 +330,8 @@ mod tests {
     fn ingests_rel_chunk_resolving_against_the_confirmed_id_map() {
         let coord = coordinator();
         let mut open = OpenTxTable::new();
-        let mut next_ticket = 0u64;
-        let ticket = open_txn(&coord, &mut open, &mut next_ticket);
+        let next_ticket = AtomicU64::new(0);
+        let ticket = open_txn(&coord, &mut open, &next_ticket);
 
         let node_out = ingest_mode_b_chunk(
             &coord,
@@ -369,8 +369,8 @@ mod tests {
     fn unknown_endpoint_is_a_terminal_storage_error() {
         let coord = coordinator();
         let mut open = OpenTxTable::new();
-        let mut next_ticket = 0u64;
-        let ticket = open_txn(&coord, &mut open, &mut next_ticket);
+        let next_ticket = AtomicU64::new(0);
+        let ticket = open_txn(&coord, &mut open, &next_ticket);
 
         let err = ingest_mode_b_chunk(
             &coord,
@@ -390,8 +390,8 @@ mod tests {
     fn malformed_typed_cell_is_a_terminal_parse_error() {
         let coord = coordinator();
         let mut open = OpenTxTable::new();
-        let mut next_ticket = 0u64;
-        let ticket = open_txn(&coord, &mut open, &mut next_ticket);
+        let next_ticket = AtomicU64::new(0);
+        let ticket = open_txn(&coord, &mut open, &next_ticket);
 
         let bad_header = Arc::new(NodeHeader {
             columns: vec![

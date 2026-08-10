@@ -90,7 +90,7 @@ pub struct LocalEngine<D: BlockDevice, S: LogSink> {
     /// Open transactions, keyed by the ticket id the engine mints (same bookkeeping the loop keeps).
     open: OpenTxTable,
     /// Monotonic ticket counter (same as the loop's).
-    next_ticket: u64,
+    next_ticket: std::sync::atomic::AtomicU64,
     /// The compiled-in UDF/UDP + GDS registry, built once (as the engine thread does). `Arc`-wrapped to
     /// match the threaded engine's shape (`rmp` task #336); the inline driver never moves it to a
     /// thread, but the shared signature keeps one execution path.
@@ -103,7 +103,7 @@ pub struct LocalEngine<D: BlockDevice, S: LogSink> {
     dispatch: ReadDispatch<D, S>,
     /// A throwaway in-flight-reader counter `dispatch_command` writes through; under inline dispatch a
     /// read never dispatches off-thread, so this stays `0` (every statement finalises synchronously).
-    readers_inflight: u64,
+    readers_inflight: std::sync::atomic::AtomicU64,
     /// The engine's compiled-plan cache (`rmp` task #322), mirroring the threaded loop. Inline and
     /// single-threaded by construction, so the same reuse + schema-version invalidation applies, and
     /// the same seed still yields the same execution (the cache changes *how fast* a plan is obtained,
@@ -149,11 +149,11 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         Self {
             coordinator: Some(Arc::new(coordinator)),
             open: OpenTxTable::new(),
-            next_ticket: 0,
+            next_ticket: std::sync::atomic::AtomicU64::new(0),
             extensions: Arc::new(super::exec::install_extensions()),
             // Inline (deterministic) read dispatch — never a pool. See the field docs.
             dispatch: ReadDispatch::Inline,
-            readers_inflight: 0,
+            readers_inflight: std::sync::atomic::AtomicU64::new(0),
             plan_cache: super::exec::EnginePlanCache::new(),
             degraded: super::EngineDegraded::new(),
             maintenance_degraded: super::MaintenanceDegraded::new(),
@@ -214,11 +214,11 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             cmd,
             &mut self.coordinator,
             &mut self.open,
-            &mut self.next_ticket,
+            &self.next_ticket,
             &mut self.plan_cache,
             &self.extensions,
             &self.dispatch,
-            &mut self.readers_inflight,
+            &self.readers_inflight,
             &mut inflight,
             LOCAL_RESULT_BUFFER,
             &self.metrics,

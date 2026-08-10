@@ -42,7 +42,7 @@ pub mod stream;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use graphus_core::error::{GraphusError, Result};
 use graphus_cypher::{IndexBuildTotals, IndexCollectionTotals, TxnCoordinator};
@@ -787,6 +787,51 @@ impl ReapedTickets {
 /// `open.remove` / `open.iter` call site working unchanged; only the sites that care about *reaping*
 /// use the two inherent methods, so an ordinary `remove` (a normal commit or rollback) can never
 /// accidentally record a reap.
+/// **The engine loop's shared state** (`rmp` #1033, layer 7b of #975).
+///
+/// Every field here was a local `let mut` of [`run_engine_loop`], which is exactly what made the
+/// loop un-replicable: a second worker would have needed its own copy of state that must be one.
+/// They are grouped so the loop body can be run by W threads over one shared value.
+///
+/// # Why each is latched separately, and why that is the whole design
+///
+/// A single lock around the whole struct — or, worse, held around the command dispatch — would give
+/// W threads that take turns: *apparent* parallelism, indistinguishable from a multi-writer engine
+/// until `rmp` #1034 measures CPU occupancy and finds one core. The separation is what keeps the
+/// long part of a statement outside every lock:
+///
+/// * `open` is read by `exec::handle_run` in its first useful instruction, which copies the entry's
+///   two `Copy` fields and ends the borrow there; the execution that follows never touches it. Short
+///   commands (`BEGIN`, `COMMIT`, `ROLLBACK`, `STATUS`) may hold it for their whole handling, since
+///   each is `O(1)` over the table.
+/// * `plan_cache` is consulted once per statement to look a plan up, and once to install one.
+/// * `parked` is touched only when a statement suspends or resumes.
+struct EngineShared {
+    /// The explicit transactions this engine has open, keyed by ticket.
+    open: std::sync::Mutex<OpenTxTable>,
+    /// Compiled plans, keyed by query text and schema generation.
+    plan_cache: std::sync::Mutex<exec::EnginePlanCache>,
+    /// Statements suspended mid-execution, oldest first (`rmp` #485).
+    parked: std::sync::Mutex<VecDeque<exec::InFlightInline>>,
+    /// The next explicit-transaction ticket. An atomic, not a latched counter: it orders nothing and
+    /// only has to be unique, which `fetch_add` gives on its own.
+    next_ticket: AtomicU64,
+    /// Off-thread reads currently in flight (`rmp` #336), for the gauge and the drain barrier.
+    readers_inflight: AtomicU64,
+}
+
+impl EngineShared {
+    fn new() -> Self {
+        Self {
+            open: std::sync::Mutex::new(OpenTxTable::new()),
+            plan_cache: std::sync::Mutex::new(exec::EnginePlanCache::new()),
+            parked: std::sync::Mutex::new(VecDeque::new()),
+            next_ticket: AtomicU64::new(0),
+            readers_inflight: AtomicU64::new(0),
+        }
+    }
+}
+
 #[derive(Default)]
 struct OpenTxTable {
     live: HashMap<u64, OpenTx>,
@@ -964,14 +1009,23 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // This engine's contribution to the server-wide index-build gauges (`rmp` task #573), republished
     // every loop iteration so a build's start, progress, completion and parking are all visible.
     let mut index_builds = IndexBuildGauge::new(Arc::clone(&metrics));
-    let mut open: OpenTxTable = OpenTxTable::new();
-    let mut next_ticket: u64 = 0;
+    // The loop's shared state (`rmp` #1033). Declared once and reached through guards below, so the
+    // body can be replicated across W workers without any of it being duplicated per worker. With
+    // one worker the guards are uncontended and the behaviour is exactly what the locals gave.
+    let shared = EngineShared::new();
+    let mut open = shared
+        .open
+        .lock()
+        .expect("INVARIANT: the open-tx table's latch is not poisoned");
     // The engine's compiled-plan cache (`rmp` task #322): reuses a compiled `PhysicalPlan` for an
     // identical query text instead of re-running the ~7–9 µs compile pipeline on every `Run`. Owned by
     // (and `&mut`-borrowed on) this single engine thread, so its single-threaded contract holds with no
     // synchronisation. Invalidated by a schema-version bump on any planner-visible catalog change (DDL
     // or an online index build promoting `Populating`→`Online`).
-    let mut plan_cache = exec::EnginePlanCache::new();
+    let mut plan_cache = shared
+        .plan_cache
+        .lock()
+        .expect("INVARIANT: the plan cache's latch is not poisoned");
     // Whether an index build was pending at the end of the previous tick. A `true`→`false` transition
     // means a build just completed (an index promoted `Populating`→`Online`), which changes the
     // planner-visible catalog (`TxnCoordinator::catalog` now exposes the new index) and so must
@@ -1005,7 +1059,6 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // channel each tick so a retirement (which finalises the reader's auto-commit + closes its egress)
     // is processed promptly even if no client command arrives. Incremented at dispatch, decremented as
     // each retirement is processed.
-    let mut readers_inflight: u64 = 0;
     // The suspended inline statements (`rmp` task #372; bounded-queue generalization `rmp` #485 B1). An
     // inline `Run` whose bounded egress channel fills with a slow consumer draining is parked here
     // instead of blocking this thread on `row_tx.send`; the loop resumes each one batch per tick
@@ -1014,7 +1067,10 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // dispatching new commands while statements are parked (the #372 no-head-of-line-block property) —
     // so this is a FIFO `VecDeque`, bounded by `max_parked_inline`. The historical single-`Option` slot
     // silently clobbered the first parked statement when a second suspended (`rmp` #485 finding B1).
-    let mut parked: VecDeque<exec::InFlightInline> = VecDeque::new();
+    let mut parked = shared
+        .parked
+        .lock()
+        .expect("INVARIANT: the parked-statement latch is not poisoned");
     // Held in an `Option` so the terminal `Shutdown` can move the coordinator out to consume it for
     // the final flush (`TxnCoordinator::into_store` is by-value). It is always `Some` while the loop
     // is processing commands.
@@ -1069,7 +1125,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             &retire_rx,
             &coordinator,
             &mut open,
-            &mut readers_inflight,
+            &shared.readers_inflight,
             &metrics,
             &db_name,
             &degraded,
@@ -1132,11 +1188,11 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                 rx: &rx,
                 coordinator: &mut coordinator,
                 open: &mut open,
-                next_ticket: &mut next_ticket,
+                next_ticket: &shared.next_ticket,
                 plan_cache: &mut plan_cache,
                 extensions: &extensions,
                 dispatch: &dispatch,
-                readers_inflight: &mut readers_inflight,
+                readers_inflight: &shared.readers_inflight,
                 parked: &mut parked,
                 max_parked_inline,
                 result_buffer_capacity,
@@ -1222,7 +1278,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             || indexes_degraded
             || vector_blocked
             || ft_spatial_poisoned
-            || readers_inflight > 0
+            || shared.readers_inflight.load(Ordering::Relaxed) > 0
             || !parked.is_empty();
 
         let cmd = if timed {
@@ -1276,11 +1332,11 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             rx: &rx,
             coordinator: &mut coordinator,
             open: &mut open,
-            next_ticket: &mut next_ticket,
+            next_ticket: &shared.next_ticket,
             plan_cache: &mut plan_cache,
             extensions: &extensions,
             dispatch: &dispatch,
-            readers_inflight: &mut readers_inflight,
+            readers_inflight: &shared.readers_inflight,
             parked: &mut parked,
             max_parked_inline,
             result_buffer_capacity,
@@ -1322,7 +1378,7 @@ fn process_retirements<D: BlockDevice, S: LogSink>(
     retire_rx: &std::sync::mpsc::Receiver<read_pool::ReadRetirement>,
     coordinator: &Option<Arc<TxnCoordinator<D, S>>>,
     open: &mut OpenTxTable,
-    readers_inflight: &mut u64,
+    readers_inflight: &AtomicU64,
     metrics: &Metrics,
     db: &str,
     degraded: &EngineDegraded,
@@ -1333,7 +1389,12 @@ fn process_retirements<D: BlockDevice, S: LogSink>(
         if let Some(coord) = coordinator.as_deref() {
             finish_reader(coord, open, retirement, metrics, db, degraded);
         }
-        *readers_inflight = readers_inflight.saturating_sub(1);
+        // `fetch_update`, not `fetch_sub`: the original was a `saturating_sub`, and the two differ
+        // exactly at zero — `fetch_sub` wraps to `u64::MAX`, which would report an engine with
+        // eighteen quintillion readers in flight and make the drain barrier never finish.
+        let _ = readers_inflight.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            Some(n.saturating_sub(1))
+        });
         active_txns.publish(
             coordinator
                 .as_deref()
@@ -1511,7 +1572,7 @@ fn maintenance_interval_bytes(store_bytes: u64) -> u64 {
 ///
 /// Returns `Some(next_ticket + 1)` when `readers_inflight > 0`, and `None` otherwise. The `+ 1` is
 /// load-bearing: [`open_tx`] issues a ticket **post-increment** (`*next_ticket += 1; ticket =
-/// *next_ticket`), so the newest open transaction's ticket **equals** `next_ticket`; the barrier must be
+/// next_ticket.load(Ordering::Relaxed)`), so the newest open transaction's ticket **equals** `next_ticket`; the barrier must be
 /// strictly greater so that [`RecordStore::release_held`](graphus_storage::RecordStore::release_held) —
 /// which releases a held slot once `oldest_open_ticket >= barrier` — keeps the slot held while that
 /// newest reader is still the oldest open (a lost `+ 1` releases the slot under the newest reader's feet
@@ -2344,11 +2405,11 @@ struct ProcessCtx<'a, D: BlockDevice + Send + Sync + 'static, S: LogSink + Send 
     rx: &'a std::sync::mpsc::Receiver<EngineCommand>,
     coordinator: &'a mut Option<Arc<TxnCoordinator<D, S>>>,
     open: &'a mut OpenTxTable,
-    next_ticket: &'a mut u64,
+    next_ticket: &'a AtomicU64,
     plan_cache: &'a mut exec::EnginePlanCache,
     extensions: &'a Arc<graphus_cypher::extension::ExtensionRegistry>,
     dispatch: &'a read_pool::ReadDispatch<D, S>,
-    readers_inflight: &'a mut u64,
+    readers_inflight: &'a AtomicU64,
     parked: &'a mut VecDeque<exec::InFlightInline>,
     max_parked_inline: usize,
     result_buffer_capacity: usize,
@@ -2517,7 +2578,10 @@ fn process_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // freed slots are immediately reusable). Both are read here where `open`/`next_ticket`/
     // `readers_inflight` are in scope, so a GC-freed slot cannot be reused while a reader that predates
     // the free is still walking a chain through it.
-    let reuse_barrier = gc_reuse_barrier(*next_ticket, *readers_inflight);
+    let reuse_barrier = gc_reuse_barrier(
+        next_ticket.load(Ordering::Relaxed),
+        readers_inflight.load(Ordering::Relaxed),
+    );
     let oldest_open_ticket = open.keys().copied().min().unwrap_or(u64::MAX);
     maybe_run_maintenance(
         coordinator,
@@ -2544,11 +2608,11 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
     cmd: EngineCommand,
     coordinator: &mut Option<Arc<TxnCoordinator<D, S>>>,
     open: &mut OpenTxTable,
-    next_ticket: &mut u64,
+    next_ticket: &AtomicU64,
     plan_cache: &mut exec::EnginePlanCache,
     extensions: &Arc<graphus_cypher::extension::ExtensionRegistry>,
     dispatch: &read_pool::ReadDispatch<D, S>,
-    readers_inflight: &mut u64,
+    readers_inflight: &AtomicU64,
     inflight: &mut Option<exec::InFlightInline>,
     result_buffer_capacity: usize,
     metrics: &Arc<Metrics>,
@@ -2728,7 +2792,10 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             // `rmp` #588: an explicit `CHECKPOINT DATABASE` runs the same reader-unsafe GC reclaim as the
             // background cadence, so it must bracket the pass with the reuse barrier too — otherwise a
             // slot it frees could be reused while a concurrent off-thread reader walks a chain through it.
-            let reuse_barrier = gc_reuse_barrier(*next_ticket, *readers_inflight);
+            let reuse_barrier = gc_reuse_barrier(
+                next_ticket.load(Ordering::Relaxed),
+                readers_inflight.load(Ordering::Relaxed),
+            );
             let oldest_open_ticket = open.keys().copied().min().unwrap_or(u64::MAX);
             let out = handle_checkpoint(coord, reuse_barrier, oldest_open_ticket, metrics, db);
             // A manual (admin-triggered) checkpoint that succeeds is proof reclamation is making
@@ -2768,7 +2835,10 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             // off-thread reader could still be walking through. Bracket the batch with the reuse barrier
             // so any freed slot is shadow-held from reuse until predating readers retire (ingest itself
             // frees nothing, so the barrier only bites at the reclaiming `End`).
-            let reuse_barrier = gc_reuse_barrier(*next_ticket, *readers_inflight);
+            let reuse_barrier = gc_reuse_barrier(
+                next_ticket.load(Ordering::Relaxed),
+                readers_inflight.load(Ordering::Relaxed),
+            );
             let oldest_open_ticket = open.keys().copied().min().unwrap_or(u64::MAX);
             coord.set_reuse_barrier(reuse_barrier);
             let out = bulk_load::handle_bulk_import_batch(coord, loading_session, batch);
@@ -2899,7 +2969,7 @@ fn run_statement_isolated<
     privileges: Option<EffectivePrivileges>,
     extensions: &Arc<graphus_cypher::extension::ExtensionRegistry>,
     dispatch: &read_pool::ReadDispatch<D, S>,
-    readers_inflight: &mut u64,
+    readers_inflight: &AtomicU64,
     inflight: &mut Option<exec::InFlightInline>,
     result_buffer_capacity: usize,
     metrics: &Arc<Metrics>,
@@ -2941,7 +3011,7 @@ fn run_statement_isolated<
             // `rmp` task #575-g.1: the count of reads already in flight, so the dispatch site can size
             // this read's adaptive morsel width (a snapshot BEFORE this read is counted — it becomes the
             // `+ 1` in `reader_pool_morsel_width`). Read on the engine thread; never mutated here.
-            *readers_inflight,
+            readers_inflight.load(Ordering::Relaxed),
             result_buffer_capacity,
             metrics,
             db,
@@ -2958,7 +3028,9 @@ fn run_statement_isolated<
         Ok(outcome) => match outcome {
             // A read dispatched off-thread retires later (it is not yet finalised); track it so the
             // engine loop polls the retirement channel until it returns.
-            exec::RunOutcome::OffThreadReader => *readers_inflight += 1,
+            exec::RunOutcome::OffThreadReader => {
+                readers_inflight.fetch_add(1, Ordering::Relaxed);
+            }
             // The egress channel filled with a slow consumer draining (`rmp` task #372): hand the
             // suspended statement back through this dispatch's `inflight` slot. `inflight` is a
             // **per-dispatch** `Option` (a fresh `None` for each `Run`; the engine loop drains it into
@@ -3726,14 +3798,13 @@ fn handle_constraint_ddl<D: BlockDevice, S: LogSink>(
 fn open_tx<D: BlockDevice, S: LogSink>(
     coordinator: &TxnCoordinator<D, S>,
     open: &mut OpenTxTable,
-    next_ticket: &mut u64,
+    next_ticket: &AtomicU64,
     mode: AccessMode,
     auto_commit: bool,
     begin_nanos: u64,
 ) -> TxTicket {
     let txn = coordinator.begin_at(mode.isolation(), begin_nanos);
-    *next_ticket += 1;
-    let ticket = *next_ticket;
+    let ticket = next_ticket.fetch_add(1, Ordering::Relaxed) + 1;
     open.insert(
         ticket,
         OpenTx {
@@ -3888,11 +3959,11 @@ fn pipelined_group_commit<
     rx: &std::sync::mpsc::Receiver<EngineCommand>,
     coordinator: &mut Option<Arc<TxnCoordinator<D, S>>>,
     open: &mut OpenTxTable,
-    next_ticket: &mut u64,
+    next_ticket: &AtomicU64,
     plan_cache: &mut exec::EnginePlanCache,
     extensions: &Arc<graphus_cypher::extension::ExtensionRegistry>,
     dispatch: &read_pool::ReadDispatch<D, S>,
-    readers_inflight: &mut u64,
+    readers_inflight: &AtomicU64,
     commit_batch: &mut Vec<PendingCommit>,
     pending_cmd: &mut Option<EngineCommand>,
     parked: &mut VecDeque<exec::InFlightInline>,
@@ -4114,11 +4185,11 @@ fn drain_commit_batch<
     rx: &std::sync::mpsc::Receiver<EngineCommand>,
     coordinator: &mut Option<Arc<TxnCoordinator<D, S>>>,
     open: &mut OpenTxTable,
-    next_ticket: &mut u64,
+    next_ticket: &AtomicU64,
     plan_cache: &mut exec::EnginePlanCache,
     extensions: &Arc<graphus_cypher::extension::ExtensionRegistry>,
     dispatch: &read_pool::ReadDispatch<D, S>,
-    readers_inflight: &mut u64,
+    readers_inflight: &AtomicU64,
     commit_batch: &mut Vec<PendingCommit>,
     pending_cmd: &mut Option<EngineCommand>,
     parked: &mut VecDeque<exec::InFlightInline>,
@@ -4570,7 +4641,7 @@ mod maintenance_tests {
     /// `rmp` #588 (sprint-52 B1) GATE: the GC reuse barrier must **strictly exceed** the newest open
     /// transaction's ticket, and must be `None` when no off-thread reader is in flight.
     ///
-    /// [`open_tx`] issues a ticket **post-increment** (`*next_ticket += 1; ticket = *next_ticket`), so
+    /// [`open_tx`] issues a ticket **post-increment** (`*next_ticket += 1; ticket = next_ticket.load(Ordering::Relaxed)`), so
     /// the newest open transaction's ticket EQUALS `next_ticket`. [`RecordStore::release_held`] releases
     /// a slot held at barrier `b` once `oldest_open_ticket >= b`; if the barrier merely equalled the
     /// newest ticket, that reader — while it is the oldest open — would release the slot under its own
@@ -4877,7 +4948,7 @@ mod max_transaction_age_tests {
     fn reaps_over_age_explicit_txn_only() {
         let coord = fresh_coord();
         let mut open: OpenTxTable = OpenTxTable::new();
-        let mut next_ticket: u64 = 0;
+        let next_ticket = AtomicU64::new(0);
         let cap = std::time::Duration::from_secs(60);
         let now = 61 * 1_000_000_000u64; // 61s in nanos — past the cap
         let clock = clock_at(now);
@@ -4885,28 +4956,14 @@ mod max_transaction_age_tests {
         let mut gauge = ActiveTxnGauge::new(Arc::clone(&metrics), Arc::from("test"));
 
         // Over-age explicit reader (begin at t=0 ⇒ age 61s ≥ cap).
-        let aged_explicit = open_tx(
-            &coord,
-            &mut open,
-            &mut next_ticket,
-            AccessMode::Read,
-            false,
-            0,
-        );
+        let aged_explicit = open_tx(&coord, &mut open, &next_ticket, AccessMode::Read, false, 0);
         // Over-age auto-commit statement (same age, but excluded from the sweep).
-        let aged_auto = open_tx(
-            &coord,
-            &mut open,
-            &mut next_ticket,
-            AccessMode::Read,
-            true,
-            0,
-        );
+        let aged_auto = open_tx(&coord, &mut open, &next_ticket, AccessMode::Read, true, 0);
         // Young explicit reader (begin just now ⇒ age 1ns ≪ cap).
         let young_explicit = open_tx(
             &coord,
             &mut open,
-            &mut next_ticket,
+            &next_ticket,
             AccessMode::Read,
             false,
             now - 1,
@@ -4949,19 +5006,12 @@ mod max_transaction_age_tests {
     fn disabled_cap_reaps_nothing() {
         let coord = fresh_coord();
         let mut open: OpenTxTable = OpenTxTable::new();
-        let mut next_ticket: u64 = 0;
+        let next_ticket = AtomicU64::new(0);
         let clock = clock_at(u64::MAX); // arbitrarily far in the future
         let metrics = Arc::new(Metrics::new());
         let mut gauge = ActiveTxnGauge::new(Arc::clone(&metrics), Arc::from("test"));
 
-        let _ = open_tx(
-            &coord,
-            &mut open,
-            &mut next_ticket,
-            AccessMode::Read,
-            false,
-            0,
-        );
+        let _ = open_tx(&coord, &mut open, &next_ticket, AccessMode::Read, false, 0);
         assert_eq!(coord.active_count(), 1);
 
         let coordinator = Some(Arc::new(coord));
