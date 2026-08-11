@@ -573,18 +573,24 @@ fn reconcile(acked: &BTreeSet<i64>, present: &BTreeSet<i64>) -> Option<String> {
 /// show up as present and `reconcile` would report it as "a refused transaction left a trace" —
 /// which is the correct diagnosis of exactly that bug.
 #[test]
-// FAILS TODAY, AND THAT IS THE FINDING (`rmp` #1053 and #1052). At `engine_workers = 8` this gate
-// reports a reopened store carrying `UndoSlot { kind: Commit, DeltaCountMismatch { recorded: 3,
-// actual: 4 } }` on several COMMITTED slots — durable corruption of the undo area that survived WAL
-// recovery (#1053) — and two engine workers panic simultaneously on `statistics count decrement
-// underflow at absent key` (#1052). The IDENTICAL workload and the IDENTICAL 16 client threads pass
-// at `engine_workers = 1` in 1.06 s, so this is the worker count and not the workload.
+// FAILS TODAY, AND THAT IS THE FINDING (`rmp` #1053). At `engine_workers = 8` this gate reports a
+// reopened store carrying `UndoSlot { kind: Commit, DeltaCountMismatch { recorded: 3, actual: 4 } }`
+// on several COMMITTED slots — durable corruption of the undo area that survived WAL recovery. The
+// IDENTICAL workload and the IDENTICAL 16 client threads pass at `engine_workers = 1` in 1.06 s, so
+// this is the worker count and not the workload.
+//
+// `rmp` #1052 is FIXED and no longer contributes: the two engine workers that used to panic
+// simultaneously on `statistics count decrement underflow at absent key` no longer do — 14 runs of
+// this gate in a row came back with neither that panic nor any other engine-thread panic. Its
+// regression guards are `graphus-storage`'s `catalog_counts_multi_writer_1052` (which asserts the
+// counter VALUE, so it fails in a release build too) and `graphus-dst`'s
+// `det_scheduler_catalog_counts_1052`.
 //
 // Ignored by an EXPLICIT decision of the project owner (2026-08-11), as a named exception to
-// CLAUDE.md's "Tests MUST NOT be created with skip": the suite stays green while #1052 and #1053 are
-// fixed, rather than staying red for the whole window. The exception is bounded — the task that
-// fixes each defect REMOVES this attribute, and neither task may close while it is still here.
-#[ignore = "rmp #1052/#1053: fails at engine_workers > 1; un-ignored by the task that fixes them"]
+// CLAUDE.md's "Tests MUST NOT be created with skip": the suite stays green while #1053 is fixed,
+// rather than staying red for the whole window. The exception is bounded — the task that fixes
+// #1053 REMOVES this attribute, and it may not close while it is still here.
+#[ignore = "rmp #1053: fails at engine_workers > 1; un-ignored by the task that fixes it"]
 fn no_acknowledged_commit_is_lost_or_invented_across_a_restart() {
     const SHARDS: i64 = 4;
     const PER_CLIENT: i64 = 40;

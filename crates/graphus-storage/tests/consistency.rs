@@ -634,7 +634,7 @@ fn check_store_cold_open_contract_holds_on_fresh_open() {
 #[test]
 #[should_panic(expected = "cold-open contract violated")]
 fn cold_open_assert_panics_on_warm_store() {
-    let mut s = fresh(64);
+    let s = fresh(64);
     let txn = TxnId(1);
     s.begin(txn);
     // A write with no flush leaves dirty resident pages: the pool is warm.

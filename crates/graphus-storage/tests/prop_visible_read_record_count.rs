@@ -67,7 +67,7 @@ fn fresh() -> Store {
 /// every one of those commits.
 fn node_with_overwrites(overwrites: u64) -> (Store, u64, u32, Snapshot) {
     assert!(overwrites > 0);
-    let mut store = fresh();
+    let store = fresh();
     let key = store
         .intern_token(Namespace::PropKey, "batch_seq")
         .expect("intern propkey");
@@ -208,7 +208,7 @@ fn a_visible_read_costs_exactly_one_record_in_each_store() {
 #[test]
 fn distinct_keys_still_cost_one_record_read_each() {
     for k in [8u64, 64, 512] {
-        let mut store = fresh();
+        let store = fresh();
         let keys: Vec<u32> = (0..k)
             .map(|i| {
                 store

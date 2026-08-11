@@ -100,6 +100,16 @@ cargo test --profile gate -p graphus-storage --test scan_polarity_barrier
 step '4/10 property visible-read record count — rmp #967 AC2 (needs --features read-probe)'
 cargo test --profile gate -p graphus-storage --features read-probe --test prop_visible_read_record_count
 
+step '4b/10 catalog counters in RELEASE — rmp #1052 (debug_assertions OFF is where it is silent)'
+# The counters this suite certifies are guarded in the store by a `debug_assert!`, which the gate
+# profile compiles IN — so a regression there fails on the assertion, and the suite's real claim (the
+# NUMBER is right) is never the thing that failed. In a release build the same code takes its
+# saturating rail in silence and writes a wrong cardinality into the durable catalog, which `rmp` #866
+# then serves as the answer to `count()`. That is the failure that ships, so it gets its own run with
+# the assertions compiled out: here the only thing standing between a regression and a green gate is
+# the asserted value. Measured against each reverted half of the `rmp` #1052 fix, this run fails.
+cargo test --release -p graphus-storage --test catalog_counts_multi_writer_1052
+
 # `rmp` #973 puts the DST's thread interleaving under a seeded scheduler, so a concurrency defect
 # reproduces from a seed the way a crash already does. Its suites are behind the opt-in `det-sched`
 # cargo feature and declare `required-features`, so `cargo test --workspace` does not even COMPILE
@@ -122,6 +132,8 @@ cargo test --profile gate -p graphus-dst --features det-sched --lib detsched::
 cargo test --profile gate -p graphus-dst --features det-sched --test det_scheduler_gc_reader_811
 cargo test --profile gate -p graphus-dst --features det-sched --test det_scheduler_elle_oracle
 cargo test --profile gate -p graphus-dst --features det-sched --test det_scheduler_multi_writer_1034
+cargo test --profile gate -p graphus-dst --features det-sched --test det_scheduler_double_rollback_1051
+cargo test --profile gate -p graphus-dst --features det-sched --test det_scheduler_catalog_counts_1052
 
 # `rmp` #973 acceptance criterion 3 — the production cost is ZERO — asserted mechanically rather
 # than argued. The release build below reproduces the container image's `-p graphus-server` package

@@ -3926,6 +3926,45 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // PREPARE: append the `COMMIT` record with NO `fdatasync` (the group-commit deferral, `rmp`
         // #528). The caller hardens the whole batch with a single `harden_wal`.
         let commit_lsn = self.wal.with(|w| w.commit_at_no_sync(txn, commit_ts))?;
+        // THE COUNT DELTA IS SETTLED HERE, and not with the rest of the bookkeeping below (`rmp`
+        // #1052).
+        //
+        // [`committed_statistics`](Self::committed_statistics) reads "has an active-set entry" as "not
+        // yet committed" and withdraws that transaction's delta from the image it persists. From this
+        // line on that reading is FALSE: the `COMMIT` record is in the log, so `txn` is committed and a
+        // concurrent committer's checkpoint must persist its rows. Leaving the delta in place until
+        // `settle_committed_txn` a few lines below left a window in which exactly that happened, and
+        // the result is NOT transient: `RecordStore::checkpoint` bounds redo and never writes the
+        // catalog, so the ONLY thing that rewrites the counters is the next commit's own
+        // `checkpoint_meta`. Stop writing at the wrong moment and the durable catalog under-counts a
+        // committed transaction for good — which a reopen then serves as the answer to `count()`
+        // (`rmp` #866). Measured on the multi-writer certification workload: 12 runs in 200 came back
+        // short by one transaction's delta with everything else in this task already fixed.
+        //
+        // Clearing rather than withdrawing, because nothing is owed: the delta's effect on the LIVE
+        // counters is now permanent and correct, and what is being retired is only the claim that it is
+        // still pending. Empty is also what makes
+        // [`counts_match_committed_image`](Self::counts_match_committed_image) tell the truth in this
+        // window — from here the live counters DO equal the committed image as far as `txn` goes.
+        //
+        // Under the catalog latch, which is what makes it a settle rather than a race: the reader it
+        // has to be atomic against takes that same latch to sample the counters and the deltas
+        // together.
+        //
+        // Sound against a crash before the deferred `fdatasync`: the image a concurrent committer
+        // writes with `txn`'s rows in it is on a page whose WAL frames belong to THAT committer, whose
+        // own `COMMIT` record is later in the log than this one. So the image is durable only if this
+        // commit is durable, and if that committer's record never hardens, recovery undoes its page
+        // write and the previous image stands.
+        //
+        // A rollback after this point is not a case: every remaining step is infallible, and were one
+        // ever added, withdrawing an empty delta is the correct behaviour for a committed transaction.
+        let active = &self.active;
+        self.with_catalog_mut(|_catalog| {
+            // The catalog itself is not touched — the latch is taken for the exclusion it gives
+            // against `committed_statistics`, which samples the counters and the deltas under it.
+            active.with_existing(txn, |a| a.counts = CountDelta::default());
+        });
         // COMMIT SETTLED. Every fallible step has succeeded, so — and not one line earlier — this
         // transaction becomes committed-visible and its bookkeeping is released.
         //
@@ -6503,6 +6542,28 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// call site into a failing test. (It also makes the [`SYSTEM_TXN`] guard the other `note_*`
     /// helpers carry unnecessary here: the system transaction is never in `active`, and it never
     /// mutates a counter.)
+    ///
+    /// # The two halves are ONE hold, and splitting them is a defect (`rmp` #1052)
+    ///
+    /// Applying to the live counters and recording in the transaction's delta look like two
+    /// independent bookkeeping steps and are not: the only reader of either
+    /// ([`committed_statistics`](Self::committed_statistics)) reads their DIFFERENCE, so a state in
+    /// which one has moved and the other has not is a state no image may be computed from. This ran
+    /// as two holds — the catalog latch, then an active-table shard mutex — until #1052.
+    ///
+    /// It is worth spelling out because the surviving half of the window is easy to argue away.
+    /// `committed_statistics` now samples both under the catalog latch, and the APPLY takes that same
+    /// latch exclusively, so it cannot land inside a sample. The RECORD does not — its shard mutex is
+    /// unrelated — so with the two split, a writer whose apply was in the image and whose record had
+    /// not yet reached its shard when the fold passed it leaves an uncommitted row in a committed
+    /// image. That is a silent over-count rather than the underflow #1052 was reported as, which is
+    /// exactly why it needs writing down: the tests catch it far less often than they catch its
+    /// louder sibling (measured, `catalog_counts_multi_writer_1052`), so the argument, not the sweep,
+    /// is what holds this together.
+    ///
+    /// The nesting is the established one: rank 10 is the outermost latch and the active table's
+    /// shards are inner (`apply_schema_undo` takes all sixteen under it), and no path anywhere takes
+    /// a shard first and the catalog second.
     fn count_bump(&self, txn: TxnId, key: CountKey, increment: bool) {
         debug_assert!(
             self.is_txn_active(txn),
@@ -6510,9 +6571,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
              never be withdrawn, so the counter would drift permanently"
         );
         let delta = if increment { 1 } else { -1 };
-        self.with_catalog_mut(|c| Arc::make_mut(&mut c.statistics).apply_count_delta(key, delta));
-        self.active.with_existing(txn, |active| {
-            active.counts.record(key, delta);
+        // ONE hold over BOTH halves (`rmp` #1052). See [`CountDelta`] for why this is not a style
+        // preference: the live counter and the pending delta are one state, and every reader of the
+        // pair subtracts one from the other.
+        let active = &self.active;
+        self.with_catalog_mut(|c| {
+            Arc::make_mut(&mut c.statistics).apply_count_delta(key, delta);
+            active.with_existing(txn, |a| a.counts.record(key, delta));
         });
     }
 
@@ -8048,30 +8113,39 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // ------------------------------------------------------------------------------------------
         // UNDO SETTLED (`rmp` #955). Nothing below can fail.
         // ------------------------------------------------------------------------------------------
-        let ActiveTxn {
-            schema_undo,
-            counts,
-            ..
-        } = self.active.remove(txn).unwrap_or_default();
-        // The counts twin of the delta replay: this transaction's own increments and decrements,
-        // withdrawn from the live counters. Commutative and exactly invertible, so order is
-        // irrelevant and no image of the counters is needed (`rmp` #866).
-        self.with_catalog_mut(|c| counts.withdraw_from(Arc::make_mut(&mut c.statistics)));
-        if !schema_undo.is_empty() {
-            // Catalog DDL is not WAL-logged (it becomes durable only through the commit-time
-            // `checkpoint_meta`), so it has its own per-entry logical undo — the same shape as the
-            // delta replay, applied to the live schema rather than to a restored copy (`rmp` #734).
-            // ONE hold over the replay: the schema map and the generations it unwinds are two
-            // halves of one state, and a reader between them would see an entry whose generation
-            // belongs to a mutation that has already been undone (`rmp` #1015).
-            let active = &self.active;
-            self.with_catalog_mut(|c| {
-                let CatalogState {
-                    statistics,
-                    schema_last_seq,
-                    catalog_dirty,
-                    ..
-                } = c;
+        // ONE hold over the release of this transaction's bookkeeping AND the undo of what that
+        // bookkeeping describes (`rmp` #1052).
+        //
+        // The counts half is the reason the hold has to span the `remove` as well. It withdraws this
+        // transaction's own increments and decrements from the live counters — commutative and exactly
+        // invertible, so order among transactions is irrelevant and no image of the counters is needed
+        // (`rmp` #866) — but between taking the delta out of the active table and withdrawing it, a
+        // concurrent [`committed_statistics`](Self::committed_statistics) sees the live counters still
+        // carrying the delta and the active table no longer holding it, and bakes an aborted
+        // transaction's rows into the durable catalog. Reverse the two and the same reader withdraws
+        // the delta twice. Taking the two as one transition is the only ordering that is neither.
+        //
+        // The schema half needs the same hold for its own reason (`rmp` #1015): the schema map and the
+        // generations it unwinds are two halves of one state, and a reader between them would see an
+        // entry whose generation belongs to a mutation that has already been undone. Catalog DDL is not
+        // WAL-logged (it becomes durable only through the commit-time `checkpoint_meta`), so it has its
+        // own per-entry logical undo — the same shape as the delta replay, applied to the live schema
+        // rather than to a restored copy (`rmp` #734).
+        let active = &self.active;
+        self.with_catalog_mut(|c| {
+            let ActiveTxn {
+                schema_undo,
+                counts,
+                ..
+            } = active.remove(txn).unwrap_or_default();
+            let CatalogState {
+                statistics,
+                schema_last_seq,
+                catalog_dirty,
+                ..
+            } = c;
+            counts.withdraw_from(Arc::make_mut(statistics));
+            if !schema_undo.is_empty() {
                 Self::apply_schema_undo(
                     Arc::make_mut(statistics),
                     schema_last_seq,
@@ -8079,8 +8153,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                     &schema_undo,
                 );
                 *catalog_dirty = true;
-            });
-        }
+            }
+        });
         Ok(())
     }
 
@@ -8130,22 +8204,15 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // list already IS the correct state, and the only thing this rollback owes it is the
         // withdrawal of its own pushes below.
         //
-        // The live-record COUNTERS still have the old hazard, because `reload_catalog` still reverts
-        // the whole `Statistics` wholesale (`rmp`
-        // #866). They move eagerly at write time, so the in-memory value is "durable image + every
-        // in-flight transaction's delta", and `reload_catalog` below throws all of that away. Snapshot
-        // them now — the snapshot already reflects every CONCURRENT open transaction's increments and
-        // decrements — so that after the reload the counters can be restored to this image MINUS this
-        // transaction's own delta (`aborted_counts`, withdrawn below). That is the free-list
-        // `pre_free`-minus-`aborted_freed_ids` shape, applied to the counts.
-        //
-        // Captured UNCONDITIONALLY, unlike the `rmp` #534 `pre_statistics` below. That capture is
-        // guarded on "some transaction holds pending DDL", but a plain data-writing transaction holds
-        // pending COUNTS with an empty `schema_undo`, so the guard does not cover this half. Cloning
-        // only the counts (never the twelve DDL maps) keeps the unconditional capture cheap: it is
-        // bounded by the number of distinct labels/relationship types in the schema, not by the number
-        // of records the transaction touched.
-        let pre_counts = self.with_catalog(|c| c.statistics.counts_image());
+        // The live-record COUNTERS are NOT snapshotted either, since `rmp` #1052, and now for exactly
+        // the same reason: `reload_catalog` no longer reverts them, so the live counters already ARE
+        // the correct state and this rollback owes them only the withdrawal of its own delta
+        // (`aborted_counts`, below). The capture that used to stand here — a `counts_image()` taken
+        // before the whole physical undo and reinstalled after it — was the free list's own
+        // `pre_free` defect in the counts: a concurrent transaction's increment landing anywhere
+        // inside that window was reverted by the restore, while its `CountDelta` survived to be
+        // withdrawn later against an image that no longer held it. That is what produced
+        // `statistics count decrement underflow at absent key` on two engine threads at once.
         // The physical-id high-water marks are NOT captured either (`rmp` #1023), and for the same
         // reason as the free lists: `reload_catalog` no longer lowers them, so there is nothing to
         // floor back. The capture and the floor together only ever computed `max(durable, in-memory)`,
@@ -8255,21 +8322,29 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // entry so we can withdraw this transaction's OWN free-list pushes below (`rmp` #578): only a
         // GC pass populates `freed_ids`; a normal write transaction's is empty. Also take its `rmp`
         // #581 pop bookkeeping (`popped_ids` / `popped_prop_owners`) so a normal write transaction's
-        // own reused-id pops can be RECLAIMED to the free list after the restore below.
-        // Also take its `rmp` #866 pending COUNT delta, withdrawn from the pre-rollback counter image
-        // below.
+        // own reused-id pops can be RECLAIMED to the free list below.
+        //
+        // Its `rmp` #866 pending COUNT delta is withdrawn from the live counters HERE, in the same
+        // hold that takes the entry out of the active table (`rmp` #1052) — the logical path's
+        // reasoning applies unchanged: between the two, a concurrent checkpoint sees the counters still
+        // carrying a delta the active table no longer holds and bakes an aborted transaction's rows
+        // into the durable catalog; reverse them and the same reader withdraws it twice.
+        let active = &self.active;
         let ActiveTxn {
             created: aborted_created,
             freed_ids: aborted_freed_ids,
             popped_ids: aborted_popped_ids,
             popped_prop_owners: aborted_prop_owners,
             schema_undo: aborted_schema_undo,
-            counts: aborted_counts,
             commit_slot: aborted_commit_slot,
             undo_links: aborted_undo_links,
             undo_slab: aborted_undo_slab,
             ..
-        } = self.active.remove(txn).unwrap_or_default();
+        } = self.with_catalog_mut(|c| {
+            let entry = active.remove(txn).unwrap_or_default();
+            entry.counts.withdraw_from(Arc::make_mut(&mut c.statistics));
+            entry
+        });
         // The remainder is as reusable after an abort as after a commit: none of its ids was ever
         // written (`rmp` #1011). Handed back BEFORE the catalog reload below, whose allocator reset is
         // exactly what made a SHARED cursor unsafe to keep — a slab of already-mapped ids is not.
@@ -8324,47 +8399,30 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             }
         }
         self.with_catalog_mut(|c| c.tokens = pre_tokens);
-        // Restore the live-record COUNTERS to their pre-rollback in-memory image, then withdraw
-        // exactly this transaction's own delta (`rmp` #866) — the counts twin of the `pre_free` minus
-        // `aborted_freed_ids` free-list restore below.
-        //
-        // `reload_catalog` has just reverted them wholesale to the durable image, which is right only
-        // when this transaction is the only one that ever moved them. Under statement-granularity
-        // interleaving it is wrong in both directions, permanently:
-        //
-        // * a CONCURRENT open transaction's increments live ONLY in memory (the catalog is
-        //   checkpointed at commit), so the wholesale revert WIPES them — and that transaction's own
-        //   commit then checkpoints the wiped value, durably under-counting;
-        // * conversely, a concurrent transaction that COMMITTED while this one was open checkpointed
-        //   the live counter, which already carried THIS transaction's uncommitted increments, so the
-        //   durable image this reload restores hands them back as though they had committed, durably
-        //   over-counting. (`committed_statistics` now strips open transactions' counts, so new
-        //   checkpoints no longer bake them; restoring the pre-rollback image rather than the durable
-        //   one keeps the rollback correct regardless of what older checkpoints hold.)
-        //
-        // Withdrawing `aborted_counts` from the pre-rollback image discards precisely this
-        // transaction's own effect and nothing else. Ordering is irrelevant — integer counts are
+        // The live-record COUNTERS were settled above, at the instant this transaction's entry left the
+        // active table (`rmp` #866 / #1052). What used to stand here — reinstall a `counts_image()`
+        // captured before the undo, then withdraw this transaction's delta from it — is gone in both
+        // halves: `reload_catalog` no longer reverts the counters, so there is nothing to reinstall,
+        // and reinstalling a pre-window image was itself the defect (it reverted whatever a concurrent
+        // writer did inside the window). Withdrawing the delta discards precisely this transaction's
+        // own effect and nothing else. Ordering among transactions is irrelevant — integer counts are
         // commutative and every delta is exactly invertible — which is why this needs none of the
         // generation/witness/splice machinery the schema undo below requires (see `CountDelta`).
-        self.with_catalog_mut(|c| {
-            Arc::make_mut(&mut c.statistics).restore_counts(pre_counts);
-            aborted_counts.withdraw_from(Arc::make_mut(&mut c.statistics));
-        });
         // `rmp` #534: superset-preserve the schema-catalog half of `Statistics` for a CONCURRENT open
         // transaction (`pre_statistics` is `Some` exactly when one was open at capture, above).
-        // `reload_catalog` reverted the whole `Statistics` to the durable image (counts AND schema);
-        // the schema equals `pre_statistics`'s only when nothing is pending. When it DIVERGES, a
-        // concurrent transaction holds an uncommitted catalog DDL change — restore it, and keep the
-        // store flagged catalog-dirty so that transaction's later commit does NOT take the `rmp` #529
-        // read-only fast path and drop it (overriding the `catalog_dirty = false` above).
+        // `reload_catalog` reverted the SCHEMA half of `Statistics` to the durable image (since `rmp`
+        // #1052 it reverts nothing else); the schema equals `pre_statistics`'s only when nothing is
+        // pending. When it DIVERGES, a concurrent transaction holds an uncommitted catalog DDL change —
+        // restore it, and keep the store flagged catalog-dirty so that transaction's later commit does
+        // NOT take the `rmp` #529 read-only fast path and drop it (overriding the
+        // `catalog_dirty = false` above).
         //
         // This block touches ONLY the schema half: `adopt_schema_from` moves the twelve DDL maps and
-        // leaves the counters exactly as the `rmp` #866 restore above left them, which is the
-        // pre-rollback image minus this transaction's own count delta. (The comment that used to
-        // stand here said the counts "stay at the durable image ... correctly discarding this
-        // aborting transaction's create/delete increments". That was true only when no other
-        // transaction was open — the very case the rest of this method exists to handle — and it is
-        // the defect #866 closes.)
+        // leaves the counters exactly as the withdrawal above left them, which is the live image minus
+        // this transaction's own count delta. (The comment that used to stand here said the counts
+        // "stay at the durable image ... correctly discarding this aborting transaction's create/delete
+        // increments". That was true only when no other transaction was open — the very case the rest
+        // of this method exists to handle — and it is the defect #866 closes.)
         //
         // A *rolling-back* transaction's OWN pending DDL is removed from that restored image first
         // (`rmp` #734): `apply_schema_undo` walks this transaction's per-entry undo log newest-first,
@@ -8731,17 +8789,41 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // own deltas instead of reverting shared state.
         let mut catalog = self.catalog_write();
         catalog.tokens = Arc::new(meta.tokens);
-        // Restore the whole `Statistics` from the durable catalog (`rmp` task #79 / #81). This is a
-        // WHOLESALE revert of both halves — the live-record counters and the schema-catalog DDL maps —
-        // and, exactly like the id high-water / free-list restore above, it is only ever *part* of the
-        // answer: it drops every in-memory change since the last checkpoint, including changes that
-        // belong to a CONCURRENT still-open transaction rather than to the one rolling back. Both
-        // halves are therefore layered back on by `rollback`, which is this method's only caller:
-        // `restore_counts` + the aborting transaction's `CountDelta` withdrawal for the counters
-        // (`rmp` #866), and `adopt_schema_from` + `apply_schema_undo` for the schema (`rmp` #534 /
-        // #734). Do NOT read this line as "a rollback discards the aborting transaction's counts": it
-        // discards *everybody's*, and the caller puts the others back.
-        catalog.statistics = Arc::new(meta.statistics);
+        // THE LIVE-RECORD COUNTERS ARE PRESERVED (`rmp` #1052) — the third field to join the page map
+        // (#721) and the physical allocators (#1023) in not being reverted, and for the same reason.
+        //
+        // Only the SCHEMA half of `Statistics` comes from the durable catalog here. The counters used
+        // to come from it too, and the caller then put back an image it had captured ~200 lines and one
+        // whole physical undo earlier (`pre_counts` + `restore_counts`). The end state was right for a
+        // lone writer and WRONG under several: a counter mutation another transaction made anywhere
+        // inside that window was captured by nobody and reverted by this line, so the live counters
+        // silently LOST it while that transaction's `CountDelta` — the record of what it is owed —
+        // stayed in the active table. Every later reader of the pair then underflowed against an image
+        // that no longer contained what it was withdrawing: the transaction's own rollback
+        // (`counts.withdraw_from`) and every concurrent checkpoint
+        // ([`committed_statistics`](Self::committed_statistics)) alike. That is the second half of
+        // `rmp` #1052, and it is the `rmp` #1023 free-list argument verbatim: restoring a snapshot
+        // taken before the window does not merely preserve, it REVERTS whatever happened inside it.
+        //
+        // Preserving is not an approximation of the old answer, it IS the answer. A counter moves
+        // eagerly at write time, so the live value is "committed image + every in-flight transaction's
+        // delta", and every delta is exactly invertible by its owner. What genuinely belongs to this
+        // rollback is therefore its OWN delta and nothing else, which is all the caller now withdraws —
+        // the `remove_free_id` / `reclaim_aborted_pops` shape, applied to the counts.
+        //
+        // The SCHEMA half keeps the wholesale revert: a DDL entry holds an opaque VALUE on unversioned
+        // state, so it has no invertible delta and the caller must layer a concurrent transaction's
+        // back on (`adopt_schema_from` + `apply_schema_undo`, `rmp` #534 / #734). Do NOT read this line
+        // as "a rollback discards the aborting transaction's DDL": it discards *everybody's*, and the
+        // caller puts the others back.
+        //
+        // The capture and the install are ONE hold, which is what makes this immune to the window it
+        // closes: no concurrent `count_bump` can slip between them, because that too takes this latch
+        // (`rmp` #1052).
+        let live_counts = catalog.statistics.counts_image();
+        let mut statistics = meta.statistics;
+        statistics.restore_counts(live_counts);
+        catalog.statistics = Arc::new(statistics);
         // The catalog is only ever checkpointed at commit, so during an open transaction the chain
         // already matches disk; reload (rollback / recovery) restores the durable committed chain.
         catalog.meta_chain = meta_chain;
@@ -12134,45 +12216,77 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// every workload that is not interleaving writes across statements — this is exactly the clone it
     /// always was, plus one `is_empty` check per open transaction.
     fn committed_statistics(&self, committing: TxnId) -> Statistics {
-        let mut committed = self.with_catalog(|c| (*c.statistics).clone());
-        // Counts half (`rmp` #866). Order-independent, but NOT because "integer deltas commute" on its
-        // own: `add_keyed`/`add_total` saturate at 0, and saturation does not commute. It holds because
-        // an intermediate withdrawal can never go negative — each negative unit in a delta is a
-        // distinct entity or label bit that transaction removed, and two open transactions cannot have
-        // removed the same one. Since `rmp` #971 exactly one mechanism makes that true —
-        // `ensure_chain_head_unheld`, reached by every entity-removal path through
-        // `note_entity_deleted` → `link_delta`, and by every label removal through the check
-        // `remove_label` now runs BEFORE its idempotent no-op exit. Before #971 the label half of this
-        // argument rested on that no-op exit rather than on any conflict check, which was an accident
-        // of ordering; naming the mechanism is what makes it an argument. So no ordering of the
-        // withdrawals can reach the saturating rail, and the sum over a HashMap's unstable iteration
-        // order is deterministic without sorting. That determinism is load-bearing twice over: the
-        // value is written into a DURABLE catalog, and an order-dependent one would also break DST
-        // reproducibility. The schema half below cannot make the same argument and sorts by `seq`.
-        self.active.fold_all((), |(), txn, active| {
-            if txn != committing {
-                active.counts.withdraw_from(&mut committed);
-            }
+        // ONE hold over the image AND the deltas withdrawn from it (`rmp` #1052). The two are read
+        // together because the answer is their DIFFERENCE, and a difference of two states sampled at
+        // two instants is not a state of anything: this method used to clone the live counters under
+        // one hold and fold the deltas under the active-table's shard mutexes afterwards, so a
+        // concurrent writer that applied its increment to the live counters AFTER the clone and
+        // recorded its delta BEFORE the fold reached its shard had that increment withdrawn from an
+        // image that never contained it. `sched::yield_at` immediately below marks that instant.
+        //
+        // The failure was not the debug assertion it tripped — that only fires in a debug build. In a
+        // release build `add_keyed` takes its saturating rail silently and the DURABLE catalog is left
+        // holding a cardinality that is simply wrong, which `rmp` #866 then serves as the answer to
+        // `count()`. Found by the `rmp` #1034 multi-writer certification at `engine_workers = 8`, where
+        // two engine threads tripped it at the same instant.
+        //
+        // Taking the read latch does not merely narrow the window, it removes it: the writer's half of
+        // the pair ([`count_bump`](Self::count_bump)) applies AND records under the WRITE latch, so it
+        // is either wholly before this hold or wholly after it, and either way the two halves agree.
+        // The shard mutexes taken inside are inner to the rank-10 catalog latch, which is the order
+        // every other nested hold in this file uses (`apply_schema_undo`).
+        sched::yield_at(
+            YieldSite::CatalogCommittedImage,
+            ResourceId::txn(committing.0),
+        );
+        let active = &self.active;
+        let (mut committed, mut pending, last_seq) = self.with_catalog(|c| {
+            let mut committed = (*c.statistics).clone();
+            // ONE sweep of the shards for both halves, where there were three. `committed` is
+            // withdrawn from in place and the schema logs are accumulated, so a transaction's entry is
+            // visited once.
+            //
+            // Counts half (`rmp` #866). Order-independent, but NOT because "integer deltas commute" on
+            // its own: `add_keyed`/`add_total` saturate at 0, and saturation does not commute. It holds
+            // because an intermediate withdrawal can never go negative — each negative unit in a delta
+            // is a distinct entity or label bit that transaction removed, and two open transactions
+            // cannot have removed the same one. Since `rmp` #971 exactly one mechanism makes that true
+            // — `ensure_chain_head_unheld`, reached by every entity-removal path through
+            // `note_entity_deleted` → `link_delta`, and by every label removal through the check
+            // `remove_label` now runs BEFORE its idempotent no-op exit. Before #971 the label half of
+            // this argument rested on that no-op exit rather than on any conflict check, which was an
+            // accident of ordering; naming the mechanism is what makes it an argument. That argument is
+            // about the DELTAS; it says nothing about whether the image they are withdrawn from
+            // contains them, which is what the hold above establishes and what #1052 was. So no
+            // ordering of the withdrawals can reach the saturating rail, and the sum over a HashMap's
+            // unstable iteration order is deterministic without sorting. That determinism is
+            // load-bearing twice over: the value is written into a DURABLE catalog, and an
+            // order-dependent one would also break DST reproducibility. The schema half cannot make the
+            // same argument and sorts by `seq`.
+            //
+            // Schema half (`rmp` #734): merge every open transaction's undo log, to be replayed in
+            // reverse GLOBAL order below. Sorting by the store-global `seq` is also what makes the
+            // result deterministic: `active` is a HashMap, so its iteration order is not stable, but
+            // `seq` is unique and totally ordered.
+            let pending: Vec<SchemaUndo> = active.fold_all(Vec::new(), |mut acc, txn, a| {
+                if txn != committing {
+                    a.counts.withdraw_from(&mut committed);
+                    acc.extend(a.schema_undo.iter().cloned());
+                }
+                acc
+            });
+            // A scratch copy of the generations: this is a read-only view of the catalog, so the
+            // store's own witness map must survive it untouched. Cloned only when there is a log to
+            // replay, which is every workload that is not interleaving DDL across statements.
+            let last_seq = (!pending.is_empty()).then(|| c.schema_last_seq.clone());
+            (committed, pending, last_seq)
         });
-        // Schema half (`rmp` #734).
-        if self.active.fold_all(true, |acc, txn, a| {
-            acc && (txn == committing || a.schema_undo.is_empty())
-        }) {
+        // The replay works on the three snapshots taken above and touches no shared state, so it sits
+        // OUTSIDE the hold: what has to be atomic is the sampling, not the arithmetic.
+        let Some(mut last_seq) = last_seq else {
             return committed;
-        }
-        // Merge every open transaction's undo log and replay it in reverse GLOBAL order. Sorting by
-        // the store-global `seq` is also what makes the result deterministic: `active` is a HashMap,
-        // so its iteration order is not stable, but `seq` is unique and totally ordered.
-        let mut pending: Vec<SchemaUndo> = self.active.fold_all(Vec::new(), |mut acc, txn, a| {
-            if txn != committing {
-                acc.extend(a.schema_undo.iter().cloned());
-            }
-            acc
-        });
+        };
         pending.sort_unstable_by_key(|e| std::cmp::Reverse(e.seq));
-        // A scratch copy of the generations: this is a read-only view of the catalog, so the store's
-        // own witness map must survive it untouched.
-        let mut last_seq = self.with_catalog(|c| c.schema_last_seq.clone());
         for entry in pending {
             // No splice here, and none is needed. A decline means some transaction wrote this entry
             // after `entry` and is not in `pending` — i.e. it COMMITTED, and its log was dropped with

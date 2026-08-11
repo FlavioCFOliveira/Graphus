@@ -111,3 +111,7 @@ required-features = ["det-sched"]
 [[test]]
 name = "det_scheduler_double_rollback_1051"
 required-features = ["det-sched"]
+
+[[test]]
+name = "det_scheduler_catalog_counts_1052"
+required-features = ["det-sched"]

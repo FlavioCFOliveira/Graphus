@@ -61,9 +61,22 @@
 //!
 //! # Running it
 //!
+//! An installed scheduler is **process-global** (one static), and `cargo test` runs a
+//! binary's tests on parallel threads. So a scheduled test and an ordinary one running side by side
+//! in the same binary is not a supported configuration: the ordinary one's thread is neither
+//! registered nor [`exempt`], and the first yield point it reaches panics with the message above.
+//! That is the tripwire working — the ordinary test really would have run free of the scheduler that
+//! was installed — but it means a run must be FILTERED to the scheduled targets rather than sprayed
+//! across a whole crate. `cargo test -p graphus-dst --features det-sched` on its own fails ~172
+//! unrelated tests for exactly this reason, and `scripts/verify.sh` gate 5 is narrowed accordingly:
+//!
 //! ```text
-//! cargo test -p graphus-dst --features det-sched
+//! cargo test -p graphus-dst --features det-sched --lib detsched::
+//! cargo test -p graphus-dst --features det-sched --test det_scheduler_<scenario>
 //! ```
+//!
+//! Each `--test` target is its own binary, so scenarios in different files never see each other's
+//! scheduler; within one binary, [`install`] serialises them.
 
 // The scheduler creates a happens-before edge between every pair of consecutive steps, so ThreadSanitizer
 // running under it would observe a totally ordered program and report **zero** races — hiding exactly what
@@ -144,6 +157,15 @@ pub enum YieldSite {
     CommitRegistryRecord = 41,
     /// `RecordStore::commit` — just before the transaction's active-set entry is settled.
     CommitSettle = 42,
+    /// `RecordStore::committed_statistics` — just before a checkpoint samples the catalog image it is
+    /// about to make durable.
+    ///
+    /// The image is the live counters MINUS every still-open transaction's pending delta, and `rmp`
+    /// #1052 was that difference being sampled at two instants. This site sits immediately BEFORE the
+    /// single hold that now samples both, so a scheduled writer released here runs to completion
+    /// against a checkpoint that has not started — which is the interleaving the defect needed, and
+    /// which the fix has to survive.
+    CatalogCommittedImage = 43,
 
     // ---- Snapshot acquisition (50..=59) -----------------------------------------------------
     /// `TxnCoordinator::oldest_active_snapshot` — the reclamation floor every GC watermark derives
@@ -1024,6 +1046,7 @@ mod tests {
             YieldSite::CommitPublishSlot,
             YieldSite::CommitRegistryRecord,
             YieldSite::CommitSettle,
+            YieldSite::CatalogCommittedImage,
             YieldSite::SnapshotOldestActive,
             YieldSite::SnapshotReadTaskInputs,
             YieldSite::FreeListPush,
