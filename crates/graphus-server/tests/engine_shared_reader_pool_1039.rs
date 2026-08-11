@@ -385,3 +385,80 @@ fn a_mode_a_bulk_import_session_completes_on_a_four_worker_engine() {
     drop(handle);
     shutdown(engine);
 }
+
+/// **GATE 4 — the index-build gauge reports the engine's value, not `W` times it (`rmp` #1039,
+/// acceptance criterion 3).**
+///
+/// `IndexBuildGauge` folds DELTAS: `publish` compares against what this gauge last contributed and
+/// folds only the change. One gauge per engine therefore reports the engine's totals however many
+/// workers republish them; one gauge PER WORKER gives each its own `last`, so `W` workers each fold
+/// the full value and the shared series reads `W` times the truth.
+///
+/// That difference is invisible at rest — with zero totals every publish is a no-op in both shapes —
+/// so this gate has to catch a build while it is genuinely PENDING. It seeds enough rows that the
+/// build cannot finish within the sampling window, issues the `CREATE INDEX`, and waits for the gauge
+/// to go non-zero; the assertion is on the value it then reads.
+///
+/// The wait is the fixture, not the oracle: if the gauge never goes non-zero the build finished before
+/// anything could look, and the gate says so rather than passing on a zero it never distinguished.
+///
+/// **Non-vacuity.** With `IndexBuildGauge::new` moved back inside the per-worker loop, the same
+/// pending build reads 4 against the 1 this requires.
+#[test]
+fn the_index_build_gauge_reports_the_engines_value_not_w_times_it() {
+    const WORKERS: usize = 4;
+    const ROWS: usize = 200_000;
+    let _serial = COUNTER_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let dir = TempDir::new("idxgauge");
+    let (engine, metrics) = engine(&dir.path, WORKERS, 2);
+    let handle = engine.handle.clone();
+
+    let seed = handle.begin_blocking(AccessMode::Write).expect("begin");
+    run_in(
+        &handle,
+        seed,
+        &format!("UNWIND range(1, {ROWS}) AS x CREATE (:Big {{seq: x}})"),
+        false,
+    )
+    .expect("seed");
+    handle.commit_blocking(seed).expect("commit seed");
+
+    handle
+        .index_ddl_blocking(
+            graphus_server::engine::command::IndexCommand::CreateNodePropertyIndex {
+                name: Some("ix_big_seq".to_owned()),
+                label: "Big".to_owned(),
+                properties: vec!["seq".to_owned()],
+                if_not_exists: false,
+            },
+        )
+        .expect("create index");
+
+    // Catch the build while it is pending. A build over 200 000 rows is driven a slice per idle tick,
+    // so the window is large; the deadline is the fixture's own validity check.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut pending = 0u64;
+    while std::time::Instant::now() < deadline {
+        pending = metrics.index_builds_pending();
+        if pending > 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        pending > 0,
+        "the index build never showed as pending, so this gate never compared anything: the build \
+         finished before the gauge could be sampled and the fixture needs more rows (rmp #1039)"
+    );
+    assert_eq!(
+        pending, 1,
+        "a {WORKERS}-worker engine reports {pending} pending index builds for ONE build: the gauge is \
+         per worker, so each folds the same engine-wide total again (rmp #1039)"
+    );
+
+    drop(handle);
+    shutdown(engine);
+}
