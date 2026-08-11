@@ -115,3 +115,7 @@ required-features = ["det-sched"]
 [[test]]
 name = "det_scheduler_catalog_counts_1052"
 required-features = ["det-sched"]
+
+[[test]]
+name = "det_scheduler_unpublished_delta_1053"
+required-features = ["det-sched"]

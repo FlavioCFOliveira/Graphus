@@ -573,11 +573,19 @@ fn reconcile(acked: &BTreeSet<i64>, present: &BTreeSet<i64>) -> Option<String> {
 /// show up as present and `reconcile` would report it as "a refused transaction left a trace" —
 /// which is the correct diagnosis of exactly that bug.
 #[test]
-// FAILS TODAY, AND THAT IS THE FINDING (`rmp` #1053). At `engine_workers = 8` this gate reports a
+// `rmp` #1053 is FIXED, and this gate's `#[ignore]` was removed with it. It used to report a
 // reopened store carrying `UndoSlot { kind: Commit, DeltaCountMismatch { recorded: 3, actual: 4 } }`
-// on several COMMITTED slots — durable corruption of the undo area that survived WAL recovery. The
-// IDENTICAL workload and the IDENTICAL 16 client threads pass at `engine_workers = 1` in 1.06 s, so
-// this is the worker count and not the workload.
+// on several COMMITTED slots — durable corruption of the undo area that survived WAL recovery, on
+// EVERY run at `engine_workers = 8` and on none at `engine_workers = 1`.
+//
+// The cause was in `RecordStore::link_delta`: a delta is written live BEFORE its chain-head
+// publication (the order `04 §5.1.2` fixes) and registered in `undo_links` AFTER it, so a refused
+// publication — the write-write conflict two writers on one chain produce — left the delta live, on
+// no chain, uncounted by `publish_commit_slot` and unfreed by `detach_own_deltas`. It outlived its
+// transaction and went on naming a commit slot the allocator had already re-issued to somebody else.
+// `link_delta` now retires that delta before propagating the refusal. Measured: 36 of 36 runs that
+// reached this check were corrupt with the retirement withdrawn, 0 of 40 with it in place. Its
+// by-seed guard is `graphus-dst`'s `det_scheduler_unpublished_delta_1053`.
 //
 // `rmp` #1052 is FIXED and no longer contributes: the two engine workers that used to panic
 // simultaneously on `statistics count decrement underflow at absent key` no longer do — 14 runs of
@@ -586,11 +594,20 @@ fn reconcile(acked: &BTreeSet<i64>, present: &BTreeSet<i64>) -> Option<String> {
 // counter VALUE, so it fails in a release build too) and `graphus-dst`'s
 // `det_scheduler_catalog_counts_1052`.
 //
-// Ignored by an EXPLICIT decision of the project owner (2026-08-11), as a named exception to
-// CLAUDE.md's "Tests MUST NOT be created with skip": the suite stays green while #1053 is fixed,
-// rather than staying red for the whole window. The exception is bounded — the task that fixes
-// #1053 REMOVES this attribute, and it may not close while it is still here.
-#[ignore = "rmp #1053: fails at engine_workers > 1; un-ignored by the task that fixes it"]
+// STILL IGNORED, for a defect neither of those was: `rmp` #1056. With both fixes in place this gate
+// still fails about 15 % of runs on a different oracle — "the shared counters total 105 after 107
+// acknowledged concurrent increments", a LOST UPDATE, which is the cardinal ACID violation. It was
+// measured to be independent and pre-existing (4 failures in 40 runs with #1053's fix withdrawn
+// against 6 in 40 with it — statistically indistinguishable), and it composes two defects in another
+// subsystem: `ensure_chain_head_unheld` never implemented the "nor committed before its own start
+// timestamp" arm that `D-write-conflict-detection` ratified, and `SsiTracker::are_concurrent` treats
+// `commit_ts == begin_ts` as non-concurrent, which contradicts visibility and stops the rw-edge from
+// forming — so the SSI backstop never fires either. Every losing pair measured had exactly that
+// equality.
+//
+// Ignored under the same bounded exception the project owner approved on 2026-08-11: #1056 removes
+// this attribute and may not close while it is still here.
+#[ignore = "rmp #1056: lost update at engine_workers > 1; un-ignored by the task that fixes it"]
 fn no_acknowledged_commit_is_lost_or_invented_across_a_restart() {
     const SHARDS: i64 = 4;
     const PER_CLIENT: i64 = 40;

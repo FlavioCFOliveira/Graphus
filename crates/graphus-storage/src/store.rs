@@ -1498,6 +1498,14 @@ struct Maintenance {
     /// abort-heavy workload does not grow the store — while moving the recycle to a maintenance
     /// boundary. When the indexes become version-aware (#992) the parking can go and the abort can free
     /// the slot directly.
+    ///
+    /// **The `Undo` entry is populated for a different reason** (`rmp` #1053): the delta of a REFUSED
+    /// publication, retired to a corpse by
+    /// [`retire_unpublished_delta`](RecordStore::retire_unpublished_delta). No index keys a delta, so
+    /// the paragraph above does not apply; what applies is that the transaction that wrote it is
+    /// still OPEN, and listing a slot a live writer can still be physically undone over is the
+    /// `rmp` #578 / #588 shape. Parking moves the recycle past the end of that transaction, which is
+    /// the same maintenance boundary for the same class of reason.
     pending_orphan_slots: [std::collections::BTreeSet<u64>; STORE_COUNT],
     /// Whether an **unreclaimed empty** property cell (`rmp` #967, `D-property-removal`) may exist:
     /// set by [`empty_prop_cell`](RecordStore::empty_prop_cell), and **re-derived** after every property
@@ -4939,7 +4947,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // that has since been displaced, is a stale check — and re-points this delta's `next` before
         // trying again. The two `rmp` #973 yield points move inside the retry with it, so each
         // iteration still has its read half and its publication half.
-        self.prepend_chain_head(
+        if let Err(refused) = self.prepend_chain_head(
             ChainPrepend {
                 owner_kind: kind,
                 owner_id: entity,
@@ -4954,7 +4962,44 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             head,
             id,
             txn,
-        )?;
+        ) {
+            // THE DELTA ALREADY EXISTS AND IS LIVE, so a refusal has to retire it (`rmp` #1053).
+            //
+            // Step 3 above wrote it in full, with its `in_use` bit set and its `commit_info` naming
+            // this transaction's commit slot, because the publication order is not negotiable. The
+            // registration below — the ONLY record anything else keeps of a delta — happens after the
+            // publication. Between the two there is a fallible step, and everything that reads a
+            // delta afterwards reads one side or the other of it:
+            //
+            //   * [`publish_commit_slot`](Self::publish_commit_slot) counts `undo_links`, so an
+            //     unregistered delta is not counted;
+            //   * [`detach_own_deltas`](Self::detach_own_deltas) frees `undo_links`, so an
+            //     unregistered delta is not freed by the abort either;
+            //   * the census the consistency checker runs counts every LIVE delta naming a slot.
+            //
+            // Left as it was, the delta therefore survives its transaction — live, on no chain, and
+            // still naming a commit slot that [`free_own_commit_slot`](Self::free_own_commit_slot)
+            // hands back to the allocator on the strength of "every delta naming it is gone". The
+            // next transaction to take that slot id commits and publishes ITS count, and the census
+            // finds one delta too many: `DeltaCountMismatch { recorded: n, actual: n + 1 }`, durable
+            // and reproduced through WAL recovery, on the slot of an entirely innocent committed
+            // transaction. That is `rmp` #1053, and it needs two writers because the only thing that
+            // refuses a publication is another transaction on the same chain.
+            //
+            // Retiring it is exact rather than best-effort: `graphus_chainhead::prepend` returns `Ok`
+            // the instant a publication wins, so an `Err` proves nothing was ever published and no
+            // chain — no reader, no walk, no GC pass — can reach this delta. What it becomes is the
+            // ordinary CORPSE the header-only creation undo would have left had the transaction
+            // aborted at this instant, which is a state every reader of the undo area already
+            // handles.
+            //
+            // The retirement's own failure is returned in preference to the refusal: a refusal is a
+            // retriable serialization failure the caller is expected to absorb, and absorbing one
+            // while the store is left inconsistent is the outcome this whole branch exists to
+            // prevent.
+            self.retire_unpublished_delta(id, txn)?;
+            return Err(refused);
+        }
         self.active.with_entry(txn, |a| {
             a.undo_links.push(UndoLink {
                 kind,
@@ -4966,6 +5011,51 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // pending-set design, applied to chains): the sweep iterates this set instead of scanning.
         self.with_maintenance(|m| m.pending_undo_chains.insert((kind as u8, entity)));
         Ok(id)
+    }
+
+    /// Retires the delta [`link_delta`](Self::link_delta) wrote but could not publish, leaving it a
+    /// **corpse** (`rmp` #1053).
+    ///
+    /// Clearing the `in_use` byte is the whole retirement, and it is the same one-byte write the
+    /// header-only creation undo of [`write_undo_area_create`](Self::write_undo_area_create) would
+    /// have made had the transaction aborted here — so what the store is left holding is a state it
+    /// already understands everywhere: a delta a transaction did not complete. It stops counting
+    /// towards its commit slot the moment the bit is clear, because a slot's `delta_count` counts
+    /// **live** deltas (`05 §12.4`).
+    ///
+    /// # Why the id is parked and not freed
+    ///
+    /// The obvious inverse — [`free_own_delta`](Self::free_own_delta), which clears the bit *and*
+    /// lists the id — would put a slot back in circulation while the transaction that wrote it is
+    /// still OPEN. A second transaction could then take that slot, write its own delta there and
+    /// commit, and a crash before this transaction's `ABORT` record would have recovery undo this
+    /// transaction physically: the undo of the write above sets the byte back, the undo of the
+    /// creation clears it, and a committed delta is destroyed. That is the `rmp` #578 / #588
+    /// reuse-under-an-open-writer shape, and this path must not add an instance of it.
+    ///
+    /// Parking is unambiguous rather than merely cautious. The id is off the free list from the
+    /// moment [`alloc_undo_id`](Self::alloc_undo_id) handed it out, and
+    /// [`reclaim_aborted_pops`](Self::reclaim_aborted_pops) declines every `Undo` / `Commit` id by
+    /// name, so between here and the GC drain nothing else can list it — which is what makes the
+    /// drain's `!in_use` re-check unable to catch a slot in the window between a pop and its first
+    /// write.
+    ///
+    /// A crash before that drain leaves the slot `!in_use` and unlisted, which is the same bounded
+    /// space leak [`gc_reclaim_orphan_slots`](Self::gc_reclaim_orphan_slots) documents for a record
+    /// slot, and it is collected by the same post-open pass
+    /// ([`gc_sweep_undo_orphans`](Self::gc_sweep_undo_orphans) phase 1 frees exactly an unreachable
+    /// corpse delta).
+    ///
+    /// # Errors
+    /// Returns a storage error if the delta's page cannot be written.
+    fn retire_unpublished_delta(&self, id: u64, txn: TxnId) -> Result<()> {
+        let (rel_page, off) = paging::record_location(id, undo::UNDO_RECORD_SIZE);
+        let dev = self.device_page(StoreKind::Undo, rel_page)?;
+        self.write_region(dev, off + undo::UNDO_OFF_FLAGS, &[0u8], txn)?;
+        self.with_maintenance(|m| {
+            m.pending_orphan_slots[StoreKind::Undo as usize].insert(id);
+        });
+        Ok(())
     }
 
     /// First write of a freshly-allocated undo-area record, with the **header-only creation undo**
@@ -6862,11 +6952,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             sched::yield_at(YieldSite::GcPhaseC, ResourceId::txn(txn.0));
             reclaimed += self.reclaim_pending(StoreKind::Node, txn, watermark)?;
 
-            // ---- Phase B2: return the slots a logical rollback ORPHANED (`rmp` #970, AC 7). ----
+            // ---- Phase B2: return the slots a logical rollback ORPHANED (`rmp` #970, AC 7), and
+            // the deltas a REFUSED publication retired (`rmp` #1053). ----
             // The abort unlinked these from every chain and zeroed their headers but deliberately did
-            // not list them (see `pending_orphan_slots`). They are reachable from nothing, so this is
-            // a pure accounting step — but it is still guarded on the record actually being retired,
-            // so a slot some later writer has legitimately re-used cannot be double-freed.
+            // not list them (see `pending_orphan_slots`); a refused publication never linked its
+            // delta at all. They are reachable from nothing either way, so this is a pure accounting
+            // step — but it is still guarded on the record actually being retired, so a slot some
+            // later writer has legitimately re-used cannot be double-freed.
             sched::yield_at(YieldSite::GcPhaseB2, ResourceId::txn(txn.0));
             reclaimed += self.gc_reclaim_orphan_slots(txn)?;
 
@@ -7954,8 +8046,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.free_own_commit_slot(slot, txn)
     }
 
-    /// Returns to the free list every record slot a logical rollback orphaned (`rmp` #970,
-    /// acceptance criterion 7), and returns how many it reclaimed.
+    /// Returns to the free list every slot a logical rollback orphaned (`rmp` #970, acceptance
+    /// criterion 7) or a refused publication retired (`rmp` #1053), and returns how many it
+    /// reclaimed.
     ///
     /// Exact rather than census-based: the abort itself parked these ids, and it is the operation that
     /// made them unreachable, so no store scan is needed to establish it. The `!in_use` guard is
@@ -7988,6 +8081,28 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 if self.free_push(kind, id, txn) {
                     reclaimed += 1;
                 }
+            }
+        }
+        // The undo store's own twin (`rmp` #1053). A delta whose publication was refused was written
+        // in full and then retired to a corpse by
+        // [`retire_unpublished_delta`](Self::retire_unpublished_delta). It needs no reachability
+        // proof — an `Err` out of `graphus_chainhead::prepend` means the entry was never published,
+        // so no chain has ever named it — and it takes the same `!in_use` re-check as a record slot,
+        // for the same reason: only a slot nothing has legitimately taken over may be listed.
+        let deltas: Vec<u64> = self
+            .with_maintenance(|m| {
+                std::mem::take(&mut m.pending_orphan_slots[StoreKind::Undo as usize])
+            })
+            .into_iter()
+            .collect();
+        for id in deltas {
+            // A zeroed slot is not a delta at all (`05 §12.3`), which is as retired as `!in_use`, so
+            // both answer "reclaimable" and only a LIVE delta declines.
+            if self.read_delta(id)?.is_some_and(|d| d.in_use()) {
+                continue;
+            }
+            if self.free_push(StoreKind::Undo, id, txn) {
+                reclaimed += 1;
             }
         }
         Ok(reclaimed)
