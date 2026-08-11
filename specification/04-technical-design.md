@@ -1564,28 +1564,45 @@ concurrent prepend has made the record no longer the head, so the neighbour bran
 `RecordStore::set_owner_first_prop` publishes an owner's `first_prop` conditionally and fails closed,
 because its only caller is a GC pass under which the head cannot legitimately move.
 
-**What remains uncovered, enumerated exhaustively.** The enumeration this section used to carry named
-TWO sites and was wrong. A full sweep of every writer of `first_rel`, `first_prop` and `undo_ptr` (task
-#1030) found more, and — the part that matters — **four of them are ordinary transactional paths, not
-GC**. Three were missed because the previous framing looked for "an unconditional whole-record write":
-they write a single word or a header region instead, which defeats the compare-and-publish just as
-thoroughly while not matching the description.
+**The enumeration, redone.** The list this section used to carry named TWO uncovered sites and was
+wrong. A full sweep of every writer of `first_rel`, `first_prop` and `undo_ptr` (task #1030) found
+more, and — the part that mattered — four of them were ordinary transactional paths rather than GC.
+Three had been missed because the previous framing looked for "an unconditional whole-record write":
+they wrote a single word or a header region instead, which defeats the compare-and-publish just as
+thoroughly while not matching the description. The enumeration's shape was hiding them.
 
-| Site | What it installs, and how | Reached from | Class |
+Task #1030 brought all of them through the mechanism except one, which is exempt with its reason
+stated at the site:
+
+| Site | Was | Now | Class |
 | --- | --- | --- | --- |
-| `repoint_neighbour` | the neighbour's whole `RelRecord`, carrying `first_prop` and `undo_ptr` from a stale read | `unlink_side_with` (both branches) → `undo_own_incidence` → `rollback_logical`; also `reclaim_rel` | transactional |
-| `retire_own_prop_cell` | the owner's `first_prop`, unconditional 8-byte write, when the retired cell is the head | `undo_own_property` → `rollback_logical` | transactional |
-| `undo_own_creation` | the whole 25-byte MVCC header zeroed, `undo_ptr` included | `apply_own_delta` → `rollback_logical` | transactional |
-| `detach_own_deltas` | the entity's live `undo_ptr`, repointed past the aborting transaction's deltas | `rollback_logical` directly | transactional |
-| `relink_run_endpoint`, `reclaim_node`, `reclaim_rel`, `gc_splice_corpses` phase 3, `free_undo_chain` | whole-record or header writes carrying head words | `gc_inner` | GC only |
-| the deferred WAL undo of every whole-record write above | all three words, from a pre-image taken before the write | `rollback_physical`, crash recovery | both |
+| `unlink_side_with` | whole `NodeRecord` write installing `first_rel` | conditional publication of the word; the unlink restarts when refused | transactional |
+| `set_owner_first_prop` | whole owner-record write installing `first_prop` | conditional publication, fail-closed | GC |
+| `retire_own_prop_cell` | unconditional 8-byte write of `first_prop` | conditional publication, fail-closed | transactional |
+| `detach_own_deltas` | unconditional header-word write repointing the live `undo_ptr` | conditional publication, fail-closed | transactional |
+| `repoint_neighbour` | whole `RelRecord` write carrying `first_prop` and `undo_ptr` | only the chain-pointer words that changed, one write per word | transactional |
+| `undo_own_creation` | zeroes the whole MVCC header, `undo_ptr` included | **unchanged, exempt**: the transaction created the record, the slot has never been visible to another writer, and no chain reaches it by the time this runs — there is no head for anyone to be publishing | transactional |
+| `relink_run_endpoint`, `reclaim_node`, `reclaim_rel`, `gc_splice_corpses` phase 3, `free_undo_chain` | whole-record or header writes carrying head words | unchanged, covered by GC exclusivity | GC only |
+
+Two properties of the unlink conversions are load-bearing and are recorded here rather than left to
+the code. First, the publication is **conditional**, not merely latched: under the rank-27 latch the
+word cannot move, but the read that DECIDES headship happens outside it, so a concurrent prepend in
+that window makes the record no longer the head and an unconditional store would publish over the
+entry that prepend just linked in. A refusal is therefore not an error at `unlink_side_with` — it is
+the news that this is no longer the head, and the unlink restarts and takes the neighbour branch.
+Second, `repoint_neighbour` writes **per word, not per block**: two unlinks can legitimately touch the
+same neighbour at once, one facing its start node and one facing its end node, and a block write from
+a stale read would have each revert the other's side.
 
 The GC rows are safe for the same reason the corpse splice's refusal is fail-closed: a GC pass holds
 the store exclusively. That exclusivity is a single-writer convention documented in prose, not a lock —
 `gc` takes `&self` — so it is one of the things task #1016 has to re-establish rather than inherit.
 
-The four transactional rows are **not** covered by that argument and are outstanding work. This
-specification records them as such rather than implying an invariant the code does not yet hold.
+One writer class neither this section nor the code comments mentioned before #1030: the **deferred WAL
+undo** of a whole-record write is a second writer of all three words, re-applied at
+`rollback_physical` and at crash recovery from a pre-image taken before the write. It shrank with
+`repoint_neighbour`'s conversion — each word now carries its own pre-image — but the GC whole-record
+writers still have it.
 
 **How this is proved.** Two suites, deliberately different in kind, because neither can stand in for
 the other:

@@ -4417,39 +4417,37 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// fail-closed on refusal), and — since `rmp` #1030 — `unlink_side_with`'s head branch
     /// (`first_rel`, retried on refusal) and `set_owner_first_prop` (`first_prop`, GC, fail-closed).
     ///
-    /// **NOT through this primitive, and still open.** Each writes a head word outside the rank-27
-    /// latch with no compare, so each makes every other writer's comparison meaningless. The framing
-    /// this list used to have — "installs a chain head by rewriting the owner record whole" — is why
-    /// three of them were missed: they write a single word or a header region, not a whole record, and
-    /// an audit looking for whole-record writes does not find them.
+    /// **Brought through it by `rmp` #1030.** Three of these four were missed by the previous
+    /// enumeration because its framing — "installs a chain head by rewriting the owner record whole" —
+    /// does not describe them: they wrote a single word or a header region, which defeats the compare
+    /// just as thoroughly while not looking like the thing being audited for.
     ///
-    /// * `repoint_neighbour` — whole-record `write_rel`, carrying the neighbour's `first_prop` and
-    ///   `undo_ptr` from a stale read. Reached from `unlink_side_with`'s BOTH branches, hence from
-    ///   `undo_own_incidence` → `rollback_logical`. **Transactional.**
-    /// * `retire_own_prop_cell` — unconditional 8-byte write of the owner's `first_prop` when the
-    ///   retired cell is the head. Reached from `undo_own_property` → `rollback_logical`.
-    ///   **Transactional.**
-    /// * `undo_own_creation` — zeroes the whole 25-byte MVCC header, `undo_ptr` included. Reached from
-    ///   `apply_own_delta` → `rollback_logical`. **Transactional.**
-    /// * `detach_own_deltas` — repoints the entity's live `undo_ptr` to the first delta the aborting
-    ///   transaction does not own, via `patch_header_word`. Called by `rollback_logical` directly.
-    ///   **Transactional**, and a genuine head mutation on a shared word.
+    /// * `retire_own_prop_cell` (`first_prop`) — was an unconditional 8-byte write; now conditional,
+    ///   fail-closed. Reached from `undo_own_property` → `rollback_logical`. **Transactional.**
+    /// * `detach_own_deltas` (`undo_ptr`) — was an unconditional header-word write repointing the
+    ///   entity's LIVE undo-chain head; now conditional, fail-closed. Called by `rollback_logical`
+    ///   directly. **Transactional.**
+    /// * `repoint_neighbour` — was a whole-record `write_rel` carrying the neighbour's `first_prop`
+    ///   and `undo_ptr` from a stale read; now writes only the chain-pointer words that actually
+    ///   changed, per word rather than per block so two unlinks on the same neighbour cannot revert
+    ///   each other. Reached from `unlink_side_with`'s BOTH branches. **Transactional.**
+    ///
+    /// **Deliberately NOT through it, with the reason stated at the site:**
+    ///
+    /// * `undo_own_creation` zeroes the whole MVCC header, `undo_ptr` included — but the transaction
+    ///   created the record, the slot has never been visible to another writer, and by the time it
+    ///   runs no chain reaches the record. There is no head for anyone to be publishing, so there is
+    ///   no comparison to defeat. Same argument as `create_node` / `create_rel` installing `undo_ptr`
+    ///   in a record's first write.
     /// * `relink_run_endpoint`, `reclaim_node`, `reclaim_rel`, `gc_splice_corpses` phase 3 and
-    ///   `free_undo_chain` — whole-record or header writes carrying head words. **GC only**, so the
-    ///   exclusivity argument covers them for as long as it holds. Note it is a convention documented
-    ///   in prose, not a lock: `gc` takes `&self`, and `rmp` #1016 is what would have to re-establish it.
-    /// * The DEFERRED WAL UNDO of every whole-record write above is a second writer of all three words:
-    ///   `rollback_physical` and crash recovery re-apply a whole-record pre-image taken before the
-    ///   write. Neither doc mentioned this class.
-    ///
-    /// `create_node` and `create_rel` install `undo_ptr` in the record's own first write; the slot is
-    /// freshly allocated and private to the creating transaction, so no concurrent writer can hold it.
-    ///
-    /// Under one writer none of this bites. Under the concurrent writers of `rmp` #1016 a whole-record
-    /// write carries `first_prop`, `labels` and the MVCC header along from a stale read, reverting a
-    /// concurrent writer's fields — the `rmp` #772 clobber class — and an unconditional single-word
-    /// write silently defeats every comparison. Until the four transactional sites above are closed,
-    /// this primitive's guarantee is scoped to the sites listed as going through it.
+    ///   `free_undo_chain` — whole-record or header writes carrying head words, **GC only**, covered by
+    ///   the exclusivity of a GC pass. Note that exclusivity is a convention documented in prose, not a
+    ///   lock: `gc` takes `&self`, and `rmp` #1016 is what would have to re-establish it.
+    /// * The DEFERRED WAL UNDO of a whole-record write is a second writer of all three words —
+    ///   `rollback_physical` and crash recovery re-apply a pre-image taken before the write. Neither
+    ///   document mentioned this class before `rmp` #1030. It shrank with `repoint_neighbour`'s
+    ///   conversion (each word now carries its own pre-image) but the GC whole-record writers still
+    ///   have it.
     ///
     /// # The three steps, and why they are one
     ///
@@ -7621,9 +7619,28 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 StoreKind::Node => NODE_OFF_FIRST_PROP,
                 _ => REL_OFF_FIRST_PROP,
             };
-            let (rel_page, off) = paging::record_location(entity, kind.record_size());
-            let dev = self.device_page(kind, rel_page)?;
-            self.write_region(dev, off + field_off, &successor.to_le_bytes(), txn)?;
+            // Through the publication mechanism (`rmp` #1030). This wrote the word directly, outside
+            // the rank-27 latch and with no compare — which does not clobber a neighbouring field the
+            // way a whole-record write does, but defeats the compare-and-publish just as thoroughly:
+            // one writer that stores unconditionally makes every other writer's comparison
+            // meaningless. It was missed by the previous enumeration precisely because it is a
+            // single-word write and the enumeration was looking for whole-record ones.
+            //
+            // Fail-closed on refusal rather than retrying. A property write takes the entity's
+            // write-conflict check (`D-property-write-conflict`), so no other transaction can have
+            // prepended onto this chain while this one held it — the compare is therefore expected
+            // never to refuse, and a refusal means that invariant has been broken by some new writer.
+            // Unlinking against a head that has moved would splice a live chain.
+            if !self
+                .compare_and_publish_chain_head(kind, entity, field_off, cell_id, successor, txn)?
+            {
+                return Err(GraphusError::Storage(format!(
+                    "{kind:?} {entity} first_prop moved while transaction {} retired its own cell \
+                     {cell_id}; the write-conflict check should have made that impossible \
+                     (`rmp` #1030)",
+                    txn.0
+                )));
+            }
         } else {
             let guard = self.store(StoreKind::Prop).alloc.high_water() + 1;
             let mut cur = head;
@@ -7720,6 +7737,22 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // Zero the whole MVCC header, not just the `in_use` bit: the slot is genuinely free again
         // (nothing threads through it — see the doc above), so leaving a stale `created_ts` or
         // `undo_ptr` behind would only give a later reader something to misread.
+        //
+        // THIS WRITES `undo_ptr` WITHOUT THE PUBLICATION MECHANISM, DELIBERATELY (`rmp` #1030). Every
+        // other writer of a chain-head word now goes through `compare_and_publish_chain_head`, and the
+        // enumeration in that method's docs is what makes the compare sound — so an exception has to
+        // be justified rather than merely noted.
+        //
+        // The justification is the same one `create_node` and `create_rel` rely on when they install
+        // `undo_ptr` in a record's very first write, and it is stronger here: the transaction CREATED
+        // this record, so the slot has never been visible to another writer, and by the time this runs
+        // the incidence deltas have already been applied (they were linked later, so newest-first
+        // applies them first) — no chain reaches the record at all. There is no head for a concurrent
+        // writer to be publishing, so there is no comparison for this write to defeat. The slot is
+        // then PARKED rather than freed, which is what keeps that true until the GC pass returns it.
+        //
+        // If a future change ever lets a record be created and reached by another writer before its
+        // creating transaction resolves, this exception dies with it.
         let (rel_page, off) = paging::record_location(entity, kind.record_size());
         let dev = self.device_page(kind, rel_page)?;
         self.write_region(dev, off, &[0u8; MVCC_HEADER_SIZE], txn)?;
@@ -7791,7 +7824,32 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 head = delta.next;
             }
             if head != mvcc.undo_ptr {
-                self.patch_header_word(kind, entity, MVCC_OFF_UNDO_PTR, head, txn)?;
+                // Through the publication mechanism (`rmp` #1030). This repoints the entity's LIVE
+                // undo-chain head past the deltas this rollback detached, and it used to do so with an
+                // unconditional header-word write — outside the rank-27 latch and with no compare,
+                // which makes every other writer's comparison meaningless.
+                //
+                // Fail-closed on refusal. The head-prefix invariant (`ensure_chain_head_unheld` plus
+                // `D-incidence-anchor`) says no other open transaction can hold a chain this one has
+                // deltas on, so the head cannot legitimately move here and the compare is expected
+                // never to refuse. That is exactly why a refusal is an error: it means the invariant
+                // the loop above depends on has been broken, and repointing the head against a value
+                // that has moved would splice a live chain — the same failure the check below the
+                // loop refuses to risk, caught one step earlier.
+                if !self.compare_and_publish_chain_head(
+                    kind,
+                    entity,
+                    MVCC_OFF_UNDO_PTR,
+                    mvcc.undo_ptr,
+                    head,
+                    txn,
+                )? {
+                    return Err(GraphusError::Storage(format!(
+                        "undo-chain head of {kind:?} {entity} moved while transaction {} detached its \
+                         own deltas; the head-prefix invariant has been broken (`rmp` #1030)",
+                        txn.0
+                    )));
+                }
             }
         }
         // Free ONLY what the walks above actually detached, and require that to be every delta the
@@ -10330,7 +10388,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         which: NeighbourPtr,
         txn: TxnId,
     ) -> Result<()> {
-        let mut nb = self.read_rel(neighbour)?;
+        let before = self.read_rel(neighbour)?;
+        let mut nb = before;
         let patch = |side: ChainSide, n: &mut RelRecord| {
             let (mut p, mut nx) = n.chain_pointers(side);
             match which {
@@ -10354,7 +10413,36 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         if nb.end_node == node {
             patch(ChainSide::End, &mut nb);
         }
-        self.write_rel(neighbour, &nb, txn)
+        // WRITE ONLY WHAT CHANGED (`rmp` #1030). This used to write the whole `RelRecord` back, which
+        // carried the neighbour's `first_prop` and its MVCC header — `undo_ptr` included — along from
+        // the read above. Neither is this function's business, and a concurrent writer that had moved
+        // either of them would have had its work reverted: the `rmp` #772 clobber class, reached from
+        // logical rollback through `unlink_side_with`'s BOTH branches.
+        //
+        // Per-word rather than one write over the contiguous 61..93 pointer block, because two unlinks
+        // can legitimately touch the SAME neighbour at once — one facing its start node, one facing
+        // its end node — and a block write from a stale read would have each revert the other's side.
+        // Each word carries its own undo pre-image, which is strictly tighter than the whole-record
+        // pre-image it replaces.
+        for (side, prev_off, next_off) in [
+            (ChainSide::Start, REL_OFF_START_PREV, REL_OFF_START_NEXT),
+            (ChainSide::End, REL_OFF_END_PREV, REL_OFF_END_NEXT),
+        ] {
+            let (old_prev, old_next) = before.chain_pointers(side);
+            let (new_prev, new_next) = nb.chain_pointers(side);
+            if new_prev != old_prev {
+                self.patch_header_word(StoreKind::Rel, neighbour, prev_off, new_prev, txn)?;
+            }
+            if new_next != old_next {
+                self.patch_header_word(StoreKind::Rel, neighbour, next_off, new_next, txn)?;
+            }
+        }
+        if nb.chain_flags != before.chain_flags {
+            let (rel_page, off) = paging::record_location(neighbour, StoreKind::Rel.record_size());
+            let dev = self.device_page(StoreKind::Rel, rel_page)?;
+            self.write_region(dev, off + REL_OFF_CHAIN_FLAGS, &[nb.chain_flags], txn)?;
+        }
+        Ok(())
     }
 
     // ----------------------------- property CRUD ----------------------------
