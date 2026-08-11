@@ -238,11 +238,20 @@ pub struct SsiTracker {
     /// (inserted in [`record_predicate_write`](Self::record_predicate_write)) and purged on
     /// [`forget`](Self::forget).
     predicate_writers_of: HashMap<PredicateRead, HashSet<TxnId>>,
-    /// Transactions condemned to abort at their commit. Populated when a dangerous structure
-    /// completes around a pivot that has **already committed** (so the pivot itself cannot be the
-    /// victim): the still-active endpoint that just closed the structure is doomed instead. This is
-    /// the eager counterpart of the commit-time [`detect_pivot_abort`](Self::detect_pivot_abort),
-    /// which alone cannot catch a pivot whose two rw-edges form only after it commits (`rmp` audit F9).
+    /// Transactions condemned to abort at their own commit, read by
+    /// [`detect_pivot_abort`](Self::detect_pivot_abort)'s first branch. Two things populate it, and
+    /// both are cases where the transaction that must abort is **not** the one asking:
+    ///
+    /// * [`add_edge`](Self::add_edge) — a dangerous structure completed around a pivot that has
+    ///   **already committed**, so the pivot itself cannot be the victim; the still-active endpoint
+    ///   that just closed the structure is doomed instead. This is the eager counterpart of the
+    ///   commit-time detection, which alone cannot catch a pivot whose two rw-edges form only after it
+    ///   commits (`rmp` audit F9).
+    /// * [`doom`](Self::doom) — a committing transaction found a **still-running** pivot (Case B) and
+    ///   condemns it rather than running its undo from the committer's thread (`rmp` #1051).
+    ///
+    /// In both cases the condemnation is the only thing that ever crosses a transaction boundary: the
+    /// undo itself always runs on the condemned transaction's own worker.
     doomed: HashSet<TxnId>,
     /// Transactions running at **Snapshot Isolation** whose SIREAD markers must NOT enter the conflict
     /// graph (`rmp` task #545): a standalone auto-commit read-only statement is demoted to SI (MySQL /
@@ -641,11 +650,50 @@ impl SsiTracker {
         }
     }
 
+    /// Condemns `victim` to abort at **its own** commit, and reports whether the condemnation can
+    /// still take effect.
+    ///
+    /// Returns `false` — and marks nothing — when the tracker no longer has a transaction to condemn:
+    /// the victim has already committed, or it was never registered (or has been
+    /// [`forget`](Self::forget)ten). A caller that gets `false` must break the dangerous structure
+    /// some other way; it must NOT assume the victim will abort.
+    ///
+    /// # Why a victim is condemned rather than undone (`rmp` #1051)
+    ///
+    /// A transaction other than the one committing belongs to **another engine worker**
+    /// (`D-multi-writer`), which may at this instant be executing a statement in it, committing it, or
+    /// already rolling it back. Running its undo from here is therefore a concurrent second rollback of
+    /// one transaction: reproduced at `engine_workers = 8`, two workers entered
+    /// `RecordStore::rollback_logical` for the same transaction, the first detached and freed its
+    /// deltas and its commit slot, and the second walked a chain those deltas had already left — which
+    /// the store's own head-prefix tripwire refused, leaving the transaction OPEN with its writes
+    /// physically present and the database degraded. The engine states the same rule for its age sweep
+    /// and declines a sibling worker's transaction for exactly this reason
+    /// (`graphus-server/src/engine/mod.rs`, `maybe_reap_aged`).
+    ///
+    /// Condemnation is how a transaction is aborted by somebody else without being touched by them: it
+    /// aborts **itself**, on its own worker, through [`detect_pivot_abort`](Self::detect_pivot_abort)'s
+    /// doomed branch. This is PostgreSQL's model — a backend that must kill a pivot sets
+    /// `SXACT_FLAG_DOOMED` on it ("we flag the writer for termination, causing it to abort when it
+    /// tries to commit", `src/backend/storage/lmgr/predicate.c`
+    /// `OnConflict_CheckForSerializationFailure` and `PreCommit_CheckForSerializationFailure`, read
+    /// 2026-08-11) and never executes another backend's rollback.
+    pub fn doom(&mut self, victim: TxnId) -> bool {
+        if self.txns.get(&victim).is_none_or(|t| t.commit_ts.is_some()) {
+            return false;
+        }
+        self.doomed.insert(victim);
+        true
+    }
+
     /// Decides whether committing `txn` must abort to break a dangerous structure (`04 §5.4`).
     ///
     /// Returns `Some(victim)` — the [`TxnId`] to abort with a serialization failure — when a
     /// dangerous structure in which `txn` participates can close a cycle, and `None` when it is safe
     /// to commit.
+    ///
+    /// A victim that is not `txn` is **condemned, never undone by the caller** — see
+    /// [`doom`](Self::doom) for why, and for what a caller must do when the condemnation cannot take.
     ///
     /// Implements the pivot rule and the read-only optimization; see the module docs for the
     /// safe-retry guarantee.

@@ -11073,6 +11073,61 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         capture
     }
 
+    /// Breaks the dangerous structure [`SsiTracker::detect_pivot_abort`] found while committing `txn`,
+    /// having chosen `victim` (`04 §5.4`). The single door both [`commit`](Self::commit) and
+    /// [`commit_prepare`](Self::commit_prepare) go through.
+    ///
+    /// Returns `Ok(())` when the structure is broken and `txn` may go on to commit, and a **retriable**
+    /// [`GraphusError::Transaction`] when `txn` itself was the transaction that had to abort — in which
+    /// case it has already been rolled back here.
+    ///
+    /// # This transaction is undone here; another transaction never is (`rmp` #1051)
+    ///
+    /// When `victim == txn` the undo runs inline: `txn` is this worker's own transaction and this
+    /// thread is the only one inside it.
+    ///
+    /// When `victim != txn` the victim belongs to **another engine worker** (`D-multi-writer`), which
+    /// may at this instant be executing a statement in it, committing it, or already rolling it back.
+    /// This used to call `abort(victim)` regardless, and at `engine_workers = 8` that put two workers
+    /// inside `RecordStore::rollback_logical` for one transaction at the same time: the first detached
+    /// and freed its deltas and its commit slot, the second walked a chain those deltas had already
+    /// left, and the store's head-prefix tripwire refused — leaving the transaction OPEN with its
+    /// uncommitted writes physically present and taking the database to its degraded state. The engine
+    /// states the same rule for its age sweep and declines a sibling's transaction on it (`maybe_reap_aged`,
+    /// `rmp` #1041). So the victim is **condemned** ([`SsiTracker::doom`]) and aborts itself, at its own
+    /// commit, on its own worker — PostgreSQL's model exactly (`predicate.c`: "we flag the writer for
+    /// termination, causing it to abort when it tries to commit").
+    ///
+    /// # And when the condemnation cannot take, this transaction commits suicide
+    ///
+    /// A condemnation only takes if the victim will actually consult it: it must still be open in the
+    /// tracker ([`SsiTracker::doom`] reports that) **and** its own commit must run SSI validation,
+    /// which an [`IsolationLevel::Snapshot`] transaction does not. If either fails, the structure is
+    /// broken the only other way that never touches a foreign transaction — `txn` aborts instead. That
+    /// is PostgreSQL's own escape hatch for a pivot it cannot kill: "Normally, we kill the pivot
+    /// transaction to make sure we make progress if the failing transaction is retried. However, we
+    /// can't kill it if it's already prepared, so in that case we commit suicide instead"
+    /// (`PreCommit_CheckForSerializationFailure`, read 2026-08-11). It costs the guarantee nothing and
+    /// only the forward-progress preference, on a path the server cannot reach: every transaction the
+    /// server begins is `Serializable`, and the one demotion to `Snapshot` (`rmp` #545) applies to
+    /// read-only auto-commit statements, which write nothing and so can never be a pivot.
+    fn break_dangerous_structure(&self, txn: TxnId, victim: TxnId) -> Result<()> {
+        let condemned = victim != txn
+            && self
+                .with_active(|a| a.get(&victim).map(|t| t.isolation))
+                .is_some_and(IsolationLevel::runs_ssi)
+            && self.ssi.borrow_mut().doom(victim);
+        if condemned {
+            return Ok(());
+        }
+        self.abort(txn)?;
+        Err(GraphusError::Transaction(format!(
+            "serialization failure: transaction {} aborted to preserve serializability (SSI \
+             dangerous structure); retry",
+            txn.0
+        )))
+    }
+
     /// Merges an off-thread reader's accumulated [`SsiReadBuffer`] into the shared
     /// [`SsiTracker`](graphus_txn::SsiTracker) on the engine thread, replaying its SIREAD markers
     /// (sorted + deduped) so the conflict graph is byte-identical to recording them inline (`rmp` tasks
@@ -11111,17 +11166,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         if isolation.runs_ssi() {
             let victim = self.ssi.borrow().detect_pivot_abort(txn);
             if let Some(victim) = victim {
-                if victim == txn {
-                    self.abort(txn)?;
-                    return Err(GraphusError::Transaction(format!(
-                        "serialization failure: transaction {} aborted to preserve serializability \
-                         (SSI dangerous structure); retry",
-                        txn.0
-                    )));
-                }
-                // The pivot is another open transaction: abort it so this safe member commits. Its
-                // own later commit/statement will fail as inactive (the poisoned-victim model).
-                self.abort(victim)?;
+                self.break_dangerous_structure(txn, victim)?;
             }
         }
 
@@ -11188,15 +11233,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         if isolation.runs_ssi() {
             let victim = self.ssi.borrow().detect_pivot_abort(txn);
             if let Some(victim) = victim {
-                if victim == txn {
-                    self.abort(txn)?;
-                    return Err(GraphusError::Transaction(format!(
-                        "serialization failure: transaction {} aborted to preserve serializability \
-                         (SSI dangerous structure); retry",
-                        txn.0
-                    )));
-                }
-                self.abort(victim)?;
+                self.break_dangerous_structure(txn, victim)?;
             }
         }
 

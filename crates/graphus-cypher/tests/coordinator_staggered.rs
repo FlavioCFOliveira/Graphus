@@ -57,13 +57,18 @@ fn compile(src: &str) -> PhysicalPlan {
 fn run_stmt(coord: &Coord, txn: TxnId, src: &str) -> (Vec<Row>, bool) {
     let plan = compile(src);
     let bound = bind_parameters(&plan, &Parameters::new()).expect("bind");
-    // A SERIALIZABLE commit can abort *another* still-open transaction (the poisoned-victim model:
-    // `coordinator::commit` aborts a pivot that is another open txn so a safe member can commit). That
-    // victim's next statement then fails as "inactive txn", which is **expected** serializable behaviour,
-    // not a harness error — so treat it exactly like a captured serialization failure (`ok == false`),
-    // and let the driver roll the txn out of the active set. (Before `rmp` #325 tightened the label-scan
-    // SSI footprint, the seeds here happened never to poison a cross-txn victim; the precise footprint
-    // now reaches that legitimate structure, which this harness must tolerate.)
+    // A SERIALIZABLE commit can condemn *another* still-open transaction — the Case-B pivot, which
+    // `TxnCoordinator::break_dangerous_structure` dooms so that a safe member can commit. Since
+    // `rmp` #1051 the victim is NOT undone by the committer (that put two threads inside one
+    // transaction's rollback at `engine_workers > 1`); it stays open and usable, and fails at its
+    // OWN commit with a retriable serialization failure. Its statements therefore keep succeeding
+    // until then, which this harness needs no special case for.
+    //
+    // `statement` can still refuse — an aged reap, or a transaction this driver has already rolled
+    // out of the active set — so an inactive txn is treated exactly like a captured serialization
+    // failure (`ok == false`) rather than as a harness error. (Before `rmp` #325 tightened the
+    // label-scan SSI footprint, the seeds here happened never to reach a cross-txn victim at all;
+    // the precise footprint now does, which this harness must tolerate.)
     let mut graph = match coord.statement(txn) {
         Ok(graph) => graph,
         Err(_) => return (Vec::new(), false),

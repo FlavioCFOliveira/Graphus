@@ -383,8 +383,11 @@ impl Rng {
 /// - the `D-write-conflict-detection` header check, which aborts a writer that finds another open
 ///   transaction's delta at the head of the entity's chain;
 /// - the SSI pivot abort at commit time; and
-/// - the **poisoned-victim** form of the same thing — a committing transaction aborts *another*
-///   open transaction as the pivot, whose own later commit then reports `commit of inactive txn`.
+/// - the **condemned-victim** form of the same thing — a committing transaction dooms *another* open
+///   transaction as the pivot (`rmp` #1051), and that transaction then aborts itself, on its own
+///   worker, at its own commit, with the same retriable serialization failure. It is never undone by
+///   the committer's thread: doing that put two workers inside one transaction's rollback, which is
+///   the defect this gate found.
 ///
 /// Anything else is counted separately, kept verbatim, and fails the gate. A gate that folded an
 /// unexpected error into "contention" would be measuring its own bugs.
@@ -864,16 +867,20 @@ fn inject_write_skew(history: &History) -> Option<History> {
 /// - **No register's list contains a duplicate**, which is what a lost update looks like from the
 ///   other side.
 #[test]
-// FAILS TODAY, AND THAT IS THE FINDING (`rmp` #1051). At `engine_workers = 8`, 3 runs out of 3, a
-// rollback refuses to run — "delta D on Node X is not on the head prefix of its chain, so detaching
-// it would splice a live chain" — so the transaction stays OPEN with its uncommitted writes
-// physically present, and `degrade_on_incomplete_undo` takes the whole database out: 476 of 480
-// requests answered "engine degraded … pending a controlled restart". The IDENTICAL workload passes
-// at `engine_workers = 1` in 1.92 s.
+// GREEN SINCE `rmp` #1051, and what it found is worth keeping next to the gate that found it. At
+// `engine_workers = 8` this failed 3 runs out of 3 with the store's own fail-closed tripwire —
+// "delta D on Node X is not on the head prefix of its chain, so detaching it would splice a live
+// chain" — after which the transaction stayed OPEN with its uncommitted writes physically present
+// and `degrade_on_incomplete_undo` took the whole database out: 476 of 480 requests answered "engine
+// degraded … pending a controlled restart". The IDENTICAL workload passed at `engine_workers = 1`,
+// which is what said the defect was multi-writer and not the workload.
 //
-// Ignored by an EXPLICIT decision of the project owner (2026-08-11) — see the note on the gate
-// above for the terms. #1051 removes this attribute and may not close while it is still here.
-#[ignore = "rmp #1051: fails at engine_workers > 1; un-ignored by the task that fixes it"]
+// The cause was NOT the chain-head protocol the message points at. `TxnCoordinator::commit_prepare`
+// answered an SSI Case-B dangerous structure by running the VICTIM's undo from the committing
+// worker's thread, and the victim was a transaction another worker was running — so two workers
+// entered one `rollback_logical`. The victim is now condemned instead
+// (`TxnCoordinator::break_dangerous_structure`, `SsiTracker::doom`) and aborts itself, on its own
+// worker. Reproduced from a seed by `graphus-dst`'s `det_scheduler_double_rollback_1051`.
 fn the_concurrent_history_has_no_isolation_anomaly() {
     const KEYS: i64 = 4;
     const PER_CLIENT: i64 = 30;
