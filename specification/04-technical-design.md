@@ -1558,18 +1558,34 @@ writes exactly those fields and nothing else.
 operation that *adds* an entry to a chain — at all six prepend sites of the storage core (both
 endpoint heads of a new relationship, the self-loop's single chain, a node's and a relationship's
 `first_prop`, and the undo chain's `undo_ptr`), plus the GC corpse splice's repointing of a node head.
-They do **not** yet cover the operations that *remove* an entry from a chain, which still install a
-chain head with an unconditional whole-record write:
+Task #1030 brought the two **unlink** sites under the same protocol — `RecordStore::unlink_side_with`
+publishes a node's `first_rel` conditionally and restarts the unlink when refused (a refusal means a
+concurrent prepend has made the record no longer the head, so the neighbour branch is now correct), and
+`RecordStore::set_owner_first_prop` publishes an owner's `first_prop` conditionally and fails closed,
+because its only caller is a GC pass under which the head cannot legitimately move.
 
-| Site | What it installs unconditionally | Reached from |
-| --- | --- | --- |
-| `RecordStore::unlink_side_with` | a node's `first_rel`, by rewriting the whole `NodeRecord` | `undo_own_incidence` — the **logical rollback** of an incidence delta, a transactional path — and `reclaim_rel`, a GC path |
-| `RecordStore::set_owner_first_prop` | an owner's `first_prop`, by rewriting the whole `NodeRecord` or `RelRecord` | `gc_property_chain`, a GC path only |
+**What remains uncovered, enumerated exhaustively.** The enumeration this section used to carry named
+TWO sites and was wrong. A full sweep of every writer of `first_rel`, `first_prop` and `undo_ptr` (task
+#1030) found more, and — the part that matters — **four of them are ordinary transactional paths, not
+GC**. Three were missed because the previous framing looked for "an unconditional whole-record write":
+they write a single word or a header region instead, which defeats the compare-and-publish just as
+thoroughly while not matching the description.
 
-The GC paths are safe for the same reason the splice's refusal is fail-closed: a GC pass holds the
-store exclusively. The rollback path is not covered by that argument. Bringing it under the protocol
-is **outstanding work**, not something task #1028 delivered, and this specification records it as such
-rather than implying an invariant the code does not yet hold.
+| Site | What it installs, and how | Reached from | Class |
+| --- | --- | --- | --- |
+| `repoint_neighbour` | the neighbour's whole `RelRecord`, carrying `first_prop` and `undo_ptr` from a stale read | `unlink_side_with` (both branches) → `undo_own_incidence` → `rollback_logical`; also `reclaim_rel` | transactional |
+| `retire_own_prop_cell` | the owner's `first_prop`, unconditional 8-byte write, when the retired cell is the head | `undo_own_property` → `rollback_logical` | transactional |
+| `undo_own_creation` | the whole 25-byte MVCC header zeroed, `undo_ptr` included | `apply_own_delta` → `rollback_logical` | transactional |
+| `detach_own_deltas` | the entity's live `undo_ptr`, repointed past the aborting transaction's deltas | `rollback_logical` directly | transactional |
+| `relink_run_endpoint`, `reclaim_node`, `reclaim_rel`, `gc_splice_corpses` phase 3, `free_undo_chain` | whole-record or header writes carrying head words | `gc_inner` | GC only |
+| the deferred WAL undo of every whole-record write above | all three words, from a pre-image taken before the write | `rollback_physical`, crash recovery | both |
+
+The GC rows are safe for the same reason the corpse splice's refusal is fail-closed: a GC pass holds
+the store exclusively. That exclusivity is a single-writer convention documented in prose, not a lock —
+`gc` takes `&self` — so it is one of the things task #1016 has to re-establish rather than inherit.
+
+The four transactional rows are **not** covered by that argument and are outstanding work. This
+specification records them as such rather than implying an invariant the code does not yet hold.
 
 **How this is proved.** Two suites, deliberately different in kind, because neither can stand in for
 the other:

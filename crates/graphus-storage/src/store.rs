@@ -4403,24 +4403,53 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// property version or undo delta — silently leaves the chain. That is the `rmp` #220 defect class
     /// as a live hazard rather than a durability one.
     ///
-    /// # What this does NOT yet cover, stated exactly
+    /// # Who else writes these words, enumerated exhaustively (`rmp` #1030)
     ///
-    /// A compare-and-publish is sound only while **every** writer of the word goes through it, so the
-    /// enumeration of those writers is load-bearing and is recorded here rather than assumed. Two
-    /// **unlink** paths still install a chain head by rewriting the owner record whole, and neither is
-    /// a prepend, so neither can use this primitive as it stands (`rmp` #1030):
+    /// A compare-and-publish is sound only while **every** writer of the word goes through it, so this
+    /// enumeration is load-bearing and is recorded here rather than assumed. It was swept exhaustively
+    /// for `rmp` #1030 — every assignment to `first_rel`, `first_prop` and `undo_ptr` in the workspace —
+    /// and the previous version of this list, which named TWO sites, was wrong: there are more, and
+    /// four of them are ordinary transactional paths rather than GC.
     ///
-    /// * [`unlink_side_with`](Self::unlink_side_with) writes the node's `first_rel` through
-    ///   `write_node`. Reached from `reclaim_rel` — a GC pass, which holds the store exclusively — but
-    ///   ALSO from [`undo_own_incidence`](Self::undo_own_incidence), which is logical rollback and
-    ///   therefore an ordinary transactional path. The GC argument does not cover it.
-    /// * [`set_owner_first_prop`](Self::set_owner_first_prop) writes the owner's `first_prop` whole,
-    ///   and is reached only from `gc_property_chain`.
+    /// **Through this primitive** (the six prepend sites, plus two direct compare-and-publishes):
+    /// `link_delta` (`undo_ptr`), `create_node_prop_cell` and `create_rel_prop_cell` (`first_prop`),
+    /// the three `create_rel` head installs (`first_rel`), `bridge_corpse_run` (`first_rel`, GC,
+    /// fail-closed on refusal), and — since `rmp` #1030 — `unlink_side_with`'s head branch
+    /// (`first_rel`, retried on refusal) and `set_owner_first_prop` (`first_prop`, GC, fail-closed).
     ///
-    /// Under one writer both are harmless. Under the concurrent writers of `rmp` #1016 a whole-record
+    /// **NOT through this primitive, and still open.** Each writes a head word outside the rank-27
+    /// latch with no compare, so each makes every other writer's comparison meaningless. The framing
+    /// this list used to have — "installs a chain head by rewriting the owner record whole" — is why
+    /// three of them were missed: they write a single word or a header region, not a whole record, and
+    /// an audit looking for whole-record writes does not find them.
+    ///
+    /// * `repoint_neighbour` — whole-record `write_rel`, carrying the neighbour's `first_prop` and
+    ///   `undo_ptr` from a stale read. Reached from `unlink_side_with`'s BOTH branches, hence from
+    ///   `undo_own_incidence` → `rollback_logical`. **Transactional.**
+    /// * `retire_own_prop_cell` — unconditional 8-byte write of the owner's `first_prop` when the
+    ///   retired cell is the head. Reached from `undo_own_property` → `rollback_logical`.
+    ///   **Transactional.**
+    /// * `undo_own_creation` — zeroes the whole 25-byte MVCC header, `undo_ptr` included. Reached from
+    ///   `apply_own_delta` → `rollback_logical`. **Transactional.**
+    /// * `detach_own_deltas` — repoints the entity's live `undo_ptr` to the first delta the aborting
+    ///   transaction does not own, via `patch_header_word`. Called by `rollback_logical` directly.
+    ///   **Transactional**, and a genuine head mutation on a shared word.
+    /// * `relink_run_endpoint`, `reclaim_node`, `reclaim_rel`, `gc_splice_corpses` phase 3 and
+    ///   `free_undo_chain` — whole-record or header writes carrying head words. **GC only**, so the
+    ///   exclusivity argument covers them for as long as it holds. Note it is a convention documented
+    ///   in prose, not a lock: `gc` takes `&self`, and `rmp` #1016 is what would have to re-establish it.
+    /// * The DEFERRED WAL UNDO of every whole-record write above is a second writer of all three words:
+    ///   `rollback_physical` and crash recovery re-apply a whole-record pre-image taken before the
+    ///   write. Neither doc mentioned this class.
+    ///
+    /// `create_node` and `create_rel` install `undo_ptr` in the record's own first write; the slot is
+    /// freshly allocated and private to the creating transaction, so no concurrent writer can hold it.
+    ///
+    /// Under one writer none of this bites. Under the concurrent writers of `rmp` #1016 a whole-record
     /// write carries `first_prop`, `labels` and the MVCC header along from a stale read, reverting a
-    /// concurrent writer's fields — the `rmp` #772 clobber class. `rmp` #1030 closes them and blocks
-    /// #1016; until it lands, this primitive's guarantee is scoped to the prepend paths.
+    /// concurrent writer's fields — the `rmp` #772 clobber class — and an unconditional single-word
+    /// write silently defeats every comparison. Until the four transactional sites above are closed,
+    /// this primitive's guarantee is scoped to the sites listed as going through it.
     ///
     /// # The three steps, and why they are one
     ///
@@ -10035,7 +10064,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         owner_id: u64,
         watermark: Timestamp,
     ) -> Result<PropChainSweep> {
-        let mut first_prop = self.owner_first_prop(owner_kind, owner_id)?;
+        let first_prop = self.owner_first_prop(owner_kind, owner_id)?;
         // Read once, before the walk: `undo_ptr == 0` is the O(1) proof that Phase F has already
         // retired this owner's whole history (see the method docs for what that does and does not
         // buy). While it is non-zero the empty cells below are DEFERRED, not skipped for ever.
@@ -10115,8 +10144,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 self.write_prop(cur, &dead, txn)?;
                 self.free_push(StoreKind::Prop, cur, txn);
                 if prev == NULL_ID {
-                    first_prop = next;
-                    self.set_owner_first_prop(owner_kind, owner_id, first_prop, txn)?;
+                    // `cur` is the head: publish `next` over it, conditionally on the head still
+                    // naming `cur` (`rmp` #1030).
+                    self.set_owner_first_prop(owner_kind, owner_id, cur, next, txn)?;
                 } else {
                     let mut p = self.read_prop(prev)?;
                     p.next_prop = next;
@@ -10151,30 +10181,48 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         })
     }
 
-    /// Repoints the `first_prop` head pointer of a node or relationship owner, rewriting the owner
-    /// record under `txn` (GC helper, used when the head property is spliced out).
+    /// Publishes the owner's `first_prop`, and ONLY that word, conditionally on it still naming
+    /// `expect` (`rmp` #1030).
+    ///
+    /// This used to read the whole owner record and write it back with `first_prop` replaced — a
+    /// read-modify-write of the ENTIRE record, carrying `labels`, `first_rel` and the MVCC header
+    /// along from a snapshot taken before the write, which is the `rmp` #772 clobber class. It also
+    /// bypassed the compare-and-publish, and a compare-and-set is sound only while EVERY writer of
+    /// the word goes through it: one writer that stores unconditionally makes every other writer's
+    /// comparison meaningless.
+    ///
+    /// CONDITIONAL, and fail-closed on refusal. The only caller is `gc_property_chain`, which holds
+    /// the store exclusively, so the head cannot move under it — the compare is therefore expected
+    /// never to refuse. That is exactly why a refusal is an ERROR here rather than a retry: if the
+    /// head did move, the chain this pass walked is not the chain that exists, and splicing it would
+    /// unlink live structure. This mirrors the GC corpse splice, which fails closed for the same
+    /// reason and in the same words.
     fn set_owner_first_prop(
         &self,
         owner_kind: StoreKind,
         owner_id: u64,
+        expect: u64,
         first_prop: u64,
         txn: TxnId,
     ) -> Result<()> {
-        match owner_kind {
-            StoreKind::Node => {
-                let mut node = self.read_node(owner_id)?;
-                node.first_prop = first_prop;
-                self.write_node(owner_id, &node, txn)
+        let head_off = match owner_kind {
+            StoreKind::Node => NODE_OFF_FIRST_PROP,
+            StoreKind::Rel => REL_OFF_FIRST_PROP,
+            StoreKind::Prop | StoreKind::Strings | StoreKind::Undo | StoreKind::Commit => {
+                return Err(GraphusError::Storage(format!(
+                    "{owner_kind:?} is not a property-chain owner"
+                )));
             }
-            StoreKind::Rel => {
-                let mut rel = self.read_rel(owner_id)?;
-                rel.first_prop = first_prop;
-                self.write_rel(owner_id, &rel, txn)
-            }
-            StoreKind::Prop | StoreKind::Strings | StoreKind::Undo | StoreKind::Commit => Err(
-                GraphusError::Storage(format!("{owner_kind:?} is not a property-chain owner")),
-            ),
+        };
+        if !self.compare_and_publish_chain_head(
+            owner_kind, owner_id, head_off, expect, first_prop, txn,
+        )? {
+            return Err(GraphusError::Storage(format!(
+                "{owner_kind:?} {owner_id} first_prop moved during a GC property-chain splice; the \
+                 chain this pass walked is stale (`rmp` #1030)"
+            )));
         }
+        Ok(())
     }
 
     fn unlink_side(&self, id: u64, side: ChainSide, node: u64, txn: TxnId) -> Result<()> {
@@ -10214,24 +10262,60 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         node: u64,
         txn: TxnId,
     ) -> Result<()> {
-        let (prev, next) = rel.chain_pointers(side);
-        // `prev != id` excludes a self-loop's NON-head link, whose `prev` names the record itself:
-        // both of its sides face `node`, so `first_rel == id` alone cannot tell them apart, and only
-        // the side the relink actually touched (the one whose `prev` was `NULL`) is the stale head.
-        let is_head = prev == NULL_ID || (prev != id && self.read_node(node)?.first_rel == id);
-        if is_head {
-            let mut n = self.read_node(node)?;
-            n.first_rel = next;
-            self.write_node(node, &n, txn)?;
-        } else {
-            self.repoint_neighbour(prev, node, id, next, NeighbourPtr::Next, txn)?;
+        // The record image this attempt reasons from. Re-read when a publication is refused, because
+        // a refusal means the chain moved and every conclusion drawn from the old image — headship,
+        // `prev`, `next` — was drawn from a state that no longer exists.
+        let mut current = *rel;
+        loop {
+            let (prev, next) = current.chain_pointers(side);
+            // `prev != id` excludes a self-loop's NON-head link, whose `prev` names the record itself:
+            // both of its sides face `node`, so `first_rel == id` alone cannot tell them apart, and
+            // only the side the relink actually touched (the one whose `prev` was `NULL`) is the
+            // stale head.
+            let is_head = prev == NULL_ID || (prev != id && self.read_node(node)?.first_rel == id);
+            if is_head {
+                // PUBLISH ONLY THE WORD, CONDITIONALLY (`rmp` #1030). This used to read the whole
+                // `NodeRecord` and write it back with `first_rel` replaced — a read-modify-write of
+                // the ENTIRE record, carrying `first_prop`, `labels` and the MVCC header along from a
+                // snapshot taken before the write. That is the `rmp` #772 clobber class, and it also
+                // bypassed the compare-and-publish: a compare-and-set is sound only while EVERY
+                // writer of the word goes through it, so one unconditional store makes every other
+                // writer's comparison meaningless.
+                //
+                // CONDITIONAL, NOT UNCONDITIONAL, and the reason is the same one the prepend has.
+                // Under the rank-27 latch the word cannot move — but the read that DECIDED headship
+                // happens outside it, three lines up. Between that read and this publication another
+                // writer can prepend, which makes `first_rel` name the new entry and this record no
+                // longer the head; an unconditional store would then publish `next` over the new
+                // head and drop the entry that writer just linked in. So `expect` is this record
+                // itself, and a refusal is not an error — it is the news that this is no longer the
+                // head. The unlink re-reads and starts again, and on the next pass takes the
+                // neighbour branch, which is the correct treatment for a non-head record.
+                //
+                // This terminates: a refusal means some other writer completed a publication, and a
+                // record can only stop being the head once — nothing puts it back at the front while
+                // this unlink is in progress, because the entry is being removed from the chain.
+                if !self.compare_and_publish_chain_head(
+                    StoreKind::Node,
+                    node,
+                    NODE_OFF_FIRST_REL,
+                    id,
+                    next,
+                    txn,
+                )? {
+                    current = self.read_rel(id)?;
+                    continue;
+                }
+            } else {
+                self.repoint_neighbour(prev, node, id, next, NeighbourPtr::Next, txn)?;
+            }
+            if next != NULL_ID {
+                // A new head's `prev` is `NULL`, not the stale pointer this record happened to carry.
+                let restored_prev = if is_head { NULL_ID } else { prev };
+                self.repoint_neighbour(next, node, id, restored_prev, NeighbourPtr::Prev, txn)?;
+            }
+            return Ok(());
         }
-        if next != NULL_ID {
-            // A new head's `prev` is `NULL`, not the stale pointer this record happened to carry.
-            let restored_prev = if is_head { NULL_ID } else { prev };
-            self.repoint_neighbour(next, node, id, restored_prev, NeighbourPtr::Prev, txn)?;
-        }
-        Ok(())
     }
 
     /// On relationship `neighbour`, replace the `which` pointer (`prev`/`next`) of every side
