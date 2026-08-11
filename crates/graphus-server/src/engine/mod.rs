@@ -6153,6 +6153,59 @@ mod maintenance_tests {
         assert_eq!(single.release_floor.load(Ordering::Acquire), 0);
     }
 
+    /// **`rmp` #1037 GATE — the barrier the ENGINE arms dominates every worker's open ticket.**
+    ///
+    /// [`gc_reuse_barrier`] is checked directly by its own tests, and [`TicketSequencer`] by
+    /// [`ticket_tests::the_high_water_dominates_every_workers_ticket`]. Neither of them checks the WIRE
+    /// between the two — that [`EngineReclaim::reuse_barrier`] takes its floor from the engine's
+    /// sequence and not from something narrower — and the wire is precisely where the defect lived:
+    /// with `rmp` #1035's per-worker counters, the floor a pass computed dominated its own worker's
+    /// tickets and nobody else's.
+    ///
+    /// That gap was not hypothetical. Measured while closing this task: with `reuse_barrier` passing a
+    /// per-worker peek instead of `tickets().high_water()`, every gate in the tree stayed green —
+    /// `tests/engine_reclaim_barrier_1037.rs`, `tests/gc_reader_reclaim_reuse_588.rs` and every unit
+    /// test here — because above one worker the release FLOOR happens to cover the same ground, and at
+    /// one worker no gate reads the barrier's value at all. A headline change that no gate can
+    /// falsify is the `rmp` #960 shape, so this test exists to falsify it.
+    ///
+    /// **Non-vacuity, measured.** With `reuse_barrier`'s floor replaced by `0` (an untouched
+    /// per-worker minter) this fails at the first worker it checks: `at W = 1, barrier 1 does not
+    /// exceed the open ticket 1`.
+    #[test]
+    fn the_armed_barrier_exceeds_every_workers_open_ticket() {
+        for workers in [1usize, 2, 4] {
+            let reclaim = EngineReclaim::new(workers, 0);
+            // A read is in flight, so the barrier is armed at one worker too — otherwise the W = 1
+            // case would be `None` for the unrelated reason that nothing needs holding.
+            reclaim.readers_inflight.fetch_add(1, Ordering::Relaxed);
+            let minters: Vec<_> = (0..workers)
+                .map(|w| TicketMinter::new(WorkerAffinity::new(w, workers), reclaim.tickets()))
+                .collect();
+            // Lopsided on purpose: the last worker to mint is not the one with the most tickets, which
+            // is the shape a per-worker floor gets wrong.
+            let mut open = Vec::new();
+            for round in 0..7 {
+                for (w, minter) in minters.iter().enumerate() {
+                    if (round + w) % 2 == 0 {
+                        open.push(minter.mint());
+                    }
+                }
+                let barrier = reclaim
+                    .reuse_barrier()
+                    .expect("a reader is in flight, so a pass must arm the barrier");
+                for &ticket in &open {
+                    assert!(
+                        barrier > ticket,
+                        "at W = {workers}, barrier {barrier} does not exceed the open ticket \
+                         {ticket}: `release_held` frees that transaction's slots while it is still \
+                         walking them (the `rmp` #588 defect, through the `rmp` #1035 door)"
+                    );
+                }
+            }
+        }
+    }
+
     /// **`rmp` #1037 GATE — the reclaim gate refuses re-entry from the thread that holds it.**
     ///
     /// Without this, a future call site that reaches a reclaim section from inside one gets a silent
