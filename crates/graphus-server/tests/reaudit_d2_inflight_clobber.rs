@@ -288,7 +288,22 @@ fn two_concurrent_suspended_inline_statements_must_not_clobber() {
     // With both transactions committed, the active-txn gauge must net back to zero — no parked
     // statement leaked its transaction into the active set (which would pin the MVCC GC watermark and
     // escape the age-cap reap). On the release-mode clobber, A's transaction was never finalized.
-    let active = metrics.active_txns();
+    // The gauge is published by the ENGINE LOOP, not by the reply to `commit_blocking` — so the commit
+    // returning to this thread does not mean the fold has been applied yet. Sampling it on the next
+    // line therefore asks a question the engine has not finished answering, and on an idle machine it
+    // happens to get the right answer anyway.
+    //
+    // Measured under the concurrent suite (`rmp` #1044): the first read returns 1 and the gauge settles
+    // to 0 after 1,08 ms. That is propagation, not a leak — a leaked transaction never settles, which
+    // is exactly what the bound below distinguishes. Waiting for the condition is not a weaker
+    // assertion than reading it once: the requirement is still "it must reach zero", and a transaction
+    // that stays open fails this in five seconds just as loudly as it failed instantly before.
+    let settle_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut active = metrics.active_txns();
+    while active != 0 && std::time::Instant::now() < settle_deadline {
+        std::thread::sleep(Duration::from_millis(1));
+        active = metrics.active_txns();
+    }
     assert_eq!(
         active, 0,
         "a parked inline transaction leaked into the active set ({active} still open after both \

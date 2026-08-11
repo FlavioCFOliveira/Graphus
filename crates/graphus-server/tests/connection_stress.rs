@@ -335,7 +335,22 @@ async fn many_concurrent_connections_all_complete_no_leak() {
     let server = boot(config).await;
     let uds = Arc::new(server.uds_path.clone().expect("UDS enabled"));
 
-    // Baseline FD count before the burst (after the server is fully up), for the no-leak assertion.
+    // Baseline FD count before the burst, for the no-leak assertion — taken after ONE complete client
+    // has connected, run a statement and disconnected.
+    //
+    // "After the server is fully up" is not the same instant as "after the server has opened every
+    // descriptor it permanently holds": the store, the WAL and the per-connection machinery are opened
+    // on first use, not at boot. A baseline read before that first client counts a process that has not
+    // finished becoming itself, and the burst is then charged with descriptors it did not leak. It is
+    // not a small effect — measured across runs of the concurrent suite, the same baseline read came out
+    // as 32 on one run and 256 on another, and the 32 run failed the assertion at 112 while the 256 run
+    // settled at 54 (`rmp` #1044).
+    //
+    // One warm-up client fixes the boundary at a state the burst can actually return to, and the
+    // property being asserted is unchanged: after the burst drains, no descriptor is left behind.
+    run_client(&uds)
+        .await
+        .expect("warm-up client I/O must not hard-fail");
     #[cfg(target_os = "linux")]
     let fd_baseline = open_fd_count();
 

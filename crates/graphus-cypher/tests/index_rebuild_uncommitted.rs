@@ -418,16 +418,30 @@ fn composite_rebuild_does_not_regress_to_cartesian_product() {
         started.elapsed().as_micros()
     }
 
-    // At V=64 the linear sweep rebuilds the whole node in ~3 ms; a 3-key cartesian product over ~65
-    // versions per key would emit ~275_000 tuples and is orders of magnitude beyond this. The bound is
-    // tightened to 20 ms (from 60 ms, now the construction no longer carries a quadratic term): ~6x over
-    // the measured ~3 ms so it does not flap on a loaded machine, yet ~13x below where a product
-    // regression lands (269_900us at only V=16, far worse at V=64).
+    // THE ORACLE IS A RATIO, NOT A STOPWATCH. What separates a linear sweep from a cartesian product
+    // is the GROWTH of the cost with the version count, and growth is what this measures: quadrupling
+    // the versions multiplies a linear rebuild's cost by about four, and a 3-key product's by about
+    // sixty-four.
+    //
+    // The bound used to be an absolute 20 ms at V=64, chosen as "~6x over the measured ~3 ms so it does
+    // not flap on a loaded machine". Six times was not enough: once the suite began running its
+    // binaries concurrently (`rmp` #1044) this measured 20 102 us — a failure by 0,5%, reporting an
+    // algorithmic regression that had not happened. An absolute duration is a property of the host, and
+    // no margin makes it a property of the algorithm; a ratio between two measurements taken back to
+    // back on the SAME host under the SAME load is one.
+    //
+    // The bound of 12 is three times the ~4 a linear sweep produces, and far below the ~64 a product
+    // produces — the recorded product regression cost 269 900 us at V=16 alone, so its V=64/V=16 ratio
+    // is nowhere near 12. Both measurements are kept in the message: a ratio that passes for the wrong
+    // reason (both sides slow) is visible rather than hidden.
+    let at16 = rebuild_micros(16).max(1);
     let at64 = rebuild_micros(64);
+    let growth = at64 as f64 / at16 as f64;
     assert!(
-        at64 < 20_000,
-        "composite rebuild cost regressed toward the cartesian product: V=64 took {at64}us \
-         (linear sweep measures ~3_000us; the product cost 269_900us at only V=16)",
+        growth < 12.0,
+        "composite rebuild cost grew {growth:.1}x when the version count grew 4x (V=16 took {at16}us, \
+         V=64 took {at64}us): a linear sweep grows ~4x and a 3-key cartesian product ~64x, so this is \
+         the product regression returning (recorded at 269_900us for V=16 alone)",
     );
 }
 

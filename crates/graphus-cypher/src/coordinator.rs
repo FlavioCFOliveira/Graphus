@@ -14415,7 +14415,23 @@ mod index_gc_collection_992 {
         {
             let arrived = Arc::clone(&arrived);
             let done = Arc::clone(&done);
+            // The hook is installed in a process-wide static, but the rendezvous it drives has exactly
+            // two participants: this test's `gc()` and its committer. Any OTHER test in this binary
+            // that runs a collection while the hook is installed becomes an uninvited third, and the
+            // barrier then pairs the wrong two threads — our pass sails through without the clock
+            // having advanced and removes entries the gate exists to see abandoned. That is not
+            // hypothetical: it is how this test failed once the suite began running binaries
+            // concurrently (`rmp` #1044), and it could always have failed, since this binary runs its
+            // own tests in parallel already.
+            //
+            // Scoping the hook to the installing thread makes it ours alone. A foreign collection
+            // returns immediately and is neither paused nor counted, which is exactly the isolation
+            // the static cannot provide by itself.
+            let owner = std::thread::current().id();
             let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                if std::thread::current().id() != owner {
+                    return; // another test's collection: not the interval this gate pins
+                }
                 arrived.wait();
                 done.wait();
             });

@@ -415,19 +415,74 @@ fn a_writer_progresses_while_another_stores_latch_is_held() {
 ///
 /// Same keeper/withdrawer shape as the single-id withdrawal below, for the same reason: without runs
 /// that stay outstanding, a lowered mark has nothing to undercut and the test proves nothing.
+///
+/// # The interleaving is CONSTRUCTED for one round, then left free for the rest
+///
+/// The evidence that the threads interleaved is a *declined* withdrawal: a withdrawer found the mark no
+/// longer at the end of its own run, which can only mean another thread claimed in between. Leaving
+/// that to the scheduler is leaving the test's validity to the host — under the concurrent suite
+/// (`rmp` #1044) eight threads ran end to end rather than together, not one withdrawal was declined,
+/// and the non-vacuity assertion fired on a machine where nothing was wrong.
+///
+/// Raising the round count would not fix that; it would only make the same coin-flip cheaper to win.
+/// So round zero is *built* to interleave, with two rendezvous, and it is cross-thread by construction
+/// rather than by luck:
+///
+/// 1. every withdrawer claims its run — rendezvous — so all withdrawn runs exist first;
+/// 2. every keeper claims its run — rendezvous — so every keeper's run sits ABOVE every withdrawer's;
+/// 3. every withdrawer then withdraws, and each one is declined, because a run it does not own is on
+///    top of the mark. Four declines, caused by other threads' claims, on any machine at any load.
+///
+/// The remaining rounds run exactly as before, unsynchronised, so the full interleaving space — a claim
+/// racing a withdrawal, two withdrawals racing each other — is still exercised, and the overlap
+/// property below is asserted over every round of every thread.
 #[test]
 fn claimed_runs_under_contention_never_overlap() {
     const ROUNDS: usize = 1_500;
     const RUN_LEN: u64 = 7;
 
     let alloc = Arc::new(StoreAllocator::new());
+    // Used twice, by all eight threads, to stage round zero (see the doc comment above).
+    let staged = Arc::new(Barrier::new(THREADS));
 
     let a = Arc::clone(&alloc);
     let per_thread = race(move |t| {
         let keeper = t % 2 == 0;
         let mut outstanding: Vec<(u64, u64)> = Vec::new();
         let mut declined = 0usize;
-        for _ in 0..ROUNDS {
+
+        // ROUND ZERO, staged: withdrawers claim, then keepers claim on top of them, then the
+        // withdrawals are attempted and every one of them must be declined.
+        let staged_run = if keeper {
+            staged.wait();
+            let run = a
+                .lock()
+                .claim_run(|first| Ok(first + RUN_LEN))
+                .expect("space");
+            staged.wait();
+            outstanding.push(run);
+            None
+        } else {
+            let run = a
+                .lock()
+                .claim_run(|first| Ok(first + RUN_LEN))
+                .expect("space");
+            staged.wait();
+            staged.wait();
+            Some(run)
+        };
+        if let Some((first, end)) = staged_run {
+            assert!(
+                !a.lock().unbump_run(first, end),
+                "run [{first}, {end}) was withdrawn even though a keeper's run was claimed on top of \
+                 it: `unbump_run` moved a mark that was no longer its own to move, which is exactly \
+                 how two threads end up owning overlapping ids"
+            );
+            declined += 1;
+            outstanding.push((first, end));
+        }
+
+        for _ in 1..ROUNDS {
             let (first, end) = a
                 .lock()
                 .claim_run(|first| Ok(first + RUN_LEN))
@@ -468,12 +523,22 @@ fn claimed_runs_under_contention_never_overlap() {
         alloc.high_water()
     );
 
-    // Non-vacuity, checked LAST so a real overlap above is reported as the overlap it is.
+    // NON-VACUITY. It is asserted inside the threads, on the staged round, and deliberately not here:
+    // this is where it used to live as `declined > 0` over the free-running rounds, and that is a
+    // property of the host's scheduler, not of the allocator — it fired on a loaded machine with
+    // nothing wrong (`rmp` #1044). The staged round proves the same thing about the same code path
+    // (`unbump_run` declining a mark another thread moved) on every machine at every load, and it
+    // still fails under the mutation this file's module docs name: an unconditional `restore_to`
+    // withdraws the run and the staged assertion trips at once.
+    //
+    // The free rounds' declines are reported rather than required, because that is exactly the status
+    // they have: evidence of how much genuine interleaving this particular run happened to get.
+    let staged = THREADS / 2; // one guaranteed decline per withdrawer, from the staged round
     let declined: usize = per_thread.iter().map(|(_, d)| d).sum();
-    assert!(
-        declined > 0,
-        "no run withdrawal was ever declined, so the threads did not interleave and this test proved \
-         nothing about the race. Raise ROUNDS or THREADS."
+    println!(
+        "claimed_runs_under_contention_never_overlap: {} declined withdrawals in the free rounds \
+         (plus {staged} staged)",
+        declined - staged
     );
 }
 
@@ -490,11 +555,20 @@ fn claimed_runs_under_contention_never_overlap() {
 ///
 /// The keepers' ids are what makes that observable. A test where every thread withdrew would see the
 /// mark bounce harmlessly, because no id would be outstanding for the lowering to undercut.
+///
+/// Round zero is staged exactly as in [`claimed_runs_under_contention_never_overlap`], and for the same
+/// reason: a declined withdrawal is this test's evidence that the threads interleaved, and leaving that
+/// evidence to the scheduler makes the test's validity a property of the host. Withdrawers allocate,
+/// rendezvous, keepers allocate on top of them, rendezvous, and every withdrawal is then declined
+/// because a live id it does not own sits above the mark. The remaining rounds are unsynchronised, so
+/// the full race is still run.
 #[test]
 fn withdrawals_under_contention_never_reissue_a_live_id() {
     const ROUNDS: usize = 4_000;
 
     let alloc = Arc::new(StoreAllocator::new());
+    // Used twice, by all eight threads, to stage round zero (see the doc comment above).
+    let staged = Arc::new(Barrier::new(THREADS));
 
     let a = Arc::clone(&alloc);
     let per_thread = race(move |t| {
@@ -503,7 +577,33 @@ fn withdrawals_under_contention_never_reissue_a_live_id() {
         // ids whose withdrawal was DECLINED, which are outstanding for the same reason.
         let mut outstanding: Vec<u64> = Vec::new();
         let mut declined = 0usize;
-        for _ in 0..ROUNDS {
+
+        // ROUND ZERO, staged: withdrawers allocate, then keepers allocate on top of them, then every
+        // withdrawal is attempted and every one of them must be declined.
+        let staged_id = if keeper {
+            staged.wait();
+            let id = a.allocate().expect("space").id();
+            staged.wait();
+            outstanding.push(id);
+            None
+        } else {
+            let id = a.allocate().expect("space").id();
+            staged.wait();
+            staged.wait();
+            Some(id)
+        };
+        if let Some(id) = staged_id {
+            assert!(
+                !a.lock().unbump_fresh(id),
+                "id {id} was withdrawn even though a keeper's id was allocated on top of it: the \
+                 withdrawal lowered a mark that was no longer its own to move, which re-issues a live \
+                 id and puts two records in one physical slot"
+            );
+            declined += 1;
+            outstanding.push(id);
+        }
+
+        for _ in 1..ROUNDS {
             let id = a.allocate().expect("space").id();
             if keeper {
                 outstanding.push(id);
@@ -537,13 +637,17 @@ fn withdrawals_under_contention_never_reissue_a_live_id() {
         alloc.high_water()
     );
 
-    // Non-vacuity: under real contention some withdrawals MUST be declined, otherwise the threads ran
-    // end to end and the race this test exists for never happened. Checked LAST, so a genuine
-    // correctness failure above is reported as the correctness failure it is.
+    // NON-VACUITY. Asserted inside the threads, on the staged round, and deliberately not here — the
+    // reasoning is identical to `claimed_runs_under_contention_never_overlap`'s, and so was the
+    // failure: `declined > 0` over the free-running rounds is a property of the host's scheduler, and
+    // it fired under the concurrent suite with nothing wrong (`rmp` #1044). The staged round proves
+    // the same thing about the same code path on every machine, and still trips under the mutation
+    // this file's module docs name (an unconditional `restore`).
+    let staged = THREADS / 2; // one guaranteed decline per withdrawer, from the staged round
     let declined: usize = per_thread.iter().map(|(_, d)| d).sum();
-    assert!(
-        declined > 0,
-        "no withdrawal was ever declined, so the threads did not interleave and this test proved \
-         nothing about the race. Raise ROUNDS or THREADS."
+    println!(
+        "withdrawals_under_contention_never_reissue_a_live_id: {} declined withdrawals in the free \
+         rounds (plus {staged} staged)",
+        declined - staged
     );
 }

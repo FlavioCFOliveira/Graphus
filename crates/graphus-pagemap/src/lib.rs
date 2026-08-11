@@ -562,16 +562,28 @@ mod tests {
     #[test]
     fn concurrent_readers_never_miss_a_published_entry() {
         const N: usize = 50_000;
+        const READERS: usize = 4;
         let w = PageMapWriter::new();
         let m = w.reader();
         let stop = Arc::new(AtomicBool::new(false));
+        // The readers must be RUNNING before the writer starts, or this test measures the scheduler.
+        // Without the barrier the writer can finish all 50 000 pushes and set `stop` before a reader
+        // is ever scheduled: every reader then observes nothing, `any_saw_growth` is false, and the
+        // gate reports "the readers never observed the map at all" — which is what it did once the
+        // suite began running binaries concurrently (`rmp` #1044), and what it would do on any loaded
+        // machine. The barrier makes the overlap a fact rather than a hope, and costs one rendezvous.
+        let ready = Arc::new(std::sync::Barrier::new(READERS + 1));
+        let observed = Arc::new(AtomicBool::new(false));
 
-        let readers: Vec<_> = (0..4)
+        let readers: Vec<_> = (0..READERS)
             .map(|_| {
                 let m = Arc::clone(&m);
                 let stop = Arc::clone(&stop);
+                let ready = Arc::clone(&ready);
+                let observed = Arc::clone(&observed);
                 std::thread::spawn(move || {
                     let mut max_seen = 0usize;
+                    ready.wait();
                     while !stop.load(Ordering::Relaxed) {
                         let len = m.len();
                         // Every index below the published length MUST resolve, and to the right value.
@@ -581,6 +593,9 @@ mod tests {
                             });
                             assert_eq!(got, PageId(i as u64 + 1), "entry {i} is wrong");
                         }
+                        if len > 0 {
+                            observed.store(true, Ordering::Release);
+                        }
                         max_seen = max_seen.max(len);
                     }
                     max_seen
@@ -588,8 +603,24 @@ mod tests {
             })
             .collect();
 
+        ready.wait();
         for i in 0..N {
             w.push(PageId(i as u64 + 1)).unwrap();
+        }
+        // Hold the window open until a reader has actually READ the map. That is the condition the
+        // assertion below states, so waiting for it is what turns the assertion from lucky into true:
+        // closing the window on a timer instead leaves "did anyone look?" to the scheduler.
+        //
+        // The deadline is not a margin on the property — it is what keeps a BROKEN map reportable. If
+        // `len()` were mutated to never grow, the readers would observe nothing, this wait would never
+        // be satisfied, and an unbounded spin would turn a defect into a hung test that reports
+        // nothing at all. With the deadline the wait simply gives up and the assertion below fails
+        // with the message it always had. The bound is enormous compared with what a working map needs
+        // (the readers are already inside the loop and the map is fully published, so the next `len()`
+        // any of them performs returns `N`), so a healthy run never approaches it.
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !observed.load(Ordering::Acquire) && std::time::Instant::now() < give_up {
+            std::hint::spin_loop();
         }
         stop.store(true, Ordering::Relaxed);
 

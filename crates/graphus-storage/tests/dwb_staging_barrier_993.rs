@@ -386,9 +386,32 @@ fn concurrent_evictors_each_see_their_own_copy_durable_before_writing_home() {
         0,
         "no staging barrier may have been issued under the mutex"
     );
+    // ONE BARRIER PER EVICTION IS NOT A PROPERTY OF THIS CODE, and asserting it was a mistake this
+    // gate got away with only while the machine was idle.
+    //
+    // `rmp` #994 amortises the barrier deliberately: an evictor whose ticket a peer's round already
+    // covered returns without issuing one of its own — that is the whole point of group staging. So
+    // the count of `sync_data` calls is at most the number of evictions, and equals it only when no
+    // two evictors happen to be inside `wait_durable` together. Under the concurrent suite two of
+    // them did, and this gate read 94 against the 96 it demanded and reported a defect that did not
+    // exist (`rmp` #1044).
+    //
+    // What IS exact, under any interleaving, is the accounting: every eviction either LED a barrier
+    // round or RODE one, and every round that was led went through the off-lock handle. That is
+    // asserted here in both halves, so the gate still fails if a barrier goes missing (the eviction
+    // would be neither led nor ridden) or moves back under the mutex (`device_barriers` above, and
+    // the handle count below would fall short of the rounds led).
+    let (led, rode) = stager.barrier_counters();
     assert_eq!(
         dwb_dev.handle_barriers() as u64,
+        led,
+        "every barrier round that was led must have been issued through the off-lock handle"
+    );
+    assert_eq!(
+        led + rode,
         THREADS * ROUNDS,
-        "one off-lock staging barrier per eviction"
+        "every eviction must either lead a staging barrier or ride a peer's: {led} led + {rode} rode \
+         does not account for the {} evictions performed",
+        THREADS * ROUNDS
     );
 }
