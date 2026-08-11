@@ -15,3 +15,42 @@ authors = ["Flavio CF Oliveira"]
 [profile.release]
 codegen-units = 1
 lto = "thin"
+
+# The profile the verification gates run under (`rmp` #1043).
+#
+# WHY IT EXISTS. Measured on this workspace (16 cores, 30 GB, rustc 1.96.0), running all 452 test
+# binaries and 6347 tests one at a time, exactly as `cargo test` does:
+#
+#   profile.dev  (opt-level = 0)   2139,7 s   —   35,7 min
+#   profile.gate (opt-level = 1)    333,3 s   —    5,6 min   (6,4x)
+#
+# The cost was never compilation: with the cache warm, `cargo test --workspace --no-run` returns in
+# 0,58 s. It was executing unoptimised code, and it concentrated — 78% of the time sat in 20 of the
+# 452 binaries, while 248 of them cost under 0,1 s each.
+#
+# WHY opt-level = 1 AND NOT 2. Measured both. `opt-level = 2` runs marginally faster (310,2 s) and
+# costs nearly twice as much to build: 723,9 s against 408,7 s from cold, and 608,7 s against 356,0 s
+# to rebuild after touching `graphus-storage`. Since the gates rebuild on every change, the cycle that
+# matters — rebuild plus run — is 690,8 s at level 1 against 918,9 s at level 2. Level 1 wins the
+# thing being optimised.
+#
+# WHY NOT `--release`, WHICH WOULD BE FASTER STILL. Because it turns `debug_assertions` and
+# `overflow-checks` OFF: the suite would run faster and prove less, with nothing in the output saying
+# so. Both are therefore set EXPLICITLY here rather than inherited, and
+# `graphus-core/tests/verification_profile_keeps_its_assertions.rs` proves from inside the compiled
+# binary that they survived — it passes under this profile and FAILS under `--release`, on purpose.
+#
+# `debug = "line-tables-only"` keeps file:line in every backtrace (a gate that cannot be diagnosed is
+# worth little) while dropping the variable-level debuginfo that made a single test binary 126 MB;
+# they are 10,5 MB here, which took the whole target directory from 449 GB to ~20 GB.
+#
+# NOT ADOPTED, and measured rather than assumed: the `lld` linker shipped with the toolchain. It links
+# one binary in 3,0 s against 25,8 s, and changes the gate's rebuild cycle not at all (355,3 s against
+# 356,0 s) — the dominant cost is codegen, not linking. It buys an environment dependency and no time.
+[profile.gate]
+inherits = "dev"
+opt-level = 1
+debug = "line-tables-only"
+debug-assertions = true
+overflow-checks = true
+incremental = false

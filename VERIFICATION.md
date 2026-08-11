@@ -9,23 +9,68 @@ A single convenience runner, [`scripts/verify.sh`](scripts/verify.sh), runs the 
 sequence (and, with flags, the slow ones). The table below is the authority on what each gate is and
 how CI should schedule it.
 
+## The profile the gates run under (`rmp` #1043)
+
+Every workspace gate runs under **`--profile gate`**, defined in the root `Cargo.toml`. It is
+`profile.dev` with `opt-level = 1`, and it exists because the suite was spending its time executing
+unoptimised code rather than compiling anything. Measured on one host (16 cores, 30 GB, rustc 1.96.0),
+running all **452 test binaries and 6347 tests** one at a time, exactly as `cargo test` does:
+
+| | `profile.dev` (`opt-level = 0`) | `profile.gate` (`opt-level = 1`) |
+| --- | --- | --- |
+| Whole suite, sequential | **2139,7 s** (35,7 min) | **333,3 s** (5,6 min) — 6,4× |
+| Rebuild after touching `graphus-storage` | 196,5 s | 356,0 s |
+| Cycle that matters (rebuild + run) | **2336 s** (38,9 min) | **691 s** (11,5 min) — 3,4× |
+| One test binary on disk | 126 MB | 10,5 MB |
+| Whole target directory | 449 GB | 23 GB |
+
+Compilation was never the bottleneck — with the cache warm, `cargo test --workspace --no-run` returns
+in **0,58 s** — and the execution cost concentrates hard: **78% of it sits in 20 of the 452 binaries**,
+while 248 of them cost under 0,1 s each.
+
+**`opt-level = 1` and not 2, by measurement.** Level 2 runs marginally faster (310,2 s) and costs
+nearly twice as much to build (723,9 s cold against 408,7 s; 608,7 s to rebuild against 356,0 s).
+Since the gates rebuild on every change, level 1 wins the cycle: 691 s against 919 s.
+
+**Not `--release`, and this is enforced rather than asked.** `--release` turns `debug_assertions` and
+`overflow-checks` OFF: the suite would run faster and prove less, with nothing in the output saying so.
+`[profile.gate]` sets both explicitly, and
+[`graphus-core/tests/verification_profile_keeps_its_assertions.rs`](crates/graphus-core/tests/verification_profile_keeps_its_assertions.rs)
+proves it from inside the compiled binary — it passes under the gate profile and **fails under
+`--release`**, on purpose, so that "speed the gates up by running them in release" cannot happen
+quietly.
+
+**`lld` was evaluated and rejected.** The `rust-lld` shipped with the toolchain links a single test
+binary in 3,0 s against 25,8 s — and changes the gate's rebuild cycle not at all (355,3 s against
+356,0 s), because the dominant cost is codegen, not linking. It buys an environment dependency and no
+time.
+
+The **performance** gates (6, 7, 8, 9 below, and the release symbol check) stay on `--release`: their
+committed baselines were measured there, and comparing against another profile would invalidate the
+comparison rather than speed it up.
+
 ## Gate summary
 
-| # | Gate | Crate / file | CI cadence | Typical runtime |
+Runtimes below were **measured on 2026-08-11** (16 cores, 30 GB, rustc 1.96.0) by the runner itself —
+`scripts/verify.sh` now prints what each step cost, because a figure nobody remeasures stops being a
+measurement. "Warm" means the artefacts were already built; the first run of a step also pays for
+compilation.
+
+| # | Gate | Crate / file | CI cadence | Measured runtime (warm) |
 | - | ---- | ------------ | ---------- | --------------- |
-| 1 | Anomaly checker (Elle/DSG serializability) | `graphus-cypher/tests/elle.rs` | every push | < 1 s |
+| 1 | Anomaly checker (Elle/DSG serializability) | `graphus-cypher/tests/elle.rs` | every push | **0 s** |
 | 2 | loom model-check (lock-free latch protocol) | `graphus-bufpool/tests/loom_bufpool.rs` | nightly / on-change | seconds (bounded) |
 | 3 | miri UB gate (pure-logic crates) | `graphus-core`, `graphus-wal`, `graphus-bolt`, `graphus-index`, `graphus-storage` | nightly / on-change | ~3 min total |
-| 4 | proptest invariants (codecs, key order) | `graphus-storage/tests/proptest_codecs.rs`, `graphus-cypher/tests/proptest_keycodec.rs` | every push | < 1 s |
+| 4 | proptest invariants (codecs, key order) | `graphus-storage/tests/proptest_codecs.rs`, `graphus-cypher/tests/proptest_keycodec.rs` | every push | **1 s** |
 | 5 | cargo-fuzz targets (parser, packstream) | `graphus-cypher/fuzz`, `graphus-bolt/fuzz` | manual / scheduled campaign | build < 2 min; campaign = as long as you let it |
-| 6 | Criterion regression gate | `graphus-bench` (`bin/bench_gate`, `baseline.toml`) | every push (release) | ~1–2 s |
+| 6 | Criterion regression gate | `graphus-bench` (`bin/bench_gate`, `baseline.toml`) | every push (release) | **~40 s** — currently **RED**, see `rmp` #1047 |
 | 7 | Criterion micro-benchmark suites | `graphus-bench/benches/*`, `graphus-io/benches/loopback` | manual / perf job | minutes |
-| 8 | LDBC-SNB macro harness | `graphus-bench` (`bin/ldbc_snb`, `src/ldbc/`) | nightly / perf job | seconds (tiny) |
-| 9 | Examples suite — E2E, both modes | `examples/run-all.sh` via `scripts/examples-gate.sh` | every push | ~2–4 min |
-| 10 | Read-polarity census (superset / decision / conservative) | `graphus-cypher/tests/read_polarity_census.rs`, `graphus-storage/tests/scan_polarity_barrier.rs` | every push | < 1 s |
-| 11 | Official Neo4j driver interop (real driver over Bolt) | `graphus-server/tests/neo4j_driver_interop.rs` (feature `neo4j-interop`) | every push | ~1–3 min |
-| 12 | Property visible-read record count (`rmp` #967 AC2) | `graphus-storage/tests/prop_visible_read_record_count.rs` (feature `read-probe`) | every push | < 1 s |
-| 13 | Deterministic writer scheduler (`rmp` #973) | `graphus-dst/tests/det_scheduler_gc_reader_811.rs`, `graphus-dst/tests/det_scheduler_elle_oracle.rs`, `graphus-dst/src/detsched.rs` (feature `det-sched`) | every push | ~5 s |
+| 8 | LDBC-SNB macro harness | `graphus-bench` (`bin/ldbc_snb`, `src/ldbc/`) | nightly / perf job | **16 s** |
+| 9 | Examples suite — E2E, both modes | `examples/run-all.sh` via `scripts/examples-gate.sh` | every push | **769 s (12,8 min)** — the runner's most expensive step by far, and currently **RED**, see `rmp` #1048 |
+| 10 | Read-polarity census (superset / decision / conservative) | `graphus-cypher/tests/read_polarity_census.rs`, `graphus-storage/tests/scan_polarity_barrier.rs` | every push | **1 s** |
+| 11 | Official Neo4j driver interop (real driver over Bolt) | `graphus-server/tests/neo4j_driver_interop.rs` (feature `neo4j-interop`) | every push | **33 s** |
+| 12 | Property visible-read record count (`rmp` #967 AC2) | `graphus-storage/tests/prop_visible_read_record_count.rs` (feature `read-probe`) | every push | **0 s** |
+| 13 | Deterministic writer scheduler (`rmp` #973) | `graphus-dst/tests/det_scheduler_gc_reader_811.rs`, `graphus-dst/tests/det_scheduler_elle_oracle.rs`, `graphus-dst/src/detsched.rs` (feature `det-sched`) | every push | **6 s** |
 
 > **What "every push" means today.** It is the *intended* cadence, and it is what `scripts/verify.sh`
 > runs — but nothing invokes that script automatically: `.github/workflows/` holds only the on-demand
@@ -33,6 +78,13 @@ how CI should schedule it.
 > `scripts/verify.sh`**. This is worth stating plainly rather than leaving the column to imply
 > enforcement that does not exist, because a gate nobody runs is exactly how `rmp` #960 survived (see
 > gate 11). Restoring a CI workflow that invokes `scripts/verify.sh` is the open item.
+
+> **Reading the invocations below.** Each gate's section gives the command in its plain form
+> (`cargo test -p … --test …`), which is what you want when you are iterating on that one gate. The
+> runner adds **`--profile gate`** to every workspace invocation, and that is what a verification run
+> is: same command, same assertions, 6,4× less waiting (see the profile section above). The
+> `--release` invocations — the regression gate, LDBC, the examples suite, the symbol check — stay
+> exactly as written, because their baselines were measured in release.
 
 ---
 
@@ -573,4 +625,11 @@ scripts/verify.sh
 # Add the slow gates as needed:
 scripts/verify.sh --with-loom     # + loom model-check
 scripts/verify.sh --with-miri     # + miri UB gate (nightly + miri)
+
+# The whole test suite on its own, under the verification profile (452 binaries, 6347 tests, 5,6 min
+# — against 35,7 min at `opt-level = 0`). This is the command to use while developing, too:
+cargo test --workspace --profile gate
 ```
+
+Every run prints what each step cost. If a step's number drifts, that is the measurement telling you
+something — remeasure before assuming it is the machine.

@@ -1,6 +1,18 @@
 #!/usr/bin/env bash
 # verify.sh — run the FAST gates of the Graphus standing verification suite in sequence (`rmp` #27).
 #
+# EVERY workspace gate below runs under `--profile gate` (`rmp` #1043), the optimised-and-fully-
+# asserted profile defined in the root `Cargo.toml`. Measured: the whole suite takes 2139,7 s at
+# `opt-level = 0` and 333,3 s here, and the profile keeps `debug_assertions` and `overflow-checks` ON
+# so nothing is traded away for that — `graphus-core/tests/verification_profile_keeps_its_assertions.rs`
+# proves it from inside the compiled binary and FAILS under `--release`, which is not a verification
+# profile. Using one profile for every step also means one artefact graph instead of three, so clippy
+# reuses what the tests built (measured: 25,4 s).
+#
+# The performance gates below (the criterion regression gate, LDBC, the examples suite, the release
+# symbol check) stay on `--release` deliberately: their committed baselines were measured there, and
+# comparing against a different profile would invalidate the comparison rather than speed it up.
+#
 # This runs the gates that finish in seconds-to-minutes and belong on every push:
 #   1. workspace build + clippy + fmt check
 #   2. anomaly checker (Elle/DSG serializability)
@@ -38,15 +50,31 @@ for arg in "$@"; do
     esac
 done
 
-step() { printf '\n\033[1;34m==> %s\033[0m\n' "$1"; }
+# Each step reports what it cost. A runner whose per-step cost is invisible cannot be optimised and
+# cannot be defended: the table in VERIFICATION.md carried figures nobody had remeasured since they
+# were written, and "~2-4 min" for a gate is not a measurement. Now every run produces one.
+GATE_T0=$(date +%s)
+STEP_NAME=""
+STEP_T0=0
+close_step() {
+    if [ -n "$STEP_NAME" ]; then
+        printf '\033[2m    ↳ %s: %ds\033[0m\n' "$STEP_NAME" "$(($(date +%s) - STEP_T0))"
+    fi
+}
+step() {
+    close_step
+    STEP_NAME="$1"
+    STEP_T0=$(date +%s)
+    printf '\n\033[1;34m==> %s\033[0m\n' "$1"
+}
 
 step "1/10 build + clippy + fmt (workspace)"
-cargo build --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+cargo build --workspace --profile gate
+cargo clippy --workspace --all-targets --profile gate -- -D warnings
 cargo fmt --all --check
 
 step "2/10 anomaly gate — Elle/DSG serializability checker"
-cargo test -p graphus-cypher --test elle
+cargo test --profile gate -p graphus-cypher --test elle
 
 # A read of the record store returns raw physical state; which answer the caller owes back is one of
 # three (superset / decision / conservative, `04 §5.3`). Confusing them produced three CRITICAL
@@ -54,8 +82,8 @@ cargo test -p graphus-cypher --test elle
 # gate reads source text, costs milliseconds, and fails when a polarity-sensitive read appears or
 # moves without being classified (`rmp` #905; VERIFICATION.md gate 10).
 step "3/10 read-polarity census — superset / decision / conservative storage reads"
-cargo test -p graphus-cypher --test read_polarity_census
-cargo test -p graphus-storage --test scan_polarity_barrier
+cargo test --profile gate -p graphus-cypher --test read_polarity_census
+cargo test --profile gate -p graphus-storage --test scan_polarity_barrier
 
 # Acceptance criterion 2 of `rmp` #967 — "reading the visible property does not walk the chain" —
 # proven by a RECORD-READ COUNT rather than a timing, because a timing is a property of the host's
@@ -69,8 +97,8 @@ cargo test -p graphus-storage --test scan_polarity_barrier
 # gate green. `04-technical-design.md` §11.6 was ratified by #967 itself to stop that recurring, and a
 # headline acceptance criterion asserted by nothing any gate runs is the same defect again. Hence the
 # explicit `--features read-probe` invocation here.
-step "4/10 property visible-read record count — `rmp` #967 AC2 (needs --features read-probe)"
-cargo test -p graphus-storage --features read-probe --test prop_visible_read_record_count
+step '4/10 property visible-read record count — rmp #967 AC2 (needs --features read-probe)'
+cargo test --profile gate -p graphus-storage --features read-probe --test prop_visible_read_record_count
 
 # `rmp` #973 puts the DST's thread interleaving under a seeded scheduler, so a concurrency defect
 # reproduces from a seed the way a crash already does. Its suites are behind the opt-in `det-sched`
@@ -83,10 +111,10 @@ cargo test -p graphus-storage --features read-probe --test prop_visible_read_rec
 # green. A headline acceptance criterion asserted only by a suite nothing runs is that defect again.
 # Hence the explicit `--features det-sched` invocation here, covering BOTH suites and the
 # scheduler's own unit tests.
-step "5/10 deterministic writer scheduler — `rmp` #973 (needs --features det-sched)"
-cargo test -p graphus-dst --features det-sched --lib detsched::
-cargo test -p graphus-dst --features det-sched --test det_scheduler_gc_reader_811
-cargo test -p graphus-dst --features det-sched --test det_scheduler_elle_oracle
+step '5/10 deterministic writer scheduler — rmp #973 (needs --features det-sched)'
+cargo test --profile gate -p graphus-dst --features det-sched --lib detsched::
+cargo test --profile gate -p graphus-dst --features det-sched --test det_scheduler_gc_reader_811
+cargo test --profile gate -p graphus-dst --features det-sched --test det_scheduler_elle_oracle
 
 # `rmp` #973 acceptance criterion 3 — the production cost is ZERO — asserted mechanically rather
 # than argued. The release build below reproduces the container image's `-p graphus-server` package
@@ -100,7 +128,7 @@ cargo test -p graphus-dst --features det-sched --test det_scheduler_elle_oracle
 # eight `tokio::runtime::blocking::schedule::BlockingSchedule` symbols and would make this gate
 # report a violation that does not exist. A gate that cries wolf is retired by the next person who
 # sees it, so it is anchored here on purpose.
-step "5b/10 deterministic scheduler costs production NOTHING — `rmp` #973 AC3"
+step '5b/10 deterministic scheduler costs production NOTHING — rmp #973 AC3'
 cargo build --release --locked -p graphus-server
 for pattern in 'graphus_core::sched::' 'detsched' 'YieldSite'; do
     found=$(nm -C target/release/graphus-server | grep -c -- "$pattern" || true)
@@ -113,8 +141,8 @@ done
 echo "    no scheduler symbol reaches the release binary (3 patterns, 0 matches)"
 
 step "6/10 proptest invariants — codec round-trips + order-preserving key codec"
-cargo test -p graphus-storage --test proptest_codecs
-cargo test -p graphus-cypher --test proptest_keycodec
+cargo test --profile gate -p graphus-storage --test proptest_codecs
+cargo test --profile gate -p graphus-cypher --test proptest_keycodec
 
 step "7/10 criterion regression gate — vs committed baseline (release)"
 cargo run -q -p graphus-bench --release --bin bench_gate
@@ -165,7 +193,7 @@ if [ -n "$missing_interop_tools" ]; then
 fi
 # Serial: the tests each boot a server and share one npm prefix, one pip cache and one Go module
 # cache, so they must not race on them.
-cargo test -p graphus-server --features neo4j-interop --test neo4j_driver_interop -- --test-threads=1
+cargo test --profile gate -p graphus-server --features neo4j-interop --test neo4j_driver_interop -- --test-threads=1
 
 if [ "$WITH_LOOM" = "1" ]; then
     step "loom model-check — buffer-pool latch protocol (slow)"
@@ -183,4 +211,5 @@ if [ "$WITH_MIRI" = "1" ]; then
         record:: valenc:: propenc:: labels:: heap:: paging:: tokens:: idalloc:: meta::
 fi
 
-printf '\n\033[1;32mAll requested gates passed.\033[0m\n'
+close_step
+printf '\n\033[1;32mAll requested gates passed in %ds.\033[0m\n' "$(($(date +%s) - GATE_T0))"
