@@ -308,3 +308,80 @@ fn counter(metrics: &Metrics, name: &str) -> u64 {
     }
     panic!("metric {name} not found in the Prometheus rendering");
 }
+
+/// **GATE 3 — a Mode A bulk-import session completes at `W > 1` (`rmp` #1039, acceptance criterion 4).**
+///
+/// A Mode A session's state is a `loading_session` LOCAL of the engine loop, so it lives on ONE worker
+/// with nothing in the message to say which. `EngineHandle::route` therefore pins every
+/// `BulkImportBatch` to worker 0, so each batch meets the session the previous batch created. Mode A
+/// takes the whole database into `Loading`, so there is at most one such session and pinning costs no
+/// concurrency.
+///
+/// Reading that routing is not proving it. This drives a real session — several batches of the SAME
+/// file, then the `End` sentinel — against a four-worker engine, and requires the CUMULATIVE stats to
+/// account for every row. The cumulative count is the oracle precisely because it is session state: a
+/// batch that landed on a worker without the session would start a new one, and the total would come
+/// back short.
+///
+/// **Non-vacuity.** With `BulkImportBatch` routed round-robin instead of pinned — the shape it had
+/// before `rmp` #1041 made the routing exhaustive — three of every four batches meet a worker with no
+/// session, and the cumulative node count returned by the last batch is a fraction of the rows sent.
+#[test]
+fn a_mode_a_bulk_import_session_completes_on_a_four_worker_engine() {
+    const WORKERS: usize = 4;
+    const BATCHES: usize = 8;
+    const ROWS_PER_BATCH: usize = 25;
+    let _serial = COUNTER_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let dir = TempDir::new("modea");
+    let (engine, _metrics) = engine(&dir.path, WORKERS, 2);
+    let handle = engine.handle.clone();
+
+    // One header, shared across every batch — the `Arc::ptr_eq` the session uses to recognise "same
+    // file, reuse the cached property-key tokens".
+    let header = Arc::new(
+        graphus_bulk::NodeHeader::parse([":ID", ":LABEL", "seq:int"]).expect("node header parses"),
+    );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("bulk-import runtime");
+
+    let mut last_nodes = 0u64;
+    for b in 0..BATCHES {
+        let records: Vec<csv::StringRecord> = (0..ROWS_PER_BATCH)
+            .map(|r| {
+                let id = b * ROWS_PER_BATCH + r;
+                csv::StringRecord::from(vec![format!("n{id}"), "Row".to_owned(), id.to_string()])
+            })
+            .collect();
+        let outcome = rt
+            .block_on(handle.bulk_import_batch(
+                graphus_server::engine::BulkImportBatchInput::Nodes {
+                    header: Arc::clone(&header),
+                    records,
+                },
+            ))
+            .expect("a Mode A batch must be ingested");
+        last_nodes = outcome.stats.nodes;
+    }
+
+    assert_eq!(
+        last_nodes,
+        (BATCHES * ROWS_PER_BATCH) as u64,
+        "the session reported {last_nodes} nodes for {} rows sent across {BATCHES} batches: a batch \
+         reached a worker that held no session, so it started a new one and the cumulative count \
+         restarted (rmp #1039)",
+        BATCHES * ROWS_PER_BATCH
+    );
+
+    // The sentinel end: idempotent, and it must find the session it is ending.
+    rt.block_on(handle.bulk_import_batch(graphus_server::engine::BulkImportBatchInput::End))
+        .expect("ending a Mode A session must succeed");
+
+    drop(handle);
+    shutdown(engine);
+}
