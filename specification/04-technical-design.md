@@ -444,14 +444,66 @@ logical-per-record so a rollback can be applied even after page reorganization.
 
 ### 4.2 Group commit & fdatasync strategy
 
-Committing transactions append their `COMMIT` records and then **park on a commit queue**. A single
-**log-flush worker** batches all pending records up to the current log tail, issues **one**
-`write()` + **one** `fdatasync()` (data + size metadata, not full `fsync`, on filesystems where
-`fdatasync` is sufficient — verified per-platform), and then wakes every parked committer whose LSN
-is now durable. This amortizes the sync cost across concurrent commits (Source: WAL/ARIES, Postgres
-group commit). A **per-transaction synchronous** mode (`synchronous_commit=on` per session) bypasses
+Committing transactions append their `COMMIT` records and then **park on a commit queue**. An engine
+worker batches all pending records up to the current log tail; that batch costs **one** `write()` and
+**one** `fdatasync()` (data + size metadata, not full `fsync`, on filesystems where
+`fdatasync` is sufficient — verified per-platform), and the worker then wakes every parked committer
+whose LSN is now durable. This amortizes the sync cost across concurrent commits (Source: WAL/ARIES,
+Postgres group commit). **Which thread performs that `fdatasync`, and how many run at once, is the
+subject of the two paragraphs below.** A **per-transaction synchronous** mode (`synchronous_commit=on` per session) bypasses
 batching for callers that need it; an explicit relaxed mode is **not** offered as a default because
 it would violate NFR-1.
+
+**The `fdatasync` is pipelined, not inline** (task **#532**). `begin_harden` writes a batch's records
+to the log file *without* syncing them and hands back a **deferred job**; the worker offers that job
+to the database's fsync group leader, prepares the **next** consecutive commit batch while the sync
+runs off its own thread, then waits for the job, completes the harden, and only then acknowledges its
+committers. So the durability sync of batch *K* overlaps the CPU preparation of batch *K+1* instead of
+an engine worker blocking on every `fdatasync`. Between the write and the completion the WAL has
+`durable_len < written_len`; the buffer pool shares the same WAL manager, so an eviction that must
+write home a data page whose `page_lsn` falls inside that window hardens the written range **inline**,
+and the WAL-before-data rule is never suspended. The synchronous, non-pipelined path is retained for
+the deterministic simulator, so that a DST replay is bit-identical (`07-dst-simulator.md`).
+
+**One fsync group leader per database engine, never one per worker** (decision `D-wal-group-leader`,
+task **#1040**). Each engine worker runs its own commit pipeline, so several workers can sit between
+`begin_harden` and `complete_harden` at the same time, and every one of their jobs is offered to the
+**single** leader. The leader runs one job at a time and folds the rest into one pending slot, keeping
+the job with the largest target; a worker whose job was folded away is released by the job that ran,
+because that job's range subsumes its own. This is the trade PostgreSQL's `XLogFlush` makes when one
+backend's flush satisfies every backend waiting on a smaller LSN. **Depth-1 is a property of the
+database, not of a worker: at most one `fdatasync` is in flight for the whole engine**, whatever the
+worker count — so the crash tail is the tail of **one** un-synced interval rather than of several
+interleaved ones. The structure this replaced was one fsync thread **per worker**, which documented
+itself as strict depth-1 and stopped being true the day the engine became multi-worker: each worker
+was depth-1 for itself, so the system reached depth `W`, issuing `W` duplicate `fdatasync`s of
+overlapping ranges over one WAL manager with no coalescing between them.
+
+**The sink contract the coalescing rests on.** Discarding one worker's job because another worker's
+job subsumes it is sound only under three properties of the log sink. They are **normative**, and each
+is pinned by a test that fails if it is broken:
+
+1. **A job hardens at least its whole declared range** `[covers_from, target_len)` — it syncs the
+   whole files spanning the range, not the byte range one caller happened to append.
+2. **`covers_from` is the sink's global durable frontier** at the moment the job was created, never a
+   per-worker frontier. This is what makes the newest job's range a superset of every older live
+   job's.
+3. **Completion is a monotone maximum** (`durable_len = max(durable_len, target_len)`), and a
+   committer is acknowledged only against a `durable_len` read **after** that advance — so a waiter
+   may legitimately complete with the watermark the **group** reached rather than its own.
+
+All three held before task #1040 and **none of them was declared anywhere**, which is exactly how a
+later move to `sync_file_range`, to a per-worker durable frontier, or to a sync per segment rather
+than per file would have turned a correct engine into one that acknowledges commits whose bytes were
+never synced. The deferred job therefore carries the range it hardens **explicitly** — both ends, not
+only its end — so the contract is machine-checkable rather than prose, and **every discard is
+adjudicated by an always-on tripwire** against the sink's own attested durable frontier. The leader
+learns that frontier independently, because each offer reports it, which is also how it observes that
+an eviction's inline harden advanced durability behind its back; without that second source the
+tripwire would mistake a legitimate advance for a broken sink contract. A failed `fdatasync` fails
+**every** waiter whose bytes were in the range — the correct blast radius, since the WAL tail they
+share is precisely what did not reach the platter — and it does so **before** any committer of that
+batch is acknowledged (§4.9).
 
 ### 4.3 Steal + no-force
 
@@ -2367,8 +2419,10 @@ traversal-heavy benchmark before being locked** (measurement-gated).
   (b) partitioned logging keyed by data partition with a global LSN order — only if (a) is shown to
   bottleneck. Reads are fully parallel and lock-free against committed versions.
 - **CPU-heavy work off the runtime workers.** Query operators that burn CPU (sorts, aggregations,
-  large traversals) and the WAL fsync run on **dedicated pools** (a `rayon`-style CPU pool and
-  dedicated I/O/fsync threads), so the async runtime never blocks. This is a hard rule (no blocking
+  large traversals) and the WAL `fdatasync` run **off the async runtime**, so it never blocks: a
+  `rayon`-style CPU pool for the operators, and for durability **one dedicated fsync group leader
+  thread per database engine** — one leader shared by every engine worker, not one thread per worker
+  (§4.2, decision `D-wal-group-leader`). This is a hard rule (no blocking
   syscalls, no heavy loops, no `std::thread::sleep` on runtime workers).
 
 ### 9.2 Lock-free structures

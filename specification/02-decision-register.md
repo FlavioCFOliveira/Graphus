@@ -10,9 +10,9 @@ to the domain/component it constrains. On ratification, the chosen option is rec
 and its status set to `ratified`.
 
 > **Status: all 24 decisions of the original 2026-06-05 round are ratified.** The chosen option is
-> recorded on each `Decision` node (`status: ratified`, property `chosen`). Twenty-two further
+> recorded on each `Decision` node (`status: ratified`, property `chosen`). Twenty-three further
 > decisions were ratified after that round; they are recorded in the same index below, each carrying
-> its own ratification date. The register therefore holds **46 decisions** in total. The decision index in
+> its own ratification date. The register therefore holds **47 decisions** in total. The decision index in
 > the next section is the canonical enumeration; the options tables below it are kept for the
 > rationale and trade-offs, and are not a decision list.
 
@@ -84,6 +84,7 @@ Parse contract, to be preserved by any future edit:
 | `D-orphan-slot-parking` | ratified | 2026-08-05 | **A record slot that a logical rollback orphans is parked in memory until the next garbage-collection pass, not returned to the free list by the abort itself.** The abort knows the slot is unreachable — it is what unlinked it — so the restraint is deliberate, and its reason lies outside the storage engine: the latest-state TEXT, FULLTEXT and SPATIAL indexes are in memory, **not transactional**, and key their documents by **physical node id**. An aborted node's posting survives its rollback as a harmless false positive that the re-check filters out, but recycling the id immediately turns the next writer's *insert* into what the index reads as the **replacement of a still-committed document** — the one shape `rmp` #756 must fail closed on, at the cost of a poisoned freshness marker and of every text or spatial seek degrading to a full scan until a rebuild. Parking keeps the space guarantee (the slots do come back, so an abort-heavy workload does not grow the store) while moving the recycle to a maintenance boundary; the GC phase is guarded on the record still being retired, so a slot legitimately re-used by some other path is never double-freed. The parking becomes unnecessary once those indexes are version-aware. Design in `04-technical-design.md` §5.1.5. |
 | `D-statement-isolation` | ratified | 2026-08-05 | **A statement does not observe its own writes, and the rule is one comparison operator over the delta's `command_id`.** Every read carries a **view** — `New` (the default) or `Old` — beside its snapshot; the view decides nothing about other transactions and only whether the reader's own uncommitted deltas are undone (`New`: written by a later command; `Old`: written by a later command **or by the current one**). A delta written outside any statement carries `command_id = 0` and is undone by **no** view, because it belongs to the transaction's baseline rather than to a statement. The counter lives in the record store, which is its single source of truth, and it advances at exactly **two** points: when a cursor opens, and at a `WITH` that follows a write. Polarity is fixed per clause: `Old` for every scan, every index seek, every relationship expansion, a `MATCH`'s `Filter`, `UNWIND` and a read-only procedure `CALL`; `New` for `MERGE`'s match sub-plan, every update clause, projection, aggregation and ordering, and a writing procedure `CALL`. The planner's `Eager` barriers are **all retained**: they decouple row production while the view re-polarises visibility, and reforming them is separate work. Closes the `command_id` half of `04-technical-design.md` §5.1.4; design in `04-technical-design.md` §§5.1.4, 5.3 and `05-storage-format.md` §12.2. |
 | `D-chain-head-publication` | ratified | 2026-08-09 | **A chain head is published by a compare-and-publish held atomic by a short publication latch, and a refused publication logs nothing.** The unconditional byte write through which a **prepend** published `first_rel`, `first_prop` and `undo_ptr` is retired: a prepend now reads the head, writes its entry linked to that head, publishes the entry **only if** the head still holds what it read, and fixes the displaced predecessor's back-pointer only **after** it has won — so two writers can never relink the same predecessor. A refusal re-reads the head, re-links the entry and retries. The protocol lives in the dependency-free leaf crate `graphus-chainhead`, where `loom` can model-check it. Atomicity and, equally, **durable order** (log order must equal the order in which publications take effect on the page) are supplied by a sharded latch at **rank 27**, between the allocation latch (25) and the WAL (30), taken with the page already pinned, admitting one holder per thread, and never held across I/O — mechanically enforced in debug builds. The redo image is a compare-and-set patch, which needs **no** new WAL record type, format version or recovery step. The write stays **redo-only** (`D-chain-head-redo-only` is unchanged). The same latch covers two further writes, because the head word alone is not the whole prepend: the shared `chain_flags` byte of the displaced relationship, which a prepend clears with a commutative mask instead of a computed byte, and the GC corpse splice's repointing of a node head, converted so that no writer of that word stores into it unconditionally. Facet table in the "Ratified decision (2026-08-09) — chain-head publication" section below; design in `04-technical-design.md` §5.7.1. |
+| `D-wal-group-leader` | ratified | 2026-08-11 | **One shared fsync group leader hardens the WAL for every engine worker, and the per-worker fsync thread is retired.** The pipelined group commit of task **#532** offloads a commit batch's `fdatasync` so that the durability sync of batch *K* overlaps the CPU preparation of batch *K+1*. Its documented invariant was **strict depth-1** — a job channel of depth one, and the engine waiting for the outstanding job before submitting the next, so at most one batch is ever written-but-un-synced and a crash tail is the tail of one batch. That invariant became **false** the moment the engine grew to `W` workers: each worker spawned its own fsync thread over the **one** `WalManager` they share behind `SharedWal`, so each was depth-1 for itself while the system reached depth `W`, and a crash tail could hold interleaved batches from several workers. The ack-after-fsync rule was not actually violated, but only because of three properties of the sink that **no contract declared** — a job hardens whole files and therefore at least its entire declared range; every `begin_harden` starts at the sink's **global** durable frontier; and completion is a monotone maximum that the acknowledgement is taken after. This decision promotes those three to **the sink contract**, declared normatively and each pinned by a test, and makes the job carry the range it hardens explicitly (`covers_from`, `target_len`) so the contract is machine-checkable rather than prose. **One fsync group leader per database engine** then replaces the per-worker thread: workers offer their job to the leader, at most one `fdatasync` is in flight system-wide, a newer offer subsumes and discards an older pending one, and each worker is released once the group's hardened watermark passes its own target — the `XLogFlush` shape of PostgreSQL. **Depth-1 is restated where it is now true**: one `fdatasync` in flight for the whole engine, so the crash tail is again the tail of one un-synced interval rather than of `W` interleaved ones. Every discard is adjudicated by an **always-on tripwire** against the sink's own attested durable frontier, so a per-worker frontier or a sync narrowed to a byte range trips it instead of silently acknowledging un-synced bytes. Refines `D-multi-writer` by fixing the durability mechanism its parallel writers share; leaves `D-async-commit` untouched, since ack-after-fsync remains unconditional and nothing here defers or batches a sync in time; supersedes no ratified outcome, and changes no on-disk format. Facet table in the "Ratified decision (2026-08-11) — the WAL fsync group leader" section below; design in `04-technical-design.md` §4.2 and §9.1. |
 
 <!-- END decision-index -->
 
@@ -703,6 +704,103 @@ scope and are propagated into `00-overview.md` and `01-needs-survey.md`:
 > §5.1.2 step 3; the leaf-crate rule is §11.4. Format-side consequences — none of them a byte change —
 > are `05-storage-format.md` §7, §9 and §12.5. The DST scenario and the `dst`-gated publication seam
 > are `07-dst-simulator.md` §6.2 and §10.
+
+## Ratified decision (2026-08-11) — the WAL fsync group leader
+
+> **`D-wal-group-leader` settles how the WAL is hardened once a database engine runs more than one
+> worker, in task #1040.** It refines the earlier rounds rather than replacing any part of them:
+> `D-durability-mode` keeps group commit + `fdatasync` with a per-transaction synchronous mode
+> available, and **`D-async-commit` is untouched** — ack-after-fsync remains unconditional, and
+> nothing here defers or batches a sync in time. Every one of the four inviolable requirements of
+> `CLAUDE.md` stands as written, and **no byte of any on-disk format changes** — not the WAL record
+> set, not the log layout, not the format version, not a recovery step.
+>
+> **Status: ratified.**
+>
+> **Why now.** The pipelined group commit of task **#532** offloads each commit batch's `fdatasync` to
+> a dedicated thread so that the durability sync of batch *K* overlaps the CPU preparation of batch
+> *K+1*. Its documented invariant was **strict depth-1**: the job channel has depth one and the engine
+> always waits for the outstanding job before submitting the next, so at most one batch is ever
+> written-but-un-synced, and a crash tail is the tail of **one** batch. That invariant became false
+> the moment the engine grew to `W` workers: each worker spawned its own fsync thread over the **one**
+> `WalManager` shared behind `SharedWal`, so each was depth-1 for itself while the system reached
+> depth `W`, and a crash tail could contain interleaved batches from several workers.
+>
+> **What was actually holding, and why that was the danger.** The ack-after-fsync rule was nevertheless
+> not violated by the code as it stood — but only because of three properties of the sink that no
+> contract declared:
+>
+> | Property | What it says | Why the coalescing needs it |
+> | --- | --- | --- |
+> | **1 — a job hardens whole files, not byte ranges** | The deferred job runs `full_sync_data` per file handle, so any job that runs hardens every byte written to those files before it was issued. | This is what makes out-of-order completion between workers safe: a later job's sync covers an earlier job's bytes. |
+> | **2 — every `begin_harden` starts at the global durable frontier** | Writes are serialised by the single WAL mutex, and a job's range always begins at the sink's one `durable_len`, never at a per-worker frontier. | It is what makes "the newest offer subsumes the older one" true rather than merely plausible: all live jobs share a lower bound. |
+> | **3 — completion is a monotone maximum, and the acknowledgement follows it** | `complete_harden` never regresses `durable_len`, and a committer is acknowledged only against a `durable_len` read **after** that advance. | It lets a waiter complete with the watermark the **group** reached instead of its own, which is the whole point of being released by someone else's sync. |
+>
+> **A durability guarantee that rests on three tacit properties is a guarantee by accident.** The day
+> the sink moved to `sync_file_range`, to a durable frontier per worker, or to a sync per segment
+> instead of per file, property 1 or 2 would die and the always-on ack gate would begin approving
+> bytes that were never `fdatasync`ed — **false durability, the cardinal ACID violation**. The
+> measurable cost of the shape as it stood was `W` duplicated syncs of the same interval, `W` fsync
+> threads, and no coalescing whatsoever between workers.
+>
+> **What is ratified.**
+>
+> - **The three properties above become THE SINK CONTRACT**, declared normatively rather than relied
+>   on tacitly, and each pinned by a test that fails if it is broken. The deferred job now carries the
+>   range it hardens explicitly (`covers_from`, `target_len`) instead of only its end, so the contract
+>   is **machine-checkable rather than prose**.
+> - **One fsync group leader per database engine replaces the per-worker fsync thread.** Workers offer
+>   their job to the shared leader; at most one `fdatasync` is in flight system-wide; a newer offer
+>   **subsumes and discards** an older pending one, because by property 2 every live job starts at the
+>   same global frontier and the newest therefore covers a superset of the range; and each worker is
+>   released once the group's hardened watermark passes its own target.
+> - **Depth-1 is restated where it is now true**: at most one `fdatasync` is in flight for the whole
+>   engine, so the crash tail is again the tail of **one** un-synced interval rather than of `W`
+>   interleaved ones.
+> - **The discard is guarded by an always-on tripwire, not by a comment.** A job may only be discarded
+>   in favour of one that leaves **no gap and no shortfall** in the range it covered, adjudicated
+>   against the sink's own attested durable frontier. A per-worker frontier, or a sync narrowed to a
+>   byte range, trips it.
+> - **The coalescing this unlocks between workers is a prerequisite of, and is completed by, the commit
+>   sequencer of task #977**, which owns total commit order and SSI validation for parallel writers.
+>   This decision fixes the **durability mechanism**; #977 fixes the **ordering** on top of it.
+>
+> **The reference read, at a pinned revision.** This is the shape PostgreSQL settled on, and it is
+> read for the same reason Graphus needs it: a follower whose durability requirement was already met by
+> another backend's flush must not issue a second one.
+>
+> | Reference | What was read, and what it shows |
+> | --- | --- |
+> | **PostgreSQL** (`/data/refsrc/postgres`, commit `0fd30e2`) | `XLogFlush` (`src/backend/access/transam/xlog.c:2800`) opens with a **quick exit if the record is already known flushed** (`:2819-2820`), and then, rather than queueing behind the write lock, calls `LWLockAcquireOrWait(WALWriteLock, LW_EXCLUSIVE)` (`:2874`) whose documented purpose is to "wait until it's released, and recheck if we still need to do the flush **or if the backend that held the lock did it for us already**. This helps to maintain a good rate of group committing when the system is bottlenecked by the speed of fsyncing" (`:2868-2871`). Having taken the lock it **rechecks once more** and breaks out without syncing if the request is by then satisfied (`:2884-2886`). The precedent Graphus adopts is exactly that: one backend's flush discharges every waiter below its watermark, and the waiter's own sync is dropped rather than performed. |
+>
+> This is the same **wait-and-recheck** axis the project already built for the doublewrite staging
+> barrier in tasks **#993/#994**, whose leaf crate `graphus-groupsync` records the same PostgreSQL
+> grounding; the WAL path had simply never been brought onto it.
+>
+> **How it is proved.** A multi-worker test drives 8 concurrent writers against an engine running 4
+> workers over one shared leader and requires three things at once: every write is acknowledged (a
+> shortfall means the leader failed to release a worker whose job it folded away); **no acknowledgement
+> runs ahead of durability**, measured against the frontier an `fdatasync` has actually *completed*
+> over rather than the sink's bookkeeping about it; and every acknowledged row is present after a
+> restart. On top of those, the coalescing itself is asserted with a **material margin** rather than a
+> strict inequality — a build that ran every folded-away job inline instead of dropping it measured
+> **292 `fdatasync`s for 293 hardens** and would have passed a strict `fsyncs < hardens` test, so the
+> bar is set at 0.75 syncs per harden, which refutes "no coalescing" (≈1.00 by construction under the
+> per-worker thread) with room on both sides. A recorded run at 4 workers and 8 writers produced **400
+> commits, 259 hardens and 155 real `fdatasync` calls** — 0.60 syncs per harden. The three sink-contract
+> properties are pinned separately, including a test that fails the day `begin_harden` starts from a
+> per-caller frontier.
+>
+> **Scope note — this decision does not lift the multi-writer gate.** `admission.engine_workers` above
+> 1 remains **refused by configuration validation**, fail-closed, pending the certification measured by
+> task **#1034**; multi-worker engines are reachable from tests, which is what keeps this path
+> exercised. This decision removes one of the blockers behind that gate, and does not by itself open
+> it.
+>
+> **Where this is specified.** The pipelined harden, the group leader, the restated depth-1 statement
+> and the sink contract are `04-technical-design.md` §4.2; the runtime shape that places the leader off
+> the async runtime is §9.1; the fsyncgate policy a failed sync follows is §4.9. The exemption of the
+> leader from the deterministic scheduler is `07-dst-simulator.md` §5.2.3.
 
 ## TCK target (pinned — closes `D-cypher-line` open question 1)
 

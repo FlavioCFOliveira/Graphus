@@ -201,117 +201,496 @@ const MAX_COMMIT_BATCH: usize = 128;
 /// a full write batch plus its interleaved opens/reads before the bound bites.
 const MAX_DRAIN_COMMANDS: usize = 2 * MAX_COMMIT_BATCH;
 
-/// A dedicated blocking thread that runs the offloaded WAL `fdatasync` of the **pipelined**
-/// group-commit harden (`rmp` #532, commit pipelining / fsync offload).
+/// The database's **one** WAL fsync group leader: a single dedicated blocking thread that runs the
+/// offloaded `fdatasync` of the pipelined group-commit harden (`rmp` #532), shared by every engine
+/// worker (`rmp` #1040).
 ///
 /// # What it buys
 ///
 /// [`WalManager::begin_harden`](graphus_wal::WalManager::begin_harden) writes a commit batch's
-/// records to the log file *without* `fdatasync`ing and hands back a [`FsyncJob`]. The engine
-/// [`submit`](WalSyncThread::submit)s that job here and, while the `fdatasync` runs on this thread,
-/// PREPAREs the **next** consecutive commit batch (and retires reads) on the engine thread; it then
-/// [`wait`](WalSyncThread::wait)s and completes the harden. So the durability sync of batch *K*
-/// overlaps the CPU work of batch *K+1*, instead of the engine thread blocking on every `fdatasync`.
+/// records to the log file *without* `fdatasync`ing and hands back an [`FsyncJob`](graphus_wal::FsyncJob). A worker
+/// [`offer`](WalGroupSync::offer)s that job here and, while the `fdatasync` runs on this thread,
+/// PREPAREs the **next** consecutive commit batch (and retires reads) on its own thread; it then
+/// [`wait_hardened`](WalGroupSync::wait_hardened)s and completes the harden. So the durability sync
+/// of batch *K* overlaps the CPU work of batch *K+1*, instead of an engine worker blocking on every
+/// `fdatasync`.
 ///
-/// # Strict depth-1
+/// # What it does with `W` workers
 ///
-/// The job channel is bounded at **1** and the engine always `wait`s for the outstanding job before
-/// `submit`ting the next, so at most **one** batch is ever written-but-un-synced. The on-disk crash
-/// state is therefore the same *category* as inline group commit (a torn tail of one un-synced batch,
-/// which recovery truncates whole), so crash recovery is unchanged.
+/// **One fsync in flight for the whole database, and followers coalesce onto it.** Each worker runs
+/// its own commit pipeline, so several workers can be between `begin_harden` and `complete_harden`
+/// at the same time; every one of their jobs is offered to this single leader. The leader runs one
+/// job at a time and folds the rest into a single `pending` slot, keeping the job with the largest
+/// `target_len`. A worker whose job was folded away is released by the job that ran, because that
+/// job's range subsumes its own — the same trade PostgreSQL's `XLogFlush` makes when one backend's
+/// flush satisfies every backend waiting on a smaller LSN.
+///
+/// This replaced a `WalSyncThread` **per worker**. That structure documented itself as "strict
+/// depth-1 — at most one batch is ever written-but-un-synced", which stopped being true the day the
+/// engine became multi-worker (`rmp` #1033): each worker was depth-1 for itself, so the SYSTEM
+/// reached depth `W`, with `W` fsync threads issuing `W` duplicate `fdatasync`s of overlapping
+/// ranges over one [`WalManager`](graphus_wal::WalManager) and no coalescing between them. What is
+/// depth-1 now is the statement the code actually enforces: **one `fdatasync` in flight per
+/// database**, whatever `W` is.
+///
+/// # The contract underneath (`rmp` #1040)
+///
+/// Dropping one worker's job because another worker's job subsumes it is sound only because of the
+/// three properties documented as THE SINK CONTRACT on [`FsyncJob`](graphus_wal::FsyncJob): a job hardens at least its whole
+/// declared range `[covers_from, target_len)`; `covers_from` is the sink's GLOBAL durable frontier
+/// (never a per-worker one); and `complete_harden` is a monotone max, so a waiter may complete with
+/// the group's watermark rather than its own. None of those was declared anywhere before this type
+/// existed — they were true, and nothing said so, which is exactly how a later `sync_file_range` or
+/// a per-worker frontier would have turned a correct engine into one that acks non-durable commits.
+///
+/// [`offer`](WalGroupSync::offer) checks property 2 DIRECTLY, on every offer: each job's declared
+/// `covers_from` is compared against the durable frontier the sink itself reports, which is the one
+/// quantity a job cannot also misreport. That check, not a subsumption test over ranges, is what
+/// catches a per-caller frontier — such a frontier produces ranges perfectly contiguous with their
+/// predecessor's, which every range comparison accepts. Property 1 is NOT machine-checked and cannot
+/// be: a `run` narrowed below its declared range lies about what it did, not about what it covers.
+/// Worse, property 1's whole-file surplus routinely MASKS a broken property 2, so neither may be
+/// reasoned about as if the other held — see the contract text for that entanglement.
 ///
 /// # Why a bare `std::thread`, not `graphus_io::FsyncPool`
 ///
-/// The async runtime is Tokio, but this engine loop is a plain, blocking thread that must
-/// `submit`/`wait` synchronously. `graphus_io::FsyncPool` is Tokio-only (its handles are futures),
-/// unusable from here — so this is a `std::thread` with std channels.
+/// The async runtime is Tokio, but the engine loop is a plain, blocking thread that must offer and
+/// wait synchronously. `graphus_io::FsyncPool` is Tokio-only (its handles are futures), unusable from
+/// here — so this is a `std::thread` with a `Mutex` + `Condvar`.
 ///
 /// # fsyncgate (`04 §4.9`)
 ///
-/// A failed `fdatasync` is unrecoverable: [`wait`](WalSyncThread::wait) PANICs (a controlled abort)
-/// **before** any committer of that batch is acked, so a lost batch is never acknowledged — the
-/// ack-after-fsync rule, identical in effect to the inline `harden`'s panic policy.
-struct WalSyncThread {
-    /// Submits a job to the fsync thread. Bounded at 1 (depth-1): a job is submitted, then always
-    /// `wait`ed on before the next submit, so `send` never blocks. `Option` so [`Drop`] can close it
-    /// (ending the thread's loop) before joining. `None` only transiently during drop.
-    job_tx: Option<std::sync::mpsc::SyncSender<graphus_wal::FsyncJob>>,
-    /// The FIFO outcome of each submitted job: `Ok(target_len)` (the write frontier the `fdatasync`
-    /// made durable, passed to `complete_harden`) or the storage error (→ fsyncgate PANIC).
-    result_rx: std::sync::mpsc::Receiver<Result<u64>>,
+/// A failed `fdatasync` is unrecoverable. The failure is recorded and **every waiter panics** (a
+/// controlled abort) — rather than the fsync thread panicking alone, which would leave every waiter
+/// blocked on a condition nothing can now satisfy. The panic happens **before** any committer of the
+/// failed batch is acked, so a lost batch is never acknowledged: the ack-after-fsync rule, identical
+/// in effect to the inline `harden`'s panic policy. Coalescing does not weaken this — a failure
+/// fails every worker whose bytes were in the range, which is the correct blast radius, because the
+/// WAL tail they share is exactly what did not reach the platter.
+struct WalGroupSync {
+    /// Shared with the fsync thread, which is why the state is behind an `Arc` rather than owned
+    /// here: this handle is itself shared by every worker through an `Arc<WalGroupSync>`.
+    inner: Arc<GroupSyncInner>,
+    /// Where the fold is published (`graphus_wal_fsync_coalesced_total`). The leader is the only
+    /// place in the server that knows an `fdatasync` was AVOIDED, so if it does not count them
+    /// nothing does — and "the coalescing stopped happening" is invisible from every other counter,
+    /// since the bytes, the commits and the latencies all stay where they were.
+    metrics: Arc<Metrics>,
     /// Joined on drop so the fsync thread never outlives the engine.
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
-impl WalSyncThread {
-    /// Spawns the dedicated fsync thread for the database `db_name`.
-    fn spawn(db_name: &str) -> Self {
-        let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<graphus_wal::FsyncJob>(1);
-        let (result_tx, result_rx) = std::sync::mpsc::channel::<Result<u64>>();
+/// The leader's shared state: the fsync thread and every engine worker meet here.
+struct GroupSyncInner {
+    /// Deliberately a plain `Mutex` and NOT an [`EngineLatch`] (`rmp` #1038): this is not engine
+    /// session state and has no rank in that order. Every critical section under it is a handful of
+    /// integer comparisons and an `Option` swap — the `fdatasync` itself runs with the lock
+    /// RELEASED — and nothing reachable from inside it calls back into the engine, so it can neither
+    /// be held across work of unbounded duration nor take part in a cycle. The one blocking entry
+    /// point, [`wait_hardened`](WalGroupSync::wait_hardened), asserts that no engine session latch is
+    /// held when it is reached.
+    state: std::sync::Mutex<GroupSyncState>,
+    /// Signals both directions: workers wake the fsync thread when they offer, and the fsync thread
+    /// wakes every waiter when a job completes or fails. One variable rather than two, because every
+    /// wake-up is a change to the same state and a waiter must re-test its own condition anyway.
+    cv: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct GroupSyncState {
+    /// The newest offered job not yet running. Older offers are DROPPED once their range is proven
+    /// subsumed — see [`offer`](WalGroupSync::offer) for the proof and the tripwire that enforces it.
+    pending: Option<graphus_wal::FsyncJob>,
+    /// A job is executing on the fsync thread right now. Read by
+    /// [`wait_hardened`](WalGroupSync::wait_hardened) to tell "the
+    /// frontier is about to advance" from "nothing can ever advance it".
+    running: bool,
+    /// The highest byte offset **known durable**, monotone. Two independent sources feed it, and both
+    /// are genuine `fdatasync`-backed durability:
+    ///
+    /// 1. a job whose `fdatasync` COMPLETED here, contributing its `target_len`;
+    /// 2. the WAL sink's own `durable_len`, which every [`offer`](WalGroupSync::offer) reports —
+    ///    this is how the leader learns that an eviction's inline `sync` (the WAL-before-data rule)
+    ///    hardened a range behind its back.
+    ///
+    /// Source 2 is also what keeps the leader from mistaking a legitimately advanced frontier for a
+    /// broken sink contract: without it, an eviction's inline `sync` — which the leader never sees —
+    /// would look exactly like a job claiming a frontier that does not exist, and a healthy database
+    /// would abort. It is the difference between the two that the attestation tripwire in
+    /// [`offer`](WalGroupSync::offer) is able to test, and it can test it only because the sink is
+    /// asked directly rather than inferred from the jobs.
+    durable: u64,
+    /// An `fdatasync` failed: every waiter panics (fsyncgate) instead of blocking forever.
+    failed: Option<String>,
+    /// The engine is shutting down; the fsync thread exits once nothing is pending.
+    closed: bool,
+}
+
+impl WalGroupSync {
+    /// Spawns the database's one fsync group leader.
+    fn spawn(db_name: &str, metrics: Arc<Metrics>) -> Self {
+        let inner = Arc::new(GroupSyncInner {
+            state: std::sync::Mutex::new(GroupSyncState::default()),
+            cv: std::sync::Condvar::new(),
+        });
+        let thread_inner = Arc::clone(&inner);
         let handle = std::thread::Builder::new()
             .name(format!("graphus-walsync-{db_name}"))
             .spawn(move || {
                 // `rmp` #973: deliberately OUTSIDE the deterministic scheduler. This thread exists to
-                // take a blocking `fdatasync` off the engine thread; scheduling it would put a real
+                // take a blocking `fdatasync` off the engine threads; scheduling it would put a real
                 // syscall on the critical path of the token, and durability latency is not what a
                 // deterministic interleaving is trying to model. Marked EXPLICITLY rather than left
                 // unregistered, so an unmarked thread reaching a yield point still fails loudly.
                 graphus_core::sched::exempt();
-                // Run each submitted `fdatasync` in order, forwarding its outcome. The loop ends (and
-                // the thread exits cleanly) when the engine drops `job_tx` at shutdown, or if the
-                // result channel is gone (engine already torn down).
-                for job in job_rx.iter() {
-                    let target = job.target_len();
-                    let outcome = job.run().map(|()| target);
-                    if result_tx.send(outcome).is_err() {
-                        break;
-                    }
-                }
+                run_group_sync(&thread_inner);
             })
             .expect("INVARIANT: spawning the WAL fsync thread must succeed");
         Self {
-            job_tx: Some(job_tx),
-            result_rx,
+            inner,
+            metrics,
             handle: Some(handle),
         }
     }
 
-    /// Submits `job`'s `fdatasync` to run on the dedicated thread. Never blocks under the depth-1
-    /// discipline (the previous job was always [`wait`](WalSyncThread::wait)ed on first).
-    fn submit(&self, job: graphus_wal::FsyncJob) {
-        self.job_tx
-            .as_ref()
-            .expect("INVARIANT: job_tx present for the engine's lifetime")
-            .send(job)
-            .expect("INVARIANT: the WAL fsync thread is alive for the engine's lifetime");
-    }
-
-    /// Waits for the in-flight `fdatasync` and returns the write frontier it hardened (for
-    /// `complete_harden`).
+    /// Offers `job`'s `fdatasync` to the leader and returns the frontier the caller must then
+    /// [`wait_hardened`](WalGroupSync::wait_hardened) for (the job's `target_len`). Never blocks.
+    ///
+    /// `sink_durable` MUST be the WAL sink's own durable frontier — `coord.wal_durable_len()` — read
+    /// **after** the `begin_harden` that produced `job`. It is the leader's only independent view of
+    /// durability; see the field docs on [`GroupSyncState::durable`] and the tripwire analysis below
+    /// for why passing a stale or invented value there is not merely imprecise.
+    ///
+    /// # Why dropping the older job is sound
+    ///
+    /// This is the heart of the design, so the argument is written out rather than asserted.
+    ///
+    /// The whole argument rests on property 2 of the sink contract
+    /// ([`FsyncJob`](graphus_wal::FsyncJob)) — which is a PREMISE here, not a conclusion, and is why
+    /// the attestation check below tests it on every offer instead of trusting it. Given it: every
+    /// job starts at the sink's GLOBAL
+    /// durable frontier, and `write_pending` is serialised by the single WAL mutex. So while
+    /// `durable_len` has not advanced, all live jobs share the same `covers_from` and the newest has
+    /// the largest `target_len`: its range is a superset of every other's, and property 1 says
+    /// running it hardens that whole range. Everything below the shared `covers_from` is durable
+    /// already — that is what a durable frontier means — so nothing the dropped job would have
+    /// hardened is left un-hardened.
+    ///
+    /// If `durable_len` DID advance in between — an eviction's inline `sync` honouring
+    /// WAL-before-data hardened the written range and cleared `dir_sync_pending` — then the newer
+    /// job's `covers_from` equals that advanced frontier, and the dropped job's range now sits
+    /// entirely below it: already durable, again nothing left un-hardened. The leader does not have
+    /// to infer that: the same advance is reported to it as `sink_durable`, so it discards such a job
+    /// outright, before any subsumption question is asked.
+    ///
+    /// The same argument covers the job's optional **directory** fsync. A newer job carries
+    /// `dir = None` only when `dir_sync_pending` was clear at its creation, and that flag is cleared
+    /// in exactly two places: an inline `sync` that hardened the directory entry, or a
+    /// `complete_harden` that reached the write frontier (so the job which took it there carried
+    /// `dir = Some` and synced it). Either way the entry is durable before the flag goes.
     ///
     /// # Panics
-    /// Panics (fsyncgate, `04 §4.9`) if the `fdatasync` failed — deliberately BEFORE any committer is
-    /// acked, so a lost batch is never acknowledged.
-    fn wait(&self) -> u64 {
-        match self
-            .result_rx
-            .recv()
-            .expect("INVARIANT: the WAL fsync thread is alive for the engine's lifetime")
-        {
-            Ok(target) => target,
+    ///
+    /// Three always-on `INVARIANT VIOLATED (rmp #1040)` checks guard this, and they catch different
+    /// things. All are always-on rather than `debug_assert!`: a controlled abort is strictly safer
+    /// than acking a commit whose bytes no `fdatasync` covered.
+    ///
+    /// **The ATTESTATION check (the primary one) — `sink_durable >= job.covers_from()`.** Every job
+    /// is required to declare, as `covers_from`, the sink's global durable frontier (property 2). A
+    /// job that claims more than the sink itself reports is claiming bytes are durable that are not,
+    /// and nothing downstream will ever harden them: this job starts above them and every later job
+    /// starts higher still. The check is sound because `covers_from` and `sink_durable` are two
+    /// samples of the same monotone `durable_len`, the second taken later — so on a healthy sink the
+    /// inequality holds by construction, and it can only fail if the two disagree about what the
+    /// frontier is. It fires on EVERY offer, at any `W`, with no fold required, which is what makes
+    /// it the check a per-caller frontier cannot slip past. It also pins the read ORDER the caller
+    /// must use: `wal_durable_len()` after `begin_harden_wal()`, never before.
+    ///
+    /// **The SHORTFALL and GAP checks**, inside [`fold_pending`] — the keeper must end at or beyond
+    /// the dropped job's `target_len`, and must start at or below it. These are last-line guards on
+    /// the FOLD rather than on the sink: the shortfall check is a guard against a future edit to the
+    /// keeper choice, and the gap check is, given the attestation check above, unreachable through
+    /// `offer` — the two discards ahead of it use `durable`, which already folds in an attested
+    /// frontier at or beyond every live job's `covers_from`, so a gapped pair is discarded before it
+    /// can be folded. It is kept because it is the check that still stands if the attestation check
+    /// is ever weakened, and it is unit-tested directly against [`fold_pending`], where it IS the
+    /// sole control — testing it through `offer` would only re-test the attestation check.
+    fn offer(&self, job: graphus_wal::FsyncJob, sink_durable: u64) -> u64 {
+        // THE ATTESTATION TRIPWIRE, before the lock and before anything else looks at this job.
+        //
+        // It is deliberately not inside the fold: the failure it catches — a `covers_from` that runs
+        // ahead of the sink's real durable frontier — is a property of ONE job, present the moment
+        // the job is made, and a fold is neither necessary nor likely to expose it. A per-caller
+        // frontier, the exact catastrophe property 2 names, produces ranges that are perfectly
+        // CONTIGUOUS with their predecessor's (`covers_from == previous target_len`), so every
+        // subsumption test over declared ranges accepts them. This one does not, because it compares
+        // the claim against a source the claim cannot move.
+        assert!(
+            sink_durable >= job.covers_from(),
+            "INVARIANT VIOLATED (rmp #1040): a WAL fsync job declares covers_from={} but the sink \
+             reports only {} durable. `covers_from` MUST be the sink's GLOBAL durable frontier (THE \
+             SINK CONTRACT, property 2 on `FsyncJob`); a job claiming more means the bytes in \
+             [{}, {}) are hardened by nobody — not by this job, which starts above them, and not by \
+             any later one, which starts higher still — while `complete_harden` advances over them. \
+             The other possible cause is a caller reading `wal_durable_len()` BEFORE `begin_harden` \
+             instead of after it",
+            job.covers_from(),
+            sink_durable,
+            sink_durable,
+            job.covers_from(),
+        );
+        let target = job.target_len();
+        let mut state = self.lock();
+        // The sink's own frontier first: everything below it is durable regardless of what this
+        // leader has run, and both discards below depend on knowing it.
+        state.durable = state.durable.max(sink_durable);
+
+        if state.durable >= target {
+            // Nothing to harden: this job's whole range is already durable. Dropping it is not an
+            // optimisation, it is the truth — and `wait_hardened(target)` returns immediately.
+            return target;
+        }
+        match state.pending.take() {
+            // The queued job's range is already durable too (an inline `sync`, or a larger job that
+            // completed while it waited). Same reasoning, no subsumption question arises.
+            Some(old) if state.durable >= old.target_len() => {
+                state.pending = Some(job);
+            }
+            Some(old) => {
+                state.pending = Some(fold_pending(old, job));
+                self.metrics.record_wal_fsync_coalesced();
+            }
+            None => state.pending = Some(job),
+        }
+        // Wake the leader. Notified with the lock held: the critical section is a few comparisons, so
+        // the hand-off cost of a possible spurious contention is below the cost of a second lock
+        // round-trip, and correctness does not depend on which it is.
+        self.inner.cv.notify_all();
+        target
+    }
+
+    /// Blocks until the WAL is durable through `target`, and returns the frontier actually reached —
+    /// at or beyond `target`, because another worker's job may have hardened further. Pass THAT value
+    /// to `complete_harden`, which is a monotone max (property 3 of the sink contract).
+    ///
+    /// # Panics
+    ///
+    /// - **fsyncgate (`04 §4.9`)**: panics if an `fdatasync` failed, deliberately BEFORE any
+    ///   committer is acked, so a lost batch is never acknowledged.
+    /// - `INVARIANT VIOLATED (rmp #1040)` if the frontier cannot advance — no job running and none
+    ///   pending — because a silent wait there would present as a hung server with a healthy process,
+    ///   which is the hardest possible failure to diagnose. It is unreachable by construction: a
+    ///   waiter's `target` is the `target_len` of a job it offered, and that job is either already
+    ///   covered by `durable`, or pending, or running, or was folded into a keeper whose `target_len`
+    ///   is at least as large — an invariant the fold preserves down any chain of folds.
+    fn wait_hardened(&self, target: u64) -> u64 {
+        // The wait is bounded only by an `fdatasync`, which is work of unbounded duration by the
+        // definition rank 5 uses (`rmp` #1038). Reaching it under a session latch would serialise
+        // every worker of the engine behind one syscall while every answer stayed correct — invisible
+        // to any test that checks results, which is why it is asserted rather than reasoned about.
+        assert_no_engine_latch_held("WAL group-sync wait");
+        let mut state = self.lock();
+        loop {
+            if let Some(e) = &state.failed {
+                panic!("WAL fdatasync failed; aborting to avoid silent data loss (fsyncgate): {e}");
+            }
+            if state.durable >= target {
+                return state.durable;
+            }
+            // `closed` is deliberately NOT an exception here. It is set only by `Drop`, which runs
+            // after the last worker has left the engine loop, so no waiter can coexist with it;
+            // folding it in removes the only path on which this could block forever.
+            assert!(
+                state.running || state.pending.is_some(),
+                "INVARIANT VIOLATED (rmp #1040): a committer is waiting for WAL durability through \
+                 {target} but the fsync leader has nothing running and nothing pending, so the \
+                 durable frontier ({}) can never reach it — the harden this batch was offered to has \
+                 been lost",
+                state.durable,
+            );
+            state = self
+                .inner
+                .cv
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    /// The state, recovering a poisoned lock rather than propagating the poison.
+    ///
+    /// A poisoned lock here means a waiter panicked with the guard held — which is the fsyncgate
+    /// abort, already the intended outcome. The state it guards has no invariant that panic could
+    /// have broken (three integers, an `Option`, two flags), and refusing to recover would replace a
+    /// diagnosable fsyncgate panic with a second, unrelated one.
+    fn lock(&self) -> std::sync::MutexGuard<'_, GroupSyncState> {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Folds two live fsync jobs into the one the leader will run: keep the larger range, drop the one it
+/// subsumes. `job` (the newer offer) wins ties, so a repeated offer at an unchanged frontier replaces
+/// rather than accumulates.
+///
+/// Split out of [`WalGroupSync::offer`] so the two subsumption guards below can be tested where they
+/// are the SOLE control. Through `offer` they are not: the attestation tripwire and the two
+/// already-durable discards ahead of them reject or absorb every input that could reach them, so a
+/// test driven through `offer` would prove the earlier check and say nothing about these.
+///
+/// # Panics
+///
+/// `INVARIANT VIOLATED (rmp #1040)` if the keeper does not cover the dropped job's range — it ends
+/// below it (SHORTFALL) or starts above it (GAP). See [`WalGroupSync::offer`] for which failure each
+/// one is the last line against.
+fn fold_pending(old: graphus_wal::FsyncJob, job: graphus_wal::FsyncJob) -> graphus_wal::FsyncJob {
+    let (keeper, dropped) = if job.target_len() >= old.target_len() {
+        (job, old)
+    } else {
+        (old, job)
+    };
+    assert!(
+        keeper.target_len() >= dropped.target_len(),
+        "INVARIANT VIOLATED (rmp #1040): the WAL fsync leader would drop the job hardening \
+         [{}, {}) in favour of one that ends BELOW it, at [{}, {}) — the dropped tail would be \
+         hardened by nobody while `complete_harden` advanced over it",
+        dropped.covers_from(),
+        dropped.target_len(),
+        keeper.covers_from(),
+        keeper.target_len(),
+    );
+    assert!(
+        keeper.covers_from() <= dropped.target_len(),
+        "INVARIANT VIOLATED (rmp #1040): the WAL fsync leader would drop the job hardening \
+         [{}, {}) in favour of one starting ABOVE it, at [{}, {}), leaving [{}, {}) hardened by \
+         nobody. `covers_from` must be the sink's GLOBAL durable frontier (THE SINK CONTRACT, \
+         property 2)",
+        dropped.covers_from(),
+        dropped.target_len(),
+        keeper.covers_from(),
+        keeper.target_len(),
+        dropped.target_len(),
+        keeper.covers_from(),
+    );
+    keeper
+}
+
+/// Marks the leader as FAILED on any exit that is not the clean shutdown return (`rmp` #1040).
+///
+/// The loop below has one deliberate exit and several it cannot see: a panic anywhere inside
+/// `job.run()` unwinds straight through it. `full_sync_data` itself does not panic, but `run` is a
+/// boxed closure supplied by whatever sink the database was opened with — a decorator, an encrypted
+/// sink, a test double — and any of them may. Without this guard such an unwind leaves the shared
+/// state saying `running == true` with `failed == None` and no thread alive to change it, so every
+/// [`WalGroupSync::wait_hardened`] loops forever: the fsyncgate branch sees no failure, the liveness
+/// assertion sees `running` and is satisfied, and the condvar has no notifier left. A hung server
+/// with a healthy process — the exact failure that assertion's doc calls the hardest to diagnose.
+///
+/// The design this replaced got fail-fast for free: the unwinding thread dropped its result channel
+/// and the engine's `recv()` panicked. A `Condvar` has no such hang-up signal, so it is reconstructed
+/// here — as a `Drop` guard rather than a `catch_unwind`, so it covers every abnormal exit including
+/// ones added later, not only the panic path visible today.
+struct LeaderExit<'a> {
+    inner: &'a Arc<GroupSyncInner>,
+    /// Set only on the deliberate shutdown return.
+    clean: bool,
+}
+
+impl Drop for LeaderExit<'_> {
+    fn drop(&mut self) {
+        if self.clean {
+            return;
+        }
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.running = false;
+        if state.failed.is_none() {
+            state.failed = Some(
+                "the WAL fsync leader thread exited abnormally (a panic inside the deferred \
+                 fdatasync, or an unhandled early return) — no fdatasync can be assumed to have \
+                 completed"
+                    .to_owned(),
+            );
+        }
+        self.inner.cv.notify_all();
+    }
+}
+
+/// The fsync leader's loop: take the pending job, run its `fdatasync` with the lock RELEASED, publish
+/// the outcome, repeat until the engine closes it.
+fn run_group_sync(inner: &Arc<GroupSyncInner>) {
+    let mut exit = LeaderExit {
+        inner,
+        clean: false,
+    };
+    loop {
+        let job = {
+            let mut state = inner
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while state.pending.is_none() && !state.closed {
+                state = inner
+                    .cv
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            match state.pending.take() {
+                Some(job) => {
+                    state.running = true;
+                    job
+                }
+                // Closed with nothing left to harden: the engine is gone. The ONLY clean exit.
+                None => {
+                    exit.clean = true;
+                    return;
+                }
+            }
+        };
+        let target = job.target_len();
+        // The `fdatasync` runs WITHOUT the lock: this is the only slow step, and holding the lock
+        // across it would stop workers offering into the very slot this coalescing depends on.
+        let outcome = job.run();
+        let mut state = inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.running = false;
+        match outcome {
+            Ok(()) => {
+                // Monotone: an eviction's inline `sync` may already have carried the frontier past
+                // this job's range while it ran.
+                state.durable = state.durable.max(target);
+                inner.cv.notify_all();
+            }
             Err(e) => {
-                panic!("WAL fdatasync failed; aborting to avoid silent data loss (fsyncgate): {e}")
+                // fsyncgate: record and stop. Panicking HERE would take down the one thread every
+                // waiter is waiting on, leaving them blocked forever; instead each waiter panics on
+                // its own stack, before it acks anything. Recorded here rather than left to
+                // [`LeaderExit`] because the real error text is worth keeping — the guard's generic
+                // message is for the exits that carry no error at all.
+                state.failed = Some(e.to_string());
+                inner.cv.notify_all();
+                return;
             }
         }
     }
 }
 
-impl Drop for WalSyncThread {
+impl Drop for WalGroupSync {
     fn drop(&mut self) {
-        // Close the job channel first (ends the thread's `iter()`), THEN join — so the fsync thread
-        // never outlives the engine and any final in-flight `fdatasync` completes. Under depth-1 the
-        // engine always waits before dropping, so no job is ever in flight at drop time.
-        drop(self.job_tx.take());
+        // Close first (ending the leader's loop), THEN join — so the fsync thread never outlives the
+        // engine. This runs when the LAST worker's `Arc` share is released, so by construction no
+        // worker is offering or waiting; a job still pending is run before the loop returns.
+        {
+            let mut state = self.lock();
+            state.closed = true;
+        }
+        self.inner.cv.notify_all();
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -1644,6 +2023,13 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // reformulated M1 ordering proof that replaces "it is all one thread".
     dispatch: Arc<read_pool::ReadDispatch<D, S>>,
     retire_rx: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<read_pool::ReadRetirement>>>,
+    // The ENGINE's ONE WAL fsync group leader (`rmp` #1040), built once by
+    // [`spawn_engine_with_timeout`] and shared by every worker.
+    //
+    // It used to be spawned HERE, so a `W`-worker engine ran `W` fsync threads over one
+    // `WalManager`, each depth-1 for itself and none for the system: `W` duplicate `fdatasync`s of
+    // overlapping ranges, and no coalescing between workers. See [`WalGroupSync`].
+    wal_sync: Arc<WalGroupSync>,
     metrics: Arc<Metrics>,
     degraded: EngineDegraded,
     maintenance_degraded: MaintenanceDegraded,
@@ -1785,11 +2171,6 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // iteration, IN ORDER, after the batch it followed has been hardened + acked — never reordered ahead
     // of the batch, and never dropped.
     let mut pending_cmd: Option<EngineCommand> = None;
-    // The dedicated WAL fsync thread (`rmp` #532): the pipelined group-commit harden offloads each
-    // batch's `fdatasync` here so it overlaps the CPU work of PREPAREing the next batch. Depth-1 (a
-    // capacity-1 job channel), so at most one batch is ever written-but-un-synced — the on-disk crash
-    // state stays the same category as inline group commit. Joined when this loop returns (its `Drop`).
-    let wal_sync = WalSyncThread::spawn(&db_name);
 
     'engine: loop {
         // Drain any reader retirements that have arrived (M1' merge → auto-commit). The channel is the
@@ -3529,9 +3910,10 @@ struct ProcessCtx<'a, D: BlockDevice + Send + Sync + 'static, S: LogSink + Send 
     builds_were_pending: &'a mut bool,
     /// A command a group-commit batch drain pulled but did not batch, stashed for the loop's next tick.
     pending_cmd: &'a mut Option<EngineCommand>,
-    /// The dedicated WAL fsync thread the pipelined group-commit harden offloads each batch's
-    /// `fdatasync` to (`rmp` #532). Lives for the engine's lifetime.
-    wal_sync: &'a WalSyncThread,
+    /// The database's ONE WAL fsync group leader, which the pipelined group-commit harden offloads
+    /// each batch's `fdatasync` to (`rmp` #532, shared across workers since `rmp` #1040). Lives for
+    /// the engine's lifetime.
+    wal_sync: &'a WalGroupSync,
     /// The off-thread reader retirement channel (`rmp` #336). Threaded in so [`pipelined_group_commit`]
     /// can release readers' GC-watermark pins BETWEEN hardened batches under a sustained write storm,
     /// instead of leaving them pinned until the engine loop's next top-of-tick sweep (`rmp` #583, F1b).
@@ -3623,8 +4005,9 @@ fn process_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
 
     // Group commit + **pipelining** (`rmp` #528 + #532): if this command PREPAREd a durable write
     // commit, coalesce further queued commits into the SAME batch, then harden the batch with the
-    // pipelined split — `begin_harden` writes its records to the file and the `fdatasync` is offloaded
-    // to `wal_sync` while the engine PREPAREs the NEXT consecutive batch (depth-1), then wait + complete
+    // pipelined split — `begin_harden` writes its records to the file and the `fdatasync` is offered
+    // to the database's ONE fsync group leader (`rmp` #1040), where it may be folded onto a
+    // concurrent worker's, while this worker PREPAREs the NEXT consecutive batch, then wait + complete
     // + ack (ack-after-fsync). The drain stashes the first non-commit command into `pending_cmd`
     // (processed next tick, in order).
     if !commit_batch.is_empty() {
@@ -5132,22 +5515,24 @@ fn flush_commit_batch<D: BlockDevice, S: LogSink>(
 
 /// **Pipelined** group-commit harden + ack (`rmp` #532, commit pipelining), the async-engine
 /// counterpart of the inline [`flush_commit_batch`] (which the DST/`LocalEngine` driver keeps, for a
-/// bit-identical synchronous replay). Depth-1: the `fdatasync` of the current batch is offloaded to
-/// `wal_sync` while this thread PREPAREs the **next** consecutive commit batch, then it waits +
-/// completes + acks.
+/// bit-identical synchronous replay). The `fdatasync` of the current batch is offered to the
+/// database's fsync group leader while this worker PREPAREs the **next** consecutive commit batch,
+/// then it waits + completes + acks.
 ///
 /// # Per-batch phases
 /// 1. **begin_harden** — [`TxnCoordinator::begin_harden_wal`] writes the batch's records to the log
 ///    file (advancing the WAL write frontier) WITHOUT `fdatasync`ing, returning the deferred job.
-/// 2. **submit** — hand the job to `wal_sync` (the fsync runs off the engine thread).
+/// 2. **offer** — hand the job to `wal_sync` (the fsync runs off the engine thread), together with
+///    the sink's own durable frontier, which is the leader's independent view of durability.
 /// 3. **overlap** — PREPARE the next consecutive commit batch ([`drain_commit_batch`], append-only,
-///    so the WAL write frontier does NOT advance — preserving depth-1). Skipped once a non-commit
-///    command has been stashed in `pending_cmd` (it must be processed before any later command).
-/// 4. **wait** — [`WalSyncThread::wait`] blocks for the `fdatasync`; a failure PANICs (fsyncgate)
-///    BEFORE any ack.
+///    so this worker's WAL write frontier does NOT advance). Skipped once a non-commit command has
+///    been stashed in `pending_cmd` (it must be processed before any later command).
+/// 4. **wait** — [`WalGroupSync::wait_hardened`] blocks until the WAL is durable through this
+///    batch's frontier; a failure PANICs (fsyncgate) BEFORE any ack. It may return MORE than was
+///    asked for, when another worker's job hardened further.
 /// 5. **complete_harden** — [`TxnCoordinator::complete_harden_wal`] advances the durable watermark
 ///    (monotonic — race-free with an eviction's inline harden during the overlap, which shares the
-///    same WAL manager lock).
+///    same WAL manager lock, and with another worker completing the same shared frontier).
 /// 6. **ack** — acknowledge every committer of the just-hardened batch (ack-after-fsync).
 ///
 /// # WAL-before-data during the overlap
@@ -5160,7 +5545,7 @@ fn pipelined_group_commit<
     D: BlockDevice + Send + Sync + 'static,
     S: LogSink + Send + Sync + 'static,
 >(
-    wal_sync: &WalSyncThread,
+    wal_sync: &WalGroupSync,
     rx: &std::sync::Mutex<std::sync::mpsc::Receiver<EngineCommand>>,
     coordinator: &mut Option<Arc<TxnCoordinator<D, S>>>,
     // The latch: this path re-enters the dispatch (`rmp` #1033).
@@ -5224,9 +5609,16 @@ fn pipelined_group_commit<
             batch.clear();
             return;
         };
-        // (1) begin_harden + (2) submit: write the batch's records to the file, offload the fdatasync.
+        // (1) begin_harden + (2) offer: write the batch's records to the file, offload the fdatasync.
+        //
+        // The sink's own durable frontier goes with the job, read AFTER `begin_harden_wal` so it is
+        // at or beyond the frontier the job captured. It is the leader's ONLY view of durability
+        // independent of what the job claims about itself, and both the "already durable, discard it"
+        // paths and the freedom from false positives of the subsumption tripwire rest on it — see
+        // [`WalGroupSync::offer`]. Reading it costs one uncontended WAL-mutex round trip per BATCH,
+        // beside the one `ack_prepared_commits` already takes below.
         let job = coord.begin_harden_wal();
-        wal_sync.submit(job);
+        let target = wal_sync.offer(job, coord.wal_durable_len());
 
         // (3) OVERLAP: PREPARE the next consecutive commit batch while the fdatasync is in flight.
         // Only if the prior drain didn't stash a non-commit command (which must be processed first).
@@ -5258,11 +5650,14 @@ fn pipelined_group_commit<
             );
         }
 
-        // (4) WAIT for the in-flight fdatasync (depth-1). PANICs on failure (fsyncgate) BEFORE any ack.
-        let target = wal_sync.wait();
+        // (4) WAIT until the WAL is durable through this batch's frontier. PANICs on failure
+        // (fsyncgate) BEFORE any ack. The value returned is at or beyond `target`: another worker's
+        // job may have hardened further, and completing with the larger one is both correct (it is
+        // durable) and useful (it is what the sink's watermark would reach anyway).
+        let hardened = wal_sync.wait_hardened(target);
         // (5) complete_harden: advance the durable watermark (monotonic / race-free). (6) ack the batch.
         if let Some(coord) = coordinator.as_deref() {
-            coord.complete_harden_wal(target);
+            coord.complete_harden_wal(hardened);
             ack_prepared_commits(coord.wal_durable_len(), &mut batch, metrics, db);
         } else {
             batch.clear();
@@ -5930,6 +6325,14 @@ where
     // `Receiver` is `!Sync`, so the workers share it under a lock — the same shape their own command
     // queues already have. Whichever worker reaches it drains it; see `process_retirements`.
     let retire_rx = Arc::new(std::sync::Mutex::new(retire_rx));
+    // The ENGINE's ONE WAL fsync group leader (`rmp` #1040), built here beside the other structures
+    // that belong to the engine rather than to a worker, and for the same reason: spawned inside the
+    // worker loop it was spawned `W` times, so an engine with `W` workers ran `W` fsync threads over
+    // one `WalManager` — each depth-1 for itself, the system depth-`W` — duplicating every
+    // `fdatasync` and coalescing nothing between workers. One leader makes "at most one `fdatasync`
+    // in flight" a property of the DATABASE, and lets one worker's sync satisfy the rest. See
+    // [`WalGroupSync`] for the sink contract that makes that sound.
+    let wal_sync = Arc::new(WalGroupSync::spawn(&db_name, Arc::clone(&metrics)));
 
     let mut joins = Vec::with_capacity(engine_workers);
     for (worker_id, rx) in receivers.into_iter().enumerate() {
@@ -5942,6 +6345,7 @@ where
         let index_builds = Arc::clone(&index_builds);
         let dispatch = Arc::clone(&dispatch);
         let retire_rx = Arc::clone(&retire_rx);
+        let wal_sync = Arc::clone(&wal_sync);
         // Its OWN queue: no latch, because no other worker reads it (`rmp` #1035).
         let rx = Arc::new(std::sync::Mutex::new(rx));
         let loop_metrics = Arc::clone(&loop_metrics);
@@ -5974,6 +6378,7 @@ where
                     result_buffer_capacity,
                     dispatch,
                     retire_rx,
+                    wal_sync,
                     loop_metrics,
                     loop_degraded,
                     loop_maintenance_degraded,
@@ -6004,6 +6409,11 @@ where
     // catalog kept the handle — the phantom-count failure the retraction exists to prevent.
     drop(active_txns);
     drop(index_builds);
+    // Release the spawner's share of the fsync leader too, so its `Drop` — which closes and JOINS the
+    // fsync thread — runs when the LAST WORKER exits rather than when this `Engine` value is
+    // eventually dropped. Holding one here would keep the thread alive for as long as the catalog
+    // kept the handle, and would move the join onto whichever thread finally released it.
+    drop(wal_sync);
 
     // Startup already succeeded: the coordinator was built above, before any worker existed, so
     // there is no thread whose startup result has to be waited for (`rmp` #1033).
@@ -6961,5 +7371,359 @@ mod active_txn_gauge_tests {
             0,
             "the SSI-tracked gauge has the same fold and the same failure mode"
         );
+    }
+}
+
+#[cfg(test)]
+mod wal_group_sync_1040 {
+    use super::*;
+
+    /// Holds ONE job inside its `run()` until the test releases it, so the jobs offered afterwards
+    /// are provably still in the leader's `pending` slot when the next offer folds them.
+    ///
+    /// Without it these tests would be racy in the direction that hides the defect: a leader that
+    /// picked the first job up before the second arrived would run both, and a test asserting "one
+    /// `fdatasync` for two offers" would fail for a reason that has nothing to do with the fold.
+    struct Barrier {
+        state: std::sync::Mutex<BarrierState>,
+        cv: std::sync::Condvar,
+    }
+
+    #[derive(Default)]
+    struct BarrierState {
+        entered: bool,
+        open: bool,
+    }
+
+    impl Barrier {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                state: std::sync::Mutex::new(BarrierState::default()),
+                cv: std::sync::Condvar::new(),
+            })
+        }
+
+        /// Called from inside a job's `run()`: announce arrival, then block until released.
+        fn hold(&self) {
+            let mut s = self.state.lock().expect("barrier lock");
+            s.entered = true;
+            self.cv.notify_all();
+            while !s.open {
+                s = self.cv.wait(s).expect("barrier wait");
+            }
+        }
+
+        /// Blocks until the held job is provably inside `run()` — i.e. the leader is occupied.
+        fn wait_entered(&self) {
+            let mut s = self.state.lock().expect("barrier lock");
+            while !s.entered {
+                s = self.cv.wait(s).expect("barrier wait");
+            }
+        }
+
+        fn release(&self) {
+            let mut s = self.state.lock().expect("barrier lock");
+            s.open = true;
+            self.cv.notify_all();
+        }
+    }
+
+    /// Releases the barrier on drop — including while unwinding from a `should_panic` assertion — so
+    /// a failing test can never leave the leader blocked and hang the whole run at the join in
+    /// [`WalGroupSync::drop`]. Declare it AFTER the `WalGroupSync` so it drops FIRST.
+    struct BarrierGuard(Arc<Barrier>);
+    impl Drop for BarrierGuard {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    /// A job that hardens `[covers_from, target)` and counts the fact that it ran.
+    fn counted(runs: &Arc<AtomicU64>, covers_from: u64, target: u64) -> graphus_wal::FsyncJob {
+        let runs = Arc::clone(runs);
+        graphus_wal::FsyncJob::deferred(
+            move || {
+                runs.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            },
+            covers_from,
+            target,
+        )
+    }
+
+    /// A leader with its own `Metrics`, so a test can read the fold counter it publishes.
+    fn leader(tag: &str) -> (WalGroupSync, Arc<Metrics>) {
+        let metrics = Arc::new(Metrics::new());
+        (WalGroupSync::spawn(tag, Arc::clone(&metrics)), metrics)
+    }
+
+    /// A job that occupies the leader until the barrier is released.
+    fn blocker(barrier: &Arc<Barrier>) -> graphus_wal::FsyncJob {
+        let barrier = Arc::clone(barrier);
+        graphus_wal::FsyncJob::deferred(
+            move || {
+                barrier.hold();
+                Ok(())
+            },
+            0,
+            100,
+        )
+    }
+
+    /// **Several workers' offers coalesce into ONE `fdatasync`, and every one of them is released.**
+    ///
+    /// This is what the shared leader buys over the per-worker fsync thread it replaced: two workers
+    /// hardening overlapping ranges pay one sync between them, not two, and the worker whose job was
+    /// folded away is released by the job that ran — because that job's range subsumes its own.
+    #[test]
+    fn offers_coalesce_into_one_fdatasync_and_release_every_waiter() {
+        let runs = Arc::new(AtomicU64::new(0));
+        let barrier = Barrier::new();
+        let (sync, metrics) = leader("unit-fold");
+        sync.offer(blocker(&barrier), 0);
+        barrier.wait_entered();
+        let guard = BarrierGuard(Arc::clone(&barrier));
+
+        // Worker A hardens through 200; worker B, still inside the same overlap window, through 300.
+        // Both start at the sink's one durable frontier (100 here), as the sink contract requires —
+        // and both attest that frontier, because no sink can produce `covers_from` above what it
+        // reports durable. Passing 0 here (as this test first did) is an input the attestation
+        // tripwire now rejects outright, which is exactly why it was blind to a per-caller frontier.
+        let target_a = sync.offer(counted(&runs, 100, 200), 100);
+        let target_b = sync.offer(counted(&runs, 100, 300), 100);
+        assert_eq!(target_a, 200);
+        assert_eq!(target_b, 300);
+
+        drop(guard);
+        let hardened_a = sync.wait_hardened(target_a);
+        let hardened_b = sync.wait_hardened(target_b);
+        assert!(
+            hardened_a >= target_a,
+            "worker A must be released by worker B's job, which covers its range: got {hardened_a}"
+        );
+        assert_eq!(
+            hardened_b, 300,
+            "worker B must see exactly the frontier its own job reached"
+        );
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            1,
+            "the two offers must have coalesced onto ONE fdatasync — a leader that ran both is the \
+             per-worker fsync thread this replaced, wearing a different name"
+        );
+        assert_eq!(
+            metrics.wal_fsync_coalesced(),
+            1,
+            "the fold must be COUNTED: it is the only place in the server that knows an fdatasync \
+             was avoided, and an operator has no other way to see the coalescing stop"
+        );
+    }
+
+    /// **THE PRIMARY TRIPWIRE: a job claiming a durable frontier the sink does not report aborts.**
+    ///
+    /// This is the check that catches the catastrophe property 2 names — `begin_harden` handing out
+    /// a per-caller frontier instead of the sink's global one. It has to be this check and not a
+    /// subsumption test over ranges, because a per-caller frontier produces ranges that are exactly
+    /// CONTIGUOUS with their predecessor's (`covers_from == previous target_len`), which every
+    /// subsumption test accepts. Only comparing the claim against the sink's own report separates
+    /// them, and that comparison needs no fold, no concurrency and no particular `W`.
+    #[test]
+    #[should_panic(expected = "INVARIANT VIOLATED (rmp #1040)")]
+    fn a_job_claiming_more_than_the_sink_reports_trips_the_wire() {
+        let (sync, _metrics) = leader("unit-attest");
+        // The sink says 100 bytes are durable; the job says everything below 250 is.
+        sync.offer(graphus_wal::FsyncJob::deferred(|| Ok(()), 250, 300), 100);
+    }
+
+    /// **The last-line tripwire: a keeper that does not reach back to the dropped job's range.**
+    ///
+    /// Driven against [`fold_pending`] DIRECTLY, not through `offer`. Through `offer` this is
+    /// unreachable — the attestation check and the two already-durable discards absorb every input
+    /// that could produce a gapped pair — so a test driven that way would pass while proving only
+    /// that the earlier check fired, and would keep passing with this assertion deleted. Testing the
+    /// guard where it is the SOLE control is the only way it stays honest.
+    ///
+    /// `[250, 300)` does not cover `[100, 200)`: running the keeper alone would leave `[100, 200)`
+    /// hardened by nobody while the waiter for 200 was released against a frontier that never
+    /// covered it.
+    #[test]
+    #[should_panic(expected = "INVARIANT VIOLATED (rmp #1040)")]
+    fn a_keeper_that_leaves_a_gap_trips_the_fold() {
+        let _ = fold_pending(
+            graphus_wal::FsyncJob::deferred(|| Ok(()), 100, 200),
+            graphus_wal::FsyncJob::deferred(|| Ok(()), 250, 300),
+        );
+    }
+
+    /// The fold's other last-line guard, likewise where it is the sole control: the keeper must not
+    /// end below the job it displaces. It holds by construction of the keeper choice today, so this
+    /// pins the choice rather than the arithmetic — reverse the comparison in [`fold_pending`] and
+    /// this is what says so.
+    #[test]
+    fn the_fold_keeps_the_job_with_the_larger_range() {
+        let keeper = fold_pending(
+            graphus_wal::FsyncJob::deferred(|| Ok(()), 100, 300),
+            graphus_wal::FsyncJob::deferred(|| Ok(()), 100, 200),
+        );
+        assert_eq!(
+            keeper.target_len(),
+            300,
+            "the newer but SMALLER job won the fold"
+        );
+        let keeper = fold_pending(
+            graphus_wal::FsyncJob::deferred(|| Ok(()), 100, 200),
+            graphus_wal::FsyncJob::deferred(|| Ok(()), 100, 300),
+        );
+        assert_eq!(keeper.target_len(), 300);
+    }
+
+    /// **A legitimately advanced frontier is discarded, not tripped over.**
+    ///
+    /// The same gapped shape as above — pending `[100, 200)`, keeper starting at 250 — except that
+    /// the sink now REPORTS 250 durable, because an eviction's inline `sync` (the WAL-before-data
+    /// rule) hardened that range behind the leader's back. The pending job is then redundant rather
+    /// than orphaned, and the leader must say so instead of aborting a healthy database.
+    ///
+    /// This is the case that makes the tripwire safe to leave always-on: it separates "the sink
+    /// advanced" from "the job is claiming a frontier the sink does not have", which is the only
+    /// thing the assertion above can then be firing at.
+    #[test]
+    fn an_inline_sync_that_advanced_the_frontier_is_not_a_violation() {
+        let runs = Arc::new(AtomicU64::new(0));
+        let barrier = Barrier::new();
+        let (sync, _metrics) = leader("unit-advance");
+        sync.offer(blocker(&barrier), 0);
+        barrier.wait_entered();
+        let guard = BarrierGuard(Arc::clone(&barrier));
+
+        let target_a = sync.offer(counted(&runs, 100, 200), 100);
+        // The eviction's inline `sync` hardened everything through 250 and the sink says so.
+        let target_b = sync.offer(counted(&runs, 250, 300), 250);
+        drop(guard);
+
+        assert!(
+            sync.wait_hardened(target_a) >= target_a,
+            "the worker whose job was discarded as already-durable must still be released"
+        );
+        assert_eq!(sync.wait_hardened(target_b), 300);
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            1,
+            "only the surviving job runs: the discarded one's range was already on the platter"
+        );
+    }
+
+    /// **A range the sink already reports durable costs no `fdatasync` at all, and stalls no waiter.**
+    ///
+    /// The leader must not queue work for bytes that are already on the platter — and, just as
+    /// importantly, the waiter for such a range must return instead of blocking on a job that was
+    /// never queued, which is what the liveness assertion in `wait_hardened` would otherwise catch.
+    #[test]
+    fn an_already_durable_range_is_neither_hardened_nor_waited_on() {
+        let runs = Arc::new(AtomicU64::new(0));
+        let (sync, _metrics) = leader("unit-durable");
+        let target = sync.offer(counted(&runs, 0, 100), 100);
+        assert_eq!(target, 100);
+        assert_eq!(sync.wait_hardened(target), 100);
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            0,
+            "nothing to harden: the sink already reported this range durable"
+        );
+    }
+
+    /// **A PANIC inside the deferred `fdatasync` fails the waiters instead of hanging them.**
+    ///
+    /// `run` is a boxed closure the sink supplies, so a panic in it unwinds the leader thread — and
+    /// before `rmp` #1040's exit guard that left `running == true` with no failure recorded and no
+    /// thread alive, so every waiter blocked for good: the fsyncgate branch saw nothing, the liveness
+    /// assertion was satisfied by the stale `running`, and the condvar had no notifier. A hung server
+    /// with a healthy process. The design this replaced got fail-fast for free, because the
+    /// unwinding thread dropped its result channel; a `Condvar` has no hang-up, so it is
+    /// reconstructed by the guard. This test is what says it still is.
+    ///
+    /// Deliberately NOT a `#[should_panic]` test. The regression it guards is a HANG, and a
+    /// `should_panic` test meets a hang by hanging — leaving the whole suite to be killed by a
+    /// harness timeout minutes later, with nothing in the output naming the cause. So the wait runs
+    /// on its own thread behind a bounded `recv_timeout`, which turns the hang into an ordinary,
+    /// immediate, self-describing test failure.
+    #[test]
+    fn a_panicking_fdatasync_fails_the_waiter_instead_of_hanging_it() {
+        let (sync, _metrics) = leader("unit-panic");
+        let target = sync.offer(
+            graphus_wal::FsyncJob::deferred(
+                || panic!("a sink decorator panicked inside the deferred fdatasync"),
+                0,
+                100,
+            ),
+            0,
+        );
+
+        // A DETACHED thread, deliberately not `std::thread::scope`. A scope joins every thread it
+        // spawned before it returns — including while unwinding — so a scoped version of this test
+        // meets the regression by blocking in that join, and the bounded timeout below can never
+        // fire. (Measured: it ran past 300s.) Detached, the waiter is simply abandoned where it hung
+        // and the failure is reported at once.
+        let sync = Arc::new(sync);
+        let waiter = Arc::clone(&sync);
+        let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<u64, String>>();
+        std::thread::spawn(move || {
+            // The waiter is EXPECTED to panic (fsyncgate). Catching it here — rather than letting it
+            // escape — is what lets the message be asserted instead of merely observed.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                waiter.wait_hardened(target)
+            }));
+            let msg = match outcome {
+                Ok(reached) => Ok(reached),
+                Err(payload) => Err(payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+                    .unwrap_or_else(|| "<non-string panic payload>".to_owned())),
+            };
+            let _ = tx.send(msg);
+        });
+
+        match rx.recv_timeout(std::time::Duration::from_secs(15)) {
+            Err(_) => panic!(
+                "the committer waiting on a PANICKED fdatasync never returned. The leader thread \
+                 unwound leaving `running == true` and no failure recorded, so the liveness \
+                 assertion is satisfied by stale state and the condvar has no notifier left: a hung \
+                 server with a healthy process (rmp #1040)"
+            ),
+            Ok(Ok(reached)) => panic!(
+                "the waiter returned {reached} as DURABLE after the fdatasync panicked — no sync \
+                 completed, so this is false durability"
+            ),
+            Ok(Err(msg)) => assert!(
+                msg.contains("fsyncgate"),
+                "the waiter failed, but not as an fsyncgate abort: {msg}"
+            ),
+        }
+    }
+
+    /// **fsyncgate: a failed `fdatasync` panics the WAITER, not the leader alone.**
+    ///
+    /// The panic must reach the thread that is about to ack committers, because that is the thread
+    /// that must not ack them. A leader that panicked on its own would take down the one thread every
+    /// waiter is waiting on and leave them blocked for good — a hung database instead of a
+    /// diagnosable abort.
+    #[test]
+    #[should_panic(expected = "fsyncgate")]
+    fn a_failed_fdatasync_panics_the_waiter() {
+        let (sync, _metrics) = leader("unit-fsyncgate");
+        let target = sync.offer(
+            graphus_wal::FsyncJob::deferred(
+                || {
+                    Err(GraphusError::Storage(
+                        "injected fdatasync failure".to_owned(),
+                    ))
+                },
+                0,
+                100,
+            ),
+            0,
+        );
+        sync.wait_hardened(target);
     }
 }

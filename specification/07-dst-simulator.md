@@ -277,7 +277,9 @@ An unregistered, non-exempt thread that reaches a yield point **panics**. A thre
 not control runs freely and would destroy the determinism of the whole run in silence, so a thread
 that is deliberately outside the simulation must say so explicitly by calling `sched::exempt()`, at
 the point where it is created and for a reason recorded there. Today that covers the reader-pool
-workers and both WAL fsync offloads, which block in a channel `recv()`; the rayon analytics workers,
+workers, which block in a channel `recv()`, and the database's **one** WAL fsync group leader, which
+blocks on its condition variable — one per database rather than one per engine worker since task
+#1040 retired the per-worker fsync thread (`04-technical-design.md` §4.2); the rayon analytics workers,
 because rayon owns its own work-stealing scheduler; the server's engine thread, whose blocking
 command and reply channels must become scheduled resources first; and the scheduler's own watchdog.
 

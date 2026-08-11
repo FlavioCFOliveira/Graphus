@@ -670,10 +670,15 @@ impl<S: LogSink> WalManager<S> {
 
     /// **PREPARE** half of a pipelined harden (`rmp` #532, commit pipelining): writes every appended
     /// record to the backing store (advancing the sink's write frontier) and returns the deferred
-    /// [`FsyncJob`], WITHOUT `fdatasync`ing. The engine hands the job to a dedicated fsync thread,
-    /// overlaps the sync with preparing the next batch, then — after the job runs successfully — calls
-    /// [`complete_harden`](Self::complete_harden) with the job's
-    /// [`target_len`](crate::FsyncJob::target_len) to advance the durable watermark.
+    /// [`FsyncJob`](crate::FsyncJob), WITHOUT `fdatasync`ing. The engine offers the job to its
+    /// per-database fsync group leader, overlaps the sync with preparing the next batch, then — once
+    /// the WAL is durable through the job's frontier — calls
+    /// [`complete_harden`](Self::complete_harden) to advance the durable watermark.
+    ///
+    /// With several engine workers, several jobs are alive over this one manager at a time and the
+    /// leader may run ONE of them on behalf of the rest. The properties that makes sound are
+    /// documented as THE SINK CONTRACT on [`FsyncJob`](crate::FsyncJob), and they are requirements on
+    /// the sink underneath, not on this method.
     ///
     /// The produced durable bytes are byte-for-byte identical to [`flush`](Self::flush); only the
     /// `fdatasync` is deferred. The commit is committed-**durable** only once the job has run *and*

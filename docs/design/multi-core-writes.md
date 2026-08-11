@@ -43,6 +43,16 @@ Three things changed, and each one moves a conclusion below:
    own commit round-trip. That is what the single engine thread now costs, and it is what `rmp` #975
    removes.
 
+   **Where "depth-1" now lives (`rmp` #1040).** It is a property of the **database**, not of a thread.
+   Each engine worker still runs one commit pipeline — offer the batch's `fdatasync`, PREPARE the
+   next batch, wait, complete — but every worker offers to **one** fsync group leader per database
+   (`WalGroupSync`), which keeps at most one `fdatasync` in flight and folds the offers that arrive
+   while it runs into a single job whose range subsumes them. So the pipeline depth measured in this
+   table is unchanged, and the *reason* it holds no longer assumes a single engine thread: before
+   #1040 each worker spawned its own fsync thread and was depth-1 only for itself, which made the
+   system depth-`W` with `W` duplicate syncs of overlapping ranges. Deepening the pipeline (T2 in §7)
+   remains open, and is now one change in one place instead of `W`.
+
 **What still stands** is the reasoning, the architecture comparison in §4, and the ranking's *shape*:
 coalescing before cores, and cores before sharding. What does not stand is the claim that adding cores
 cannot lift the number — it could not lift it *while the fsync barrier stood*, and that barrier is

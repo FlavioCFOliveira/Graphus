@@ -11,11 +11,12 @@
 //!
 //! The deterministic simulator (`specification/07-dst-simulator.md` §5.1) runs the engine on **one
 //! cooperative OS thread with each statement atomic**, so the true-parallel group-commit pipeline —
-//! N concurrent committers, the batch `fdatasync` offloaded to the dedicated `WalSyncThread`, and a
-//! crash landing *in* the depth-1 overlap window — has no deterministic coverage. Its DST-level
-//! counterpart is `graphus-dst`'s `deferred_fsync_overlap_recovery` (which drives the store
-//! primitives single-threaded). This test is the real-OS-thread twin: it drives the **whole engine**
-//! (real `spawn_engine`, real `WalSyncThread`, real concurrent auto-commit writers) and then crashes.
+//! N concurrent committers, the batch `fdatasync` offloaded to the database's `WalGroupSync` fsync
+//! leader, and a crash landing *in* the written-but-un-synced overlap window — has no deterministic
+//! coverage. Its DST-level counterpart is `graphus-dst`'s `deferred_fsync_overlap_recovery` (which
+//! drives the store primitives single-threaded). This test is the real-OS-thread twin: it drives the
+//! **whole engine** (real `spawn_engine`, real `WalGroupSync`, real concurrent auto-commit writers)
+//! and then crashes.
 //!
 //! It belongs to the ThreadSanitizer soak lane (`scripts/tsan-soak.sh`, `rmp` #460), NOT the
 //! deterministic seed-replay gate: the interleaving is chosen by the OS scheduler.
@@ -38,11 +39,11 @@
 //! A real power loss stops the CPU atomically; injecting `crash()` into a *live* shared sink while the
 //! engine keeps running would let the engine deliver acks a real crash never would (unfaithful). So the
 //! test freezes the engine at a **clean, quiescent crash point**: a [`Gate`] blocks the deferred
-//! `fdatasync` of exactly one batch (the "victim"), parking the engine in `WalSyncThread::wait` —
-//! holding no sink/device lock, performing no I/O — with the victim's records written-but-un-synced and
-//! un-acked. The test then snapshots the durable prefix and crashes the (shared) sink and device with
-//! the engine provably idle. This is exactly the power-loss image: the durable bytes survive, the
-//! un-`fdatasync`'d victim tail is gone.
+//! `fdatasync` of exactly one batch (the "victim"), parking the engine in
+//! `WalGroupSync::wait_hardened` — holding no sink/device lock, performing no I/O — with the victim's
+//! records written-but-un-synced and un-acked. It then snapshots the durable prefix and crashes the
+//! (shared) sink and device with the engine provably idle. This is exactly the power-loss image: the
+//! durable bytes survive, the un-`fdatasync`'d victim tail is gone.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -71,7 +72,7 @@ impl Clock for RealClock {
 }
 
 /// A gate that blocks the deferred `fdatasync` of a single batch so the engine parks in
-/// `WalSyncThread::wait` at a clean, I/O-free crash point.
+/// `WalGroupSync::wait_hardened` at a clean, I/O-free crash point.
 ///
 /// Starts **open** (every batch's deferred harden runs through immediately). [`close`](Gate::close)
 /// makes the *next* harden job block in its `run()`; when that job blocks it flips `parked`, which
@@ -182,15 +183,21 @@ impl LogSink for SharedGatedSink {
         self.hardens.fetch_add(1, Ordering::Relaxed);
         // The inner deferred sink moves `pending` into the written-but-un-synced frontier and returns a
         // deferred (no-op `fdatasync`) job. Wrap that job's `run` behind the gate: while the gate is
-        // closed the job blocks, so the engine parks in `WalSyncThread::wait` with this batch un-synced.
+        // closed the job blocks, so the engine parks in `WalGroupSync::wait_hardened` with this batch
+        // un-synced.
         let inner_job = self.inner.lock().expect("sink lock").begin_harden()?;
         let target = inner_job.target_len();
+        // A decorator sink forwards the inner job's declared range UNCHANGED (`rmp` #1040). Narrowing
+        // or re-deriving `covers_from` here would make this wrapper claim a durable frontier the sink
+        // underneath does not have — property 2 of THE SINK CONTRACT on `FsyncJob`.
+        let covers_from = inner_job.covers_from();
         let gate = Arc::clone(&self.gate);
         Ok(FsyncJob::deferred(
             move || {
                 gate.block_if_closed();
                 inner_job.run()
             },
+            covers_from,
             target,
         ))
     }
@@ -458,7 +465,7 @@ fn run_one_crash_recovery(iter: usize, w: usize, m: i64, sentinel: i64) -> i64 {
         })
     };
     // Wait until the victim's harden job has actually parked: the engine is now frozen in
-    // `WalSyncThread::wait`, holding no sink/device lock and doing no I/O — a clean crash point.
+    // `WalGroupSync::wait_hardened`, holding no sink/device lock and doing no I/O — a clean crash point.
     gate.wait_parked();
 
     // The written-but-un-synced overlap window is genuinely present: the victim's records are in the WAL

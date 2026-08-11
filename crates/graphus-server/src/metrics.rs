@@ -478,6 +478,20 @@ pub struct Metrics {
     /// Engine-thread-only writer per database, so unpadded.
     wal_bytes_written: AtomicU64,
 
+    // ---- write-ahead-log fsync coalescing (`rmp` #1040) ----
+    /// Commit-batch hardens that were **folded onto another batch's `fdatasync`** instead of costing
+    /// one of their own: each increment is one `fdatasync` the WAL fsync group leader did NOT issue.
+    ///
+    /// This is the operator-visible value of the shared leader. Read against
+    /// `graphus_transactions_committed_total` it says how much of the durability cost concurrent
+    /// writers are sharing; a value pinned at zero under a concurrent write load says the coalescing
+    /// is not happening — which is what a regression to one fsync thread per worker would look like
+    /// from outside, and what no byte or latency counter would show.
+    ///
+    /// Written by any engine worker, but only from inside the leader's own mutex and at most once per
+    /// commit batch — orders of magnitude rarer than the syscall it accounts for — so unpadded.
+    wal_fsync_coalesced: AtomicU64,
+
     // ---- per-database dimension (`rmp` #463) ----
     /// Per-database slices of the transaction/latency/abort families, keyed by canonical database name.
     /// Each engine records into BOTH its slice here and the aggregate fields above, so the per-database
@@ -539,6 +553,7 @@ impl Metrics {
             engine_force_detached_active: AtomicU64::new(0),
             mode_b_sessions_stranded: AtomicU64::new(0),
             wal_bytes_written: AtomicU64::new(0),
+            wal_fsync_coalesced: AtomicU64::new(0),
             per_db: RwLock::new(BTreeMap::new()),
         }
     }
@@ -1147,6 +1162,22 @@ impl Metrics {
     }
 
     /// The cumulative WAL bytes this process has made durable across every database (`rmp` #745).
+    /// Records one commit-batch harden that was **folded onto another batch's `fdatasync`** by the
+    /// WAL fsync group leader (`rmp` #1040) — i.e. one `fdatasync` that was not issued because a
+    /// concurrent worker's job already covered this one's range.
+    ///
+    /// Called from inside the leader's mutex, at most once per commit batch.
+    pub fn record_wal_fsync_coalesced(&self) {
+        self.wal_fsync_coalesced.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Commit-batch hardens folded onto another batch's `fdatasync` so far (`rmp` #1040) —
+    /// observability, and the structural proof of coalescing that a timing ratio cannot give.
+    #[must_use]
+    pub fn wal_fsync_coalesced(&self) -> u64 {
+        self.wal_fsync_coalesced.load(Ordering::Relaxed)
+    }
+
     /// Test/inspection accessor for [`publish_wal_bytes_for`](Self::publish_wal_bytes_for)'s aggregate.
     #[must_use]
     pub fn wal_bytes_written(&self) -> u64 {
@@ -1384,6 +1415,16 @@ impl Metrics {
              by WAL segment reclamation, checkpoints or a STOP/START DATABASE; only by a process restart. \
              The delta between two scrapes is the WAL volume of that window (rmp #745).",
             self.wal_bytes_written.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "graphus_wal_fsync_coalesced_total",
+            "Commit-batch hardens folded onto another batch's fdatasync by the per-database WAL fsync \
+             group leader — each one is an fdatasync that was NOT issued because a concurrent worker's \
+             job already covered this batch's range. Read against graphus_transactions_committed_total \
+             it is the share of durability cost concurrent writers avoided; pinned at zero under a \
+             concurrent write load means the coalescing is not happening (rmp #1040).",
+            self.wal_fsync_coalesced.load(Ordering::Relaxed),
         );
         counter(
             &mut out,

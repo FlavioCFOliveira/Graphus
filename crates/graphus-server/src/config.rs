@@ -1692,22 +1692,28 @@ impl ServerConfig {
         // must agree on has been hoisted out of the per-worker struct one piece at a time: the stop
         // protocol (`rmp` #1036), then the open-transaction table, the parked-statement queue and the
         // plan cache (`rmp` #1041), then the reader count, the ticket sequence and the reclamation
-        // cadence (`rmp` #1037). The state hoisting is done; the CERTIFICATION is not, and this gate
-        // is answerable to the certification and not to any one task.
+        // cadence (`rmp` #1037), then the reader pool and its retirement channel (`rmp` #1039), then
+        // the WAL fsync thread (`rmp` #1040). The state hoisting is done; the CERTIFICATION is not,
+        // and this gate is answerable to the certification and not to any one task.
         //
         // What is known to remain, each verified in the code rather than presumed:
         //
         // * `drive_index_build` is called from the tail of `process_command`, which every worker runs
         //   — so `W` workers drive the same index build concurrently. `rmp` #1037 gave the GC pass a
         //   single-flight gate; the build pass has none, and whether it needs one is unmeasured.
-        // * Every worker spawns its OWN reader pool (`reader_threads` threads) and its own WAL fsync
-        //   thread, so a `W`-worker engine creates `W × reader_threads` reader threads and `W` fsync
-        //   threads over one `WalManager`. Neither the oversubscription nor the depth-1 fsync
-        //   invariant that assumed one such thread has been measured above one worker.
         // * No throughput or stability measurement of the multi-worker engine exists at all, which is
         //   what `rmp` #1034 is for. `rmp` #1037's own fix DEFERS slot reuse above one worker (the
         //   barrier is armed on every pass), and the size of that deferral under sustained load is
         //   exactly the kind of thing that has to be measured before it is offered to an operator.
+        //
+        // What this list USED to say, and no longer does, because the code changed under it: that
+        // every worker spawns its own reader pool and its own WAL fsync thread, so a `W`-worker
+        // engine ran `W × reader_threads` reader threads and `W` fsync threads over one `WalManager`,
+        // with the fsync path's "depth-1" invariant assuming there was only one such thread. Both are
+        // fixed. The reader pool and its retirement channel are built once per ENGINE (`rmp` #1039),
+        // and so is the WAL fsync group leader (`rmp` #1040) — which now makes "at most one
+        // `fdatasync` in flight" a property of the database rather than of a worker, and lets one
+        // worker's sync satisfy every other worker waiting on a frontier at or below it.
         //
         // Refusing the value is the honest option: an uncertified engine must not be reachable from a
         // configuration file. Tests still spawn multi-worker engines directly through
@@ -1717,9 +1723,9 @@ impl ServerConfig {
         if self.admission.engine_workers > 1 {
             return Err(ConfigError::Invalid(format!(
                 "admission.engine_workers must be 1 (got {}): the multi-writer engine is not yet \
-                 certified — every worker still drives index builds and spawns its own reader pool \
-                 and WAL fsync thread, and its throughput has never been measured (rmp #1034). \
-                 Leave it unset (auto) or set it to 1",
+                 certified — every worker still drives the same index build concurrently, and the \
+                 engine's throughput and stability above one worker have never been measured (rmp \
+                 #1034). Leave it unset (auto) or set it to 1",
                 self.admission.engine_workers
             )));
         }

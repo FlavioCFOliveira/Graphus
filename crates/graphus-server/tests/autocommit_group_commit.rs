@@ -3,7 +3,7 @@
 //! Before #566, an auto-commit write (`CREATE …` sent without an explicit `BEGIN`/`COMMIT`) drove an
 //! **inline `fdatasync` per statement on the engine thread**, bypassing the #528/#532 group-commit
 //! coalescing that explicit `BEGIN…COMMIT` already used. #566 routes auto-commit writes through the same
-//! `commit_prepare` + off-thread `WalSyncThread` harden path, so many concurrent auto-commit writers'
+//! `commit_prepare` + off-thread `WalGroupSync` harden path, so many concurrent auto-commit writers'
 //! `fdatasync`s **coalesce into shared syncs off the engine thread**.
 //!
 //! These tests guard the two failure modes the #532 rework was reverted for twice:
@@ -44,7 +44,7 @@ impl Clock for RealClock {
 }
 
 /// A [`LogSink`] that wraps a real [`FileLogSink`] and counts every **physical harden** — a
-/// `begin_harden` (the pipelined group-commit path's batch `fdatasync`, offloaded to `WalSyncThread`)
+/// `begin_harden` (the pipelined group-commit path's batch `fdatasync`, offloaded to `WalGroupSync`)
 /// or a `sync` (an inline eviction / explicit flush harden). One harden == one real `fdatasync` event.
 /// The shared counter lets the test thread observe the engine thread's harden count and assert that
 /// many auto-commit commits coalesced behind few syncs (`rmp` #566, the anti-"inert offload" guard).

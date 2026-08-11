@@ -64,42 +64,139 @@ use graphus_core::error::Result;
 /// (ack-after-fsync). A sink that does not offload (the default) returns an
 /// [`already_durable`](FsyncJob::already_durable) job whose `run` is a no-op, because
 /// `begin_harden`'s default already hardened inline.
+///
+/// # THE SINK CONTRACT (`rmp` #1040)
+///
+/// A multi-worker engine has **several jobs alive at once** — one per worker, all over ONE
+/// [`WalManager`](crate::WalManager) — and its fsync group leader runs ONE of them while **dropping**
+/// the others whose range that one subsumes, exactly as PostgreSQL's `XLogFlush` lets one backend's
+/// flush satisfy every backend waiting for a smaller LSN. Coalescing like that is sound only because
+/// of four properties of the jobs a sink hands out. They are stated **here**, on the type that
+/// carries them across the thread boundary, because the code that relies on them
+/// (`graphus-server`'s `WalGroupSync`) cannot re-derive them from a boxed closure.
+///
+/// Each is followed by what breaks if a future sink stops providing it. In every case the failure is
+/// **false durability** — a committer acked over bytes no `fdatasync` ever covered — which is the
+/// cardinal ACID violation, so these are requirements on every implementor of
+/// [`begin_harden`](LogSink::begin_harden), not descriptions of one implementation.
+///
+/// **1. `run` hardens AT LEAST the whole range `[covers_from, target_len)`.** Not "the bytes this
+/// caller appended", and not a suffix of the range: the job's own declared extent, in full. The
+/// production [`FileLogSink`] provides this — and more — by `fdatasync`ing each *file handle*
+/// spanning the range (`crate::fullsync::full_sync_data`), which hardens every byte in those files,
+/// including any a later `begin_harden` appended after this job was created. That surplus is what
+/// makes a job safe to run late, and what makes running only the newest of several jobs leave no
+/// interior hole.
+/// *If violated* — say the sink moves to `sync_file_range` and narrows `run` to less than the range
+/// the job declares — the leader still reports the highest completed `target_len` to every waiter, so
+/// `complete_harden` advances `durable_len` over bytes no sync touched. **No runtime check can catch
+/// this**: every check the leader can make is over the *declared* ranges, and a narrowed `run` lies
+/// about what it did rather than about what it covers. It is held by review and by the surplus above,
+/// nothing else.
+///
+/// **2. `covers_from` is the sink's GLOBAL durable frontier at the moment the job was created.**
+/// Everything below it is already durable, for every writer, which is why no job ever needs to
+/// harden it again and why [`FileLogSink`] does not even open the segments below it. It MUST NOT be
+/// a per-worker, per-caller or per-batch frontier.
+/// *If violated* — a per-worker frontier runs ahead of the true one — the bytes between the true
+/// frontier and the claimed one are hardened by nobody: not by this job (it starts above them) and
+/// not by a later one (which starts higher still), while `complete_harden` advances straight over
+/// them. This is what the leader's leading always-on tripwire is aimed at: it compares every job's
+/// `covers_from` against the frontier the sink itself reports, which is the one quantity a lying
+/// `covers_from` cannot also move.
+///
+/// **Properties 1 and 2 are not independent, and property 1 can MASK a breach of property 2.** A job
+/// that skipped bytes below its claimed frontier is invisible for as long as those bytes happen to
+/// live in a file some later job `fdatasync`s in full — which, with `FileLogSink`'s segment sizes, is
+/// the common case. So a per-caller frontier can run for a long time looking correct, and then lose
+/// data the first time the skipped bytes fall in an earlier segment, or the first time property 1 is
+/// narrowed. Neither property may be reasoned about as if the other were absent, and the leading
+/// tripwire exists precisely because property 2 must be checked directly rather than through its
+/// symptoms.
+///
+/// **3. Completion is a monotone max, and the ack is taken from the frontier the sink reports
+/// afterwards.** [`complete_harden`](LogSink::complete_harden) does `durable_len =
+/// max(durable_len, target_len)`, and the engine acks against [`durable_len`](LogSink::durable_len)
+/// read back *after* that call. This is what lets a waiter complete with the **group's** watermark —
+/// a value at or beyond its own `target_len`, produced by a job another worker offered — instead of
+/// its own, and what makes a stale or duplicated completion a no-op rather than a regression.
+/// *If violated* — a plain assignment instead of a max — a late completion of an older job pulls the
+/// watermark back below a range an eviction's inline [`sync`](LogSink::sync) already hardened, and
+/// the two accountings of the same frontier disagree from then on.
+///
+/// **4. A job whose declared range is EMPTY (`covers_from == target_len`) has nothing to do at all.**
+/// No `fdatasync`, no directory fsync, no I/O of any kind — because the leader decides whether a job
+/// is redundant from its BYTE RANGE alone, and will discard an empty-range job without running it.
+/// [`already_durable`](FsyncJob::already_durable) is the canonical such job, and its `run` is a
+/// no-op.
+/// *If violated* — the obvious way being a job that hardens no bytes but still carries a pending
+/// **directory** fsync — the leader silently discards it, `complete_harden` then clears the sink's
+/// "directory entry not yet hardened" state having synced nothing, and a crash loses the segment's
+/// directory entry and with it every commit that segment held. [`FileLogSink`] rules that job out by
+/// construction and asserts the invariant it rests on; see its `begin_harden`.
 pub struct FsyncJob {
     /// The `fdatasync` work (segment `full_sync_data`s + an optional directory fsync). A boxed
     /// `FnOnce` so each sink supplies whatever syscalls its backing store needs; `Send` so the job
     /// can run on a dedicated fsync thread.
     run: Box<dyn FnOnce() -> Result<()> + Send + 'static>,
+    /// The start of the range this job hardens: the sink's **global** durable frontier when the job
+    /// was created (property 2 of the sink contract above). Bytes below it are already durable.
+    covers_from: u64,
     /// The write frontier this job makes durable — passed to [`LogSink::complete_harden`] after the
-    /// job runs, to advance `durable_len` (monotonically).
+    /// job runs, to advance `durable_len` (monotonically). The end of the range `[covers_from,
+    /// target_len)`.
     target_len: u64,
 }
 
 impl std::fmt::Debug for FsyncJob {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FsyncJob")
+            .field("covers_from", &self.covers_from)
             .field("target_len", &self.target_len)
             .finish_non_exhaustive()
     }
 }
 
 impl FsyncJob {
-    /// A deferred job that will run `run` (the `fdatasync`) and, on success, hardens the sink up to
-    /// `target_len` (the caller passes it to [`LogSink::complete_harden`]).
+    /// A deferred job that will run `run` (the `fdatasync`) and, on success, hardens the sink over
+    /// `[covers_from, target_len)` (the caller passes `target_len` to
+    /// [`LogSink::complete_harden`]).
+    ///
+    /// `covers_from` MUST be the sink's global durable frontier at this moment — see property 2 of
+    /// the sink contract on [`FsyncJob`]. A sink that computes the range to harden MUST pass the
+    /// SAME value here that it uses to select what `run` will harden, so the declared extent and the
+    /// hardened extent cannot drift apart.
+    ///
+    /// # Panics
+    /// Panics if `covers_from > target_len` — an inverted range, which no sink can mean.
     #[must_use]
-    pub fn deferred(run: impl FnOnce() -> Result<()> + Send + 'static, target_len: u64) -> Self {
+    pub fn deferred(
+        run: impl FnOnce() -> Result<()> + Send + 'static,
+        covers_from: u64,
+        target_len: u64,
+    ) -> Self {
+        assert!(
+            covers_from <= target_len,
+            "INVARIANT VIOLATED (rmp #1040): an fsync job declares the inverted range \
+             [{covers_from}, {target_len}) — `covers_from` is the sink's durable frontier and can \
+             never exceed the write frontier it hardens up to"
+        );
         Self {
             run: Box::new(run),
+            covers_from,
             target_len,
         }
     }
 
     /// A no-op job for a sink that already hardened inline in `begin_harden` (the default,
     /// non-pipelined path): `run` succeeds immediately and `target_len` is the already-durable
-    /// length, so the paired `complete_harden` is a no-op.
+    /// length, so the paired `complete_harden` is a no-op. The range is **empty** (`covers_from ==
+    /// target_len`): there is nothing left below the frontier for this job to harden.
     #[must_use]
     pub fn already_durable(target_len: u64) -> Self {
         Self {
             run: Box::new(|| Ok(())),
+            covers_from: target_len,
             target_len,
         }
     }
@@ -119,6 +216,16 @@ impl FsyncJob {
     #[must_use]
     pub fn target_len(&self) -> u64 {
         self.target_len
+    }
+
+    /// The start of the range this job hardens — the sink's **global** durable frontier when the job
+    /// was created (property 2 of the sink contract on [`FsyncJob`]).
+    ///
+    /// The engine's fsync group leader reads it to decide whether one job's range subsumes another's
+    /// before it drops the other, and asserts on it when it does.
+    #[must_use]
+    pub fn covers_from(&self) -> u64 {
+        self.covers_from
     }
 }
 
@@ -156,6 +263,26 @@ pub trait LogSink {
     /// no-op merely because there is no *unwritten* pending tail. Otherwise the home page is written
     /// over an un-synced WAL record and a crash before the deferred `fdatasync` leaves an
     /// uncommitted, un-undoable change on disk (an atomicity/ACID violation).
+    ///
+    /// # The sink contract this method must honour (`rmp` #1040)
+    ///
+    /// The engine runs one fsync group leader per database, and several workers' jobs are alive over
+    /// this one sink at a time; the leader runs one of them and drops the ones it subsumes. The four
+    /// properties that makes sound are stated in full on [`FsyncJob`], each with the failure it
+    /// prevents. In brief, every job this method returns MUST satisfy:
+    ///
+    /// 1. `run` hardens at least the whole range `[covers_from, target_len)` — not just the bytes
+    ///    the calling worker appended;
+    /// 2. [`covers_from`](FsyncJob::covers_from) is the sink's **global** durable frontier now —
+    ///    never a per-worker or per-caller one — so everything below it is already durable for every
+    ///    writer;
+    /// 3. the paired [`complete_harden`](LogSink::complete_harden) advances `durable_len`
+    ///    monotonically, so a waiter may complete with a watermark another worker's job produced;
+    /// 4. a job declaring an EMPTY range does no work at all — no bytes, no directory entry — since
+    ///    the leader discards such a job unrun.
+    ///
+    /// A sink that computes the range to harden MUST derive the value it selects that range with and
+    /// the value it declares as `covers_from` from ONE expression, so they cannot drift apart.
     ///
     /// # Default (non-pipelined) implementation
     ///
@@ -506,9 +633,14 @@ impl LogSink for MemLogSink {
         // write frontier; the paired `complete_harden(target)` promotes `written`'s `[durable_end, target)`
         // prefix into the durable `tail`. This reproduces the exact `durable_len < written_len` crash
         // window of the production `FileLogSink::begin_harden`.
+        // The GLOBAL durable frontier, captured BEFORE the move (the move does not touch `tail`, so
+        // this is the same value either side of it) and used for both halves of the job's declared
+        // range — property 2 of the sink contract on [`FsyncJob`]. `durable_end` is the sink's one
+        // durable frontier: there is no per-caller notion of it here, and there must never be one.
+        let covers_from = self.durable_end();
         self.written.append(&mut self.pending);
-        let target = self.durable_end() + self.written.len() as u64;
-        Ok(FsyncJob::deferred(|| Ok(()), target))
+        let target = covers_from + self.written.len() as u64;
+        Ok(FsyncJob::deferred(|| Ok(()), covers_from, target))
     }
 
     fn complete_harden(&mut self, target_len: u64) {
@@ -1134,8 +1266,35 @@ impl LogSink for FileLogSink {
         // WRITE half only: flush pending into the files, advancing `written_len` WITHOUT
         // `fdatasync`ing (deferred to the returned job) and WITHOUT advancing `durable_len`.
         self.write_pending()?;
+        // THE LEMMA THAT KEEPS PROPERTY 4 TRUE, asserted where it is relied upon (`rmp` #1040).
+        //
+        // `dir_sync_pending == true` implies `durable_len < written_len`. It holds because
+        // `write_pending` is the only place that raises the flag, it returns early on an empty
+        // `pending`, and every path that raises it also advances `written_len` by `n > 0` while
+        // leaving `durable_len` alone; and because the only two places that CLEAR the flag —
+        // `sync` and `complete_harden` — both do so having brought `durable_len` up to
+        // `written_len`. It is asserted rather than left to those three call sites because a
+        // crash-durability hole hangs off it: without it, the fall-through below would build a job
+        // whose byte range is EMPTY (`covers_from == target`) but which still carries a directory
+        // fsync — and the leader, which judges redundancy by byte range alone, would discard it
+        // unrun. `complete_harden` would then clear `dir_sync_pending` having synced no directory
+        // entry, and a crash would lose a whole segment's name, and with it every acked commit in
+        // it. The `!dir_sync_pending` conjunct below is what stands between that job and existence;
+        // this assertion is what stops a future edit from removing the conjunct's reason without
+        // noticing it had one.
+        assert!(
+            !self.dir_sync_pending || self.durable_len < self.written_len,
+            "INVARIANT VIOLATED (rmp #1040): the WAL sink has a pending directory fsync at a fully \
+             durable write frontier ({} == {}), so `begin_harden` would hand out an EMPTY-range job \
+             carrying real work — which the engine's fsync leader discards unrun (THE SINK \
+             CONTRACT, property 4 on `FsyncJob`)",
+            self.durable_len,
+            self.written_len,
+        );
         // Nothing to harden (an empty batch, or an eviction's inline `sync` during a prior overlap
-        // already hardened this range): return a no-op job at the current write frontier.
+        // already hardened this range): return a no-op job at the current write frontier. By the
+        // lemma above, reaching this with `dir_sync_pending` clear means the job really is a no-op —
+        // the empty range it declares is the truth about it, which is property 4.
         if self.durable_len >= self.written_len && !self.dir_sync_pending {
             return Ok(FsyncJob::already_durable(self.written_len));
         }
@@ -1145,8 +1304,16 @@ impl LogSink for FileLogSink {
         // cleared here: an eviction's inline `sync` during the overlap must still be able to harden
         // the directory entry before it writes a home page (it clears the flag); `complete_harden`
         // clears it once this job has hardened it.
+        //
+        // `covers_from` is the sink's GLOBAL durable frontier — property 2 of the sink contract on
+        // [`FsyncJob`] — and it is ONE local, handed BOTH to `clone_files_over` (which decides what
+        // the job will actually harden) and to the job itself (which declares what it hardens). Two
+        // expressions could drift; one cannot. It must never become a per-worker frontier: the
+        // segments below it are not even opened here, so bytes a per-worker frontier skipped over
+        // would be hardened by nobody while `complete_harden` advanced straight past them.
+        let covers_from = self.durable_len;
         let target = self.written_len;
-        let files = self.clone_files_over(self.durable_len, self.written_len)?;
+        let files = self.clone_files_over(covers_from, target)?;
         let dir = if self.dir_sync_pending {
             Some(self.dir.clone())
         } else {
@@ -1154,6 +1321,10 @@ impl LogSink for FileLogSink {
         };
         Ok(FsyncJob::deferred(
             move || {
+                // Property 1: `full_sync_data` hardens each WHOLE FILE, so this covers every byte of
+                // `[covers_from, target)` and any appended to those files since — which is what makes
+                // the job safe to run late, and safe to stand in for an older job the engine's group
+                // leader dropped.
                 for f in &files {
                     crate::fullsync::full_sync_data(f, "wal pipelined fdatasync")?;
                 }
@@ -1162,6 +1333,7 @@ impl LogSink for FileLogSink {
                 }
                 Ok(())
             },
+            covers_from,
             target,
         ))
     }
@@ -1957,5 +2129,214 @@ mod tests {
         fresh.append(&hdr);
         fresh.sync().unwrap();
         crate::WalManager::open(fresh).expect("open validates the retained header");
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // THE SINK CONTRACT (`rmp` #1040) — the properties the engine's fsync group leader coalesces on.
+    // ---------------------------------------------------------------------------------------------
+
+    /// **Property 2 + property 1: every live job starts at the sink's GLOBAL durable frontier, so the
+    /// newest job's range subsumes the older ones' and running only it loses nothing.**
+    ///
+    /// This is the property the engine's `WalGroupSync` leader drops jobs on. Two batches are written
+    /// with NO `fdatasync` in between — exactly the multi-worker overlap, where worker A is between
+    /// `begin_harden` and `complete_harden` while worker B hardens on top of it — and then only the
+    /// SECOND job is run. Batch A's bytes must come back durable anyway.
+    ///
+    /// It is the test that fails the day `begin_harden` starts from a per-caller frontier: job 2 would
+    /// then begin above batch A, `clone_files_over` would not even open the file holding it, and the
+    /// durable image would come back missing bytes that `complete_harden` had already advanced over.
+    #[cfg_attr(
+        miri,
+        ignore = "real filesystem I/O is outside miri's isolation/UB scope"
+    )]
+    #[test]
+    fn every_job_starts_at_the_global_durable_frontier() {
+        let dir = TempWal::new("frontier");
+        let mut s = FileLogSink::open(&dir.path).unwrap();
+
+        // Worker A's batch: written to the file, `fdatasync` deferred. The job is deliberately NOT run.
+        s.append(b"AAAAAAAA");
+        let job_a = s.begin_harden().unwrap();
+
+        // Worker B's batch, on top of A's un-synced bytes.
+        s.append(b"BBBBBBBBBBBB");
+        let job_b = s.begin_harden().unwrap();
+
+        assert_eq!(
+            job_b.covers_from(),
+            job_a.covers_from(),
+            "both jobs must start at the sink's ONE durable frontier ({} vs {}): a per-caller \
+             frontier here is what leaves bytes hardened by nobody",
+            job_b.covers_from(),
+            job_a.covers_from()
+        );
+        assert_eq!(job_a.covers_from(), 0, "nothing is durable yet");
+        assert!(
+            job_b.target_len() > job_a.target_len(),
+            "the later job must end further along the log ({} vs {})",
+            job_b.target_len(),
+            job_a.target_len()
+        );
+
+        // Run ONLY the newer job, exactly as the group leader does after folding the older one away.
+        let target = job_b.target_len();
+        drop(job_a);
+        job_b.run().expect("deferred fdatasync");
+        s.complete_harden(target);
+
+        assert_eq!(
+            s.durable_len(),
+            20,
+            "the surviving job must harden BOTH batches, not only its own"
+        );
+        let mut buf = Vec::new();
+        s.read_durable(0, &mut buf).unwrap();
+        assert_eq!(
+            buf, b"AAAAAAAABBBBBBBBBBBB",
+            "the dropped job's batch must be in the durable image: it is the whole reason one job \
+             may stand in for another"
+        );
+    }
+
+    /// **Property 3: completion is a monotone max, so a stale completion cannot regress the
+    /// frontier.**
+    ///
+    /// With a group leader, a worker completes with the watermark the GROUP reached — which can be
+    /// beyond its own batch — and a worker whose job was folded away may complete afterwards with the
+    /// smaller value it was originally told. That late, smaller completion must be a no-op. If
+    /// `complete_harden` assigned instead of taking a max, the two accountings of one frontier would
+    /// disagree from that point on, and the engine's ack gate would start refusing durable commits.
+    #[cfg_attr(
+        miri,
+        ignore = "real filesystem I/O is outside miri's isolation/UB scope"
+    )]
+    #[test]
+    fn completion_is_monotone_and_a_stale_one_is_a_no_op() {
+        let dir = TempWal::new("monotone");
+        let mut s = FileLogSink::open(&dir.path).unwrap();
+
+        s.append(&[b'a'; 200]);
+        let small = s.begin_harden().unwrap();
+        s.append(&[b'b'; 100]);
+        let large = s.begin_harden().unwrap();
+        assert_eq!(small.target_len(), 200);
+        assert_eq!(large.target_len(), 300);
+
+        large.run().expect("deferred fdatasync");
+        s.complete_harden(300);
+        assert_eq!(s.durable_len(), 300);
+
+        // The folded-away job's worker completes late, with the frontier it was told about.
+        drop(small);
+        s.complete_harden(200);
+        assert_eq!(
+            s.durable_len(),
+            300,
+            "a stale completion must never pull the durable frontier back"
+        );
+    }
+
+    /// The same frontier property over the **in-memory** deferred-harden sink, which is what
+    /// Deterministic Simulation Testing drives — and, unlike the `FileLogSink` tests above, this one
+    /// runs under miri.
+    #[test]
+    fn mem_deferred_jobs_also_start_at_the_global_durable_frontier() {
+        let mut s = MemLogSink::with_deferred_harden();
+        s.append(b"first");
+        let job_a = s.begin_harden().unwrap();
+        s.append(b"second");
+        let job_b = s.begin_harden().unwrap();
+
+        assert_eq!(job_a.covers_from(), job_b.covers_from());
+        assert_eq!(job_a.covers_from(), s.durable_len());
+        assert_eq!(job_a.target_len(), 5);
+        assert_eq!(job_b.target_len(), 11);
+
+        let target = job_b.target_len();
+        drop(job_a);
+        job_b.run().unwrap();
+        s.complete_harden(target);
+        assert_eq!(s.durable_bytes(), b"firstsecond");
+    }
+
+    /// An `already_durable` job declares an EMPTY range: there is nothing below the frontier left for
+    /// it to harden. The group leader relies on that to tell "this job hardens `[x, y)`" from "this
+    /// job hardens nothing, the sink is already at `y`".
+    #[test]
+    fn an_already_durable_job_declares_an_empty_range() {
+        let job = FsyncJob::already_durable(4096);
+        assert_eq!(job.covers_from(), 4096);
+        assert_eq!(job.target_len(), 4096);
+        job.run().unwrap();
+    }
+
+    /// **Property 4: an EMPTY declared range means the job has nothing to do — including no
+    /// directory fsync.**
+    ///
+    /// The leader judges a job redundant from its byte range alone and discards it unrun, so a job
+    /// that declares `covers_from == target_len` while still carrying a pending directory fsync would
+    /// be thrown away with real work inside it; `complete_harden` would then clear the sink's
+    /// "directory entry not hardened" state having synced nothing, and a crash would lose a segment's
+    /// name and every acked commit in it.
+    ///
+    /// Both directions are pinned here: every harden that carries a directory entry (the anchor's
+    /// creation, then a segment roll) declares a NON-empty range, and an idle harden declares an
+    /// empty one. The lemma that makes the first direction hold — a pending directory fsync implies
+    /// an un-synced write frontier — is asserted inside `begin_harden`.
+    #[cfg_attr(
+        miri,
+        ignore = "real filesystem I/O is outside miri's isolation/UB scope"
+    )]
+    #[test]
+    fn a_job_with_an_empty_range_carries_no_work() {
+        let dir = TempWal::new("emptyrange");
+        // A tiny segment target so the second batch rolls a new segment (a second directory entry).
+        let mut s = FileLogSink::open_with_segment_target(&dir.path, 4).unwrap();
+
+        // The anchor's creation sets the pending directory fsync.
+        s.append(b"HEAD");
+        let anchor = s.begin_harden().unwrap();
+        assert!(
+            anchor.covers_from() < anchor.target_len(),
+            "a job carrying a directory fsync must declare a NON-empty byte range, or the leader \
+             discards it unrun ([{}, {}))",
+            anchor.covers_from(),
+            anchor.target_len()
+        );
+        let target = anchor.target_len();
+        anchor.run().unwrap();
+        s.complete_harden(target);
+
+        // Nothing appended, nothing un-synced: this one really IS a no-op, and says so.
+        let idle = s.begin_harden().unwrap();
+        assert_eq!(
+            idle.covers_from(),
+            idle.target_len(),
+            "an idle harden must declare an EMPTY range — that is how the leader knows it is free \
+             to discard it"
+        );
+        idle.run().unwrap();
+
+        // A segment roll creates a second directory entry; it too must come with real bytes.
+        s.append(b"MOREBYTES");
+        let rolled = s.begin_harden().unwrap();
+        assert!(
+            rolled.covers_from() < rolled.target_len(),
+            "the segment roll's directory fsync must ride on a non-empty byte range"
+        );
+        let target = rolled.target_len();
+        rolled.run().unwrap();
+        s.complete_harden(target);
+        assert_eq!(s.durable_len(), s.buffered_len());
+    }
+
+    /// A job whose declared range is inverted is a contradiction — the durable frontier cannot be
+    /// beyond the write frontier it hardens up to — and is refused at construction rather than
+    /// carried to a leader that would reason with it.
+    #[test]
+    #[should_panic(expected = "INVARIANT VIOLATED (rmp #1040)")]
+    fn an_inverted_job_range_is_refused() {
+        let _ = FsyncJob::deferred(|| Ok(()), 300, 200);
     }
 }
