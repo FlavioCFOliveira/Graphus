@@ -108,7 +108,8 @@ pub struct ReadTask<D: BlockDevice, S: LogSink> {
 }
 
 /// What an off-thread reader delivers back to the engine thread when it retires (`rmp` task #336,
-/// Slice 3b-ii). The engine processes this on its single thread, in arrival order, from a dedicated
+/// Slice 3b-ii). The engine processes this on whichever worker reaches the ENGINE's one retirement
+/// channel (`rmp` #1039 — the order across readers is unobservable; see `finish_reader`'s M1'), from a
 /// retirement channel: it merges the SIREAD buffer (M1) and then auto-commits (commit on `outcome` ok,
 /// rollback on error), sending any terminal commit error through `row_tx` before dropping it.
 ///
@@ -317,10 +318,40 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
 /// (no unbounded channel on the request path — `04 §9.3`); a full queue is the dispatch site's
 /// fast-reject signal.
 pub struct ReadPool<D: BlockDevice, S: LogSink> {
-    /// The bounded work queue's sender; cloned into nothing else (only the dispatch site holds it).
-    work_tx: SyncSender<ReadTask<D, S>>,
-    /// The worker join handles, joined at [`Self::shutdown`].
-    workers: Vec<std::thread::JoinHandle<()>>,
+    /// The bounded work queue's sender. Behind a `Mutex<Option<..>>` since `rmp` #1039, for one reason:
+    /// the pool became the ENGINE's and is shared by every worker behind an `Arc`, so shutting it down
+    /// can no longer consume `self`. Closing the queue is therefore `take()`-ing the sender, which also
+    /// makes [`Self::shutdown`] idempotent — the first caller closes and joins, and a second finds
+    /// `None` and returns. A concurrent [`Self::try_submit`] then hands its task back and the caller
+    /// runs it inline, which is the same contract a full queue already has.
+    ///
+    /// The lock is held for a `try_send` and nothing else. Reader workers never touch it: they pull
+    /// from the receiver half, which has its own lock.
+    work_tx: std::sync::Mutex<Option<SyncSender<ReadTask<D, S>>>>,
+    /// The worker join handles, joined at [`Self::shutdown`] by whichever caller closes the queue.
+    workers: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>,
+}
+
+/// How many reader pools have been spawned in this process, ever (`rmp` #1039).
+static POOLS_SPAWNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// How many reader WORKER THREADS have been spawned in this process, ever (`rmp` #1039).
+static READER_THREADS_SPAWNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Reader pools spawned since the process started.
+///
+/// A test counts a DELTA across one `spawn_engine_with_timeout` and requires it to be `1` whatever `W`
+/// is. Counting the `Builder::spawn` calls rather than reading `/proc/self/task` is deliberate: the
+/// procfs route is Linux-only, so the gate would silently assert nothing on the macOS leg, and a gate
+/// that quietly skips is indistinguishable from one that passes.
+#[must_use]
+pub fn pools_spawned() -> u64 {
+    POOLS_SPAWNED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Reader worker threads spawned since the process started. See [`pools_spawned`].
+#[must_use]
+pub fn reader_threads_spawned() -> u64 {
+    READER_THREADS_SPAWNED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static> ReadPool<D, S> {
@@ -340,6 +371,8 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         metrics: Arc<Metrics>,
     ) -> Self {
         let threads = threads.max(1);
+        POOLS_SPAWNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        READER_THREADS_SPAWNED.fetch_add(threads as u64, std::sync::atomic::Ordering::Relaxed);
         let (work_tx, work_rx) =
             std::sync::mpsc::sync_channel::<ReadTask<D, S>>(queue_capacity.max(1));
         // One shared, lockable receiver: `std::sync::mpsc::Receiver` is `!Sync`, so wrap it in a
@@ -372,7 +405,10 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                 .expect("INVARIANT: spawning a bounded reader worker thread");
             workers.push(join);
         }
-        Self { work_tx, workers }
+        Self {
+            work_tx: std::sync::Mutex::new(Some(work_tx)),
+            workers: std::sync::Mutex::new(workers),
+        }
     }
 
     /// Tries to enqueue `task` without blocking, returning it back (`Err`) if the bounded queue is full
@@ -382,20 +418,52 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     // common success path.
     #[allow(clippy::result_large_err)]
     pub fn try_submit(&self, task: ReadTask<D, S>) -> Result<(), ReadTask<D, S>> {
-        match self.work_tx.try_send(task) {
+        let guard = self
+            .work_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The queue is closed (shutdown ran): hand the task back, exactly as a full queue does. The
+        // caller runs it inline, which is correct — just serial.
+        let Some(tx) = guard.as_ref() else {
+            return Err(task);
+        };
+        match tx.try_send(task) {
             Ok(()) => Ok(()),
             Err(std::sync::mpsc::TrySendError::Full(task))
             | Err(std::sync::mpsc::TrySendError::Disconnected(task)) => Err(task),
         }
     }
 
-    /// Drops the work-queue sender (so the workers' `recv` ends) and joins every worker. Called when
-    /// the engine loop exits, so no reader thread outlives the engine. Idempotent-safe to call once.
-    pub fn shutdown(self) {
-        // Dropping `work_tx` closes the queue; each worker's blocking `recv` then returns `Err` and the
-        // worker loop ends. Join them so no detached thread survives the engine.
-        drop(self.work_tx);
-        for join in self.workers {
+    /// Closes the work queue (so the workers' `recv` ends) and joins every worker, so no reader thread
+    /// outlives the engine.
+    ///
+    /// Takes `&self` and is IDEMPOTENT (`rmp` #1039): the pool is the engine's and is shared by every
+    /// worker, so there is no single owner to consume it. Whichever caller arrives first takes the
+    /// sender and joins; a later caller finds the queue already closed and returns without joining
+    /// twice. Both the `Shutdown` command handler and the loop-exit teardown call it, and either may
+    /// be the first depending on how the engine stops.
+    pub fn shutdown(&self) {
+        // Taking `work_tx` closes the queue; each worker's blocking `recv` then returns `Err` and the
+        // worker loop ends.
+        let closed = self
+            .work_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if closed.is_none() {
+            return; // already shut down; the joins below have already run
+        }
+        drop(closed);
+        // Join OUTSIDE the sender lock: a worker finishing its last task may still be running, and
+        // holding the submit lock across the join would block every concurrent `try_submit` for the
+        // duration of a read rather than letting it fall back to the inline path.
+        let workers = std::mem::take(
+            &mut *self
+                .workers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for join in workers {
             let _ = join.join();
         }
     }

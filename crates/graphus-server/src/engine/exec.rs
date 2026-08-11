@@ -38,6 +38,8 @@ use super::command::{AccessMode, QueryPlan, Reply};
 use super::latch::EngineLatch;
 use super::privileges::EffectivePrivileges;
 use super::read_pool::{ReadDispatch, ReadTask};
+use std::sync::atomic::AtomicU64;
+
 use super::stream::{RowReceiver, RowSender, SummarySink};
 use super::{OpenTxTable, RunReply, RunSummary, TxTicket};
 use crate::metrics::Metrics;
@@ -368,12 +370,23 @@ pub(super) fn handle_run<
     privileges: Option<EffectivePrivileges>,
     extensions: &Arc<ExtensionRegistry>,
     dispatch: &ReadDispatch<D, S>,
-    // How many off-thread reads are already in flight on the engine (`rmp` task #575-g.1). Read-only, a
-    // snapshot taken on the engine thread just before this statement: the dispatch site derives this read's
-    // **adaptive morsel width** from it (`floor(analytics_pool_threads / (readers_inflight + 1))`) so a
-    // lone heavy read fans out across the whole analytics pool while `K` concurrent reads share it without
-    // over-subscription. Unused on every non-dispatch path.
-    readers_inflight: u64,
+    // The ENGINE's count of off-thread reads in flight (`rmp` task #575-g.1, `rmp` #1039).
+    //
+    // Two uses, and the second is why this is the counter and no longer a snapshot of it. The dispatch
+    // site derives this read's **adaptive morsel width** from it
+    // (`floor(analytics_pool_threads / (readers_inflight + 1))`), so a lone heavy read fans out across
+    // the whole analytics pool while `K` concurrent reads share it without over-subscription.
+    //
+    // It also COUNTS this read, and the increment has to happen BEFORE `try_submit` hands the statement
+    // to a reader thread. The reader can retire the instant it is submitted, and since `rmp` #1039 the
+    // retirement is drained by whichever worker gets to the engine's one channel — not necessarily this
+    // one. An increment after the submit can therefore land after the matching decrement, which is a
+    // `saturating_sub` at zero (deliberately, so it cannot wrap) and is simply lost: the counter then
+    // stands at one for the life of the process, the idle tick never quiesces, and every subsequent
+    // read sizes its morsel width against a reader that does not exist.
+    //
+    // Unused on every non-dispatch path.
+    readers_inflight: &AtomicU64,
     result_buffer_capacity: usize,
     metrics: &Arc<Metrics>,
     db: &str,
@@ -630,7 +643,7 @@ pub(super) fn handle_run<
                     // A lone read (`readers_inflight == 0`) fans across the whole analytics pool; `K`
                     // concurrent reads get `<= P/K` each (sum `<= P`, no over-subscription; `1` at `K >= P`).
                     morsel_width: graphus_cypher::morsel::reader_pool_morsel_width(
-                        readers_inflight,
+                        readers_inflight.load(std::sync::atomic::Ordering::Relaxed),
                     ),
                     row_tx,
                     row_rx: row_rx
@@ -638,6 +651,9 @@ pub(super) fn handle_run<
                         .expect("egress receiver present before dispatch"),
                     reply: reply.take().expect("reply present before dispatch"),
                 };
+                // Counted BEFORE the submit: see `readers_inflight`'s parameter docs. Released again on
+                // the `Err` path below, where the statement runs inline instead and is never a reader.
+                readers_inflight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 match dispatch.try_submit(task) {
                     Ok(()) => {
                         // Dispatched: the reader owns the statement now. The engine does **not** commit
@@ -648,6 +664,8 @@ pub(super) fn handle_run<
                         return RunOutcome::OffThreadReader;
                     }
                     Err(returned) => {
+                        // Not dispatched after all: give the count back before anything can observe it.
+                        readers_inflight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                         // The reader queue is full: rather than block the engine, fall through to the
                         // inline `stream_rows` path below (correct, just serial). Re-bind the locals the
                         // task consumed. (We could fast-reject with `ServerBusy`, but running inline

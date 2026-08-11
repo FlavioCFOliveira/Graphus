@@ -35,7 +35,10 @@ mod latch;
 mod local;
 mod managed;
 pub mod privileges;
-mod read_pool;
+/// The off-thread reader pool and its retirement channel (`rmp` task #336). Public since `rmp` #1039
+/// only so that `pools_spawned` / `reader_threads_spawned` — the counters the "one pool per engine"
+/// gate reads — are reachable from an integration test.
+pub mod read_pool;
 pub mod rest_values;
 mod seam_bolt;
 mod seam_rest;
@@ -1627,19 +1630,26 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // cross-worker passes over the shared tables use to tell their own transactions from the rest.
     engine_workers: usize,
     result_buffer_capacity: usize,
-    reader_threads: usize,
+    // The ENGINE's reader pool and the ENGINE's retirement channel (`rmp` #1039), both built once by
+    // [`spawn_engine_with_timeout`] and shared by every worker.
+    //
+    // They used to be built HERE, so a `W`-worker engine ran `W` pools: `W * min(cores, 16)` reader
+    // threads on a machine with `cores` cores, each sized as if it were the only one, plus `W`
+    // retirement channels. The measurement `rmp` #1034 exists to take would have been of contention
+    // rather than of scale.
+    //
+    // The receiver is behind a `Mutex` because `std::sync::mpsc::Receiver` is `!Sync` — the same shape
+    // this worker's own command queue already has. Whichever worker reaches it drains it; see
+    // [`process_retirements`] for why any worker may finalise any reader, and [`finish_reader`] for the
+    // reformulated M1 ordering proof that replaces "it is all one thread".
+    dispatch: Arc<read_pool::ReadDispatch<D, S>>,
+    retire_rx: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<read_pool::ReadRetirement>>>,
     metrics: Arc<Metrics>,
     degraded: EngineDegraded,
     maintenance_degraded: MaintenanceDegraded,
     clock: Arc<dyn graphus_core::capability::Clock + Send + Sync>,
     statement_timeout: Option<std::time::Duration>,
     max_transaction_age: Option<std::time::Duration>,
-    // The off-thread reader egress-stall ceiling (`rmp` #591, C-F1): bounds a reader-pool read's
-    // no-progress wait on a full result-egress channel INDEPENDENTLY of `statement_timeout`, so a stalled
-    // consumer releases the reader's GC-watermark pin + pool slot even when the per-statement timeout is
-    // disabled. Threaded into the reader pool at spawn. `None` disables it. The deterministic
-    // [`LocalEngine`] never runs this loop (no pool, unbounded egress), so DST is unaffected.
-    egress_stall_timeout: Option<std::time::Duration>,
     // The bound on **concurrently parked (suspended) inline statements** (`rmp` #485, finding B1).
     // Several slow-consumer inline statements can be parked at once (writes + explicit-txn reads run
     // inline and any can fill its bounded egress on its first visit), so a single slot is unsound: a
@@ -1719,20 +1729,6 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // SAME registry that backed compilation (`rmp` task #336 — `ExtensionRegistry` is `Send + Sync`,
     // so this is sound). The engine borrows it immutably for each `Run`; commands are serial.
     let extensions = Arc::new(exec::install_extensions());
-    // The off-thread reader pool (`rmp` task #336, Slice 3b-ii): read-only auto-commit statements run
-    // on it concurrently with this engine thread. Workers post retirements back on a **dedicated**
-    // retirement channel (NOT the command channel — keeping it separate avoids the worker clones
-    // pinning the command channel open and lets the loop tear the pool down on a clean channel-close
-    // shutdown). The work queue is bounded (no unbounded channel — `04 §9.3`); a full queue makes the
-    // dispatch site fall back to the inline path.
-    let (retire_tx, retire_rx) = std::sync::mpsc::channel::<read_pool::ReadRetirement>();
-    let dispatch = read_pool::ReadDispatch::Threaded(read_pool::ReadPool::spawn(
-        reader_threads,
-        reader_threads.saturating_mul(8).max(16),
-        egress_stall_timeout,
-        retire_tx,
-        Arc::clone(&metrics),
-    ));
     // How many readers are dispatched-but-not-yet-retired. While `> 0` the loop polls the retirement
     // channel each tick so a retirement (which finalises the reader's auto-commit + closes its egress)
     // is processed promptly even if no client command arrives. Incremented at dispatch, decremented as
@@ -1796,8 +1792,9 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     let wal_sync = WalSyncThread::spawn(&db_name);
 
     'engine: loop {
-        // Drain any reader retirements that have arrived (M1 merge → auto-commit, on this thread, in
-        // arrival order). Done first each iteration so a retirement is never starved behind a blocking
+        // Drain any reader retirements that have arrived (M1' merge → auto-commit). The channel is the
+        // ENGINE's since `rmp` #1039, so this drains whatever is there, not only what this worker
+        // dispatched. Done first each iteration so a retirement is never starved behind a blocking
         // command `recv`. Returns false only on `Shutdown`, which cannot arrive here (retirements are
         // not commands), so the result is ignored.
         process_retirements(
@@ -2147,7 +2144,11 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // moment the counter became real, the same order would let `try_unwrap` run against a share this
     // worker still held. A slower stop is the price, and it is bounded by a join of threads that
     // have already been told to finish.
-    if let read_pool::ReadDispatch::Threaded(pool) = dispatch {
+    // The pool is the ENGINE's since `rmp` #1039, so this is a shared, idempotent close rather than a
+    // consuming one: whichever worker leaves last closes the queue and joins the readers, and the ones
+    // before it find it already closed. A worker still dispatching while another closes gets its task
+    // handed back and runs it inline — the same contract a full queue has always had.
+    if let read_pool::ReadDispatch::Threaded(pool) = &*dispatch {
         pool.shutdown();
     }
     drop(coordinator.take());
@@ -2155,12 +2156,34 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     stop.live_workers.fetch_sub(1, Ordering::AcqRel);
 }
 
-/// Drains and processes every reader retirement currently available on `retire_rx` (`rmp` task #336,
-/// Slice 3b-ii), on the engine thread, in arrival order. Non-blocking: stops when the channel is
-/// momentarily empty. Each retirement is finalised by [`finish_reader`].
+/// Drains and processes every reader retirement currently available on the ENGINE's retirement channel
+/// (`rmp` task #336 Slice 3b-ii; engine-wide since `rmp` #1039). Non-blocking: stops when the channel
+/// is momentarily empty. Each retirement is finalised by [`finish_reader`].
+///
+/// # Any worker may drain it, and any worker may finalise any reader
+///
+/// The channel is one per engine, so a reader dispatched by worker 3 can be finalised by worker 1.
+/// That is deliberate — it makes retirement latency the minimum over the workers' ticks rather than the
+/// wait for one particular worker — and it is admissible for a reason narrower than it looks.
+///
+/// The `rmp` #1041 rule is not "a worker must not touch a foreign transaction"; it is "a worker must
+/// not reap or resume a transaction whose owner may be INSIDE it". An off-thread reader satisfies the
+/// same condition [`drain_inflight`] relies on: its dispatching worker returned
+/// `RunOutcome::OffThreadReader` and holds no further reference to the statement, and the reader thread
+/// has finished — posting the retirement is the last thing it does. The age sweep cannot contend
+/// either: it declines every auto-commit entry unconditionally, and an off-thread reader is auto-commit
+/// by construction. The one remaining race, a client `Rollback` for the same ticket, is resolved where
+/// it always was — by the `open.remove` claim in [`finish_reader`], which is atomic across workers
+/// because the table is engine-wide.
+///
+/// The lock is taken for the DEQUEUE ONLY. [`finish_reader`] takes the rank-5 open-table latch and runs
+/// a commit; holding a plain mutex across that would convoy every worker behind one reader's
+/// finalisation, which is the `rmp` #1038 shape. Poison is recovered rather than propagated: a poisoned
+/// retire lock would pin the GC watermark forever and leak every in-flight reader's egress channel, and
+/// there is no state a panic could have left inconsistent — the `Receiver` is intact.
 #[allow(clippy::too_many_arguments)] // The retirement path threads its execution context here.
 fn process_retirements<D: BlockDevice, S: LogSink>(
-    retire_rx: &std::sync::mpsc::Receiver<read_pool::ReadRetirement>,
+    retire_rx: &std::sync::Mutex<std::sync::mpsc::Receiver<read_pool::ReadRetirement>>,
     coordinator: &Option<Arc<TxnCoordinator<D, S>>>,
     open: &EngineLatch<OpenTxTable>,
     reclaim: &EngineReclaim,
@@ -2170,7 +2193,15 @@ fn process_retirements<D: BlockDevice, S: LogSink>(
     active_txns: &ActiveTxnGauge,
 ) {
     let mut any_retired = false;
-    while let Ok(retirement) = retire_rx.try_recv() {
+    loop {
+        let Ok(retirement) = ({
+            let rx = retire_rx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            rx.try_recv()
+        }) else {
+            break;
+        };
         if let Some(coord) = coordinator.as_deref() {
             finish_reader(coord, open, retirement, metrics, db, degraded);
         }
@@ -2231,13 +2262,41 @@ fn process_retirements<D: BlockDevice, S: LogSink>(
 ///
 /// 1. **Merge (M1):** fold the reader's SIREAD buffer into the shared SSI tracker *before* the
 ///    auto-commit's `detect_pivot_abort`, so the reader's rw-edges are present when its (or a
-///    concurrent writer's) pivot is checked. Because this runs on ONE thread — the worker that
-///    dispatched the reader, in its own retirement channel's arrival order — the no-lost-edge proof
-///    reduces to in-order event processing. That premise survived `rmp` #1033: the retirement channel
-///    is per worker and a reader retires to the worker that dispatched it, so the ordering is still a
-///    single thread's. What W > 1 does put in question is step (1)'s ordering against a commit on
-///    ANOTHER worker, which is the multi-writer commit path (`rmp` #1037 and its siblings) and is why
-///    `admission.engine_workers` above one is still refused.
+///    concurrent writer's) pivot is checked.
+///
+///    The old justification was "this runs on ONE thread — the worker that dispatched the reader, in
+///    its own retirement channel's arrival order — so no-lost-edge reduces to in-order event
+///    processing". `rmp` #1039 makes the retirement channel the ENGINE's, so a reader dispatched by
+///    worker 3 may be finalised by worker 1 and two retirements may be finalised concurrently. That
+///    premise is gone and is NOT replaced by a weaker version of itself. What replaces it:
+///
+///    **M1′.** For every off-thread reader `R`, `merge_read_buffer(R)` runs exactly once, under
+///    exclusive access to the tracker, and strictly before `detect_pivot_abort(R)` — on whichever
+///    worker drains `R`'s retirement. The DRAIN ORDER IS UNOBSERVABLE, because merging `R`'s buffer
+///    can only touch edges incident on `R`: it calls `record_read`/`record_predicate_read` and nothing
+///    else, and those add `R` to a key's reader set and `add_edge(R, w)` for concurrent writers of
+///    that key. Two readers' merges therefore touch disjoint edge sets, and interleaving them changes
+///    nothing. Exclusivity comes from the tracker's own lock (`SharedCell`), not from being one
+///    thread — which is what makes "whichever worker" sound.
+///
+///    Nor does the merge need to be ordered against a concurrent WRITE: rw-edge formation is symmetric
+///    in the two reverse indexes (`record_read` consults `writers_of`, `record_write` consults
+///    `readers_of`), so whichever lands second closes the edge; and a merge that lands after the
+///    writer already committed is caught by `add_edge`'s eager committed-pivot break, which dooms the
+///    still-active endpoint.
+///
+///    WHAT WOULD BREAK M1′, stated because each is one edit away: moving the merge after the commit
+///    below, or after the `still_open` early return (the merge is deliberately done BEFORE the ticket
+///    claim, so a reader whose rollback raced still contributes its markers); making `record_read`
+///    stop consulting `writers_of` or `record_write` stop consulting `readers_of`; removing the
+///    committed-pivot break; or ever letting an off-thread reader WRITE, which would give it an
+///    inbound edge and destroy the disjointness the whole argument rests on.
+///
+///    M1′ does NOT close the window between a writer's `detect_pivot_abort` and its `record_commit`,
+///    which are separate tracker acquisitions with store work between them. A merge landing inside it
+///    sees the writer neither validated-with-the-edge nor committed. That window is not opened by the
+///    shared channel — an inline read on any worker merges through the same function — it opens the
+///    moment `W > 1`, and it is why `admission.engine_workers` above one is still refused.
 /// 2. **Auto-commit (the terminal-error contract):** on a clean `outcome`, `commit` the reader — which
 ///    may itself SSI-abort it (a writeless reader can be another transaction's pivot-victim). A commit
 ///    failure is sent as a **terminal error** through the still-open egress channel `row_tx`, exactly
@@ -2264,8 +2323,8 @@ fn finish_reader<D: BlockDevice, S: LogSink>(
     } = retirement;
 
     // (1) M1: merge the reader's SIREAD markers into the shared tracker BEFORE any commit's pivot
-    // detection. Ordered w.r.t. every commit THIS worker performs, because it is the same thread; see
-    // the ordering note in the doc comment for what more than one worker would add to that claim.
+    // detection. This worker need not be the one that dispatched the reader (`rmp` #1039); see M1′ in
+    // the doc comment for why the drain order is unobservable, and what would break that.
     coordinator.merge_read_buffer(buffer);
 
     // Remove the open-tx ticket (the engine owns its lifecycle now). A reader that the client
@@ -3476,7 +3535,7 @@ struct ProcessCtx<'a, D: BlockDevice + Send + Sync + 'static, S: LogSink + Send 
     /// The off-thread reader retirement channel (`rmp` #336). Threaded in so [`pipelined_group_commit`]
     /// can release readers' GC-watermark pins BETWEEN hardened batches under a sustained write storm,
     /// instead of leaving them pinned until the engine loop's next top-of-tick sweep (`rmp` #583, F1b).
-    retire_rx: &'a std::sync::mpsc::Receiver<read_pool::ReadRetirement>,
+    retire_rx: &'a std::sync::Mutex<std::sync::mpsc::Receiver<read_pool::ReadRetirement>>,
     /// The server-wide live-transaction registry (`rmp` #637/#903): where a validating
     /// `CREATE CONSTRAINT` registers itself, so it is visible to `SHOW TRANSACTIONS` and stoppable by
     /// `TERMINATE TRANSACTIONS` for as long as its validation walk runs.
@@ -4096,10 +4155,11 @@ fn run_statement_isolated<
             privileges,
             extensions,
             dispatch,
-            // `rmp` task #575-g.1: the count of reads already in flight, so the dispatch site can size
-            // this read's adaptive morsel width (a snapshot BEFORE this read is counted — it becomes the
-            // `+ 1` in `reader_pool_morsel_width`). Read on the engine thread; never mutated here.
-            reclaim.readers_inflight.load(Ordering::Relaxed),
+            // The engine's in-flight reader count (`rmp` task #575-g.1, `rmp` #1039). Handed over as the
+            // COUNTER, not a snapshot of it: the dispatch site both sizes this read's adaptive morsel
+            // width from it and counts this read into it, and the counting has to happen before the
+            // submit — see its parameter docs in `exec::handle_run`.
+            &reclaim.readers_inflight,
             result_buffer_capacity,
             metrics,
             db,
@@ -4114,11 +4174,12 @@ fn run_statement_isolated<
 
     match result {
         Ok(outcome) => match outcome {
-            // A read dispatched off-thread retires later (it is not yet finalised); track it so the
-            // engine loop polls the retirement channel until it returns.
-            exec::RunOutcome::OffThreadReader => {
-                reclaim.readers_inflight.fetch_add(1, Ordering::Relaxed);
-            }
+            // A read dispatched off-thread retires later (it is not yet finalised). It was counted into
+            // `readers_inflight` at the dispatch site rather than here (`rmp` #1039): the reader can
+            // retire before this frame regains control, and since the retirement channel became the
+            // engine's, the matching decrement can run on another worker — so an increment here could
+            // land after it and be lost at zero.
+            exec::RunOutcome::OffThreadReader => {}
             // The egress channel filled with a slow consumer draining (`rmp` task #372): hand the
             // suspended statement back through this dispatch's `inflight` slot. `inflight` is a
             // **per-dispatch** `Option` (a fresh `None` for each `Run`; the engine loop drains it into
@@ -5122,7 +5183,7 @@ fn pipelined_group_commit<
     clock: &Arc<dyn graphus_core::capability::Clock + Send + Sync>,
     statement_timeout: Option<std::time::Duration>,
     loading_session: &mut Option<bulk_load::LoadingSession>,
-    retire_rx: &std::sync::mpsc::Receiver<read_pool::ReadRetirement>,
+    retire_rx: &std::sync::Mutex<std::sync::mpsc::Receiver<read_pool::ReadRetirement>>,
     transactions: &Arc<crate::txn_registry::TransactionRegistry>,
 ) {
     // The current PREPAREd batch (batch K). First coalesce further queued commits into it, exactly as
@@ -5213,9 +5274,10 @@ fn pipelined_group_commit<
         // (`rmp` #543) that finished mid-pipeline would keep pinning `oldest_active_snapshot` for the whole
         // storm — letting dead versions accumulate in proportion to its duration. Draining retirements here
         // finalises each finished reader (M1 merge + auto-commit) so its snapshot stops pinning the GC
-        // watermark within one batch. Safe: this is the SAME engine worker thread, and the retirements are
-        // processed in channel arrival order, so [`finish_reader`]'s in-order no-lost-edge SSI guarantee is
-        // unchanged — this is exactly the top-of-loop sweep, run at a finer granularity.
+        // watermark within one batch. Safe for the same reason the top-of-loop sweep is — this is exactly
+        // that sweep at a finer granularity — and since `rmp` #1039 that reason is M1' rather than "the same
+        // thread, in arrival order": a reader's merge only touches edges incident on that reader, so which
+        // worker drains it, and in what order, is unobservable. See [`finish_reader`].
         process_retirements(
             retire_rx,
             coordinator,
@@ -5698,6 +5760,20 @@ where
     )
 }
 
+/// How many engine retirement channels have been created in this process, ever (`rmp` #1039).
+///
+/// There must be exactly ONE per engine whatever `W` is; `tests/engine_shared_reader_pool_1039.rs`
+/// asserts the delta across a spawn. See [`read_pool::pools_spawned`] for why this is a spawn counter
+/// rather than a scan of the process's threads.
+static RETIREMENT_CHANNELS_CREATED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Engine retirement channels created since the process started.
+#[must_use]
+pub fn retirement_channels_created() -> u64 {
+    RETIREMENT_CHANNELS_CREATED.load(Ordering::Relaxed)
+}
+
 /// [`spawn_engine`] with an explicit per-statement execution **timeout** (`rmp` #476) and
 /// maximum-transaction-age cap (`rmp` #477).
 ///
@@ -5828,6 +5904,32 @@ where
         Arc::clone(&db_name),
     ));
     let index_builds = Arc::new(IndexBuildGauge::new(Arc::clone(&metrics)));
+    // The ENGINE's off-thread reader pool and its ONE retirement channel (`rmp` task #336 Slice 3b-ii;
+    // engine-wide since `rmp` #1039). Built here, beside the other structures that are the engine's
+    // rather than a worker's, and for the same reason: built inside the worker loop it was built `W`
+    // times, so an engine with `W` workers ran `W * reader_threads` reader threads — each pool sized as
+    // if it were the only one — and `W` retirement channels. `reader_threads` is already auto-sized to
+    // `min(cores, 16)`, so at `W = 8` on a 16-core host that is 128 reader threads for one database, and
+    // the multi-writer measurement of `rmp` #1034 would have been of contention rather than of scale.
+    //
+    // Retirements come back on a channel of their OWN, not the command channel: keeping them separate
+    // stops the workers' sender clones pinning the command channel open, and lets the loop tear the pool
+    // down on a clean channel-close shutdown. The queue is bounded (`04 §9.3`); a full queue makes the
+    // dispatch site fall back to running the read inline.
+    RETIREMENT_CHANNELS_CREATED.fetch_add(1, Ordering::Relaxed);
+    let (retire_tx, retire_rx) = std::sync::mpsc::channel::<read_pool::ReadRetirement>();
+    let dispatch = Arc::new(read_pool::ReadDispatch::Threaded(
+        read_pool::ReadPool::spawn(
+            reader_threads,
+            reader_threads.saturating_mul(8).max(16),
+            egress_stall_timeout,
+            retire_tx,
+            Arc::clone(&metrics),
+        ),
+    ));
+    // `Receiver` is `!Sync`, so the workers share it under a lock — the same shape their own command
+    // queues already have. Whichever worker reaches it drains it; see `process_retirements`.
+    let retire_rx = Arc::new(std::sync::Mutex::new(retire_rx));
 
     let mut joins = Vec::with_capacity(engine_workers);
     for (worker_id, rx) in receivers.into_iter().enumerate() {
@@ -5838,6 +5940,8 @@ where
         let reclaim = Arc::clone(&reclaim);
         let active_txns = Arc::clone(&active_txns);
         let index_builds = Arc::clone(&index_builds);
+        let dispatch = Arc::clone(&dispatch);
+        let retire_rx = Arc::clone(&retire_rx);
         // Its OWN queue: no latch, because no other worker reads it (`rmp` #1035).
         let rx = Arc::new(std::sync::Mutex::new(rx));
         let loop_metrics = Arc::clone(&loop_metrics);
@@ -5868,14 +5972,14 @@ where
                     worker_id,
                     engine_workers,
                     result_buffer_capacity,
-                    reader_threads,
+                    dispatch,
+                    retire_rx,
                     loop_metrics,
                     loop_degraded,
                     loop_maintenance_degraded,
                     clock,
                     statement_timeout,
                     max_transaction_age,
-                    egress_stall_timeout,
                     // Bound on concurrently parked (suspended) inline statements (`rmp` #485 B1).
                     // Since `rmp` #1041 the queue is engine-wide, so this bounds the ENGINE rather
                     // than each worker — while the command queues it is derived from are

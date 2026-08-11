@@ -531,10 +531,17 @@ impl SsiTracker {
     }
 
     /// Drains a reader's [`SsiReadBuffer`] into the shared conflict graph, recomputing its rw-OUT
-    /// edges deterministically (`rmp` #341). This is the **single-writer merge point**: it must be
-    /// called on the one thread that owns the [`SsiTracker`] (the writer/coordinator thread), at the
-    /// reader's statement-end / commit, **before** any partner transaction's
+    /// edges deterministically (`rmp` #341). This is the merge point, and what it requires is
+    /// EXCLUSIVE access to the [`SsiTracker`] — not a particular thread: the caller holds the tracker
+    /// (a lock acquisition, since it lives behind a shared cell), and calls this at the reader's
+    /// statement-end / commit **before** any partner transaction's
     /// [`detect_pivot_abort`](Self::detect_pivot_abort) runs (`rmp` #341 rule M1).
+    ///
+    /// The "one thread that owns it" wording was a description of the engine of the day, and `rmp`
+    /// #1039 made it false: a reader's retirement is drained by whichever engine worker reaches the
+    /// engine's one retirement channel. It is sound because merging a reader's buffer only ever touches
+    /// edges incident on THAT reader, so two readers' merges commute and the drain order is
+    /// unobservable — the proof is written out at `graphus_server::engine::finish_reader` as M1'.
     ///
     /// ## Why this is byte-identical to recording each marker inline
     ///
@@ -1468,6 +1475,91 @@ mod tests {
             buffered.detect_pivot_abort(TxnId(2))
         );
         assert_eq!(buffered.detect_pivot_abort(TxnId(1)), Some(TxnId(1)));
+    }
+
+    /// **`rmp` #1039 GATE — the order in which DISTINCT readers are merged is unobservable.**
+    ///
+    /// The sibling test below covers order WITHIN one buffer. This covers order ACROSS buffers, which
+    /// is the property the engine started depending on when the retirement channel became the engine's:
+    /// a reader dispatched by one worker may be finalised by another, and two retirements may be
+    /// finalised concurrently, so there is no longer a single arrival order to appeal to.
+    ///
+    /// M1' says the drain order cannot matter, because merging a reader's buffer only ever touches
+    /// edges incident on THAT reader. This executes the same multiset of operations — two readers'
+    /// merges and a concurrent write — in every order that the engine can now produce, and requires the
+    /// resulting graph and every pivot verdict to be identical.
+    ///
+    /// **Non-vacuity, measured.** With `record_read`'s lookup of `writers_of` removed (the reverse
+    /// index that closes the edge when the READ lands second), the orders diverge and this fails: the
+    /// interleavings where a merge follows the write lose the edge, and the fingerprints stop matching.
+    /// That mutation targets the symmetry M1' rests on and cannot be satisfied by anything else.
+    #[test]
+    fn merging_distinct_readers_is_order_independent() {
+        // Two readers of key 10, and a writer of key 10 concurrent with both. Every ordering below is
+        // one the engine can now produce: the merges land on whichever worker drains them, and the
+        // write happens on whichever worker owns the writing transaction.
+        let run = |steps: &[&str]| {
+            let mut s = SsiTracker::new();
+            s.register(TxnId(1), ts(1)); // reader A
+            s.register(TxnId(2), ts(1)); // reader B
+            s.register(TxnId(3), ts(1)); // writer
+            for step in steps {
+                match *step {
+                    "mergeA" => {
+                        let mut b = SsiReadBuffer::new(TxnId(1));
+                        b.record_read(10);
+                        s.merge_read_buffer(b);
+                    }
+                    "mergeB" => {
+                        let mut b = SsiReadBuffer::new(TxnId(2));
+                        b.record_read(10);
+                        s.merge_read_buffer(b);
+                    }
+                    "write" => s.record_write(TxnId(3), 10),
+                    other => panic!("unknown step {other}"),
+                }
+            }
+            s
+        };
+
+        let orders: [&[&str]; 6] = [
+            &["mergeA", "mergeB", "write"],
+            &["mergeB", "mergeA", "write"],
+            &["mergeA", "write", "mergeB"],
+            &["mergeB", "write", "mergeA"],
+            &["write", "mergeA", "mergeB"],
+            &["write", "mergeB", "mergeA"],
+        ];
+        let baseline = run(orders[0]);
+        let fingerprint = graph_fingerprint(&baseline);
+        for order in &orders[1..] {
+            let other = run(order);
+            assert_eq!(
+                graph_fingerprint(&other),
+                fingerprint,
+                "the conflict graph depends on the order {order:?} in which retirements were drained: \
+                 M1' says it cannot, because a reader's merge only touches edges incident on that \
+                 reader (rmp #1039)"
+            );
+            for txn in [TxnId(1), TxnId(2), TxnId(3)] {
+                assert_eq!(
+                    run(order).detect_pivot_abort(txn),
+                    run(orders[0]).detect_pivot_abort(txn),
+                    "transaction {txn:?} gets a different verdict under drain order {order:?}"
+                );
+            }
+        }
+        // NON-VACUITY of the fixture itself: the edge must actually exist, or every order agrees on
+        // nothing and the comparison above is empty.
+        assert!(
+            baseline.txns.get(&TxnId(1)).unwrap().out_conflict,
+            "reader A must have taken an rw-out edge to the concurrent writer, or this gate compares \
+             six copies of an empty graph"
+        );
+        assert!(
+            baseline.txns.get(&TxnId(2)).unwrap().out_conflict,
+            "reader B must have taken an rw-out edge to the concurrent writer"
+        );
     }
 
     #[test]

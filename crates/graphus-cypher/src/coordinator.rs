@@ -11082,9 +11082,11 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// **before** it runs [`commit`](Self::commit) for that reader (or for any concurrent writer whose
     /// pivot detection could depend on the reader's edges) — i.e. the merge is the first step of closing
     /// the reader. Because the merge and every [`commit`](Self::commit)'s `detect_pivot_abort` both run
-    /// on the engine thread from the single serial event stream, M1 reduces to in-order event
-    /// processing (see the Slice 3b no-lost-edge proof). Calling it for a still-open `txn` simply folds
-    /// the markers in; it does not commit or remove the transaction.
+    /// under the tracker's own lock — exclusivity, not one serial event stream — the no-lost-edge proof
+    /// is M1' rather than in-order event processing: a reader's merge only touches edges incident on
+    /// that reader, so the order in which distinct readers are merged is unobservable (`rmp` #1039; the
+    /// proof is written out at `graphus_server::engine::finish_reader`). Calling it for a still-open
+    /// `txn` simply folds the markers in; it does not commit or remove the transaction.
     pub fn merge_read_buffer(&self, buffer: SsiReadBuffer) {
         self.ssi.borrow_mut().merge_read_buffer(buffer);
     }
