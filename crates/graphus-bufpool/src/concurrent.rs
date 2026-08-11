@@ -262,6 +262,35 @@ const PERSISTENT_ALL_PINNED_SWEEPS: usize = 100_000;
 /// a latched region.
 const WAL_HOIST_ATTEMPTS: usize = 1024;
 
+/// What every round of a hoist loop asked the log to reach (`rmp` #1031).
+///
+/// Two facts, and together they separate the two ways a hoist loop can run out of rounds — see
+/// [`ConcurrentBufferPool::hoist_exhausted`], which is where they are read.
+#[derive(Default)]
+struct HoistWitness {
+    lsn: Option<Lsn>,
+    changed: bool,
+}
+
+impl HoistWitness {
+    /// Records the LSN this round asked for.
+    fn observe(&mut self, lsn: Lsn) {
+        match self.lsn {
+            Some(previous) if previous != lsn => self.changed = true,
+            _ => {}
+        }
+        self.lsn = Some(lsn);
+    }
+
+    /// The LSN every round asked for, when they all asked for the same one.
+    ///
+    /// `None` when the loop never ran, or when the LSN moved — a moving LSN is a writer re-dirtying
+    /// the page, which is a different fault with a different remedy.
+    fn stable_lsn(&self) -> Option<Lsn> {
+        if self.changed { None } else { self.lsn }
+    }
+}
+
 /// The reservation state of a page, as recorded in a frame-table shard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Slot {
@@ -1290,6 +1319,9 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
     /// [`WAL_HOIST_ATTEMPTS`] hoist-and-retry rounds (only reachable if a concurrent writer re-dirties
     /// the frame with a fresh LSN on every single round).
     pub fn flush(&self, f: PinnedFrame) -> Result<()> {
+        // Which LSN each round asked the log to reach. See `hoist_exhausted` for what its stability
+        // across the whole budget distinguishes (`rmp` #1031).
+        let mut asked = HoistWitness::default();
         for _ in 0..WAL_HOIST_ATTEMPTS {
             let needs_harden = {
                 // Offer the token BEFORE the latched region opens (`rmp` #973). It cannot be offered
@@ -1310,6 +1342,7 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
                 drop(latch);
                 lsn
             };
+            asked.observe(needs_harden);
             // No latch held: this is where the `fdatasync` is allowed to happen. Refresh first —
             // the mirror may simply have been stale-low because the store's commit path advanced
             // the log without going through this pool.
@@ -1317,11 +1350,48 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
                 self.harden_wal(needs_harden)?;
             }
         }
-        Err(GraphusError::Storage(format!(
-            "flush of frame {} did not converge within {WAL_HOIST_ATTEMPTS} WAL hoist rounds: the \
-             frame was re-dirtied with a not-yet-durable page_lsn on every round",
-            f.0
-        )))
+        Err(self.hoist_exhausted(&format!("flush of frame {}", f.0), &asked))
+    }
+
+    /// The error a hoist loop reports when it runs out of rounds — and, crucially, WHICH of the two
+    /// possible faults it names (`rmp` #1031).
+    ///
+    /// A loop that never converges has exactly two causes, and they call for opposite responses:
+    ///
+    /// * **A concurrent writer** keeps re-dirtying the page with a fresh, not-yet-durable `page_lsn`.
+    ///   The LSN asked for therefore CHANGES between rounds. Nothing is wrong with the data; the
+    ///   flusher simply lost a race it can win later.
+    /// * **The `page_lsn` names no record at all** — it lies past the end of the log. The LSN asked
+    ///   for is then the SAME on every round, and no number of hardens can ever cover it. That is a
+    ///   false claim about what the page reflects, and it is the claim `assert_wal_covers` is decided
+    ///   on before letting a page go home.
+    ///
+    /// The second used to be reported as the first. Measured (`rmp` #1031): a store recovered by a
+    /// harness that discarded the undo phase's CLRs carried `page_lsn 14496` against a durable
+    /// frontier of `14495`, and the message blamed a concurrent writer that did not exist — on a
+    /// single-threaded deterministic simulation, where one could not have existed.
+    ///
+    /// The distinction is made from what the loop observed, not from a fresh probe of the rule: a
+    /// stale-low frontier is legitimate and temporal (the store commits without going through this
+    /// pool), so no single reading of `durable_len` can tell the two apart, while the stability of the
+    /// LSN across the whole budget can.
+    fn hoist_exhausted(&self, what: &str, asked: &HoistWitness) -> GraphusError {
+        let frontier = self.wal_durable.load(Ordering::Acquire);
+        match asked.stable_lsn() {
+            Some(lsn) => GraphusError::Storage(format!(
+                "{what}: page_lsn {} lies beyond the end of the log. It was asked for on every one of \
+                 {WAL_HOIST_ATTEMPTS} hoist rounds and never changed, and the durable frontier stands \
+                 at {frontier}, so no record with that LSN exists and none ever will. A page carrying \
+                 it makes a false claim about what it reflects — the claim WAL-before-data is decided \
+                 on — so it is kept out of the home file rather than written",
+                lsn.0
+            )),
+            None => GraphusError::Storage(format!(
+                "{what}: did not converge within {WAL_HOIST_ATTEMPTS} WAL hoist rounds: a concurrent \
+                 writer re-dirtied it with a fresh, not-yet-durable page_lsn on every round (durable \
+                 frontier {frontier})"
+            )),
+        }
     }
 
     /// Writes a frame back that intentionally carries **no WAL-logged change** (its `page_lsn` is
@@ -1420,6 +1490,8 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
     /// Propagates the first WAL-rule, device-write or sync failure, or reports failure to converge
     /// within [`WAL_HOIST_ATTEMPTS`] hoist rounds.
     fn flush_batch(&self, want: Option<&rustc_hash::FxHashSet<u64>>) -> Result<()> {
+        // Which LSN each round asked the log to reach (`rmp` #1031); see `hoist_exhausted`.
+        let mut asked = HoistWitness::default();
         for _ in 0..WAL_HOIST_ATTEMPTS {
             // Phase 1: collect the batch's dirty frames with their write latches held. The tripwire
             // is armed for exactly as long as those latches are (`FlushBatch` drops the guards
@@ -1460,6 +1532,7 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
             // monotone in the LSN, so one check over the maximum decides the whole batch.
             if !self.wal_covers(max_lsn) {
                 drop(batch);
+                asked.observe(max_lsn);
                 // Latches released: refresh the mirror (it may merely be stale-low after a commit
                 // this pool did not drive) and harden only if the log really is behind.
                 if !self.wal_covers_after_refresh(max_lsn) {
@@ -1549,10 +1622,7 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
             drop(batch);
             return self.barrier_sync_all();
         }
-        Err(GraphusError::Storage(format!(
-            "batch flush did not converge within {WAL_HOIST_ATTEMPTS} WAL hoist rounds: a \
-             concurrent writer re-dirtied the batch with a not-yet-durable page_lsn on every round"
-        )))
+        Err(self.hoist_exhausted("batch flush", &asked))
     }
 
     /// A snapshot count of currently dirty frames (diagnostics / tests).
@@ -3070,6 +3140,51 @@ mod tests {
         p.unpin(f);
         p.unpin(f); // extra unpin must not underflow
         assert_eq!(p.pin_count(f), 0);
+    }
+
+    /// **`rmp` #1031 GATE — a `page_lsn` past the end of the log fails closed, and says which fault
+    /// it is.**
+    ///
+    /// A page LSN that names no record is a false claim about what the page reflects, and it is the
+    /// claim `assert_wal_covers` is decided on. The log can never be hardened through it, so the
+    /// hoist loop would spin its whole retry budget and then report "a concurrent writer re-dirtied
+    /// the batch with a not-yet-durable page_lsn on every round" — naming a writer that does not
+    /// exist. That is what actually happened (`rmp` #1031): a store recovered by a harness that
+    /// discarded the undo phase's CLRs carried `page_lsn 14496` against a durable frontier of
+    /// `14495`, and the real fault was invisible in the message.
+    ///
+    /// The rule here is not broken: it reports a frontier and it hardens successfully. It simply has
+    /// an END, as every log does, and the page claims to sit past it.
+    ///
+    /// **Non-vacuity.** With the post-condition check removed from `harden_wal`, `flush` still
+    /// errors — but with the retry-budget message, after `WAL_HOIST_ATTEMPTS` rounds — so the
+    /// assertion on the message is what makes this gate about the diagnosis rather than merely about
+    /// failing.
+    #[test]
+    fn a_page_lsn_beyond_the_end_of_the_log_fails_closed_and_names_the_fault() {
+        /// A log with 100 durable bytes and nothing after them. `ensure_durable` succeeds — there is
+        /// nothing to harden — which is exactly the shape that makes the loop spin.
+        struct EndedLog;
+        impl WalRule for EndedLog {
+            fn ensure_durable(&mut self, _up_to: Lsn) -> Result<()> {
+                Ok(())
+            }
+            fn durable_len(&mut self) -> u64 {
+                100
+            }
+        }
+        let p = ConcurrentBufferPool::with_wal(MemBlockDevice::new(0), EndedLog, 2);
+        let (f, _id) = p.new_page().unwrap();
+        p.with_page_mut_lsn(f, Lsn(500), |page| page[100] = 1);
+        let err = p
+            .flush(f)
+            .expect_err("a page whose LSN names no record must never be written home");
+        assert!(
+            err.to_string().contains("lies beyond the end of the log"),
+            "the fault must be reported as what it is, not as a concurrent writer: {err}"
+        );
+        // And the page is still in the pool, unwritten: failing closed keeps the false claim off disk.
+        assert_eq!(p.dirty_frames(), 1);
     }
 
     #[test]

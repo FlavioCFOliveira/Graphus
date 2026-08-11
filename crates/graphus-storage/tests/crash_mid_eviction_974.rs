@@ -82,9 +82,13 @@ fn crash_mid_eviction_and_recover(store: &mut Store) -> Store {
     sink.append(&log);
     sink.sync().expect("sync log prefix");
 
-    let mut wal = WalManager::open(sink.clone()).expect("open wal");
+    let mut wal = WalManager::open(sink).expect("open wal");
     recover_device(&mut wal, &mut device).expect("recover");
-    let wal = WalManager::open(sink).expect("reopen wal");
+    // Reopen over the log RECOVERY WROTE TO, CLRs included (`rmp` #1031). `MemLogSink` derives
+    // `Clone` as a deep copy, so recovering over a clone and reopening over the original discards
+    // every compensation record the undo phase appended — and leaves the pages it compensated
+    // stamped with LSNs that name no record in the log the store then reopens over.
+    let wal = WalManager::open(wal.sink().clone()).expect("reopen over the recovered log");
     RecordStore::open(device, wal, 64).expect("open store")
 }
 

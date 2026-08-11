@@ -313,10 +313,9 @@ fn crash_no_force(store: Store) -> (Store, usize) {
     sink.append(&log);
     sink.sync().expect("sync log prefix");
     let mut device = MemBlockDevice::new(0);
-    let mut wal = WalManager::open(sink.clone()).expect("open wal");
+    let mut wal = WalManager::open(sink).expect("open wal");
     let report = recover_device(&mut wal, &mut device).expect("recover");
-    let wal = WalManager::open(sink).expect("reopen wal");
-    let store = RecordStore::open(device, wal, POOL_CAPACITY).expect("open store");
+    let store = RecordStore::open(device, reopen_over(&wal), POOL_CAPACITY).expect("open store");
     (store, report.losers)
 }
 
@@ -337,11 +336,31 @@ fn crash_steal(store: Store) -> (Store, usize) {
     let mut sink = MemLogSink::new();
     sink.append(&log);
     sink.sync().expect("sync log prefix");
-    let mut wal = WalManager::open(sink.clone()).expect("open wal");
+    let mut wal = WalManager::open(sink).expect("open wal");
     let report = recover_device(&mut wal, &mut device).expect("recover");
-    let wal = WalManager::open(sink).expect("reopen wal");
-    let store = RecordStore::open(device, wal, POOL_CAPACITY).expect("open store");
+    let store = RecordStore::open(device, reopen_over(&wal), POOL_CAPACITY).expect("open store");
     (store, report.losers)
+}
+
+/// The log a recovered store must reopen over: **the one recovery just wrote to**, CLRs included.
+///
+/// `MemLogSink` derives `Clone` as a deep copy of its byte vectors, so recovering over `sink.clone()`
+/// and reopening over the original — which both crash shapes above used to do — silently discards
+/// every compensation record the undo phase appended, and every `ABORT` end marker after them. What
+/// that models does not exist: a real reopen attaches to the same log file recovery appended to.
+///
+/// The damage was not confined to the log. Undo stamps each page it compensates with the LSN of the
+/// CLR it just wrote (`graphus_wal::recovery`), so the recovered pages carried LSNs naming records
+/// that the reopened log did not contain — a `page_lsn` one byte past the end of the log, on which
+/// `assert_wal_covers` is decided. The blind (non-monotone) `set_page_lsn` hid it by overwriting the
+/// value on the next write to each page; the moment `rmp` #1029 makes the stamp a `max`, the value is
+/// retained and the flush cannot converge. Measured (`rmp` #1031): `page_lsn 14496` against a durable
+/// frontier of `14495`.
+///
+/// It also broke recovery IDEMPOTENCE, which is what the CLRs are for: a second crash after this
+/// reopen would re-undo actions the discarded CLRs said were already compensated.
+fn reopen_over(wal: &WalManager<MemLogSink>) -> WalManager<MemLogSink> {
+    WalManager::open(wal.sink().clone()).expect("reopen over the log recovery wrote to")
 }
 
 /// The sweep. Every run must recover a consistent store with intact survivor chains and no loser
