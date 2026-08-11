@@ -47,8 +47,28 @@
 //! Gate 5 needed the same care for a different reason, and getting it wrong the first time is worth
 //! recording: it sampled the parked statement's progress AFTER joining the occupying statement, so the
 //! rows its owner delivered the instant it was free — the correct behaviour the gate exists to permit —
-//! landed inside the window it was measuring. It now samples only after confirming the owner is still
-//! busy, which is the same ordering gate 3 uses and for the same reason.
+//! landed inside the window it was measuring.
+//!
+//! # Both occupancy gates were measuring the machine, and `rmp` #1042 corrected them
+//!
+//! Gates 3 and 5 each watch a counter for as long as a worker is occupied, and each got two things
+//! wrong that only an optimised build could reveal.
+//!
+//! The first is the ORDER of the two observations. Both checked "is it still busy?" and then read the
+//! counter, which leaves a window between the two in which the legitimate event — the owner reaping
+//! its own over-age transaction, or resuming its own parked statement, the instant it goes free —
+//! lands in the sample and is attributed to a foreign worker. Both now read the counter FIRST and test
+//! liveness AFTER: `is_finished` is monotonic, so an observation of "still running" at the later
+//! instant proves the earlier sample was taken while it ran. The window closes by construction rather
+//! than by being too small to hit.
+//!
+//! The second is that both sized their occupancy window with a fixed row count and a comment claiming
+//! it lasted "hundreds of milliseconds" — a claim about the compiler's output, not about the engine.
+//! At `opt-level = 1` the same statement runs in under a third of the time, both windows fell below
+//! the minimum each gate demands of itself, and both failed. They failed LOUDLY, naming the duration
+//! they got, because each carries a non-vacuity assertion; that is the only reason this was a
+//! correction and not a pair of gates quietly measuring nothing. Both now size the statement by
+//! measuring it ([`rows_for_window`]).
 //!
 //! # Why these engines are built directly
 //!
@@ -174,6 +194,42 @@ fn run_in(
             Err(e) => return Err(e.to_string()),
         }
     }
+}
+
+/// The aggregation the two occupancy gates use to hold a worker, sized for `target` on THIS build.
+///
+/// Gates 3 and 5 both need a statement that keeps its worker inside the cursor for a window they can
+/// sample, and both used to name a fixed row count for it — 700 000, with a comment asserting that it
+/// was "long enough to hold its worker for hundreds of milliseconds". That was true of the binary the
+/// gates were written against and of no other: measured on one machine, the identical statement takes
+/// ~700 ms at `opt-level = 0` and ~200 ms at `opt-level = 1`. A fixed count therefore hard-codes an
+/// optimisation level, and when the verification profile was optimised (`rmp` #1042) both windows
+/// collapsed below the minimum each gate requires of itself.
+///
+/// Neither went quiet, and that is the only reason this is a correction and not an incident: each gate
+/// asserts its own non-vacuity and each failed loudly, naming the duration it got. The remedy is to
+/// stop assuming the machine and measure it — one calibration pass, then scale, because the statement
+/// is linear in the row count (it filters and counts, and materialises nothing per row).
+///
+/// The scaling is deliberately CONSERVATIVE about its own error. The calibration pass pays a fixed
+/// cost the scaled statement does not repeat per row (parse, plan, one auto-commit transaction), so
+/// treating the whole measurement as per-row work underestimates the count needed — by ~15% at the
+/// sizes used here. Callers therefore ask for a target several times the minimum their assertion
+/// demands, and the assertion stays as the backstop that catches any machine where even that is wrong.
+fn rows_for_window(handle: &EngineHandle, target: Duration) -> i64 {
+    const CALIB_ROWS: i64 = 100_000;
+    let started = std::time::Instant::now();
+    run_auto(
+        handle,
+        &format!("UNWIND range(1, {CALIB_ROWS}) AS x WITH x WHERE x % 7 = 3 RETURN count(x) AS c"),
+    )
+    .expect("the calibration statement must succeed");
+    let elapsed = started.elapsed().as_micros().max(1);
+    let scaled = (u128::try_from(CALIB_ROWS).unwrap_or(0) * target.as_micros()) / elapsed;
+    // Never below the calibration size: a host fast enough to make even that instantaneous would
+    // otherwise be handed a statement too small to hold anything, and the gate's own non-vacuity
+    // assertion — not this floor — is what would then report it.
+    i64::try_from(scaled).unwrap_or(i64::MAX).max(CALIB_ROWS)
 }
 
 /// One auto-commit statement, drained. Used to seed data.
@@ -383,13 +439,18 @@ fn ddl_on_one_worker_invalidates_every_workers_plan() {
 #[test]
 fn age_sweep_spares_a_transaction_executing_on_another_worker() {
     const WORKERS: usize = 4;
-    // x % 7 == 3 for x in 1..=ROWS: 3, 10, ..., 699_996 — one every seven.
-    const ROWS: i64 = 700_000;
-    const EXPECTED: i64 = 100_000;
     const CAP: Duration = Duration::from_millis(100);
+    // The statement must outlive `CAP * 3` for the fixture to mean anything (asserted at the end), so
+    // it is sized for well beyond that on THIS build rather than at a row count that only held a
+    // worker while the code was unoptimised. See [`rows_for_window`].
+    const WINDOW: Duration = Duration::from_millis(700);
     let dir = TempDir::new("reapexec");
     let (engine, metrics) = engine(&dir.path, WORKERS, 256, Some(CAP));
     let handle = engine.handle.clone();
+
+    let rows_target = rows_for_window(&handle, WINDOW);
+    // x % 7 == 3 for x in 1..=ROWS — one every seven, and the count is the oracle for truncation.
+    let expected = (rows_target + 4) / 7;
 
     let ticket = handle.begin_blocking(AccessMode::Write).expect("begin");
     let before = counter(&metrics, "graphus_transactions_aborted_total");
@@ -404,17 +465,31 @@ fn age_sweep_spares_a_transaction_executing_on_another_worker() {
                 &handle,
                 ticket,
                 &format!(
-                    "UNWIND range(1, {ROWS}) AS x WITH x WHERE x % 7 = 3 RETURN count(x) AS c"
+                    "UNWIND range(1, {rows_target}) AS x WITH x WHERE x % 7 = 3 RETURN count(x) AS c"
                 ),
             )
         })
     };
 
     // Watch for a reap for as long as — and only as long as — the statement is still running.
+    //
+    // THE ORDER OF THESE TWO OBSERVATIONS IS THE ORACLE. Read the counter FIRST and test liveness
+    // AFTER: `is_finished` is monotonic, so a statement that has not finished at the later instant had
+    // not finished at the earlier one either, and a count sampled before that check is therefore a
+    // count that was already reached while the statement was executing. The reverse order — the one
+    // this gate shipped with — leaves a window between the liveness check and the read in which the
+    // OWNING worker's reap, which is correct and expected the moment the statement ends, lands in the
+    // sample and is reported as a foreign worker's. That window is not theoretical: it is what made
+    // this gate fail on an optimised build (`rmp` #1042), where the statement no longer ran for so
+    // much longer than the cap that the last microseconds could be dismissed.
     let mut aborted_mid_statement = 0u64;
-    while !runner.is_finished() {
-        aborted_mid_statement = counter(&metrics, "graphus_transactions_aborted_total") - before;
-        if aborted_mid_statement > 0 {
+    loop {
+        let sampled = counter(&metrics, "graphus_transactions_aborted_total") - before;
+        if runner.is_finished() {
+            break; // sample discarded: it may have been taken after the statement ended
+        }
+        if sampled > 0 {
+            aborted_mid_statement = sampled; // proven: reaped WHILE executing
             break;
         }
         std::thread::sleep(Duration::from_micros(500));
@@ -433,8 +508,8 @@ fn age_sweep_spares_a_transaction_executing_on_another_worker() {
     );
     assert_eq!(rows.len(), 1, "the aggregation must produce its one row");
     assert!(
-        rows[0][0].contains(&format!("Integer({EXPECTED})")),
-        "the aggregate must be the real count ({EXPECTED}), not a truncated one: {:?}",
+        rows[0][0].contains(&format!("Integer({expected})")),
+        "the aggregate must be the real count ({expected}), not a truncated one: {:?}",
         rows[0]
     );
     // The fixture only means anything if the statement outlived the cap: otherwise no sweep ever saw
@@ -534,12 +609,15 @@ fn age_sweep_spares_a_parked_statement() {
 fn a_parked_statement_is_resumed_only_by_its_owner() {
     const WORKERS: usize = 4;
     const PARKED_ROWS: usize = 4_000;
-    // x % 7 == 3 for x in 1..=700_000 — long enough to hold its worker for hundreds of milliseconds.
-    const BUSY_ROWS: i64 = 700_000;
+    // The occupying statement must hold its worker for longer than the 300 ms this gate requires of
+    // itself below, on whatever build is running it. See [`rows_for_window`].
+    const WINDOW: Duration = Duration::from_millis(700);
     let dir = TempDir::new("resumeowner");
     // One row of egress buffer, so the streaming statement suspends almost immediately.
     let (engine, _metrics) = engine(&dir.path, WORKERS, 1, None);
     let handle = engine.handle.clone();
+
+    let busy_rows_target = rows_for_window(&handle, WINDOW);
 
     // Two transactions on ONE worker: `BEGIN` round-robins, so these are the 1st and the 5th.
     let parked_ticket = handle
@@ -579,7 +657,7 @@ fn a_parked_statement_is_resumed_only_by_its_owner() {
                 &handle,
                 busy_ticket,
                 &format!(
-                    "UNWIND range(1, {BUSY_ROWS}) AS x WITH x WHERE x % 7 = 3 RETURN count(x) AS c"
+                    "UNWIND range(1, {busy_rows_target}) AS x WITH x WHERE x % 7 = 3 RETURN count(x) AS c"
                 ),
             )
         })
@@ -620,13 +698,23 @@ fn a_parked_statement_is_resumed_only_by_its_owner() {
         })
     };
 
-    // Sample the parked statement's progress for exactly as long as its owner is busy, and check that
-    // it still IS busy before each sample. Reading the counter after the join instead would count the
-    // rows the owner delivers the moment it is free — which is the correct behaviour this gate exists
-    // to permit, arriving after the window it is measuring has closed.
+    // Sample the parked statement's progress for exactly as long as its owner is busy. Reading the
+    // counter after the join instead would count the rows the owner delivers the moment it is free —
+    // which is the correct behaviour this gate exists to permit, arriving after the window it is
+    // measuring has closed.
+    //
+    // The order is the same one gate 3 uses, and for the same reason: SAMPLE FIRST, test liveness
+    // AFTER. `is_finished` is monotonic, so an owner still busy at the later instant was busy at the
+    // earlier one, which is what makes the sample admissible. Checking liveness first — as this gate
+    // shipped — admits a sample taken after the owner went free, and the rows it then counts are the
+    // owner's own legitimate resume.
     let mut during = 0usize;
-    while !busy.is_finished() {
-        during = delivered.load(std::sync::atomic::Ordering::Relaxed);
+    loop {
+        let sampled = delivered.load(std::sync::atomic::Ordering::Relaxed);
+        if busy.is_finished() {
+            break; // sample discarded: it may post-date the owner becoming free
+        }
+        during = sampled; // proven: delivered while the owner was still inside the other statement
         std::thread::sleep(Duration::from_millis(1));
     }
     let busy_rows = busy
