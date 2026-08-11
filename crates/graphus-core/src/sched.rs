@@ -174,8 +174,10 @@ pub enum YieldSite {
     GcPhaseE = 68,
 
     // ---- Write-path header reads (80..=89) --------------------------------------------------
-    // Installed but not yet exercised: the writer-vs-writer value of these points only arrives with
-    // `rmp` #975 (N concurrent writers). They are wired now so that task adds seeds, not plumbing.
+    // Exercised by several concurrent writers since `rmp` #1034: `graphus-dst`'s
+    // `det_scheduler_multi_writer_1034` drives four scheduled writers against one store and asserts
+    // that each of these sites is reached by MORE THAN ONE of them — so the writer-vs-writer value
+    // `rmp` #975 wired them for is now proven rather than anticipated.
     /// `RecordStore::read_mvcc` — the header read every write-path conflict decision starts from.
     WriteReadMvcc = 80,
     /// `RecordStore::ensure_no_conflicting_writer` — the write-write conflict check.

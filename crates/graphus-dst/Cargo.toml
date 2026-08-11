@@ -103,3 +103,7 @@ required-features = ["det-sched"]
 [[test]]
 name = "det_scheduler_elle_oracle"
 required-features = ["det-sched"]
+
+[[test]]
+name = "det_scheduler_multi_writer_1034"
+required-features = ["det-sched"]

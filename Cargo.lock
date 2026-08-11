@@ -1483,6 +1483,7 @@ dependencies = [
  "graphus-core",
  "graphus-crypto",
  "graphus-cypher",
+ "graphus-elle",
  "graphus-examples-harness",
  "graphus-fraud-gen",
  "graphus-gds-gen",

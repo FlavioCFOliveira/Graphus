@@ -5401,8 +5401,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Returns [`GraphusError::Transaction`] — a **retriable serialization failure** — when the chain
     /// head belongs to another open transaction, and a storage error if the chain head dangles.
     fn ensure_no_conflicting_writer(&self, kind: StoreKind, entity: u64, txn: TxnId) -> Result<()> {
-        // `rmp` #973: INSTALLED BUT NOT YET EXERCISED (see `read_mvcc`) — the write-write conflict
-        // check, whose whole point only exists once `rmp` #975 gives it a second writer to race.
+        // `rmp` #973: the write-write conflict check, whose whole point only exists once `rmp` #975
+        // gives it a second writer to race. Exercised since `rmp` #1034 — `det_scheduler_multi_writer_1034`
+        // asserts this site is reached by more than one scheduled writer, and that a loser really aborts.
         sched::yield_at(
             YieldSite::WriteConflictCheck,
             ResourceId::slot(kind as u8, entity),

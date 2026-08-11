@@ -87,7 +87,7 @@ fn scenario(seed: u64) -> Run {
         // 64 frames — the same small pool the storage-crate reproducer uses, so eviction is live and
         // the victim-selection path is genuinely exercised rather than sitting idle behind a pool
         // larger than the working set.
-        let mut store = RecordStore::create(device, wal, 64, 1).expect("create store");
+        let store = RecordStore::create(device, wal, 64, 1).expect("create store");
 
         let ka = store
             .intern_token(Namespace::PropKey, "a")

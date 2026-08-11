@@ -167,6 +167,12 @@ uuid = { version = "1", default-features = false, features = ["v4"] }
 # In-test self-signed certificate generation for the TLS listener paths (`04 §8.4`; same crate
 # `graphus-auth` uses for its TLS test). 0.14 tracks rustls 0.23's cert/key DER types.
 rcgen = "0.14"
+# The project's Elle/Adya list-append isolation oracle, so the multi-writer certification
+# (`tests/multi_writer_certification_1034.rs`) checks a history recorded from REAL OS threads against
+# the same checker the DST simulator uses, instead of hand-rolling a serializability argument. A leaf
+# crate whose only dependency is `graphus-core`, so this introduces no cycle; a TEST-TARGET
+# dev-dependency that never enters the production build.
+graphus-elle = { path = "../graphus-elle" }
 # The Bolt codec (handshake, framing, PackStream, messages) to drive a real Bolt session end-to-end
 # over a loopback socket from the integration test.
 graphus-bolt = { path = "../graphus-bolt" }

@@ -59,7 +59,7 @@ fn scheduled_history(seed: u64) -> (Vec<Transaction>, u64) {
     let (history, sched_history) = run_scheduled(cfg, || {
         let device = MemBlockDevice::new(0);
         let wal = WalManager::create(MemLogSink::new()).expect("create wal");
-        let mut store = RecordStore::create(device, wal, 64, 1).expect("create store");
+        let store = RecordStore::create(device, wal, 64, 1).expect("create store");
 
         // One property key per append, so each append is a distinct list element rather than an
         // overwrite of the previous one.

@@ -109,12 +109,19 @@ cargo test --profile gate -p graphus-storage --features read-probe --test prop_v
 # That is also, precisely, how `rmp` #960 hid: a suite behind an opt-in feature that no automated
 # gate ever enabled, so the defect it existed to catch survived on `main` with every other gate
 # green. A headline acceptance criterion asserted only by a suite nothing runs is that defect again.
-# Hence the explicit `--features det-sched` invocation here, covering BOTH suites and the
+# Hence the explicit `--features det-sched` invocation here, covering EVERY suite and the
 # scheduler's own unit tests.
-step '5/10 deterministic writer scheduler — rmp #973 (needs --features det-sched)'
+#
+# The clippy run below is part of the same argument. The workspace lint gate enables no optional
+# feature, so these test targets are not merely unlinted — they are not compiled at all by it, and
+# two of them had accumulated `-D warnings` failures that no gate could see. A suite nothing lints
+# rots exactly the way a suite nothing runs does.
+step '5/10 deterministic writer scheduler — rmp #973/#1034 (needs --features det-sched)'
+cargo clippy --profile gate -p graphus-dst --features det-sched --all-targets -- -D warnings
 cargo test --profile gate -p graphus-dst --features det-sched --lib detsched::
 cargo test --profile gate -p graphus-dst --features det-sched --test det_scheduler_gc_reader_811
 cargo test --profile gate -p graphus-dst --features det-sched --test det_scheduler_elle_oracle
+cargo test --profile gate -p graphus-dst --features det-sched --test det_scheduler_multi_writer_1034
 
 # `rmp` #973 acceptance criterion 3 — the production cost is ZERO — asserted mechanically rather
 # than argued. The release build below reproduces the container image's `-p graphus-server` package
