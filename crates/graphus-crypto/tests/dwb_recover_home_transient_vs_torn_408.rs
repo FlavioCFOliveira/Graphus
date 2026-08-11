@@ -46,7 +46,9 @@ fn fresh_encrypted(pages: u64) -> EncMem {
 fn make_page(id: u64, lsn: u64, fill: u8) -> Page {
     let mut p = [fill; PAGE_SIZE];
     page::set_page_id(&mut p, id);
-    page::set_page_lsn(&mut p, Lsn(lsn));
+    // A page BUILT from a fill byte, not amended: its header LSN is whatever the fill happens to
+    // spell, so the intended value must REPLACE it rather than be maxed against it (`rmp` #1029).
+    page::reset_page_lsn(&mut p, Lsn(lsn));
     page::write_checksum(&mut p);
     p
 }

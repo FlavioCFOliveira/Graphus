@@ -3142,6 +3142,47 @@ mod tests {
         assert_eq!(p.pin_count(f), 0);
     }
 
+    /// **`rmp` #1029 GATE — the WAL-before-data gate is decided on the HIGHEST LSN the content
+    /// reflects, never on a later, lower stamp.**
+    ///
+    /// This is the consequence the monotone stamp exists to prevent, stated where it bites. Two
+    /// writers take LSNs 12 and 10 and apply out of order, so the frame's content is at 12 while the
+    /// last stamp asks for 10. With the log durable through 11, a claim of 10 would satisfy
+    /// `assert_wal_covers` and the page would reach the home file ahead of its own redo record — the
+    /// WAL-before-data violation of `rmp` #1029, reachable through EVERY `with_page_mut_lsn` call
+    /// site rather than through one.
+    ///
+    /// **Non-vacuity.** With `set_page_lsn` returned to a blind store the frame's claim becomes 10,
+    /// the gate passes, and `flush` returns `Ok` — the assertion below then fails.
+    #[test]
+    fn the_wal_gate_reads_the_highest_lsn_the_content_reflects() {
+        /// Durable through 11 and no further: `ensure_durable` cannot advance it.
+        struct DurableThrough11;
+        impl WalRule for DurableThrough11 {
+            fn ensure_durable(&mut self, _up_to: Lsn) -> Result<()> {
+                Ok(())
+            }
+            fn durable_len(&mut self) -> u64 {
+                12 // covers every LSN strictly below 12, i.e. through 11
+            }
+        }
+        let p = ConcurrentBufferPool::with_wal(MemBlockDevice::new(0), DurableThrough11, 2);
+        let (f, _id) = p.new_page().unwrap();
+        // The writer that took LSN 12 applies first...
+        p.with_page_mut_lsn(f, Lsn(12), |page| page[100] = 12);
+        // ...and the one that took LSN 10 applies afterwards. The content now reflects 12.
+        p.with_page_mut_lsn(f, Lsn(10), |page| page[200] = 10);
+        let err = p.flush(f).expect_err(
+            "the page's content reflects LSN 12, which is not durable: it must not be written home",
+        );
+        assert!(
+            err.to_string().contains("beyond the end of the log")
+                || err.to_string().contains("did not converge"),
+            "the refusal must come from the WAL gate, not from something else: {err}"
+        );
+        assert_eq!(p.dirty_frames(), 1, "the page stays in the pool, unwritten");
+    }
+
     /// **`rmp` #1031 GATE — a `page_lsn` past the end of the log fails closed, and says which fault
     /// it is.**
     ///

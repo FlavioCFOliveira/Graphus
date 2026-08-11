@@ -189,7 +189,9 @@ fn checkpoint_persists_floor_and_recovery_ignores_a_stale_below_floor_ring_slot(
         );
         let mut stale_img: Page = [0u8; PAGE_SIZE];
         page::set_page_id(&mut stale_img, victim);
-        page::set_page_lsn(&mut stale_img, Lsn(stale_lsn));
+        // A page BUILT from a fill byte, not amended: its header LSN is whatever the fill happens to
+        // spell, so the intended value must REPLACE it rather than be maxed against it (`rmp` #1029).
+        page::reset_page_lsn(&mut stale_img, Lsn(stale_lsn));
         stale_img[200] = 0x5A; // distinct stale content
         page::write_checksum(&mut stale_img);
         rdwb.stage_eviction_slot(3, PageId(victim), &stale_img)

@@ -255,7 +255,8 @@ impl<D: BlockDevice> ApplyTarget for IndexTarget<'_, D> {
         let mut buf: Page = [0u8; PAGE_SIZE];
         self.device.read_page(page, &mut buf)?;
         apply_patch(&mut buf, image)?;
-        page::set_page_lsn(&mut buf, lsn);
+        // Rebuilt, not amended — same reasoning as the record store's redo target (`rmp` #1029).
+        page::reset_page_lsn(&mut buf, lsn);
         page::set_page_id(&mut buf, page.0);
         page::write_checksum(&mut buf);
         self.device.write_page(page, &buf)

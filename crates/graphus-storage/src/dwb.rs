@@ -1437,7 +1437,9 @@ mod tests {
     fn make_page(id: u64, lsn: u64, fill: u8) -> Page {
         let mut p = [fill; PAGE_SIZE];
         page::set_page_id(&mut p, id);
-        page::set_page_lsn(&mut p, graphus_core::Lsn(lsn));
+        // A doublewrite restore REPLACES the torn home page with its staged copy, whose LSN is by
+        // construction below whatever the torn header holds (`rmp` #1029).
+        page::reset_page_lsn(&mut p, graphus_core::Lsn(lsn));
         page::write_checksum(&mut p);
         p
     }

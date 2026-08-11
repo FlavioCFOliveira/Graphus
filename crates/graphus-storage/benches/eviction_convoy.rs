@@ -162,7 +162,9 @@ fn seed_store(path: &Path, pages: u64) {
     for i in 0..pages {
         buf.fill(0);
         page::set_page_id(&mut buf, i);
-        page::set_page_lsn(&mut buf, Lsn(0));
+        // A page BUILT from a fill byte, not amended: its header LSN is whatever the fill happens to
+        // spell, so the intended value must REPLACE it rather than be maxed against it (`rmp` #1029).
+        page::reset_page_lsn(&mut buf, Lsn(0));
         page::write_checksum(&mut buf);
         dev.write_page(PageId(i), &buf).expect("seed write");
     }

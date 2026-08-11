@@ -85,7 +85,10 @@ impl<D: BlockDevice> ApplyTarget for DeviceTarget<'_, D> {
         let mut buf: Page = [0u8; PAGE_SIZE];
         self.device.read_page(page, &mut buf)?;
         crate::paging::apply_patch(&mut buf, image)?;
-        page::set_page_lsn(&mut buf, lsn);
+        // The page is REBUILT here, not amended: a page that failed its checksum reports an LSN of
+        // `0` above so redo replays every record for it, and a monotone stamp would retain the torn
+        // header's garbage LSN and skip the whole rebuild (`rmp` #1029). See `reset_page_lsn`.
+        page::reset_page_lsn(&mut buf, lsn);
         page::set_page_id(&mut buf, page.0);
         page::write_checksum(&mut buf);
         self.device.write_page(page, &buf)
