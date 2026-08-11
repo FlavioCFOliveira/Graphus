@@ -4509,6 +4509,18 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // under a rank-27 hold, and both paths assert it (`assert_no_chain_head_latch_held`).
         let f = self.pool.fetch(dev)?;
         let published = {
+            // NO HAND-OFF while this shard lock is held (`rmp` #1030). The two `with_page` calls
+            // below are scheduler yield points, and this `Mutex` is not scheduler-mediated: under the
+            // deterministic scheduler a writer that hands the token over from inside here parks
+            // HOLDING the lock, and the thread that receives it blocks on the same lock — the run
+            // wedges with `det-sched: STALLED`. Measured with gdb on both stacks while building the
+            // `rmp` #1030 gate: the parked thread inside `compare_and_publish_chain_head`'s
+            // `with_page`, the token holder blocked on `chain_head_shard(..).lock()`.
+            //
+            // The buffer pool solved exactly this for its page-table shard lock (`ShardGuard`'s
+            // `_no_switch`). Same remedy, same reason. Declared BEFORE the guard so it drops after it:
+            // the no-hand-off region must outlive the lock, never the reverse.
+            let _no_switch = graphus_core::sched::NoSwitchScope::new();
             let _guard = self
                 .chain_head_shard(kind, id)
                 .lock()
@@ -9606,6 +9618,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // `fetch` under a rank-27 hold could evict, write home and harden.
         let f = self.pool.fetch(dev)?;
         {
+            // No hand-off while the shard lock is held — see `compare_and_publish_chain_head` for the
+            // measured stall this prevents (`rmp` #1030).
+            let _no_switch = graphus_core::sched::NoSwitchScope::new();
             let _guard = self
                 .chain_head_shard(StoreKind::Rel, rel_id)
                 .lock()
@@ -10413,36 +10428,27 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         if nb.end_node == node {
             patch(ChainSide::End, &mut nb);
         }
-        // WRITE ONLY WHAT CHANGED (`rmp` #1030). This used to write the whole `RelRecord` back, which
-        // carried the neighbour's `first_prop` and its MVCC header — `undo_ptr` included — along from
-        // the read above. Neither is this function's business, and a concurrent writer that had moved
-        // either of them would have had its work reverted: the `rmp` #772 clobber class, reached from
-        // logical rollback through `unlink_side_with`'s BOTH branches.
+        // WRITE THE WHOLE RECORD, still — and the reason is a defect I introduced and measured, so it
+        // is recorded here rather than left for the next person to rediscover (`rmp` #1030).
         //
-        // Per-word rather than one write over the contiguous 61..93 pointer block, because two unlinks
-        // can legitimately touch the SAME neighbour at once — one facing its start node, one facing
-        // its end node — and a block write from a stale read would have each revert the other's side.
-        // Each word carries its own undo pre-image, which is strictly tighter than the whole-record
-        // pre-image it replaces.
-        for (side, prev_off, next_off) in [
-            (ChainSide::Start, REL_OFF_START_PREV, REL_OFF_START_NEXT),
-            (ChainSide::End, REL_OFF_END_PREV, REL_OFF_END_NEXT),
-        ] {
-            let (old_prev, old_next) = before.chain_pointers(side);
-            let (new_prev, new_next) = nb.chain_pointers(side);
-            if new_prev != old_prev {
-                self.patch_header_word(StoreKind::Rel, neighbour, prev_off, new_prev, txn)?;
-            }
-            if new_next != old_next {
-                self.patch_header_word(StoreKind::Rel, neighbour, next_off, new_next, txn)?;
-            }
-        }
-        if nb.chain_flags != before.chain_flags {
-            let (rel_page, off) = paging::record_location(neighbour, StoreKind::Rel.record_size());
-            let dev = self.device_page(StoreKind::Rel, rel_page)?;
-            self.write_region(dev, off + REL_OFF_CHAIN_FLAGS, &[nb.chain_flags], txn)?;
-        }
-        Ok(())
+        // The clobber this function has is real: it carries the neighbour's `first_prop` and MVCC
+        // header, `undo_ptr` included, from the read above. Converting it to per-word writes removes
+        // that — and BREAKS SNAPSHOT ISOLATION, because a whole-record `write_region` is one
+        // acquisition of the frame write latch and therefore atomic against a reader taking the frame
+        // read latch, while two-to-five per-word writes are not. A reader walking the incidence chain
+        // can then observe a neighbour with its `prev` repointed and its first-in-chain flag not yet
+        // set, which is a state no consistent snapshot ever contained. Measured:
+        // `concurrent_reader_serializability::concurrent_readers_see_consistent_snapshot` reported one
+        // violation of the conserved total under eight concurrent readers, and passed 5/5 in isolation
+        // — the shape of a torn update, not of a busy host.
+        //
+        // So the correct fix is neither of the two obvious ones. It has to write LESS than the whole
+        // record and still write it in ONE frame-latch critical section: the four chain-pointer words
+        // are contiguous (61..93) but `chain_flags` at 101 is not, so one `write_region` cannot cover
+        // both, and the flag moves exactly when `prev` becomes NULL. That needs either a layout change
+        // or a multi-region write primitive that holds the latch once, and it is more than this task
+        // should decide on its own.
+        self.write_rel(neighbour, &nb, txn)
     }
 
     // ----------------------------- property CRUD ----------------------------
