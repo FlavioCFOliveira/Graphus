@@ -70,14 +70,37 @@ pub fn slow_query_threshold() -> Duration {
 /// Defaults to `info` when `RUST_LOG` is unset. Idempotent-safe: a second call (e.g. in a test that
 /// also boots a server) is ignored rather than panicking, because the subscriber can only be set
 /// once per process.
+///
+/// Under the `tracy` feature it additionally streams every span to the Tracy real-time profiler
+/// (CLAUDE.md, "Empirical measurement"). That path is a *separate* branch rather than an extra layer
+/// on the existing one on purpose: composing layers requires a `Registry`, and the default build has
+/// no reason to pay for one. With the feature off, the subscriber below is byte-for-byte the
+/// subscriber this server has always installed.
 pub fn init_logging() {
     use tracing_subscriber::EnvFilter;
     use tracing_subscriber::fmt;
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
     // `try_init` returns `Err` if a global subscriber is already installed; ignore it so multiple
     // server instances in one test process do not abort.
+    #[cfg(not(feature = "tracy"))]
     let _ = fmt().with_env_filter(filter).with_target(true).try_init();
+
+    // The Tracy GUI connects to the running process over a socket; spans emitted before it attaches
+    // are buffered by the client, so a profiled run needs no start-up race to be won. `RUST_LOG`
+    // still filters what reaches Tracy, exactly as it filters what reaches the log.
+    #[cfg(feature = "tracy")]
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        let _ = tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt::layer().with_target(true))
+            .with(tracing_tracy::TracyLayer::default())
+            .try_init();
+    }
 }
 
 /// The application name reported in the startup banner (the Cargo package name of this binary crate,
@@ -246,5 +269,32 @@ mod tests {
         // Logging without a global subscriber installed is a no-op, not a panic; this guards the
         // banner call site (formatting + field capture) against regressions.
         log_startup_banner();
+    }
+
+    /// `init_logging` installs a working subscriber under **both** arms of the `tracy` cfg.
+    ///
+    /// The Tracy arm builds a different subscriber (a `Registry` with layers) than the default one,
+    /// and nothing else in the suite compiles it — without this test, a build with `--features
+    /// tracy` could panic on its first line of logging and no gate would notice. Running it under
+    /// the feature is what makes it non-vacuous:
+    ///   cargo test -p graphus-server --features tracy --lib observability
+    ///
+    /// The second call is the real assertion: `try_init` returns `Err` once a global subscriber
+    /// exists, and `init_logging` must swallow that rather than abort a process that boots two
+    /// server instances (the documented idempotency contract).
+    #[test]
+    fn init_logging_installs_a_subscriber_and_tolerates_a_second_call() {
+        init_logging();
+        init_logging();
+
+        // Prove the subscriber is actually there rather than merely that nothing panicked: with one
+        // installed, `tracing` dispatches to it instead of the no-op default.
+        assert!(
+            tracing::dispatcher::has_been_set(),
+            "init_logging must leave a global subscriber installed",
+        );
+
+        // And that emitting through it — the thing the Tracy layer intercepts — is safe.
+        tracing::info!(test = true, "init_logging subscriber smoke check");
     }
 }

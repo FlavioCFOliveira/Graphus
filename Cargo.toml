@@ -10,6 +10,32 @@ license-file = "LICENSE"
 repository = "https://github.com/FlavioCFOliveira/Graphus"
 authors = ["Flavio CF Oliveira"]
 
+# Profiling instrumentation, pinned once here so every crate that opts in measures with the same
+# version (see CLAUDE.md, "Empirical measurement", and `docs/profiling.md` for how to run each tool).
+#
+# Both are declared `optional` at every use site and sit behind a feature that is OFF by default,
+# because both are *invasive by construction*: `dhat` replaces the global allocator and
+# `tracing-tracy` opens a listening socket and streams every span off-process. Neither may enter a
+# production build by accident, and neither is compiled at all unless its feature is named.
+#
+# The other tools in the "Empirical measurement" policy — cargo-flamegraph, samply, perf, heaptrack —
+# are EXTERNAL BINARIES, not crates: they observe an unmodified build from outside the process and so
+# have nothing to declare here. What they do need is symbols, which is what `profile.profiling` below
+# exists to give them.
+#
+# Licences checked before adoption (CLAUDE.md, "Direct copying is forbidden"): dhat is
+# `MIT OR Apache-2.0`, tracing-tracy is `MIT/Apache-2.0`. Both are permissive and compatible.
+# tracing-tracy's MSRV (1.70) sits below this workspace's 1.85, so it constrains nothing.
+[workspace.dependencies]
+# Heap profiler (the dhat-rs port of Valgrind's DHAT): records every allocation with its full call
+# stack and writes `dhat-heap.json`, readable at https://nnethercote.github.io/dh_view/dh_view.html.
+# It answers *where* the heap goes and how many times — not how long the CPU spent there.
+dhat = "0.3"
+# Streams `tracing` spans to the Tracy real-time profiler as a `tracing-subscriber` layer, giving a
+# millisecond-by-millisecond view of thread execution. It needs the Tracy GUI (a separate program) to
+# connect to the running process, hence the `registry` feature it pulls in at the use site.
+tracing-tracy = "0.11"
+
 # Release build configuration (revisit with measurements — see
 # specification/04-technical-design.md and the Rust Performance Book).
 [profile.release]
@@ -54,3 +80,35 @@ debug = "line-tables-only"
 debug-assertions = true
 overflow-checks = true
 incremental = false
+
+# The profile the sampling profilers run under (CLAUDE.md, "Empirical measurement").
+#
+# WHY IT EXISTS. cargo-flamegraph, samply and perf attribute samples through the binary's debug
+# information. Measured on this workspace (`readelf -S`, `nm -C`): the release binary carries the
+# same 4897 Graphus symbols in `.symtab` but ZERO debug sections, so a release profile resolves
+# function NAMES and nothing else — no file:line, and every frame `lto`/`codegen-units = 1` inlined
+# is silently folded into its caller, which is exactly where this engine's hot paths live. `--dev`
+# has the debug info but measures unoptimised code, profiling a program nobody ships. This profile is
+# the only combination that answers the question actually being asked: the SAME code generation as
+# release, plus the debug information needed to attribute it (84 MB against release's 20 MB).
+#
+# It INHERITS FROM RELEASE DELIBERATELY, `codegen-units = 1` and `lto = "thin"` included. Loosening
+# either would make the profile faster to build and its measurements a fiction — inlining decisions
+# are precisely what determines where a release build spends its time, so a profile that changes them
+# reports someone else's program. Frames inlined away are not lost: `debug = "line-tables-only"`
+# keeps the inline records, so the profilers still unwind through them.
+#
+# `debug = "line-tables-only"` and not `debug = true`: line tables are what the sampling profilers
+# consume (function, file, line), while full variable-level debuginfo is for debuggers and cost this
+# workspace a measured 126 MB in a single binary (see `profile.gate` above). `strip` is left off
+# explicitly because `strip = "debuginfo"` would silently discard exactly what this profile is for.
+#
+#   cargo build --profile profiling -p graphus-server
+#   samply record ./target/profiling/graphus-server config.toml
+#
+# `perf` on a kernel without frame pointers needs `--call-graph dwarf`, or rebuild with
+# `RUSTFLAGS="-C force-frame-pointers=yes"`; see `docs/profiling.md`.
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+strip = "none"

@@ -18,6 +18,14 @@ autobenches = false
 # `graphus-storage/src/read_probe.rs` for what the counter costs when it is on.
 read-probe = ["graphus-storage/read-probe"]
 
+# Heap profiling of the LDBC-SNB macro harness (CLAUDE.md, "Empirical measurement"). Installs `dhat`
+# as the global allocator in the `ldbc_snb` binary and writes `dhat-heap.json` on exit, attributing
+# every allocation of a full generate-and-query run to its call stack. OFF by default so the harness
+# keeps reporting throughput and latency for the uninstrumented path — the same reasoning that keeps
+# `read-probe` off above. Run with:
+#   cargo run --profile profiling -p graphus-bench --features dhat-heap --bin ldbc_snb -- --medium
+dhat-heap = ["dep:dhat"]
+
 [dependencies]
 graphus-core = { path = "../graphus-core" }
 # The LDBC-SNB macro harness (`src/ldbc/`) and its `ldbc_snb` binary drive the real engine end to
@@ -29,6 +37,11 @@ graphus-txn = { path = "../graphus-txn" }
 graphus-storage = { path = "../graphus-storage" }
 graphus-wal = { path = "../graphus-wal" }
 graphus-io = { path = "../graphus-io" }
+
+# The heap profiler, OFF by default — see the `dhat-heap` feature above. A *normal* dependency and
+# not a dev-dependency for the reason already stated above: `src/bin/ldbc_snb.rs` lives in `src/`,
+# which cannot see dev-dependencies. Version pinned once in the workspace root.
+dhat = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Lean Criterion for the micro-benchmarks (commit_path / read_path / loopback). The engine crates

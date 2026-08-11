@@ -20,7 +20,26 @@ use std::process::ExitCode;
 
 use graphus_server::{Server, ServerConfig};
 
+/// The heap profiler's allocator, installed **only** under the `dhat-heap` feature (CLAUDE.md,
+/// "Empirical measurement"). It wraps the system allocator to record every allocation with its call
+/// stack, so it is compiled out entirely in every normal build — including `--release` — and the
+/// server keeps the platform allocator it ships with.
+///
+/// `#[global_allocator]` needs no `unsafe` at this site: the `GlobalAlloc` implementation (and its
+/// obligations) live inside `dhat`, so the crate-level `#![forbid(unsafe_code)]` above stands.
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 fn main() -> ExitCode {
+    // Armed first so it observes the whole process, and bound to a named local (never `_`, which
+    // would drop it immediately and profile nothing) so it lives until `main` returns. The report is
+    // written by its `Drop`, which means it lands on a CLEAN exit only: a graceful shutdown or the
+    // `adopt` early return produce `dhat-heap.json`, while `SIGKILL` — or any path through
+    // `std::process::exit` — bypasses the destructor and produces no file at all.
+    #[cfg(feature = "dhat-heap")]
+    let _dhat_profiler = dhat::Profiler::new_heap();
+
     // The `adopt` subcommand (`rmp` #681) is an OFFLINE, synchronous operation that never starts the
     // server runtime: intercept it before the config-then-runtime `try_main` path. It is recognised
     // only as the FIRST argument, so a config file literally named `adopt` is still usable as

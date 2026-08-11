@@ -90,11 +90,11 @@ All code and development MUST, as a rule, be **full-fledged**. Tests MUST NOT be
 
 Whenever you find pre-existing bugs, you MUST fix them on the spot and then continue the work you were doing when you found the bug.
 
-## Production-oriented
+## Perfection-oriented
 
-**EVERY action you take MUST be held to production-grade standards** — development, bug fixes, evaluations, analyses, audits, and anything else. There is no category of work that is exempt.
+**EVERY action you take MUST be held to the standards of a production environment, and MUST be carried out in an exemplary and perfect manner** — development, bug fixes, evaluations, analyses, audits, and anything else. There is no category of work that is exempt.
 
-Throughout the entire work cycle (analysis → planning → development → testing), the goal MUST be that the produced result is **production-grade**. Apply not only your maximum knowledge but also your maximum diligence to ensure that you only ever work toward code that is ready to be used in production.
+Throughout the entire work cycle (analysis → planning → development → testing), the goal MUST be that the produced result is **perfect and production-grade**. Apply not only your maximum knowledge but also your maximum diligence to ensure that you only ever work toward code that is ready to be used in production.
 
 ### Exemplary components
 
@@ -110,9 +110,9 @@ The general architecture of the project — and the specific architecture of eac
 
 ## Subagent team
 
-Graphus is built by a **team**, not by a lone generalist. In addition to your own work, you have a roster of **specialized subagents** defined both at the **user level** (`~/.claude/agents/`) and at the **project level** (`.claude/agents/`). You MUST treat these subagents as **members of the working team** and actively put them to work.
+Graphus is built by a **team**, not by a lone generalist. In addition to your own work, you have a roster of **subagents** covering every available scope: the **built-in (global)** ones provided by the harness, the ones defined at the **user level** (`~/.claude/agents/`), and any defined at the **project level** (`.claude/agents/`). You MUST treat these subagents as **members of the working team** and actively put them to work.
 
-1. **Know your team.** You MUST be aware of which subagents are available (user-level and project-level) and what each one specializes in. The roster includes deep specialists across the project's domains — for example, and non-exhaustively: the Bolt protocol, PackStream, storage engines, concurrency and parallelism, Rust engineering and profiling, columnar / NoSQL / graph-theory knowledge, security research, specification management, and releases.
+1. **Know your team.** You MUST be aware of which subagents are available (global, user-level, and project-level) and what each one specializes in. The roster includes deep specialists across the project's domains — for example, and non-exhaustively: the Bolt protocol, PackStream, storage engines, concurrency and parallelism, Rust engineering and profiling, columnar / NoSQL / graph-theory knowledge, security research, specification management, and releases.
 
 2. **They act and intervene whenever their specialty is useful.** A specialist MUST act and intervene **whenever its expertise adds value to the work at hand — not only when explicitly asked**. Delegate proactively: route each piece of work to the subagent best suited to it, and call in the relevant specialist to design, review, audit, or certify anything that touches their domain (for example: a storage change reviewed by the storage auditor; security-sensitive code vetted by the security researcher; Bolt / PackStream work validated by the respective protocol experts) — including proactively, before a task is closed.
 
@@ -254,6 +254,27 @@ Follow this sequence for each component:
 ## Measure to decide
 
 Whenever it is necessary to evaluate performance, completeness (whether something is complete), or correctness (whether something is right), you MUST ALWAYS gather evidence from the project to determine the needs. You MUST ALWAYS decide empirically.
+
+## Empirical measurement
+
+Whenever it is convenient, or whenever the tasks require it, you MUST use the most appropriate tools of the Rust ecosystem to extract, measure, observe, and profile every aspect of the code and of its execution.
+
+The tools below are wired into this project and ready to run; `docs/profiling.md` documents how to invoke each one, which question each one answers, and the `profiling` build profile they require.
+
+### CPU and general performance analysis
+
+- **`cargo-flamegraph`** — the most widely used tool for generating flamegraphs. It is easy to use and integrates directly with `cargo`, relying on `perf` (Linux) or `dtrace` (macOS) underneath.
+- **`samply`** — a modern, highly refined sampling profiler. It serves a local web UI with an excellent interactive interface for exploring CPU time and system calls.
+- **`perf`** — the native Linux tool. It is the most powerful and lowest-level foundation for analysing CPU cycles, cache misses, and hardware instructions.
+
+### Memory analysis (allocation and heaps)
+
+- **`dhat`** (from the Valgrind suite) — integrated through a Rust crate; it examines in detail where heap memory is allocated, how many times, and where blocks are held or wasted.
+- **`heaptrack`** — excellent on Linux systems. It records every allocation and deallocation in order to show peak consumption and memory leaks over time through navigable graphs.
+
+### Real-time tracing and instrumentation
+
+- **`tracy`** (with the `tracing-tracy` crate) — an extraordinarily fast real-time profiler. It is widely used in game development and high-performance systems to observe thread execution millisecond by millisecond.
 
 ## Token-economy policy
 

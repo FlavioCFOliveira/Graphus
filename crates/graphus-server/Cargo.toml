@@ -32,6 +32,22 @@ dst = ["graphus-cypher/dst"]
 # internal-test-udf --test panic_isolation`.
 internal-test-udf = []
 
+# Heap profiling of the real server process (CLAUDE.md, "Empirical measurement"). Installs `dhat` as
+# the GLOBAL ALLOCATOR and writes `dhat-heap.json` on a clean exit. OFF by default and never to be
+# shipped: every allocation then carries a backtrace, which is a large, deliberate slowdown of the
+# very path this project exists to keep fast. Run with:
+#   cargo run --profile profiling -p graphus-server --features dhat-heap -- config.toml
+dhat-heap = ["dep:dhat"]
+
+# Real-time span streaming to the Tracy profiler (CLAUDE.md, "Empirical measurement"). Adds a
+# `TracyLayer` to the subscriber built in `observability::init_logging`, which requires composing
+# layers over a `Registry` — hence the extra `tracing-subscriber` feature, pulled in ONLY here so the
+# default build keeps the leaner `fmt`-only subscriber it has today. OFF by default: the Tracy client
+# opens a listening socket and broadcasts on the network, which a database server must never do
+# unasked. Run with (then attach the Tracy GUI):
+#   cargo run --profile profiling -p graphus-server --features tracy -- config.toml
+tracy = ["dep:tracing-tracy", "tracing-subscriber/registry"]
+
 [dependencies]
 # The shared value model, error taxonomy and the injected `Clock` capability (used to drive REST
 # transaction expiry and JWT validity deterministically). `04 §7.2`, `§8.4`.
@@ -100,6 +116,12 @@ tower = { version = "0.5", default-features = false, features = ["util"] }
 # `fmt` is the structured text subscriber.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "std", "ansi"] }
+
+# Profiling instrumentation, both OPTIONAL and both OFF by default — see the `dhat-heap` and `tracy`
+# features above for what each one costs and how to run it. Versions are pinned once in the
+# workspace root so every crate that opts in measures with the same build.
+dhat = { workspace = true, optional = true }
+tracing-tracy = { workspace = true, optional = true }
 
 # Config file parsing (`config` module). `serde` derives `ServerConfig`; `toml` is the small, vetted
 # file format. Env overrides are read directly from `std::env` (no extra crate). int handling is

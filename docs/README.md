@@ -23,6 +23,12 @@ into the guide for the interface you need.
   fraud OLTP, GDS analytics, knowledge graph over REST, and more), each instrumented to
   collect CPU/RAM/storage evidence.
 
+## For contributors
+
+- **[profiling.md](profiling.md)** — measuring the server's execution: the `profiling` build
+  profile, CPU sampling (cargo-flamegraph, samply, perf), heap analysis (dhat, heaptrack),
+  real-time tracing (tracy), and the hygiene rules that make a measurement mean something.
+
 ## The four guarantees
 
 Graphus holds four inviolable guarantees: **100% ACID**, **100% openCypher TCK**, **100%
