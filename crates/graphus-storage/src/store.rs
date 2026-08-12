@@ -2643,6 +2643,48 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         for (slot, store) in stores.iter_mut().zip(self.stores.iter()) {
             *slot = store.to_meta()?;
         }
+        // THE FREE LISTS ARE THE COMMITTED ONES, NOT THE LIVE ONES (`rmp` #1063).
+        //
+        // Same discipline as the counters (`rmp` #866) and the schema DDL (`rmp` #734), and it
+        // became load-bearing when this image stopped being physically undone. A free-list PUSH is
+        // eager — [`free_push`](Self::free_push) lists the id the moment the record is cleared, well
+        // before the clearing transaction commits — so the live list carries the frees of every open
+        // transaction. Only a GC pass ever pushes (a normal write transaction's `freed_ids` is
+        // empty), and a GC pass that reaches this checkpoint and then dies is a recovery LOSER: undo
+        // restores its records to `in_use`, and an image that had listed their ids as free would hand
+        // a live record's slot to the next allocation. `check_free_lists` catches that at `open`
+        // (`StillInUse`), which is a database refusing to serve — a failure this must not produce.
+        //
+        // Until `rmp` #1063 the pre-image undo of this page happened to cover it, whenever no other
+        // committer had overwritten the image in between. That is the same accident that made the
+        // undo erase committed catalogues, so it is replaced by the exclusion rather than kept.
+        //
+        // THE COMMITTING TRANSACTION IS EXCLUDED BY NAME, exactly as in `committed_statistics`, and
+        // an earlier draft of this that excluded it too was WRONG — measured, not reasoned.
+        //
+        // A GC pass is the only transaction that ever pushes, and `checkpoint_meta` runs inside that
+        // pass's OWN commit. Excluding the committing transaction therefore dropped a GC pass's frees
+        // at the one checkpoint that was ever going to carry them, and no later one puts them back
+        // (a later checkpoint samples the live list, but the ids are gone from the image the reopen
+        // reads). The reclaimed space was then lost across every restart — a permanent, monotonic
+        // leak, and `store::tests::a_catalog_reload_never_reverts_a_free_list_pop_1023` caught it on
+        // its own vacuity guard: the durable list came back EMPTY.
+        //
+        // So the asymmetry is the same one the counts and the DDL use, and for the same reason: this
+        // image is the only route those frees have to disk. What it leaves open is the same residual
+        // too — a committing GC pass that becomes a recovery LOSER has its record clears undone while
+        // its image still lists the ids. That is tracked with the DDL half in `rmp` #1083, is detected
+        // fail-closed at `open` by `check_free_lists` (`StillInUse`) rather than silently reused, and
+        // is not closed by excluding the committing transaction — that trade buys it with a
+        // guaranteed leak on every successful GC pass, which is the worse of the two.
+        self.active.fold_all((), |(), txn, a| {
+            if txn == committing {
+                return;
+            }
+            for &(kind, id) in &a.freed_ids {
+                stores[kind as usize].free_list.remove_id(id);
+            }
+        });
         // Clones the whole `Statistics` (counts *and* the `rmp` task #81 property-histogram map): the
         // histogram blobs ride the same checkpoint-at-commit path as the counts with no
         // special-casing — `Statistics` is cloned structurally. The SCHEMA half is taken from the
@@ -3288,6 +3330,95 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Persists the in-memory catalog to the metadata page as one WAL-logged update under `txn`.
     /// When `commit` is set, `txn` is begun and committed around the write (standalone catalog
     /// change, `04 §2.6`); otherwise the write joins the caller's open `txn`.
+    ///
+    /// # The catalogue image is REDO-ONLY (`rmp` #1063)
+    ///
+    /// Its page writes use [`write_region_keep`](Self::write_region_keep) — a record with **no undo
+    /// image at all** — and not [`write_region`](Self::write_region)'s byte pre-image. A pre-image
+    /// here was a **critical ACID defect**: it let a loser erase a committed transaction's catalogue.
+    ///
+    /// ```text
+    ///   L: checkpoint_meta -> Update(META, redo = I_L, undo = P0)   ... and no COMMIT record
+    ///   W: commit          -> Update(META, redo = I_W, undo = I_L), COMMIT, fdatasync
+    ///   crash; recovery redoes I_L then I_W, then undoes L -> the page holds P0
+    /// ```
+    ///
+    /// `P0` predates both, and `W` was acknowledged to its client. Reproduced deterministically in
+    /// `crates/graphus-dst/src/count_txn_undo.rs` (scenario 4): the winner's interned label token
+    /// vanished while the node it labelled survived redo, leaving a committed record whose label bit
+    /// names a token the dictionary no longer holds.
+    ///
+    /// This is ARIES's own precondition, stated in the negative (Mohan et al. 1992, §1.2): a
+    /// page-oriented undo is sound only under a **commit-duration** exclusive claim on the undone
+    /// bytes — a *lock*, explicitly not the page *latch* that [`in_page_order`](Self::in_page_order)
+    /// takes, which is released when the write returns. With several writers the paper prescribes a
+    /// logical undo. The metadata page acquired several writers the moment the engine ran more than
+    /// one worker, and it is rewritten **wholesale** by every committing transaction, so any two
+    /// concurrent committers' regions collide by construction.
+    ///
+    /// # Why redo-only is the SOUND answer here, field by field
+    ///
+    /// Restoring the exclusive claim (serialising every commit on this one page) and a logical undo
+    /// were both considered. Redo-only is what the reference engines do for shared derived state —
+    /// InnoDB takes a byte pre-image of no page region anywhere (its row undo is logical and its
+    /// shared structures, space header, free lists and rollback-segment header, are never undone at
+    /// all), and PostgreSQL never undoes `pg_control`, the free space map or a relation extension —
+    /// and it is sound here because every field of this image is derived, monotone, or covered by the
+    /// log:
+    ///
+    /// * **token dictionary** — append-only, so *keeping* a loser's tokens is harmless: an unused id
+    ///   is inert, while a lost one strands a committed relationship's `type_id` (`rmp` #220/#172),
+    ///   which is the direction that hurts. [`rollback_physical`](Self::rollback_physical) takes the
+    ///   same superset stance in memory.
+    /// * **`element_id_next`, `commit_ts_hw`, the stores' high-water marks** — monotone in memory,
+    ///   so a *later-sampled* image can only be ahead (`rmp` #1023).
+    /// * **free lists** — sampled COMMITTED rather than live, by the exclusion in
+    ///   [`snapshot_meta`](Self::snapshot_meta) that this task added; **device-page maps** are live
+    ///   state and never restored from an image (`rmp` #1023/#721).
+    /// * **live-record counters** — a base plus the set of transactions folded into it since `rmp`
+    ///   #1067; a loser's delta is in the log and recovery's committed set is what admits it, and the
+    ///   `_coverage` guard below stops a reclaim dropping a delta this image does not account for.
+    /// * **schema DDL** — [`committed_statistics`](Self::committed_statistics) already strips every
+    ///   *other* open transaction's pending DDL (`rmp` #734); the committing one's is the residual
+    ///   below.
+    ///
+    /// # What this argument does NOT establish, stated rather than glossed
+    ///
+    /// The monotone fields are safe against a *later-sampled* image landing last, and the durable
+    /// image is the one written LAST, which is not the one sampled last. `snapshot_meta` samples and
+    /// the chunk loop writes with nothing held in between, so `sample(I1) sample(I2) write(I2)
+    /// write(I1)` is a legal interleaving and the stale `I1` lands — `rmp` #1055, measured on 256
+    /// seeds in `crates/graphus-dst/tests/det_scheduler_checkpoint_inversion_1055.rs`. #1067 closed
+    /// that for the counters by taking them out of the image; for the tokens and the monotone marks
+    /// it is **still open**, independently of this task: a stale image lands whether its writer
+    /// commits or loses, so it was never the undo that protected them — the undo merely healed the
+    /// sub-case where the stale writer happened to be a loser AND no committed writer followed.
+    /// Closing it needs the sample and the writes to be one totally ordered step, which is `rmp`
+    /// #1084 and which cannot be a plain lock: the span contains scheduler yield points that
+    /// `det_scheduler_checkpoint_inversion_1055` attributes its whole measurement from.
+    ///
+    /// # The one residual, named rather than assumed
+    ///
+    /// `committed_statistics` keeps the **committing** transaction's own DDL by name, so an image
+    /// written by a transaction that then never commits carries that DDL, and redo-only leaves it
+    /// durable until the next catalogue write. The window is bounded rather than open-ended: a
+    /// rollback that discards its own DDL sets `catalog_dirty`
+    /// ([`rollback_physical`](Self::rollback_physical)'s `adopt_schema_from` branch — which fires
+    /// *because of* this change, since the reloaded image now differs from the corrected one), so the
+    /// next commit rewrites the catalogue without it, and the in-memory schema is corrected
+    /// immediately in either rollback flavour. What is left is a crash inside that window.
+    ///
+    /// Be precise about how much of this is new, because half of it is not. A transaction that owns a
+    /// commit slot already took [`rollback_logical`](Self::rollback_logical), which reverts no bytes
+    /// and writes an `ABORT` — so its image already stayed on the page, and the `ABORT` already kept
+    /// recovery from treating it as a loser. But a **DDL-only** transaction owns no slot, so it took
+    /// [`rollback_physical`](Self::rollback_physical), whose `compensate_one` did revert this page.
+    /// For that class the exposure IS new, and saying otherwise would be an unaudited claim.
+    ///
+    /// What closes it is the treatment `rmp` #1067 gave the counters — the DDL reaching disk as its
+    /// own logged delta, applied only for a transaction recovery finds committed — which
+    /// [`snapshot_meta`](Self::snapshot_meta) already names as a task of its own. Tracked as `rmp`
+    /// #1083, with the regression recorded there rather than left implicit.
     fn checkpoint_meta(&self, txn: TxnId, commit: bool) -> Result<()> {
         // Heal any store whose mark outruns its mapped pages BEFORE the image is built, so the floor
         // in `to_meta` is a floor and not a trap (`rmp` #1014, criterion 7).
@@ -3391,13 +3522,50 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 continue;
             }
             self.meta_chunk_writes.0.fetch_add(1, Ordering::Relaxed);
-            self.write_region(pages[i], HEADER_SIZE, &framed, txn)?;
+            // REDO-ONLY, and this is `rmp` #1063's whole fix — see the section note above
+            // [`checkpoint_meta`](Self::checkpoint_meta).
+            //
+            // A byte pre-image undo here restored a catalogue image that a **committed** transaction
+            // had already overwritten, because the metadata page has one writer per committing
+            // transaction and a pre-image may only be restored under a claim that lasts until the
+            // capturing transaction is decided. Undo == redo makes a loser's compensation a no-op, so
+            // no committed image can ever be erased by one.
+            self.write_region_keep(pages[i], HEADER_SIZE, &framed, txn)?;
         }
 
         if commit {
             self.wal.with(|w| w.commit(txn))?;
         }
         Ok(())
+    }
+
+    /// Runs `txn`'s commit-time catalogue checkpoint — the production
+    /// [`checkpoint_meta`](Self::checkpoint_meta), at the exact point
+    /// [`commit_prepare_at`](Self::commit_prepare_at) calls it — and **stops**, leaving `txn` open
+    /// with its catalogue image on the metadata page and **no `COMMIT` record appended**.
+    ///
+    /// # This exists to stage a crash, and it is not a commit
+    ///
+    /// It is the state a power loss between `checkpoint_meta` and `commit_at_no_sync` leaves behind,
+    /// reached by running the real function rather than by re-implementing it. That window is not
+    /// hypothetical: [`publish_commit_slot`](Self::publish_commit_slot) and the count-delta append sit
+    /// inside it, and a failure of the former leaves exactly this state for a later
+    /// [`rollback`](Self::rollback) to find (`rmp` #955).
+    ///
+    /// It is the only way to reach that window from a single thread, which is what makes a
+    /// reproduction of it deterministic by construction rather than by seed:
+    /// [`commit_prepare`](Self::commit_prepare) appends the `COMMIT` record before returning, so the
+    /// loser's record would sit *before* a later committer's in the log and no durable prefix could
+    /// contain the one without the other.
+    ///
+    /// Never call this on a live database: `txn` is left holding a catalogue image it has not
+    /// committed. `crates/graphus-dst/src/count_txn_undo.rs` (scenario 4) is its only caller.
+    ///
+    /// # Errors
+    /// As [`checkpoint_meta`](Self::checkpoint_meta).
+    #[doc(hidden)]
+    pub fn checkpoint_meta_for_test(&self, txn: TxnId) -> Result<()> {
+        self.checkpoint_meta(txn, false)
     }
 
     /// The transactions whose logged cardinality deltas the durable base already accounts for
@@ -3555,7 +3723,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // defect this fix closes. The page is fully initialised (header seeded, `flush_unlogged`d,
             // unpinned) before it is published, so a reader can never observe a half-built page.
             self.store(kind).device_pages.push(dev_page)?;
-            // WAL-log the record page's type+subtype header word with **undo == redo** (`rmp` #239).
+            // WAL-log the record page's type+subtype header word **redo-only** (`rmp` #239).
             //
             // The per-store device-page map (`device_pages`) is persisted only in the durable catalog at
             // a *commit*'s `checkpoint_meta`. A device page allocated solely by transactions that ABORT
@@ -3566,7 +3734,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // re-attributable after such a recovery (so a committed node's `first_rel` can still read an
             // aborted-edge dead-link corpse on an orphan page — `rmp` #220), the store-kind tag must be
             // **redo-durable**. Logging the type/subtype word here means ARIES redo restores it. Using
-            // undo == redo (a no-op on abort) keeps the tag even when the allocating txn aborts: page
+            // a redo-only record (nothing to compensate on abort) keeps the tag even when the
+            // allocating txn aborts: page
             // growth is never undone, so the page stays a tagged record page regardless of txn outcome,
             // and `reconstruct_orphan_store_pages` can rebuild `device_pages`/`high_water` on open.
             let mut hdr = [0u8; 2];
@@ -3579,10 +3748,32 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         })
     }
 
-    /// Writes `bytes` at `offset` within device `page` as one WAL-logged update under `txn` with
-    /// **undo == redo** (a no-op on abort/recovery). Used for structural writes that must persist
-    /// regardless of the writing transaction's outcome — currently the record-page type/subtype header
-    /// stamp (`rmp` #239), since page growth is never undone.
+    /// Writes `bytes` at `offset` within device `page` as one WAL-logged update under `txn` that is
+    /// **redo-only**: the record carries no undo image at all, so neither a rollback nor recovery's
+    /// undo phase compensates it. Used for writes that must persist regardless of the writing
+    /// transaction's outcome, of which there are two:
+    ///
+    /// * the record-page type/subtype header stamp (`rmp` #239), since page growth is never undone;
+    /// * the **catalogue image** on the metadata-page chain (`rmp` #1063) — see
+    ///   [`checkpoint_meta`](Self::checkpoint_meta) for why a byte pre-image there is unsound with
+    ///   more than one committing transaction, and why every field of that image tolerates a loser's
+    ///   version surviving.
+    ///
+    /// This is the primitive to reach for whenever a region has **more than one writer**: a pre-image
+    /// undo requires a claim on those bytes that lasts until the capturing transaction is decided
+    /// (ARIES, Mohan et al. 1992, §1.2), and [`in_page_order`](Self::in_page_order) is a latch, not
+    /// such a claim.
+    ///
+    /// # Why NO undo image, and not `undo == redo` (`rmp` #1063)
+    ///
+    /// It carried `undo == redo` until #1063, on the reading that re-applying the bytes it had just
+    /// written was a no-op. That reading holds for exactly one writer and fails for two: the
+    /// compensation re-applies **this** transaction's post-image, so a loser's rollback — or
+    /// recovery's undo pass — puts a stale image back over whatever a committed transaction wrote
+    /// afterwards. Measured, not argued: with the catalogue moved onto this primitive at `undo ==
+    /// redo`, `count_txn_undo`'s scenario 4 still lost the winner's token, and the recovered
+    /// catalogue was the loser's image rather than the pre-image. An **empty** undo is the only form
+    /// that is inert under both, and it is what [`WalManager::log_update_redo_only`] exists for.
     fn write_region_keep(
         &self,
         page: PageId,
@@ -3592,10 +3783,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ) -> Result<()> {
         let end = offset + bytes.len();
         assert!(end <= PAGE_SIZE, "region runs past the page");
-        // Inline patch (`rmp` #373): undo == redo, so build it once and hand the WAL a borrowed
-        // redo plus an owned undo (the only image the WAL retains). The redo never allocates.
+        // Inline patch (`rmp` #373): the redo is lent by borrow and never heap-allocates, and there
+        // is no undo image to retain.
         let redo = paging::encode_patch(offset, bytes);
-        let undo = redo.clone().into_vec();
         // PINNED before the rank-27 section opens, because a `fetch` under it could evict, write a
         // victim home and harden (`rmp` #1062; the pool asserts it).
         let f = self.pool.fetch(page)?;
@@ -3606,7 +3796,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // call. `with_page_mut_lsn` stamps `page_lsn` and applies the post-image under one write
         // latch (`rmp` #337, Slice 1).
         self.in_page_order(page, || {
-            let lsn = self.log_page_record(page, |w| w.log_update_borrowed(txn, page, &redo, undo));
+            let lsn = self.log_page_record(page, |w| w.log_update_redo_only(txn, page, &redo));
             self.pool.with_page_mut_lsn(f, lsn, |p| {
                 p[offset..end].copy_from_slice(bytes);
             });
@@ -3618,6 +3808,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Writes `bytes` at `offset` within device `page` as one WAL-logged update under `txn`:
     /// appends an `Update` record (redo = post-image patch, undo = pre-image patch), stamps the
     /// page's `page_lsn`, and applies the post-image to the cached page (`04 §4.1`).
+    ///
+    /// **Single-writer only.** The pre-image undo is sound only while no other transaction may write
+    /// this region before `txn` is decided (ARIES, Mohan et al. 1992, §1.2) — which for the record
+    /// stores is what `ensure_no_conflicting_writer` and the entity-granularity conflict check give,
+    /// and which shared structures do not have. For those use
+    /// [`write_region_keep`](Self::write_region_keep); `rmp` #1063 is what a shared region cost here.
     ///
     /// The WAL borrow is released before any pool write path runs, so the pool's WAL rule can
     /// re-borrow the shared manager safely (see [`crate::wal_rule`]).
@@ -10161,7 +10357,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         //
         // 1. **Page growth is never undone.** A device page allocated by a transaction that then aborts
         //    stays allocated and stays attributed to its store (its type/subtype header word is
-        //    WAL-logged with `undo == redo` for exactly this reason, `rmp` #239). So the durable
+        //    WAL-logged redo-only for exactly this reason, `rmp` #239). So the durable
         //    catalog's map is always a PREFIX of the live map, never a correction of it: rebuilding from
         //    it would only throw away the tail, which the caller then had to laboriously re-append.
         // 2. **Readers hold it.** The map is shared live with every in-flight off-thread reader
@@ -17539,7 +17735,19 @@ mod tests {
         s.delete_node(t2, doomed_a).expect("delete");
         s.delete_node(t2, doomed_b).expect("delete");
         s.commit(t2).expect("commit");
-        s.gc(TxnId(9), Timestamp(u64::MAX)).expect("gc");
+        // The GC pass is BEGUN and COMMITTED, as `gc`'s own contract requires ("the prune applies
+        // when `txn` commits and is discarded if `txn` rolls back") and as the DST harness drives it
+        // (`crates/graphus-dst/src/harness.rs`, `gc_after_recovery`). This fixture used to call `gc`
+        // bare, leaving the pass permanently OPEN, and then relied on an **uncommitted** transaction's
+        // frees reaching the durable catalogue. Since `rmp` #1063 they do not: `snapshot_meta` samples
+        // the COMMITTED free lists, so an open pass's frees are stripped from the image exactly as an
+        // open transaction's counts (`rmp` #866) and DDL (`rmp` #734) already were. Committing the
+        // pass is what production does, and it makes this fixture's premise stronger rather than
+        // weaker — the durable list below now holds a slot whose reclamation actually committed.
+        let gc_txn = TxnId(9);
+        s.begin(gc_txn);
+        s.gc(gc_txn, Timestamp(u64::MAX)).expect("gc");
+        s.commit(gc_txn).expect("the gc pass commits");
         // Checkpoint so the DURABLE catalog carries a freed slot. A read-only commit writes no catalog
         // (`rmp` #529), so this transaction must actually change something — and because a create
         // REUSES a freed slot, two were freed above so that one still remains listed afterwards. With

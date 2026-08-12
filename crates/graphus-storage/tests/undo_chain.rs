@@ -656,7 +656,7 @@ fn the_wal_cost_of_a_created_entity_stays_within_its_budget() {
 // ============================================================================================
 
 /// A store must reopen when `undo.store` has an **orphan** page: one a transaction allocated and then
-/// aborted, so it exists on the device (its store-kind subtype byte is WAL-logged with `undo == redo`,
+/// aborted, so it exists on the device (its store-kind subtype byte is WAL-logged redo-only,
 /// because page growth is never undone) but no durable catalog maps it.
 ///
 /// # What this covers, and — precisely — what it does not

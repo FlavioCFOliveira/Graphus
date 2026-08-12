@@ -28,7 +28,7 @@
 //!
 //! **A store's page map is monotone: entries are only ever APPENDED, and an existing entry is never
 //! remapped, moved or removed.** Page growth is never undone — not by a rollback (the record-page
-//! type stamp is WAL-logged with `undo == redo` precisely so an aborted allocator's page survives,
+//! type stamp is WAL-logged redo-only precisely so an aborted allocator's page survives,
 //! `rmp` #239), and not by GC (slots are reused; pages are not returned to the device).
 //!
 //! So resolving a record id against the **live** map is not merely safe, it is the only self-consistent

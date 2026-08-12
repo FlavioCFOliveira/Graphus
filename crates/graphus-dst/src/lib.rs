@@ -89,9 +89,10 @@ pub use cli::{CliConfig, run, summarize};
 // The `rmp` #866 live-record-count undo scenarios (the counts-half twin of `catalog_rollback_undo`).
 // They reuse that module's `Crash` enum, re-exported above, so a caller drives both with one type.
 pub use count_txn_undo::{
-    BystanderEnding, CheckpointFaultReport, CommitRecordFate, CountReport, Counters,
-    StolenCheckpointReport, run_crash_between_checkpoint_and_commit_harden,
-    run_io_error_at_catalog_checkpoint, run_stolen_pages_vs_checkpointed_counts,
+    BystanderEnding, CatalogUndoReport, CheckpointFaultReport, CommitRecordFate, CountReport,
+    Counters, StolenCheckpointReport, run_crash_between_checkpoint_and_commit_harden,
+    run_io_error_at_catalog_checkpoint, run_loser_catalogue_undo_over_a_committed_image,
+    run_stolen_pages_vs_checkpointed_counts,
 };
 pub use fault::{DeferredFault, FaultKind};
 pub use freelist_reuse::{

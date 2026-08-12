@@ -13,7 +13,7 @@ pub const HEADER_SIZE: usize = 24;
 const OFF_CHECKSUM: usize = 0; // u32
 /// Byte offset of the 4-byte type/flags word: low byte = page type, second byte = subtype (store
 /// kind for record pages, `rmp` #239), remaining bytes reserved flags. Public so the storage layer
-/// can WAL-log the type/subtype stamp at offset (a redo-durable, undo == redo structural write).
+/// can WAL-log the type/subtype stamp at offset (a redo-durable, redo-only structural write).
 pub const OFF_PAGE_TYPE: usize = 4; // u32 (low byte = type)
 const OFF_PAGE_LSN: usize = 8; // u64
 const OFF_PAGE_ID: usize = 16; // u64

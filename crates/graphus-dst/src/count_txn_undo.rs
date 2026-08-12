@@ -794,6 +794,205 @@ pub fn run_crash_between_checkpoint_and_commit_harden(
 }
 
 // -------------------------------------------------------------------------------------------------
+// Scenario 4 — a loser's catalogue undo, over a CONCURRENTLY COMMITTED image (`rmp` #1063)
+// -------------------------------------------------------------------------------------------------
+
+/// The label the LOSER interns. It never commits, so this token must **not** be in the recovered
+/// catalogue — the other half of the property, asserted so a fix cannot buy the first half by simply
+/// never undoing anything.
+const LOSER_LABEL: &str = "LoserOnly";
+/// The label the WINNER interns. Its transaction commits and hardens, so this token **must** be in
+/// the recovered catalogue: a token is catalog-only state, durable through `checkpoint_meta` and
+/// through nothing else.
+const WINNER_LABEL: &str = "WinnerOnly";
+
+/// What [`run_loser_catalogue_undo_over_a_committed_image`] observed.
+///
+/// The oracle is a **token**, deliberately, and not a counter. Since `rmp` #1067 the durable
+/// counters are a base plus the logged deltas the base does not name, so a reverted catalogue image
+/// no longer costs a count — the log covers it. A token dictionary has no log record: it reaches
+/// disk inside the catalogue image and nowhere else (`RecordStore::intern_token`), so it is exactly
+/// the state that a reverted image loses for good.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogUndoReport {
+    /// The winner's token as the LIVE catalogue held it after its commit was acknowledged and
+    /// before the crash. `None` means the workload never interned it and the run is vacuous.
+    pub winner_token_live: Option<u32>,
+    /// The winner's token in the catalogue a REOPEN recovered. Must equal `winner_token_live`.
+    pub winner_token_recovered: Option<u32>,
+    /// The loser's token in the recovered catalogue.
+    ///
+    /// **Reported, deliberately not asserted.** A token is append-only and a SUPERSET is the
+    /// documented stance of this store — `RecordStore::rollback_physical` preserves a rolled-back
+    /// transaction's tokens in memory for exactly that reason, because an unused id is harmless while
+    /// a lost one strands a committed relationship's `type_id` (`rmp` #220/#172). So an aborted
+    /// transaction's token surviving is not a failure, and pinning it either way would pin an
+    /// implementation detail instead of a property. What must NOT survive is the loser's *rows*,
+    /// which [`loser_rows_reverted`](Self::loser_rows_reverted) asserts.
+    pub loser_token_recovered: Option<u32>,
+    /// Live nodes the recovered store counts. Must be exactly the seed's plus the winner's — the
+    /// witness that undo still did its job on everything the loser is actually accountable for, and
+    /// therefore that the property above was not bought by disabling undo.
+    pub recovered_total_nodes: u64,
+    /// The same number obtained by an independent live re-scan of the recovered store, so a wrong
+    /// counter cannot agree with a wrong scan.
+    pub recovered_total_nodes_rescan: u64,
+    /// What both of those must be: one seed node plus the winner's.
+    pub expected_total_nodes: u64,
+    /// The label token ids the recovered store reads back for the node the WINNER created. The
+    /// record itself is redo-durable, so this stays populated even when the catalogue that names
+    /// the token is reverted — which is what makes the loss a *dangling* label rather than a
+    /// missing row.
+    pub winner_node_labels_recovered: Vec<u32>,
+    /// Metadata-page chunks the LOSER's `checkpoint_meta` WROTE. Zero means it logged no catalogue
+    /// update at all and there is no undo record to be wrong about.
+    pub loser_meta_chunk_writes: u64,
+    /// Metadata-page chunks the WINNER's commit WROTE. Zero means the winner's image never reached
+    /// the page, so the loser's undo had nothing of the winner's to erase.
+    pub winner_meta_chunk_writes: u64,
+    /// Loser transactions ARIES undo rolled back. Must be `> 0`.
+    pub recovery_losers: usize,
+    /// Compensation records undo wrote — the witness that undo did real work.
+    pub recovery_clrs: usize,
+    /// Whether recovery stopped at a torn tail. Must be `false`: nothing is truncated here, the
+    /// loser simply never appended a COMMIT record.
+    pub recovery_tail_truncated: bool,
+}
+
+impl CatalogUndoReport {
+    /// **The property.** A committed transaction's catalogue state survives a concurrent loser's
+    /// undo, and the loser's rows still do not.
+    #[must_use]
+    pub fn holds(&self) -> bool {
+        self.winner_survives() && self.loser_rows_reverted()
+    }
+
+    /// The winner's committed token is in the recovered catalogue.
+    #[must_use]
+    pub fn winner_survives(&self) -> bool {
+        self.winner_token_live.is_some() && self.winner_token_recovered == self.winner_token_live
+    }
+
+    /// The loser's rows are absent from the recovered store, by both oracles.
+    #[must_use]
+    pub fn loser_rows_reverted(&self) -> bool {
+        self.recovered_total_nodes == self.expected_total_nodes
+            && self.recovered_total_nodes_rescan == self.expected_total_nodes
+    }
+}
+
+/// Drives `rmp` #1063: **a loser's physical catalogue undo, applied over a committed transaction's
+/// image.**
+///
+/// # The interleaving, and why it needs no scheduler
+///
+/// ```text
+///   L: checkpoint_meta   -> Update(META, redo = I_L, undo = P0)     ... and STOPS (no COMMIT)
+///   W: commit            -> Update(META, redo = I_W, undo = I_L), COMMIT, fdatasync
+///   crash
+///   recovery: redo I_L, redo I_W  => the page holds I_W
+///             undo L (a loser)    => the page holds P0
+/// ```
+///
+/// `P0` predates **both** transactions, and `W` is committed and acknowledged. This is the ARIES
+/// precondition stated in the negative (Mohan et al. 1992, §1.2 and §6.4): a byte pre-image may be
+/// restored only while nobody else may have written those bytes since it was captured, which is a
+/// **commit-duration** exclusive claim and not the page latch `write_region` takes. The metadata
+/// page has as many writers as there are committing transactions.
+///
+/// The order is what makes it reachable, and it is the opposite of
+/// [`run_crash_between_checkpoint_and_commit_harden`]'s: there the loser checkpoints LAST, so its
+/// pre-image *is* the winner's image and restoring it is correct. Here the loser checkpoints FIRST.
+/// That ordering cannot be staged by tearing the log tail — the loser's `COMMIT` record would then
+/// precede the winner's in the log, and a durable prefix holding the winner's cannot omit it — so
+/// the loser is stopped where a crash would stop it, through
+/// [`RecordStore::checkpoint_meta_for_test`], which runs the production `checkpoint_meta` at the
+/// point `commit_prepare_at` calls it.
+///
+/// # Panics
+///
+/// Panics if any store operation that is expected to succeed fails, or if the recovered store
+/// cannot be opened at all — which is itself a failure of this property, in its loudest form.
+#[must_use]
+pub fn run_loser_catalogue_undo_over_a_committed_image(crash: Crash) -> CatalogUndoReport {
+    let store = create_store(POOL_CAPACITY);
+
+    // ---- P0: a committed baseline catalogue, hardened. ----
+    let t0 = TxnId(1);
+    store.begin(t0);
+    let person = store
+        .intern_token(Namespace::Label, SEED_LABEL)
+        .expect("intern the seed label");
+    let (seed_node, _) = store.create_node(t0).expect("seed node");
+    store
+        .add_label(t0, seed_node, person)
+        .expect("label the seed node");
+    store.commit(t0).expect("the seed commits");
+    store.flush().expect("flush the seed");
+    store.with_wal(WalManager::flush);
+
+    // ---- L, the LOSER: catalogue image written, no COMMIT record. ----
+    let loser = TxnId(2);
+    store.begin(loser);
+    let loser_token = store
+        .intern_token(Namespace::Label, LOSER_LABEL)
+        .expect("intern the loser's label");
+    let (loser_node, _) = store.create_node(loser).expect("the loser's node");
+    store
+        .add_label(loser, loser_node, loser_token)
+        .expect("label the loser's node");
+    let before_loser = store.meta_chunk_writes().0;
+    store
+        .checkpoint_meta_for_test(loser)
+        .expect("the loser's catalogue checkpoint");
+    let loser_meta_chunk_writes = store.meta_chunk_writes().0 - before_loser;
+
+    // ---- W, the WINNER: a whole commit, hardened, over the loser's image. ----
+    let winner = TxnId(3);
+    store.begin(winner);
+    let winner_token = store
+        .intern_token(Namespace::Label, WINNER_LABEL)
+        .expect("intern the winner's label");
+    let (winner_node, _) = store.create_node(winner).expect("the winner's node");
+    store
+        .add_label(winner, winner_node, winner_token)
+        .expect("label the winner's node");
+    let before_winner = store.meta_chunk_writes().0;
+    store.commit(winner).expect("the winner commits");
+    let winner_meta_chunk_writes = store.meta_chunk_writes().0 - before_winner;
+    // ACK-AFTER-FSYNC: the winner's COMMIT record is durable from here, so everything appended
+    // before it — the loser's catalogue update included — is durable too (a log is a prefix).
+    store.with_wal(WalManager::flush);
+
+    // Read out of the LIVE store, before the crash, so a missing token afterwards cannot be blamed
+    // on the workload never having interned it.
+    let winner_token_live = store.token_id(Namespace::Label, WINNER_LABEL);
+
+    // ---- The crash. Nothing is truncated: the loser has no COMMIT record to tear. ----
+    let (mut recovered, report) = match crash {
+        Crash::NoForce => crash_no_force(&store, 0, POOL_CAPACITY),
+        Crash::Steal => crash_steal(store, 0, POOL_CAPACITY),
+    };
+
+    CatalogUndoReport {
+        winner_token_live,
+        winner_token_recovered: recovered.token_id(Namespace::Label, WINNER_LABEL),
+        loser_token_recovered: recovered.token_id(Namespace::Label, LOSER_LABEL),
+        winner_node_labels_recovered: recovered.node_labels(winner_node).unwrap_or_default(),
+        recovered_total_nodes: recovered.statistics().total_nodes(),
+        recovered_total_nodes_rescan: Counters::by_rescan(&mut recovered).total_nodes,
+        // The seed's node and the winner's. From the workload's constants, not from anything the
+        // run counted.
+        expected_total_nodes: 2,
+        loser_meta_chunk_writes,
+        winner_meta_chunk_writes,
+        recovery_losers: report.losers,
+        recovery_clrs: report.clrs_written,
+        recovery_tail_truncated: report.tail_truncated,
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
 // Crash + recovery spine (mirrors `catalog_rollback_undo`'s, with the recovery report retained)
 // -------------------------------------------------------------------------------------------------
 
@@ -1047,6 +1246,78 @@ mod tests {
         }
     }
 
+    /// **`rmp` #1063.** A committed transaction's catalogue image must survive a concurrent loser's
+    /// undo — and the loser's own catalogue state must still revert.
+    ///
+    /// This is the half [`a_torn_commit_record_reverts_the_checkpointed_counts`] cannot reach. That
+    /// test proves the loser's OWN checkpoint reverts; it says nothing about what the reversion does
+    /// to a neighbour, because its loser checkpoints LAST and its pre-image therefore *is* the
+    /// committed image. Here the loser checkpoints FIRST, so its pre-image predates the winner.
+    #[test]
+    fn a_losers_catalogue_undo_never_erases_a_committed_image() {
+        for crash in [Crash::NoForce, Crash::Steal] {
+            let report = run_loser_catalogue_undo_over_a_committed_image(crash);
+            // Non-vacuity first: without these the property below could pass on a run in which the
+            // two transactions never contended for the metadata page at all.
+            assert!(
+                report.loser_meta_chunk_writes > 0,
+                "{crash:?}: the loser's `checkpoint_meta` wrote no metadata chunk, so it logged no \
+                 catalogue update and there is no undo record under test: {report:?}"
+            );
+            assert!(
+                report.winner_meta_chunk_writes > 0,
+                "{crash:?}: the winner's commit wrote no metadata chunk, so its catalogue image \
+                 never reached the page and the loser's undo had nothing of the winner's to \
+                 erase: {report:?}"
+            );
+            assert!(
+                report.recovery_losers > 0 && report.recovery_clrs > 0,
+                "{crash:?}: recovery undid nothing, so the loser was not a loser and this run \
+                 exercises no undo: {report:?}"
+            );
+            assert!(
+                !report.recovery_tail_truncated,
+                "{crash:?}: the durable log was torn. Nothing is truncated in this scenario — the \
+                 loser never appends a COMMIT record — so a tear means the harness lost bytes the \
+                 winner was acknowledged on: {report:?}"
+            );
+            assert!(
+                report.winner_token_live.is_some(),
+                "{crash:?}: the winner's token was not in the LIVE catalogue before the crash, so \
+                 the workload never interned it: {report:?}"
+            );
+            // The record itself is redo-durable, so a reverted catalogue leaves a node whose label
+            // bit names a token the dictionary no longer has. Asserted separately, because it is
+            // what makes the loss a dangling reference rather than a missing row.
+            assert!(
+                !report.winner_node_labels_recovered.is_empty(),
+                "{crash:?}: the winner's node came back with no label at all, so redo did not \
+                 restore its record and the catalogue is not what this test is measuring: \
+                 {report:?}"
+            );
+            // THE PROPERTY.
+            assert!(
+                report.winner_survives(),
+                "{crash:?}: a COMMITTED, acknowledged transaction's catalogue state was erased by \
+                 a concurrent LOSER's physical undo (`rmp` #1063). The loser's `checkpoint_meta` \
+                 captured a byte pre-image of the metadata page, the winner overwrote that page and \
+                 committed, and recovery then restored the loser's pre-image over it — leaving a \
+                 catalogue OLDER than both while the winner is committed. A token reaches disk only \
+                 inside this image, so this is permanent: the winner's node keeps a label bit \
+                 naming a token the dictionary no longer holds. ARIES (Mohan et al. 1992) permits a \
+                 physical undo only under a commit-duration exclusive claim on the undone bytes; \
+                 the metadata page has one writer per committing transaction: {report:?}"
+            );
+            // THE OTHER HALF, and it is what stops the property above from being satisfied by a
+            // build that simply stopped undoing: the loser's rows must still be gone.
+            assert!(
+                report.loser_rows_reverted(),
+                "{crash:?}: the LOSER's rows survived recovery, so undo did not roll it back at \
+                 all — whatever the winner's catalogue did: {report:?}"
+            );
+        }
+    }
+
     /// Same input ⇒ identical report, for every runner (no clock, no threads, no randomness).
     #[test]
     fn reproduction_is_deterministic() {
@@ -1072,6 +1343,13 @@ mod tests {
                     "{fate:?}/{crash:?}: the torn-COMMIT reproduction is not deterministic"
                 );
             }
+        }
+        for crash in [Crash::NoForce, Crash::Steal] {
+            assert_eq!(
+                run_loser_catalogue_undo_over_a_committed_image(crash),
+                run_loser_catalogue_undo_over_a_committed_image(crash),
+                "{crash:?}: the `rmp` #1063 catalogue-undo reproduction is not deterministic"
+            );
         }
     }
 }
