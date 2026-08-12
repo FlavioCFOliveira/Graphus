@@ -1155,15 +1155,20 @@ fn the_concurrent_history_has_no_isolation_anomaly() {
 /// clean [`ConsistencyReport`] is required, and the live counts are printed so the run records what
 /// was actually there rather than only that nothing was broken.
 #[test]
-// HANGS TODAY, AND THAT IS THE FINDING (`rmp` #1054). At `engine_workers = 8` one engine worker
-// spins at 105 % CPU for more than 10 minutes while its 7 siblings, the reader threads, the walsync
-// thread and all 16 client threads sit in `futex_wait` — no progress, no timeout, no error. The
-// IDENTICAL workload finishes in 2.0 s at `engine_workers = 1`. It is ignored rather than left to
-// run because a hang has no failure to report: it would wedge the suite instead of failing it.
+// USED TO HANG, AND THAT WAS THE FINDING (`rmp` #1054, now FIXED — the `#[ignore]` is gone with it).
+// At `engine_workers = 8` one engine worker spun at 105 % CPU for more than ten minutes while its 7
+// siblings, the reader threads, the walsync thread and all 16 client threads sat in `futex_wait` — no
+// progress, no timeout, no error — against 2.0 s at `engine_workers = 1` for the IDENTICAL workload.
 //
-// Ignored by an EXPLICIT decision of the project owner (2026-08-11) — see the note two gates above
-// for the terms. #1054 removes this attribute and may not close while it is still here.
-#[ignore = "rmp #1054: wedges at engine_workers > 1; un-ignored by the task that fixes it"]
+// The spin was `RecordStore::unlink_side_with`'s publication retry. It decided headship from the
+// relationship's own back-pointer (`prev == NULL_ID` ⇒ "I am the head") rather than from the node's
+// `first_rel`, so when three separate writers of a `prev` word — a relink writing the side it did not
+// own, a relink declining to write the side it did, and a neighbour repoint writing the record whole
+// from a stale image — left that word naming nobody while the head word named somebody else, the
+// compare-and-publish was refused for ever and the re-read could not change it. Headship now comes
+// from the node, every writer of a chain word goes through one latched primitive, and the predecessor
+// is derived from the forward chain when the back-pointer cannot supply it; the retry is bounded by
+// `graphus_chainhead::MAX_ATTEMPTS` and fails loudly rather than spinning.
 fn the_store_is_physically_consistent_after_a_concurrent_write_storm() {
     const HUBS: i64 = 6;
     const PER_CLIENT: i64 = 30;

@@ -9729,9 +9729,47 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Points the `prev` pointer of `old_head`'s **head link** at `new_id` and clears its
     /// first-in-chain marker. Used when pushing a new head onto `node`'s chain.
     ///
-    /// Only the link whose `prev == NULL` (the current head) is repointed — crucial for a
-    /// self-loop `old_head`, where both sides face `node` but only one side is the head link; the
-    /// other side's `prev` must keep pointing to the head link inside the same record.
+    /// Exactly one link is repointed: the side of `old_head` that faces `node` (for a self-loop, the
+    /// one that is the head link). The other side's `prev` belongs to a different chain and is not
+    /// this writer's to touch — see the ownership rule below.
+    ///
+    /// # This writer owns ONE word, writes it, and writes nothing else (`rmp` #1054)
+    ///
+    /// [`graphus_chainhead`] states the ownership rule the whole protocol rests on: *only* the
+    /// publisher whose compare-and-publish succeeded with `expect == old_head` displaced `old_head`,
+    /// so only that publisher repairs its back-pointer, and two writers can never repair the same
+    /// one. This function used to break that rule in **both** directions, and each break produced the
+    /// same corrupt state — a record whose `prev` is `NULL` while the node's `first_rel` names
+    /// somebody else.
+    ///
+    /// * **It wrote a word it does not own.** The post-images of `start_prev` *and* `end_prev` were
+    ///   computed from one unlatched `read_rel` and then both were written back, so the side facing
+    ///   the *other* endpoint was re-written with a stale value. A relationship is the head of **two**
+    ///   chains — its start node's and its end node's — so two transactions prepending to those two
+    ///   nodes both displace this record, and each blind write-back clobbered the other's repair.
+    ///   That is the identical lost update [`clear_chain_first_flags`](Self::clear_chain_first_flags)
+    ///   exists to prevent for the `chain_flags` byte; the two `prev` words were left exposed to it.
+    ///   Observed directly: `old_head=4 node=5 new_id=7 -> end_prev=7` followed by
+    ///   `old_head=4 node=4 new_id=3 -> start_prev=3 end_prev=0`, the second writer's stale
+    ///   `end_prev=0` erasing the first writer's `end_prev=7`.
+    ///
+    /// * **It declined to write the word it does own.** The write was guarded on
+    ///   `<side>_prev_rel == NULL_ID`. That guard is not a test of *whether this writer displaced the
+    ///   record* — it already knows it did — but of whether the back-pointer happens to be in the
+    ///   shape a quiet system would leave it in. It is legitimately **not** in that shape while a
+    ///   concurrent unlink of the previous head has published `first_rel := old_head` but not yet
+    ///   repaired `old_head.prev`. The guard then skipped, that unlink's repair landed afterwards and
+    ///   set `prev := NULL`, and the record was left claiming a headship `first_rel` denies. Writing
+    ///   unconditionally makes the two orders agree: this writer's store is unconditional and the
+    ///   unlink's is conditional on `prev == <the record it is removing>`, so whichever lands second
+    ///   is the one that is right.
+    ///
+    /// The self-loop discriminator no longer uses `prev == NULL` for the same reason — a
+    /// not-yet-repaired back-pointer must not be mistaken for "this is the other side". A self-loop
+    /// threads into the one chain twice (`create_rel`'s self-loop branch) with the **end** side as the
+    /// head link and the **start** side's `prev` naming this very record, so "does not name itself" is
+    /// the property that picks the head link, and it holds no matter what a concurrent writer has or
+    /// has not repaired yet.
     fn relink_old_head(&self, old_head: u64, node: u64, new_id: u64, txn: TxnId) -> Result<()> {
         let old = self.read_rel(old_head)?;
         // Recompute the exact post-image of the two back-pointer fields and the flags byte, then write
@@ -9751,88 +9789,48 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // head's `prev == NULL` / first-in-chain flag, making it look like the chain head and letting GC
         // reclaim it on top of a committed prepend. The GC corpse splice re-points `prev`/flags back to
         // head form when the new (loser) record becomes a corpse.
-        let mut start_prev = old.start_prev_rel;
-        let mut end_prev = old.end_prev_rel;
-        // The bits this relink is responsible for clearing. Collected as a MASK rather than as a
-        // finished byte, because the byte is shared with the other side of this record and must be
-        // updated by an atomic clear — see `clear_chain_first_flags` (`rmp` #1028).
-        let mut clear = 0u8;
-        if old.start_node == node && old.start_prev_rel == NULL_ID {
-            start_prev = new_id;
-            clear |= CHAIN_FLAG_START_FIRST;
+        // Which side of `old_head` this writer displaced, and therefore which single `prev` word it
+        // owns. `start_node`/`end_node` are immutable for a live relationship, so this is decided from
+        // facts the unlatched read cannot have stale — never from a back-pointer another writer may be
+        // repairing right now (`rmp` #1054; see the ownership section above).
+        let start_faces = old.start_node == node;
+        let end_faces = old.end_node == node;
+        let (relink_start, relink_end) = if start_faces && end_faces {
+            // Self-loop: both sides face `node`, and the start side's `prev` names this very record.
+            (old.start_prev_rel != old_head, old.end_prev_rel != old_head)
+        } else {
+            (start_faces, end_faces)
+        };
+        // ONE latched critical section for the back-pointer word AND the marker bit that goes with it
+        // (`rmp` #1054). The marker has always needed the rank-27 latch — the byte is shared with the
+        // other side of this record, so clearing it is a read-modify-write two writers can lose (`rmp`
+        // #1028) — and the word beside it needs the same latch for the same kind of reason: the
+        // conditional repair in `repoint_neighbour` compares that word, and a comparison is sound only
+        // while every writer of the word goes through it. Writing the two together also closes the
+        // window in which the pointer had moved and the marker had not.
+        let mut ops: [ChainWordWrite; 2] = [ChainWordWrite::NONE; 2];
+        let mut n = 0;
+        if relink_start {
+            ops[n] = ChainWordWrite {
+                field_off: REL_OFF_START_PREV,
+                expect: None,
+                value: new_id,
+                set_flag: 0,
+                clear_flag: CHAIN_FLAG_START_FIRST,
+            };
+            n += 1;
         }
-        if old.end_node == node && old.end_prev_rel == NULL_ID {
-            end_prev = new_id;
-            clear |= CHAIN_FLAG_END_FIRST;
+        if relink_end {
+            ops[n] = ChainWordWrite {
+                field_off: REL_OFF_END_PREV,
+                expect: None,
+                value: new_id,
+                set_flag: 0,
+                clear_flag: CHAIN_FLAG_END_FIRST,
+            };
+            n += 1;
         }
-        self.write_field_redo_only(
-            StoreKind::Rel,
-            old_head,
-            REL_OFF_START_PREV,
-            &start_prev.to_le_bytes(),
-            txn,
-        )?;
-        self.write_field_redo_only(
-            StoreKind::Rel,
-            old_head,
-            REL_OFF_END_PREV,
-            &end_prev.to_le_bytes(),
-            txn,
-        )?;
-        self.clear_chain_first_flags(old_head, clear, txn)?;
-        Ok(())
-    }
-
-    /// Clears the bits of `mask` in relationship `rel_id`'s `chain_flags` byte, as one **atomic
-    /// read-modify-write** (`rmp` #1028).
-    ///
-    /// # Why this is not a `write_field_redo_only` of a byte the caller computed
-    ///
-    /// `chain_flags` packs BOTH sides' first-in-chain markers ([`CHAIN_FLAG_START_FIRST`],
-    /// [`CHAIN_FLAG_END_FIRST`]) into one byte, and one relationship can be the head of **two
-    /// different nodes' chains** — its start node's and its end node's. Two writers prepending to
-    /// those two nodes therefore both displace this record and both clear a bit of this one byte.
-    /// Computed outside and written whole, that is a textbook lost update: each reads `0b11`, each
-    /// clears its own bit, each writes its own result, and whichever lands second resurrects the
-    /// other's marker. A record that still claims first-in-chain while a committed prepend sits above
-    /// it is precisely what lets the GC reclaim it as a head (`rmp` #220 / #239).
-    ///
-    /// The head word's compare-and-publish does not cover this: different word, different record. So
-    /// the read, the clear and the write run under the same rank-27 shard latch a publication uses —
-    /// keyed on the record being modified — which also puts the redo record in the log in the order
-    /// the byte actually changed. Taking a **mask** rather than a finished byte is what makes the
-    /// operation commutative: two clears of disjoint bits compose to the same result in either order.
-    ///
-    /// # Errors
-    /// Returns a storage error if the record's page cannot be mapped, fetched or written.
-    fn clear_chain_first_flags(&self, rel_id: u64, mask: u8, txn: TxnId) -> Result<()> {
-        if mask == 0 {
-            return Ok(());
-        }
-        let (rel_page, off) = paging::record_location(rel_id, StoreKind::Rel.record_size());
-        let dev = self.device_page(StoreKind::Rel, rel_page)?;
-        let abs = off + REL_OFF_CHAIN_FLAGS;
-        // Pinned before the latch, for the reason `compare_and_publish_chain_head` pins before it: a
-        // `fetch` under a rank-27 hold could evict, write home and harden.
-        let f = self.pool.fetch(dev)?;
-        {
-            // No hand-off while the shard lock is held — see `compare_and_publish_chain_head` for the
-            // measured stall this prevents (`rmp` #1030).
-            let _no_switch = graphus_core::sched::NoSwitchScope::new();
-            let _guard = self
-                .chain_head_shard(StoreKind::Rel, rel_id)
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _scope = graphus_core::latch::ChainHeadLatchScope::new();
-            let current = self.pool.with_page(f, |p| p[abs]);
-            let flags = current & !mask;
-            if flags != current {
-                let redo = paging::encode_patch(abs, &[flags]);
-                let lsn = self.wal.with(|w| w.log_update_redo_only(txn, dev, &redo));
-                self.pool.with_page_mut_lsn(f, lsn, |p| p[abs] = flags);
-            }
-        }
-        self.pool.unpin(f);
+        self.patch_chain_words(old_head, &ops[..n], txn)?;
         Ok(())
     }
 
@@ -10525,6 +10523,21 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// The node's `first_rel` is the authoritative statement of headship, so it is what decides. This
     /// is the same re-derive-from-the-live-walk discipline `gc_splice_corpses` already applies for the
     /// same reason (see its module comment, hazard 1).
+    ///
+    /// **And it decides on its own** (`rmp` #1054). The test used to be
+    /// `prev == NULL_ID || (prev != id && first_rel == id)`, whose first disjunct hands the decision
+    /// back to the very back-pointer the paragraphs above declare untrustworthy — and hands it back in
+    /// the one direction that does not terminate. `prev == NULL` while `first_rel` names another
+    /// record makes this claim headship, publish against `expect == id`, be refused *because that is
+    /// exactly what the head word says*, and then re-read the **relationship** — a different word from
+    /// the one the refusal was about, and one that no other thread has any reason to change. The loop
+    /// then repeats that forever at full CPU. See [`relink_old_head`](Self::relink_old_head) for the
+    /// two writers that produced the state.
+    ///
+    /// # Errors
+    /// Returns a storage error if a record cannot be read or written; if the back-pointer and the head
+    /// word disagree (see above); or if the publication is refused
+    /// [`graphus_chainhead::MAX_ATTEMPTS`] times.
     fn unlink_side_with(
         &self,
         id: u64,
@@ -10537,13 +10550,21 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // a refusal means the chain moved and every conclusion drawn from the old image — headship,
         // `prev`, `next` — was drawn from a state that no longer exists.
         let mut current = *rel;
-        loop {
-            let (prev, next) = current.chain_pointers(side);
+        for _ in 0..graphus_chainhead::MAX_ATTEMPTS {
+            let (prev_word, _) = current.chain_pointers(side);
+            let first_rel = self.read_node(node)?.first_rel;
+            // THE NODE DECIDES, AND NOTHING ELSE DOES (`rmp` #1054). This used to short-circuit on
+            // `prev == NULL_ID` — "my own back-pointer names no predecessor, so I am the head" — and
+            // that disjunct is what made this loop non-terminating. `prev` is a back-pointer another
+            // writer repairs, so it can say `NULL` while `first_rel` names somebody else; the
+            // compare-and-publish below then expects `id`, is refused for exactly that reason, and the
+            // re-read re-reads THE RELATIONSHIP — a different word from the one the refusal was about,
+            // and one nothing is going to change. One engine worker burned 105 % CPU there for over
+            // ten minutes while its seven siblings and all sixteen clients sat in `futex_wait`.
+            //
             // `prev != id` excludes a self-loop's NON-head link, whose `prev` names the record itself:
-            // both of its sides face `node`, so `first_rel == id` alone cannot tell them apart, and
-            // only the side the relink actually touched (the one whose `prev` was `NULL`) is the
-            // stale head.
-            let is_head = prev == NULL_ID || (prev != id && self.read_node(node)?.first_rel == id);
+            // both of its sides face `node`, so `first_rel == id` alone cannot tell them apart.
+            let is_head = prev_word != id && first_rel == id;
             if is_head {
                 // PUBLISH ONLY THE WORD, CONDITIONALLY (`rmp` #1030). This used to read the whole
                 // `NodeRecord` and write it back with `first_rel` replaced — a read-modify-write of
@@ -10557,15 +10578,17 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 // Under the rank-27 latch the word cannot move — but the read that DECIDED headship
                 // happens outside it, three lines up. Between that read and this publication another
                 // writer can prepend, which makes `first_rel` name the new entry and this record no
-                // longer the head; an unconditional store would then publish `next` over the new
-                // head and drop the entry that writer just linked in. So `expect` is this record
-                // itself, and a refusal is not an error — it is the news that this is no longer the
-                // head. The unlink re-reads and starts again, and on the next pass takes the
-                // neighbour branch, which is the correct treatment for a non-head record.
+                // longer the head; an unconditional store would then publish `next` over the new head
+                // and drop the entry that writer just linked in. So `expect` is this record itself,
+                // and a refusal is not an error — it is the news that this is no longer the head.
                 //
-                // This terminates: a refusal means some other writer completed a publication, and a
-                // record can only stop being the head once — nothing puts it back at the front while
-                // this unlink is in progress, because the entry is being removed from the chain.
+                // This terminates, and now for a reason the loop can hold: headship is read from
+                // `first_rel`, the very word the compare-and-publish compares. A refusal means
+                // `first_rel` no longer names `id`, so the next pass reads that and takes the
+                // neighbour branch — the correct treatment for a non-head record. Nothing puts the
+                // record back at the front while this unlink is in progress, so the branch cannot
+                // flip back (`rmp` #1054).
+                let (_, next) = current.chain_pointers(side);
                 if !self.compare_and_publish_chain_head(
                     StoreKind::Node,
                     node,
@@ -10577,21 +10600,166 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                     current = self.read_rel(id)?;
                     continue;
                 }
-            } else {
-                self.repoint_neighbour(prev, node, id, next, NeighbourPtr::Next, txn)?;
+                if next != NULL_ID {
+                    // The new head's `prev` is `NULL`, not the stale pointer it happened to carry.
+                    self.repoint_neighbour(next, node, id, NULL_ID, NeighbourPtr::Prev, txn)?;
+                }
+                return Ok(());
             }
+            // THE PREDECESSOR COMES FROM THE FORWARD CHAIN WHEN THE BACK-POINTER CANNOT SUPPLY IT
+            // (`rmp` #1054). A prepend publishes `first_rel := Z` and only afterwards repairs the
+            // displaced record's `prev` — the order [`graphus_chainhead`] requires, because a writer
+            // that has not yet won the publication has no claim on the record it is trying to
+            // displace. So between those two writes this record is legitimately not the head AND
+            // names no predecessor, and that window belongs to another thread: waiting for it to
+            // close is waiting for a writer that owes this one nothing, which is a live-lock however
+            // politely it is spelt. The forward direction is the one the chain is authoritative in
+            // (it is what `first_rel` and every reader's walk use), so it is walked for the answer
+            // instead — bounded by the chain, needing no other thread to move.
+            let pred = if prev_word != NULL_ID {
+                prev_word
+            } else {
+                // Re-read first: the caller's image may simply predate the repair, in which case the
+                // walk is not needed at all — and the `next` used to bridge below must come from the
+                // same image as the predecessor, never from one taken before it.
+                current = self.read_rel(id)?;
+                let (fresh, _) = current.chain_pointers(side);
+                if fresh != NULL_ID {
+                    fresh
+                } else {
+                    match self.chain_predecessor(node, id, first_rel)? {
+                        Some(p) => p,
+                        None => {
+                            // Neither the head, nor reachable from it. The record is in no position
+                            // the chain admits, so there is no predecessor to bridge and no honest
+                            // guess to make. Loud and named, never a silent spin (`rmp` #1054).
+                            return Err(GraphusError::Storage(format!(
+                                "relationship {id}'s {side:?} link is neither node {node}'s chain \
+                                 head (first_rel names {first_rel}) nor reachable from it, so this \
+                                 unlink has no predecessor to bridge (`rmp` #1054)"
+                            )));
+                        }
+                    }
+                }
+            };
+            let (_, next) = current.chain_pointers(side);
+            self.repoint_neighbour(pred, node, id, next, NeighbourPtr::Next, txn)?;
             if next != NULL_ID {
-                // A new head's `prev` is `NULL`, not the stale pointer this record happened to carry.
-                let restored_prev = if is_head { NULL_ID } else { prev };
-                self.repoint_neighbour(next, node, id, restored_prev, NeighbourPtr::Prev, txn)?;
+                self.repoint_neighbour(next, node, id, pred, NeighbourPtr::Prev, txn)?;
             }
             return Ok(());
         }
+        // THE TRIPWIRE (`rmp` #1054, following the `rmp` #1040 precedent for the fsync leader).
+        //
+        // Every pass either completes the unlink or observes a head word some OTHER writer has just
+        // published — a refusal means somebody published — so the loop is lock-free in the technical
+        // sense and this bound is not a live-lock brake. It is the loud, attributable failure that a
+        // head word being written OUTSIDE the publication protocol must produce, instead of a thread
+        // that burns a core inside a database for ever: that is what happened here, for over ten
+        // minutes, while every other thread in the process waited on a futex. Same bound and same
+        // reasoning as `graphus_chainhead::MAX_ATTEMPTS`, which guards the prepend half of this
+        // protocol; this is the unlink half, and it had none.
+        let (prev, next) = current.chain_pointers(side);
+        let first_rel = self.read_node(node)?.first_rel;
+        Err(GraphusError::Storage(format!(
+            "unlinking relationship {id}'s {side:?} link from node {node}'s incidence chain was \
+             refused {} times (prev={prev}, next={next}, node.first_rel={first_rel}): node \
+             {node}'s first_rel is being written outside the chain-head publication protocol \
+             (`rmp` #1054)",
+            graphus_chainhead::MAX_ATTEMPTS
+        )))
+    }
+
+    /// The link that immediately precedes `id` in `node`'s incidence chain, found by walking
+    /// **forward** from `first_rel`; `None` if `id` is the head or is not in the chain at all.
+    ///
+    /// # Why the forward direction, and only it (`rmp` #1054)
+    ///
+    /// `first_rel` plus the `next` words are the chain: they are what every reader walks
+    /// ([`read_view::incident_rels`](crate::read_view::incident_rels)), what the GC's corpse splice
+    /// re-derives its positions from, and what the publication protocol keeps consistent. The `prev`
+    /// words are a back-pointer repaired *after* the publication that invalidates them, so there are
+    /// windows in which they name nobody. This is what the unlink consults in those windows, so that
+    /// it depends on the chain rather than on another thread finishing a write.
+    ///
+    /// The walk is the same one `collect_corpse_runs` and `incident_rels` perform, including the
+    /// self-loop rule (follow END's `next` when arriving at the head or via END, else START's) and the
+    /// saturating `2 * high_water + 2` cycle guard (`rmp` #452): a chain can thread each relationship
+    /// from both ends, and an unchecked doubling wraps to a tiny bound near `2^63` — defeating the
+    /// very protection it exists to give.
+    ///
+    /// # Errors
+    /// Returns a storage error if a link cannot be read, or if the chain does not terminate within
+    /// the guard.
+    fn chain_predecessor(&self, node: u64, id: u64, first_rel: u64) -> Result<Option<u64>> {
+        let guard = self
+            .store(StoreKind::Rel)
+            .alloc
+            .high_water()
+            .saturating_mul(2)
+            .saturating_add(2);
+        let mut cur = first_rel;
+        let mut prev_link = NULL_ID;
+        let mut steps = 0u64;
+        while cur != NULL_ID {
+            if cur == id {
+                return Ok((prev_link != NULL_ID).then_some(prev_link));
+            }
+            steps += 1;
+            if steps > guard {
+                return Err(GraphusError::Storage(format!(
+                    "incidence chain of node {node} is malformed (cycle?)"
+                )));
+            }
+            let r = self.read_rel(cur)?;
+            let is_loop = r.start_node == node && r.end_node == node;
+            let next = if is_loop {
+                let (end_prev, end_next) = r.chain_pointers(ChainSide::End);
+                if end_prev == prev_link || prev_link == NULL_ID {
+                    end_next
+                } else {
+                    r.chain_pointers(ChainSide::Start).1
+                }
+            } else if r.start_node == node {
+                r.start_next_rel
+            } else {
+                r.end_next_rel
+            };
+            prev_link = cur;
+            cur = next;
+        }
+        Ok(None)
     }
 
     /// On relationship `neighbour`, replace the `which` pointer (`prev`/`next`) of every side
     /// facing `node` that currently equals `id` with `replacement`; mark a new head when a `prev`
     /// becomes `NULL`.
+    ///
+    /// # It writes the words it names, conditionally, and nothing else (`rmp` #1054)
+    ///
+    /// This used to read the neighbour, patch the copy, and write the record **whole**. Both halves
+    /// of that were unsound the moment a second writer existed:
+    ///
+    /// * **Whole-record.** The write carried `first_prop`, the MVCC header, `undo_ptr` and the three
+    ///   chain words this call does not touch, all from an unlatched read. Every one of them is a word
+    ///   some other transaction may be publishing right now, and the write-back silently undid it.
+    ///   Measured on the `rmp` #1034 storm: `relink_old_head` set relationship 10's `end_prev` to 5 for
+    ///   node 6, and a `repoint_neighbour` of relationship 10's *start* side — a different chain, a
+    ///   different node — wrote `end_prev` back to 0 from an image read before it. Node 6's `first_rel`
+    ///   then named 5 while 10's back-pointer named nobody, which is the state that made
+    ///   [`unlink_side_with`](Self::unlink_side_with) spin.
+    ///
+    /// * **Unconditional.** `nx == id` / `p == id` was tested against that same stale image, so a
+    ///   writer that legitimately re-pointed the word in between was overwritten anyway. The test and
+    ///   the store have to be one step, which is what
+    ///   [`repoint_chain_words`](Self::repoint_chain_words) makes them.
+    ///
+    /// `start_node`/`end_node` are immutable for a live relationship, so deciding *which side faces
+    /// `node`* from the unlatched read is sound; deciding *what the pointer currently holds* is not,
+    /// and that decision has moved under the latch.
+    ///
+    /// # Errors
+    /// Returns a storage error if the neighbour or its page cannot be read or written.
     fn repoint_neighbour(
         &self,
         neighbour: u64,
@@ -10602,51 +10770,169 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         txn: TxnId,
     ) -> Result<()> {
         let before = self.read_rel(neighbour)?;
-        let mut nb = before;
-        let patch = |side: ChainSide, n: &mut RelRecord| {
-            let (mut p, mut nx) = n.chain_pointers(side);
-            match which {
-                NeighbourPtr::Next if nx == id => nx = replacement,
-                NeighbourPtr::Prev if p == id => {
-                    p = replacement;
-                    if replacement == NULL_ID {
-                        n.chain_flags |= match side {
-                            ChainSide::Start => CHAIN_FLAG_START_FIRST,
-                            ChainSide::End => CHAIN_FLAG_END_FIRST,
-                        };
-                    }
-                }
-                _ => {}
+        // At most two: a self-loop faces `node` with both of its sides.
+        let mut ops: [ChainWordWrite; 2] = [ChainWordWrite::NONE; 2];
+        let mut n = 0;
+        for side in [ChainSide::Start, ChainSide::End] {
+            let faces = match side {
+                ChainSide::Start => before.start_node == node,
+                ChainSide::End => before.end_node == node,
+            };
+            if !faces {
+                continue;
             }
-            n.set_chain_pointers(side, p, nx);
-        };
-        if nb.start_node == node {
-            patch(ChainSide::Start, &mut nb);
+            let (field_off, flag) = match (which, side) {
+                (NeighbourPtr::Next, ChainSide::Start) => (REL_OFF_START_NEXT, 0),
+                (NeighbourPtr::Next, ChainSide::End) => (REL_OFF_END_NEXT, 0),
+                (NeighbourPtr::Prev, ChainSide::Start) => {
+                    (REL_OFF_START_PREV, CHAIN_FLAG_START_FIRST)
+                }
+                (NeighbourPtr::Prev, ChainSide::End) => (REL_OFF_END_PREV, CHAIN_FLAG_END_FIRST),
+            };
+            ops[n] = ChainWordWrite {
+                field_off,
+                // Conditional: this is a repair of a pointer that names the record being removed, and
+                // only while it still does.
+                expect: Some(id),
+                value: replacement,
+                // A `prev` that becomes NULL makes this side the new head of the chain, and the
+                // marker says so. Only then, and only if this writer is the one that moved the word.
+                set_flag: if replacement == NULL_ID { flag } else { 0 },
+                clear_flag: 0,
+            };
+            n += 1;
         }
-        if nb.end_node == node {
-            patch(ChainSide::End, &mut nb);
+        self.patch_chain_words(neighbour, &ops[..n], txn)
+    }
+
+    /// Applies a set of updates to relationship `rel_id`'s chain words — each one either a
+    /// compare-and-set repair or an owned unconditional publication, with first-in-chain marker bits
+    /// set and cleared alongside — as **one** frame-latch critical section under the rank-27
+    /// chain-word latch (`rmp` #1054).
+    ///
+    /// # This latch is the whole point, and it is why there is one function and not two
+    ///
+    /// A compare-and-set is sound only while **every** writer of the word goes through it — the same
+    /// sentence [`compare_and_publish_chain_head`](Self::compare_and_publish_chain_head) carries for
+    /// head words, and the one this function exists to make true for back-pointer words. It was false:
+    /// [`repoint_neighbour`](Self::repoint_neighbour) compared-and-set a `prev` word while
+    /// [`relink_old_head`](Self::relink_old_head) stored the same word through a plain
+    /// `write_field_redo_only` with no latch at all, so the two interleaved *inside* the comparison.
+    /// Measured on the `rmp` #1034 storm: relationship 30's `end_prev` was published to 34 by the
+    /// transaction that displaced it, and a compare-and-set that had already read 32 then stored 0 on
+    /// top — leaving node 6's `first_rel` naming 34 and relationship 30's back-pointer naming nobody,
+    /// which is the state that made [`unlink_side_with`](Self::unlink_side_with) spin at 105 % CPU.
+    /// With both writers serialised here, both orders agree: the repair fires before the publication
+    /// and is overwritten by it, or the publication lands first and the repair no longer matches.
+    ///
+    /// # Why one critical section, and not one call per word
+    ///
+    /// `rmp` #1030 measured this: splitting a whole-record write into per-word writes let a reader
+    /// taking the frame read latch observe a neighbour whose `prev` had been re-pointed and whose
+    /// first-in-chain flag had not yet been set — a state no consistent snapshot ever contained.
+    /// `concurrent_reader_serializability::concurrent_readers_see_consistent_snapshot` reported one
+    /// violation of the conserved total under eight concurrent readers and passed 5/5 in isolation:
+    /// the shape of a torn update. The chain words are contiguous (`61..93`) but `chain_flags` at
+    /// `101` is not, so no single `write_region` covers both; what makes them one atom is the single
+    /// [`with_page_mut_lsn_if`](graphus_bufpool::ConcurrentBufferPool::with_page_mut_lsn_if) below,
+    /// not their layout. The previous answer to that measurement was to keep writing the record
+    /// **whole**, which bought the atomicity by carrying `first_prop`, the MVCC header and three
+    /// untouched chain words from an unlatched read — a lost update on every one of them.
+    ///
+    /// # Why the redo images differ per op
+    ///
+    /// A conditional repair logs [`paging::encode_cas_patch`], which carries the comparison into the
+    /// redo image so replay re-takes the decision this writer took rather than a different one. An
+    /// owned publication logs a plain [`paging::encode_patch`]. The marker byte is an absolute image
+    /// and is sound as one because every writer of it now takes this same latch, so log order is
+    /// apply order for that byte.
+    ///
+    /// # Errors
+    /// Returns a storage error if the record's page cannot be mapped, fetched or written.
+    fn patch_chain_words(&self, rel_id: u64, ops: &[ChainWordWrite], txn: TxnId) -> Result<()> {
+        if ops.is_empty() {
+            return Ok(());
         }
-        // WRITE THE WHOLE RECORD, still — and the reason is a defect I introduced and measured, so it
-        // is recorded here rather than left for the next person to rediscover (`rmp` #1030).
-        //
-        // The clobber this function has is real: it carries the neighbour's `first_prop` and MVCC
-        // header, `undo_ptr` included, from the read above. Converting it to per-word writes removes
-        // that — and BREAKS SNAPSHOT ISOLATION, because a whole-record `write_region` is one
-        // acquisition of the frame write latch and therefore atomic against a reader taking the frame
-        // read latch, while two-to-five per-word writes are not. A reader walking the incidence chain
-        // can then observe a neighbour with its `prev` repointed and its first-in-chain flag not yet
-        // set, which is a state no consistent snapshot ever contained. Measured:
-        // `concurrent_reader_serializability::concurrent_readers_see_consistent_snapshot` reported one
-        // violation of the conserved total under eight concurrent readers, and passed 5/5 in isolation
-        // — the shape of a torn update, not of a busy host.
-        //
-        // So the correct fix is neither of the two obvious ones. It has to write LESS than the whole
-        // record and still write it in ONE frame-latch critical section: the four chain-pointer words
-        // are contiguous (61..93) but `chain_flags` at 101 is not, so one `write_region` cannot cover
-        // both, and the flag moves exactly when `prev` becomes NULL. That needs either a layout change
-        // or a multi-region write primitive that holds the latch once, and it is more than this task
-        // should decide on its own.
-        self.write_rel(neighbour, &nb, txn)
+        let (rel_page, off) = paging::record_location(rel_id, StoreKind::Rel.record_size());
+        let dev = self.device_page(StoreKind::Rel, rel_page)?;
+        // Pinned before the latch, for the reason `compare_and_publish_chain_head` pins before it: a
+        // `fetch` under a rank-27 hold could evict, write home and harden.
+        let f = self.pool.fetch(dev)?;
+        let outcome = self.patch_chain_words_latched(rel_id, dev, off, ops, txn, f);
+        self.pool.unpin(f);
+        outcome
+    }
+
+    /// The latched body of [`patch_chain_words`](Self::patch_chain_words); split out so the frame is
+    /// unpinned exactly once, on every path, after the latch is released.
+    fn patch_chain_words_latched(
+        &self,
+        rel_id: u64,
+        dev: PageId,
+        off: usize,
+        ops: &[ChainWordWrite],
+        txn: TxnId,
+        f: graphus_bufpool::PinnedFrame,
+    ) -> Result<()> {
+        // No hand-off while the shard lock is held — see `compare_and_publish_chain_head` for the
+        // measured stall this prevents (`rmp` #1030).
+        let _no_switch = graphus_core::sched::NoSwitchScope::new();
+        let _guard = self
+            .chain_head_shard(StoreKind::Rel, rel_id)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _scope = graphus_core::latch::ChainHeadLatchScope::new();
+        let flags_abs = off + REL_OFF_CHAIN_FLAGS;
+        // Which updates will fire, decided under the latch that keeps the answer true until the write
+        // below applies it. An owned publication always fires; a repair fires while the word still
+        // holds what it is repairing away from.
+        let (firing, flags) = self.pool.with_page(f, |p| {
+            let mut firing = [false; 2];
+            let mut set = 0u8;
+            let mut clear = 0u8;
+            for (i, op) in ops.iter().enumerate() {
+                let abs = off + op.field_off;
+                let now = u64::from_le_bytes(p[abs..abs + 8].try_into().expect("8-byte slice"));
+                if op.expect.is_none_or(|expect| now == expect) {
+                    firing[i] = true;
+                    set |= op.set_flag;
+                    clear |= op.clear_flag;
+                }
+            }
+            let current = p[flags_abs];
+            let next = (current | set) & !clear;
+            (firing, (next != current).then_some(next))
+        });
+        let fires = |i: usize| firing[i];
+        if !(0..ops.len()).any(fires) && flags.is_none() {
+            return Ok(());
+        }
+        // WAL borrow dropped before the pool write latch (lock-ordering rule, `crate::wal_rule`).
+        let mut lsn = None;
+        for op in (0..ops.len()).filter(|i| fires(*i)).map(|i| &ops[i]) {
+            let abs = off + op.field_off;
+            let redo = match op.expect {
+                Some(expect) => paging::encode_cas_patch(abs, expect, op.value),
+                None => paging::encode_patch(abs, &op.value.to_le_bytes()),
+            };
+            lsn = Some(self.wal.with(|w| w.log_update_redo_only(txn, dev, &redo)));
+        }
+        if let Some(next) = flags {
+            let redo = paging::encode_patch(flags_abs, &[next]);
+            lsn = Some(self.wal.with(|w| w.log_update_redo_only(txn, dev, &redo)));
+        }
+        let lsn = lsn.expect("a firing update or a flag change logged a record");
+        self.pool.with_page_mut_lsn_if(f, lsn, |p| {
+            for op in (0..ops.len()).filter(|i| fires(*i)).map(|i| &ops[i]) {
+                let abs = off + op.field_off;
+                p[abs..abs + 8].copy_from_slice(&op.value.to_le_bytes());
+            }
+            if let Some(next) = flags {
+                p[flags_abs] = next;
+            }
+            Some(())
+        });
+        Ok(())
     }
 
     // ----------------------------- property CRUD ----------------------------
@@ -13243,6 +13529,42 @@ enum NeighbourPtr {
     Next,
 }
 
+/// One update to a relationship's chain-pointer word, as
+/// [`patch_chain_words`](RecordStore::patch_chain_words) applies it (`rmp` #1054): store `value` into
+/// `field_off`, and — only if that fires — set `set_flag` and clear `clear_flag` in the record's
+/// `chain_flags` byte.
+#[derive(Clone, Copy)]
+struct ChainWordWrite {
+    /// Byte offset of the 8-byte pointer word within the relationship record.
+    field_off: usize,
+    /// `Some(v)`: a **conditional repair** — apply only while the word still holds `v`. The writer is
+    /// mending a pointer that names a record it is removing, and another writer may legitimately have
+    /// moved it on already, so the test and the store must be one step.
+    ///
+    /// `None`: an **owned publication** — this writer won the compare-and-publish that displaced the
+    /// record, so by [`graphus_chainhead`]'s ownership rule the word is its own to set and the store
+    /// is unconditional. Declining to write it because it holds an unexpected value is what left a
+    /// back-pointer naming nobody while the head word named somebody (`rmp` #1054).
+    expect: Option<u64>,
+    /// The value to store.
+    value: u64,
+    /// First-in-chain marker bit to set alongside, or `0` for none.
+    set_flag: u8,
+    /// First-in-chain marker bit to clear alongside, or `0` for none.
+    clear_flag: u8,
+}
+
+impl ChainWordWrite {
+    /// The inert filler for the unused slot of the fixed-size array a caller stages its updates in.
+    const NONE: Self = Self {
+        field_off: REL_OFF_START_PREV,
+        expect: Some(NULL_ID),
+        value: NULL_ID,
+        set_flag: 0,
+        clear_flag: 0,
+    };
+}
+
 /// One maximal run of consecutive dead-link corpses discovered by a live-chain walk (`rmp` #220): the
 /// run sits in `node`'s incidence chain between the live link `pred` (`NULL_ID` when the run starts at
 /// the chain head, reached straight from `first_rel`) and the live link `succ` (`NULL_ID` at the chain
@@ -15520,6 +15842,114 @@ mod tests {
                 "scan_in_use_mvcc must only return in-use slots"
             );
         }
+    }
+
+    /// Sets up node `A` with a two-link incidence chain `r2 -> r1` on its START side, then forces the
+    /// state `rmp` #1054 spun on: `r1`'s back-pointer names nobody while `A`'s `first_rel` names `r2`.
+    ///
+    /// That pairing is REACHABLE WITHOUT ANY CORRUPTION. A prepend publishes the head word first and
+    /// repairs the displaced record's back-pointer afterwards — the order [`graphus_chainhead`]
+    /// requires — so between those two writes the displaced record is legitimately not the head and
+    /// names no predecessor. Writing the `NULL` here reproduces that window deterministically, on one
+    /// thread, without having to catch it.
+    fn setup_head_moved_before_back_pointer_repaired(s: &mut Store) -> (u64, u64, u64) {
+        let ty = s.intern_token(Namespace::RelType, "LINK").unwrap();
+        let t0 = TxnId(1);
+        s.begin(t0);
+        let (a, _) = s.create_node(t0).unwrap();
+        let (b, _) = s.create_node(t0).unwrap();
+        let (r1, _) = s.create_rel(t0, ty, a, b).unwrap();
+        let (r2, _) = s.create_rel(t0, ty, a, b).unwrap();
+        s.commit(t0).unwrap();
+        assert_eq!(
+            s.read_node(a).unwrap().first_rel,
+            r2,
+            "setup: the later relationship is the head of A's chain"
+        );
+        assert_eq!(
+            s.read_rel(r1).unwrap().start_prev_rel,
+            r2,
+            "setup: the displaced relationship's back-pointer names the record that displaced it"
+        );
+        let t1 = TxnId(2);
+        s.begin(t1);
+        s.write_field_redo_only(
+            StoreKind::Rel,
+            r1,
+            REL_OFF_START_PREV,
+            &NULL_ID.to_le_bytes(),
+            t1,
+        )
+        .unwrap();
+        s.commit(t1).unwrap();
+        (a, r1, r2)
+    }
+
+    /// Regression (`rmp` #1054): an unlink whose back-pointer names nobody must BRIDGE FROM THE
+    /// FORWARD CHAIN, not spin waiting for another writer to repair that back-pointer.
+    ///
+    /// This is the defect that wedged the engine. `unlink_side_with` decided headship from the
+    /// relationship's own `prev` (`prev == NULL_ID` was read as "I am the head") instead of from the
+    /// node's `first_rel`, so in the state below it published against `expect == r1`, was refused
+    /// because `first_rel` names `r2` — the very reason it should have concluded it was NOT the head —
+    /// and then re-read the RELATIONSHIP, a different word from the one the refusal was about and one
+    /// nothing was going to change. At `engine_workers = 8` one worker burned 105 % CPU in that loop
+    /// for more than ten minutes while every other thread in the process sat in `futex_wait`.
+    ///
+    /// Before the fix this test does not fail — it HANGS, which is the whole point of the bound that
+    /// now backs it.
+    #[test]
+    fn an_unlink_whose_back_pointer_names_nobody_bridges_from_the_forward_chain() {
+        let mut s = fresh();
+        let (a, r1, r2) = setup_head_moved_before_back_pointer_repaired(&mut s);
+
+        let t = TxnId(3);
+        s.begin(t);
+        s.unlink_side(r1, ChainSide::Start, a, t).expect(
+            "the unlink must complete from the forward chain, not spin on the back-pointer",
+        );
+        s.commit(t).unwrap();
+
+        assert_eq!(
+            s.read_node(a).unwrap().first_rel,
+            r2,
+            "the head word must be untouched: r1 was never the head, whatever its back-pointer said"
+        );
+        assert_eq!(
+            s.read_rel(r2).unwrap().start_next_rel,
+            NULL_ID,
+            "r1's true predecessor — found by walking forward from the head — must be bridged past it"
+        );
+        assert_eq!(
+            s.incident_rels(a).unwrap(),
+            vec![r2],
+            "A's chain must hold exactly the link that was not unlinked"
+        );
+    }
+
+    /// Regression (`rmp` #1054): a link that is neither the head nor reachable from it has no
+    /// predecessor to bridge, and that must be a NAMED failure rather than a silent spin or a guess.
+    ///
+    /// This is the tripwire half of the fix (the `rmp` #1040 precedent): the loop that used to have no
+    /// exit now has one, and it says what it could not do. Reaching it means some writer has moved a
+    /// chain word outside the publication protocol.
+    #[test]
+    fn an_unlink_of_a_link_no_chain_reaches_fails_loudly() {
+        let mut s = fresh();
+        let (a, r1, _) = setup_head_moved_before_back_pointer_repaired(&mut s);
+
+        let t = TxnId(3);
+        s.begin(t);
+        s.unlink_side(r1, ChainSide::Start, a, t).unwrap();
+        // Second unlink: r1 is out of A's chain now, and its back-pointer still names nobody.
+        let err = s
+            .unlink_side(r1, ChainSide::Start, a, t)
+            .expect_err("a link no chain reaches has no predecessor, and that must be reported");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("nor reachable from it") && msg.contains("rmp` #1054"),
+            "the failure must name the invariant it could not satisfy, got: {msg}"
+        );
     }
 
     /// Regression (`rmp` #452): the corrupt-cyclic-chain guard in `collect_corpse_runs`
