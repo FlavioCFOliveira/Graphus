@@ -179,7 +179,7 @@ fn run(work: &Path) -> Result<String> {
     let src_snapshot = node_rel_summary(&mut src);
 
     let backup_t0 = Instant::now();
-    let artifact = backup_store(&mut src)?;
+    let artifact = backup_store(&src)?;
     let backup_ms = backup_t0.elapsed().as_secs_f64() * 1000.0;
     let artifact_size = artifact.len() as u64;
 
@@ -261,8 +261,8 @@ fn create_encrypted_store(
     let wal_backing = FileLogSink::open(wal_path).map_err(wal_err)?;
     let wal =
         WalManager::create(EncryptedFileLogSink::create(wal_backing, &kr)?).map_err(wal_err)?;
-    let mut store: EncFileStore = RecordStore::create(device, wal, 64, 1)?;
-    let handles = write_secret_graph(&mut store)?;
+    let store: EncFileStore = RecordStore::create(device, wal, 64, 1)?;
+    let handles = write_secret_graph(&store)?;
     store.flush()?;
     drop(store);
     Ok(handles)
@@ -274,9 +274,8 @@ fn create_cleartext_store(store_path: &Path, wal_path: &Path) -> Result<()> {
     let device = FileBlockDevice::open(store_path)?;
     let wal_backing = FileLogSink::open(wal_path).map_err(wal_err)?;
     let wal = WalManager::create(wal_backing).map_err(wal_err)?;
-    let mut store: RecordStore<FileBlockDevice, FileLogSink> =
-        RecordStore::create(device, wal, 64, 1)?;
-    write_secret_graph(&mut store)?;
+    let store: RecordStore<FileBlockDevice, FileLogSink> = RecordStore::create(device, wal, 64, 1)?;
+    write_secret_graph(&store)?;
     store.flush()?;
     drop(store);
     Ok(())
@@ -286,8 +285,8 @@ fn create_cleartext_store(store_path: &Path, wal_path: &Path) -> Result<()> {
 fn create_mem_store_with_graph() -> Result<MemStore> {
     let device = graphus_io::MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new())?;
-    let mut store: MemStore = RecordStore::create(device, wal, 64, 1)?;
-    write_secret_graph(&mut store)?;
+    let store: MemStore = RecordStore::create(device, wal, 64, 1)?;
+    write_secret_graph(&store)?;
     Ok(store)
 }
 

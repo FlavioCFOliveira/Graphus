@@ -18,6 +18,31 @@
 //! crabbing / B-link concurrency discipline (`04 §6.1`) is documented in [`BTree::lookup`] and is a
 //! later concurrency task, exactly as the buffer pool and record store stage it.
 //!
+//! ## Why this tree does NOT take the rank-27 page log-apply-order latch (`rmp` #1062)
+//!
+//! `rmp` #1062 established, for the record store, that every logged page write must append its record
+//! and apply it to the page as one indivisible step of that page's log-apply order — otherwise two
+//! writers of a page enter the log in one order and take effect in another, and ARIES (which replays
+//! strictly in log order) rebuilds an image the live system never held. `RecordStore` routes all ten
+//! of its append sites through one door (`RecordStore::log_page_record`) that asserts the latch is
+//! held.
+//!
+//! The eight `wal.with(|w| w.log_update(...))` sites in this file go through **no such door**, and
+//! that is recorded here rather than left for someone to rediscover:
+//!
+//! * **They are safe today, but by a different mechanism.** Every mutating `BTree` method takes
+//!   `&mut self`, each tree owns its own single-threaded [`BufferPool`] and its own base-page range,
+//!   and the concurrency discipline this module needs (latch coupling / B-link) is explicitly a later
+//!   task. Rust exclusivity therefore guarantees one writer per tree, and one writer cannot interleave
+//!   with itself. The guarantee is **structural, not enforced by the #1062 mechanism** — so the moment
+//!   this tree admits a second concurrent writer, every one of those eight sites needs the treatment
+//!   the record store's sites got, and nothing will warn about it.
+//! * **They are invisible to the #1062 oracle.** These sites stamp through
+//!   [`graphus_bufpool::page::set_page_lsn`] on the single-threaded pool, not through
+//!   `ConcurrentBufferPool::with_page_mut_lsn`, so a descent here would not increment
+//!   `ConcurrentBufferPool::page_lsn_descents` and no `rmp` #1062 battery would see it. Do not read a
+//!   green descent count as covering this file.
+//!
 //! ## WAL logging of index pages (`04 §6.4`)
 //!
 //! Index pages are ordinary logical pages, so a modification is a WAL `Update` whose redo is the

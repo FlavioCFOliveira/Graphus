@@ -372,11 +372,11 @@ and for the **WAL rule** (a dirty page may not be flushed until the WAL is durab
   write latch is taken whether or not the write happens, because the decision itself must be made
   under it.
 - **Latch ranks.** Every blocking primitive in the engine carries a **rank**, and a thread acquires
-  ranks in ascending order, innermost last: **10** catalog / DDL, **20** commit sequencer and
-  active-transaction table, **25** the per-store physical-id allocation latch, **27** the chain-head
-  publication latch (§5.7.1), **30** the WAL, **40** the buffer-pool frame latch, **50** the
-  page-table shard, **60** the device and the doublewrite stager. Rank **22**, the GC's maintenance
-  latch, sits between 20 and 25 (task #1014). An acquisition out of rank order is permitted only as a
+  ranks in ascending order, innermost last: **5** the engine's session latches, **10** catalog / DDL,
+  **20** commit sequencer and active-transaction table, **25** the per-store physical-id allocation
+  latch, **27** the page **log-apply-order** latch (§5.7.2), **30** the WAL, **40** the buffer-pool
+  frame latch, **50** the page-table shard, **60** the device and the doublewrite stager. Rank **22**,
+  the GC's maintenance latch, sits between 20 and 25 (task #1014). An acquisition out of rank order is permitted only as a
   `try_lock`, which creates no wait edge. Ranks 10, 22, 25 and 27 admit **at most one holder per
   thread**: two locks of the same rank cannot be ordered by rank at all, so two threads that acquire a
   different pair in a different order deadlock. Ranks 25 and 27 are also **released before any I/O** —
@@ -1701,12 +1701,24 @@ symptom the protocol itself could detect:
   different verdict from the one the live system reached — and after a crash the *replayed* verdict is
   the one that survives.
 
-**The storage core honours both with a sharded rank-27 publication latch.** Its head cell is an
+**The storage core honours both with a sharded rank-27 latch.** Its head cell is an
 8-byte word on a WAL-logged page, and one shard of the latch is held across three steps that have to
 be one: peek at the word, append the redo record, apply it. Splitting them is exactly what breaks
 durable order — the record is appended under the WAL mutex (rank 30) and applied under the frame
 latch (rank 40), and nothing else ties those two instants together, so two publishers can enter the
-log in one order and take effect on the page in the other. Three consequences are normative:
+log in one order and take effect on the page in the other.
+
+> **The latch's key changed after this section was written.** Task #1028 keyed it by
+> `(store kind, record id)`; task **#1062** re-keyed it by the **device page** and routed every logged
+> page write through it, because the same divergence turned out to afflict ordinary writes that are
+> not chain heads at all. The re-keying is a **strict widening** — every writer of a record is a writer
+> of its page and maps to the same shard — so everything this section states about the publication
+> protocol holds unchanged, and the two publishers above are still ordered. The general invariant, the
+> single logging door and the measurement that forced the widening are **§5.7.2**
+> (`D-page-write-order`). Read the rest of this section with "one shard per head word" replaced by
+> "one shard per device page"; nothing else in it is affected.
+
+Three consequences are normative:
 
 - **The page is mapped and pinned before the latch is taken**, and the latch is released before the
   frame is unpinned. Rank 27 is never held across store growth, across a page fetch that may evict, or
@@ -1720,7 +1732,8 @@ log in one order and take effect on the page in the other. Three consequences ar
   rather than torn — the record really is the head of the start node's chain and not yet of the end
   node's — and the retry completes it.
 - **The shard count is a contention parameter only.** Correctness requires nothing more than that one
-  head word always maps to one shard.
+  page always maps to one shard (one *head word* always mapped to one shard before the #1062
+  re-keying; the widened rule implies the narrower one).
 
 **A refused publication appends no record.** Under the latch the word is observed first, and the redo
 record is appended only if it still holds the expected value, so the log never carries a record for a
@@ -1747,7 +1760,8 @@ primitive so that no writer of that word stores into it unconditionally.
   is a lost update: whichever write lands second resurrects the other's marker, and a record that
   still claims first-in-chain while a committed prepend sits above it is exactly what lets the GC
   reclaim it as a head. The clear is therefore an atomic read-modify-write under the same rank-27
-  shard latch, keyed on the record being modified, and it takes a **mask** rather than a finished
+  shard latch — keyed on the record being modified when task #1028 wrote this, on that record's device
+  page since task #1062 (§5.7.2) — and it takes a **mask** rather than a finished
   byte — which makes it commutative, so two clears of disjoint bits compose to the same result in
   either order.
 - **The GC's corpse splice.** When a collapsed run of corpses starts at the node head, the splice
@@ -1864,6 +1878,143 @@ the other:
 - **A DST crash scenario** — `crates/graphus-dst/tests/chain_head_publication_recovery_1028.rs` —
   proves the durable half: every committed publication replays, and a refused publication leaves no
   trace for recovery to find. See `07-dst-simulator.md` §10.
+
+#### 5.7.2 Log order is apply order, per page (task #1062)
+
+`D-page-write-order`. §5.7.1 ordered the writers of a **chain head**. This section states the general
+rule that ordering turned out to be one instance of, and specifies the mechanism that supplies it for
+every logged page write.
+
+**The invariant.**
+
+> For every page, the order in which logged writes against that page enter the WAL is the order in
+> which those writes take effect on that page.
+
+Equivalently, and this is the form worth testing against: **what recovery rebuilds for a page is what
+the last logged write to that page applied.**
+
+**Why it does not hold for free.** A logged page write is **two instants in two media**. The record
+enters the log under the WAL mutex (rank 30); the change takes effect on the cached page under the
+frame latch (rank 40). Nothing about those two latches couples them, so two writers of one page can
+enter the log in one order and apply in the other. ARIES replays **strictly in log order** and gates
+each record on the page's `page_lsn`, so when the two orders differ, recovery reconstructs an image
+the live system never held. The failure has a property that makes it particularly dangerous: the
+crash-free answer and the post-crash answer are each internally consistent and neither is wrong on its
+own terms, so **no result-checking test can see it**. Only an oracle on the ordering itself can.
+
+**The observable signature** is a page being offered an LSN **below** the one its header already
+carries — a *page-LSN descent*. The buffer pool counts descents under the frame write latch, so the
+count is exact rather than sampled, and the record store surfaces it. Zero descents is the property
+the suite asserts.
+
+**Why a monotone `page_lsn` is not the fix.** The stamp takes the maximum of the page's current LSN
+and the record's, and has done so since task #1029, so it never descends. It was therefore **already
+in the tree while the divergence below was measured**. A monotone stamp hides a divergence only if the
+page's *content* is monotone too, and content is not: recovery still rebuilds a different image from
+the one the runtime produced. Worse, relying on the stamp alone would be actively harmful — redo skips
+every record whose LSN is at or below `page_lsn`, so a page carrying an LSN it never applied silently
+loses every legitimate record logged at or below it, and nothing reports the loss (§3.3). Clamping the
+symptom converts a mis-ordering into a **skipped** record.
+
+**The mechanism.** The rank-27 section of §5.7.1, **re-keyed by the device page**, is the one door
+through which a logged page write happens. Inside one section, for one page, in this order:
+
+1. **Capture the undo pre-image** from the page.
+2. **Append the WAL record** (redo, and undo where the write is not redo-only).
+3. **Apply the post-image** to the cached page.
+4. **Stamp `page_lsn`** with the record's LSN.
+
+Step 1 must be inside the section and not before it: a pre-image read outside can be overwritten by
+another writer of that region before this record is appended, and the undo would then restore a state
+that was never this writer's to restore. Steps 2 and 3 are the two instants the invariant couples.
+
+**The obligations on the section.**
+
+- **The page is mapped and pinned before the section is entered**, and unpinned after it is left. The
+  section is never held across a page fetch that may evict, across store growth, or across a
+  durability barrier (§3.3). Held across any of them it convoys every writer of the shard behind one
+  `fdatasync`.
+- **At most one holder per thread** (§3.3), for the reason every same-rank latch carries: two locks of
+  one rank cannot be ordered by rank, so two threads taking a different pair in a different order
+  deadlock.
+- **There is exactly one door to appending a WAL record against a page**, and it asserts that the
+  caller holds the section for that page. Ten append sites in the record store pass through it, plus
+  the rollback path's compensation append, which holds the section explicitly and asserts it. The
+  count is of **sites**, not of appends: one site sits in a loop and appends once per word.
+- **The shard count is a contention parameter only.** Correctness requires nothing beyond "one page
+  always maps to one shard". The shard index is derived by multiplicative (Fibonacci) hashing, which
+  mixes the low-entropy input — device page ids are dense and consecutive — instead of aliasing every
+  *N*-th page onto one shard. It is a mixing function, **not** a perfect distribution: two unrelated
+  pages can land on one shard and then serialize needlessly, which costs throughput and never
+  correctness.
+- **Debug builds check every obligation with thread-local tripwires**; a release build compiles the
+  checks out. The latch and the door exist in every build — what a release build gives up is the
+  *diagnosis* of a violation, not the protection.
+
+**Why the key is the page and not the record.** `page_lsn` is a property of the **page**. Redo is
+gated on `record.lsn > page_lsn` and replayed in log order, so two writers of two *different* records
+that share a page must be ordered exactly as much as two writers of one record. Keying by page is a
+**strict widening** of §5.7.1's key: every writer of a record is a writer of its page and maps to the
+same shard, so the chain-head guarantee is preserved exactly rather than re-derived.
+
+**The two rejected routes, and why neither is available here.**
+
+- **Append under the frame latch**, so the LSN is assigned while the page is held. This inverts ranks
+  30 and 40, and the WAL barrier refuses **by tripwire** to run with a frame latch held. It is the
+  same inversion §5.7.1 rejected for the head word, arriving for the general write path.
+- **Apply under the WAL mutex**, so append and apply are one section under the WAL lock. This violates
+  the store's absolute rule that it never holds its own WAL lock across a buffer-pool call that can
+  trigger a write-back, because the write-back re-enters the WAL rule's durability check and would
+  take the WAL lock again — a wait cycle between threads, and a non-reentrant self-deadlock in one.
+
+**What it cost.** Two writers of one page now serialize where before they did not. That widening of
+contention is deliberate and accepted: page-level serialization is what the durability model requires,
+and the alternative is a database whose recovered state disagrees with the state it just served.
+
+**How it is proved.** The deterministic simulator, on
+`crates/graphus-dst/tests/page_log_apply_order_1062.rs` and its sister scenario
+`det_scheduler_checkpoint_inversion_1055` — two writers, four commits each, sixteen seeds:
+
+- **Before the fix: 32 page-LSN descents across the sixteen seeds, and not one on a chain head.** The
+  pages that descended were the catalog image (`write_region`), the commit slot
+  (`patch_commit_slot_word`, which reaches the log through `write_region`), the undo area
+  (`write_undo_area_create`) and a node's label word (`write_node_labels`) — all ordinary
+  transactional writes, none of them the path §5.7.1 had already closed. This is the measurement that
+  decided the key.
+- **The divergence in full**, seed `0x1`: a reopen recovered `[9, 5, 4]`, transaction 1004's image,
+  while the last page write in the recorded schedule was transaction 2004's `[9, 4, 5]`.
+- **Non-vacuity.** "Zero descents" is satisfied trivially by a run whose writers never share a page, so
+  two facts are asserted rather than hoped for: that at least one frame was LSN-stamped by two
+  different logical threads, read out of the recorded schedule; and that the run really committed under
+  contention, with the writes read back **out of the store** rather than from a counter the writer loop
+  incremented.
+- **The positive control.** With the section ablated to a bare call and everything else identical, the
+  invariant test fails on **13 of the 16 seeds**, 1 to 4 descents each, 30 in total, while the
+  non-vacuity assertions still pass. With the section restored, all sixteen seeds report zero.
+
+**One limitation, stated plainly.** The B+-tree index layer (`crates/graphus-index/src/btree.rs`) has
+**eight WAL-append sites** that do **not** go through this door, and cannot: the section and the door
+are internal to the record store, and the index crate has no access to them. Those eight sites satisfy
+the invariant today by **Rust exclusivity and by construction**, not by the mechanism this section
+specifies:
+
+- every mutating `BTree` method takes `&mut self`;
+- each tree owns its buffer pool **by value** — the single-threaded pool, whose mutating API is itself
+  `&mut self` — rather than sharing one;
+- each tree owns its own base-page range, and as wired in production each tree is handed a
+  brand-new device and log sink of its own, so two trees never contend for a page.
+
+No two threads can therefore be writing one tree page at all, and the invariant holds vacuously. **That
+is a sound argument about the engine as it stands and it is not the invariant this section states.** The
+moment the index layer becomes multi-writer over one tree, the defect reappears there in full — and it
+will reappear *silently*, because those pages are stamped outside the concurrent pool's instrumented
+path, so the page-LSN-descent oracle does not observe them and would report zero while they diverged.
+Two further sharp edges belong to the same limitation: the tree's single-threaded ownership is a
+property of its construction and its API, **not** a compiler-enforced `!Send`/`!Sync` marker; and the
+tree exposes an `&self` accessor that hands out a mutable WAL manager, which is a door to appending
+outside any section. Any task that makes an index tree writable by more than one thread MUST bring
+these sites under an equivalent mechanism **before** the writers arrive, not after — the same sequencing
+`D-chain-head-publication` was ratified to respect.
 
 ---
 

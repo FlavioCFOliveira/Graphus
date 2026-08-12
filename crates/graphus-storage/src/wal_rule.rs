@@ -29,13 +29,24 @@
 //! > [`ensure_durable`](WalRule::ensure_durable) and would try to take the WAL lock again.
 //!
 //! Every write path in [`crate::store`] already *drops* its WAL borrow (the `with` closure ends)
-//! before calling `page_mut`/`fetch`/`flush`. The one path where `WalManager::rollback` *itself*
-//! holds the manager lock while driving page application — live transaction rollback — is handled
-//! in [`crate::store::RecordStore::rollback`] by **recording** the compensating page images during
-//! the locked phase and **replaying** them into the pool only *after* the WAL lock is released (so
-//! an eviction during replay takes the WAL lock with no holder). See that method for the full
-//! rationale; the `rmp` #337 audit proved that without this split a rollback whose working set
-//! exceeds the pool capacity deadlocks (it panicked under the old `RefCell` handle).
+//! before calling `page_mut`/`fetch`/`flush`. Live transaction rollback used to be the one path that
+//! could not: [`WalManager::rollback`] held the manager lock while driving page application, so
+//! `rmp` #337 gave it a *recording* apply target that captured every compensating image during the
+//! locked phase and replayed them into the pool afterwards. The `rmp` #337 audit proved the split was
+//! not optional — without it, a rollback whose working set exceeds the pool capacity deadlocks (it
+//! panicked as a `RefCell` double-borrow under the old single-threaded handle).
+//!
+//! **That recording target no longer exists** (`rmp` #1062). The rule it served is unchanged and is
+//! now satisfied by a different, stronger structure:
+//! [`crate::store::RecordStore::rollback_physical`] drains the undo chain **one compensation at a
+//! time**, and each one is a page log-apply-order section — pin the page, take the rank-27 latch,
+//! append the CLR under the WAL mutex, release it, apply under the frame latch. The WAL borrow is
+//! therefore released before every pool call exactly as on every other write path, so an eviction
+//! triggered by one of those `fetch`es still takes the WAL lock with no holder. The reason for the
+//! change was ordering, not locking: a batch of appends followed by a batch of applies lets a
+//! concurrent writer interleave between them, so the CLRs enter the log in one order and take effect
+//! on the page in another, and ARIES — which replays strictly in log order — then rebuilds an image
+//! the live system never held.
 
 use std::sync::{Arc, Mutex};
 

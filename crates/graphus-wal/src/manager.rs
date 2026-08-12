@@ -502,31 +502,127 @@ impl<S: LogSink> WalManager<S> {
     ///
     /// # Panics
     /// Panics if the final `fdatasync` fails (`§4.9`).
+    /// # Byte-identity, and the precise limit of it (`rmp` #1062)
+    ///
+    /// Since #1062 this is a thin driver over [`compensate_next`](Self::compensate_next) and
+    /// [`finish_rollback`](Self::finish_rollback), which is how `graphus_storage` now drives a
+    /// rollback directly. The **records this method emits** are unchanged — the same CLRs, in the
+    /// same newest-first order, with the same `prev_lsn`/`undo_next_lsn`, followed by the same
+    /// `ABORT` — so a single-threaded log is byte-for-byte what the pre-#1062 loop produced.
+    ///
+    /// That is NOT the same as saying the log's byte stream is unchanged under concurrency, and the
+    /// difference is deliberate. The old loop held the manager lock across the whole batch, so a
+    /// transaction's CLRs were contiguous in the log; the WAL mutex is now taken **per
+    /// compensation**, so another transaction's records may interleave among them. Nothing reads a
+    /// CLR run as contiguous — recovery follows `prev_lsn`/`undo_next_lsn`, never adjacency — but a
+    /// test that diffs whole log bytes across a concurrent run will see the difference, and should.
     pub fn rollback<T: ApplyTarget>(&mut self, txn: TxnId, target: &mut T) -> Result<()> {
-        let Some(st) = self.active.remove(&txn) else {
-            return Ok(());
-        };
+        while let Some((page_id, clr_lsn, image)) = self.compensate_next(txn) {
+            target.apply(page_id, clr_lsn, &image)?;
+        }
+        self.finish_rollback(txn);
+        Ok(())
+    }
+
+    /// The device page of `txn`'s newest not-yet-compensated undo entry, **without consuming it**
+    /// (`rmp` #1062). [`None`] when the chain is exhausted or `txn` has no active entry.
+    ///
+    /// # Why the caller needs to know the page before the CLR is appended
+    ///
+    /// A compensation is a logged page write like any other, so its `write_clr` and its application
+    /// to the page must happen as one indivisible step of that page's log-apply order — otherwise the
+    /// order in which CLRs enter the log stops matching the order in which they take effect, and ARIES
+    /// (which replays strictly in log order) rebuilds a different image from the one the live system
+    /// holds. The latch that supplies that order is keyed by the page, so the driver has to learn the
+    /// page **first**, take the latch, and only then call [`compensate_next`](Self::compensate_next).
+    ///
+    /// The peek is stable: an undo chain belongs to one transaction, and only that transaction's own
+    /// thread compensates it, so nothing can change which entry is newest between this call and the
+    /// pop. `graphus_storage`'s driver asserts the two agree anyway.
+    #[must_use]
+    pub fn next_undo_page(&self, txn: TxnId) -> Option<PageId> {
+        let st = self.active.get(&txn)?;
         // Invariant guard (`rmp` #724, storage-audit hardening): a sink that opts out of undo retention
         // (`retains_undo() == false`, i.e. the never-rolled-back ephemeral index `DiscardingLogSink`)
         // must have an EMPTY undo chain here — nothing was ever pushed. A non-empty chain under a
         // non-retaining sink would mean the "never rolled back" invariant was violated (a real rollback
         // reached a manager whose chain the fix deliberately dropped). This makes that invariant loud in
         // debug builds; it never fires for any durable sink (which always retains and rolls back
-        // normally).
+        // normally). Checked on every peek rather than once, which is strictly stronger and costs a
+        // branch on a path that is already walking the chain.
         debug_assert!(
             self.sink.retains_undo() || st.undo.is_empty(),
             "rollback of a non-retaining (DiscardingLogSink) WAL with a non-empty undo chain \
              violates the rmp #724 invariant"
         );
-        for entry in st.undo.iter().rev() {
-            let clr_lsn =
-                self.write_clr(txn, entry.page_id, entry.lsn, &entry.undo, entry.prev_lsn);
-            target.apply(entry.page_id, clr_lsn, &entry.undo)?;
-        }
+        st.undo.last().map(|e| e.page_id)
+    }
+
+    /// How many of `txn`'s logged actions are still waiting to be compensated — the length of its
+    /// WAL undo chain (`rmp` #1062). `0` for a transaction with no active entry.
+    ///
+    /// A diagnostic for the rollback drain: it is what lets a test say "the drain really stopped
+    /// early" and "recovery was really left with work to do" as measurements rather than as
+    /// assumptions.
+    #[must_use]
+    pub fn undo_chain_len(&self, txn: TxnId) -> usize {
+        self.active.get(&txn).map_or(0, |st| st.undo.len())
+    }
+
+    /// Pops `txn`'s newest not-yet-compensated undo entry, appends its CLR, and hands back the page,
+    /// the CLR's LSN and the compensating image for the caller to apply (`rmp` #1062).
+    ///
+    /// [`None`] when the chain is exhausted or `txn` has no active entry. The image is **moved** out
+    /// of the undo chain, so draining a chain this way costs no copy and frees each image as it goes.
+    ///
+    /// # The active-table entry is deliberately left in place until `finish_rollback`
+    ///
+    /// The pre-#1062 batch removed it before writing a single CLR. Keeping it is load-bearing in the
+    /// safe direction, in two ways:
+    ///
+    /// * **Log reclamation.** [`reclaim`](Self::reclaim) clamps its floor to the minimum `first_lsn`
+    ///   over the active table. A transaction mid-rollback still needs its own back-chain — that is
+    ///   exactly what recovery walks if the process dies before the `ABORT` — so dropping it from the
+    ///   table would let a concurrent reclaim delete the records the resume path depends on.
+    /// * **Checkpoints.** A transaction with un-compensated records in the log is active, so a fuzzy
+    ///   checkpoint taken now must list it as such.
+    pub fn compensate_next(&mut self, txn: TxnId) -> Option<(PageId, Lsn, Vec<u8>)> {
+        let entry = self.active.get_mut(&txn)?.undo.pop()?;
+        let clr_lsn = self.write_clr(txn, entry.page_id, entry.lsn, &entry.undo, entry.prev_lsn);
+        Some((entry.page_id, clr_lsn, entry.undo))
+    }
+
+    /// Ends `txn` as **aborted**: retires it from the active table, appends the `ABORT`
+    /// end-of-undo marker and hardens (`rmp` #1062, the tail of a step-wise
+    /// [`rollback`](Self::rollback)).
+    ///
+    /// A no-op for a transaction with no active entry, which is what makes a read-only abort cost
+    /// zero WAL bytes and zero syncs, and what makes a double rollback idempotent.
+    ///
+    /// # A crash before this point is recovered, not lost
+    ///
+    /// Without the `ABORT`, `txn` is still a recovery **loser**: its records are in the log and it has
+    /// neither a `COMMIT` nor an `ABORT`. Recovery's undo phase walks its back-chain from its last
+    /// record, meets the CLRs already written by the interrupted rollback, and resumes at each one's
+    /// `undo_next_lsn` — so the compensations already taken are not re-applied and the ones still
+    /// owed are. That is exactly the mechanism that makes a crash *during recovery* idempotent
+    /// (`crate::recovery`), reused here.
+    ///
+    /// # Panics
+    /// Panics (controlled abort) if the `fdatasync` fails (`§4.9`).
+    pub fn finish_rollback(&mut self, txn: TxnId) {
+        let Some(st) = self.active.remove(&txn) else {
+            return;
+        };
+        debug_assert!(
+            st.undo.is_empty(),
+            "finish_rollback with {} un-compensated undo entries: the chain must be drained through \
+             `compensate_next` first, or those actions survive the abort",
+            st.undo.len()
+        );
         let mut end = LogRecord::new(RecordType::Abort, txn, PageId(0));
         self.append(&mut end);
         self.harden();
-        Ok(())
     }
 
     /// Ends `txn` as **aborted** without applying any compensation (`rmp` #970).
@@ -761,10 +857,10 @@ impl<S: LogSink> WalManager<S> {
         // never held across I/O, and a barrier is the sharpest instance of that: held here, one
         // `fdatasync` would convoy every allocator of that store. Also debug-only.
         graphus_core::latch::assert_no_alloc_latch_held("WalManager::harden");
-        // And for the store's rank-27 chain-head publication latch (`rmp` #1028), which sits between
-        // the allocator and this log for the same reason and carries the same never-across-I/O
-        // promise. Debug-only.
-        graphus_core::latch::assert_no_chain_head_latch_held("WalManager::harden");
+        // And for the store's rank-27 page log-apply-order latch (`rmp` #1028, widened to every logged
+        // page write by `rmp` #1062), which sits between the allocator and this log for the same
+        // reason and carries the same never-across-I/O promise. Debug-only.
+        graphus_core::latch::assert_no_page_order_latch_held("WalManager::harden");
         // Rank 22, the maintenance latch (`rmp` #1014): a leaf, and hardening under it would put
         // every writer with a record to tombstone behind this fdatasync.
         graphus_core::latch::assert_no_maintenance_latch_held("WalManager::harden");

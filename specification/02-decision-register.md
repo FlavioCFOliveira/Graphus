@@ -10,9 +10,9 @@ to the domain/component it constrains. On ratification, the chosen option is rec
 and its status set to `ratified`.
 
 > **Status: all 24 decisions of the original 2026-06-05 round are ratified.** The chosen option is
-> recorded on each `Decision` node (`status: ratified`, property `chosen`). Twenty-four further
+> recorded on each `Decision` node (`status: ratified`, property `chosen`). Twenty-five further
 > decisions were ratified after that round; they are recorded in the same index below, each carrying
-> its own ratification date. The register therefore holds **48 decisions** in total. The decision index in
+> its own ratification date. The register therefore holds **49 decisions** in total. The decision index in
 > the next section is the canonical enumeration; the options tables below it are kept for the
 > rationale and trade-offs, and are not a decision list.
 
@@ -83,9 +83,10 @@ Parse contract, to be preserved by any future edit:
 | `D-chain-head-redo-only` | ratified | 2026-08-05 | **A chain-head publication (`undo_ptr`, `first_rel`, `first_prop`) and the relink of the head it displaces are logged redo-only, with an empty undo image.** Their inverse is to *unlink the entry*, computed at abort time from the transaction's own deltas, and never the restoration of the word. Neither form of restoration could be made safe: a plain pre-image undo of a shared head clobbers a concurrently-committed prepend (the whole of `rmp` #220), and the compare-and-set undo that replaced it was narrower but still unsound, because it restores an **id**, and once a slot can be freed and handed out again the id it restores may name a different record. The state a redo-only write leaves after recovery is a head naming a `!in_use` record — a **corpse**, which every chain walk in the storage core already threads through and the GC splice reclaims — and that is the state `rmp` #220 / #172 already designed the header-only creation undo around. Two exceptions are deliberate: the GC's clearing of `undo_ptr` keeps a physical undo, because it is not a prepend; and the compare-and-set undo itself is **not** retired, surviving on the node's `labels` word and on the MVCC header word, where a whole-word write's inverse *is* the word. Closes the chain-head half of `04-technical-design.md` §5.1.5 row 3; design in `04-technical-design.md` §4.4, and format consequences in `05-storage-format.md` §7 and §12.5. |
 | `D-orphan-slot-parking` | ratified | 2026-08-05 | **A record slot that a logical rollback orphans is parked in memory until the next garbage-collection pass, not returned to the free list by the abort itself.** The abort knows the slot is unreachable — it is what unlinked it — so the restraint is deliberate, and its reason lies outside the storage engine: the latest-state TEXT, FULLTEXT and SPATIAL indexes are in memory, **not transactional**, and key their documents by **physical node id**. An aborted node's posting survives its rollback as a harmless false positive that the re-check filters out, but recycling the id immediately turns the next writer's *insert* into what the index reads as the **replacement of a still-committed document** — the one shape `rmp` #756 must fail closed on, at the cost of a poisoned freshness marker and of every text or spatial seek degrading to a full scan until a rebuild. Parking keeps the space guarantee (the slots do come back, so an abort-heavy workload does not grow the store) while moving the recycle to a maintenance boundary; the GC phase is guarded on the record still being retired, so a slot legitimately re-used by some other path is never double-freed. The parking becomes unnecessary once those indexes are version-aware. Design in `04-technical-design.md` §5.1.5. |
 | `D-statement-isolation` | ratified | 2026-08-05 | **A statement does not observe its own writes, and the rule is one comparison operator over the delta's `command_id`.** Every read carries a **view** — `New` (the default) or `Old` — beside its snapshot; the view decides nothing about other transactions and only whether the reader's own uncommitted deltas are undone (`New`: written by a later command; `Old`: written by a later command **or by the current one**). A delta written outside any statement carries `command_id = 0` and is undone by **no** view, because it belongs to the transaction's baseline rather than to a statement. The counter lives in the record store, which is its single source of truth, and it advances at exactly **two** points: when a cursor opens, and at a `WITH` that follows a write. Polarity is fixed per clause: `Old` for every scan, every index seek, every relationship expansion, a `MATCH`'s `Filter`, `UNWIND` and a read-only procedure `CALL`; `New` for `MERGE`'s match sub-plan, every update clause, projection, aggregation and ordering, and a writing procedure `CALL`. The planner's `Eager` barriers are **all retained**: they decouple row production while the view re-polarises visibility, and reforming them is separate work. Closes the `command_id` half of `04-technical-design.md` §5.1.4; design in `04-technical-design.md` §§5.1.4, 5.3 and `05-storage-format.md` §12.2. |
-| `D-chain-head-publication` | ratified | 2026-08-09 | **A chain head is published by a compare-and-publish held atomic by a short publication latch, and a refused publication logs nothing.** The unconditional byte write through which a **prepend** published `first_rel`, `first_prop` and `undo_ptr` is retired: a prepend now reads the head, writes its entry linked to that head, publishes the entry **only if** the head still holds what it read, and fixes the displaced predecessor's back-pointer only **after** it has won — so two writers can never relink the same predecessor. A refusal re-reads the head, re-links the entry and retries. The protocol lives in the dependency-free leaf crate `graphus-chainhead`, where `loom` can model-check it. Atomicity and, equally, **durable order** (log order must equal the order in which publications take effect on the page) are supplied by a sharded latch at **rank 27**, between the allocation latch (25) and the WAL (30), taken with the page already pinned, admitting one holder per thread, and never held across I/O — mechanically enforced in debug builds. The redo image is a compare-and-set patch, which needs **no** new WAL record type, format version or recovery step. The write stays **redo-only** (`D-chain-head-redo-only` is unchanged). The same latch covers two further writes, because the head word alone is not the whole prepend: the shared `chain_flags` byte of the displaced relationship, which a prepend clears with a commutative mask instead of a computed byte, and the GC corpse splice's repointing of a node head, converted so that no writer of that word stores into it unconditionally. Facet table in the "Ratified decision (2026-08-09) — chain-head publication" section below; design in `04-technical-design.md` §5.7.1. |
+| `D-chain-head-publication` | ratified | 2026-08-09 | **A chain head is published by a compare-and-publish held atomic by a short publication latch, and a refused publication logs nothing.** The unconditional byte write through which a **prepend** published `first_rel`, `first_prop` and `undo_ptr` is retired: a prepend now reads the head, writes its entry linked to that head, publishes the entry **only if** the head still holds what it read, and fixes the displaced predecessor's back-pointer only **after** it has won — so two writers can never relink the same predecessor. A refusal re-reads the head, re-links the entry and retries. The protocol lives in the dependency-free leaf crate `graphus-chainhead`, where `loom` can model-check it. Atomicity and, equally, **durable order** (log order must equal the order in which publications take effect on the page) are supplied by a sharded latch at **rank 27**, between the allocation latch (25) and the WAL (30), taken with the page already pinned, admitting one holder per thread, and never held across I/O — mechanically enforced in debug builds. The redo image is a compare-and-set patch, which needs **no** new WAL record type, format version or recovery step. The write stays **redo-only** (`D-chain-head-redo-only` is unchanged). The same latch covers two further writes, because the head word alone is not the whole prepend: the shared `chain_flags` byte of the displaced relationship, which a prepend clears with a commutative mask instead of a computed byte, and the GC corpse splice's repointing of a node head, converted so that no writer of that word stores into it unconditionally. Facet table in the "Ratified decision (2026-08-09) — chain-head publication" section below; design in `04-technical-design.md` §5.7.1. **Post-ratification (2026-08-12, task #1062): the rank-27 latch is now keyed by the device page instead of by `(store kind, record id)`. The widening is strict — every writer of a record is a writer of its page and maps to the same shard — so this decision's guarantee is unchanged, and chain-head publication is now a particular case of `D-page-write-order`. See the "Post-ratification note (2026-08-12) — `D-chain-head-publication`" below.** |
 | `D-wal-group-leader` | ratified | 2026-08-11 | **One shared fsync group leader hardens the WAL for every engine worker, and the per-worker fsync thread is retired.** The pipelined group commit of task **#532** offloads a commit batch's `fdatasync` so that the durability sync of batch *K* overlaps the CPU preparation of batch *K+1*. Its documented invariant was **strict depth-1** — a job channel of depth one, and the engine waiting for the outstanding job before submitting the next, so at most one batch is ever written-but-un-synced and a crash tail is the tail of one batch. That invariant became **false** the moment the engine grew to `W` workers: each worker spawned its own fsync thread over the **one** `WalManager` they share behind `SharedWal`, so each was depth-1 for itself while the system reached depth `W`, and a crash tail could hold interleaved batches from several workers. The ack-after-fsync rule was not actually violated, but only because of three properties of the sink that **no contract declared** — a job hardens whole files and therefore at least its entire declared range; every `begin_harden` starts at the sink's **global** durable frontier; and completion is a monotone maximum that the acknowledgement is taken after. This decision promotes those three to **the sink contract**, declared normatively and each pinned by a test, and makes the job carry the range it hardens explicitly (`covers_from`, `target_len`) so the contract is machine-checkable rather than prose. **One fsync group leader per database engine** then replaces the per-worker thread: workers offer their job to the leader, at most one `fdatasync` is in flight system-wide, a newer offer subsumes and discards an older pending one, and each worker is released once the group's hardened watermark passes its own target — the `XLogFlush` shape of PostgreSQL. **Depth-1 is restated where it is now true**: one `fdatasync` in flight for the whole engine, so the crash tail is again the tail of one un-synced interval rather than of `W` interleaved ones. Every discard is adjudicated by an **always-on tripwire** against the sink's own attested durable frontier, so a per-worker frontier or a sync narrowed to a byte range trips it instead of silently acknowledging un-synced bytes. Refines `D-multi-writer` by fixing the durability mechanism its parallel writers share; leaves `D-async-commit` untouched, since ack-after-fsync remains unconditional and nothing here defers or batches a sync in time; supersedes no ratified outcome, and changes no on-disk format. Facet table in the "Ratified decision (2026-08-11) — the WAL fsync group leader" section below; design in `04-technical-design.md` §4.2 and §9.1. |
 | `D-published-snapshot-horizon` | ratified | 2026-08-12 | **A snapshot timestamp is the published commit-visibility horizon, never the commit-timestamp allocation clock.** A commit timestamp is issued at the start of commit and the commit publishes itself only afterwards, in **two writes in two media** — the durable commit-info slot and the in-memory commit registry — so the issuing clock names commits that neither visibility oracle will yet admit. Handing that clock out as a begin timestamp became a **lost update** the moment `D-multi-writer` allowed a second worker to begin inside that window: the transaction read the pre-commit value of every record the committing transaction wrote and, being itself a writer, overwrote it — two acknowledged increments, one applied, on roughly one run in five at eight engine workers and never at one. The store now holds the set of commit timestamps that are **issued but not yet published** and derives the horizon as the **contiguous published prefix** (the lowest pending timestamp minus one, or the whole allocation clock when nothing is pending), advanced by an atomic maximum so it is monotone under any interleaving. The set is guarded by the **rank-20 commit sequencer latch**, entered through a single acquisition door, a leaf, and off the read path entirely: taking a snapshot remains one atomic load. An issued timestamp is released on **every** exit — published once both halves of publication are done, abandoned on failure and thereafter skipped, never reissued — because a leaked timestamp freezes the horizon for the life of the process; the commit path is therefore split into a timestamp-issuing wrapper and a fallible body, so release is a property of one caller rather than of every fallible step. `begin` and the commit path **return** the timestamp they captured or assigned, and callers use that value instead of re-reading a clock a sibling worker may have moved. Refines `D-version-representation` by fixing what a snapshot timestamp *means*, and `D-write-conflict-detection` by making its second arm answerable; supersedes no ratified outcome and changes no on-disk format. Facet table in the "Ratified decision (2026-08-12) — the published snapshot horizon" section below; design in `04-technical-design.md` §5.2, §5.1.3 and §5.7. |
+| `D-page-write-order` | ratified | 2026-08-12 | **For every page, the order in which logged writes enter the WAL is the order in which they take effect on that page.** A logged page write is two instants — the record enters the log under the WAL mutex (rank 30), the change takes effect on the cached page under the frame latch (rank 40) — and until task **#1062** nothing tied them together. With one writer per database that is latent; with several, two writers of one page could enter the log in one order and apply in the other, and because ARIES replays strictly in log order the durable state after a crash **differed** from the state a crash-free execution left, with neither wrong on its own terms and no result-checking test able to see it. The invariant is supplied by the **rank-27 section re-keyed from `(store kind, record id)` to the device page**, with the page pinned before the latch is taken: capture the undo pre-image, append the record, apply the post-image and stamp `page_lsn` are **one indivisible section per page**, and every one of the record store's ten WAL-append sites — plus the rollback path's compensation append — passes through the single door that enters it. Three alternatives are rejected: a **monotone `page_lsn` stamp alone** (already in the tree since task #1029 while the divergence was measured, and worse than useless on its own, because a page stamped with an LSN it never applied makes redo **skip** a legitimate record); **appending under the frame latch** (it inverts ranks 30 and 40, and the WAL barrier refuses by tripwire to run with a frame latch held); and **applying under the WAL mutex** (it violates the absolute rule that the store never holds its WAL lock across a buffer-pool call that can trigger a write-back). `D-chain-head-publication` is absorbed as a particular case, unchanged, because keying by page is a strict widening of keying by record. No byte of any on-disk format changes, and no recovery step changes. Facet table in the "Ratified decision (2026-08-12) — log order equals apply order, per page" section below; design in `04-technical-design.md` §5.7.2 and §3.3. |
 
 <!-- END decision-index -->
 
@@ -983,6 +984,152 @@ scope and are propagated into `00-overview.md` and `01-needs-survey.md`:
 > pass and a bulk import all write without ever taking a snapshot, so there is nothing to compare
 > against. The ratified outcome is unchanged and nothing is re-baselined; this note records the
 > completion of the rule and fixes the reading of its boundary. Design in `04-technical-design.md` §5.7.
+
+## Ratified decision (2026-08-12) — log order equals apply order, per page
+
+> **`D-page-write-order` settles what a logged page write must guarantee once more than one worker
+> may be writing, in task #1062.** It refines the earlier rounds rather than replacing any part of
+> them: `D-multi-writer`, `D-version-representation`, `D-write-conflict-detection`,
+> `D-chain-head-redo-only`, `D-wal-group-leader` and `D-published-snapshot-horizon` are unchanged, and
+> `D-chain-head-publication` is **absorbed as a particular case** rather than superseded. Every one of
+> the four inviolable requirements of `CLAUDE.md` stands as written, and **no byte of any on-disk
+> format changes** — not the record layouts, not the WAL record set, not the patch codec, not the
+> format version, not a recovery step.
+>
+> **Status: ratified.**
+>
+> **The invariant, normatively.** For every page, the order in which logged writes against that page
+> enter the WAL is the order in which those writes take effect on the page. Equivalently: what
+> recovery rebuilds for a page is what the last logged write to that page applied.
+>
+> **Why now.** A logged page write is **two instants** in two media. The record enters the log under
+> the WAL mutex (rank 30); the change takes effect on the cached page under the frame latch (rank 40).
+> Until task #1062 nothing tied those two instants together, and `write_region` — the store's general
+> page-write helper — appended and applied as two separately scheduled steps. With one writer per
+> database that is latent. Once the engine gained several writers (the multi-writer layers of
+> `D-multi-writer`), two writers of one page could enter the log in one order and take effect in the
+> other. ARIES replays **strictly in log order** and gates each record on the page's `page_lsn`, so
+> recovery then reconstructs an image the live system never held: the durable answer with no crash and
+> the durable answer after a crash **differ**, and after a crash the replayed one is the one that
+> survives. Neither answer is wrong on its own terms, which is exactly why no result-checking test
+> catches it.
+>
+> **The evidence that decided it.** Measured with the deterministic simulator, on the scenario
+> `det_scheduler_checkpoint_inversion_1055` — two writers, four commits each, sixteen seeds — before
+> the fix:
+>
+> - **32 page-LSN descents across the sixteen seeds**, and **not one of them on a chain head**. The
+>   pages that descended were the catalog image (`write_region`), the commit slot
+>   (`patch_commit_slot_word`, which reaches the log through `write_region`), the undo area
+>   (`write_undo_area_create`) and a node's label word (`write_node_labels`) — every one of them an
+>   ordinary transactional write, none of them the chain-head path task #1028 had already closed.
+> - The divergence in full, on seed `0x1`: a reopen recovered `[9, 5, 4]`, which is transaction 1004's
+>   image, while the **last** page write in the recorded schedule was transaction 2004's `[9, 4, 5]`.
+>   Recovery and the live system reached different verdicts about the same page.
+> - **The positive control.** With the rank-27 section ablated to a bare call and everything else
+>   identical, the invariant test fails on **13 of the 16 seeds**, 1 to 4 descents each, 30 in total,
+>   while the three non-vacuity assertions of the same file continue to pass — so the zero the suite
+>   asserts with the section in place is a zero the workload could have broken.
+>
+> **The alternatives weighed.**
+>
+> | Option | Verdict |
+> | --- | --- |
+> | **A — rely on the monotone `page_lsn` stamp.** The stamp already takes the maximum of the page's current LSN and the record's, so it never descends; the argument was that a page whose LSN never goes backwards is a page whose ordering is already safe. | **Rejected — empirically insufficient, and harmful on its own.** The stamp has taken the maximum since task **#1029**, so it was **already in the tree while the 32 descents above were measured**: a monotone stamp is therefore not the fix. It hides the divergence only if the page's *content* is monotone too, and content is not. Worse, the stamp alone is not merely inadequate but actively dangerous: redo skips every record whose LSN is at or below `page_lsn`, so a page carrying an LSN it never applied silently loses every legitimate record logged at or below it, and nothing reports the loss. Clamping the symptom would have made recovery **skip** records rather than mis-order them. |
+> | **B — append the record under the frame latch, so that the LSN is assigned while the page is held.** This is what the reference engines do, and it would make the two instants one by construction. | **Rejected — it inverts the engine's latch order.** The append needs the WAL mutex (rank 30) while the frame latch is rank 40, so taking the WAL mutex under the frame latch is an out-of-rank acquisition, and the WAL barrier already refuses **by tripwire** to run with a frame latch held. This is the same rank inversion that `D-chain-head-publication` rejected in 2026-08-09, arriving for the general write path rather than for the head word. |
+> | **C — hold the WAL mutex across the page apply, so that append and apply are one section under the WAL lock.** | **Rejected — it violates an absolute rule of the store.** The store MUST NOT hold its own WAL lock while calling any buffer-pool method that can trigger a write-back, because a write-back re-enters the WAL rule's durability check and would take the WAL lock again. The rule is stated as strict and absolute in `crates/graphus-storage/src/wal_rule.rs`, and it exists to prevent both a wait cycle and a non-reentrant self-deadlock. |
+> | **D — re-key the existing rank-27 section from `(store kind, record id)` to the device page, and route every logged page write through it. ★ chosen** | **Ratified.** It supplies the missing coupling at the granularity the invariant actually needs, and it adds **no new latch, no new rank, no new record type and no format change** — it widens a mechanism the engine already had, already ranked, and already enforced by tripwire. |
+>
+> **Why the key is the page and not the record.** `page_lsn` is a property of the **page**. ARIES gates
+> redo on `record.lsn > page_lsn` and replays in log order, so two writers of two *different* records
+> that happen to share a page must be ordered exactly as much as two writers of one record — and the
+> measurement above is precisely that case, since none of the 32 descents was on a chain head. Keying
+> by page is a **strict widening** of keying by record: every writer of a record is a writer of its
+> page and maps to the same shard, so the guarantee `D-chain-head-publication` ratified is preserved
+> exactly rather than re-derived.
+>
+> **The consequences that are normative.**
+>
+> - **One section, four steps.** Capturing the undo pre-image, appending the record, applying the
+>   post-image and stamping `page_lsn` are one indivisible section per page. The pre-image capture has
+>   to be inside it: an image read outside the section can be overwritten by another writer of that
+>   region before this record is appended, and the undo would then restore a state that was never this
+>   writer's to restore.
+> - **The page is pinned before the section is entered and unpinned after it is left.** The section is
+>   never held across a page fetch that may evict, across store growth, or across a durability barrier.
+> - **One door.** Every WAL append made against a page goes through the store's single logging door,
+>   which asserts that the caller holds the section for that page. This is a **standing obligation on
+>   future work**: a new append site that reaches the WAL by any other route reopens the defect in
+>   full, and no test currently in the suite would name it as the cause.
+> - **The shard count is a contention parameter only.** Correctness requires nothing beyond "one page
+>   always maps to one shard". The array is sharded so that writers on unrelated pages do not wait for
+>   one another; the index is derived by multiplicative (Fibonacci) hashing, which mixes the
+>   low-entropy input — device page ids are dense and consecutive — instead of aliasing every *N*-th
+>   page onto one shard. It is a mixing function and not a perfect distribution: two unrelated pages
+>   can share a shard and then serialize needlessly, which costs throughput and never correctness.
+> - **The cost accepted.** Two writers of one page now serialize where before they did not. That is a
+>   deliberate widening of contention, taken because the alternative is a database whose recovered
+>   state disagrees with the state it just served, and because page-level serialization is what the
+>   durability model requires rather than an artefact of this implementation.
+> - **The tripwires are debug-build only.** Every obligation above is checked by thread-local
+>   tripwires that a release build compiles out. The mechanism itself — the latch and the single door —
+>   is present in every build; what a release build gives up is the *diagnosis* of a violation, not the
+>   protection.
+>
+> **One limitation is recorded rather than left to be discovered.** The B+-tree index layer has
+> **eight WAL-append sites** (in `crates/graphus-index/src/btree.rs`) that do **not** pass through this
+> door, and cannot: the section and its door are internal to the record store, and the index crate
+> cannot reach them. Those eight sites satisfy the invariant today by **Rust exclusivity and by
+> construction**, not by the mechanism this decision installs — every mutating `BTree` method takes
+> `&mut self`, each tree owns its own single-threaded buffer pool and its own base-page range, and in
+> production each tree is handed a device of its own, so no two threads can be writing one tree page
+> at all. That is a sound argument for the
+> engine as it stands today and **it is not the invariant this decision states**. The moment the index
+> layer becomes multi-writer over one tree, the defect reappears there in full, and it will reappear
+> silently: those pages are stamped outside the concurrent pool's instrumented path, so the
+> page-LSN-descent oracle that measured the 32 descents does not observe them and would report zero
+> while they diverged. Any task that makes an index tree writable by more than one thread MUST bring
+> those sites under an equivalent mechanism first.
+>
+> **Where this is specified.** The invariant, the section, the single logging door, the enumerated
+> append sites and the index-layer limitation are `04-technical-design.md` §5.7.2; the latch ranks and
+> their obligations are §3.3; the chain-head protocol that is now a particular case is §5.7.1. The
+> deterministic scenario, its non-vacuity controls and the ablation are `07-dst-simulator.md`.
+
+## Post-ratification note (2026-08-12) — `D-chain-head-publication`
+
+> **This note records how task #1062 changed the mechanism `D-chain-head-publication` relies on. It
+> creates no new decision of its own, and it changes no ratified outcome of the 2026-08-09 round.**
+> The four ordered steps of a prepend, the compare-and-publish, the rule that step 4 follows a winning
+> publication, the retry a refusal demands, the rule that a refused publication appends no record, the
+> redo-only status of the write and the placement of the protocol in a dependency-free leaf crate all
+> stand exactly as ratified.
+>
+> **What changed.** The rank-27 publication latch that supplies the two ordering obligations —
+> atomicity and durable order — was **re-keyed from `(store kind, record id)` to the device page**.
+> Everything else about the latch is as ratified: the same rank, the same position between the
+> allocation latch (25) and the WAL (30), the page pinned before the latch is taken, at most one
+> holder per thread, never held across I/O, and the obligations checked mechanically in debug builds.
+>
+> **Why the ratified guarantee is unchanged.** The re-keying is a **strict widening**. Every writer of
+> a record is a writer of the page that record lives on, and both map to the same shard, so every pair
+> of writers the 2026-08-09 key ordered is still ordered by the 2026-08-12 key. Nothing that was
+> serialized before is unserialized now; strictly more is serialized. The 2026-08-09 decision's own
+> reasoning is therefore untouched, and its measurement of the chain-head defect class stands.
+>
+> **Why the widening was necessary, in one sentence.** Keying by record orders the writers of one
+> chain head and leaves unordered two writers of two *different* records that share a page — and that
+> is where the divergence was actually measured: of the 32 page-LSN descents task #1062 found, **not
+> one was on a chain head**.
+>
+> **Its new standing.** `D-chain-head-publication` is a **particular case of `D-page-write-order`**,
+> already absorbed by it. Both decisions remain in the canonical index with their own keys and their
+> own ratification dates, because each one names a real and distinct scope: 2026-08-09 settled how a
+> chain head is *published* — the compare-and-publish, the four steps, the refusal semantics — and
+> 2026-08-12 settles what *every* logged page write must guarantee about order. Neither is redundant,
+> and the earlier one remains a faithful record of what task #1028 ratified.
+>
+> Design in `04-technical-design.md` §5.7.1 (the protocol, unchanged) and §5.7.2 (the widened section).
 
 ## TCK target (pinned — closes `D-cypher-line` open question 1)
 

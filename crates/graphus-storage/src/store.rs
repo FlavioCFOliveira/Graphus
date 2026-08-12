@@ -1793,25 +1793,39 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// created. Surfaced by [`opened_format_version`](Self::opened_format_version) so a caller can
     /// see that an upgrade happened; the store itself always writes the current version.
     opened_format_version: u32,
-    /// **`rmp` #1028.** The sharded **chain-head publication latch** (rank 27, see
-    /// [`graphus_core::latch::ChainHeadLatchScope`]), keyed by the record that owns the head.
+    /// **`rmp` #1028, widened by `rmp` #1062.** The sharded **page log-apply-order latch** (rank 27,
+    /// see [`graphus_core::latch::PageOrderLatchScope`]), keyed by the **device page**.
     ///
-    /// One entry of this array is held for the whole of
-    /// [`compare_and_publish_chain_head`](Self::compare_and_publish_chain_head): peek at the head,
-    /// append the redo record, apply it. Those three steps have to be indivisible, and not for the
-    /// reason that first comes to mind. Making the read-compare-write atomic *in memory* is only half
-    /// of it; the half that bites is **durable order**. The redo record is appended under the WAL
-    /// mutex (rank 30) and applied under the frame latch (rank 40), and nothing else ties those two
-    /// instants together — so two publishers can enter the log in one order and take effect on the
-    /// page in the other. ARIES replays in log order, so recovery would then reach a *different*
-    /// verdict from the live system, and after a crash the replayed verdict is the one that survives:
-    /// a committed relationship dropped out of its node's incidence chain, which is `rmp` #220
-    /// arriving by a route the compare-and-set alone does not close.
+    /// One entry of this array is held for the whole of every logged page write — read what the
+    /// record needs, append it, apply it — through [`in_page_order`](Self::in_page_order). Those
+    /// steps have to be indivisible, and not for the reason that first comes to mind. Making a
+    /// read-compare-write atomic *in memory* is only half of it; the half that bites is **durable
+    /// order**. The record is appended under the WAL mutex (rank 30) and applied under the frame
+    /// latch (rank 40), and nothing else ties those two instants together — so two writers can enter
+    /// the log in one order and take effect on the page in the other. ARIES replays in log order, so
+    /// recovery would then reach a *different* verdict from the live system, and after a crash the
+    /// replayed verdict is the one that survives: a committed relationship dropped out of its node's
+    /// incidence chain, which is `rmp` #220 arriving by a route the compare-and-set alone does not
+    /// close.
     ///
-    /// Sharded rather than global so publishers on unrelated records never wait for one another; the
-    /// shard count is a contention parameter only — correctness needs just that the *same* head
-    /// always maps to the *same* shard.
-    chain_head_locks: Box<[Mutex<()>]>,
+    /// # Why the key is the page and not the record (`rmp` #1062)
+    ///
+    /// `rmp` #1028 keyed this array by `(store kind, record id)`, which orders the writers of one
+    /// record and leaves the writers of two *different* records that share a page unordered. But
+    /// `page_lsn` is a property of the **page**: ARIES gates redo on `record.lsn > page_lsn` and
+    /// replays in log order, so two writers of one page must be ordered whether or not they touch the
+    /// same record. Measured (`rmp` #1062, 2026-08-12): the
+    /// `det_scheduler_checkpoint_inversion_1055` scenario — two writers, four commits each, sixteen
+    /// seeds — produced **32** page-LSN descents, **none of them on a chain head**: the catalog image
+    /// (`write_region`), the commit slot (`patch_commit_slot_word`), the undo area
+    /// (`write_undo_area_create`) and a node's label word (`write_node_labels`). Keying by page is a
+    /// strict widening: every writer of a record is a writer of its page and maps to the same shard,
+    /// so the #1028 guarantee is preserved exactly.
+    ///
+    /// Sharded rather than global so writers on unrelated pages never wait for one another; the shard
+    /// count is a contention parameter only — correctness needs just that the *same* page always maps
+    /// to the *same* shard.
+    page_order_locks: Box<[Mutex<()>]>,
     /// **`rmp` #992.** What the derived-index layer asked this store to report about the versions its
     /// GC reclaims. Empty by default, replaced wholesale before each pass by the caller that owns the
     /// indexes; see [`IndexInterest`].
@@ -1903,16 +1917,16 @@ const MAX_SPARE_UNDO_SLABS: usize = 16;
 /// store pages — a handful of page fetches per kind.
 const FREEZE_AUDIT_WINDOW_IDS: u64 = 8192;
 
-/// Shards of the chain-head publication latch (`rmp` #1028).
+/// Shards of the page log-apply-order latch (`rmp` #1028, re-keyed by page in `rmp` #1062).
 ///
-/// Purely a contention parameter: correctness needs only that one head word always maps to one
-/// shard. Sized so that the publishers of unrelated records essentially never collide, while the
-/// array itself stays a few hundred bytes — a store holds one.
-const CHAIN_HEAD_LOCK_SHARDS: usize = 64;
+/// Purely a contention parameter: correctness needs only that one page always maps to one shard.
+/// Sized so that the writers of unrelated pages essentially never collide, while the array itself
+/// stays a few hundred bytes — a store holds one.
+const PAGE_ORDER_LOCK_SHARDS: usize = 64;
 
-/// Builds the store's chain-head publication latch array.
-fn new_chain_head_locks() -> Box<[Mutex<()>]> {
-    (0..CHAIN_HEAD_LOCK_SHARDS)
+/// Builds the store's page log-apply-order latch array.
+fn new_page_order_locks() -> Box<[Mutex<()>]> {
+    (0..PAGE_ORDER_LOCK_SHARDS)
         .map(|_| Mutex::new(()))
         .collect()
 }
@@ -2081,7 +2095,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // `rmp` #966 undo-area state: all in-memory, all rebuilt from scratch every open. The
             // chain sweep's pending set is reseeded by the first pass's full scan
             // (`gc_full_scan_pending`), so a crash-recovered store reclaims its chains normally.
-            chain_head_locks: new_chain_head_locks(),
+            page_order_locks: new_page_order_locks(),
             // `rmp` #992: nothing is reported until a derived-index layer declares what it covers.
             index_interest: RwLock::new(IndexInterest::default()),
             checkpoint_interval_bytes: AtomicU64::new(DEFAULT_CHECKPOINT_INTERVAL_BYTES),
@@ -2236,7 +2250,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // `rmp` #966 undo-area state: all in-memory, all rebuilt from scratch every open. The
             // chain sweep's pending set is reseeded by the first pass's full scan
             // (`gc_full_scan_pending`), so a crash-recovered store reclaims its chains normally.
-            chain_head_locks: new_chain_head_locks(),
+            page_order_locks: new_page_order_locks(),
             // `rmp` #992: nothing is reported until a derived-index layer declares what it covers.
             index_interest: RwLock::new(IndexInterest::default()),
             checkpoint_interval_bytes: AtomicU64::new(DEFAULT_CHECKPOINT_INTERVAL_BYTES),
@@ -3090,8 +3104,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // the log — holding a rank-25 latch across that takes rank 30..60 out of order and convoys
         // every allocator in the database behind one `fdatasync`. Debug-only; compiled out in release.
         graphus_core::latch::assert_no_alloc_latch_held("RecordStore::ensure_store_page");
-        // Ditto for the rank-27 chain-head publication latch (`rmp` #1028). Debug-only.
-        graphus_core::latch::assert_no_chain_head_latch_held("RecordStore::ensure_store_page");
+        // Ditto for the rank-27 page log-apply-order latch (`rmp` #1028/#1062). Debug-only.
+        graphus_core::latch::assert_no_page_order_latch_held("RecordStore::ensure_store_page");
         // And for the rank-22 maintenance latch (`rmp` #1014), which is a leaf: a GC pass that grew
         // the store while still holding the set it was draining would convoy every writer with a
         // record to tombstone behind this growth. Debug-only.
@@ -3157,16 +3171,20 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // redo plus an owned undo (the only image the WAL retains). The redo never allocates.
         let redo = paging::encode_patch(offset, bytes);
         let undo = redo.clone().into_vec();
+        // PINNED before the rank-27 section opens, because a `fetch` under it could evict, write a
+        // victim home and harden (`rmp` #1062; the pool asserts it).
         let f = self.pool.fetch(page)?;
-        // The WAL borrow is released (the `with` closure ends) before the pool write latch is taken,
+        // Append and apply as ONE step of this page's log-apply order (`rmp` #1062), so the order in
+        // which records enter the log is the order in which they take effect on the page. The WAL
+        // borrow is still released (the `with` closure ends) before the pool write latch is taken,
         // upholding the lock-ordering rule (`crate::wal_rule`): never hold the WAL lock across a pool
         // call. `with_page_mut_lsn` stamps `page_lsn` and applies the post-image under one write
         // latch (`rmp` #337, Slice 1).
-        let lsn = self
-            .wal
-            .with(|w| w.log_update_borrowed(txn, page, &redo, undo));
-        self.pool.with_page_mut_lsn(f, lsn, |p| {
-            p[offset..end].copy_from_slice(bytes);
+        self.in_page_order(page, || {
+            let lsn = self.log_page_record(page, |w| w.log_update_borrowed(txn, page, &redo, undo));
+            self.pool.with_page_mut_lsn(f, lsn, |p| {
+                p[offset..end].copy_from_slice(bytes);
+            });
         });
         self.pool.unpin(f);
         Ok(())
@@ -3181,25 +3199,32 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     fn write_region(&self, page: PageId, offset: usize, bytes: &[u8], txn: TxnId) -> Result<()> {
         let end = offset + bytes.len();
         assert!(end <= PAGE_SIZE, "region runs past the page");
+        // PINNED before the rank-27 section opens, because a `fetch` under it could evict, write a
+        // victim home and harden (`rmp` #1062; the pool asserts it).
         let f = self.pool.fetch(page)?;
-        // Build the undo patch from the still-unmodified page slice (read latch) before the in-place
-        // overwrite (write latch) below. The frame stays pinned across the two sequential — never
-        // nested — latch acquisitions (`rmp` #337, Slice 1 closure-API conversion).
-        // Capture the undo pre-image STRICTLY before the post-image overwrite below (`rmp` #373): the
-        // read latch reads the still-unmodified region into an inline patch; only this undo image is
-        // retained by the WAL (taken by value). The redo post-image is built inline and lent to the
-        // WAL by borrow, so the redo never heap-allocates.
-        let undo = self
-            .pool
-            .with_page(f, |p| paging::encode_patch(offset, &p[offset..end]))
-            .into_vec();
-        let redo = paging::encode_patch(offset, bytes);
-        // WAL borrow dropped before the pool write latch (lock-ordering rule, `crate::wal_rule`).
-        let lsn = self
-            .wal
-            .with(|w| w.log_update_borrowed(txn, page, &redo, undo));
-        self.pool.with_page_mut_lsn(f, lsn, |p| {
-            p[offset..end].copy_from_slice(bytes);
+        // Capture the undo pre-image, append, apply: ONE step of this page's log-apply order.
+        //
+        // The frame stays pinned across the three sequential — never nested — latch acquisitions
+        // (`rmp` #337, Slice 1 closure-API conversion). The pre-image is read under the frame's READ
+        // latch, strictly before the post-image overwrite under its WRITE latch (`rmp` #373), into an
+        // inline patch; only this undo image is retained by the WAL (taken by value), while the redo
+        // post-image is lent by borrow and never heap-allocates.
+        //
+        // All three are inside the rank-27 section, and the pre-image capture has to be
+        // (`rmp` #1062): an image read outside it can be overwritten by another writer of this region
+        // before this record is appended, and the undo would then restore bytes that were never this
+        // transaction's to restore — an abort that reverts a neighbour's committed write.
+        self.in_page_order(page, || {
+            let undo = self
+                .pool
+                .with_page(f, |p| paging::encode_patch(offset, &p[offset..end]))
+                .into_vec();
+            let redo = paging::encode_patch(offset, bytes);
+            // WAL borrow dropped before the pool write latch (lock-ordering rule, `crate::wal_rule`).
+            let lsn = self.log_page_record(page, |w| w.log_update_borrowed(txn, page, &redo, undo));
+            self.pool.with_page_mut_lsn(f, lsn, |p| {
+                p[offset..end].copy_from_slice(bytes);
+            });
         });
         self.pool.unpin(f);
         Ok(())
@@ -4581,19 +4606,22 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // Capture the pre-image (`old_word`) under a read latch before the overwrite — the frame stays
         // pinned across the two sequential latches (`rmp` #337, Slice 1), exactly as `write_region` /
         // `compare_and_publish_chain_head` do.
-        let old_word = self.pool.with_page(f, |p| {
-            u64::from_le_bytes(p[abs..abs + 8].try_into().expect("8-byte slice"))
-        });
-        // Redo is a plain, unconditional post-image (byte-identical to `patch_header_word`'s redo, so
-        // recovery redo is unchanged). Undo is the compare-and-set: reset to `old_word` iff the word is
-        // still `new_word` (this txn's own stamp). Redo lent by borrow; undo retained by value.
-        let redo = paging::encode_patch(abs, &new_word.to_le_bytes());
-        let undo = paging::encode_cas_patch(abs, new_word, old_word).into_vec();
-        let lsn = self
-            .wal
-            .with(|w| w.log_update_borrowed(txn, dev, &redo, undo));
-        self.pool.with_page_mut_lsn(f, lsn, |p| {
-            p[abs..abs + 8].copy_from_slice(&new_word.to_le_bytes());
+        // Read, append and apply as ONE step of this page's log-apply order (`rmp` #1062): the undo
+        // image is built from `old_word`, so a writer landing between the read and the append would
+        // make it a compare-and-set against a word this transaction never saw.
+        self.in_page_order(dev, || {
+            let old_word = self.pool.with_page(f, |p| {
+                u64::from_le_bytes(p[abs..abs + 8].try_into().expect("8-byte slice"))
+            });
+            // Redo is a plain, unconditional post-image (byte-identical to `patch_header_word`'s redo, so
+            // recovery redo is unchanged). Undo is the compare-and-set: reset to `old_word` iff the word is
+            // still `new_word` (this txn's own stamp). Redo lent by borrow; undo retained by value.
+            let redo = paging::encode_patch(abs, &new_word.to_le_bytes());
+            let undo = paging::encode_cas_patch(abs, new_word, old_word).into_vec();
+            let lsn = self.log_page_record(dev, |w| w.log_update_borrowed(txn, dev, &redo, undo));
+            self.pool.with_page_mut_lsn(f, lsn, |p| {
+                p[abs..abs + 8].copy_from_slice(&new_word.to_le_bytes());
+            });
         });
         self.pool.unpin(f);
         Ok(())
@@ -4648,28 +4676,122 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         let end = abs + bytes.len();
         let redo = paging::encode_patch(abs, bytes);
         let f = self.pool.fetch(dev)?;
-        let lsn = self.wal.with(|w| w.log_update_redo_only(txn, dev, &redo));
-        self.pool.with_page_mut_lsn(f, lsn, |p| {
-            p[abs..end].copy_from_slice(bytes);
+        // One step of this page's log-apply order (`rmp` #1062).
+        self.in_page_order(dev, || {
+            let lsn = self.log_page_record(dev, |w| w.log_update_redo_only(txn, dev, &redo));
+            self.pool.with_page_mut_lsn(f, lsn, |p| {
+                p[abs..end].copy_from_slice(bytes);
+            });
         });
         self.pool.unpin(f);
         Ok(())
     }
 
-    /// The shard of the chain-head publication latch that guards the head words of record `id` in
-    /// `kind`'s store (`rmp` #1028).
+    /// The shard of the page log-apply-order latch that guards device page `dev`
+    /// (`rmp` #1028, re-keyed by page in `rmp` #1062).
     ///
-    /// A record's two head words (a relationship's `first_prop` and its `undo_ptr`, say) share a
-    /// shard. That is deliberate and costs nothing: they are never published concurrently by one
-    /// writer, and correctness needs only that the *same* word always maps to the *same* shard.
-    fn chain_head_shard(&self, kind: StoreKind, id: u64) -> &Mutex<()> {
+    /// Every logged write to `dev` — whichever record it lands in — takes this one shard, because
+    /// what has to be ordered is the page's `page_lsn` and the page's content, not a record's.
+    fn page_order_shard(&self, dev: PageId) -> &Mutex<()> {
         // Fibonacci hashing: multiply by 2^64/φ (odd, so the map is a bijection) and take the HIGH
-        // bits, which mixes the low-entropy input — physical ids are dense and consecutive, and the
-        // store kind lives in the top byte — instead of aliasing every 64th id onto one shard.
-        let key = ((kind as u64) << 56) | id;
-        let mixed = key.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let idx = (mixed >> 32) as usize % self.chain_head_locks.len();
-        &self.chain_head_locks[idx]
+        // bits, which mixes the low-entropy input — device page ids are dense and consecutive —
+        // instead of aliasing every 64th page onto one shard.
+        let mixed = dev.0.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let idx = (mixed >> 32) as usize % self.page_order_locks.len();
+        &self.page_order_locks[idx]
+    }
+
+    /// Runs `body` as ONE indivisible step of device page `dev`'s **log-apply order** (`rmp` #1062):
+    /// while it runs, no other thread may append a record against `dev` and apply it.
+    ///
+    /// # The contract, which cannot be checked from here
+    ///
+    /// `body` must, for `dev` and no other page: read whatever the record's images need, append
+    /// exactly the record(s) it will apply, and apply them. Two obligations follow, and both are on
+    /// the caller:
+    ///
+    /// * **The frame must already be pinned.** The latch is rank 27 and admits no I/O: a `fetch`
+    ///   under it could miss, evict a dirty victim, write it home and harden — convoying every writer
+    ///   of the shard behind one `fdatasync`. `ConcurrentBufferPool::fetch` asserts this
+    ///   ([`graphus_core::latch::assert_no_page_order_latch_held`]), so a violation is loud in debug
+    ///   builds rather than a silent convoy.
+    /// * **One page per section.** Rank 27 admits at most one holder per thread (two locks of one
+    ///   rank cannot be ordered by rank, so two threads taking a different pair in a different order
+    ///   deadlock). A write that spans pages — a catalog image across the metadata chain, a
+    ///   rollback's compensations — takes one section per page, strictly one after another.
+    ///   [`PageOrderLatchScope::new`](graphus_core::latch::PageOrderLatchScope::new) asserts this too.
+    ///
+    /// # Why the deterministic scheduler must not hand over inside it
+    ///
+    /// The `Mutex` is not scheduler-mediated, and the pool calls inside `body` **are** yield points.
+    /// Under the deterministic scheduler a writer that handed the token over from in here would park
+    /// while holding the lock, and the thread that received it would block on the same lock — the run
+    /// wedges with `det-sched: STALLED`. Measured on `rmp` #1030 with gdb on both stacks. The
+    /// [`NoSwitchScope`](graphus_core::sched::NoSwitchScope) suppresses the hand-off without
+    /// suppressing the yield: the site still enters the recorded history, so a schedule stays a
+    /// complete account of the run and the `rmp` #1055 battery can still attribute each page write.
+    ///
+    /// Locals drop in reverse declaration order, so the region closes as: tripwire disarmed, lock
+    /// released, hand-off re-enabled — never the reverse, and correctly on an unwind out of `body`.
+    ///
+    /// # The cost, stated so the next person measuring write throughput finds it (`rmp` #1062, Q5-a)
+    ///
+    /// `body` appends under the `SharedWal` mutex, and that mutex is held across `sink.sync()` by
+    /// `WalManager::harden` — measured at ~2.9 ms per `fdatasync` on the reference host
+    /// (`rmp` #829 evaluation). So a writer inside this section can block on the WAL mutex behind
+    /// **somebody else's** durability barrier while holding its page shard, and every other writer of
+    /// that shard — roughly one in [`PAGE_ORDER_LOCK_SHARDS`] of the concurrent page writers — waits
+    /// with it.
+    ///
+    /// This exposure is not new, but #1062 **widened** it: before, only chain-head publications took
+    /// a rank-27 latch around a WAL append, and now every logged page write does. It is not a
+    /// correctness problem — the latch order (27 → 30 → 40) is respected, no I/O runs under the
+    /// rank-27 hold itself, and the rank-27 tripwire still refuses any path that would evict or harden
+    /// while it is held — and it was not measured to regress the suites this task ran. But it is the
+    /// one thing this change makes structurally worse, and the honest place to look first if
+    /// multi-writer commit throughput disappoints. The fix, if it is ever needed, is to shorten the
+    /// WAL mutex's own hold rather than to weaken this section: `harden` does not need the append lock
+    /// for the duration of the `fsync`.
+    ///
+    /// Raising [`PAGE_ORDER_LOCK_SHARDS`] narrows the blast radius but does not remove it, and is a
+    /// contention parameter only — correctness needs just that one page always maps to one shard.
+    #[inline]
+    fn in_page_order<R>(&self, dev: PageId, body: impl FnOnce() -> R) -> R {
+        let _no_switch = graphus_core::sched::NoSwitchScope::new();
+        let _guard = self
+            .page_order_shard(dev)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _scope = graphus_core::latch::PageOrderLatchScope::new(dev.0);
+        body()
+    }
+
+    /// The store's **only** door to appending a WAL record against a page (`rmp` #1062).
+    ///
+    /// Asserts, in debug builds, that this thread is inside `dev`'s rank-27 log-apply-order section
+    /// — see [`in_page_order`](Self::in_page_order) — and then appends under the WAL mutex, releasing
+    /// it before returning so no caller can hold it across a pool call (`crate::wal_rule`).
+    ///
+    /// # Why a door rather than a convention
+    ///
+    /// The rank-27 latch buys "log order is apply order" only while EVERY logged write to a page goes
+    /// through it. One future site that appends outside the section re-opens the defect in full, and
+    /// nothing would report it: the live image and the replayed image each stay internally
+    /// consistent, they simply stop being the same image. Routing all ten append sites through here
+    /// turns that from a comment other people have to remember into an assertion that fires on the
+    /// first append.
+    #[inline]
+    fn log_page_record(&self, dev: PageId, log: impl FnOnce(&mut WalManager<S>) -> Lsn) -> Lsn {
+        graphus_core::latch::assert_page_order_held_for(dev.0, "RecordStore::log_page_record");
+        self.wal.with(log)
+    }
+
+    /// How many times a page of this store was stamped with an LSN below the one it already carried
+    /// — the "log order is apply order" oracle of `rmp` #1062. Zero is the invariant; see
+    /// [`ConcurrentBufferPool::page_lsn_descents`].
+    #[must_use]
+    pub fn page_lsn_descents(&self) -> u64 {
+        self.pool.page_lsn_descents()
     }
 
     /// Publishes `new_head` into the 8-byte chain-head field at `field_off` of record `id` **if and
@@ -4737,7 +4859,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///
     /// # The three steps, and why they are one
     ///
-    /// Under the shard's rank-27 latch ([`chain_head_shard`](Self::chain_head_shard)) this peeks at
+    /// Under the shard's rank-27 latch ([`page_order_shard`](Self::page_order_shard)) this peeks at
     /// the head, appends the redo record, and applies it. Splitting them breaks the primitive in a way
     /// no amount of care at the call sites repairs:
     ///
@@ -4792,7 +4914,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         let abs = off + field_off;
         // Map and PIN the page before taking the latch. `ensure_store_page` grows the device and
         // `fetch` may miss, evict, write a victim home and harden the log — none of which may happen
-        // under a rank-27 hold, and both paths assert it (`assert_no_chain_head_latch_held`).
+        // under a rank-27 hold, and both paths assert it (`assert_no_page_order_latch_held`).
         let f = self.pool.fetch(dev)?;
         let published = {
             // NO HAND-OFF while this shard lock is held (`rmp` #1030). The two `with_page` calls
@@ -4801,25 +4923,25 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // HOLDING the lock, and the thread that receives it blocks on the same lock — the run
             // wedges with `det-sched: STALLED`. Measured with gdb on both stacks while building the
             // `rmp` #1030 gate: the parked thread inside `compare_and_publish_chain_head`'s
-            // `with_page`, the token holder blocked on `chain_head_shard(..).lock()`.
+            // `with_page`, the token holder blocked on `page_order_shard(..).lock()`.
             //
             // The buffer pool solved exactly this for its page-table shard lock (`ShardGuard`'s
             // `_no_switch`). Same remedy, same reason. Declared BEFORE the guard so it drops after it:
             // the no-hand-off region must outlive the lock, never the reverse.
             let _no_switch = graphus_core::sched::NoSwitchScope::new();
             let _guard = self
-                .chain_head_shard(kind, id)
+                .page_order_shard(dev)
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             // Armed after the lock and disarmed before the unlock, so the tripwire's window is
             // exactly the region the latch is held (declared second, dropped first).
-            let _scope = graphus_core::latch::ChainHeadLatchScope::new();
+            let _scope = graphus_core::latch::PageOrderLatchScope::new(dev.0);
             let current = self.pool.with_page(f, |p| {
                 u64::from_le_bytes(p[abs..abs + 8].try_into().expect("8-byte slice"))
             });
             if current == expect {
                 let redo = paging::encode_cas_patch(abs, expect, new_head);
-                let lsn = self.wal.with(|w| w.log_update_redo_only(txn, dev, &redo));
+                let lsn = self.log_page_record(dev, |w| w.log_update_redo_only(txn, dev, &redo));
                 let wrote = self
                     .pool
                     .with_page_mut_lsn_if(f, lsn, |p| {
@@ -5315,18 +5437,20 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         let f = self.pool.fetch(dev)?;
         // Capture the one-byte flags pre-image under a read latch, strictly before the whole-record
         // post-image overwrite under the write latch (frame pinned across both, `rmp` #337).
-        let undo_img = self
-            .pool
-            .with_page(f, |p| {
-                paging::encode_patch(off + flags_off, &p[off + flags_off..off + flags_off + 1])
-            })
-            .into_vec();
-        let redo = paging::encode_patch(off, buf);
-        let lsn = self
-            .wal
-            .with(|w| w.log_update_borrowed(txn, dev, &redo, undo_img));
-        self.pool.with_page_mut_lsn(f, lsn, |p| {
-            p[off..end].copy_from_slice(buf);
+        // Pre-image, append and apply as ONE step of this page's log-apply order (`rmp` #1062).
+        self.in_page_order(dev, || {
+            let undo_img = self
+                .pool
+                .with_page(f, |p| {
+                    paging::encode_patch(off + flags_off, &p[off + flags_off..off + flags_off + 1])
+                })
+                .into_vec();
+            let redo = paging::encode_patch(off, buf);
+            let lsn =
+                self.log_page_record(dev, |w| w.log_update_borrowed(txn, dev, &redo, undo_img));
+            self.pool.with_page_mut_lsn(f, lsn, |p| {
+                p[off..end].copy_from_slice(buf);
+            });
         });
         self.pool.unpin(f);
         Ok(())
@@ -6694,11 +6818,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         let redo = paging::encode_patch(abs, &new_labels.to_le_bytes());
         let undo = paging::encode_cas_patch(abs, new_labels, old_labels).into_vec();
         let f = self.pool.fetch(dev)?;
-        let lsn = self
-            .wal
-            .with(|w| w.log_update_borrowed(txn, dev, &redo, undo));
-        self.pool.with_page_mut_lsn(f, lsn, |p| {
-            p[abs..abs + 8].copy_from_slice(&new_labels.to_le_bytes());
+        // One step of this page's log-apply order (`rmp` #1062).
+        self.in_page_order(dev, || {
+            let lsn = self.log_page_record(dev, |w| w.log_update_borrowed(txn, dev, &redo, undo));
+            self.pool.with_page_mut_lsn(f, lsn, |p| {
+                p[abs..abs + 8].copy_from_slice(&new_labels.to_le_bytes());
+            });
         });
         self.pool.unpin(f);
         Ok(())
@@ -6731,18 +6856,20 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // Header-only undo captured STRICTLY before the whole-record post-image overwrite (`rmp`
         // #220 / #172): same bytes (the 25-byte MVCC header pre-image), inline buffer. Retained undo
         // taken by value; redo lent by borrow.
-        let undo = self
-            .pool
-            .with_page(f, |p| {
-                paging::encode_patch(off, &p[off..off + MVCC_HEADER_SIZE])
-            })
-            .into_vec();
-        let redo = paging::encode_patch(off, buf);
-        let lsn = self
-            .wal
-            .with(|w| w.log_update_borrowed(txn, dev, &redo, undo));
-        self.pool.with_page_mut_lsn(f, lsn, |p| {
-            p[off..end].copy_from_slice(buf);
+        // Pre-image, append and apply as ONE step of this page's log-apply order (`rmp` #1062): the
+        // MVCC-header pre-image would otherwise be read outside the section that appends it.
+        self.in_page_order(dev, || {
+            let undo = self
+                .pool
+                .with_page(f, |p| {
+                    paging::encode_patch(off, &p[off..off + MVCC_HEADER_SIZE])
+                })
+                .into_vec();
+            let redo = paging::encode_patch(off, buf);
+            let lsn = self.log_page_record(dev, |w| w.log_update_borrowed(txn, dev, &redo, undo));
+            self.pool.with_page_mut_lsn(f, lsn, |p| {
+                p[off..end].copy_from_slice(buf);
+            });
         });
         self.pool.unpin(f);
         Ok(())
@@ -8556,6 +8683,85 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         Ok(())
     }
 
+    /// Undoes ONE of `txn`'s logged actions — the newest not-yet-compensated one — as a single
+    /// indivisible step of its page's log-apply order (`rmp` #1062). Reports whether there was one.
+    ///
+    /// This is the whole body of [`rollback_physical`](Self::rollback_physical)'s drain loop, and it
+    /// is a method rather than an inline block so a test can stop the drain at an arbitrary step and
+    /// stage a crash there while running the **production** code — see
+    /// [`compensate_prefix_for_test`](Self::compensate_prefix_for_test).
+    ///
+    /// # Errors
+    /// Returns a storage error if the compensated page cannot be fetched or the patch cannot be
+    /// applied. The remaining chain is left intact, so the drain is restartable.
+    fn compensate_one(&self, txn: TxnId) -> Result<bool> {
+        let Some(page) = self.wal.with(|w| w.next_undo_page(txn)) else {
+            return Ok(false);
+        };
+        // PINNED before the rank-27 section: a `fetch` under it could evict, write home and
+        // harden, convoying every writer of the shard behind one `fdatasync`.
+        let f = self.pool.fetch(page)?;
+        let r = self.in_page_order(page, || {
+            // Same door, different shape: `compensate_next` returns the image too, so it cannot
+            // go through `log_page_record`, but the obligation it checks is identical.
+            graphus_core::latch::assert_page_order_held_for(page.0, "RecordStore::compensate_one");
+            let (got, lsn, image) = self.wal.with(|w| w.compensate_next(txn)).expect(
+                "INVARIANT: the chain was non-empty at the peek one line above, and an undo \
+                 chain is drained only by its own transaction's thread",
+            );
+            // RELEASE-ACTIVE, and deliberately not a `debug_assert_eq!` (`rmp` #1062, audit
+            // S1). `next_undo_page` peeks and `compensate_next` pops under two SEPARATE
+            // acquisitions of the WAL mutex, and their agreement rests on a premise this file
+            // enforces nowhere: that one thread alone drains a transaction's undo chain. If that
+            // premise ever fails, a debug-only check would let a release build apply `got`'s
+            // compensating image onto `page`'s frame, under `page`'s latch and stamped with
+            // `page`'s LSN — silent two-page corruption, of exactly the class this task exists to
+            // prevent. The sibling `.expect` above is already release-active, so failing loud here
+            // also removes the asymmetry of failing loud on an empty chain and silent on the
+            // wrong page. The cost is one integer compare per compensation.
+            assert_eq!(
+                got, page,
+                "the compensation popped names a different page from the one peeked, so this \
+                 section holds the wrong page's log-apply-order latch (`rmp` #1062)"
+            );
+            self.pool
+                .with_page_mut_lsn(f, lsn, |p| paging::apply_patch(p, &image))
+        });
+        self.pool.unpin(f);
+        r?;
+        Ok(true)
+    }
+
+    /// Runs at most `steps` of [`rollback_physical`](Self::rollback_physical)'s drain and then
+    /// **stops**, leaving `txn` in the WAL's active table with the rest of its undo chain intact and
+    /// **no `ABORT` record written**. Returns how many compensations were taken.
+    ///
+    /// # This exists to stage a crash, and it is not a rollback
+    ///
+    /// It is the state a power loss in the middle of `rollback_physical` leaves behind, reached by
+    /// running the real loop rather than by re-implementing it — which is the point, since a
+    /// hand-rolled imitation would prove nothing about the code that ships. `rmp` #1062 moved the
+    /// `ABORT` and its `fdatasync` from BEFORE the applies to AFTER them, so this window is new and
+    /// is where the change's residual risk sits: the transaction is a recovery **loser**, and
+    /// correctness rests on ARIES meeting the CLRs this drain already wrote and resuming at each
+    /// one's `undo_next_lsn` instead of compensating those actions twice.
+    ///
+    /// Never call this on a live database: the store's own bookkeeping for `txn` (its active-set
+    /// entry, count delta, schema undo, free-list pushes) is untouched, so the transaction is left
+    /// half-undone by construction. `crates/graphus-storage/tests/rollback_crash_resume_1062.rs` is
+    /// its only caller.
+    ///
+    /// # Errors
+    /// Returns a storage error if a compensated page cannot be fetched or patched.
+    #[doc(hidden)]
+    pub fn compensate_prefix_for_test(&self, txn: TxnId, steps: usize) -> Result<usize> {
+        let mut taken = 0;
+        while taken < steps && self.compensate_one(txn)? {
+            taken += 1;
+        }
+        Ok(taken)
+    }
+
     /// Rolls `txn` back: undoes its logged page changes newest-first (writing CLRs and applying
     /// the compensating images to the cached pages), then reloads the catalog from the now-reverted
     /// metadata page so the in-memory allocators, free lists and tokens match (`04 §4.4`).
@@ -8574,12 +8780,18 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// holding uncommitted state. That is the truth: its effects were not undone, so every gate that
     /// asks "may I decide the committed image right now?" must keep answering *no*.
     ///
-    /// The store cannot repair itself from here — the undo is not restartable from an arbitrary
-    /// mid-point — so the caller MUST treat an `Err` (or a caught unwind) as a hard failure of this
-    /// database and stop serving over the suspect in-memory state; on the server that is the
-    /// per-engine degraded flag (`rmp` #409/#414), which is per-database and never fleet-wide. What
-    /// the caller must NOT do is drop the entry to "tidy up": that flips the `rmp` #902 constraint-DDL
-    /// guard from fail-safe to fail-open at exactly the moment it matters most.
+    /// Since `rmp` #1062 the WAL undo chain IS restartable from where it stopped — the drain consumes
+    /// one entry per compensation and leaves the rest in the active table, and no `ABORT` is written
+    /// until the chain is empty — so a failure here is recoverable by re-running the rollback, and a
+    /// crash here is recovered by ARIES (the transaction is still a loser, and its already-written
+    /// CLRs are skipped via their `undo_next_lsn`). What is NOT restartable is the rest of this
+    /// method: the catalog reload, the free-list withdrawal and the count-delta retirement below are
+    /// not idempotent against a partially-undone transaction. So the caller MUST still treat an `Err`
+    /// (or a caught unwind) as a hard failure of this database and stop serving over the suspect
+    /// in-memory state; on the server that is the per-engine degraded flag (`rmp` #409/#414), which is
+    /// per-database and never fleet-wide. What the caller must NOT do is drop the entry to "tidy up":
+    /// that flips the `rmp` #902 constraint-DDL guard from fail-safe to fail-open at exactly the
+    /// moment it matters most.
     ///
     /// # Errors
     /// Returns a storage error if undo apply fails or the catalog cannot be reloaded.
@@ -8670,29 +8882,47 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // and why the removal needs no unwind guard: an entry that is never taken cannot be dropped on
         // the way out.
         // ------------------------------------------------------------------------------------------
-        // `rmp` #337, Slice 1: drive the WAL rollback with a *recording* target that captures the
-        // compensating page images WITHOUT touching the pool while the WAL lock is held, then replay
-        // them into the pool AFTER the lock is released. This breaks the eviction-during-rollback
-        // reentrancy that would otherwise deadlock the shared WAL handle (it panicked as a RefCell
-        // double-borrow under the old single-threaded handle when a rollback's working set exceeded
-        // the pool capacity). The WAL `rollback` hardens the CLRs + ABORT before returning, so the
-        // CLRs are durable before any pool write here; a crash between the durable ABORT and this
-        // replay is recovered identically by ARIES redo of the CLRs (see `mod pool_target`).
-        let mut target = pool_target::RecordingTarget::new();
-        self.wal.with(|w| w.rollback(txn, &mut target))?;
-        // Lock-free replay: the WAL lock is released, so an eviction triggered by these `fetch`es can
-        // take it with no holder. Stamp each page's `page_lsn` to the CLR's lsn via
-        // `with_page_mut_lsn` so a dirty replayed page written home later carries a real redo LSN
-        // (the WAL-before-data invariant — a page_lsn of 0 would make the pool's `ensure_durable(0)`
-        // a no-op; Tier-1 storage audit F6).
-        for comp in target.into_compensations() {
-            let f = self.pool.fetch(comp.page)?;
-            let r = self
-                .pool
-                .with_page_mut_lsn(f, comp.lsn, |p| paging::apply_patch(p, &comp.image));
-            self.pool.unpin(f);
-            r?;
-        }
+        // Undo this transaction's actions ONE AT A TIME, newest first, each compensation appended and
+        // applied inside its own page log-apply-order section (`rmp` #1062).
+        //
+        // `rmp` #337, Slice 1 established the shape this replaces: drive the WAL rollback with a
+        // *recording* target that captures every compensating image WITHOUT touching the pool while
+        // the WAL lock is held, then replay them all AFTER the lock is released. The reason it did
+        // that is still in force and is still honoured here — a `fetch` during replay can evict, and
+        // an eviction re-enters the shared WAL handle through `ensure_durable`, so no pool call may
+        // run under the WAL lock (it panicked as a `RefCell` double-borrow under the old
+        // single-threaded handle when a rollback's working set exceeded the pool capacity). Below,
+        // every `wal.with` closure still returns before any pool call.
+        //
+        // What changed is that a whole BATCH of appends followed by a whole batch of applies is
+        // exactly the separation `rmp` #1062 exists to remove: between the two, a concurrent writer
+        // can append against one of these pages and apply first, so the CLRs enter the log in one
+        // order and take effect in another, and ARIES — which replays strictly in log order —
+        // rebuilds an image the live system never held. Pairing each `write_clr` with its own apply
+        // under that page's rank-27 latch closes it, and costs nothing but one lock acquisition per
+        // compensation.
+        //
+        // Two consequences, both deliberate:
+        //
+        // * The `ABORT` and its `fdatasync` now come AFTER the applies rather than before. A crash in
+        //   between therefore leaves `txn` a recovery **loser** instead of a fully aborted
+        //   transaction — which is recovered, not lost: recovery walks its back-chain, meets the CLRs
+        //   this loop already wrote, and resumes at each one's `undo_next_lsn`, so the compensations
+        //   already taken are not repeated and the ones still owed are taken
+        //   (`WalManager::finish_rollback`, `graphus_wal::recovery`). WAL-before-data is unaffected:
+        //   any page written home in the meantime is hardened through its own `page_lsn` by the
+        //   pool's WAL rule, and that `page_lsn` is the CLR's.
+        // * A failure part-way leaves the REMAINING undo chain intact in the WAL rather than
+        //   discarded, which strengthens the `rmp` #955 fallible-section property rather than
+        //   weakening it: the previous shape removed the whole active entry before the first apply.
+        //
+        // Stamping each page's `page_lsn` to the CLR's lsn via `with_page_mut_lsn` is unchanged, and
+        // still required: a dirty replayed page written home later must carry a real redo LSN, since
+        // a `page_lsn` of 0 would make the pool's `ensure_durable(0)` a no-op (the WAL-before-data
+        // invariant, Tier-1 storage audit F6).
+        while self.compensate_one(txn)? {}
+        // The chain is drained: retire `txn` from the WAL's active table, mark it aborted and harden.
+        self.wal.with(|w| w.finish_rollback(txn));
         // The device-page maps are NOT touched here (`rmp` #721). They used to be `std::mem::take`-n
         // out of every store, handed to `reload_catalog` (which rebuilt each store wholesale from the
         // durable catalog, shrinking the map back to the last committed prefix), and then re-extended
@@ -11211,7 +11441,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // Pinned before the latch, for the reason `compare_and_publish_chain_head` pins before it: a
         // `fetch` under a rank-27 hold could evict, write home and harden.
         let f = self.pool.fetch(dev)?;
-        let outcome = self.patch_chain_words_latched(rel_id, dev, off, ops, txn, f);
+        let outcome = self.patch_chain_words_latched(dev, off, ops, txn, f);
         self.pool.unpin(f);
         outcome
     }
@@ -11220,7 +11450,6 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// unpinned exactly once, on every path, after the latch is released.
     fn patch_chain_words_latched(
         &self,
-        rel_id: u64,
         dev: PageId,
         off: usize,
         ops: &[ChainWordWrite],
@@ -11231,10 +11460,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // measured stall this prevents (`rmp` #1030).
         let _no_switch = graphus_core::sched::NoSwitchScope::new();
         let _guard = self
-            .chain_head_shard(StoreKind::Rel, rel_id)
+            .page_order_shard(dev)
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _scope = graphus_core::latch::ChainHeadLatchScope::new();
+        let _scope = graphus_core::latch::PageOrderLatchScope::new(dev.0);
         let flags_abs = off + REL_OFF_CHAIN_FLAGS;
         // Which updates will fire, decided under the latch that keeps the answer true until the write
         // below applies it. An owned publication always fires; a repair fires while the word still
@@ -11268,11 +11497,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 Some(expect) => paging::encode_cas_patch(abs, expect, op.value),
                 None => paging::encode_patch(abs, &op.value.to_le_bytes()),
             };
-            lsn = Some(self.wal.with(|w| w.log_update_redo_only(txn, dev, &redo)));
+            lsn = Some(self.log_page_record(dev, |w| w.log_update_redo_only(txn, dev, &redo)));
         }
         if let Some(next) = flags {
             let redo = paging::encode_patch(flags_abs, &[next]);
-            lsn = Some(self.wal.with(|w| w.log_update_redo_only(txn, dev, &redo)));
+            lsn = Some(self.log_page_record(dev, |w| w.log_update_redo_only(txn, dev, &redo)));
         }
         let lsn = lsn.expect("a firing update or a flag change logged a record");
         self.pool.with_page_mut_lsn_if(f, lsn, |p| {
@@ -13929,77 +14158,6 @@ struct CorpseRun {
     node: u64,
     pred: u64,
     succ: u64,
-}
-
-/// A **recording** [`ApplyTarget`](graphus_wal::ApplyTarget) used for **live rollback** only
-/// (`04 §4.4`, `rmp` #337 Slice 1).
-///
-/// During live rollback the WAL manager calls only [`apply`](graphus_wal::ApplyTarget::apply)
-/// (never `page_lsn`), once per compensating intra-page patch, **while holding the WAL manager
-/// lock**. On the concurrent buffer pool that lock and the pool's internal WAL-rule lock wrap the
-/// same [`WalManager`] (see [`crate::wal_rule`]): applying the patch *through the pool* inside
-/// `apply` would `fetch` a page, and if that fetch evicts a dirty victim the pool's write-back
-/// re-enters the WAL rule and tries to take the WAL lock again — a self-deadlock (it panicked as a
-/// `RefCell` double-borrow under the old single-threaded handle; the `rmp` #337 audit proved a
-/// rollback whose working set exceeds the pool capacity hits exactly this).
-///
-/// The fix (the ARIES-precedent "don't nest the buffer-pool flush under the log latch", as InnoDB /
-/// PostgreSQL / SQLite all do): this target merely **records** each `(page, lsn, image)` while the
-/// lock is held — touching the pool not at all — and [`RecordStore::rollback`] **replays** them into
-/// the pool *after* the WAL lock is released. By then the CLRs the WAL appended are already durable
-/// (rollback hardens once before returning), so an eviction during replay takes the WAL lock with no
-/// holder, and a crash between the (durable) ABORT and the replay is recovered identically by ARIES
-/// redo of the CLRs against the device. Crash recovery itself uses [`crate::recovery::DeviceTarget`]
-/// (direct device writes, no pool, no reentrancy).
-mod pool_target {
-    use graphus_core::Lsn;
-    use graphus_core::PageId;
-    use graphus_core::error::Result;
-
-    /// One recorded compensating page image to replay into the pool after the WAL lock is released.
-    pub struct Compensation {
-        pub page: PageId,
-        pub lsn: Lsn,
-        pub image: Vec<u8>,
-    }
-
-    /// A recorder that captures the compensating images the WAL emits during rollback, applying
-    /// nothing to the pool itself (see module docs for why deferral is required and safe).
-    #[derive(Default)]
-    pub struct RecordingTarget {
-        compensations: Vec<Compensation>,
-    }
-
-    impl RecordingTarget {
-        /// A fresh recorder with no captured compensations.
-        pub fn new() -> Self {
-            Self::default()
-        }
-
-        /// Consumes the recorder, yielding the captured compensations in apply order (newest-first,
-        /// exactly as the WAL emitted them).
-        pub fn into_compensations(self) -> Vec<Compensation> {
-            self.compensations
-        }
-    }
-
-    impl graphus_wal::ApplyTarget for RecordingTarget {
-        fn page_lsn(&self, _page: PageId) -> Lsn {
-            // Never consulted during live rollback (the WAL manager calls only `apply`).
-            Lsn(0)
-        }
-
-        fn apply(&mut self, page: PageId, lsn: Lsn, image: &[u8]) -> Result<()> {
-            // Record only — no pool access while the WAL lock is held. Replay happens lock-free in
-            // `RecordStore::rollback` after the WAL `rollback` returns.
-            self.compensations.push(Compensation {
-                page,
-                lsn,
-                image: image.to_vec(),
-            });
-            Ok(())
-        }
-    }
 }
 
 #[cfg(test)]

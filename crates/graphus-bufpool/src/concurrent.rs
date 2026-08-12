@@ -492,6 +492,26 @@ pub struct ConcurrentBufferPool<D: BlockDevice, W: WalRule = NoWal> {
     /// ([`crate::page`]; `graphus_storage::recovery::recover_device_with_dwb`). `None` for a pool with
     /// no doublewrite protection (e.g. a transient scratch store, or before the stager is attached).
     dwb_stager: Mutex<Option<Arc<dyn PageStager>>>,
+    /// How many times a page was offered an LSN **below** the one its header already carried
+    /// (`rmp` #1062). The oracle for "log order is apply order", and always compiled in.
+    ///
+    /// # Why a counter and not an assertion
+    ///
+    /// The stamp itself is a maximum ([`page::set_page_lsn`], `rmp` #1029), so a descent never
+    /// *lowers* `page_lsn` and never breaks WAL-before-data. What it does mean is that this page
+    /// applied a higher-LSN change before a lower-LSN one — so ARIES, which replays strictly in log
+    /// order, rebuilds an image the live system never held. That divergence is invisible in every
+    /// result-checking test: both images are internally consistent, they simply are not the same
+    /// image.
+    ///
+    /// `rmp` #1029 measured descents and deliberately declined to assert on them, because a live
+    /// ordering question must not brick every debug build. This counter is the middle term it asked
+    /// for: always measured, never fatal, and readable by a test that then asserts **zero** on the
+    /// workload it drives (`graphus-dst`'s `page_log_apply_order_1062` battery). Reading it
+    /// costs one relaxed load; maintaining it costs one 8-byte compare inside a region that already
+    /// holds the frame's write latch, and an atomic increment only on the (post-`rmp` #1062:
+    /// never-taken) descent branch.
+    lsn_descents: AtomicU64,
     /// Eviction-diagnostics counters (`rmp` #359, `bufpool-probe` feature only). Compiled out of the
     /// production build (zero cost: the field does not exist).
     #[cfg(feature = "bufpool-probe")]
@@ -536,6 +556,7 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
             table,
             clock: AtomicUsize::new(0),
             dwb_stager: Mutex::new(None),
+            lsn_descents: AtomicU64::new(0),
             #[cfg(feature = "bufpool-probe")]
             probe: probe::Probe::default(),
         }
@@ -839,6 +860,12 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
     /// silently break WAL-before-data. `with_page_mut` is for stamp-free work only (e.g. zero-init of
     /// a freshly allocated page); `write_back` enforces the invariant in release builds (it returns
     /// an error for a logged-but-unstamped dirty page; see `guard_wal_before_data`).
+    ///
+    /// A stamp that is **below** the page's current `page_lsn` is counted (see
+    /// [`page_lsn_descents`](Self::page_lsn_descents)) rather than refused: `set_page_lsn` is a
+    /// maximum, so the page LSN itself stays sound, but the descent is evidence that this page took
+    /// its changes in an order the log does not record — which is what `rmp` #1062 exists to make
+    /// impossible and what its battery asserts is zero.
     pub fn with_page_mut_lsn<R>(
         &self,
         f: PinnedFrame,
@@ -848,8 +875,32 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
         let _release = frame_release(f.0);
         let mut meta = latch_write(self.slot(f), f.0, YieldSite::FrameWriteWithPageMutLsn);
         meta.dirty = true;
+        self.note_lsn_order(&meta.data, lsn);
         page::set_page_lsn(&mut meta.data, lsn);
         func(&mut meta.data)
+    }
+
+    /// Counts a stamp offered below the page's current `page_lsn` (`rmp` #1062).
+    ///
+    /// Called under the frame's **write latch**, so the read of the header and the stamp that
+    /// follows it cannot be separated by another writer: the count is exact, not a sample.
+    #[inline]
+    fn note_lsn_order(&self, page: &Page, offered: Lsn) {
+        if offered < page::page_lsn(page) {
+            self.lsn_descents.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// How many times a page in this pool was stamped with an LSN **below** the one it already
+    /// carried — the "log order is apply order" oracle of `rmp` #1062.
+    ///
+    /// Zero is the invariant. A non-zero count means some page applied a higher-LSN change before a
+    /// lower-LSN one, so ARIES redo (which replays strictly in log order) reconstructs a different
+    /// image from the one the running system holds: the durable answer with no crash and the durable
+    /// answer after a crash differ. See [`with_page_mut_lsn`](Self::with_page_mut_lsn).
+    #[must_use]
+    pub fn page_lsn_descents(&self) -> u64 {
+        self.lsn_descents.load(Ordering::Relaxed)
     }
 
     /// Like [`with_page_mut_lsn`](Self::with_page_mut_lsn) but for a mutation that may decline to
@@ -888,6 +939,7 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
             // Only now: the write happened, so the page is dirty and its `page_lsn` really does cover
             // this record. The order (mutate, then stamp) is irrelevant under the exclusive latch.
             meta.dirty = true;
+            self.note_lsn_order(&meta.data, lsn);
             page::set_page_lsn(&mut meta.data, lsn);
         }
         out
@@ -946,11 +998,12 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
         // a *silent* convoy — the failure mode a tripwire exists to make loud. Asserted on every
         // `fetch`, hit or miss, because the caller cannot know which it will be. Debug-only.
         graphus_core::latch::assert_no_alloc_latch_held("BufferPool::fetch");
-        // Same argument for the rank-27 chain-head publication latch (`rmp` #1028): the publication
-        // primitive pins its page BEFORE taking the latch precisely so this path is never reached
-        // under it — a fetch under the latch could evict, write home and harden, convoying every
-        // publisher of the shard behind one `fdatasync`. Debug-only.
-        graphus_core::latch::assert_no_chain_head_latch_held("BufferPool::fetch");
+        // Same argument for the rank-27 page log-apply-order latch (`rmp` #1028, widened to every
+        // logged page write by `rmp` #1062): every writer pins its page BEFORE taking the latch
+        // precisely so this path is never reached under it — a fetch under the latch could evict,
+        // write home and harden, convoying every writer of the shard behind one `fdatasync`.
+        // Debug-only.
+        graphus_core::latch::assert_no_page_order_latch_held("BufferPool::fetch");
         // Rank 22 (`rmp` #1014): a fetch can evict, and an eviction writes home and may harden.
         graphus_core::latch::assert_no_maintenance_latch_held("BufferPool::fetch");
         // One backoff per `fetch` call: it escalates across the transient retries below (lost hit-race,

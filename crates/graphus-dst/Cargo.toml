@@ -131,3 +131,11 @@ required-features = ["det-sched"]
 [[test]]
 name = "det_scheduler_live_snapshot_1058"
 required-features = ["det-sched"]
+
+[[test]]
+name = "det_scheduler_checkpoint_inversion_1055"
+required-features = ["det-sched"]
+
+[[test]]
+name = "page_log_apply_order_1062"
+required-features = ["det-sched"]

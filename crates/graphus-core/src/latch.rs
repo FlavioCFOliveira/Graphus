@@ -15,8 +15,8 @@
 //!   over the GC's pending-work sets;
 //! * the **allocator-latch tripwire** ([`AllocLatchScope`], `rmp` #1012) — the per-store physical-id
 //!   allocation latch;
-//! * the **chain-head-latch tripwire** ([`ChainHeadLatchScope`], `rmp` #1028) — the sharded latch
-//!   that makes one chain-head publication atomic.
+//! * the **page-order-latch tripwire** ([`PageOrderLatchScope`], `rmp` #1028/#1062) — the sharded
+//!   latch that makes one logged page write — append the record, apply it to the page — atomic.
 //!
 //! [`FrameLatchScope`] and [`DwbLockScope`] were each *measured* to convoy behind a barrier and then
 //! hoisted out. The rest state the same guarantee **before** the convoy can be built: each of those
@@ -275,7 +275,7 @@ thread_local! {
 ///
 /// Graphus orders its latches by rank, innermost last: **5** the engine's session latches, **10**
 /// catalog/DDL, **20** commit sequencer and active-transaction table, **22** the maintenance latch,
-/// **25** the allocation latch, **27** the chain-head publication latch, **30** WAL, **40**
+/// **25** the allocation latch, **27** the page log-apply-order latch, **30** WAL, **40**
 /// buffer-pool frame latch, **50** page-table shard, **60** device and doublewrite stager. An
 /// acquisition out of rank order is permitted only as a `try_lock`, which creates no wait edge.
 ///
@@ -387,43 +387,109 @@ pub fn assert_no_alloc_latch_held(site: &str) {
     let _ = site;
 }
 
-/// Whether the current thread holds a chain-head publication latch — `0` or `1`, never more
-/// (`rmp` #1028).
+/// Whether the current thread holds a page log-apply-order latch — `0` or `1`, never more
+/// (`rmp` #1028, widened to every logged page write by `rmp` #1062).
 ///
 /// Like [`alloc_latch_depth`] this is a flag rather than a nesting count: rank 27 admits at most one
 /// holder per thread. Always `0` in a release build.
 #[cfg(debug_assertions)]
 #[must_use]
-pub fn chain_head_latch_depth() -> u32 {
-    CHAIN_HEAD_DEPTH.with(std::cell::Cell::get)
+pub fn page_order_latch_depth() -> u32 {
+    PAGE_ORDER_DEPTH.with(std::cell::Cell::get)
 }
 
-/// Whether the current thread holds a chain-head publication latch. Always `0` in a release build.
+/// Whether the current thread holds a page log-apply-order latch. Always `0` in a release build.
 #[cfg(not(debug_assertions))]
 #[must_use]
-pub const fn chain_head_latch_depth() -> u32 {
+pub const fn page_order_latch_depth() -> u32 {
     0
 }
 
 #[cfg(debug_assertions)]
 thread_local! {
-    static CHAIN_HEAD_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static PAGE_ORDER_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// The device page the held rank-27 latch is keyed by. Meaningful only while
+    /// [`page_order_latch_depth`] is `1`; rank 27 admits one holder per thread, so one cell suffices.
+    static PAGE_ORDER_PAGE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// An RAII marker for a region in which the current thread holds a chain-head publication latch
-/// (`rmp` #1028).
+/// The device page whose log-apply-order latch this thread holds, or [`None`] when it holds none
+/// (`rmp` #1062). Always [`None`] in a release build.
+#[cfg(debug_assertions)]
+#[must_use]
+pub fn page_order_latch_page() -> Option<u64> {
+    (page_order_latch_depth() != 0).then(|| PAGE_ORDER_PAGE.with(std::cell::Cell::get))
+}
+
+/// The device page whose log-apply-order latch this thread holds. Always [`None`] in a release build.
+#[cfg(not(debug_assertions))]
+#[must_use]
+pub const fn page_order_latch_page() -> Option<u64> {
+    None
+}
+
+/// Panics (debug builds only) unless this thread holds `page`'s log-apply-order latch (`rmp` #1062).
+///
+/// This is the other half of the rank-27 guarantee, and the half a doc-comment cannot keep. The latch
+/// buys "log order is apply order" only while **every** logged write to a page goes through it: one
+/// site that appends a record for `page` outside the section re-opens the whole defect, silently, and
+/// no result-checking test would notice — both the live image and the replayed image stay internally
+/// consistent, they simply stop being the same image. Called from the store's single WAL-append door
+/// (`RecordStore::log_page_record`), so a new write path that forgets the section fails loudly on its
+/// first append instead of shipping.
+///
+/// # Panics
+/// Panics in a debug build if no rank-27 latch is held, or one is held for a different page.
+/// Compiled out in release.
+#[inline]
+pub fn assert_page_order_held_for(page: u64, site: &str) {
+    #[cfg(debug_assertions)]
+    {
+        let held = page_order_latch_page();
+        assert!(
+            held == Some(page),
+            "{site}: a WAL record was appended against page {page} while this thread holds \
+             {held:?}'s log-apply-order latch. Every logged page write must append AND apply inside \
+             one rank-27 section keyed by that page (`rmp` #1062), or the order records enter the log \
+             stops matching the order they take effect and ARIES rebuilds an image the live system \
+             never held. Wrap the write in `RecordStore::in_page_order` (see `graphus_core::latch`)."
+        );
+    }
+    let _ = (page, site);
+}
+
+/// An RAII marker for a region in which the current thread holds a page **log-apply-order** latch
+/// (`rmp` #1028; widened from chain heads to every logged page write by `rmp` #1062).
+///
+/// # What it serialises, and why it is keyed by PAGE
+///
+/// One acquisition covers one indivisible **(append the record, apply it to the page)** pair. The
+/// property it buys is that, for a given page, *log order is apply order* — the order in which
+/// records enter the WAL is the order in which they take effect on that page's cached image.
+///
+/// The key is the **device page id**, not the record: `page_lsn` is a property of the page, ARIES
+/// gates redo on it (`record.lsn > page_lsn`), and recovery replays in log order. Two writers of two
+/// *different records that share a page* therefore have to be ordered exactly as much as two writers
+/// of one record do, and `rmp` #1028's original per-record key did not order them. Measured
+/// (`rmp` #1062, 2026-08-12): the `det_scheduler_checkpoint_inversion_1055` scenario — two writers,
+/// four commits each, sixteen seeds — produced **32** page-LSN descents, and **not one of them on a
+/// chain head**: the catalog image, the commit slot, the undo area and a node's label word. Those are
+/// pages whose content reflected one order while the log reflected another, so a reopen rebuilt an
+/// image the live system never held.
 ///
 /// # The rank, and the rule it encodes
 ///
 /// Rank **27**, between the allocation latch (25) and the WAL (30) — see [`AllocLatchScope`] for the
 /// full order. That position is the whole design of the latch, and it is forced from both sides:
 ///
-/// * **Below the WAL (30) and the frame latch (40)**, because publishing a chain head *is* the
-///   sequence "append the redo record, then apply it to the page". Those two must happen in one
-///   indivisible step, or the order in which publications enter the log stops matching the order in
-///   which they take effect — and ARIES replays in log order, so recovery would then reach a
-///   different verdict from the live system and the *replayed* one is what survives the crash. The
-///   latch is what makes that one step; it must therefore be outside both locks it serialises.
+/// * **Below the WAL (30) and the frame latch (40)**, because a logged page write *is* the sequence
+///   "append the redo record, then apply it to the page". Those two must happen in one indivisible
+///   step, or the order in which changes enter the log stops matching the order in which they take
+///   effect — and ARIES replays in log order, so recovery would then reach a different verdict from
+///   the live system and the *replayed* one is what survives the crash. The latch is what makes that
+///   one step; it must therefore be outside both locks it serialises. Doing it the other way round —
+///   appending under the frame latch — is not an option: it inverts ranks 30 and 40, and the WAL
+///   barrier already refuses by tripwire to run with a frame latch held ([`FrameLatchScope`]).
 /// * **Above everything that does I/O**, and hence never held across a durability barrier: it is
 ///   taken only once the page is already resident and pinned, and released before the frame is
 ///   unpinned. Held across a barrier it would convoy every writer of the same shard behind one
@@ -431,78 +497,83 @@ thread_local! {
 ///
 /// As with rank 25, **at most one holder per thread**: two locks of the same rank cannot be ordered
 /// by rank, so two threads acquiring a different pair in a different order deadlock. Nothing needs
-/// two: a relationship publishes its start endpoint's head and its end endpoint's head strictly one
-/// after the other, precisely so that this stays true.
+/// two: a write that spans two pages (a catalog image across the metadata chain, a rollback's
+/// compensations) takes them strictly one after the other, precisely so that this stays true.
 ///
 /// `!Send`/`!Sync` for the same reason as its siblings — the depth is a thread-local, and a scope
 /// created on one thread and dropped on another would corrupt both threads' counters.
 #[derive(Debug)]
-pub struct ChainHeadLatchScope {
+pub struct PageOrderLatchScope {
     _private: std::marker::PhantomData<*const ()>,
 }
 
-impl ChainHeadLatchScope {
-    /// Enters a chain-head-publication region on the current thread.
+impl PageOrderLatchScope {
+    /// Enters a page log-apply-order region on the current thread.
     ///
     /// # Panics
-    /// Panics in a debug build if this thread **already** holds a chain-head latch (rank 27 is not
+    /// Panics in a debug build if this thread **already** holds a page-order latch (rank 27 is not
     /// re-entrant — see above). Compiled out in release.
     #[must_use]
     #[inline]
-    pub fn new() -> Self {
+    pub fn new(page: u64) -> Self {
         // Rank 22 is a LEAF (`rmp` #1014); see `AllocLatchScope::new` for why the check belongs at the
         // acquisition rather than at the barrier.
-        assert_no_maintenance_latch_held("ChainHeadLatchScope::new");
+        assert_no_maintenance_latch_held("PageOrderLatchScope::new");
+        // The re-entrancy check runs BEFORE the page is recorded (`rmp` #1062, audit Q4-a). Recording
+        // first would let a refused nested acquisition overwrite the OUTER section's page on its way
+        // to panicking — harmless only while nothing catches the panic, and the engine's worker loop
+        // does exactly that (`catch_unwind`, `rmp` #409/#414). After such a catch the outer section
+        // would still be held, but `assert_page_order_held_for` would be comparing against the inner
+        // page and would either wave through an append against the wrong page or reject a correct one.
         #[cfg(debug_assertions)]
-        CHAIN_HEAD_DEPTH.with(|d| {
+        PAGE_ORDER_DEPTH.with(|d| {
             assert!(
                 d.get() == 0,
-                "a second chain-head publication latch was taken while this thread already holds \
+                "a second page log-apply-order latch was taken while this thread already holds \
                  one. Rank 27 is not re-entrant and admits one holder per thread (`rmp` #1028): two \
                  locks of the same rank cannot be ordered by rank, so two threads acquiring a \
-                 different pair in a different order deadlock. Publish one head at a time (see \
+                 different pair in a different order deadlock. Write one page at a time (see \
                  `graphus_core::latch`)."
             );
             d.set(1);
         });
+        // Recorded only once the acquisition is ACCEPTED, so the cell always names the page of the
+        // section this thread actually holds.
+        #[cfg(debug_assertions)]
+        PAGE_ORDER_PAGE.with(|p| p.set(page));
+        let _ = page;
         Self {
             _private: std::marker::PhantomData,
         }
     }
 }
 
-impl Default for ChainHeadLatchScope {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Drop for ChainHeadLatchScope {
+impl Drop for PageOrderLatchScope {
     #[inline]
     fn drop(&mut self) {
         #[cfg(debug_assertions)]
-        CHAIN_HEAD_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        PAGE_ORDER_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
     }
 }
 
-/// Panics (debug builds only) if the current thread holds a chain-head publication latch.
+/// Panics (debug builds only) if the current thread holds a page log-apply-order latch.
 ///
 /// Call this at every point the latch must already have been released: the durability barrier, and
 /// the page-fetch / store-growth paths that can evict (and therefore write home, and therefore
 /// harden). `site` names the point so a failure points straight at the offending path.
 ///
 /// # Panics
-/// Panics in a debug build if [`chain_head_latch_depth`] is non-zero. Compiled out in release.
+/// Panics in a debug build if [`page_order_latch_depth`] is non-zero. Compiled out in release.
 #[inline]
-pub fn assert_no_chain_head_latch_held(site: &str) {
+pub fn assert_no_page_order_latch_held(site: &str) {
     #[cfg(debug_assertions)]
     {
-        let depth = chain_head_latch_depth();
+        let depth = page_order_latch_depth();
         assert!(
             depth == 0,
-            "{site}: reached while holding {depth} chain-head publication latch(es). That latch is \
+            "{site}: reached while holding {depth} page log-apply-order latch(es). That latch is \
              rank 27 and must be released before any I/O (`rmp` #1028): held across page growth, a \
-             page fetch that can evict, or a durability barrier, it convoys every publisher of the \
+             page fetch that can evict, or a durability barrier, it convoys every writer of the \
              shard behind one fdatasync. Pin the page before taking it (see `graphus_core::latch`)."
         );
     }
@@ -718,7 +789,7 @@ impl EngineLatchScope {
             assert_no_frame_latch_held("EngineLatchScope::new");
             assert_no_maintenance_latch_held("EngineLatchScope::new");
             assert_no_alloc_latch_held("EngineLatchScope::new");
-            assert_no_chain_head_latch_held("EngineLatchScope::new");
+            assert_no_page_order_latch_held("EngineLatchScope::new");
             assert!(
                 catalog_latch_depth() == 0,
                 "EngineLatchScope::new: an engine session latch was taken while this thread holds the \
@@ -854,7 +925,7 @@ impl CatalogLatchScope {
             assert_no_frame_latch_held("CatalogLatchScope::new");
             assert_no_maintenance_latch_held("CatalogLatchScope::new");
             assert_no_alloc_latch_held("CatalogLatchScope::new");
-            assert_no_chain_head_latch_held("CatalogLatchScope::new");
+            assert_no_page_order_latch_held("CatalogLatchScope::new");
             CATALOG_DEPTH.with(|d| {
                 assert!(
                     d.get() == 0,
@@ -971,21 +1042,21 @@ mod tests {
         assert_eq!(alloc_latch_depth(), 1);
         assert_no_frame_latch_held("unrelated barrier");
         assert_no_dwb_lock_held("unrelated barrier");
-        assert_no_chain_head_latch_held("unrelated barrier");
+        assert_no_page_order_latch_held("unrelated barrier");
     }
 
     #[cfg(debug_assertions)]
     #[test]
-    #[should_panic(expected = "chain-head publication latch")]
-    fn chain_head_assert_fires_inside_a_latched_region() {
-        let _scope = ChainHeadLatchScope::new();
-        assert_no_chain_head_latch_held("test durability barrier");
+    #[should_panic(expected = "page log-apply-order latch")]
+    fn page_order_assert_fires_inside_a_latched_region() {
+        let _scope = PageOrderLatchScope::new(7);
+        assert_no_page_order_latch_held("test durability barrier");
     }
 
     #[test]
-    fn chain_head_assert_passes_outside_a_latched_region() {
-        assert_eq!(chain_head_latch_depth(), 0);
-        assert_no_chain_head_latch_held("test durability barrier");
+    fn page_order_assert_passes_outside_a_latched_region() {
+        assert_eq!(page_order_latch_depth(), 0);
+        assert_no_page_order_latch_held("test durability barrier");
     }
 
     /// **Positive control for the non-re-entrancy rule** (`rmp` #1028), the rank-27 twin of
@@ -995,25 +1066,25 @@ mod tests {
     #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "Rank 27 is not re-entrant")]
-    fn a_second_chain_head_scope_on_one_thread_is_refused() {
-        let _first = ChainHeadLatchScope::new();
-        let _second = ChainHeadLatchScope::new();
+    fn a_second_page_order_scope_on_one_thread_is_refused() {
+        let _first = PageOrderLatchScope::new(7);
+        let _second = PageOrderLatchScope::new(9);
     }
 
     /// Sequential scopes are fine — exactly the shape `create_rel` uses for its two endpoints.
     #[test]
-    fn chain_head_scopes_taken_one_after_another_are_fine() {
+    fn page_order_scopes_taken_one_after_another_are_fine() {
         for _ in 0..3 {
-            let _s = ChainHeadLatchScope::new();
+            let _s = PageOrderLatchScope::new(7);
         }
-        assert_eq!(chain_head_latch_depth(), 0);
+        assert_eq!(page_order_latch_depth(), 0);
     }
 
     #[test]
-    fn chain_head_scope_does_not_trip_the_other_tripwires() {
-        let _scope = ChainHeadLatchScope::new();
+    fn page_order_scope_does_not_trip_the_other_tripwires() {
+        let _scope = PageOrderLatchScope::new(7);
         #[cfg(debug_assertions)]
-        assert_eq!(chain_head_latch_depth(), 1);
+        assert_eq!(page_order_latch_depth(), 1);
         assert_no_frame_latch_held("unrelated barrier");
         assert_no_dwb_lock_held("unrelated barrier");
         assert_no_alloc_latch_held("unrelated barrier");
@@ -1068,10 +1139,10 @@ mod tests {
     /// The leaf rule's rank-27 twin.
     #[cfg(debug_assertions)]
     #[test]
-    #[should_panic(expected = "ChainHeadLatchScope::new")]
-    fn taking_the_chain_head_latch_under_the_maintenance_latch_is_refused() {
+    #[should_panic(expected = "PageOrderLatchScope::new")]
+    fn taking_the_page_order_latch_under_the_maintenance_latch_is_refused() {
         let _maintenance = MaintenanceLatchScope::new();
-        let _publish = ChainHeadLatchScope::new();
+        let _publish = PageOrderLatchScope::new(7);
     }
 
     #[test]
@@ -1082,7 +1153,7 @@ mod tests {
         assert_no_frame_latch_held("unrelated barrier");
         assert_no_dwb_lock_held("unrelated barrier");
         assert_no_alloc_latch_held("unrelated barrier");
-        assert_no_chain_head_latch_held("unrelated barrier");
+        assert_no_page_order_latch_held("unrelated barrier");
     }
 
     #[cfg(debug_assertions)]
@@ -1157,7 +1228,7 @@ mod tests {
         assert_no_frame_latch_held("unrelated barrier");
         assert_no_dwb_lock_held("unrelated barrier");
         assert_no_alloc_latch_held("unrelated barrier");
-        assert_no_chain_head_latch_held("unrelated barrier");
+        assert_no_page_order_latch_held("unrelated barrier");
         assert_no_maintenance_latch_held("unrelated barrier");
     }
 

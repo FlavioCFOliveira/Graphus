@@ -77,11 +77,19 @@ pub fn page_lsn(page: &Page) -> Lsn {
 /// Taking the maximum is honest under either cause: the content DOES reflect the higher LSN, because
 /// the change logged at it was applied. What the maximum does not do is fix the divergence between log
 /// order and apply order — recovery replays by LSN and would rebuild a different image than the
-/// runtime produced. That is `rmp` #1028's subject, and an assertion that catches it belongs there;
-/// this function deliberately carries none, so that a live, known ordering question does not brick
-/// every debug build (decided 2026-08-11 with the measurement above in hand). InnoDB states the sister
-/// invariant as an assertion because its apply order is its log order (`buf0flu.ic`:
-/// `ut_ad(block->page.get_newest_lsn() <= end_lsn)` before `set_newest_lsn(end_lsn)`).
+/// runtime produced. That is `rmp` #1028's subject; this function deliberately carries no assertion,
+/// so that a live ordering question does not brick every debug build (decided 2026-08-11 with the
+/// measurement above in hand). InnoDB states the sister invariant as an assertion because its apply
+/// order is its log order (`buf0flu.ic`: `ut_ad(block->page.get_newest_lsn() <= end_lsn)` before
+/// `set_newest_lsn(end_lsn)`).
+///
+/// `rmp` #1062 closed that ordering question — every logged page write now appends and applies under
+/// one rank-27 page latch, so the maximum never has to clamp — and supplied the middle term this note
+/// asked for instead of an assertion:
+/// [`ConcurrentBufferPool::page_lsn_descents`](crate::ConcurrentBufferPool::page_lsn_descents)
+/// **counts** every clamped stamp, always, in every build. It is the pool, not this function, that
+/// counts, because only the pool holds the write latch across the read-then-stamp pair and can
+/// therefore report an exact count rather than a sample.
 ///
 /// A page being REBUILT rather than updated in place is a different operation and must not come here —
 /// see [`reset_page_lsn`].
