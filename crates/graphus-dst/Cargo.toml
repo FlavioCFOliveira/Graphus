@@ -127,3 +127,7 @@ required-features = ["det-sched"]
 [[test]]
 name = "det_scheduler_lost_update_1056"
 required-features = ["det-sched"]
+
+[[test]]
+name = "det_scheduler_live_snapshot_1058"
+required-features = ["det-sched"]

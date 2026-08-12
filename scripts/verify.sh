@@ -136,6 +136,11 @@ cargo test --profile gate -p graphus-dst --features det-sched --test det_schedul
 cargo test --profile gate -p graphus-dst --features det-sched --test det_scheduler_catalog_counts_1052
 cargo test --profile gate -p graphus-dst --features det-sched --test det_scheduler_unpublished_delta_1053
 cargo test --profile gate -p graphus-dst --features det-sched --test det_scheduler_torn_property_read_1057
+# `det_scheduler_lost_update_1056` was declared with `required-features` and then left out of this
+# list, which is the very omission the comment above describes: `cargo test --workspace` does not
+# compile it, and nothing else enables the feature, so the lost-update reproduction ran nowhere.
+cargo test --profile gate -p graphus-dst --features det-sched --test det_scheduler_lost_update_1056
+cargo test --profile gate -p graphus-dst --features det-sched --test det_scheduler_live_snapshot_1058
 
 # `rmp` #973 acceptance criterion 3 — the production cost is ZERO — asserted mechanically rather
 # than argued. The release build below reproduces the container image's `-p graphus-server` package

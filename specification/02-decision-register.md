@@ -922,14 +922,35 @@ scope and are propagated into `00-overview.md` and `01-needs-survey.md`:
 > task **#1034**; multi-worker engines are reachable from tests, which is what keeps this path
 > exercised. This decision removes one of the blockers behind that gate and does not by itself open it.
 >
-> **What this decision does not close.** The same allocation-versus-publication distinction has a
-> second, still-open instance on the **property read path**, tracked as task **#1058** and filed as a
-> **prerequisite** of the multi-writer certification rather than a follow-up to it: at more than one
-> worker a reader can still observe **one leg of a commit that is in flight**, probed at 2 to 7 torn
-> reads in the first ~240 reads and unreachable at a single engine worker. This section fixes what a
-> *snapshot timestamp* means; it does not by itself make every read of the property path resolve
-> against one. The residual arms itself the moment multi-writer is certified, which is why it is
-> sequenced **before** task #1034 and not after it.
+> **The property read path — measured, not assumed (task #1058).** This decision was recorded with a
+> residual open against it: that the same allocation-versus-publication distinction had a second,
+> still-live instance on the **property read path**, where a reader could observe **one leg of a
+> commit that is in flight** (probed at 2 to 7 torn reads in the first ~240 reads before this
+> decision landed). Task #1058 went back and measured it, and the residual is **closed by this
+> decision itself** rather than by any further change.
+>
+> The mechanism is real and unchanged: a reader resolves each undo delta against a **live** read of
+> that delta's commit slot, once per entity, so two entities written by one transaction are two slot
+> reads at two instants, and a publication landing between them tears the read. What closes it is
+> that the horizon never lets a reader hold a snapshot at or above a timestamp that is still
+> publishing. At `C - 1` both slot reads decide the same way whichever side of the publication they
+> fall on — unpublished resolves as not-yet-committed, published resolves as `Committed(C)` with
+> `C > snapshot.ts` — and both undo the delta. The tear is not repaired; it is made **unreachable**.
+>
+> Two probes measure this and are kept as permanent regression cover.
+> `graphus-storage/tests/live_snapshot_horizon_1058.rs` runs four writer threads and twelve reader
+> threads against a bare `RecordStore`, every reader deriving its own snapshot through
+> `RecordStore::begin` concurrently with the committers; it is clean, and with `snapshot_ts()`
+> reverted to the allocation clock it fails **5 runs out of 5**, at 6583 to 6808 torn reads of about
+> 29 500. `graphus-dst/tests/det_scheduler_live_snapshot_1058.rs` is its deterministic twin and
+> reproduces the tear from a seed on **9 of 16 seeds**, byte-identically across runs. Both assert the
+> window was genuinely sampled — the allocation clock read before the snapshot, against the horizon
+> the snapshot got — rather than inferring it.
+>
+> **What this leaves open.** Both probes cover **node properties**. Relationship properties and labels
+> reach the same `scan_polarity::delta_verdict` through different entry points and are not covered by
+> them. And the scope note above still stands on its own terms: `admission.engine_workers` above 1
+> remains refused by configuration validation pending task #1034.
 >
 > **Where this is specified.** The invariant, the horizon, the sequencer latch, the release obligation
 > and the return-the-timestamp rule are `04-technical-design.md` §5.2; the latch ranks are §3.3; what
