@@ -17,7 +17,7 @@ use graphus_core::capability::Clock;
 use graphus_core::error::Result;
 use graphus_io::FileBlockDevice;
 use graphus_server::engine::command::AccessMode;
-use graphus_server::engine::{Engine, EngineHandle, spawn_engine};
+use graphus_server::engine::{Engine, EngineHandle, spawn_engine_with_timeout};
 use graphus_storage::RecordStore;
 use graphus_wal::{FileLogSink, FsyncJob, LogSink, WalManager};
 
@@ -103,12 +103,12 @@ impl Drop for TempDir {
     }
 }
 
-fn create_engine(dir: &Path, real_fsyncs: Arc<AtomicU64>) -> Engine {
+fn create_engine(dir: &Path, real_fsyncs: Arc<AtomicU64>, engine_workers: usize) -> Engine {
     let device_path = dir.join("graph.db");
     let wal_dir = dir.join("wal");
     let clock: Arc<dyn Clock + Send + Sync> = Arc::new(RealClock);
     let metrics = Arc::new(graphus_server::metrics::Metrics::new());
-    spawn_engine::<FileBlockDevice, CountingSink, _>(
+    spawn_engine_with_timeout::<FileBlockDevice, CountingSink, _>(
         Arc::from("pipe"),
         move || {
             let device = FileBlockDevice::open(&device_path)?;
@@ -120,8 +120,15 @@ fn create_engine(dir: &Path, real_fsyncs: Arc<AtomicU64>) -> Engine {
         8192,
         256,
         4,
+        // The measurement's independent variable (`rmp` #1034): how many engine workers serve the
+        // command queues. The baseline this table is compared against was taken at 1, when that was
+        // the only possibility.
+        engine_workers,
         metrics,
         clock,
+        None,
+        None,
+        None,
         std::sync::Arc::new(graphus_server::txn_registry::TransactionRegistry::new()),
     )
     .expect("spawn fresh file engine")
@@ -205,10 +212,10 @@ fn clk_tck() -> f64 {
     100.0
 }
 
-fn run_w(w: usize, per_thread: i64) {
+fn run_w(w: usize, per_thread: i64, engine_workers: usize) {
     let dir = TempDir::new(&format!("w{w}"));
     let real_fsyncs = Arc::new(AtomicU64::new(0));
-    let engine = create_engine(&dir.path, Arc::clone(&real_fsyncs));
+    let engine = create_engine(&dir.path, Arc::clone(&real_fsyncs), engine_workers);
     let handle = engine.handle.clone();
 
     // Warmup: intern label+key, reach steady state.
@@ -262,8 +269,17 @@ fn pipeline_scaling_w_1_2_4_8_16() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(4_000);
     println!("\n=== rmp #570 pipeline scaling ({per_thread} writes/thread) ===");
+    // Two curves, and the pair is what the comparison needs (`rmp` #1034). The first repeats the
+    // baseline shape — W client writers against ONE engine worker — so the numbers are directly
+    // comparable with the 2026-08-05 table. The second gives the engine a worker per writer, which
+    // is what layers 7a/7b/#1035 made possible and what this task exists to measure.
+    println!("\n-- engine_workers = 1 (the baseline shape) --");
     for w in [1usize, 2, 4, 8, 16] {
-        run_w(w, per_thread);
+        run_w(w, per_thread, 1);
+    }
+    println!("\n-- engine_workers = W (one worker per writer) --");
+    for w in [1usize, 2, 4, 8, 16] {
+        run_w(w, per_thread, w);
     }
     println!("=== end ===\n");
 }
