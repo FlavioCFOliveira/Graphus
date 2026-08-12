@@ -1115,6 +1115,152 @@ pub fn node_has_label<D: BlockDevice, S: LogSink, P: StorePages>(
     labels::has_label(node.labels, label_token_id).map_err(GraphusError::from)
 }
 
+/// How many times a property read re-reads an entity's cells while trying to observe them together
+/// with an undo-chain head that did not move underneath them (`rmp` #1057).
+///
+/// A **liveness** backstop, not a correctness parameter: correctness comes from the validation
+/// itself, which either succeeds or retries. One attempt is enough unless a writer mutated *this*
+/// entity's properties during *this* entity's cell walk, so the loop is expected to run once; the
+/// bound exists so that a pathological writer hammering one entity cannot spin a reader forever.
+/// Exhausting it is answered with a **retriable** [`GraphusError::Transaction`] rather than with a
+/// value, because the alternative is returning an image the store never held (the
+/// fail-closed-on-read-fault contract, `rmp` #733).
+const CHAIN_HEAD_STABILISE_ATTEMPTS: u32 = 1_024;
+
+/// `(kind, entity)`'s property-chain head and undo-chain head, from **one** record read — so the two
+/// words are mutually consistent by construction (one latched decode of one record).
+///
+/// # Errors
+/// As [`read_node`] / [`read_rel`], plus a storage error if `kind` owns no property chain.
+fn chain_anchor<D: BlockDevice, S: LogSink, P: StorePages>(
+    pool: &Pool<D, S>,
+    pages: &P,
+    kind: StoreKind,
+    entity: u64,
+) -> Result<(u64, u64)> {
+    match kind {
+        StoreKind::Node => {
+            let node = read_node(pool, pages, entity)?;
+            Ok((node.first_prop, node.mvcc.undo_ptr))
+        }
+        StoreKind::Rel => {
+            let rel = read_rel(pool, pages, entity)?;
+            Ok((rel.first_prop, rel.mvcc.undo_ptr))
+        }
+        other => Err(GraphusError::Storage(format!(
+            "{other:?} records own no property chain, so they anchor no property read"
+        ))),
+    }
+}
+
+/// Reads `(kind, entity)`'s property cells **together with an undo-chain head they are consistent
+/// with** — the atomicity a property read needs and did not have (`rmp` #1057).
+///
+/// # The defect this closes
+///
+/// A property read reconstructs a version from two things that live in **different records, on
+/// different pages, under different latches**: the *current* value of each key (the `props.store`
+/// cells) and the *older* values (the entity's undo chain, reached through the `undo_ptr` word of the
+/// entity's own record). Nothing made the pair atomic, and the write path publishes the two halves in
+/// this order (`RecordStore::link_delta` step 3, whose order is itself non-negotiable — the delta is
+/// written in full and only then does the head name it):
+///
+/// 1. write the delta carrying the **old** value, and publish it as the entity's new chain head;
+/// 2. rewrite the cell in place with the **new** value.
+///
+/// A reader that sampled the head **before** step 1 and the cell **after** step 2 therefore held a
+/// new value with no delta above its head to undo it — and kept it, whoever wrote it. Measured on
+/// `rmp` #1057: an off-thread reader summing 50 `:Account` balances returned a total off by exactly
+/// one transfer leg, because for one account it had observed the value of a transaction that had not
+/// merely committed after its snapshot but **had not committed at all** — a dirty read. The captured
+/// interleaving (four real threads, storage layer, the reader's snapshot timestamp published only
+/// after `commit` returned so no commit-slot state could have made the writer visible):
+///
+/// ```text
+/// W  SET node 3 = 1000 (leg a of txn 21966)     <- in flight; delta 43749 published, cell rewritten
+/// R0 READ node 3 @ts 21867: head 43748->43749 => 1000    <- kept the in-flight value
+/// W  SET node 4 = 1010 (leg b of txn 21966)
+/// R0 VIOLATION sum 7990 != 8000
+/// ```
+///
+/// where a re-read of the very same node at the very same snapshot answered `1010` — the read was
+/// not a function of the snapshot, which is what a torn read *is*.
+///
+/// # Why a validated re-read, and not simply reading the head last
+///
+/// Reading the head *after* the cells looks like the whole answer, and for the write path it is: the
+/// writer publishes the pointer before the data, so a reader that reads the data before the pointer
+/// cannot see data whose pointer it missed. But the **abort** path publishes the two halves in the
+/// opposite order — [`RecordStore::rollback`] restores the cells (`apply_own_deltas`) and only then
+/// detaches the deltas (`detach_own_deltas`) — so "head last" would newly expose a reader that
+/// sampled a cell still holding an aborted value and then a head from which that value's delta had
+/// already been detached. One read order cannot be safe against two opposite publication orders.
+///
+/// Validation is safe against both, because it does not depend on which order a writer publishes in:
+/// it accepts the cells only if the head *did not move* across the walk that read them. Every
+/// mutation of an entity's property cells is preceded by linking a delta onto that entity's chain
+/// (`rmp` #970 made that true with no exceptions — an unversioned cell is a hole, not a shortcut), so
+/// a head that is unchanged before and after the walk is a witness that no cell under it was
+/// rewritten in between.
+///
+/// # Cost
+///
+/// **One extra 24-byte header read per property read** in the expected case — the `undo_ptr` word of
+/// a record whose page the anchor read has just made resident, so a page-table lookup, a frame latch
+/// and a decode, with no device I/O.
+///
+/// Measured, rather than asserted, on the worst *relative* case — an entity holding exactly ONE
+/// property, warm pool, release build, `best of 7 × 400 000` reads on this host:
+///
+/// | | ns per visible-property read |
+/// |---|---|
+/// | before (head sampled first, no validation) | 139.5 |
+/// | after (this function) | 155.8 / 158.0 / 160.8 |
+///
+/// so **+16 to +21 ns, ~+13%** where the added read is the largest possible fraction of the whole,
+/// and proportionally less on every entity holding more than one key (`cargo bench -p graphus-bench
+/// --bench prop_overwrite`, `distinct keys` arms at K = 1000: 38.2 µs before, 38.4 µs after — inside
+/// the run-to-run spread, because one header read joins a thousand cell reads).
+///
+/// The `read_prop` / `read_delta` / `read_commit_slot` counts the `rmp` #967 acceptance criterion
+/// pins are **unchanged** — this reads neither a property record, nor a delta, nor a commit slot, and
+/// `tests/prop_visible_read_record_count.rs` still passes with its exact triple. A retry costs one
+/// more anchor read plus one more cell walk, and only happens when a writer touched this entity
+/// during this read.
+///
+/// # Errors
+/// As [`read_node`] / [`read_rel`] and [`collect_prop_chain`], plus a **retriable**
+/// [`GraphusError::Transaction`] if the head could not be observed stable within
+/// [`CHAIN_HEAD_STABILISE_ATTEMPTS`].
+fn cells_with_consistent_head<D: BlockDevice, S: LogSink, P: StorePages>(
+    pool: &Pool<D, S>,
+    pages: &P,
+    kind: StoreKind,
+    entity: u64,
+    owner_label: &str,
+) -> Result<(Vec<(u64, PropRecord)>, u64)> {
+    let (mut first_prop, mut head) = chain_anchor(pool, pages, kind, entity)?;
+    for _ in 0..CHAIN_HEAD_STABILISE_ATTEMPTS {
+        let cells = collect_prop_chain(pool, pages, first_prop, owner_label, entity)?;
+        // The validation, and the only line that makes the pair atomic: the head this image will be
+        // reconstructed against is the head that was already in place when the walk began.
+        if read_mvcc(pool, pages, kind, entity)?.undo_ptr == head {
+            return Ok((cells, head));
+        }
+        // It moved: a writer linked (or an abort detached) a delta on this entity while the cells
+        // were being read, so the image and the chain describe different instants. Re-anchor — the
+        // record's `first_prop` may have moved too, a prepend being how an added key arrives — and
+        // read the cells again.
+        let (moved_first_prop, moved_head) = chain_anchor(pool, pages, kind, entity)?;
+        first_prop = moved_first_prop;
+        head = moved_head;
+    }
+    Err(GraphusError::Transaction(format!(
+        "property read of {owner_label} {entity} could not observe its cells and its undo-chain head \
+         at one instant within {CHAIN_HEAD_STABILISE_ATTEMPTS} attempts; retry"
+    )))
+}
+
 /// The **superset**-polarity read of `node_id`'s properties (the body of
 /// `RecordStore::superset_scan_node_properties`): every slot-occupied cell in its `first_prop` chain
 /// **and** its whole undo-delta history, which after `rmp` #967 is where every older value lives.
@@ -1127,9 +1273,11 @@ pub fn superset_scan_node_properties<D: BlockDevice, S: LogSink, P: StorePages>(
     pages: &P,
     node_id: u64,
 ) -> Result<SupersetProperties> {
-    let node = read_node(pool, pages, node_id)?;
-    let cells = collect_prop_chain(pool, pages, node.first_prop, "node", node_id)?;
-    let history = collect_undo_history(pool, pages, StoreKind::Node, node_id, node.mvcc.undo_ptr)?;
+    // `rmp` #1057: the cells and the head they are read against must be one instant, superset
+    // polarity included — a cell rewritten under a head this walk never saw is a version the
+    // "superset" would be missing, which is exactly what the polarity promises it never does.
+    let (cells, head) = cells_with_consistent_head(pool, pages, StoreKind::Node, node_id, "node")?;
+    let history = collect_undo_history(pool, pages, StoreKind::Node, node_id, head)?;
     Ok(SupersetProperties::from_chain(cells, history))
 }
 
@@ -1143,9 +1291,9 @@ pub fn superset_scan_rel_properties<D: BlockDevice, S: LogSink, P: StorePages>(
     pages: &P,
     rel_id: u64,
 ) -> Result<SupersetProperties> {
-    let rel = read_rel(pool, pages, rel_id)?;
-    let cells = collect_prop_chain(pool, pages, rel.first_prop, "rel", rel_id)?;
-    let history = collect_undo_history(pool, pages, StoreKind::Rel, rel_id, rel.mvcc.undo_ptr)?;
+    // `rmp` #1057 — see [`cells_with_consistent_head`].
+    let (cells, head) = cells_with_consistent_head(pool, pages, StoreKind::Rel, rel_id, "rel")?;
+    let history = collect_undo_history(pool, pages, StoreKind::Rel, rel_id, head)?;
     Ok(SupersetProperties::from_chain(cells, history))
 }
 
@@ -1162,14 +1310,15 @@ pub fn decision_scan_node_properties<D: BlockDevice, S: LogSink, P: StorePages>(
     node_id: u64,
     snapshot: Snapshot,
 ) -> Result<DecidedProperties> {
-    let node = read_node(pool, pages, node_id)?;
-    let cells = collect_prop_chain(pool, pages, node.first_prop, "node", node_id)?;
+    // `rmp` #1057: the cells and the chain head are ONE observation, or this read reconstructs a
+    // version out of two instants that never coexisted — see [`cells_with_consistent_head`].
+    let (cells, head) = cells_with_consistent_head(pool, pages, StoreKind::Node, node_id, "node")?;
     decide_properties(
         pool,
         pages,
         StoreKind::Node,
         node_id,
-        node.mvcc.undo_ptr,
+        head,
         &cells,
         snapshot,
     )
@@ -1186,17 +1335,9 @@ pub fn decision_scan_rel_properties<D: BlockDevice, S: LogSink, P: StorePages>(
     rel_id: u64,
     snapshot: Snapshot,
 ) -> Result<DecidedProperties> {
-    let rel = read_rel(pool, pages, rel_id)?;
-    let cells = collect_prop_chain(pool, pages, rel.first_prop, "rel", rel_id)?;
-    decide_properties(
-        pool,
-        pages,
-        StoreKind::Rel,
-        rel_id,
-        rel.mvcc.undo_ptr,
-        &cells,
-        snapshot,
-    )
+    // `rmp` #1057 — see [`cells_with_consistent_head`].
+    let (cells, head) = cells_with_consistent_head(pool, pages, StoreKind::Rel, rel_id, "rel")?;
+    decide_properties(pool, pages, StoreKind::Rel, rel_id, head, &cells, snapshot)
 }
 
 /// The shared property-chain walk behind [`superset_scan_node_properties`] /

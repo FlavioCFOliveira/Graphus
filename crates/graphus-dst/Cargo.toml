@@ -119,3 +119,7 @@ required-features = ["det-sched"]
 [[test]]
 name = "det_scheduler_unpublished_delta_1053"
 required-features = ["det-sched"]
+
+[[test]]
+name = "det_scheduler_torn_property_read_1057"
+required-features = ["det-sched"]

@@ -1358,6 +1358,23 @@ contract between §5 and the rest of the engine.
   nothing does. The direct consequence is that **task #970 was a rollback change only**: because the
   chain was already the oracle when #970 landed, logical rollback replaced physical undo with no
   second rewrite of the read path.
+- **A property read must observe the cells and the chain head at ONE instant** (**#1057**). The two
+  halves of the reconstruction above live in **different records, on different pages, under different
+  latches** — the current values in `props.store` cells, the chain head in the `undo_ptr` word of the
+  entity's own record — so a reader that samples them at two instants can reconstruct a version the
+  store never held. The bullet above fixes the write order (delta linked and `undo_ptr` advanced
+  **before** the cell is rewritten), and the abort path publishes the same two halves in the
+  **opposite** order (`apply_own_deltas` restores the cells, then `detach_own_deltas` unlinks the
+  deltas — §4.4), so no single read order is safe against both. The obligation is therefore stated on
+  the reader and is a **validation**, not an order: it reads the entity's cells and accepts them only
+  once it has observed the chain head **unchanged across that walk**, re-reading otherwise. Every
+  mutation of an entity's property cells is preceded by linking a delta onto that entity's chain
+  (there are no exceptions since #970 — an unversioned cell is a hole, not a shortcut), so an
+  unmoved head is a witness that no cell under it was rewritten in between. A read that cannot obtain
+  that witness fails **retriably** rather than answering, which is the fail-closed-on-read-fault rule
+  of §5.3 applied to atomicity. Before #1057 the head was sampled first and never revalidated, and an
+  off-thread reader summing 50 balances returned a total off by exactly one transfer leg — one leg of
+  a transaction observed without the other, and the transaction in question had not committed at all.
 - **A read of the latest committed version costs one record fetch.** This is the whole point of
   in-place-latest, and it is what protects index-free adjacency: a traversal that reads the current
   version of every record it visits walks no chains at all. A reader on an older snapshot walks the
