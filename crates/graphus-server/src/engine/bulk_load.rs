@@ -248,7 +248,7 @@ impl LoadingSession {
                 return Err(e);
             }
             match store.commit(txn) {
-                Ok(()) => {
+                Ok(_commit_ts) => {
                     self.id_map.extend(pending_id_map.drain());
                     self.batch_seq = next_batch_seq;
                     Ok(())
@@ -321,7 +321,7 @@ impl LoadingSession {
                 return Err(e);
             }
             match store.commit(txn) {
-                Ok(()) => {
+                Ok(_commit_ts) => {
                     self.batch_seq = next_batch_seq;
                     Ok(())
                 }
@@ -351,9 +351,12 @@ impl LoadingSession {
                     let _ = store.rollback(txn);
                     return Err(e);
                 }
-                store.commit(txn).inspect_err(|_| {
-                    roll_back_failed_commit(store, txn);
-                })
+                store
+                    .commit(txn)
+                    .inspect_err(|_| {
+                        roll_back_failed_commit(store, txn);
+                    })
+                    .map(|_commit_ts| ())
             })?;
         }
         Ok(self.stats)

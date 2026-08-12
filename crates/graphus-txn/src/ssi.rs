@@ -603,6 +603,30 @@ impl SsiTracker {
     /// Whether `a` and `b` ran concurrently: neither had committed before the other began. Two
     /// in-flight transactions are always concurrent; a committed transaction is concurrent with `x`
     /// iff it committed after `x` began.
+    ///
+    /// # `<=` at equality, and the invariant that makes it right (`rmp` #1056)
+    ///
+    /// `commit_ts == begin_ts` counts as **not** concurrent — `b` began at a timestamp that includes
+    /// `a`, so `b` read `a`'s writes and owes it no rw-antidependency edge. That is the same reading
+    /// `crate::visibility::is_visible` gives the same two numbers (a committed creator is visible iff
+    /// `ts <= snapshot.ts`), and the two must agree: an edge is what stops a transaction acting on a
+    /// value it did not see, so declining to form one is only sound if it did see it.
+    ///
+    /// The reading is not free-standing. It depends on a begin timestamp being a genuine
+    /// **visibility horizon** — every commit at or below it has finished publishing itself — which is
+    /// a property of `graphus_storage::RecordStore`'s commit sequencer, not of this module.
+    /// `rmp` #1056 is what happens when it does not hold: the store handed out begin timestamps off
+    /// the commit-timestamp *allocation* clock, so a transaction could begin at exactly the timestamp
+    /// of a commit that had not yet published either of its two oracles, read the pre-commit value,
+    /// and be told here that the two were not concurrent. No edge formed, no dangerous structure
+    /// existed, and the SSI backstop stood down while a lost update went through. Nothing in this
+    /// function was wrong; what was wrong was the number it was given.
+    ///
+    /// So: **do not "fix" this to `<`.** It would paper over a broken horizon by aborting every
+    /// transaction that legitimately begins at the timestamp of the commit it just read — which, since
+    /// a begin timestamp *is* the last published commit's timestamp, is the ordinary case. If the
+    /// equality ever looks wrong again, the horizon is what to check;
+    /// `graphus-dst`'s `det_scheduler_lost_update_1056` holds it.
     fn are_concurrent(&self, a: TxnId, b: TxnId) -> bool {
         let (Some(ta), Some(tb)) = (self.txns.get(&a), self.txns.get(&b)) else {
             return false;

@@ -123,3 +123,7 @@ required-features = ["det-sched"]
 [[test]]
 name = "det_scheduler_torn_property_read_1057"
 required-features = ["det-sched"]
+
+[[test]]
+name = "det_scheduler_lost_update_1056"
+required-features = ["det-sched"]

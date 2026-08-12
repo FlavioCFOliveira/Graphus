@@ -417,6 +417,74 @@ impl StorePages for [FixedStore; STORE_COUNT] {
     }
 }
 
+/// The **commit sequencer** (`rmp` #1056): which issued commit timestamps have not yet finished
+/// publishing themselves, and therefore how far the visibility horizon may advance.
+///
+/// # The invariant
+///
+/// > A snapshot taken at timestamp `V` sees every transaction whose commit timestamp is `<= V`.
+///
+/// Every reader in the engine already *assumes* it — `graphus_txn::visibility::is_visible` decides a
+/// committed creator visible exactly when `ts <= snapshot.ts`, and `scan_polarity::delta_verdict`
+/// stops the undo walk on the same test. Nothing was *establishing* it.
+///
+/// # What broke without it
+///
+/// [`RecordStore::commit_prepare`] issues its commit timestamp at the top and only afterwards
+/// publishes the commit — the durable commit slot, then the in-memory
+/// [`CommitRegistry`](graphus_txn::CommitRegistry) entry. While `RecordStore` was still one writer's
+/// property those two instants could not be told apart. Under `D-multi-writer` they can: a second
+/// worker beginning a transaction inside that window read the *allocation* clock, took a begin
+/// timestamp `B == C` for a commit `C` it could not yet see, and read the pre-`C` value of every
+/// record `C` had written.
+///
+/// That is a snapshot that lies about its own contents, and `rmp` #1056 measured what it costs:
+/// `MATCH (c:Ctr) SET c.n = c.n + 1` on two workers, both acknowledged, one increment — a **lost
+/// update**, the cardinal ACID violation, on ~15-20 % of runs at `engine_workers = 8` and never at
+/// `engine_workers = 1`. The write-write check could not catch it either, because the head it
+/// inspected named a transaction that was, by then, genuinely committed at a timestamp `<= B`; and
+/// the SSI backstop could not, because `SsiTracker::are_concurrent` reads `commit_ts <= begin_ts` as
+/// "committed before it began" — which is the correct reading *of this invariant*, and was simply
+/// not true of the value `begin_ts` held.
+///
+/// # The mechanism
+///
+/// One `BTreeSet` of issued-but-unpublished timestamps. The horizon is the largest timestamp below
+/// the smallest pending one, or the whole allocation clock when nothing is pending:
+///
+/// ```text
+///     horizon = pending.first().map_or(allocated, |m| m - 1)
+/// ```
+///
+/// It is deliberately the *contiguous published prefix* rather than "every timestamp that has
+/// published": with `12` pending and `13` already published, the horizon stays `11`, because a
+/// snapshot at `13` would claim to include `12`. Conservative in the freshness of a snapshot, never
+/// in its consistency. The horizon is published with a `fetch_max`, so it is monotone even if two
+/// workers recompute it in either order.
+///
+/// This is PostgreSQL's shape, arrived at from the same requirement: a snapshot is taken under
+/// `ProcArrayLock` and a committing backend clears its XID from the proc array under that same lock
+/// **after** its commit record is written, so `GetSnapshotData` can never produce a snapshot that
+/// treats an unpublished commit as visible (`src/backend/storage/ipc/procarray.c`,
+/// `ProcArrayEndTransaction` / `GetSnapshotData`, read 2026-08-12). Memgraph reaches it by making
+/// publication a single pointer store into `commit_info` under `engine_lock_`
+/// (`/data/refsrc/memgraph/src/storage/v2/storage.cpp`), which Graphus cannot copy: its publication
+/// is two writes in two media (a durable `commit.store` slot and an in-memory registry), so the
+/// window has to be *named* rather than made instantaneous.
+///
+/// # Rank and cost
+///
+/// Rank **20** — the commit sequencer, which is the rank `graphus_core::latch` already reserved for
+/// it by name. In practice a **leaf**: the two critical sections here are a `BTreeSet` insert and a
+/// remove-plus-`first()`, and nothing is acquired inside either. Twice per commit, off every read
+/// path — [`RecordStore::snapshot_ts`] stays a single atomic load.
+#[derive(Debug, Default)]
+struct CommitSequencer {
+    /// Commit timestamps issued by [`RecordStore::next_commit_ts`] whose commit has neither finished
+    /// publishing nor been abandoned. Ordered, because only the smallest one matters.
+    pending: std::collections::BTreeSet<u64>,
+}
+
 /// The active-transaction table, **sharded by `TxnId`** (`rmp` #1013, layer 5a of #975).
 ///
 /// # Why sharded, and why interior mutability
@@ -682,6 +750,18 @@ struct ActiveTxn {
     /// [`created`](Self#structfield.created), which the transaction retains for its whole life
     /// anyway.
     created_this_command: HashSet<(u8, u64)>,
+    /// **`rmp` #1056.** The snapshot timestamp this transaction began at — its **start timestamp** in
+    /// the sense `D-write-conflict-detection` uses the term, and the horizon
+    /// [`ensure_chain_head_unheld`](RecordStore::ensure_chain_head_unheld) measures a committed chain
+    /// head against.
+    ///
+    /// [`None`] for a transaction the store never saw [`begin`](RecordStore::begin): recovery, a
+    /// maintenance pass, a bulk import and the catalog all write through the store without ever
+    /// taking an MVCC snapshot, and a transaction with no snapshot has no "committed before my start"
+    /// to test. Those callers keep the pre-#1056 behaviour (the arm is skipped); every transaction
+    /// that reaches the store through [`begin`](RecordStore::begin) — which is every transaction the
+    /// coordinator opens — carries a real one.
+    begin_ts: Option<Timestamp>,
 }
 
 /// One transaction's pending, not-yet-committed change to the six live-record cardinality counters
@@ -1594,9 +1674,14 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// share a lock, and [`graphus_core::latch::CatalogLatchScope`] for the rank.
     catalog: RwLock<CatalogState>,
     stores: [FixedStore; STORE_COUNT],
-    /// The largest MVCC commit timestamp issued so far (`04 §5.2`); persisted in [`Meta`] so it
-    /// resumes monotonically after reopen. The next commit timestamp is `commit_ts_hw + 1`, and a
-    /// fresh reader's snapshot timestamp is `commit_ts_hw` (it sees exactly what has committed).
+    /// The largest MVCC commit timestamp **issued** so far (`04 §5.2`); persisted in [`Meta`] so it
+    /// resumes monotonically after reopen. The next commit timestamp is `commit_ts_hw + 1`.
+    ///
+    /// **It is the allocation clock, not the visibility horizon (`rmp` #1056).** A fresh reader's
+    /// snapshot timestamp is [`commit_visible_hw`](Self#structfield.commit_visible_hw), which lags
+    /// this value for exactly as long as a commit is issued but not yet published. Reading a
+    /// snapshot off *this* word is what produced the lost update of `rmp` #1056 — see
+    /// [`snapshot_ts`](Self::snapshot_ts).
     /// An `Arc<AtomicU64>` since `rmp` #1022, for the same reason the allocator's high-water mark is
     /// an atomic (`rmp` #1012): it is a value maintenance needs to read **without taking the store's
     /// hold at all**. The index collector must compare it across its two phases, and it must do so
@@ -1605,6 +1690,19 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// hold, so the hold remains the total order over changes to it; the atom only permits a
     /// lock-free observer. Shared out by [`commit_clock`](Self::commit_clock).
     commit_ts_hw: Arc<AtomicU64>,
+    /// **The commit-visibility horizon (`rmp` #1056)**: the largest timestamp `V` such that **every**
+    /// commit at a timestamp `<= V` has finished publishing itself, and is therefore readable as
+    /// committed by anybody who looks. This — never
+    /// [`commit_ts_hw`](Self#structfield.commit_ts_hw) — is what
+    /// [`snapshot_ts`](Self::snapshot_ts) returns.
+    ///
+    /// Monotonic, and maintained under [`commit_seq`](Self#structfield.commit_seq); see
+    /// [`CommitSequencer`] for the invariant and for the defect that made it necessary.
+    commit_visible_hw: AtomicU64,
+    /// The **commit sequencer** (`rmp` #1056): the set of issued-but-unpublished commit timestamps,
+    /// from which [`commit_visible_hw`](Self#structfield.commit_visible_hw) is derived. Rank 20; a
+    /// leaf. See [`CommitSequencer`].
+    commit_seq: Mutex<CommitSequencer>,
     /// Per-open-transaction version-stamp bookkeeping, consumed at [`commit`](Self::commit) to
     /// settle in-flight headers to the commit timestamp (`04 §5.2`).
     active: ActiveTable,
@@ -1954,6 +2052,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 ALL_STORE_KINDS.map(|k| FixedStore::empty(k, Arc::clone(&barrier)))
             },
             commit_ts_hw: Arc::new(AtomicU64::new(0)),
+            commit_visible_hw: AtomicU64::new(0),
+            commit_seq: Mutex::new(CommitSequencer::default()),
             // A fresh store has made no durable write, so both the queue and the bookmark high-water start
             // empty/zero (`rmp` #813): a read before the first write mints `"<db>:0"`.
             active: ActiveTable::default(),
@@ -2087,6 +2187,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             element_ids: ElementIdAllocator::new(meta.element_id_next.max(1)),
             stores,
             commit_ts_hw: Arc::new(AtomicU64::new(meta.commit_ts_hw)),
+            // Nothing is in flight in a store that has just been opened, so the horizon starts level
+            // with the allocation clock (`rmp` #1056).
+            commit_visible_hw: AtomicU64::new(meta.commit_ts_hw),
+            commit_seq: Mutex::new(CommitSequencer::default()),
             // Nothing is un-hardened at open (recovery truncated the un-synced WAL tail). Seed the
             // durable-write bookmark high-water from the recovered `commit_ts_hw` (`rmp` #813): after a
             // crash only durable commit records survive, so this reflects the last durable write and can
@@ -3549,8 +3653,32 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// ([`WalManager::oldest_active_first_lsn`]) are likewise driven by the *earliest logged record*,
     /// so a transaction that logs nothing correctly contributes no floor (it has no undo chain to
     /// protect).
-    pub fn begin(&self, txn: TxnId) {
-        self.active.insert(txn, ActiveTxn::default());
+    pub fn begin(&self, txn: TxnId) -> Timestamp {
+        // The store takes the snapshot ITSELF and hands it back, rather than the caller reading
+        // `snapshot_ts()` beside this call (`rmp` #1056). Two reads are two instants: a commit landing
+        // between them would give the transaction a begin timestamp its own recorded start timestamp
+        // disagreed with, and `ensure_chain_head_unheld` measures a committed chain head against the
+        // recorded one. One read, one answer, used by both.
+        // `rmp` #1056: the snapshot instant is a scheduling seam. A transaction that takes its
+        // begin timestamp while another worker sits between issuing its commit timestamp and
+        // publishing its commit is the whole defect, and the deterministic scheduler cannot place one
+        // there unless the snapshot itself offers the token.
+        sched::yield_at(YieldSite::SnapshotBegin, ResourceId::txn(txn.0));
+        let begin_ts = self.snapshot_ts();
+        self.active.insert(
+            txn,
+            ActiveTxn {
+                begin_ts: Some(begin_ts),
+                ..ActiveTxn::default()
+            },
+        );
+        begin_ts
+    }
+
+    /// The **start timestamp** of `txn` (`D-write-conflict-detection`), or [`None`] when the store
+    /// never saw it [`begin`](Self::begin) — see [`ActiveTxn::begin_ts`].
+    fn start_ts_of(&self, txn: TxnId) -> Option<Timestamp> {
+        self.active.with(txn, |a| a.begin_ts).flatten()
     }
 
     /// Opens the next **statement** of `txn` and returns its [`CommandId`] (`04 §5.1.4`, `rmp` #972).
@@ -3588,12 +3716,73 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             .unwrap_or(CommandId::NONE)
     }
 
-    /// The current MVCC read snapshot timestamp (`04 §5.2`): the largest commit timestamp issued so
-    /// far, so a reader that begins now sees exactly every transaction that has already committed
+    /// The current MVCC read snapshot timestamp (`04 §5.2`): the **commit-visibility horizon**, so a
+    /// reader that begins now sees exactly every transaction that has already finished committing
     /// and nothing committed later. A fresh store (no commits yet) returns `Timestamp(0)`.
+    ///
+    /// It is [`commit_visible_hw`](Self#structfield.commit_visible_hw) and **not**
+    /// [`commit_ts_hw`](Self#structfield.commit_ts_hw): the latter is the allocation clock, which a
+    /// committer bumps at the start of [`commit_prepare`](Self::commit_prepare) and only afterwards
+    /// makes good. Handing that value out as a snapshot promises the reader a commit it cannot yet
+    /// see, which under `D-multi-writer` is a **lost update** — see [`CommitSequencer`] for the
+    /// measurement and the mechanism (`rmp` #1056).
+    ///
+    /// Still one relaxed atomic load: the horizon is maintained off the read path entirely.
     #[must_use]
     pub fn snapshot_ts(&self) -> Timestamp {
-        Timestamp(self.commit_ts_hw.load(Ordering::Acquire))
+        Timestamp(self.commit_visible_hw.load(Ordering::Acquire))
+    }
+
+    /// Runs `f` over the [`CommitSequencer`] — the **single acquisition door** for the rank-20
+    /// sequencer latch (`rmp` #1056), so its leaf property is a fact about one function rather than a
+    /// convention spread over call sites. Nothing inside `f` may take another lock.
+    fn with_commit_seq<R>(&self, f: impl FnOnce(&mut CommitSequencer) -> R) -> R {
+        let mut guard = self
+            .commit_seq
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(&mut guard)
+    }
+
+    /// Recomputes and publishes the commit-visibility horizon from `seq`. Called under
+    /// [`with_commit_seq`](Self::with_commit_seq) and nowhere else.
+    ///
+    /// `fetch_max` rather than `store`, so the horizon is monotone whichever order two workers reach
+    /// this in — a stale recomputation can only fail to advance it, never move it back.
+    fn republish_visible_horizon(&self, seq: &CommitSequencer) {
+        let allocated = self.commit_ts_hw.load(Ordering::Acquire);
+        let horizon = seq
+            .pending
+            .first()
+            .map_or(allocated, |lowest| lowest.saturating_sub(1));
+        self.commit_visible_hw.fetch_max(horizon, Ordering::AcqRel);
+    }
+
+    /// Publishes `commit_ts`: the commit that issued it is now readable as committed by everybody, so
+    /// the horizon may advance over it (`rmp` #1056).
+    ///
+    /// Call at the instant the commit becomes visible — after **both** halves of publication (the
+    /// durable `commit.store` slot and the in-memory [`CommitRegistry`](graphus_txn::CommitRegistry)
+    /// entry), never between them.
+    fn publish_commit_ts(&self, commit_ts: Timestamp) {
+        self.with_commit_seq(|seq| {
+            seq.pending.remove(&commit_ts.0);
+            self.republish_visible_horizon(seq);
+        });
+    }
+
+    /// Abandons `commit_ts`: the commit that issued it failed before publishing anything, so nothing
+    /// will ever be visible at that timestamp and it must stop holding the horizon down (`rmp` #1056).
+    ///
+    /// The timestamp itself is **not** reissued — it is simply skipped, exactly as a `SEQUENCE` value
+    /// consumed by a rolled-back statement is. Without this a single failed
+    /// [`commit_prepare`](Self::commit_prepare) would freeze the horizon for the life of the process
+    /// and every later reader would be pinned to a snapshot before it.
+    fn abandon_commit_ts(&self, commit_ts: Timestamp) {
+        self.with_commit_seq(|seq| {
+            seq.pending.remove(&commit_ts.0);
+            self.republish_visible_horizon(seq);
+        });
     }
 
     /// A handle to the commit-timestamp clock, readable **without the store's hold** (`rmp` #1022).
@@ -3767,17 +3956,19 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///
     /// # Panics
     /// Panics if the commit `fdatasync` fails (`04 §4.9`) — for a read-only commit no sync is issued.
-    pub fn commit(&self, txn: TxnId) -> Result<()> {
-        match self.commit_prepare(txn)? {
+    pub fn commit(&self, txn: TxnId) -> Result<Timestamp> {
+        let (commit_ts, commit_lsn) = self.commit_prepare(txn)?;
+        match commit_lsn {
             // Read-only fast path (`rmp` #529): nothing was appended, so there is nothing to harden and
             // no checkpoint to take.
-            None => Ok(()),
+            None => Ok(commit_ts),
             // A durable write commit: harden the just-appended records (the group-commit `fdatasync`)
             // and take the redo-bounding auto-checkpoint. Identical to the pre-#528 inline path (same
             // durable bytes, same fsync placement observationally, same checkpoint cadence).
             Some(_commit_lsn) => {
                 self.harden_wal();
-                self.maybe_checkpoint()
+                self.maybe_checkpoint()?;
+                Ok(commit_ts)
             }
         }
     }
@@ -3808,7 +3999,31 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///
     /// # Errors
     /// Returns a storage error if the catalog cannot be persisted or `txn` is not active.
-    pub fn commit_prepare(&self, txn: TxnId) -> Result<Option<Lsn>> {
+    pub fn commit_prepare(&self, txn: TxnId) -> Result<(Timestamp, Option<Lsn>)> {
+        // The commit timestamp is issued HERE, outside the body, for one reason: it must be given
+        // back to the sequencer whatever happens next (`rmp` #1056). An issued timestamp holds the
+        // commit-visibility horizon down until it is either published or abandoned, so a body that
+        // returned `Err` without releasing it would pin every later reader to a snapshot before this
+        // transaction — permanently, for the life of the process.
+        let commit_ts = self.next_commit_ts();
+        match self.commit_prepare_at(txn, commit_ts) {
+            Ok(commit_lsn) => Ok((commit_ts, commit_lsn)),
+            Err(e) => {
+                self.abandon_commit_ts(commit_ts);
+                Err(e)
+            }
+        }
+    }
+
+    /// The body of [`commit_prepare`](Self::commit_prepare), at an already-issued `commit_ts`.
+    ///
+    /// Split out so the timestamp's release is a property of ONE caller rather than of every `?` in
+    /// here. On success it publishes `commit_ts` to the sequencer at each exit; on failure it
+    /// publishes nothing, and [`commit_prepare`](Self::commit_prepare) abandons the timestamp.
+    ///
+    /// # Errors
+    /// As [`commit_prepare`](Self::commit_prepare).
+    fn commit_prepare_at(&self, txn: TxnId, commit_ts: Timestamp) -> Result<Option<Lsn>> {
         // Assign this transaction's commit timestamp (`04 §5.2`). **Lazy GC-time freezing**
         // (`04 §5.5`, hint-bit style, `rmp` task #49): do NOT settle each version's header from the
         // in-flight `TxnId` to the commit timestamp here — that was O(records touched) WAL-logged
@@ -3830,7 +4045,6 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         //     ONLY via the commit-time `checkpoint_meta`; missing it would silently drop a committed
         //     catalog change (the `statistics` reopen tests are the regression guard).
         let wrote_durable = self.wal.with(|w| w.is_active(txn));
-        let commit_ts = self.next_commit_ts();
         // Settle this transaction's retained label versions from its in-flight stamp to
         // `Committed(commit_ts)` (`rmp` #767). Unlike the record headers above — settled lazily at GC
         // time because doing it eagerly was O(records) WAL-logged page writes — this history is small
@@ -3891,6 +4105,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                  implies a record write, which implies WAL activity"
             );
             self.settle_committed_txn(txn, commit_ts);
+            // A read-only commit publishes nothing, so its timestamp is visible the instant it stops
+            // being pending (`rmp` #1056). It still has to be released: while it sits in the sequencer
+            // it holds the horizon down exactly as a write commit's would.
+            self.publish_commit_ts(commit_ts);
             return Ok(None);
         }
 
@@ -3998,6 +4216,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .record_commit(txn, commit_ts);
+        // BOTH halves of publication are now done — the durable commit slot above and the in-memory
+        // registry entry on the line before — so and only so may the commit-visibility horizon advance
+        // over this timestamp (`rmp` #1056). Moving this call any earlier reopens the window a snapshot
+        // could be taken in: a reader would get a begin timestamp `>= commit_ts` while one of the two
+        // oracles still answered "in flight", read the pre-commit value, and — being a writer — go on
+        // to overwrite it. That is the lost update this task closes; see [`CommitSequencer`].
+        self.publish_commit_ts(commit_ts);
         // Releases the active-set entry — and with it this transaction's count delta and schema undo log
         // (`rmp` #866). This must happen before `open_txn_holds_pending_ddl()` below, which asks whether
         // any *other* open transaction still holds unpersisted DDL and would otherwise count this one's.
@@ -4292,12 +4517,19 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // `Release` on the way out: this is the edge that publishes a commit to the lock-free
         // observers of `commit_clock`, and the index collector's whole argument is that seeing an
         // unchanged clock means no commit landed in between.
-        let next = self.commit_ts_hw.fetch_add(1, Ordering::AcqRel) + 1;
-        assert!(
-            next <= MAX_TIMESTAMP,
-            "commit timestamp space exhausted (63-bit)"
-        );
-        Timestamp(next)
+        // Issue and register as pending in ONE critical section (`rmp` #1056). Split, a second worker
+        // could recompute the horizon between the bump and the insert, find `pending` empty, and hand
+        // out a snapshot at the very timestamp just issued — which is the whole defect, reintroduced
+        // in a two-line window.
+        self.with_commit_seq(|seq| {
+            let next = self.commit_ts_hw.fetch_add(1, Ordering::AcqRel) + 1;
+            assert!(
+                next <= MAX_TIMESTAMP,
+                "commit timestamp space exhausted (63-bit)"
+            );
+            seq.pending.insert(next);
+            Timestamp(next)
+        })
     }
 
     /// Overwrites the 8-byte MVCC header word at `field_off` (one of [`MVCC_OFF_CREATED_TS`] /
@@ -5635,6 +5867,50 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 "write-write conflict: {kind:?} {entity} held by transaction {}; retry \
                  (serialization failure)",
                 holder.0
+            )));
+        }
+        // THE SECOND ARM: the head is COMMITTED, but committed after this writer began (`rmp` #1056).
+        //
+        // `D-write-conflict-detection` names both arms in one sentence — the writer aborts unless the
+        // head belongs to a transaction that "is neither itself nor committed before its own start
+        // timestamp" — and only the first was implemented. The gap is not academic: a head committed
+        // at `commit_ts > begin_ts` is, by the visibility rule this store runs on
+        // (`graphus_txn::visibility::is_visible`: a committed creator is visible iff
+        // `ts <= snapshot.ts`), a version this writer CANNOT SEE. So it read the value underneath and
+        // is about to overwrite the one on top with a result computed from the older one. Two
+        // acknowledged increments, one increment applied.
+        //
+        // First-updater-wins, which is what the ratified decision chose and what every reference
+        // engine does here: PostgreSQL raises `ERROR: could not serialize access due to concurrent
+        // update` when a REPEATABLE READ updater meets a tuple whose updater committed after its
+        // snapshot (`src/backend/executor/nodeModifyTable.c` -> `ExecUpdate` ->
+        // `table_tuple_update` returning `TM_Updated`, and `heap_update`'s `HeapTupleUpdated`
+        // path in `src/backend/access/heap/heapam.c`); Memgraph's `PrepareForWrite` returns false —
+        // a serialization error, never a wait — unless the head's timestamp is the transaction's own
+        // or below its `start_timestamp` (`/data/refsrc/memgraph/src/storage/v2/mvcc.hpp`).
+        //
+        // **`<=` and not `<`.** "Committed before my start" is measured against the *visibility*
+        // horizon, and `begin_ts` IS that horizon: `snapshot_ts()` returns the largest timestamp every
+        // one of whose commits has finished publishing ([`CommitSequencer`]), and a version at exactly
+        // that timestamp is visible. A strict `<` would refuse the ordinary serial case — a
+        // transaction that begins after a commit, reads its value, and writes on top of it, whose
+        // `begin_ts` equals that commit's timestamp by construction — i.e. it would abort almost every
+        // second write in a sequential workload. It is `<=` **because** the horizon is honest; before
+        // the sequencer existed neither operator was correct, which is why this arm could not simply
+        // be added on its own.
+        //
+        // Skipped for a transaction with no recorded start timestamp: recovery, a maintenance pass and
+        // a bulk import all write without ever taking a snapshot, and there is nothing to compare
+        // against. See [`ActiveTxn::begin_ts`].
+        if let VersionStamp::Committed(head_ts) = VersionStamp::from_raw(slot.commit_ts)
+            && slot.txn_id != txn.0
+            && let Some(begin_ts) = self.start_ts_of(txn)
+            && head_ts > begin_ts
+        {
+            return Err(GraphusError::Transaction(format!(
+                "write-write conflict: {kind:?} {entity} was written by transaction {} which \
+                 committed at {}, after this transaction began at {}; retry (serialization failure)",
+                slot.txn_id, head_ts.0, begin_ts.0
             )));
         }
         Ok(())
@@ -8827,6 +9103,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // pre-#529 behaviour and strictly preserves monotonicity now.)
         self.commit_ts_hw
             .fetch_max(meta.commit_ts_hw, Ordering::AcqRel);
+        // The visibility horizon follows the allocation clock the same way, and through the same
+        // sequencer that maintains it everywhere else (`rmp` #1056), so a reload can never leave the
+        // horizon behind a timestamp whose commit has already published. A `fetch_max` under the
+        // sequencer, so a commit publishing concurrently cannot be undone by this recomputation.
+        self.with_commit_seq(|seq| self.republish_visible_horizon(seq));
         // THE LIVE PAGE MAP IS PRESERVED — by never being touched (`rmp` #721).
         //
         // Every other per-store field is restored from the durable committed catalog. The page map is
@@ -14292,7 +14573,7 @@ mod tests {
         for i in 1..=2u64 {
             s.begin(TxnId(i));
             s.create_node(TxnId(i)).unwrap();
-            assert!(s.commit_prepare(TxnId(i)).unwrap().is_some());
+            assert!(s.commit_prepare(TxnId(i)).unwrap().1.is_some());
         }
         s.harden_wal(); // ONE group-commit fdatasync hardens batch A
 
@@ -14300,7 +14581,7 @@ mod tests {
         for i in 3..=4u64 {
             s.begin(TxnId(i));
             s.create_node(TxnId(i)).unwrap();
-            assert!(s.commit_prepare(TxnId(i)).unwrap().is_some());
+            assert!(s.commit_prepare(TxnId(i)).unwrap().1.is_some());
         }
         // Power loss BEFORE batch B's `harden_wal`: the un-synced tail is dropped whole. Capture the
         // DURABLE prefix (what survived) — it holds batch A but not batch B (never fdatasync'd).
@@ -16363,7 +16644,7 @@ mod tests {
                 .alloc
                 .lock()
                 .restore(mark_from_capacity(capacity), free);
-            let outcome = s.commit(t1);
+            let outcome = s.commit(t1).map(|_commit_ts| ());
             // What actually reached the device, read back so the assertions below are about the
             // persisted image and not about memory. The persisted CAPACITY comes back too: the repair
             // works by raising it, so an assertion that only looked at the mark could not tell healing
@@ -16876,7 +17157,7 @@ mod tests {
                 s.create_node(txn).unwrap();
                 let lsn = s.commit_prepare(txn).unwrap();
                 assert!(
-                    lsn.is_some(),
+                    lsn.1.is_some(),
                     "a write commit_prepare must append a durable COMMIT record"
                 );
             }

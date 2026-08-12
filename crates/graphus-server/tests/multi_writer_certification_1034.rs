@@ -594,20 +594,28 @@ fn reconcile(acked: &BTreeSet<i64>, present: &BTreeSet<i64>) -> Option<String> {
 // counter VALUE, so it fails in a release build too) and `graphus-dst`'s
 // `det_scheduler_catalog_counts_1052`.
 //
-// STILL IGNORED, for a defect neither of those was: `rmp` #1056. With both fixes in place this gate
-// still fails about 15 % of runs on a different oracle — "the shared counters total 105 after 107
-// acknowledged concurrent increments", a LOST UPDATE, which is the cardinal ACID violation. It was
-// measured to be independent and pre-existing (4 failures in 40 runs with #1053's fix withdrawn
-// against 6 in 40 with it — statistically indistinguishable), and it composes two defects in another
-// subsystem: `ensure_chain_head_unheld` never implemented the "nor committed before its own start
-// timestamp" arm that `D-write-conflict-detection` ratified, and `SsiTracker::are_concurrent` treats
-// `commit_ts == begin_ts` as non-concurrent, which contradicts visibility and stops the rw-edge from
-// forming — so the SSI backstop never fires either. Every losing pair measured had exactly that
-// equality.
+// `rmp` #1056 is FIXED, and this gate runs unconditionally again. It used to fail ~20 % of runs
+// (measured 4 in 20) on the counter oracle below — "the shared counters total 114 after 115
+// acknowledged concurrent increments", a LOST UPDATE, the cardinal ACID violation — and never at
+// `engine_workers = 1`.
 //
-// Ignored under the same bounded exception the project owner approved on 2026-08-11: #1056 removes
-// this attribute and may not close while it is still here.
-#[ignore = "rmp #1056: lost update at engine_workers > 1; un-ignored by the task that fixes it"]
+// The cause was NOT what the ticket predicted, and the correction is worth keeping written down.
+// `RecordStore::commit_prepare` issued its commit timestamp at the top and published the commit
+// afterwards, while `snapshot_ts()` handed out that *issuing* clock as a begin timestamp. A writer
+// beginning inside that window therefore took a begin timestamp equal to a commit timestamp it could
+// not yet see, read the pre-commit value, and overwrote it. `RecordStore`'s `CommitSequencer` now
+// holds the visibility horizon below any commit that has not finished publishing itself, and
+// `ensure_chain_head_unheld` implements the "nor committed before its own start timestamp" arm that
+// `D-write-conflict-detection` ratified. `SsiTracker::are_concurrent` needed no change: instrumented
+// on this very gate, the `commit_ts > begin_ts` shape reached the write path 100-130 times per run
+// and survived to commit ZERO times in 16 runs — the rw-edge did form and the pivot rule did abort
+// it. What formed no edge was the `commit_ts == begin_ts` shape, and that reading of the timestamps
+// is correct; the timestamp was not.
+//
+// Measured after the fix: 40 consecutive runs green at `engine_workers = 8`, and the abort rate fell
+// from 0.82 to ~0.70 (committed ~118 -> ~193 of 640) because a first-updater-wins refusal lands at
+// the statement instead of at the commit. Its by-seed guard is `graphus-dst`'s
+// `det_scheduler_lost_update_1056`.
 fn no_acknowledged_commit_is_lost_or_invented_across_a_restart() {
     const SHARDS: i64 = 4;
     const PER_CLIENT: i64 = 40;

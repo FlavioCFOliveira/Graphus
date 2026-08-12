@@ -10,9 +10,9 @@ to the domain/component it constrains. On ratification, the chosen option is rec
 and its status set to `ratified`.
 
 > **Status: all 24 decisions of the original 2026-06-05 round are ratified.** The chosen option is
-> recorded on each `Decision` node (`status: ratified`, property `chosen`). Twenty-three further
+> recorded on each `Decision` node (`status: ratified`, property `chosen`). Twenty-four further
 > decisions were ratified after that round; they are recorded in the same index below, each carrying
-> its own ratification date. The register therefore holds **47 decisions** in total. The decision index in
+> its own ratification date. The register therefore holds **48 decisions** in total. The decision index in
 > the next section is the canonical enumeration; the options tables below it are kept for the
 > rationale and trade-offs, and are not a decision list.
 
@@ -85,6 +85,7 @@ Parse contract, to be preserved by any future edit:
 | `D-statement-isolation` | ratified | 2026-08-05 | **A statement does not observe its own writes, and the rule is one comparison operator over the delta's `command_id`.** Every read carries a **view** — `New` (the default) or `Old` — beside its snapshot; the view decides nothing about other transactions and only whether the reader's own uncommitted deltas are undone (`New`: written by a later command; `Old`: written by a later command **or by the current one**). A delta written outside any statement carries `command_id = 0` and is undone by **no** view, because it belongs to the transaction's baseline rather than to a statement. The counter lives in the record store, which is its single source of truth, and it advances at exactly **two** points: when a cursor opens, and at a `WITH` that follows a write. Polarity is fixed per clause: `Old` for every scan, every index seek, every relationship expansion, a `MATCH`'s `Filter`, `UNWIND` and a read-only procedure `CALL`; `New` for `MERGE`'s match sub-plan, every update clause, projection, aggregation and ordering, and a writing procedure `CALL`. The planner's `Eager` barriers are **all retained**: they decouple row production while the view re-polarises visibility, and reforming them is separate work. Closes the `command_id` half of `04-technical-design.md` §5.1.4; design in `04-technical-design.md` §§5.1.4, 5.3 and `05-storage-format.md` §12.2. |
 | `D-chain-head-publication` | ratified | 2026-08-09 | **A chain head is published by a compare-and-publish held atomic by a short publication latch, and a refused publication logs nothing.** The unconditional byte write through which a **prepend** published `first_rel`, `first_prop` and `undo_ptr` is retired: a prepend now reads the head, writes its entry linked to that head, publishes the entry **only if** the head still holds what it read, and fixes the displaced predecessor's back-pointer only **after** it has won — so two writers can never relink the same predecessor. A refusal re-reads the head, re-links the entry and retries. The protocol lives in the dependency-free leaf crate `graphus-chainhead`, where `loom` can model-check it. Atomicity and, equally, **durable order** (log order must equal the order in which publications take effect on the page) are supplied by a sharded latch at **rank 27**, between the allocation latch (25) and the WAL (30), taken with the page already pinned, admitting one holder per thread, and never held across I/O — mechanically enforced in debug builds. The redo image is a compare-and-set patch, which needs **no** new WAL record type, format version or recovery step. The write stays **redo-only** (`D-chain-head-redo-only` is unchanged). The same latch covers two further writes, because the head word alone is not the whole prepend: the shared `chain_flags` byte of the displaced relationship, which a prepend clears with a commutative mask instead of a computed byte, and the GC corpse splice's repointing of a node head, converted so that no writer of that word stores into it unconditionally. Facet table in the "Ratified decision (2026-08-09) — chain-head publication" section below; design in `04-technical-design.md` §5.7.1. |
 | `D-wal-group-leader` | ratified | 2026-08-11 | **One shared fsync group leader hardens the WAL for every engine worker, and the per-worker fsync thread is retired.** The pipelined group commit of task **#532** offloads a commit batch's `fdatasync` so that the durability sync of batch *K* overlaps the CPU preparation of batch *K+1*. Its documented invariant was **strict depth-1** — a job channel of depth one, and the engine waiting for the outstanding job before submitting the next, so at most one batch is ever written-but-un-synced and a crash tail is the tail of one batch. That invariant became **false** the moment the engine grew to `W` workers: each worker spawned its own fsync thread over the **one** `WalManager` they share behind `SharedWal`, so each was depth-1 for itself while the system reached depth `W`, and a crash tail could hold interleaved batches from several workers. The ack-after-fsync rule was not actually violated, but only because of three properties of the sink that **no contract declared** — a job hardens whole files and therefore at least its entire declared range; every `begin_harden` starts at the sink's **global** durable frontier; and completion is a monotone maximum that the acknowledgement is taken after. This decision promotes those three to **the sink contract**, declared normatively and each pinned by a test, and makes the job carry the range it hardens explicitly (`covers_from`, `target_len`) so the contract is machine-checkable rather than prose. **One fsync group leader per database engine** then replaces the per-worker thread: workers offer their job to the leader, at most one `fdatasync` is in flight system-wide, a newer offer subsumes and discards an older pending one, and each worker is released once the group's hardened watermark passes its own target — the `XLogFlush` shape of PostgreSQL. **Depth-1 is restated where it is now true**: one `fdatasync` in flight for the whole engine, so the crash tail is again the tail of one un-synced interval rather than of `W` interleaved ones. Every discard is adjudicated by an **always-on tripwire** against the sink's own attested durable frontier, so a per-worker frontier or a sync narrowed to a byte range trips it instead of silently acknowledging un-synced bytes. Refines `D-multi-writer` by fixing the durability mechanism its parallel writers share; leaves `D-async-commit` untouched, since ack-after-fsync remains unconditional and nothing here defers or batches a sync in time; supersedes no ratified outcome, and changes no on-disk format. Facet table in the "Ratified decision (2026-08-11) — the WAL fsync group leader" section below; design in `04-technical-design.md` §4.2 and §9.1. |
+| `D-published-snapshot-horizon` | ratified | 2026-08-12 | **A snapshot timestamp is the published commit-visibility horizon, never the commit-timestamp allocation clock.** A commit timestamp is issued at the start of commit and the commit publishes itself only afterwards, in **two writes in two media** — the durable commit-info slot and the in-memory commit registry — so the issuing clock names commits that neither visibility oracle will yet admit. Handing that clock out as a begin timestamp became a **lost update** the moment `D-multi-writer` allowed a second worker to begin inside that window: the transaction read the pre-commit value of every record the committing transaction wrote and, being itself a writer, overwrote it — two acknowledged increments, one applied, on roughly one run in five at eight engine workers and never at one. The store now holds the set of commit timestamps that are **issued but not yet published** and derives the horizon as the **contiguous published prefix** (the lowest pending timestamp minus one, or the whole allocation clock when nothing is pending), advanced by an atomic maximum so it is monotone under any interleaving. The set is guarded by the **rank-20 commit sequencer latch**, entered through a single acquisition door, a leaf, and off the read path entirely: taking a snapshot remains one atomic load. An issued timestamp is released on **every** exit — published once both halves of publication are done, abandoned on failure and thereafter skipped, never reissued — because a leaked timestamp freezes the horizon for the life of the process; the commit path is therefore split into a timestamp-issuing wrapper and a fallible body, so release is a property of one caller rather than of every fallible step. `begin` and the commit path **return** the timestamp they captured or assigned, and callers use that value instead of re-reading a clock a sibling worker may have moved. Refines `D-version-representation` by fixing what a snapshot timestamp *means*, and `D-write-conflict-detection` by making its second arm answerable; supersedes no ratified outcome and changes no on-disk format. Facet table in the "Ratified decision (2026-08-12) — the published snapshot horizon" section below; design in `04-technical-design.md` §5.2, §5.1.3 and §5.7. |
 
 <!-- END decision-index -->
 
@@ -764,6 +765,11 @@ scope and are propagated into `00-overview.md` and `01-needs-survey.md`:
 > - **The coalescing this unlocks between workers is a prerequisite of, and is completed by, the commit
 >   sequencer of task #977**, which owns total commit order and SSI validation for parallel writers.
 >   This decision fixes the **durability mechanism**; #977 fixes the **ordering** on top of it.
+>   **Two distinct things are called "the commit sequencer", deliberately.** Task #977's sequencer owns
+>   commit **order**; the rank-20 commit sequencer of `D-published-snapshot-horizon` owns the
+>   **visibility horizon** — when an already-ordered commit becomes observable. They are adjacent and they meet when
+>   #977 lands, which is why the boundary is stated rather than either name changed; it is written out
+>   in `04-technical-design.md` §5.2.
 >
 > **The reference read, at a pinned revision.** This is the shape PostgreSQL settled on, and it is
 > read for the same reason Graphus needs it: a follower whose durability requirement was already met by
@@ -801,6 +807,161 @@ scope and are propagated into `00-overview.md` and `01-needs-survey.md`:
 > and the sink contract are `04-technical-design.md` §4.2; the runtime shape that places the leader off
 > the async runtime is §9.1; the fsyncgate policy a failed sync follows is §4.9. The exemption of the
 > leader from the deterministic scheduler is `07-dst-simulator.md` §5.2.3.
+
+## Ratified decision (2026-08-12) — the published snapshot horizon
+
+> **`D-published-snapshot-horizon` settles what a snapshot timestamp *means* once more than one worker
+> may be committing, in task #1056.** It refines the earlier rounds rather than replacing any part of
+> them: `D-version-representation`, `D-write-conflict-detection`, `D-multi-writer`,
+> `D-dst-writer-scheduler`, `D-incidence-anchor`, the four property-path decisions, the three
+> logical-rollback decisions, `D-statement-isolation`, `D-chain-head-publication` and
+> `D-wal-group-leader` are unchanged, and `D-async-commit` is untouched — ack-after-fsync remains
+> unconditional and nothing here defers a sync. Every one of the four inviolable requirements of
+> `CLAUDE.md` stands as written, and **no byte of any on-disk format changes** — not the record
+> layouts, not the WAL record set, not the format version, not a recovery step.
+>
+> **Status: ratified.**
+>
+> **Why now.** `D-multi-writer` ratified N parallel writers, and the layers that deliver them are under
+> way. Running the multi-writer certification gate at eight engine workers produced a **lost update** —
+> "the shared counters total 114 after 115 acknowledged concurrent increments" — on 4 runs in 20, and
+> never at one worker. Two acknowledged increments, one applied, is the cardinal ACID violation, so it
+> had to be closed before the writers are certified rather than after.
+>
+> **What was actually wrong, and why every backstop stood down.** The engine has always run on one
+> invariant, and until this task nothing established it:
+>
+> > A snapshot taken at timestamp `V` sees every transaction whose commit timestamp is at or below `V`.
+>
+> A commit timestamp is issued at the *start* of commit; the commit publishes itself afterwards, in two
+> writes in two media — the durable commit-info slot and the in-memory commit registry. `snapshot_ts()`
+> returned the **issuing** clock. A worker beginning inside that window therefore took a begin timestamp
+> equal to the commit timestamp of a transaction that neither oracle would yet admit was committed, read
+> the pre-commit value, and — being itself a writer — overwrote it. With one writer thread nobody can
+> begin inside another transaction's commit, so the window was unreachable; with eight it is a lost
+> update.
+>
+> | Consumer of the timestamp | What it concluded | Was it wrong? |
+> | --- | --- | --- |
+> | `graphus_txn::visibility::is_visible` and the chain walk of `04-technical-design.md` §5.3 | a committed creator is visible iff its commit timestamp is at or below the snapshot's | **No.** That is the invariant. |
+> | The write-write check of §5.7 | the chain head's holder is not an open transaction, so I may write | **No.** That was the only arm it had at the time. And the missing arm would not have saved it either: the head named a transaction that was by then genuinely committed at a timestamp **at or below** the writer's begin timestamp, so a committed-before-my-start test evaluated against that begin timestamp would also have permitted the write. |
+> | `SsiTracker::are_concurrent` | `commit_ts <= begin_ts` means "committed before it began", so no rw-antidependency edge | **No** — and this is the premise that was suspected and refuted. Instrumented on the certification gate, the `commit_ts > begin_ts` shape reached the write path 100–130 times per run and survived to commit **zero times in 16 runs**: the edge did form and the pivot rule did abort it. What formed no edge was the `commit_ts == begin_ts` shape, and that reading is correct. **This function must not be "fixed" to `<`**; doing so would abort every transaction that legitimately begins at the timestamp of the commit it just read, which is the ordinary case. |
+>
+> All three read the timestamp correctly. The timestamp was the thing that lied.
+>
+> **The alternatives weighed.**
+>
+> | Option | Verdict |
+> | --- | --- |
+> | **A — make publication instantaneous**, so the window cannot exist: issue the timestamp and publish the commit inside one critical section, as Memgraph does. | **Not available in that form.** Graphus publishes a commit in **two media** — a durable `commit.store` slot and an in-memory registry — so there is no single store to make atomic. Reaching Memgraph's shape would mean holding one global engine lock across a durable write for the whole commit, which re-serialises exactly the writers `D-multi-writer` exists to run in parallel, and which the latch order forbids on its own terms (`04-technical-design.md` §3.3: the inner latches are released before any I/O, precisely so that one holder cannot convoy every writer behind a durability barrier). |
+> | **B — exclude the two against each other with a lock**, taking the snapshot under the same latch a committer publishes under, as PostgreSQL's `GetSnapshotData` does under `ProcArrayLock`. | **Adopted in its guarantee, rejected in its mechanism.** It puts a latch acquisition on the **read** path, where a Graphus snapshot is a single atomic load and where every read in the engine begins. The obligation belongs on the committer, which pays it twice per commit, rather than on every reader. |
+> | **C — publish a horizon derived from the set of issued-but-unpublished timestamps, and hand *that* out as the snapshot. ★ chosen** | **Ratified.** It gives option B's guarantee with option A's read cost. The horizon is the **contiguous published prefix** — the lowest pending timestamp minus one, or the whole allocation clock when nothing is pending — so a snapshot never names a commit that has not finished publishing itself, and the read path keeps a single atomic load. |
+>
+> **The references read, at pinned revisions.** Both engines make the same guarantee; they differ only
+> in where they pay for it.
+>
+> | Reference | What was read, and what it shows |
+> | --- | --- |
+> | **PostgreSQL** (`/data/refsrc/postgres`, commit `0fd30e2`) | A snapshot and a commit's publication are mutually excluded by one lock. `GetSnapshotData` (`src/backend/storage/ipc/procarray.c:2114`) takes `ProcArrayLock` in shared mode (`:2178`); `ProcArrayEndTransaction` (`:663`) clears the committing backend's XID under the same lock in exclusive mode (`:710`), and its contract says both halves out loud: "The transaction commit/abort **must already be reported to WAL and pg_xact**", and "We must lock `ProcArrayLock` while clearing our advertised XID, **so that we do not exit the set of 'running' transactions while someone else is taking a snapshot**". Publication first, then the timestamp becomes observable — which is the rule Graphus adopts. |
+> | **Memgraph** (`/data/refsrc/memgraph`, commit `087bbf2`) | The window is closed by making the whole commit one critical section. `CreateTransaction` takes `engine_lock_` and reads its start timestamp under it (`src/storage/v2/inmemory/storage.cpp:2829`, `:2840-2842`), and `Commit` acquires the same `engine_lock_` (`:1163`) *before* issuing the commit timestamp (`:1164`, `GetCommitTimestamp()` being a bare `timestamp_++` at `:4612`) and still holds it when the commit is published by one release store into `commit_info` (`:1299`). The comment at `:1178-1184` states the ordering requirement in the same terms: the WAL "must be written before actually committing the transaction (before setting the commit timestamp) **so that no other transaction can see the modifications before they are written to disk**". |
+>
+> **The consequences that are normative.**
+>
+> - **The horizon is the contiguous published prefix, not "every timestamp that has published".** With
+>   `12` pending and `13` published the horizon stays `11`, because a snapshot at `13` would claim to
+>   include `12`. This is conservative in a snapshot's **freshness** and never in its **consistency**.
+>   It is advanced with an atomic maximum, so it is monotone whichever order two workers recompute it
+>   in.
+> - **A timestamp is issued and registered as pending in one indivisible step.** Split, a second worker
+>   could recompute the horizon between the two, find nothing pending, and hand out a snapshot at the
+>   very timestamp just issued — the same defect, reintroduced in a two-line window.
+> - **An issued timestamp is released on every exit**, published once both halves of publication are
+>   done and abandoned when the commit fails. A leaked timestamp **freezes the horizon permanently**:
+>   one failed commit would pin every later reader in the process to a snapshot taken before it. The
+>   commit path is therefore split into a timestamp-issuing wrapper and a fallible body, so that release
+>   is a property of one caller instead of an obligation on every fallible step inside it. An abandoned
+>   timestamp is **skipped, never reissued** — exactly as a sequence value consumed by a rolled-back
+>   statement is.
+> - **A transaction uses the timestamp it was handed, never a re-read of the clock.** `begin` returns
+>   the horizon it captured and the commit path returns the timestamp it assigned. A second read is a
+>   second instant: under `D-multi-writer` it yields a sibling worker's timestamp, or — since the
+>   horizon now lags an in-flight commit — one *below* the transaction's own. Neither value is this
+>   transaction's, so the write-conflict check and the SSI tracker would both be ruling on a number
+>   that belongs to no transaction in front of them.
+> - **The sequencer latch is rank 20** — the rank the engine's latch order already reserved for it by
+>   name — entered through a **single acquisition door**, and a leaf: nothing may be acquired while it
+>   is held. Two short critical sections per commit, and **nothing on the read path**.
+> - **This is not the commit ordering of task #977.** The sequencer specified here owns the *visibility
+>   horizon* — which issued timestamps may be seen. Task #977 owns *total commit order and SSI
+>   validation* for parallel writers. The two are complementary, and neither subsumes the other.
+>
+> **How it is proved.** A by-seed DST scenario drives the record store directly, with **no SSI above
+> it**, so the write-conflict rule is certified on its own terms rather than behind a backstop. Its
+> headline oracle is the invariant itself — if `A` committed at `C` and `B` began at or after `C`, then
+> `B` observed `A`'s write — and the counter oracle is kept beside it as the shape a user sees. Reaching
+> the window at all required a **yield point at the snapshot itself**: without one, the first version of
+> the scenario came back clean on all 32 seeds *with the fix withdrawn*, a by-seed reproduction that
+> reproduced nothing. Each half of the fix was then withdrawn independently, everything else untouched:
+>
+> | Withdrawn | Snapshot-honesty oracle | Counter oracle |
+> | --- | --- | --- |
+> | The horizon — the snapshot reads the issuing clock again | **fails**, 19 seeds; **every** violation reports `commit_ts == begin_ts` | **fails**, 19 of 32 seeds |
+> | The committed-before-my-start arm of the write-conflict check | passes | **fails**, all 32 seeds, 2–5 increments lost each |
+> | Nothing (the shipped design) | passes | passes |
+>
+> That table is why **both** halves are required and neither is sufficient. With an honest horizon a
+> begin timestamp never names an unpublished commit, and a writer can still overwrite a head committed
+> *after* it began, which only the second arm refuses; with a dishonest horizon the arm is asked whether
+> the head committed after a start timestamp that already equals the head's own, and answers no. At
+> engine level the gate then ran **40 consecutive runs green at eight workers**, and the abort rate fell
+> from 0.82 to about 0.70 (roughly 118 to 193 commits of 640) because a refusal now lands at the
+> statement rather than at commit.
+>
+> **Scope note — this decision does not lift the multi-writer gate.** `admission.engine_workers` above 1
+> remains **refused by configuration validation**, fail-closed, pending the certification measured by
+> task **#1034**; multi-worker engines are reachable from tests, which is what keeps this path
+> exercised. This decision removes one of the blockers behind that gate and does not by itself open it.
+>
+> **What this decision does not close.** The same allocation-versus-publication distinction has a
+> second, still-open instance on the **property read path**, tracked as task **#1058** and filed as a
+> **prerequisite** of the multi-writer certification rather than a follow-up to it: at more than one
+> worker a reader can still observe **one leg of a commit that is in flight**, probed at 2 to 7 torn
+> reads in the first ~240 reads and unreachable at a single engine worker. This section fixes what a
+> *snapshot timestamp* means; it does not by itself make every read of the property path resolve
+> against one. The residual arms itself the moment multi-writer is certified, which is why it is
+> sequenced **before** task #1034 and not after it.
+>
+> **Where this is specified.** The invariant, the horizon, the sequencer latch, the release obligation
+> and the return-the-timestamp rule are `04-technical-design.md` §5.2; the latch ranks are §3.3; what
+> the commit-info slot's single store does and does not settle is §5.1.3; the second arm of the
+> write-conflict check and its `≤` boundary are §5.7; the lock-free inventory that now distinguishes
+> reading the horizon from issuing a timestamp is §9.2. The begin-snapshot yield point that makes the
+> window reachable by a seeded schedule is `07-dst-simulator.md` §5.2.5.
+
+## Post-ratification note (2026-08-12) — `D-write-conflict-detection`
+
+> **The second arm of the ratified rule is now implemented, and the boundary is "at or before".** The
+> ratified choice names both arms in one sentence: the writer aborts unless the chain head belongs to a
+> transaction that "is neither itself nor committed before its own start timestamp". Only the *in-flight
+> holder* arm was ever implemented. Task **#1056** implemented the second, so a chain head whose
+> transaction committed **after** the writer's start timestamp is now refused with the same retriable
+> serialization failure.
+>
+> **The ratified wording reads as strict; the implemented comparison is `≤`, and that is not a
+> deviation.** "Committed before my start" is measured against the *visibility* horizon, and a begin
+> timestamp **is** that horizon (`D-published-snapshot-horizon`): the largest timestamp every one of
+> whose commits has finished publishing. A version at exactly that timestamp is visible, by the same
+> rule every reader in the engine already applies. A strict `<` would therefore refuse the ordinary
+> sequential case — a transaction that begins after a commit, reads its value and writes on top of it,
+> whose begin timestamp equals that commit's timestamp by construction — and would abort roughly every
+> second write in a serial workload. The operator is `≤` **because** the horizon is honest; before the
+> horizon existed neither operator was correct, which is why this arm could not have been added on its
+> own.
+>
+> The check is skipped for a writer that holds **no recorded start timestamp** — recovery, a maintenance
+> pass and a bulk import all write without ever taking a snapshot, so there is nothing to compare
+> against. The ratified outcome is unchanged and nothing is re-baselined; this note records the
+> completion of the rule and fixes the reading of its boundary. Design in `04-technical-design.md` §5.7.
 
 ## TCK target (pinned — closes `D-cypher-line` open question 1)
 

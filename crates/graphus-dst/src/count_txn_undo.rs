@@ -529,7 +529,9 @@ pub fn run_io_error_at_catalog_checkpoint(ending: BystanderEnding) -> Checkpoint
     let visible_scan_with_bystander_open = Counters::by_visible_scan(&mut store);
 
     match ending {
-        BystanderEnding::Commits => store.commit(bystander).expect("bystander commits"),
+        BystanderEnding::Commits => {
+            store.commit(bystander).expect("bystander commits");
+        }
         BystanderEnding::LeftOpen => {}
         BystanderEnding::RollsBack => store.rollback(bystander).expect("bystander rolls back"),
     }
@@ -660,7 +662,9 @@ pub fn run_stolen_pages_vs_checkpointed_counts(
     store.commit(committer).expect("committer commits");
 
     match ending {
-        BystanderEnding::Commits => store.commit(bystander).expect("bystander commits"),
+        BystanderEnding::Commits => {
+            store.commit(bystander).expect("bystander commits");
+        }
         BystanderEnding::LeftOpen => {}
         BystanderEnding::RollsBack => store.rollback(bystander).expect("bystander rolls back"),
     }
@@ -763,7 +767,7 @@ pub fn run_crash_between_checkpoint_and_commit_harden(
         .commit_prepare(prepared)
         .expect("prepare must run the catalog checkpoint");
     assert!(
-        commit_lsn.is_some(),
+        commit_lsn.1.is_some(),
         "the prepared transaction wrote records, so it must NOT take the `rmp` #529 read-only fast \
          path — otherwise no checkpoint ran and this scenario is vacuous"
     );

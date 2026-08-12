@@ -4264,8 +4264,12 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// (optional) monotonic begin reading.
     fn begin_inner(&self, isolation: IsolationLevel, begin_nanos: Option<u64>) -> TxnId {
         let txn = self.mint_txn();
-        let begin_ts = self.store.borrow().snapshot_ts();
-        self.store.borrow_mut().begin(txn);
+        // ONE snapshot read, taken by the store as it registers the transaction (`rmp` #1056). It used
+        // to be two — `snapshot_ts()` here and `begin(txn)` on the next line — and under
+        // `D-multi-writer` two reads are two instants: a commit landing between them gave the
+        // coordinator and the store different start timestamps for the same transaction, and the
+        // write-write check measures a committed chain head against the store's one.
+        let begin_ts = self.store.borrow_mut().begin(txn);
         self.ssi.borrow_mut().register(txn, begin_ts);
         self.with_active(|a| {
             a.insert(
@@ -11173,8 +11177,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // 2) Commit on the store: it assigns the commit timestamp, settles MVCC headers and group-
         //    commits the WAL (`rmp` task #45). The store is the timestamp oracle, so the commit
         //    timestamp is its post-commit snapshot high-water.
-        self.store.borrow_mut().commit(txn)?;
-        let commit_ts = self.store.borrow().snapshot_ts();
+        // The store RETURNS the timestamp it assigned (`rmp` #1056). Re-reading `snapshot_ts()` here
+        // was correct only while one thread could be committing: under `D-multi-writer` it returns
+        // whatever the clock says at that instant — a sibling worker's commit timestamp, or (since the
+        // horizon now lags an in-flight commit) a timestamp BELOW this transaction's own. Either way
+        // the value fed to `ssi.record_commit` below would not be this transaction's commit timestamp,
+        // and every `are_concurrent` decision involving it would be answered against a fiction.
+        let commit_ts = self.store.borrow_mut().commit(txn)?;
 
         // Authoritative cross-snapshot freshness stamp (`rmp` task #467): if `txn` structurally
         // mutated a full-text/spatial posting (recorded by the statement seam during its writes), retire
@@ -11239,8 +11248,9 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
 
         // 2) Store PREPARE: assign the commit timestamp, publish the outcome and append the `COMMIT`
         //    record WITHOUT hardening (`rmp` #528). The store is the timestamp oracle.
-        let commit_lsn = self.store.borrow_mut().commit_prepare(txn)?;
-        let commit_ts = self.store.borrow().snapshot_ts();
+        // The store returns the timestamp it assigned — see `commit` above for why re-reading the
+        // clock here is wrong under `D-multi-writer` (`rmp` #1056).
+        let (commit_ts, commit_lsn) = self.store.borrow_mut().commit_prepare(txn)?;
 
         // 3) Publish the outcome — byte-identical to `commit` (the WAL harden is the only deferred step).
         self.index

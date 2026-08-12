@@ -481,7 +481,7 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
     /// Propagates the underlying [`RecordStore::commit`] failure.
     fn commit_batch(&mut self, txn: TxnId) -> Result<()> {
         match self.store.commit(txn) {
-            Ok(()) => {
+            Ok(_commit_ts) => {
                 self.id_map.extend(self.pending_id_map.drain());
                 Ok(())
             }

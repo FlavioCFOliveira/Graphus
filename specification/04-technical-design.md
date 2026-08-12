@@ -114,7 +114,8 @@ A write query over Bolt, end to end:
    (backpressure, §9).
 2. **Transaction binding.** The message maps to a `Session` operation. An explicit `BEGIN` (or an
    implicit auto-commit `RUN`) asks `graphus-txn` for a transaction: it is assigned a `TxnId` and a
-   **begin timestamp** (snapshot) from the timestamp oracle. Access mode (read/write) is recorded.
+   **begin timestamp** — its snapshot, which is the published commit-visibility horizon of §5.2, read
+   once by the store and handed back rather than sampled twice. Access mode (read/write) is recorded.
 3. **Compile.** The Cypher text + parameters go to `graphus-cypher`. The plan cache is keyed by the
    normalized query string + schema version; on miss, the pipeline runs lexer → parser → AST →
    semantic analysis (this is where **all compile-time TCK errors** must be raised, §7.3) → logical
@@ -887,9 +888,16 @@ instead of answering it.
 **Consequences to hold.** The slot is per-transaction, so it must outlive the transaction object and
 be reclaimed only when the last delta referring to it is reclaimed. It is read on every visibility
 decision, so it is a read-mostly, heavily-shared cache line and must be sized and padded accordingly
-(§10.2). And because publication is a single release store, a reader either sees the whole transaction
-as committed or none of it — which is atomicity (the **A** of ACID) expressed directly in the data
-structure rather than reconstructed by a sweep.
+(§10.2). And because the slot is published by a single release store, **every delta of the transaction
+becomes committed at the same instant** — which is atomicity (the **A** of ACID) expressed directly in
+the data structure rather than reconstructed by a sweep.
+
+That single store settles the deltas; it is not the whole of publication. A commit also has to appear
+in the in-memory commit registry, which is what resolves an in-flight stamp still sitting in a record
+header, so publication is **two writes in two media** and cannot be made instantaneous the way
+Memgraph's is. What guarantees that no reader ever observes the transaction half-published is
+therefore not the store's atomicity but the horizon of §5.2: the commit timestamp stays unpublished —
+and no snapshot may reach it — until both writes are done.
 
 #### 5.1.4 Statement-level isolation: `command_id`
 
@@ -1184,13 +1192,94 @@ Three consequences are **normative**:
 
 A central **timestamp oracle** issues monotonically increasing logical timestamps:
 
-- **begin timestamp** at transaction start = the transaction's snapshot. A version is visible iff
-  `xmin` committed ≤ begin_ts **and** (`xmax` is 0, or `xmax` committed > begin_ts, or `xmax`
-  belongs to an uncommitted/aborted txn).
-- **commit timestamp** assigned atomically at commit, after SSI validation succeeds.
+- **begin timestamp** at transaction start = the transaction's snapshot, which is the **published
+  commit-visibility horizon** specified below and never the oracle's allocation counter. A version is
+  visible iff `xmin` committed ≤ begin_ts **and** (`xmax` is 0, or `xmax` committed > begin_ts, or
+  `xmax` belongs to an uncommitted/aborted txn).
+- **commit timestamp** issued at the start of commit, after SSI validation succeeds. Issuing it and
+  making it visible are **two distinct instants**, and the second one is what a snapshot may observe.
 
 Uncommitted versions are tagged with the writer's `TxnId` (distinguished from committed timestamps by
 a high bit) so visibility checks can resolve in-flight writers via the Active Transaction Table.
+
+**The snapshot invariant is normative** (`D-published-snapshot-horizon`, ratified 2026-08-12, task
+**#1056**):
+
+> A snapshot taken at timestamp `V` sees every transaction whose commit timestamp is at or below `V`.
+
+Every reader in the engine already *assumed* it. `graphus_txn::visibility::is_visible` admits a
+committed creator exactly when its commit timestamp is ≤ the snapshot's, the chain walk of §5.3 stops
+on the same test, and the SSI tracker of §5.4 reads `commit_ts ≤ begin_ts` as "committed before it
+began" and therefore forms no rw-antidependency edge. What no mechanism did was **establish** it.
+
+**Why the allocation clock is not a snapshot.** A commit publishes itself in two writes in two media —
+the durable commit-info slot of §5.1.3, then the in-memory commit registry — while the commit
+timestamp is issued *before* both. Handing out the allocation clock as a begin timestamp therefore
+promises a reader a commit that neither visibility oracle will yet admit. While one thread owned the
+write path the two instants could not be told apart; under `D-multi-writer` they can, and a
+transaction that begins inside that window reads the pre-commit value of every record the committing
+transaction wrote. When that transaction is itself a writer, it computes its own write from the value
+it was not entitled to see and overwrites the newer one: a **lost update**, the cardinal ACID
+violation, measured on roughly one run in five at eight engine workers and never at one. Neither
+backstop catches it — the write-write check of §5.7 inspects a head whose transaction is by then
+genuinely committed at a timestamp ≤ the reader's, and the SSI tracker declines to form an edge for
+exactly the same reason. Both are reading the timestamp correctly; the timestamp was the thing that
+lied.
+
+**The commit sequencer.** The store keeps the set of commit timestamps that have been **issued but
+have not finished publishing**, and derives the horizon from it:
+
+```text
+    horizon = lowest_pending - 1,  or the whole allocation clock when nothing is pending
+```
+
+- The horizon is the **contiguous published prefix**, not "every timestamp that has published". With
+  `12` pending and `13` already published the horizon stays `11`, because a snapshot at `13` would
+  claim to include `12`. This is conservative in the *freshness* of a snapshot and never in its
+  *consistency*.
+- It is published with an atomic maximum, so it is **monotone** whichever order two workers recompute
+  it in: a stale recomputation can fail to advance the horizon, never move it backwards.
+- A commit timestamp is released to the horizon **only after both halves of publication are done** —
+  the durable slot and the registry entry — and never between them. A read-only commit (§4.2, the
+  `rmp` #529 fast path) publishes nothing and so releases its timestamp as soon as it stops being
+  pending.
+
+**The sequencer's latch is rank 20** (§3.3), which is the rank the engine's latch order already
+reserved for it by name, and it is acquired through a **single door**: one function takes it, and
+nothing may be acquired while it is held. Its leaf property is therefore a fact about that one
+function rather than a convention spread over call sites. The cost is two short critical sections per
+commit — one insertion when the timestamp is issued, one removal when it is released — and **nothing
+on the read path**: taking a snapshot remains a single atomic load, because the horizon is maintained
+entirely by committers.
+
+**Issuing a timestamp and registering it as pending are one indivisible step, and its release is
+unconditional.** Both happen inside the same critical section; split, a second worker
+could recompute the horizon between the two, find nothing pending, and hand out a snapshot at the very
+timestamp just issued, which is the defect reintroduced in a two-line window. Symmetrically, **every
+exit from commit must release the timestamp** — publishing it on success, abandoning it on failure.
+The commit path is therefore split into a timestamp-issuing wrapper and a fallible body, so that
+release is a property of one caller rather than of every fallible step inside it. A timestamp that
+leaks holds the horizon down **permanently**: one failed commit would pin every later reader in the
+process to a snapshot taken before it. An abandoned timestamp is skipped and never reissued, exactly
+as a sequence value consumed by a rolled-back statement is; the horizon closes over the gap when the
+next pending timestamp is released.
+
+**A transaction uses the timestamp it was handed, never a re-read of the clock.** `begin` returns the
+horizon it captured, and the commit path returns the timestamp it assigned. Reading the clock a second
+time beside the call was correct only while one thread could be committing: under `D-multi-writer` a
+second read is a second instant, and it returns a sibling worker's timestamp or — since the horizon now
+lags an in-flight commit — a timestamp below the transaction's own. Neither value is this
+transaction's, so both the write-conflict check of §5.7 and the SSI tracker of §5.4 would then be
+deciding against a number that belongs to no transaction they are ruling on. One read, one answer,
+used by everything downstream.
+
+**Naming, to avoid a collision.** The **commit sequencer** specified here owns the *visibility
+horizon*: which issued timestamps may be seen. It is not the commit ordering that task #977 is to
+deliver for parallel writers, which owns *total commit order and SSI validation*. The two are
+complementary and neither subsumes the other.
+
+Nothing here changes an on-disk format: the horizon is derived in memory from state the store already
+maintains, and it is recomputed from the recovered commit-timestamp high-water when a store is opened.
 
 ### 5.3 Visibility rules
 
@@ -1316,6 +1405,19 @@ Implementation:
 - **Read-only optimization.** Read-only transactions that cannot complete a dangerous cycle are
   exempted (the SSI read-only deferral optimization), important under read-heavy graph workloads.
 
+**Concurrency between two transactions is decided on the same boundary as visibility.** A transaction
+that committed at a timestamp **at or below** another's begin timestamp is *not* concurrent with it:
+the second one saw its writes, so it owes it no rw-antidependency edge — which is the same reading
+§5.3 gives those same two numbers. The two must agree, because an edge is what stops a transaction
+acting on a value it did not see, so declining to form one is sound only if it did see it. The test is
+therefore `≤`, and it is sound **only because a begin timestamp is the published horizon of §5.2**.
+Task #1056 is what happens when that does not hold: the tracker was handed begin timestamps off the
+allocation clock, correctly declined an edge for a commit the transaction had in fact not seen, and
+stood down while a lost update went through. Its reading was right and the timestamp it was given was
+wrong, so **this test must not be tightened to `<`** — that would abort every transaction that
+legitimately begins at the timestamp of the commit it has just read, which is the ordinary case. If
+the boundary ever looks wrong again, the horizon is what to check.
+
 Predicate-read granularity for index ranges (to catch phantoms) is tracked at the B+-tree leaf/range
 level (§6.4). Getting predicate locking right is essential for **TCK + serializability** and is a
 prime DST/Elle target (§11).
@@ -1375,6 +1477,13 @@ contract between §5 and the rest of the engine.
   of §5.3 applied to atomicity. Before #1057 the head was sampled first and never revalidated, and an
   off-thread reader summing 50 balances returned a total off by exactly one transfer leg — one leg of
   a transaction observed without the other, and the transaction in question had not committed at all.
+
+  **The witness is an equality test, so it does not detect an ABA sequence, and this is known**
+  (task **#1059**). A link, a cell write and a rollback that all fit inside one reader's window return
+  the head to the value it started from; the validation compares equal and accepts cells that changed
+  underneath it. #1057 neither introduced this nor closes it — the residual is tracked separately, and
+  a witness that survives it needs a value the sequence cannot restore rather than a tighter read
+  order.
 - **A read of the latest committed version costs one record fetch.** This is the whole point of
   in-place-latest, and it is what protects index-free adjacency: a traversal that reads the current
   version of every record it visits walks no chains at all. A reader on an older snapshot walks the
@@ -1435,7 +1544,7 @@ writing, a transaction reads the head of the entity's delta chain and decides in
 | --- | --- |
 | The chain is empty | proceed |
 | The head belongs to **this** transaction | proceed |
-| The head belongs to a transaction that **committed before this transaction's start timestamp** | proceed |
+| The head belongs to a transaction that **committed at or before this transaction's start timestamp** | proceed |
 | Anything else — the head belongs to another transaction that is in flight, or that committed after this transaction started | **abort now**, with a retriable serialization failure |
 
 The writer never waits for the outcome of the conflicting transaction, so no wait-for edge is ever
@@ -1445,6 +1554,39 @@ Memgraph's `PrepareForWrite` (Source, read 2026-08-02:
 error — instead of blocking, and which gates the entire write surface: every mutating accessor calls
 it first (`vertex_accessor.cpp:191,203,265,277,425,511,580,639`;
 `edge_accessor.cpp:194,261,315,360`).
+
+**Both rows of that table that refuse are enforced, and the second one arrived with task #1056.**
+`D-write-conflict-detection` names the two in one sentence — the writer aborts unless the head belongs
+to a transaction that "is neither itself nor committed before its own start timestamp" — but only the
+*in-flight holder* arm was implemented. The gap is not academic. A head committed after this writer
+began is, by the visibility rule of §5.3, a version this writer **cannot see**; so it read the value
+underneath, and it is about to overwrite the newer one with a result computed from the older. Two
+acknowledged increments, one increment applied. The engine therefore now refuses a chain head whose
+transaction committed after the writer's start timestamp, with the same retriable serialization
+failure as the in-flight case.
+
+**The comparison is "at or before" — `≤`, not `<` — and the ratified wording must be read that way.**
+"Committed before my start" is measured against the *visibility* horizon, and a begin timestamp **is**
+that horizon (§5.2): it is the largest timestamp every one of whose commits has finished publishing,
+and a version at exactly that timestamp is visible. A strict `<` would refuse the ordinary sequential
+case — a transaction that begins after a commit, reads its value, and writes on top of it, whose begin
+timestamp equals that commit's timestamp by construction — and would abort roughly every second write
+in a serial workload. The operator is `≤` **because** the horizon is honest, which is also why this arm
+could not have been added on its own: against the allocation clock of §5.2 the writer would be asking
+whether the head committed after a start timestamp that already equalled the head's own timestamp, and
+neither operator was correct. The two halves were measured independently — withdrawing the horizon
+loses the snapshot-honesty property, withdrawing this arm loses updates — and neither is sufficient
+alone.
+
+The check is **skipped for a writer that holds no recorded start timestamp**: recovery, a maintenance
+pass and a bulk import all write without ever taking a snapshot, so there is nothing to compare
+against. Both reference engines refuse on the same boundary. Memgraph's `PrepareForWrite`, cited
+above, returns `false` unless the head's timestamp is the transaction's own or below its
+`start_timestamp`; PostgreSQL raises `could not serialize access due to concurrent update` when an
+updater whose isolation level pins its snapshot meets a tuple whose updater committed after that
+snapshot (`/data/refsrc/postgres`, commit `0fd30e2`,
+`src/backend/executor/nodeModifyTable.c:2892`, the `TM_Updated` branch of `ExecUpdate` guarded by
+`IsolationUsesXactSnapshot()`; the delete path does the same at `:1978`).
 
 **Two properties of this rule matter for the inviolable ACID requirement.** First, it is
 *first-writer-wins*, not first-updater-wins-after-a-wait: the transaction that reached the entity
@@ -2478,8 +2620,10 @@ traversal-heavy benchmark before being locked** (measurement-gated).
 
 ### 9.2 Lock-free structures
 
-Lock-free/atomics are used **deliberately and narrowly**: the timestamp oracle (atomic counter), the
-WAL LSN allocator, pin counts, the frame-table shards, and the SSI conflict-edge set hot path. Every
+Lock-free/atomics are used **deliberately and narrowly**: taking a snapshot (a single atomic load of
+the published commit-visibility horizon — **issuing** a commit timestamp is not lock-free, it happens
+under the rank-20 commit sequencer latch of §5.2), the WAL LSN allocator, pin counts, the frame-table
+shards, and the SSI conflict-edge set hot path. Every
 such unit ships with documented memory-ordering rationale and **loom + Miri + aarch64** tests
 (NFR-9, §10). Everything else uses `parking_lot`/`std` locks held for short, non-`await` critical
 sections.

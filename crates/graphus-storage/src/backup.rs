@@ -124,14 +124,16 @@ pub fn backup_store<D: BlockDevice, S: LogSink>(store: &RecordStore<D, S>) -> Re
     //    already-frozen store (e.g. re-backing-up a freshly-restored store) burns no commit timestamp
     //    and is byte-for-byte idempotent.
     let freeze_txn = graphus_core::TxnId(u64::MAX);
-    store.begin(freeze_txn);
+    let _begin_ts = store.begin(freeze_txn);
     match store.freeze_committed_headers(freeze_txn) {
         Ok(0) => {
             // Nothing to freeze: roll the empty txn back so the meta page (and `commit_ts_hw`) is
             // untouched, keeping the backup idempotent.
             store.rollback(freeze_txn)?;
         }
-        Ok(_) => store.commit(freeze_txn)?,
+        Ok(_) => {
+            store.commit(freeze_txn)?;
+        }
         Err(e) => {
             let _ = store.rollback(freeze_txn);
             return Err(e);

@@ -173,6 +173,18 @@ pub enum YieldSite {
     SnapshotOldestActive = 50,
     /// `TxnCoordinator::read_task_inputs` — the snapshot an off-thread read task carries away.
     SnapshotReadTaskInputs = 51,
+    /// `RecordStore::begin` — immediately before a transaction reads the commit-visibility horizon
+    /// and becomes its begin timestamp.
+    ///
+    /// The instant `rmp` #1056 is about. A snapshot taken here while another worker is *inside*
+    /// `commit_prepare` — past the issue of its commit timestamp, short of publishing its commit — is
+    /// what produced a begin timestamp naming a commit nobody could see, and with it a lost update.
+    /// Without a yield point at the snapshot itself the deterministic scheduler cannot place a
+    /// transaction in that window: `begin` runs straight through from wherever its thread was last
+    /// parked, so reaching the window is left to how many steps happen to separate the two, which is
+    /// how the by-seed reproduction of #1056 initially came back empty. Its guard is `graphus-dst`'s
+    /// `det_scheduler_lost_update_1056`.
+    SnapshotBegin = 52,
 
     // ---- Storage coverage points (60..=79) --------------------------------------------------
     /// `RecordStore::free_push` — a slot returned to a store's free list.
