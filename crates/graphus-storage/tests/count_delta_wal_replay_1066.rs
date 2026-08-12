@@ -88,12 +88,14 @@ fn reopen(store: &mut Store) -> Store {
 
 /// How many count-delta records the store's **retained** log still holds. The non-vacuity witness
 /// for any assertion of the form "replaying this log again changes nothing".
-fn retained_count_delta_records(store: &Store) -> usize {
+fn retained_count_delta_records(store: &Store, txn: TxnId) -> usize {
     store
         .with_wal(|w| w.recovered_transactions())
         .expect("scan the retained log")
         .count_deltas
-        .len()
+        .iter()
+        .filter(|rec| rec.txn_id == txn)
+        .count()
 }
 
 /// A store with [`BASE_NODES`] committed nodes carrying [`LABEL`], its catalogue already durable
@@ -242,10 +244,13 @@ fn replaying_the_same_log_twice_folds_the_delta_once() {
     once.commit(t).expect("commit");
 
     assert_eq!(
-        retained_count_delta_records(&once),
+        retained_count_delta_records(&once, TxnId(SYNTH[0])),
         1,
         "NON-VACUITY: the delta record is no longer in the retained log, so the reopen below has \
-         nothing it could double-count and the assertion that follows would pass on an empty log"
+         nothing it could double-count and the assertion that follows would pass on an empty log. \
+         Counted for THIS transaction rather than over the whole log (`rmp` #1067): since a commit \
+         logs its own delta, the log also holds the fixture's and this step's, and a total would go \
+         green on those alone"
     );
 
     let twice = reopen(&mut once);

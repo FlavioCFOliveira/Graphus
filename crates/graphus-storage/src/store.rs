@@ -48,7 +48,7 @@ use crate::heap::{self, BLOCK_PAYLOAD, HeapBlock, STRINGS_RECORD_SIZE};
 use crate::idalloc::{Allocation, ElementIdAllocator, NULL_ID, SharedReuseBarrier, StoreAllocator};
 use crate::labels;
 use crate::meta::{
-    CompositeIndexEntry, ConstraintEntry, CountKey, FulltextIndexEntry, IndexState,
+    CompositeIndexEntry, ConstraintEntry, CountKey, CountsImage, FulltextIndexEntry, IndexState,
     LEGACY_FORMAT_VERSION, Meta, PROPERTY_UNDO_CHAIN_FORMAT_VERSION, RelCompositeIndexEntry,
     SchemaKey, SchemaValue, SpatialIndexEntry, Statistics, StoreMeta, TextIndexEntry, VectorEntity,
     VectorIndexEntry,
@@ -1191,9 +1191,84 @@ struct CatalogState {
     /// alone would leave it claiming that deltas the preserved counters still hold have not been
     /// applied. Preserved together, the pair stays true.
     ///
-    /// Grown only by the replay at [`open`](RecordStore::open), which is the only thing that folds a
-    /// logged delta in.
+    /// Grown by the replay at [`open`](RecordStore::open) and by the fold
+    /// [`checkpoint`](RecordStore::checkpoint) performs (`rmp` #1067); shrunk by that same
+    /// checkpoint once the WAL prefix holding those records has been reclaimed.
     applied_counts: AppliedTxSet,
+    /// **The counters as the durable catalogue image carries them** (`rmp` #1067): the value every
+    /// delta named by [`applied_counts`](Self#structfield.applied_counts) is already folded into.
+    ///
+    /// This — and NOT [`statistics`](Self#structfield.statistics) — is what a checkpoint persists.
+    /// The live counters move at every write and are rewritten by every commit; sampling them into
+    /// an image that lands later is `rmp` #1055's whole failure, and it is unfixable by ordering
+    /// because a transaction that commits after the last catalogue write can appear in no image at
+    /// all. The base does not move at a commit: it moves only when
+    /// [`checkpoint`](RecordStore::checkpoint) folds retained deltas into it, immediately before
+    /// reclaiming the records it folded.
+    ///
+    /// Only the six cardinality fields of [`Statistics`] are meaningful here; the schema half is
+    /// empty and never read. The type is `Statistics` rather than a counters-only newtype so that
+    /// [`replay_count_deltas`] — which owns the saturation argument (`rmp` #1066: sum in `i128`,
+    /// apply once) — is reused verbatim by the fold instead of being written a second time.
+    counts_base: Statistics,
+    /// Committed count deltas whose WAL record is still retained and is **not** folded into
+    /// [`counts_base`](Self#structfield.counts_base), keyed by the LSN of that record.
+    ///
+    /// Keyed by LSN rather than appended to a queue because the push order is not the log order: a
+    /// committer appends its delta record and then takes this latch, so a transaction that logged
+    /// later can register first. The fold is "everything below the reclaim floor", which is a range
+    /// split on this key and would be a scan on any other.
+    pending_counts: BTreeMap<u64, (TxnId, CountDelta)>,
+    /// Deltas already folded into [`counts_base`](Self#structfield.counts_base) whose record may
+    /// still be in the retained log, keyed by that record's LSN. The id set of this map is exactly
+    /// [`applied_counts`](Self#structfield.applied_counts), and the LSN is what lets a reclaimed id
+    /// be dropped from both (`AppliedTxSet::from_retained_ids`).
+    folded_counts: BTreeMap<u64, TxnId>,
+    /// Every count-delta record below this LSN is folded into
+    /// [`counts_base`](Self#structfield.counts_base) — the base's **coverage**.
+    ///
+    /// Purely in-memory: what is durable is the (base, applied set) pair, and this is the number an
+    /// image sample carries so that WAL reclamation can tell what that image accounts for.
+    counts_cov_lsn: u64,
+    /// The coverage of a base this store has made **durable and hardened** — the floor WAL
+    /// reclamation is allowed to reach.
+    ///
+    /// Distinct from [`counts_cov_lsn`](Self#structfield.counts_cov_lsn) because the two answer
+    /// different questions and the difference is where a crash lands: the in-memory base may be
+    /// ahead of anything on disk (a fold whose image write failed, or lost the fold lock), and
+    /// reclaiming to the in-memory value would drop records the durable catalogue cannot explain.
+    /// It advances only after [`checkpoint_meta`](RecordStore::checkpoint_meta) has written AND
+    /// hardened an image carrying at least that coverage, so every failure path reclaims less rather
+    /// than too much. `0` after `open`: the durable image's coverage cannot be named in LSN terms
+    /// until this process writes one itself.
+    counts_cov_durable: u64,
+    /// The coverages of the catalogue images currently **in flight** — sampled but not yet written
+    /// — refcounted (`rmp` #1067).
+    ///
+    /// # Why this exists, and what breaks without it
+    ///
+    /// Taking the counters out of the per-commit image removes `rmp` #1055's two classes, but it
+    /// creates one new way to lose a count, and it is the same shape: a commit samples the base at
+    /// coverage `C₁`, a checkpoint folds and advances the coverage to `C₂`, reclaims the records in
+    /// `[C₁, C₂)`, and only THEN does the first commit's page write land — restoring an image whose
+    /// base stops at `C₁` while the deltas it is missing are gone from the log. Nothing about
+    /// ordering fixes that, for the reason #1055 measured: the stale writer's own write is the last
+    /// one, legitimately.
+    ///
+    /// So the reclaim floor is clamped to the OLDEST coverage any image that could still land
+    /// already accounts for. Every future image carries at least the current coverage; the only
+    /// images that can carry less are the ones already sampled, which are exactly the entries here.
+    /// The clamp costs nothing in the steady state (an image write is a handful of page writes and
+    /// the entry is gone by the next checkpoint) and it never blocks: a checkpoint that finds an old
+    /// sample in flight simply reclaims less this time.
+    ///
+    /// It is a [`Mutex`] inside the catalogue state because it must be mutated from the SAMPLE,
+    /// which holds the rank-10 latch in shared mode — and it must be mutated there and nowhere
+    /// else, because a registration that is not atomic with the sample registers a coverage the
+    /// sampled base does not have. Mutual exclusion against the fold comes from the rank-10 latch
+    /// itself (the fold takes it exclusively); this inner latch only orders concurrent samplers
+    /// against each other. It is a leaf: nothing is acquired while it is held.
+    image_cov_refs: Mutex<BTreeMap<u64, usize>>,
 }
 
 /// A **borrow of the statistics catalog**, holding the rank-10 catalog latch open for as long as it
@@ -1798,6 +1873,33 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// `Send + Sync` so [`RecordStore`] stays `Send + Sync` (the `record_store_is_send_and_sync` gate);
     /// the installed [`graphus_io::StoreOpenLock`] (a `File` + `PathBuf`) satisfies both.
     open_guard: std::sync::OnceLock<Box<dyn Send + Sync>>,
+    /// Catalogue chunks a checkpoint WROTE, and chunks it skipped because the page already held
+    /// exactly those bytes (`rmp` #1067) — `(written, skipped)`.
+    ///
+    /// Observability, and the only way the skip can be tested at all: it is invisible in every result
+    /// the store returns, so a build in which it never fired — or in which it fired always — would
+    /// look identical from the outside while writing a completely different number of bytes.
+    /// `catalog_image_amplification_1067` reads both and asserts the ratio between them.
+    meta_chunk_writes: (AtomicU64, AtomicU64),
+    /// Floors, refcounted, for count-delta records that have been positioned but whose debt is not
+    /// yet registered in `pending_counts` (`rmp` #1067) — see the note at the registration site in
+    /// `commit_prepare_at`.
+    ///
+    /// A leaf: nothing is acquired while it is held, and it is deliberately NOT inside the catalogue
+    /// state. It does not need to be sampled atomically with the fold, and the argument is worth
+    /// stating because it looks like it should: a registration the fold does not see was made after
+    /// the fold read this map, so its record's offset is above the log position the checkpoint
+    /// record already occupies, and therefore above any floor that checkpoint can compute.
+    delta_floors: Mutex<BTreeMap<u64, usize>>,
+    /// Admits **one** counter fold at a time (`rmp` #1067), and only ever through `try_lock`.
+    ///
+    /// The fold publishes its base by writing a catalogue image under [`SYSTEM_TXN`], and that id is
+    /// one WAL transaction: two threads inside it would share a begin and a commit, and the second
+    /// commit would fail a checkpoint that an ordinary committer is calling — turning a durable
+    /// commit into an error. A checkpoint that loses the race has nothing to wait for, because the
+    /// winner is publishing the same fold, so this is never acquired blocking. Try-lock only creates
+    /// no wait edge, which is why this needs no rank in `graphus_core::latch`.
+    counts_fold_lock: Mutex<()>,
 }
 
 /// Default automatic-checkpoint cadence: take a checkpoint every ~64 MiB of appended WAL. Chosen to
@@ -1942,7 +2044,126 @@ impl<D: BlockDevice, S: LogSink> graphus_chainhead::ChainHead for PageChainHead<
     }
 }
 
+/// One atomic sample of everything a catalogue image is built from
+/// ([`RecordStore::committed_statistics`]).
+///
+/// The four fields are returned together because they are read together, under one hold of the
+/// rank-10 catalogue latch, and a value assembled from two of these sampled at two instants
+/// describes no state the store was ever in (`rmp` #1052, and #1066/#1067 one layer up).
+struct CommittedImage {
+    /// The committed catalogue: the live [`Statistics`] with every OTHER open transaction's pending
+    /// schema DDL undone (`rmp` #734) and its pending counts withdrawn (`rmp` #866).
+    ///
+    /// Since `rmp` #1067 the SCHEMA half of this is what reaches disk; the counter half does not —
+    /// see [`base`](Self#structfield.base).
+    committed: Statistics,
+    /// The counters the image persists in place of `committed`'s: the durable base
+    /// ([`CatalogState::counts_base`](CatalogState#structfield.counts_base)).
+    base: CountsImage,
+    /// The transactions [`base`](Self#structfield.base) already accounts for.
+    applied: AppliedTxSet,
+    /// How far down the log [`base`](Self#structfield.base) reaches. Registered as in-flight for as
+    /// long as this image can still be written — see [`ImageCoverage`].
+    coverage: u64,
+}
+
+/// Keeps one in-flight catalogue image's counter **coverage** registered for as long as that image
+/// can still be written (`rmp` #1067) — see
+/// [`CatalogState::image_cov_refs`](CatalogState#structfield.image_cov_refs) for what it buys.
+///
+/// RAII rather than a matched pair of calls, and deliberately: `checkpoint_meta` samples the image
+/// and then performs several fallible page writes, so every `?` between the two is a path that would
+/// otherwise leak a registration and hold WAL reclamation down for the life of the process. A leaked
+/// registration is silent — it costs disk, not correctness — which is exactly the kind of leak a
+/// matched pair loses (`rmp` #594).
+struct ImageCoverage<'a, D: BlockDevice, S: LogSink> {
+    store: &'a RecordStore<D, S>,
+    cov: u64,
+}
+
+impl<D: BlockDevice, S: LogSink> Drop for ImageCoverage<'_, D, S> {
+    fn drop(&mut self) {
+        self.store.with_catalog(|c| {
+            let mut refs = c
+                .image_cov_refs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let std::collections::btree_map::Entry::Occupied(mut slot) = refs.entry(self.cov) {
+                *slot.get_mut() -= 1;
+                if *slot.get() == 0 {
+                    slot.remove();
+                }
+            } else {
+                debug_assert!(
+                    false,
+                    "an in-flight catalogue image released coverage {} that was never registered; \
+                     the reclaim floor is computed from this map, so a missing entry means WAL \
+                     records a stale image still needs could be dropped",
+                    self.cov
+                );
+            }
+        });
+    }
+}
+
+/// Holds the reclaim floor down over one count-delta record between the instant its offset is
+/// chosen and the instant its debt reaches `pending_counts` (`rmp` #1067).
+///
+/// RAII for the same reason [`ImageCoverage`] is: `commit_at_no_sync` sits between the two and is
+/// fallible, and a failure there must release the floor rather than pin WAL reclamation for the life
+/// of the process.
+struct DeltaFloor<'a, D: BlockDevice, S: LogSink> {
+    store: &'a RecordStore<D, S>,
+    lsn: u64,
+}
+
+impl<D: BlockDevice, S: LogSink> Drop for DeltaFloor<'_, D, S> {
+    fn drop(&mut self) {
+        self.store.release_delta_floor(self.lsn);
+    }
+}
+
 impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
+    /// Registers `lsn` as a floor WAL reclamation may not pass while a count-delta record is being
+    /// positioned there (`rmp` #1067).
+    fn register_delta_floor(&self, lsn: u64) {
+        self.delta_floors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(lsn)
+            .and_modify(|n| *n += 1)
+            .or_insert(1);
+    }
+
+    /// Releases a floor registered by [`register_delta_floor`](Self::register_delta_floor).
+    fn release_delta_floor(&self, lsn: u64) {
+        let mut floors = self
+            .delta_floors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let std::collections::btree_map::Entry::Occupied(mut slot) = floors.entry(lsn) {
+            *slot.get_mut() -= 1;
+            if *slot.get() == 0 {
+                slot.remove();
+            }
+        } else {
+            debug_assert!(
+                false,
+                "delta floor {lsn} was released without being registered"
+            );
+        }
+    }
+
+    /// The oldest count-delta record still being positioned, if any.
+    fn oldest_delta_floor(&self) -> Option<u64> {
+        self.delta_floors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .next()
+            .copied()
+    }
+
     /// Creates a brand-new record store on an empty `device`, with `wal` an already-created WAL,
     /// `pool_capacity` buffer frames, and `element_id_seed` the first `ElementId` to allocate
     /// (seedable for reproducible tests, `04 §2.2`). Initialises and hardens the catalog.
@@ -1990,6 +2211,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 statistics: Arc::new(Statistics::new()),
                 // A fresh store has no log to replay, so nothing has been folded in (`rmp` #1066).
                 applied_counts: AppliedTxSet::default(),
+                // …and an empty store's counters are zero, which is exactly what an empty base
+                // holds, so the base starts level with the live counters (`rmp` #1067).
+                counts_base: Statistics::new(),
+                pending_counts: BTreeMap::new(),
+                folded_counts: BTreeMap::new(),
+                counts_cov_lsn: 0,
+                counts_cov_durable: 0,
+                image_cov_refs: Mutex::new(BTreeMap::new()),
             }),
             commit_registry: RwLock::new(CommitRegistry::new()),
             // `rmp` #522 incremental-GC state (pure in-memory; rebuilt from scratch every open). The
@@ -2020,6 +2249,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             drain_progress: std::sync::OnceLock::new(),
             // No exclusive store-open lock until the server installs one ([`hold_open_guard`], #563).
             open_guard: std::sync::OnceLock::new(),
+            counts_fold_lock: Mutex::new(()),
+            delta_floors: Mutex::new(BTreeMap::new()),
+            meta_chunk_writes: (AtomicU64::new(0), AtomicU64::new(0)),
         };
         store.init_meta_page()?;
         store.checkpoint_meta(SYSTEM_TXN, true)?;
@@ -2114,6 +2346,31 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             &committed_txns,
         )?;
         let shared_len = shared.with(|w| w.durable_len());
+        // `rmp` #1067: rebuild the counter bookkeeping the write path maintains from what the log
+        // actually still holds.
+        //
+        // The counters the replay above just reconstructed ARE the base: every retained delta record
+        // has been folded into them, so the pair (base, applied) that the next checkpoint persists
+        // must name exactly those records. That is what `from_retained_ids` builds, and rebuilding —
+        // rather than keeping `meta.applied_counts` and adding to it — is what DROPS the ids whose
+        // records this log no longer has. Keeping them would be harmless for a single recovery and
+        // unbounded across a lifetime: the set is persisted, so an id that entered it once would
+        // ride every image for ever.
+        //
+        // A loser's record is retained but not folded and not named, which is the correct state for
+        // it: it must never be applied, and `recovered_txn_hw` guarantees its id is never reissued.
+        let counts_base = {
+            let mut base = Statistics::new();
+            base.restore_counts(meta.statistics.counts_image());
+            base
+        };
+        let folded_counts: BTreeMap<u64, TxnId> = recovered
+            .count_deltas
+            .iter()
+            .filter(|rec| committed_txns.contains(&rec.txn_id))
+            .map(|rec| (rec.lsn.0, rec.txn_id))
+            .collect();
+        let applied_counts = AppliedTxSet::from_retained_ids(folded_counts.values().copied());
         // Restore the transaction-id high-water from the durable WAL so the coordinator's id counter
         // resumes *past* every id already in the log. Without this the counter would restart low and
         // reuse ids, which breaks ARIES loser/winner classification on a later crash and can resurrect
@@ -2146,8 +2403,20 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 meta_chain,
                 statistics: Arc::new(meta.statistics),
                 // Whatever the replay above folded in, so the pair the checkpoint persists agrees
-                // with the counters it persists beside it (`rmp` #1066).
-                applied_counts: meta.applied_counts,
+                // with the counters it persists beside it (`rmp` #1066), narrowed to the ids whose
+                // records the retained log still holds (`rmp` #1067).
+                applied_counts,
+                counts_base,
+                // Nothing is owed: every retained delta is folded into the base above.
+                pending_counts: BTreeMap::new(),
+                folded_counts,
+                // The whole durable log is folded in, so the base covers everything written so far.
+                counts_cov_lsn: shared_len,
+                // …but nothing this process wrote is durable yet, and the image on disk carries a
+                // base whose coverage cannot be named in LSN terms — it is described by its applied
+                // SET. So reclamation waits for this process's first fold to publish one.
+                counts_cov_durable: 0,
+                image_cov_refs: Mutex::new(BTreeMap::new()),
             }),
             commit_registry: RwLock::new(commit_registry),
             // `rmp` #522 incremental-GC state (pure in-memory; rebuilt from scratch every open). The
@@ -2193,6 +2462,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             drain_progress: std::sync::OnceLock::new(),
             // No exclusive store-open lock until the server installs one ([`hold_open_guard`], #563).
             open_guard: std::sync::OnceLock::new(),
+            counts_fold_lock: Mutex::new(()),
+            delta_floors: Mutex::new(BTreeMap::new()),
+            meta_chunk_writes: (AtomicU64::new(0), AtomicU64::new(0)),
         };
         // Size the WAL segment seal threshold to the RECOVERED store, so a reopened database immediately
         // uses a segment size matched to its data image rather than the sink's default 64 MiB (`rmp` #706).
@@ -2337,7 +2609,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// # Errors
     /// Returns a storage error if any store's catalog entry would be internally inconsistent — see
     /// [`FixedStore::to_meta`], which is where the `high_water <= capacity` floor lives.
-    fn snapshot_meta(&self, committing: TxnId) -> Result<Meta> {
+    fn snapshot_meta(&self, committing: TxnId) -> Result<(Meta, ImageCoverage<'_, D, S>)> {
         let mut stores: [StoreMeta; STORE_COUNT] = std::array::from_fn(|_| StoreMeta::default());
         for (slot, store) in stores.iter_mut().zip(self.stores.iter()) {
             *slot = store.to_meta()?;
@@ -2353,25 +2625,52 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // transactions whose logged deltas are already folded into those counters, so the two are one
         // fact and sampling them at two instants would persist a pair describing no state. See
         // `committed_statistics`.
-        let (statistics, applied_counts) = self.committed_statistics(committing);
-        Ok(Meta {
-            // Every catalog this build writes is at this build's format version, so a store opened at
-            // an earlier one is UPGRADED by its first checkpoint (`05 §12.6`). From version 1 the
-            // upgrade adds the two (empty) undo-area stores and loses nothing — a version-1 store has
-            // no chains, which is precisely what an empty undo area describes. From version 2 to 3 it
-            // changes nothing but the number: those two differ only in what a property cell MEANS, and
-            // `refuse_legacy_property_tombstones` has already established at `open` that this image
-            // holds no cell whose meaning would change (`rmp` #967). From version 3 the upgrade adds
-            // the (empty) applied-transaction set, which is what such a store's history says: no build
-            // below version 4 ever wrote a count-delta record (`rmp` #1066).
-            format_version: graphus_core::constants::FORMAT_VERSION,
-            element_id_next: self.element_ids.peek(),
-            commit_ts_hw: self.commit_ts_hw.load(Ordering::Acquire),
-            stores,
-            tokens: self.with_catalog(|c| (*c.tokens).clone()),
-            statistics,
-            applied_counts,
-        })
+        let sample = self.committed_statistics(committing);
+        // From here the coverage this image was built on is registered, so no reclaim can drop a
+        // delta record this image does not account for until the guard is dropped — which the caller
+        // does only after the last page write (`rmp` #1067).
+        let coverage = ImageCoverage {
+            store: self,
+            cov: sample.coverage,
+        };
+        // THE COUNTERS THAT REACH DISK ARE THE BASE, NOT THE LIVE ONES (`rmp` #1067).
+        //
+        // This one line is what closes `rmp` #1055's two classes. The live counters are rewritten by
+        // every commit, so an image of them is a claim about an instant — and a claim written later
+        // than it was made, by a writer that cannot know what committed in between. Neither class is
+        // an ordering problem: class B is a transaction that commits after the LAST catalogue write
+        // of the whole run, which no image can contain however the writes are ordered. The base makes
+        // the claim smaller and true: "these counters account for exactly these transactions". What
+        // it leaves out is in the log, and recovery adds it back.
+        //
+        // The SCHEMA half of `sample.committed` is kept as it is: DDL has no delta record, so its
+        // durability still rides this image (and `rmp` #1055's classes still reach it — recorded in
+        // the task's report rather than fixed here, because closing it needs the same delta treatment
+        // and is a task of its own).
+        let mut statistics = sample.committed;
+        statistics.restore_counts(sample.base);
+        let applied_counts = sample.applied;
+        Ok((
+            Meta {
+                // Every catalog this build writes is at this build's format version, so a store opened at
+                // an earlier one is UPGRADED by its first checkpoint (`05 §12.6`). From version 1 the
+                // upgrade adds the two (empty) undo-area stores and loses nothing — a version-1 store has
+                // no chains, which is precisely what an empty undo area describes. From version 2 to 3 it
+                // changes nothing but the number: those two differ only in what a property cell MEANS, and
+                // `refuse_legacy_property_tombstones` has already established at `open` that this image
+                // holds no cell whose meaning would change (`rmp` #967). From version 3 the upgrade adds
+                // the (empty) applied-transaction set, which is what such a store's history says: no build
+                // below version 4 ever wrote a count-delta record (`rmp` #1066).
+                format_version: graphus_core::constants::FORMAT_VERSION,
+                element_id_next: self.element_ids.peek(),
+                commit_ts_hw: self.commit_ts_hw.load(Ordering::Acquire),
+                stores,
+                tokens: self.with_catalog(|c| (*c.tokens).clone()),
+                statistics,
+                applied_counts,
+            },
+            coverage,
+        ))
     }
 
     /// Allocates and initialises the metadata page (device page `0`) on a fresh device. Uses the
@@ -2967,7 +3266,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // The catalog is built (and its `high_water <= capacity` floor checked, `rmp` #1012) BEFORE
         // anything is written or the WAL is touched, so a refused image aborts the checkpoint having
         // changed nothing.
-        let meta = self.snapshot_meta(txn)?;
+        //
+        // `_coverage` is the counter half's guard and it must live to the END of this method (`rmp`
+        // #1067): from the sample until the last page write this image can still land on disk, so
+        // until then the WAL prefix it accounts for must not be reclaimed. Dropping it early — or
+        // binding it to `_` — reopens the one window this design has, and it is #1055's window
+        // exactly: an image whose base stops short of what has already been reclaimed.
+        let (meta, _coverage) = self.snapshot_meta(txn)?;
         let payload = meta.encode()?;
         // Split the catalog into [`META_CHUNK_CAP`]-byte chunks across the metadata-page chain. At
         // least one page (the head) is always written, even for an empty chunk.
@@ -3032,6 +3337,31 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             framed.extend_from_slice(&framed_len.to_le_bytes());
             framed.extend_from_slice(&next.to_le_bytes());
             framed.extend_from_slice(chunk);
+            // A PAGE THAT ALREADY HOLDS EXACTLY THESE BYTES IS NOT WRITTEN AGAIN (`rmp` #1067).
+            //
+            // This is what turns "the counters left the image" into bytes saved. Taking the live
+            // counters out replaced them with a base that only a fold moves, and a token dictionary
+            // has always been append-only — so on a store with a large schema most of this payload is
+            // byte-for-byte what it was at the previous commit, and rewriting it was the 96 % of a
+            // commit's WAL that `rmp` #1055's ficha measured. What genuinely changes at every commit
+            // (`commit_ts_hw`, the allocators' high-water marks and free lists) sits in the FIRST
+            // bytes of the payload, so the head page is written every time and the stable tail is not.
+            //
+            // Sound because the comparison is against the page itself, under the frame's read latch,
+            // and not against a remembered value: a cache would have to be invalidated by every path
+            // that can change the page behind this one's back — a rollback's undo of a concurrent
+            // committer's image, eviction and re-fetch, a torn-page repair — and one missed
+            // invalidation is a silently unwritten catalogue. Reading the page answers the only
+            // question that matters ("are these bytes there") in a way nothing can stale.
+            //
+            // It changes no ordering semantics. Another writer may still land a different image on
+            // this page immediately afterwards, exactly as it may today: last writer wins, and this
+            // skip does not make our bytes any less present than writing them would have.
+            if self.meta_page_already_holds(pages[i], &framed)? {
+                self.meta_chunk_writes.1.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            self.meta_chunk_writes.0.fetch_add(1, Ordering::Relaxed);
             self.write_region(pages[i], HEADER_SIZE, &framed, txn)?;
         }
 
@@ -3039,6 +3369,57 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             self.wal.with(|w| w.commit(txn))?;
         }
         Ok(())
+    }
+
+    /// The transactions whose logged cardinality deltas the durable base already accounts for
+    /// (`rmp` #1067), cloned out. Diagnostics and tests.
+    ///
+    /// What a test wants from it is its SIZE over time. The set is persisted inside every catalogue
+    /// image, so an id that entered it and never left would ride every image for the life of the
+    /// store; the bound is that an id whose delta record the WAL has reclaimed is dropped
+    /// ([`AppliedTxSet::from_retained_ids`]), and `applied_counts_stabilises_1067` is what proves
+    /// that bound holds under sustained load with losers stalling the gap-free frontier.
+    #[must_use]
+    pub fn applied_counts(&self) -> AppliedTxSet {
+        self.with_catalog(|c| c.applied_counts.clone())
+    }
+
+    /// Catalogue chunks this store has WRITTEN and chunks it has SKIPPED because the page already
+    /// held exactly those bytes (`rmp` #1067) — `(written, skipped)`, since `create`/`open`.
+    ///
+    /// The skip is what turns "the counters left the per-commit image" into bytes not written, and it
+    /// is invisible in every value the store returns, so this pair is the only way a test can tell it
+    /// apart from a build that writes every chunk every time.
+    #[must_use]
+    pub fn meta_chunk_writes(&self) -> (u64, u64) {
+        (
+            self.meta_chunk_writes.0.load(Ordering::Relaxed),
+            self.meta_chunk_writes.1.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Whether metadata page `page` already holds `framed` at its catalogue offset — the test that
+    /// lets an unchanged catalogue chunk skip its write entirely (`rmp` #1067).
+    ///
+    /// # Errors
+    /// Returns a storage error if the page cannot be fetched or `framed` would not fit inside it,
+    /// which would mean the chunk cap and the page size disagree.
+    fn meta_page_already_holds(&self, page: PageId, framed: &[u8]) -> Result<bool> {
+        let f = self.pool.fetch(page)?;
+        let same = self.pool.with_page(f, |p| {
+            let end = HEADER_SIZE + framed.len();
+            if end > p.len() {
+                return Err(GraphusError::Storage(format!(
+                    "a {}-byte catalog chunk does not fit page {} — the chunk cap and the page size \
+                     disagree",
+                    framed.len(),
+                    page.0
+                )));
+            }
+            Ok(p[HEADER_SIZE..end] == *framed)
+        });
+        self.pool.unpin(f);
+        same
     }
 
     /// Maps every page a store's high-water mark implies but its page map lacks, so the catalog floor
@@ -4189,6 +4570,57 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // points, not one.
         sched::yield_at(YieldSite::CommitPublishSlot, ResourceId::txn(txn.0));
         self.publish_commit_slot(txn, commit_ts)?;
+        // THE COUNT DELTA REACHES DISK HERE, AS ITS OWN LOG RECORD (`rmp` #1067), and it must be
+        // appended BEFORE the `COMMIT` record below — recovery applies a delta only for a
+        // transaction whose commit record it finds, so a record appended after the commit would be
+        // read as a loser's and dropped, which is the very loss this record exists to prevent
+        // (`WalManager::log_count_delta` states the same obligation from the other side).
+        //
+        // Reading the delta without a hold is sound: a transaction's own delta is moved only by its
+        // own writes (`count_bump` asserts the transaction is active and the writer is the one
+        // calling), and this transaction is inside its commit, so nothing can be adding to it. The
+        // only other mutation of this field is the retirement a few lines below, on this thread.
+        //
+        // An empty delta logs nothing. That is not an optimisation for read-only transactions (they
+        // returned on the #529 fast path long before this line) but for the ordinary write that moves
+        // no cardinality — a property update, a label change on an already-counted node — which is a
+        // large share of a real workload and would otherwise pay a record per commit for a delta of
+        // all zeroes.
+        let counts_delta = self
+            .active
+            .with(txn, |a| a.counts.clone())
+            .unwrap_or_default();
+        // THE RECORD IS FLOORED BEFORE IT IS APPENDED (`rmp` #1067).
+        //
+        // Between the append below and the registration in `pending_counts` a few lines later, the
+        // delta is in NO structure a reclaim consults, and the transaction has by then left every
+        // one that would otherwise have covered it: `commit_at_no_sync` removes it from the WAL's
+        // active table (so it stops contributing to `oldest_active_first_lsn`) and its
+        // `unfrozen_commit_lsn` entry is not inserted until much later. A concurrent `checkpoint`
+        // computing its floor inside that gap can put the floor ABOVE this record, fold nothing for
+        // it, publish a base that does not contain it, and reclaim it — a committed transaction's
+        // counter change gone from the log and from the base at once.
+        //
+        // So the record's floor is registered first, and `next_lsn` is exactly the offset the append
+        // will use. Registering before rather than after is what makes the window empty instead of
+        // small: there is no instant at which the record exists and nothing accounts for it.
+        let counts_floor = (!counts_delta.is_empty()).then(|| {
+            let lsn = self.wal.with(|w| w.next_lsn().0);
+            self.register_delta_floor(lsn);
+            DeltaFloor { store: self, lsn }
+        });
+        let counts_lsn = counts_floor.as_ref().map(|floor| {
+            let payload = counts_delta.encode();
+            let lsn = self.wal.with(|w| w.log_count_delta(txn, &payload));
+            debug_assert!(
+                lsn.0 >= floor.lsn,
+                "a count-delta record landed at LSN {} below the floor {} registered for it, so a \
+                 reclaim clamped to that floor could still drop it",
+                lsn.0,
+                floor.lsn
+            );
+            lsn
+        });
         // PREPARE: append the `COMMIT` record with NO `fdatasync` (the group-commit deferral, `rmp`
         // #528). The caller hardens the whole batch with a single `harden_wal`.
         let commit_lsn = self.wal.with(|w| w.commit_at_no_sync(txn, commit_ts))?;
@@ -4226,11 +4658,30 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // A rollback after this point is not a case: every remaining step is infallible, and were one
         // ever added, withdrawing an empty delta is the correct behaviour for a committed transaction.
         let active = &self.active;
-        self.with_catalog_mut(|_catalog| {
+        self.with_catalog_mut(|catalog| {
             // The catalog itself is not touched — the latch is taken for the exclusion it gives
             // against `committed_statistics`, which samples the counters and the deltas under it.
             active.with_existing(txn, |a| a.counts = CountDelta::default());
+            // …and, since `rmp` #1067, for one thing that IS the catalog's: the delta this
+            // transaction just logged is now owed to the base, and the pair (base, pending) must
+            // move as one state. This registration and the retirement above are the two halves of
+            // "the delta is no longer pending in memory, it is pending in the log", and a checkpoint
+            // that saw one without the other would either lose the delta (retired, unregistered) or
+            // count it twice (registered while still withdrawn from the image).
+            if let Some(lsn) = counts_lsn {
+                let previous = catalog.pending_counts.insert(lsn.0, (txn, counts_delta));
+                debug_assert!(
+                    previous.is_none(),
+                    "two count-delta records claim LSN {}; an LSN names one record, so one of the \
+                     two deltas would be dropped from the base",
+                    lsn.0
+                );
+            }
         });
+        // The debt is now in `pending_counts`, which the fold reads, so the temporary floor above has
+        // nothing left to protect. Dropped explicitly rather than at the end of the method so the
+        // reclaim floor is released as early as it soundly can be.
+        drop(counts_floor);
         // COMMIT SETTLED. Every fallible step has succeeded, so — and not one line earlier — this
         // transaction becomes committed-visible and its bookkeeping is released.
         //
@@ -4426,6 +4877,235 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             .store(bytes, Ordering::Relaxed);
     }
 
+    /// Makes the durable counter base account for every logged delta the WAL prefix `wanted` is
+    /// about to drop, and returns the floor it is actually safe to reclaim to (`rmp` #1067).
+    ///
+    /// # The obligation
+    ///
+    /// Since #1067 the durable cardinality is **a base plus every retained delta the base does not
+    /// name**. Reclaim is what makes a delta stop being retained, so reclaim is what obliges the base
+    /// to absorb it first — and to absorb it *durably*, because a crash between the fold and the
+    /// reclaim would otherwise leave a base that stops short of records that no longer exist. That is
+    /// a permanently wrong `count()` (`rmp` #866): the same failure this task took out of the
+    /// catalogue image, arriving through the back door.
+    ///
+    /// # The clamp, which is the one window this design has
+    ///
+    /// A commit samples the base and writes it later, so an image sampled before this fold can land
+    /// after it, restoring a base that stops at the older coverage. `rmp` #1055 measured that no
+    /// ordering rule closes that shape. The floor is therefore clamped to the OLDEST coverage any
+    /// image that could still land already accounts for
+    /// ([`CatalogState::image_cov_refs`](CatalogState#structfield.image_cov_refs)): every future
+    /// image carries at least the coverage this fold publishes, and every in-flight one is in that
+    /// map. It never blocks — a checkpoint that finds an old sample in flight simply reclaims less,
+    /// and the next one reclaims the rest.
+    ///
+    /// # Every failure lands on the safe side
+    ///
+    /// The returned floor never exceeds `counts_cov_durable`, which advances only after the image
+    /// write has HARDENED. So a failed write, a lost race for the fold lock, or an error on the way
+    /// out all reclaim less rather than reclaiming something the durable catalogue cannot explain.
+    /// The in-memory fold is not undone in that case and does not need to be: the base and the
+    /// pending set move together, so the pair stays exact and the next checkpoint persists it.
+    ///
+    /// # Errors
+    /// Returns a storage error if the catalogue image that carries the folded base cannot be written.
+    fn fold_counts_for_reclaim(&self, wanted: u64) -> Result<u64> {
+        // Read BEFORE the catalogue hold, and it needs no atomicity with it: a record positioned
+        // after this read is positioned above the checkpoint record this floor was computed from.
+        let positioning = self.oldest_delta_floor();
+        let wanted = positioning.map_or(wanted, |lsn| wanted.min(lsn));
+        let (target, owed) = self.with_catalog_mut(|c| {
+            // Sampled inside this hold, with the fold: a sample that registers after it carries the
+            // coverage this fold publishes, so the two together cover every image that can exist.
+            let in_flight_min = c
+                .image_cov_refs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .keys()
+                .next()
+                .copied();
+            let target = in_flight_min.map_or(wanted, |cov| wanted.min(cov));
+            if target <= c.counts_cov_durable {
+                return (target, false);
+            }
+            // Everything strictly below `target` joins the base. `split_off` leaves exactly that
+            // behind and hands back the rest, which is why this map is keyed by LSN.
+            let above = c.pending_counts.split_off(&target);
+            let below = std::mem::replace(&mut c.pending_counts, above);
+            if !below.is_empty() {
+                // Through `replay_count_deltas`, never a loop: `Statistics` saturates at zero and
+                // saturation does not commute, so a create and a later delete of the same label
+                // folded one at a time can lose the decrement (`rmp` #1066).
+                replay_count_deltas(
+                    &mut c.counts_base,
+                    &mut c.applied_counts,
+                    below.iter().map(|(_, (txn, delta))| (*txn, delta)),
+                );
+                for (lsn, (txn, _)) in below {
+                    c.folded_counts.insert(lsn, txn);
+                }
+            }
+            c.counts_cov_lsn = c.counts_cov_lsn.max(target);
+            (target, true)
+        });
+        if owed {
+            // One at a time, and never waiting: the write below runs under `SYSTEM_TXN`, and two
+            // threads inside it would share one WAL transaction — the second `commit` would find it
+            // already gone and fail a checkpoint that a *committer* is calling, turning a durable
+            // commit into an error. `try_lock` rather than `lock` because a checkpoint that loses the
+            // race has nothing to wait for: it reclaims no further than what is already durable, and
+            // the winner is publishing the same fold. Try-lock only, so it creates no wait edge and
+            // needs no rank (`graphus_core::latch`).
+            if let Ok(_fold) = self.counts_fold_lock.try_lock() {
+                self.checkpoint_meta(SYSTEM_TXN, true)?;
+                self.with_catalog_mut(|c| c.counts_cov_durable = c.counts_cov_durable.max(target));
+            }
+        }
+        // THE FLOOR IS CLAMPED BY WHAT IS STILL OWED, IN RELEASE AND NOT ONLY IN DEBUG.
+        //
+        // `target <= counts_cov_durable` is the durable image's promise and `pending_counts`'s first
+        // key is what that promise does not cover; the reclaim may pass neither. Both clamps should
+        // be redundant — the fold above moved everything below `target` out of `pending_counts`, and
+        // the registration floor keeps a record that is still being positioned out of reach — but a
+        // debug assertion is no protection at all in the build that ships, and what it would be
+        // protecting is a committed transaction's cardinality with no second copy anywhere.
+        Ok(self.with_catalog(|c| {
+            let owed = c.pending_counts.first_key_value().map_or(u64::MAX, |(&lsn, _)| lsn);
+            debug_assert!(
+                owed >= c.counts_cov_durable,
+                "a count delta at an LSN below the durable coverage is still pending, so reclaiming \
+                 to that coverage would drop a record whose delta no image accounts for"
+            );
+            target.min(c.counts_cov_durable).min(owed)
+        }))
+    }
+
+    /// Folds **every** logged cardinality delta into the durable base and persists it, so the
+    /// catalogue image alone answers the cardinality with no log at all (`rmp` #1067).
+    ///
+    /// # Who needs this, and why the ordinary fold is not enough
+    ///
+    /// [`fold_counts_for_reclaim`](Self::fold_counts_for_reclaim) absorbs only what a reclaim is
+    /// about to drop, which is the least work that keeps the pair exact — everything else is cheaper
+    /// left in the log. A **backup** breaks that assumption: it captures the data image and not the
+    /// log ([`crate::backup::backup_store`]), and a restored store opens on a fresh empty WAL. Every
+    /// delta still sitting in the log at that moment would simply cease to exist, and the restored
+    /// store would serve a cardinality short of every transaction that committed since the last
+    /// checkpoint — permanently, because `rmp` #866 answers `count()` from it and nothing recomputes
+    /// it. This is the counters' half of the argument `backup_store` already makes for the MVCC
+    /// headers it freezes before capturing.
+    ///
+    /// Unlike the reclaim fold this one is **not** clamped by the in-flight image coverages: the
+    /// clamp exists to stop a reclaim dropping records a stale image would need, and nothing is
+    /// reclaimed here. A stale image that lands after this one still regresses the base exactly as it
+    /// regresses the tokens and the store metadata beside it — the pre-existing image-staleness class
+    /// of `rmp` #1055, which this task closed for the counters at COMMIT and which a backup avoids by
+    /// quiescing the store (it already runs its freeze pass under the reserved [`SYSTEM_TXN`], which
+    /// assumes exactly that).
+    ///
+    /// # Errors
+    /// Returns a storage error if the catalogue image carrying the folded base cannot be written.
+    pub fn settle_counts_into_image(&self) -> Result<()> {
+        let folded = self.with_catalog_mut(|c| {
+            let pending = std::mem::take(&mut c.pending_counts);
+            // NOTHING PENDING MEANS NOTHING OWED, and this must write no page at all in that case.
+            //
+            // Every committed delta in the log is either already folded into the base or sitting in
+            // `pending_counts`; a loser's record is neither and must stay that way. So an empty
+            // pending set says the base already answers for the whole log, and there is no image to
+            // write.
+            //
+            // Writing one anyway is not merely wasteful, it is a fault: a store opened over a
+            // RESTORED device image holds pages stamped with the LSNs of the log that produced them,
+            // and its own WAL is fresh and far shorter. The buffer pool never lets a page's LSN
+            // descend (`rmp` #1062), so touching such a page leaves it claiming an LSN beyond the end
+            // of the log it now belongs to, and the next flush refuses to write it home — measured as
+            // six failures in `tests/incremental.rs`, whose harness re-derives an artifact by opening
+            // the restored image with a fresh WAL and backing it up again.
+            if pending.is_empty() {
+                return false;
+            }
+            replay_count_deltas(
+                &mut c.counts_base,
+                &mut c.applied_counts,
+                pending.iter().map(|(_, (txn, delta))| (*txn, delta)),
+            );
+            for (lsn, (txn, _)) in pending {
+                c.folded_counts.insert(lsn, txn);
+            }
+            // NEITHER COVERAGE IS ADVANCED HERE, and that is a correctness choice rather than an
+            // omission.
+            //
+            // The two coverages exist to bound WAL reclamation, and this path reclaims nothing. It is
+            // tempting to set them to the log's current length — everything registered has just been
+            // folded, after all — but "registered" is not "logged": a commit appends its delta record
+            // and takes the catalogue latch to register it as two steps, so a transaction committing
+            // concurrently with this call can have its record in the log while this fold cannot see
+            // it. Claiming to cover it would let a later reclaim drop that record with its delta in
+            // no image, which is the one failure this whole task exists to remove. Leaving both
+            // coverages where the last reclaim-driven fold put them is conservative in the only
+            // direction that is safe, and costs nothing: the next checkpoint folds and advances them
+            // as it always would.
+            //
+            // The backup is unaffected: what it needs is that the IMAGE accounts for every delta, and
+            // it does. A transaction still inside `commit` when the snapshot is taken has not been
+            // acknowledged, so a backup that does not carry it is a backup taken an instant earlier —
+            // the same latitude every other page in the snapshot has.
+            true
+        });
+        if folded {
+            // Blocking, unlike the checkpoint's `try_lock`: a backup that silently skipped this
+            // because a checkpoint held the lock would capture an image the log is no longer there
+            // to complete. The lock is outside the rank-10 catalogue latch and nothing that holds an
+            // inner latch ever takes it, so waiting here closes no cycle.
+            let _fold = self
+                .counts_fold_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.checkpoint_meta(SYSTEM_TXN, true)?;
+        }
+        Ok(())
+    }
+
+    /// Drops from the applied set every transaction whose delta record the WAL has now physically
+    /// reclaimed (`rmp` #1067) — the bound that stops that set growing with the life of the store.
+    ///
+    /// A record below the sink's reclaimed floor can never be presented to a replay again, so naming
+    /// its transaction claims nothing. What remains is bounded by the number of count-delta records
+    /// in the retained window, which is what makes the set stabilise under sustained load even when a
+    /// loser stalls the gap-free frontier and every id above it has to be carried explicitly.
+    fn prune_reclaimed_counts(&self) {
+        let reclaimed = self.wal.with(|w| w.sink().reclaimed_floor());
+        if reclaimed == 0 {
+            return; // a sink that has not reclaimed anything yet retains every record
+        }
+        self.with_catalog_mut(|c| {
+            debug_assert!(
+                c.pending_counts
+                    .first_key_value()
+                    .is_none_or(|(&lsn, _)| lsn >= reclaimed),
+                "a count delta whose record has been reclaimed was never folded into the base: its \
+                 rows are committed and its counter change is now unrecoverable (`rmp` #1067)"
+            );
+            // `split_off(&k)` KEEPS `[..k)` in the receiver and hands back `[k..)`, so after this line
+            // `folded_counts` holds the entries whose records are GONE and `retained` holds the ones
+            // to keep. Putting `retained` back is therefore unconditional: an earlier draft returned
+            // early when nothing had been dropped and left the map EMPTY, silently discarding every
+            // id whose record is still in the log — after which the next real prune rebuilt the
+            // applied set from a truncated map and dropped ids whose deltas are folded into the base
+            // but whose records a replay can still present. That is a double count at recovery, and
+            // it is the failure this set exists to prevent.
+            let retained = c.folded_counts.split_off(&reclaimed);
+            let dropped_any = !c.folded_counts.is_empty();
+            c.folded_counts = retained;
+            if dropped_any {
+                c.applied_counts =
+                    AppliedTxSet::from_retained_ids(c.folded_counts.values().copied());
+            }
+        });
+    }
+
     /// Takes a **checkpoint** (`04 §4.7`, `rmp` storage audit F3), bounding crash-recovery redo to
     /// the work logged since the previous checkpoint instead of replaying the whole history.
     ///
@@ -4470,6 +5150,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             (ckpt_lsn, floor)
         });
         let _ = ckpt_lsn;
+        // THE COUNTER FOLD, and it must happen HERE — after the floor is known and before a single
+        // byte below it is dropped (`rmp` #1067). It may LOWER the floor; it never raises it.
+        let reclaim_floor = self.fold_counts_for_reclaim(reclaim_floor)?;
         // DOUBLEWRITE FLOOR (`rmp` #437): persist the reclaim floor durably in the DWB **before** the
         // WAL prefix below it is reclaimed. On the next open, eviction-ring recovery ignores any ring
         // slot whose staged `page_lsn` is below this floor (provably superseded by a flushed home
@@ -4490,6 +5173,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // Now reclaim the WAL prefix below the (now durable) floor.
         self.wal
             .with(|w| -> Result<()> { w.reclaim(Lsn(reclaim_floor)) })?;
+        // What the reclaim actually freed is what the applied set may forget (`rmp` #1067). Asked of
+        // the sink AFTER the fact rather than assumed from the floor: a segmented sink drops whole
+        // segments, so it commonly retains records below the floor it was given.
+        self.prune_reclaimed_counts();
         let len = self.wal.with(|w| w.durable_len());
         self.with_commit_durability(|d| d.wal_len_at_last_checkpoint = len);
         // Re-size the WAL segment seal threshold to the current store (`rmp` #706), so as the data image
@@ -12523,6 +13210,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// equivalence predicate would otherwise be answering about a tally it does not govern. Noted so
     /// that "`apply_count_delta` is the only door" is not believed absolute: a future caller must
     /// either run inside a transaction whose delta it records, or stay off the count-store path.
+    ///
+    /// **And since `rmp` #1067 it is also purely in-memory.** What a checkpoint persists is the
+    /// counter BASE plus the logged deltas, and this writes neither — it replaces two maps in the
+    /// live `Statistics`, which no image reads any more. The effect therefore lasts until the process
+    /// exits and is gone at the next `open`, where the counters are rebuilt as base + replay. The
+    /// requirement on a future caller is now stronger than the paragraph above: a counter mutation
+    /// that produces no WAL record is not merely undisciplined, it is **not durable at all**.
     pub fn backfill_directional_rel_counts(&self) -> Result<()> {
         let rebuilt = self.recount_directional_rel_counts()?;
         self.with_catalog_mut(|c| {
@@ -13214,18 +13908,25 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// every workload that is not interleaving writes across statements — this is exactly the clone it
     /// always was, plus one `is_empty` check per open transaction.
     ///
-    /// # The applied-transaction set comes back with it, under the SAME hold (`rmp` #1066)
+    /// # The counter half of the image comes back with it, under the SAME hold (`rmp` #1066/#1067)
     ///
     /// [`AppliedTxSet`] names the transactions whose logged cardinality deltas are already folded into
-    /// the counters this returns, so the two are one fact and a checkpoint that sampled them at two
+    /// the **base** this returns, so the two are one fact and a checkpoint that sampled them at two
     /// instants would persist a pair that describes no state — a set claiming a delta is folded in
     /// beside counters that do not contain it makes the next recovery skip a committed transaction's
-    /// rows, or a set that lags makes it fold them in twice. That is `rmp` #1052's lesson applied
-    /// before it can be paid for a second time: the set is immutable after `open` **today**, so the
-    /// tear is not yet reachable, but #1067 starts moving it at commit and "unreachable because
-    /// nothing writes it yet" is exactly the kind of implicit invariant that stops holding without
-    /// anyone noticing. It is returned from inside the hold instead.
-    fn committed_statistics(&self, committing: TxnId) -> (Statistics, AppliedTxSet) {
+    /// rows, or a set that lags makes it fold them in twice. That is `rmp` #1052's lesson applied one
+    /// layer up, and since #1067 the pair genuinely moves at runtime. The base's **coverage** joins
+    /// them for the same reason, and is registered as in-flight from inside the hold.
+    ///
+    /// # What this method is NO LONGER the source of (`rmp` #1067)
+    ///
+    /// It is no longer what the counters on disk come from. Those are the base, and the withdrawal
+    /// below therefore no longer decides a durable number. It is kept — and kept exact — for two
+    /// reasons: the SCHEMA half of the image is still built here and still needs every other open
+    /// transaction's DDL undone (`rmp` #734), and the counter half is now the input to the
+    /// `base + pending == committed` invariant asserted from inside this hold, which is the one place
+    /// that can see all three at once.
+    fn committed_statistics(&self, committing: TxnId) -> CommittedImage {
         // ONE hold over the image AND the deltas withdrawn from it (`rmp` #1052). The two are read
         // together because the answer is their DIFFERENCE, and a difference of two states sampled at
         // two instants is not a state of anything: this method used to clone the live counters under
@@ -13250,54 +13951,85 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             ResourceId::txn(committing.0),
         );
         let active = &self.active;
-        let (mut committed, applied, mut pending, last_seq) = self.with_catalog(|c| {
-            let mut committed = (*c.statistics).clone();
-            // Cloned INSIDE this hold, beside the counters it describes (`rmp` #1066) — see the note
-            // on this method. Cheap: empty in every store this build writes.
-            let applied = c.applied_counts.clone();
-            // ONE sweep of the shards for both halves, where there were three. `committed` is
-            // withdrawn from in place and the schema logs are accumulated, so a transaction's entry is
-            // visited once.
-            //
-            // Counts half (`rmp` #866). Order-independent, but NOT because "integer deltas commute" on
-            // its own: `add_keyed`/`add_total` saturate at 0, and saturation does not commute. It holds
-            // because an intermediate withdrawal can never go negative — each negative unit in a delta
-            // is a distinct entity or label bit that transaction removed, and two open transactions
-            // cannot have removed the same one. Since `rmp` #971 exactly one mechanism makes that true
-            // — `ensure_chain_head_unheld`, reached by every entity-removal path through
-            // `note_entity_deleted` → `link_delta`, and by every label removal through the check
-            // `remove_label` now runs BEFORE its idempotent no-op exit. Before #971 the label half of
-            // this argument rested on that no-op exit rather than on any conflict check, which was an
-            // accident of ordering; naming the mechanism is what makes it an argument. That argument is
-            // about the DELTAS; it says nothing about whether the image they are withdrawn from
-            // contains them, which is what the hold above establishes and what #1052 was. So no
-            // ordering of the withdrawals can reach the saturating rail, and the sum over a HashMap's
-            // unstable iteration order is deterministic without sorting. That determinism is
-            // load-bearing twice over: the value is written into a DURABLE catalog, and an
-            // order-dependent one would also break DST reproducibility. The schema half cannot make the
-            // same argument and sorts by `seq`.
-            //
-            // Schema half (`rmp` #734): merge every open transaction's undo log, to be replayed in
-            // reverse GLOBAL order below. Sorting by the store-global `seq` is also what makes the
-            // result deterministic: `active` is a HashMap, so its iteration order is not stable, but
-            // `seq` is unique and totally ordered.
-            let pending: Vec<SchemaUndo> = active.fold_all(Vec::new(), |mut acc, txn, a| {
-                if txn != committing {
-                    a.counts.withdraw_from(&mut committed);
-                    acc.extend(a.schema_undo.iter().cloned());
-                }
-                acc
+        let (mut committed, applied, mut pending, last_seq, base, coverage) =
+            self.with_catalog(|c| {
+                let mut committed = (*c.statistics).clone();
+                // Cloned INSIDE this hold, beside the counters it describes (`rmp` #1066) — see the note
+                // on this method. Cheap: empty in every store this build writes.
+                let applied = c.applied_counts.clone();
+                // ONE sweep of the shards for both halves, where there were three. `committed` is
+                // withdrawn from in place and the schema logs are accumulated, so a transaction's entry is
+                // visited once.
+                //
+                // Counts half (`rmp` #866). Order-independent, but NOT because "integer deltas commute" on
+                // its own: `add_keyed`/`add_total` saturate at 0, and saturation does not commute. It holds
+                // because an intermediate withdrawal can never go negative — each negative unit in a delta
+                // is a distinct entity or label bit that transaction removed, and two open transactions
+                // cannot have removed the same one. Since `rmp` #971 exactly one mechanism makes that true
+                // — `ensure_chain_head_unheld`, reached by every entity-removal path through
+                // `note_entity_deleted` → `link_delta`, and by every label removal through the check
+                // `remove_label` now runs BEFORE its idempotent no-op exit. Before #971 the label half of
+                // this argument rested on that no-op exit rather than on any conflict check, which was an
+                // accident of ordering; naming the mechanism is what makes it an argument. That argument is
+                // about the DELTAS; it says nothing about whether the image they are withdrawn from
+                // contains them, which is what the hold above establishes and what #1052 was. So no
+                // ordering of the withdrawals can reach the saturating rail, and the sum over a HashMap's
+                // unstable iteration order is deterministic without sorting. That determinism is
+                // load-bearing twice over: the value is written into a DURABLE catalog, and an
+                // order-dependent one would also break DST reproducibility. The schema half cannot make the
+                // same argument and sorts by `seq`.
+                //
+                // Schema half (`rmp` #734): merge every open transaction's undo log, to be replayed in
+                // reverse GLOBAL order below. Sorting by the store-global `seq` is also what makes the
+                // result deterministic: `active` is a HashMap, so its iteration order is not stable, but
+                // `seq` is unique and totally ordered.
+                let pending: Vec<SchemaUndo> = active.fold_all(Vec::new(), |mut acc, txn, a| {
+                    if txn != committing {
+                        a.counts.withdraw_from(&mut committed);
+                        acc.extend(a.schema_undo.iter().cloned());
+                    }
+                    acc
+                });
+                // A scratch copy of the generations: this is a read-only view of the catalog, so the
+                // store's own witness map must survive it untouched. Cloned only when there is a log to
+                // replay, which is every workload that is not interleaving DDL across statements.
+                let last_seq = (!pending.is_empty()).then(|| c.schema_last_seq.clone());
+                // `rmp` #1067: the counter half of the image, sampled in THIS hold and no other.
+                //
+                // The three are one fact and the reason is #1052's, one layer up: `base` is the value
+                // `applied` describes, and `coverage` is how far down the log `base` reaches. A pair
+                // sampled at two instants describes no state — a set naming a delta the counters beside
+                // it do not hold makes the next recovery skip a committed transaction's rows, and a set
+                // that lags makes it fold them in twice — and a coverage sampled apart from the base it
+                // belongs to would let the reclaim clamp accept a floor this image does not cover.
+                let base = c.counts_base.counts_image();
+                let coverage = c.counts_cov_lsn;
+                c.image_cov_refs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .entry(coverage)
+                    .and_modify(|n| *n += 1)
+                    .or_insert(1);
+                // The invariant that keeps the withdrawal above load-bearing now that the image no
+                // longer persists its result (`rmp` #1067): the committed counters ARE the base plus
+                // every delta the base does not yet cover. `committing`'s own delta is added because it
+                // is excluded from the withdrawal by name and has not been logged yet — the record is
+                // appended after this checkpoint, immediately before the `COMMIT` record.
+                #[cfg(debug_assertions)]
+                Self::debug_assert_base_plus_pending_is_committed(
+                    c, active, committing, &committed,
+                );
+                (committed, applied, pending, last_seq, base, coverage)
             });
-            // A scratch copy of the generations: this is a read-only view of the catalog, so the
-            // store's own witness map must survive it untouched. Cloned only when there is a log to
-            // replay, which is every workload that is not interleaving DDL across statements.
-            let last_seq = (!pending.is_empty()).then(|| c.schema_last_seq.clone());
-            (committed, applied, pending, last_seq)
-        });
         // The replay works on the three snapshots taken above and touches no shared state, so it sits
         // OUTSIDE the hold: what has to be atomic is the sampling, not the arithmetic.
         let Some(mut last_seq) = last_seq else {
-            return (committed, applied);
+            return CommittedImage {
+                committed,
+                base,
+                applied,
+                coverage,
+            };
         };
         pending.sort_unstable_by_key(|e| std::cmp::Reverse(e.seq));
         for entry in pending {
@@ -13308,7 +14040,73 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // rollback splices out the ones that are not), so live chains unwind here without gaps.
             Self::undo_schema_entry(&mut committed, &mut last_seq, &entry);
         }
-        (committed, applied)
+        CommittedImage {
+            committed,
+            base,
+            applied,
+            coverage,
+        }
+    }
+
+    /// **The invariant that keeps the counter withdrawal honest** (`rmp` #1067): the committed
+    /// counters equal the persisted base plus every delta the base does not yet cover, plus the
+    /// committing transaction's own not-yet-logged delta.
+    ///
+    /// Debug-only, and asserted from inside the sampling hold because that is the only place where
+    /// all three are one state. It is what a drift in either direction shows up as first: a delta
+    /// folded into the base while its record is still counted as pending would double it, and a
+    /// pending entry dropped without folding would lose it — both of which reach disk as a wrong
+    /// `count()` that survives every restart (`rmp` #866) and neither of which any single-writer
+    /// test reproduces.
+    ///
+    /// The sum is taken through [`replay_count_deltas`], not by applying the deltas one at a time,
+    /// for the reason that function exists: `Statistics` saturates at zero and saturation does not
+    /// commute, so a loop would report a false mismatch on any batch containing a create and a later
+    /// delete of the same key.
+    ///
+    /// # It is skipped when the pending set is large, and that is deliberate
+    ///
+    /// The check is `O(pending)` and it runs inside EVERY commit's checkpoint, so it is `O(n²)` over
+    /// a run that lets the pending set grow — and it grows exactly when a checkpoint has not run,
+    /// which is precisely a bulk load. Measured against the ordinary cadence the set is a handful of
+    /// entries and the check is free; against a 64 MiB checkpoint interval of small commits it can
+    /// reach tens of thousands, at which point a debug build would spend minutes here per thousand
+    /// commits. The bound keeps a **debug-only** assertion from deciding how a debug build performs,
+    /// and it costs nothing in coverage: every test in this workspace runs well inside it, and a
+    /// defect that only appears above thirty-two thousand pending deltas is not one this assertion
+    /// was ever going to be the first to catch.
+    #[cfg(debug_assertions)]
+    fn debug_assert_base_plus_pending_is_committed(
+        c: &CatalogState,
+        active: &ActiveTable,
+        committing: TxnId,
+        committed: &Statistics,
+    ) {
+        /// Pending deltas above which the check is skipped. See the note on this method.
+        const MAX_CHECKED: usize = 4096;
+        if c.pending_counts.len() > MAX_CHECKED {
+            return;
+        }
+        let mut rebuilt = c.counts_base.clone();
+        let mut seen = AppliedTxSet::default();
+        let own = active
+            .with(committing, |a| a.counts.clone())
+            .unwrap_or_default();
+        replay_count_deltas(
+            &mut rebuilt,
+            &mut seen,
+            c.pending_counts
+                .values()
+                .map(|(txn, delta)| (*txn, delta))
+                .chain(std::iter::once((committing, &own))),
+        );
+        debug_assert_eq!(
+            rebuilt.counts_image(),
+            committed.counts_image(),
+            "the durable base plus the {} pending delta(s) is not the committed image, so the \
+             catalogue this checkpoint is about to write does not describe the store (`rmp` #1067)",
+            c.pending_counts.len()
+        );
     }
 
     /// Whether any currently-open transaction still holds pending schema DDL (`rmp` #734) — i.e.

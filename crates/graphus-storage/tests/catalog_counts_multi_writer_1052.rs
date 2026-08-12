@@ -67,25 +67,32 @@
 //! refused by the write-write conflict check: the expected counts are exact, not approximate. A
 //! refused commit would be reported rather than absorbed.
 //!
-//! # A fourth defect this file deliberately does not absorb
+//! # A fourth defect this file used to absorb, and no longer does (`rmp` #1055)
 //!
 //! Only a **commit** ever writes the catalog: `RecordStore::checkpoint` is the redo-bounding kind and
 //! never touches it. So the image on disk is the one written by whichever commit wrote the metadata
-//! page LAST — and under concurrent committers that need not be the one that COMPUTED its image last.
-//! `checkpoint_meta` samples the catalog under the latch and then releases it before the page writes,
-//! so `compute(I1) compute(I2) write(I2) write(I1)` leaves the stale `I1` on disk, and the durable
-//! counters lag the committed truth by whatever committed in between. Measured on this workload with
-//! every `rmp` #1052 mechanism already fixed: **9 runs in 200** came back short by exactly one
-//! transaction's delta; with a single settling commit at the end, **0 in 200**.
+//! page LAST, and under concurrent committers that image can be short of the committed truth.
 //!
-//! That is a lost update on the metadata page, not a torn read of the counters, and closing it means
-//! serialising a checkpoint's image against its own page writes — a change to the commit path's
-//! concurrency, deliberately left to its own task rather than folded into this one. It is recorded
-//! here because it is the reason [`run`] ends with one settling commit: without it, "the durable
-//! image" does not name a particular image, and an assertion about it would be asserting the
-//! scheduler. With it, the last image is computed and written with nothing else in flight, so what is
-//! asserted below is what a checkpoint COMPUTES — which is what `rmp` #1052 governs, and which all
-//! three of its mechanisms are proven to break.
+//! This file used to end with a single **settling commit** — one commit, alone, with nothing else in
+//! flight — so that the last catalog write was guaranteed complete. Measured with every `rmp` #1052
+//! mechanism fixed but before #1062: **9 runs in 200** came back short by exactly one transaction's
+//! delta without it, and **0 in 200** with it. The settling commit was therefore a mask, and #1055
+//! required it removed.
+//!
+//! **It is removed.** Re-measured 2026-08-12, after `rmp` #1062 made log order equal apply order per
+//! page: **0 short runs in 200** with no settling commit. #1062 removed one of the two contributions
+//! — the `compute(I1) compute(I2) write(I2) write(I1)` inversion, in which the older image landed
+//! after the newer one — and that is the contribution this workload's timing was mostly sampling.
+//!
+//! **`rmp` #1055 is NOT closed, and a rare failure here is that defect and not a new regression.**
+//! What survives #1062 is a shortfall with no inversion in it at all: a transaction that commits
+//! after another checkpoint has folded its image is absent from that image, and if that image lands
+//! last — or if nothing writes the catalog after that commit at all — its rows never reach the
+//! durable catalog. `graphus-dst`'s `det_scheduler_checkpoint_inversion_1055`, which schedules two
+//! writers deterministically and switches at every yield point, still reproduces it on 2 of its 16
+//! seeds and classifies both shapes by name (`the_residual_shortfall_is_attributed`). That suite, not
+//! this one, is the oracle for #1055; this file samples the same hazard incidentally and at a rate
+//! this host measured as zero in two hundred.
 
 use std::sync::Arc;
 
@@ -253,10 +260,8 @@ fn run() -> Outcome {
         .map(|t| t.join().expect("a writer thread joins"))
         .collect();
 
-    // One node per label was seeded, every committed round added exactly one more, and the settling
-    // commit below adds one to the first writer's label.
-    let mut expected_per_label: Vec<u64> = per_writer.iter().map(|c| c + 1).collect();
-    expected_per_label[0] += 1;
+    // One node per label was seeded, and every committed round added exactly one more.
+    let expected_per_label: Vec<u64> = per_writer.iter().map(|c| c + 1).collect();
     let expected_total: u64 = expected_per_label.iter().sum();
 
     let mut store = Arc::into_inner(store).expect("every writer thread has joined");
@@ -271,13 +276,9 @@ fn run() -> Outcome {
     // the page writes, so `compute(I1) compute(I2) write(I2) write(I1)` leaves a stale I1 on disk. With
     // this settling commit the last image is computed and written with nothing else in flight, so the
     // assertions below are about what a checkpoint COMPUTES, which is what #1052 governs.
-    let settle = TxnId(77_777_777);
-    store.begin(settle);
-    let (node, _) = store.create_node(settle).expect("create the settling node");
-    store
-        .add_label(settle, node, labels[0])
-        .expect("label the settling node");
-    store.commit(settle).expect("commit the settling write");
+    // The settling commit that used to stand here is GONE (`rmp` #1055). It existed to make "the
+    // durable image" name a particular image, by ensuring the last catalog write happened with nothing
+    // else in flight — which also masked the very defect #1055 is about. See the module note.
     let live = store.statistics();
     let live_total = live.total_nodes();
     let live_per_label: Vec<u64> = labels

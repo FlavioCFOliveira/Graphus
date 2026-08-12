@@ -1,6 +1,34 @@
 //! **`rmp` #1055 — two commits' catalog images, and which one is left on disk.**
 //!
+//! # Closed, and by removing the question rather than by answering it (`rmp` #1067)
+//!
+//! Everything below this section describes the defect as it stood, and it is kept verbatim because
+//! it is the measurement that chose the fix. What changed is the last line of the argument:
+//!
+//! > The durable counters are no longer an image of anything. A commit logs its cardinality change
+//! > as its own WAL record before its `COMMIT` record, and the catalogue image carries a **base**
+//! > plus the SET of transactions that base already accounts for. The durable answer is the base
+//! > plus every retained delta the set does not name.
+//!
+//! Which of two concurrently computed images lands last therefore stops being a question anyone has
+//! to answer. A stale image is not a wrong image: it names fewer transactions, and the ones it does
+//! not name are still in the log. That is what makes both measured classes disappear **by
+//! construction** rather than by becoming rarer:
+//!
+//! * **class A** — the image was correct when it was folded and stale when it landed. Whatever
+//!   committed in between logged a delta, and the landed image does not claim to have folded it.
+//! * **class B** — the transaction committed after the last catalogue write of the whole run, so no
+//!   image could have contained it. Its delta is in the log all the same, and nothing has to write
+//!   the catalogue again for recovery to find it.
+//!
+//! [`the_residual_shortfall_is_attributed`] is what keeps that honest: it asserts that the hazard
+//! windows are **still entered** on these seeds — the fix removed the consequence, not the race.
+//!
 //! # The window
+//!
+//! **Every line number below names the code as it stood BEFORE `rmp` #1067**, which is the code the
+//! measurement was taken against; they are kept because a measurement whose subject has been
+//! paraphrased is no longer a measurement.
 //!
 //! Only a **commit** ever writes the catalog: `RecordStore::checkpoint` is the redo-bounding kind and
 //! never touches it. So the durable catalog is whatever image the commit that wrote the metadata page
@@ -50,7 +78,8 @@
 //! # What these seeds say about "elect the newest image"
 //!
 //! Measured 2026-08-12 on the sixteen seeds below, `gate` profile, Linux x86-64.
-//! [`the_durable_catalog_is_an_image_some_checkpoint_computed`] prints, per seed, the image that
+//! `the_durable_catalog_is_an_image_some_checkpoint_computed` (since `rmp` #1067
+//! [`the_log_and_not_the_image_completes_the_durable_catalog`]) prints, per seed, the image that
 //! landed AND the image that was sampled last. Ten seeds come back short, and on **all ten of them
 //! the newest image sampled is itself incomplete** — on nine it is also the image that landed, so
 //! electing it changes nothing whatsoever.
@@ -83,17 +112,21 @@
 //!
 //! Asserted on every seed, never claimed:
 //!
-//! * the scheduler really handed the token over, every logical thread really ran, and the writers
-//!   **acknowledged** every commit — counted after `commit` returned, never read off the loop bound;
+//! * the scheduler really handed the token over, every logical thread really ran, and the writes are
+//!   **in the store** — the catalog's own counters against the workload's constants, and every
+//!   created node's labels read back through `node_labels`. Never a tally incremented in the writer
+//!   loop: such a tally cannot fail (a refused commit panics on its `expect` and is re-raised by
+//!   `join`) and cannot see a `commit` that returns `Ok` having persisted nothing (`rmp` #1055);
 //! * every acknowledged commit really yielded a fully located checkpoint — its image sample, its
 //!   metadata-page write and its delta retirement — so a pairing rule that silently found nothing
 //!   fails the suite instead of quietly emptying every order derived from it;
 //! * the `compute(I1) compute(I2) write(I2) write(I1)` order really occurred, on named seeds, between
 //!   named transactions ([`the_checkpoint_order_is_attributed`]);
-//! * what a reopen recovered really is one of the images this run's checkpoints sampled, and which
-//!   one ([`the_durable_catalog_is_an_image_some_checkpoint_computed`]) — the reconstruction is made
-//!   from the recorded schedule alone and matched against a number read out of a real recovered
-//!   store, so the mechanism is demonstrated rather than assumed.
+//! * the hazard windows are still entered, and the image that landed last would still have been
+//!   short of the committed truth had the log not covered it
+//!   ([`the_log_and_not_the_image_completes_the_durable_catalog`]) — reconstructed from the recorded
+//!   schedule alone and compared against a number read out of a real recovered store, so what the
+//!   log is doing is demonstrated rather than assumed.
 //!
 //! # How the three instants are attributed
 //!
@@ -147,11 +180,15 @@ const ROUNDS: u64 = 4;
 /// checkpoint order and not the pool's eviction behaviour.
 const POOL_PAGES: usize = 256;
 
-/// The seeds this suite pins. A fixed list, not a sample: a seed that reproduces a defect is evidence
-/// only if it is still run tomorrow.
-const SEEDS: [u64; 16] = [
-    0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf,
-];
+/// The seeds this suite pins: `0..SEEDS`. A fixed range, not a sample — a seed that reproduces a
+/// defect is evidence only if it is still run tomorrow.
+///
+/// **Two hundred and fifty-six, and the number is load-bearing.** At sixteen seeds this suite
+/// reported two short seeds and the first proposed fix looked total; measured across 256 the same
+/// build comes back short on 69, and a fix that closed the sixteen would have shipped as a 42 %
+/// mitigation. The whole file runs in a few seconds per test at this width, so there is no reason to
+/// measure a defect on a sixteenth of the evidence.
+const SEEDS: u64 = 256;
 
 /// Transaction-id stride per writer. Disjoint per writer, and far above the seed transaction, so a
 /// transaction id in the recorded history resolves to exactly one writer.
@@ -213,10 +250,18 @@ struct Run {
     live: Vec<u64>,
     /// The same vector, read out of the catalog a REOPEN recovered from the device image and the WAL.
     durable: Vec<u64>,
-    /// The same vector, computed from what the writers acknowledged.
+    /// The same vector, computed from the workload's own CONSTANTS — one seeded node per label plus
+    /// [`ROUNDS`] per writer — and therefore from nothing the run itself reports.
     expected: Vec<u64>,
-    /// Commits each writer ACKNOWLEDGED, counted on the line after `commit` returned.
-    committed: Vec<u64>,
+    /// The label token ids the store reports for each node the writers created, in creation order,
+    /// read back through `node_labels` after every writer has joined.
+    labels_read_back: Vec<Vec<u32>>,
+    /// The label token id each of those nodes was created WITH, in the same order — the expectation
+    /// `labels_read_back` is matched against.
+    labels_written: Vec<u32>,
+    /// `RecordStore::page_lsn_descents` on the live store, read after every writer has joined: the
+    /// direct oracle for `rmp` #1062 (log order is apply order, per page). Zero is the invariant.
+    page_lsn_descents: u64,
     history: SchedHistory,
 }
 
@@ -227,110 +272,142 @@ fn scenario(seed: u64) -> Run {
     // checkpoint sampling its image and the committer it races retiring its delta, which the
     // amortised default would step over.
     let cfg = DetSchedConfig::exhaustive(seed);
-    let ((live, durable, expected, committed), history) = run_scheduled(cfg, || {
-        let device = MemBlockDevice::new(0);
-        let wal = WalManager::create(MemLogSink::new()).expect("create wal");
-        let store =
-            Arc::new(RecordStore::create(device, wal, POOL_PAGES, 1).expect("create store"));
+    let ((live, durable, expected, labels_read_back, labels_written, page_lsn_descents), history) =
+        run_scheduled(cfg, || {
+            let device = MemBlockDevice::new(0);
+            let wal = WalManager::create(MemLogSink::new()).expect("create wal");
+            let store =
+                Arc::new(RecordStore::create(device, wal, POOL_PAGES, 1).expect("create store"));
 
-        // Interning takes the catalogue's write latch, which the scheduler does not mediate. Done on
-        // the root thread, so the run's contention is only where the scenario means it to be.
-        let labels: Vec<u32> = (0..WRITERS)
-            .map(|w| {
-                store
-                    .intern_token(Namespace::Label, &format!("L{w}"))
-                    .expect("intern a label token")
-            })
-            .collect();
-
-        // One committed node per label, so every counter starts non-zero and a counter wrongly driven
-        // to zero has somewhere to fall from. This transaction retires long before any writer starts,
-        // so every writer's image legitimately contains it.
-        let seed_txn = TxnId(1);
-        store.begin(seed_txn);
-        for &label in &labels {
-            let (node, _) = store.create_node(seed_txn).expect("create the seed node");
-            store
-                .add_label(seed_txn, node, label)
-                .expect("label the seed");
-        }
-        store.commit(seed_txn).expect("commit the seed");
-
-        let threads: Vec<_> = (0..WRITERS)
-            .map(|w| {
-                let store = Arc::clone(&store);
-                let label = labels[w];
-                graphus_core::sched::spawn("writer", move || {
-                    // COUNTED on the line after `commit` returns, never assumed from the loop bound.
-                    let mut committed = 0u64;
-                    for r in 0..ROUNDS {
-                        // Every writer's node is its own, so no round can be refused by the
-                        // write-write conflict check and the expected counts are exact.
-                        let txn = txn_of(w, r);
-                        store.begin(txn);
-                        let (node, _) = store.create_node(txn).expect("create a node");
-                        store.add_label(txn, node, label).expect("label the node");
-                        store.commit(txn).expect("a disjoint write always commits");
-                        committed += 1;
-                    }
-                    committed
+            // Interning takes the catalogue's write latch, which the scheduler does not mediate. Done on
+            // the root thread, so the run's contention is only where the scenario means it to be.
+            let labels: Vec<u32> = (0..WRITERS)
+                .map(|w| {
+                    store
+                        .intern_token(Namespace::Label, &format!("L{w}"))
+                        .expect("intern a label token")
                 })
-            })
-            .collect();
-        let committed: Vec<u64> = threads
-            .into_iter()
-            .map(|t| t.join().expect("a writer thread joins"))
-            .collect();
+                .collect();
 
-        let stats = store.statistics();
-        let mut live = vec![stats.total_nodes()];
-        live.extend(labels.iter().map(|&l| stats.node_count_for_label(l)));
-        drop(stats);
+            // One committed node per label, so every counter starts non-zero and a counter wrongly driven
+            // to zero has somewhere to fall from. This transaction retires long before any writer starts,
+            // so every writer's image legitimately contains it.
+            let seed_txn = TxnId(1);
+            store.begin(seed_txn);
+            for &label in &labels {
+                let (node, _) = store.create_node(seed_txn).expect("create the seed node");
+                store
+                    .add_label(seed_txn, node, label)
+                    .expect("label the seed");
+            }
+            store.commit(seed_txn).expect("commit the seed");
 
-        // One node per label was seeded; every acknowledged round added exactly one more.
-        let mut expected = vec![committed.iter().sum::<u64>() + WRITERS as u64];
-        expected.extend(committed.iter().map(|c| c + 1));
+            let threads: Vec<_> = (0..WRITERS)
+                .map(|w| {
+                    let store = Arc::clone(&store);
+                    let label = labels[w];
+                    graphus_core::sched::spawn("writer", move || {
+                        // The physical ids this writer created, so the run is checked against what the
+                        // STORE holds rather than against how many times this loop went round.
+                        let mut created = Vec::with_capacity(ROUNDS as usize);
+                        for r in 0..ROUNDS {
+                            // Every writer's node is its own, so no round can be refused by the
+                            // write-write conflict check and the expected counts are exact.
+                            let txn = txn_of(w, r);
+                            store.begin(txn);
+                            let (node, _) = store.create_node(txn).expect("create a node");
+                            store.add_label(txn, node, label).expect("label the node");
+                            store.commit(txn).expect("a disjoint write always commits");
+                            created.push((node, label));
+                        }
+                        created
+                    })
+                })
+                .collect();
+            let created: Vec<(u64, u32)> = threads
+                .into_iter()
+                .flat_map(|t| t.join().expect("a writer thread joins"))
+                .collect();
 
-        // THE REOPEN, and it is what makes this suite about the DURABLE catalog rather than the live
-        // one. NO `checkpoint()` first, deliberately: the image the last commit wrote must be the one
-        // a reopen finds, and `checkpoint()` would not rewrite it anyway. The shape is the
-        // steal-crash recovery the rest of the workspace uses — flush the dirty pages home, stage
-        // that device image, replay the durable WAL prefix over it.
-        store.flush().expect("flush the dirty pages home");
-        let mapped = store.mapped_pages();
-        let max = mapped.iter().map(|p| p.0).max().unwrap_or(0);
-        let staged: Vec<(u64, Box<Page>)> = mapped
-            .iter()
-            .map(|p| (p.0, store.read_device_page(*p).expect("read device page")))
-            .collect();
-        let mut device = MemBlockDevice::new(max + 1);
-        for (idx, bytes) in staged {
-            device
-                .write_page(PageId(idx), &bytes)
-                .expect("stage the page");
-        }
-        device.sync_all().expect("persist the disk image");
+            let stats = store.statistics();
+            let mut live = vec![stats.total_nodes()];
+            live.extend(labels.iter().map(|&l| stats.node_count_for_label(l)));
+            drop(stats);
 
-        let mut sink = MemLogSink::new();
-        sink.append(&store.with_wal(|w| w.sink().durable_bytes().to_vec()));
-        sink.sync().expect("sync the durable log prefix");
-        let mut wal = WalManager::open(sink.clone()).expect("open wal");
-        recover_device(&mut wal, &mut device).expect("ARIES recovery");
-        let wal = WalManager::open(sink).expect("reopen wal");
-        let reopened =
-            RecordStore::open(device, wal, POOL_PAGES).expect("open the recovered store");
-        let stats = reopened.statistics();
-        let mut durable = vec![stats.total_nodes()];
-        durable.extend(labels.iter().map(|&l| stats.node_count_for_label(l)));
-        drop(stats);
+            // Read back OUT OF THE STORE, after every writer has joined.
+            let labels_written: Vec<u32> = created.iter().map(|&(_, l)| l).collect();
+            let labels_read_back: Vec<Vec<u32>> = created
+                .iter()
+                .map(|&(node, _)| {
+                    store
+                        .node_labels(node)
+                        .expect("read a created node's labels")
+                })
+                .collect();
 
-        (live, durable, expected, committed)
-    });
+            // From the workload's CONSTANTS, not from anything the run counted: one node per label was
+            // seeded, and each of the [`WRITERS`] writers commits exactly [`ROUNDS`] more. Deriving it
+            // from a per-writer tally would route the ground truth through a counter incremented after
+            // `commit` returned — which cannot disagree with `ROUNDS`, because a refused commit panics on
+            // the `expect` above and is re-raised by `join`, and which in any case cannot see a `commit`
+            // that returns `Ok` having persisted nothing.
+            let mut expected = vec![WRITERS as u64 * ROUNDS + WRITERS as u64];
+            expected.extend(std::iter::repeat_n(ROUNDS + 1, WRITERS));
+
+            // The `rmp` #1062 oracle, read off the store that did the writing and BEFORE the reopen
+            // stages a fresh device: it counts what the runtime did to the pages, which is what
+            // recovery's `record.lsn > page_lsn` gate is compared against.
+            let page_lsn_descents = store.page_lsn_descents();
+
+            // THE REOPEN, and it is what makes this suite about the DURABLE catalog rather than the live
+            // one. NO `checkpoint()` first, deliberately: the image the last commit wrote must be the one
+            // a reopen finds, and `checkpoint()` would not rewrite it anyway. The shape is the
+            // steal-crash recovery the rest of the workspace uses — flush the dirty pages home, stage
+            // that device image, replay the durable WAL prefix over it.
+            store.flush().expect("flush the dirty pages home");
+            let mapped = store.mapped_pages();
+            let max = mapped.iter().map(|p| p.0).max().unwrap_or(0);
+            let staged: Vec<(u64, Box<Page>)> = mapped
+                .iter()
+                .map(|p| (p.0, store.read_device_page(*p).expect("read device page")))
+                .collect();
+            let mut device = MemBlockDevice::new(max + 1);
+            for (idx, bytes) in staged {
+                device
+                    .write_page(PageId(idx), &bytes)
+                    .expect("stage the page");
+            }
+            device.sync_all().expect("persist the disk image");
+
+            let mut sink = MemLogSink::new();
+            sink.append(&store.with_wal(|w| w.sink().durable_bytes().to_vec()));
+            sink.sync().expect("sync the durable log prefix");
+            let mut wal = WalManager::open(sink.clone()).expect("open wal");
+            recover_device(&mut wal, &mut device).expect("ARIES recovery");
+            let wal = WalManager::open(sink).expect("reopen wal");
+            let reopened =
+                RecordStore::open(device, wal, POOL_PAGES).expect("open the recovered store");
+            let stats = reopened.statistics();
+            let mut durable = vec![stats.total_nodes()];
+            durable.extend(labels.iter().map(|&l| stats.node_count_for_label(l)));
+            drop(stats);
+
+            (
+                live,
+                durable,
+                expected,
+                labels_read_back,
+                labels_written,
+                page_lsn_descents,
+            )
+        });
     Run {
         live,
         durable,
         expected,
-        committed,
+        labels_read_back,
+        labels_written,
+        page_lsn_descents,
         history,
     }
 }
@@ -386,12 +463,21 @@ fn checkpoints(history: &SchedHistory) -> Vec<Checkpoint> {
     out
 }
 
-/// The counters checkpoint `owner` SAMPLED, reconstructed from the recorded schedule alone.
+/// **The counters checkpoint `owner`'s image would have carried before `rmp` #1067** —
+/// reconstructed from the recorded schedule alone.
 ///
 /// The image is the seeded node per label, plus `owner`'s own commit — which `committed_statistics`
 /// excludes from the withdrawal by name — plus every other writer commit that had already RETIRED its
 /// delta when `owner` folded.
-fn image_of(owner: &Checkpoint, cps: &[Checkpoint]) -> Option<Vec<u64>> {
+///
+/// Since #1067 no image carries these numbers: the counters left the image and what is persisted is
+/// a base plus the set of transactions folded into it, and in this scenario nothing ever folds (the
+/// 64 MiB checkpoint cadence is never reached), so every image's base is the same empty one. That
+/// makes this function **the shortfall the log now covers**, which is precisely why it is kept: it
+/// is the only way to state what the durable catalogue would have been without the log, and
+/// therefore the only way to show that the log is what completes it
+/// ([`the_log_and_not_the_image_completes_the_durable_catalog`]).
+fn image_without_the_log(owner: &Checkpoint, cps: &[Checkpoint]) -> Option<Vec<u64>> {
     // Slot 0 is total_nodes; slot w+1 is writer w's label. Each starts at its seeded node.
     let mut out = vec![WRITERS as u64];
     out.extend(std::iter::repeat_n(1u64, WRITERS));
@@ -450,7 +536,7 @@ fn hazard_folds(cps: &[Checkpoint]) -> Vec<(Checkpoint, Checkpoint)> {
 #[test]
 fn the_durable_catalog_holds_every_committed_delta() {
     let mut short = Vec::new();
-    for seed in SEEDS {
+    for seed in 0..SEEDS {
         let run = scenario(seed);
         assert_eq!(
             run.live, run.expected,
@@ -496,7 +582,7 @@ fn the_durable_catalog_holds_every_committed_delta() {
 fn the_checkpoint_order_is_attributed() {
     let mut inverted = Vec::new();
     let mut hazard = Vec::new();
-    for seed in SEEDS {
+    for seed in 0..SEEDS {
         let run = scenario(seed);
         let cps = checkpoints(&run.history);
         let short = run.durable != run.expected;
@@ -526,13 +612,13 @@ fn the_checkpoint_order_is_attributed() {
     println!(
         "{} inverted pair(s) across {} seeds:\n{}",
         inverted.len(),
-        SEEDS.len(),
+        SEEDS,
         inverted.join("\n")
     );
     println!(
         "{} hazard-window fold(s) across {} seeds:\n{}",
         hazard.len(),
-        SEEDS.len(),
+        SEEDS,
         hazard.join("\n")
     );
     assert!(
@@ -542,123 +628,268 @@ fn the_checkpoint_order_is_attributed() {
     );
 }
 
-/// **The mechanism, demonstrated.** What a reopen recovers is always the image ONE of this run's
-/// checkpoints sampled — never a blend, and never the committed truth unless that one image happened
-/// to be complete.
+/// **The mechanism, demonstrated: the LOG is what completes the durable catalog, not the image.**
 ///
-/// This is what turns "the durable catalog is short" into a named cause. Every candidate image is
-/// reconstructed from the recorded schedule alone and the number a real recovered store read back is
-/// matched against the set. The matching checkpoint is printed beside the last one by **page-apply**
-/// order, and the two need not agree: `write_region` appends its WAL record (`store.rs:3198`) and
-/// applies it to the page (`store.rs:3201`) as two separately scheduled steps, so the record recovery
-/// replays last need not be the write that landed on the page last — the `rmp` #1028 hazard, log
-/// order against apply order, measured here rather than assumed.
+/// This is the re-aimed successor of `the_durable_catalog_is_an_image_some_checkpoint_computed`,
+/// which asserted that a reopen always recovers exactly the counters ONE of this run's checkpoints
+/// sampled. That was true, and it was the whole defect: the durable number was decided by an image,
+/// so it was decided by whichever commit wrote the metadata page last. Since `rmp` #1067 the
+/// counters are not in the image at all, so the old claim is not merely no longer asserted — it is
+/// **false by design**, and a suite that still asserted it would be asserting the defect.
+///
+/// What replaces it has to be stronger, not weaker, so it asserts the two halves that together say
+/// the log did the work:
+///
+/// 1. **the image alone would have been short.** [`image_without_the_log`] reconstructs, from the
+///    recorded schedule alone, the counters the image that landed LAST would have carried under the
+///    old design. On the seeds where that is short of the committed truth, the durable catalog is
+///    nevertheless exact — so the difference came from somewhere, and the only other thing a reopen
+///    reads is the log;
+/// 2. **that case really occurs**, on a counted number of these seeds. Without this the test would
+///    pass on a battery in which every image happened to be complete and would prove nothing about
+///    the log at all. It is the same non-vacuity the old test bought with `unmatched.is_empty()`,
+///    pointed at the mechanism that is now load-bearing.
 #[test]
-fn the_durable_catalog_is_an_image_some_checkpoint_computed() {
-    let mut rows = Vec::new();
-    let mut unmatched = Vec::new();
-    for seed in SEEDS {
+fn the_log_and_not_the_image_completes_the_durable_catalog() {
+    let mut short_images = Vec::new();
+    let mut durable_wrong = Vec::new();
+    for seed in 0..SEEDS {
         let run = scenario(seed);
         let cps = checkpoints(&run.history);
         let last = cps
             .iter()
             .max_by_key(|c| c.write)
             .expect("every seed runs at least one checkpoint");
-        // The image sampled LAST, which is what a compare-and-publish scheme keyed on an image
-        // version would elect. Reported beside the one that actually landed, because the two together
-        // say whether electing the newest image would have been enough.
-        let newest = cps
-            .iter()
-            .max_by_key(|c| c.fold_at)
-            .expect("every seed runs at least one checkpoint");
-        let matching: Vec<u64> = cps
-            .iter()
-            .filter(|c| image_of(c, &cps).as_ref() == Some(&run.durable))
-            .map(|c| c.txn)
-            .collect();
-        let row = format!(
-            "seed {seed:#x}: durable {:?}, committed {:?} — is the image of txn {:?}; the LAST page \
-             write was txn {}'s, image {:?}; the NEWEST image sampled was txn {}'s, image {:?} — {} \
-             inversion(s), {} hazard-window fold(s)",
-            run.durable,
-            run.expected,
-            matching,
-            last.txn,
-            image_of(last, &cps),
-            newest.txn,
-            image_of(newest, &cps),
-            inversions(&cps).len(),
-            hazard_folds(&cps).len(),
-        );
-        if matching.is_empty() {
-            unmatched.push(row.clone());
+        let landed = image_without_the_log(last, &cps)
+            .expect("the last checkpoint's image is reconstructible");
+        if landed != run.expected {
+            short_images.push(format!(
+                "seed {seed:#x}: the image txn {} wrote last would have carried {:?} against a \
+                 committed {:?} (short by {}); the durable catalog read back {:?}",
+                last.txn,
+                landed,
+                run.expected,
+                run.expected[0] as i64 - landed[0] as i64,
+                run.durable,
+            ));
         }
-        rows.push(row);
+        if run.durable != run.expected {
+            durable_wrong.push(format!(
+                "seed {seed:#x}: durable {:?} != committed {:?}",
+                run.durable, run.expected
+            ));
+        }
     }
-    println!("{}", rows.join("\n"));
+    println!(
+        "{} of {SEEDS} seed(s) landed an image that is short of the committed truth; the log \
+         covered every one of them:\n{}",
+        short_images.len(),
+        short_images.join("\n")
+    );
     assert!(
-        unmatched.is_empty(),
-        "the durable catalog matches NO image any checkpoint sampled, so `rmp` #1055 is not the whole \
-         cause of what these seeds produce and a fix would be chosen against a mechanism that has not \
-         been identified:\n{}",
-        unmatched.join("\n")
+        durable_wrong.is_empty(),
+        "a reopen came back with counters the workload did not commit, so the base plus the \
+         retained deltas is not the committed truth (`rmp` #1067):\n{}",
+        durable_wrong.join("\n")
+    );
+    assert!(
+        !short_images.is_empty(),
+        "NON-VACUITY: on every one of these {SEEDS} seeds the image that landed last was ALREADY \
+         complete, so this battery never exercised the case the logged delta exists for and the \
+         assertion above proves nothing about the log. The seeds, the writer count or the round \
+         count must be changed until the case reappears"
     );
 }
 
-/// **`rmp` #1062 — what recovery rebuilds is what the last page write applied.**
+/// **`rmp` #1062 — log order is apply order, per page.**
 ///
-/// The two are separate claims and this is the one that says they coincide. `run.durable` is read out
-/// of a store a reopen genuinely recovered from a device image and a WAL prefix; `last.write` is the
-/// last `checkpoint_meta` page write in the recorded schedule, i.e. what a crash-free execution left
-/// on the page. If ARIES and the runtime disagree about which image is last, the durable answer with
-/// no crash and the durable answer after a crash differ, and no discussion of *which* image ought to
-/// win can even be held — the durable catalog is not yet a well-defined object.
+/// # Why this test had to be re-aimed, and what it lost
 ///
-/// This is deliberately NOT the completeness property above: the image that landed may still be
-/// missing a committed transaction's rows (the hazard-window fold, `rmp` #1055), and on the seeds
-/// that produce one this test passes while
-/// [`the_durable_catalog_holds_every_committed_delta`] fails. What it asserts is only that the two
-/// mechanisms name the SAME image.
+/// It used to compare the counters a reopen recovered against the counters the LAST metadata-page
+/// write in the recorded schedule would have applied — a derived oracle for #1062, and a sharp one:
+/// it caught seed `0x1` recovering txn 1004's image while txn 2004's write was the one that landed,
+/// because `write_region` appended its record and applied it to the page as two separately scheduled
+/// steps, so the record recovery replayed last was not the write that reached the page last.
 ///
-/// MEASURED, `gate` profile, Linux x86-64, 2026-08-12:
+/// That oracle **cannot discriminate any more**, and saying so is the point. Since `rmp` #1067 the
+/// counters are not decided by the image: this scenario never reaches the 64 MiB checkpoint cadence,
+/// so no fold ever runs, so every image carries the same empty base and two images differ in nothing
+/// a reopen can read back. A test comparing them would be comparing two equal vectors on every seed
+/// — green for ever, and vacuous.
 ///
-/// * before `rmp` #1062 — seed `0x1` recovered `[9, 5, 4]`, txn 1004's image, while the last page
-///   write in the recorded schedule was txn 2004's `[9, 4, 5]`. `write_region` appended its record
-///   (`store.rs:3198`) and applied it (`store.rs:3201`) as two separately scheduled steps, so txn
-///   1004 appended LAST and applied FIRST: `page_lsn` came to rest at txn 2004's lower LSN, and
-///   redo — gated on `record.lsn > page_lsn` — then re-applied txn 1004's higher-LSN record on top
-///   of a page that did not contain it. One seed of sixteen;
-/// * after — all sixteen seeds recover exactly the image their last page write applied.
+/// So this asserts the **direct** oracle instead, in this scenario, on every seed:
+/// [`RecordStore::page_lsn_descents`] counts pages stamped with an LSN below the one they already
+/// carried, which is the inversion itself rather than a consequence of it. Zero is the invariant.
 ///
-/// It is therefore also this task's positive control: revert
-/// `RecordStore::in_page_order`'s rank-27 section to a bare `body()` and seed `0x1` fails here again.
+/// The positive control for it is `graphus-dst`'s `page_log_apply_order_1062` battery, which drives
+/// the same counter under a workload built to invert it and asserts what a reverted
+/// `RecordStore::in_page_order` produces. What this test adds is coverage of THIS schedule: two
+/// committers hammering the metadata page chain, which is the shape #1062 was found in.
+///
+/// MEASURED, `gate` profile, Linux x86-64, 2026-08-12: zero descents on all 256 seeds.
 #[test]
-fn the_durable_catalog_is_the_image_the_last_page_write_applied() {
+fn the_runtime_and_recovery_agree_on_page_order() {
     let mut diverged = Vec::new();
-    for seed in SEEDS {
+    for seed in 0..SEEDS {
         let run = scenario(seed);
-        let cps = checkpoints(&run.history);
-        let last = cps
-            .iter()
-            .max_by_key(|c| c.write)
-            .expect("every seed runs at least one checkpoint");
-        let applied = image_of(last, &cps).expect("the last checkpoint's image is reconstructible");
-        if run.durable != applied {
+        if run.page_lsn_descents != 0 {
             diverged.push(format!(
-                "seed {seed:#x}: a reopen recovered {:?}, but the LAST metadata-page write in the \
-                 recorded schedule was txn {}'s, whose image is {:?} (it wrote at step {})",
-                run.durable, last.txn, applied, last.write
+                "seed {seed:#x}: {} page(s) were stamped with an LSN below the one they already \
+                 carried",
+                run.page_lsn_descents
             ));
         }
     }
     assert!(
         diverged.is_empty(),
-        "what ARIES rebuilds is not what the runtime left on the page, so the order in which \
-         catalog images entered the log is not the order in which they took effect (`rmp` #1062). \
-         Every logged page write must append and apply inside one `RecordStore::in_page_order` \
-         section keyed by the device page; `RecordStore::page_lsn_descents` is the direct oracle for \
-         the same invariant and `page_log_apply_order_1062` asserts it is zero:\n{}",
+        "a page took an LSN backwards, so the order in which writes entered the log is not the order \
+         in which they took effect on the page (`rmp` #1062). Every logged page write must append and \
+         apply inside one `RecordStore::in_page_order` section keyed by the device page; recovery is \
+         gated on `record.lsn > page_lsn`, so a descent lets redo re-apply an older record over a \
+         newer page:\n{}",
         diverged.join("\n")
+    );
+}
+
+/// **The residual shortfall, classified — and the measurement that refutes both proposed fixes.**
+///
+/// Run 2026-08-12, after `rmp` #1062 closed the log-order/apply-order divergence, on the sixteen
+/// seeds below. Two remain short (`0x2`, `0xe`), and they are **two different mechanisms**. This test
+/// names which, per seed, so that a fix is chosen against the measurement instead of against the
+/// ficha's description.
+///
+/// Write `L` for the checkpoint whose metadata-page write landed LAST, and `C` for any other
+/// checkpoint. `L`'s image contains `C`'s rows **iff** `C` retired its count delta before `L` folded
+/// its image ([`image_without_the_log`]). So a shortfall is one of exactly two shapes:
+///
+/// * **Class A — the image was wrong by the time it landed.** `L.fold_at <= C.retire_at < L.write`:
+///   `C` committed after `L` sampled but before `L`'s write landed. The image `L` wrote was correct
+///   when it was folded and had become stale by the time it hit the page. Seed `0x2`: `L` = txn 2004
+///   (fold 585, write 597), `C` = txn 1004 (retire **591**).
+/// * **Class B — the last commit is not the last catalog write.** `C.retire_at >= L.write`: `C`
+///   committed after the last catalog write in the whole run, so **no** image could have contained it
+///   — nothing wrote the catalog afterwards. Seed `0xe`: `L` = txn 2004 (fold 585, write **589**),
+///   `C` = txn 1004 (retire **598**).
+///
+/// # What this costs the two options in the ficha
+///
+/// Both are refuted, and by the same run:
+///
+/// * *"hold the catalog latch across the writes"* — serialises a checkpoint's sample against its own
+///   page writes. It cannot help either class. In class A the two are already in order (`L` folded
+///   before it wrote); what changed underneath was another transaction's retirement, which that latch
+///   does not order against. In class B there is no second write to order at all.
+/// * *"compare-and-publish on an image version, refusing a write whose image has been overtaken"* —
+///   elects the newest image. On **both** short seeds the newest image sampled IS the image that
+///   landed and IS the incomplete one, so refusing anything changes nothing. Stronger still, and
+///   printed below: **no checkpoint in either run ever sampled a complete image**, so no scheme that
+///   elects among the images that exist can produce the right answer.
+///
+/// Class B also refutes the sharper invariant *"the image that lands last must reflect every
+/// transaction that committed before it landed"*: seed `0xe` **satisfies** it and is still short.
+///
+/// # What this test asserts NOW (`rmp` #1067), and why it is the fix's positive control
+///
+/// The two classes above are closed, so there are no short seeds left to classify — and a test whose
+/// only assertion is "every short seed is explained" would pass on an empty list for ever. That is
+/// the vacuity trap this file has already fallen into once (the settling commit `rmp` #1055 removed),
+/// so the assertion is turned around and now carries the burden the other direction:
+///
+/// 1. **the windows are still ENTERED.** Class A and class B are counted over the whole battery from
+///    the recorded schedule, exactly as before, and the test fails if neither occurs. The fix removed
+///    the consequence, not the race: a build in which these windows stopped happening — a scheduler
+///    change, a workload change, a serialisation someone added to the commit path — would make every
+///    other assertion in this file a statement about a run that no longer reproduces anything;
+/// 2. **and no seed is short anyway.** Kept here as well as in
+///    [`the_durable_catalog_holds_every_committed_delta`], because the pairing is the whole claim:
+///    "the window was entered AND the answer is right" is what "closed by construction" means, and
+///    the two halves asserted in different tests could drift apart without anyone noticing.
+///
+/// Anything short is still classified, and an unclassified shortfall still fails: if this ever goes
+/// red, the printed row says which of the two shapes came back.
+#[test]
+fn the_residual_shortfall_is_attributed() {
+    let mut rows = Vec::new();
+    let mut unexplained = Vec::new();
+    let mut seeds_with_class_a = 0usize;
+    let mut seeds_with_class_b = 0usize;
+    for seed in 0..SEEDS {
+        let run = scenario(seed);
+        let cps = checkpoints(&run.history);
+        let last = cps
+            .iter()
+            .max_by_key(|c| c.write)
+            .expect("every seed runs at least one checkpoint");
+        // The two shapes, computed on EVERY seed and not only on the short ones: since `rmp` #1067
+        // they are windows that were entered rather than failures that occurred, and counting them
+        // only where the answer came out wrong would count nothing at all.
+        let class_a: Vec<u64> = cps
+            .iter()
+            .filter(|c| {
+                c.txn != last.txn && c.retire_at >= last.fold_at && c.retire_at < last.write
+            })
+            .map(|c| c.txn)
+            .collect();
+        let class_b: Vec<u64> = cps
+            .iter()
+            .filter(|c| c.txn != last.txn && c.retire_at >= last.write)
+            .map(|c| c.txn)
+            .collect();
+        seeds_with_class_a += usize::from(!class_a.is_empty());
+        seeds_with_class_b += usize::from(!class_b.is_empty());
+        if run.durable == run.expected {
+            continue;
+        }
+        let complete: Vec<u64> = cps
+            .iter()
+            .filter(|c| image_without_the_log(c, &cps).as_ref() == Some(&run.expected))
+            .map(|c| c.txn)
+            .collect();
+        let row = format!(
+            "seed {seed:#x}: durable {:?} expected {:?}; LAST write txn {} (fold {}, write {}), \
+             image-without-the-log {:?}. Class A (committed between the fold and the landing): \
+             {class_a:?}. Class B (committed after the last catalog write): {class_b:?}. \
+             Checkpoints whose image is COMPLETE: {complete:?}",
+            run.durable,
+            run.expected,
+            last.txn,
+            last.fold_at,
+            last.write,
+            image_without_the_log(last, &cps),
+        );
+        if class_a.is_empty() && class_b.is_empty() {
+            unexplained.push(row.clone());
+        }
+        rows.push(row);
+    }
+    println!(
+        "{} short seed(s) of {SEEDS}; class A entered on {seeds_with_class_a} seed(s), class B on \
+         {seeds_with_class_b}:\n{}",
+        rows.len(),
+        rows.join("\n")
+    );
+    assert!(
+        seeds_with_class_a > 0 && seeds_with_class_b > 0,
+        "NON-VACUITY: class A was entered on {seeds_with_class_a} of {SEEDS} seeds and class B on \
+         {seeds_with_class_b}, and both must be non-zero. These are the two windows `rmp` #1055 \
+         measured — a transaction committing between another checkpoint's fold and its landing, and \
+         a transaction committing after the last catalog write of the whole run. #1067 removed what \
+         they COST, not the windows themselves, so a battery that no longer enters them proves \
+         nothing about the fix and every other assertion here is about a run that reproduces nothing"
+    );
+    assert!(
+        rows.is_empty(),
+        "a seed came back short. The durable counters are a base plus every retained delta the \
+         applied set does not name, so a shortfall means one of the two is wrong — a delta that was \
+         never logged, a record reclaimed before the base absorbed it, or an applied set naming a \
+         transaction the base does not hold (`rmp` #1067):\n{}",
+        rows.join("\n")
+    );
+    assert!(
+        unexplained.is_empty(),
+        "a seed came back short and fits NEITHER named mechanism, so the cause is not the one this \
+         file describes:\n{}",
+        unexplained.join("\n")
     );
 }
 
@@ -671,7 +902,7 @@ fn the_durable_catalog_is_the_image_the_last_page_write_applied() {
 /// vacuous.
 #[test]
 fn the_run_really_checkpoints_under_contention() {
-    for seed in SEEDS {
+    for seed in 0..SEEDS {
         let run = scenario(seed);
         assert!(
             run.history.switches > 0,
@@ -684,12 +915,39 @@ fn the_run_really_checkpoints_under_contention() {
              interleaved",
             run.history.threads
         );
+        // Store-side evidence, not a loop counter (`rmp` #1055). A tally incremented on the line
+        // after `commit` returned cannot fail — a refused commit panics on the `expect` and is
+        // re-raised by `join`, so the tally is either `ROUNDS` or the test already failed elsewhere —
+        // and it cannot see the failure it would nominally be there to catch: a `commit` that returns
+        // `Ok` having persisted nothing increments it just the same. These numbers come out of the
+        // store: the catalog's own counters, and every created node's labels read back.
         assert_eq!(
-            run.committed,
-            vec![ROUNDS; WRITERS],
-            "seed {seed:#x}: the writers acknowledged {:?} commits, not {ROUNDS} each",
-            run.committed
+            run.live, run.expected,
+            "seed {seed:#x}: the STORE's catalog holds {:?}, not the {:?} this workload commits by \
+             construction — so a commit that returned `Ok` did not leave its node behind, and every \
+             checkpoint order derived from this run was measured on less work than it claims",
+            run.live, run.expected
         );
+        assert_eq!(
+            run.labels_read_back.len(),
+            WRITERS * ROUNDS as usize,
+            "seed {seed:#x}: {} node(s) were created, not {}",
+            run.labels_read_back.len(),
+            WRITERS * ROUNDS as usize
+        );
+        for (i, (read, &written)) in run
+            .labels_read_back
+            .iter()
+            .zip(run.labels_written.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                read.as_slice(),
+                &[written],
+                "seed {seed:#x}: node #{i} was committed with label {written} but the store reads \
+                 back {read:?}"
+            );
+        }
         let cps = checkpoints(&run.history);
         assert_eq!(
             cps.len(),
@@ -712,7 +970,7 @@ fn the_run_really_checkpoints_under_contention() {
                 c.retire_at
             );
             assert!(
-                image_of(c, &cps).is_some(),
+                image_without_the_log(c, &cps).is_some(),
                 "seed {seed:#x}: txn {}'s image could not be reconstructed",
                 c.txn
             );
@@ -724,7 +982,7 @@ fn the_run_really_checkpoints_under_contention() {
 /// is what makes a reproduction from a seed a reproduction at all.
 #[test]
 fn the_same_seed_replays_the_run_identically() {
-    for seed in [SEEDS[0], SEEDS[7], SEEDS[15]] {
+    for seed in [0, 0x2, 0xe, SEEDS - 1] {
         let first = scenario(seed);
         let second = scenario(seed);
         assert_eq!(

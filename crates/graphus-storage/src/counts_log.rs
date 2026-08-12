@@ -42,20 +42,24 @@
 //! Inspiration only — no Neo4j code is reproduced here, and the encoding, the types and the replay
 //! are this project's own.
 //!
-//! # What this layer does and does not do
+//! # What this module owns, and where the write path lives
 //!
-//! This is the **format and the recovery**. The write path is unchanged: `checkpoint_meta` still
-//! persists the counters inside the catalogue image, and nothing in production emits a
-//! [`RecordType::CountDelta`](graphus_wal::RecordType::CountDelta) record yet. Making a commit emit
-//! its delta — and taking the counters out of the image, which is what finally closes `rmp` #1055 —
-//! is `rmp` #1067.
+//! This module is the **format and the arithmetic**: the record payload, the applied set, and the
+//! replay that folds one into the other. The write path that produces those records is
+//! `RecordStore`'s (`rmp` #1067) — a commit appends its delta immediately before its `COMMIT`
+//! record, and the catalogue image no longer carries the live counters at all. It carries a
+//! **base** plus the applied set, and the durable answer is that base plus every retained delta the
+//! set does not name.
 //!
-//! The invariant that ties the two halves together, and that #1067 inherits, is:
+//! The invariant that ties the two halves together is:
 //!
-//! > [`AppliedTxSet`] names exactly the transactions whose count deltas are already folded into the
-//! > [`Statistics`] persisted beside it.
+//! > [`AppliedTxSet`] names every transaction whose count delta is both folded into the
+//! > [`Statistics`] persisted beside it **and** still present as a record in the retained log.
 //!
-//! The pair is persisted together, in one catalogue image, so it cannot be observed half-updated.
+//! The pair is persisted together, in one catalogue image, so it cannot be observed half-updated —
+//! and because the pair is self-consistent, it does not matter which of two concurrently computed
+//! images lands last. That is what closes `rmp` #1055's two classes by construction: an image that
+//! is stale is not an image that is wrong, because whatever it does not name is still in the log.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -314,15 +318,25 @@ impl CountDelta {
 /// `contains` is the union of the two, and `insert` is set union followed by that compaction. Both
 /// are order-independent, which is what [`replay_count_deltas`] rests on.
 ///
-/// # Growth, and what bounds it
+/// # Growth, and what bounds it (`rmp` #1067)
 ///
 /// A transaction id that is never applied — a loser, which logs no delta a replay may use — stalls
-/// the frontier just below it, and every applied id above that point stays in `stray`. Under this
-/// layer that is inert: nothing emits delta records, so the set is empty in every store this build
-/// writes. It becomes real for `rmp` #1067, and the bound available there is that an id whose delta
-/// record is no longer in the **retained** log can never be replayed again and can be dropped from
-/// the set. Compacting against WAL reclamation is that task's, because reclamation is what its
-/// checkpoint performs; it is named here so the property is not discovered later.
+/// the frontier just below it, and every applied id above that point stays in `stray`. Under
+/// `rmp` #1066 alone that was inert: nothing emitted delta records, so the set was empty in every
+/// store that build wrote. Since #1067 a commit emits its delta, so the stall is real and the set
+/// would grow without end if nothing removed ids from it.
+///
+/// The bound is the **retained log**: an id whose delta record has been reclaimed can never be
+/// replayed again, so naming it claims nothing and it leaves the set. `RecordStore::checkpoint`
+/// performs both halves in that order — persist the folded pair, reclaim the WAL prefix, then
+/// rebuild this set through [`from_retained_ids`](Self::from_retained_ids) from exactly the folded
+/// ids whose records survived. The set is therefore bounded by the number of count-delta records in
+/// the retained window, and a loser costs at most the strays above it inside that same window.
+///
+/// The invariant this preserves is deliberately the weaker of the two available readings: the set
+/// names every transaction that is **both** folded into the counters beside it **and** still has a
+/// record in the log. An id folded in whose record is gone need not be named — nothing will ever
+/// ask about it — and naming it would make the set grow with the life of the database.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AppliedTxSet {
     /// Every transaction id in `1..=frontier` is applied. `0` means "no contiguous run yet"; the
@@ -359,6 +373,35 @@ impl AppliedTxSet {
         while self.stray.remove(&(self.frontier + 1)) {
             self.frontier += 1;
         }
+    }
+
+    /// Rebuilds the set from exactly `ids` — the transactions that are folded into the counters
+    /// **and** whose delta record is still in the retained log (`rmp` #1067).
+    ///
+    /// This is the only way an id ever LEAVES the set, and it is what bounds its growth: see the
+    /// note on this type. It is a rebuild rather than a `remove` because the representation
+    /// compacts a contiguous run into [`frontier`](Self#structfield.frontier), and removing an id
+    /// from inside that run would have to split it — a second shape for the same set, and a second
+    /// chance to get the compaction wrong. Rebuilding reaches the one canonical form for the ids
+    /// given, exactly as repeated [`insert`](Self::insert) would.
+    ///
+    /// The caller owes the soundness argument, and it is one line: an id is dropped only once its
+    /// record is below the WAL's reclaimed floor, so no future replay can present that record and
+    /// ask whether it is applied.
+    pub fn from_retained_ids(ids: impl IntoIterator<Item = TxnId>) -> Self {
+        let mut out = Self::default();
+        for id in ids {
+            out.insert(id);
+        }
+        out
+    }
+
+    /// How many ids this set names above its gap-free frontier — the part that grows when a loser
+    /// stalls the frontier, and therefore the number a stabilisation test must watch. Diagnostics
+    /// and tests only.
+    #[must_use]
+    pub fn stray_len(&self) -> usize {
+        self.stray.len()
     }
 
     /// The highest id the contiguous applied run reaches (`0` when there is none). Diagnostics and
@@ -800,6 +843,88 @@ mod tests {
             "with 1..=10 all applied the whole run compacts and the stray set empties"
         );
         assert_eq!(set.stray().count(), 0);
+    }
+
+    /// **A loser stalls the frontier for ever, and only the retained-log rebuild bounds what that
+    /// costs** (`rmp` #1067, acceptance criterion 6).
+    ///
+    /// This is the growth `rmp` #1066 named and left to #1067, exercised where it can be seen
+    /// directly: a transaction that rolls back logs no delta, so its id is never inserted, so the
+    /// gap-free frontier can never advance past it and **every** id above it has to be carried
+    /// explicitly in `stray`. The set is persisted inside every catalogue image, so that list is not
+    /// a memory leak a restart clears — it is a durable structure that grows for ever.
+    ///
+    /// Both halves are asserted, because the second is only meaningful if the first is true:
+    ///
+    /// 1. **without the bound the set grows linearly.** Ids arrive with every third one missing and
+    ///    the set is never rebuilt; after `n` insertions it names `Θ(n)` strays. This is the positive
+    ///    control — if it ever stops growing, the bound below is bounding nothing;
+    /// 2. **with the bound it plateaus.** After each batch the set is rebuilt from only the ids whose
+    ///    delta records are still inside a sliding retained window, which is exactly what
+    ///    `RecordStore::checkpoint` does against the WAL's reclaimed floor. The size then tracks the
+    ///    window and not the history.
+    #[test]
+    fn a_loser_stalls_the_frontier_and_only_the_retained_rebuild_bounds_it() {
+        const N: u64 = 600;
+        /// How many of the most recent ids the "log" still holds records for.
+        const WINDOW: u64 = 40;
+
+        // (1) Unbounded: every third id is a loser and never inserted.
+        let mut unbounded = AppliedTxSet::default();
+        for id in 1..=N {
+            if id % 3 != 0 {
+                unbounded.insert(TxnId(id));
+            }
+        }
+        assert_eq!(
+            unbounded.frontier(),
+            2,
+            "the frontier must stall at the first loser (id 3) and never move again"
+        );
+        assert!(
+            unbounded.stray_len() as u64 > N / 2,
+            "POSITIVE CONTROL: with the frontier stalled at {} the set was supposed to carry every \
+             applied id above it explicitly and it carries only {}. If this stops growing, the \
+             bound asserted below is bounding nothing",
+            unbounded.frontier(),
+            unbounded.stray_len()
+        );
+
+        // (2) Bounded: the same arrivals, rebuilt after each batch from only the ids whose records
+        // the retained window still holds — `RecordStore::checkpoint` against `reclaimed_floor()`.
+        let mut retained: BTreeSet<u64> = BTreeSet::new();
+        let mut bounded = AppliedTxSet::default();
+        let mut peak = 0usize;
+        for id in 1..=N {
+            if id % 3 != 0 {
+                bounded.insert(TxnId(id));
+                retained.insert(id);
+            }
+            if id % 10 == 0 {
+                retained.retain(|&r| r + WINDOW > id);
+                bounded = AppliedTxSet::from_retained_ids(retained.iter().map(|&r| TxnId(r)));
+                peak = peak.max(bounded.stray_len());
+            }
+        }
+        assert!(
+            peak <= WINDOW as usize,
+            "the rebuilt set peaked at {peak} strays against a retained window of {WINDOW}, so it \
+             is naming ids whose records the log no longer holds"
+        );
+        // And it is the SAME set for everything still retained — the bound must not cost membership.
+        for &id in &retained {
+            assert!(
+                bounded.contains(TxnId(id)),
+                "id {id} is still in the retained window but the rebuilt set does not name it, so \
+                 its delta would be replayed and counted a second time"
+            );
+        }
+        assert!(
+            unbounded.stray_len() > peak * 4,
+            "NON-VACUITY: the unbounded set ended at {} strays and the bounded one peaked at \
+             {peak}, which is not the difference this test claims to demonstrate",
+            unbounded.stray_len()
+        );
     }
 
     /// **The compaction preserves the set exactly**: whatever order ids arrive in, membership is the

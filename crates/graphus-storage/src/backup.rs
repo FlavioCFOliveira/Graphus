@@ -140,6 +140,16 @@ pub fn backup_store<D: BlockDevice, S: LogSink>(store: &RecordStore<D, S>) -> Re
         }
     }
 
+    // 0b. Make the CARDINALITY self-sufficient without the WAL too (`rmp` #1067), for exactly the
+    //     reason step 0 makes the MVCC headers self-sufficient. Since #1067 the durable counters are
+    //     a base plus every logged delta the base does not yet name, and the base only absorbs a
+    //     delta when a checkpoint is about to reclaim its record. A backup carries the data image and
+    //     NOT the log, so every delta still sitting in the log would simply be gone: a restored store
+    //     would serve a cardinality short of the transactions that committed since the last
+    //     checkpoint, and `rmp` #866 answers count() from that number with nothing to recompute it.
+    //     Folding them into the base first is the same "make the base self-sufficient" step, applied
+    //     to the other half of what the WAL was carrying.
+    store.settle_counts_into_image()?;
     // 1. Quiesce: flush every dirty page home (WAL rule enforced on each write-back) and sync.
     store.flush()?;
     // 2. Mark a clean, recoverable point. The snapshot is taken after a full flush, so no page is

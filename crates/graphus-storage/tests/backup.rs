@@ -761,3 +761,73 @@ fn restore_onto_a_file_device_round_trips() {
     );
     std::fs::remove_file(&path).ok();
 }
+
+// ============================================================================================
+// The cardinality counters across a backup / restore (`rmp` #1067).
+// ============================================================================================
+
+/// **A restored store's counters are the source's, including every delta still in the log.**
+///
+/// Since `rmp` #1067 the durable cardinality is a **base** plus every logged delta the base does not
+/// yet name, and the base only absorbs a delta when a checkpoint is about to reclaim its record. A
+/// backup carries the data image and **not** the log — a restored store opens on a fresh, empty WAL
+/// — so anything left in the log at capture time would simply cease to exist, and the restored store
+/// would answer `count()` short of every transaction that committed since the last checkpoint. That
+/// number is never recomputed (`rmp` #866), so the shortfall would be permanent.
+///
+/// `backup_store` therefore folds the counters into the image before capturing it, exactly as it
+/// already freezes the MVCC headers so the image resolves without the log.
+///
+/// # Non-vacuity
+///
+/// The workload deliberately commits and takes **no** checkpoint before the backup, so every delta
+/// really is still in the log at capture time. That is asserted: the count-delta records are counted
+/// in the source's retained log, and a zero there would mean this test backs up a store with nothing
+/// left to lose.
+#[test]
+fn a_restored_store_keeps_the_counters_of_every_committed_transaction() {
+    let store = fresh(64);
+    // No automatic checkpoint: every delta below must still be in the log when the backup is taken.
+    store.set_checkpoint_interval_bytes(0);
+    let label = store
+        .intern_token(Namespace::Label, "L")
+        .expect("intern the label");
+
+    const COMMITS: u64 = 12;
+    for r in 1..=COMMITS {
+        let txn = TxnId(r);
+        store.begin(txn);
+        let (node, _) = store.create_node(txn).expect("create a node");
+        store.add_label(txn, node, label).expect("label it");
+        store.commit(txn).expect("commit");
+    }
+    let expected = (store.statistics().total_nodes(), COMMITS);
+    assert_eq!(expected.0, COMMITS, "the live counter must be the commits");
+
+    // NON-VACUITY: the deltas really are still in the log, so the fold has something to do.
+    let in_log = store
+        .with_wal(|w| w.recovered_transactions())
+        .expect("scan the retained log")
+        .count_deltas
+        .len();
+    assert!(
+        in_log as u64 >= COMMITS,
+        "NON-VACUITY: the retained log holds {in_log} count-delta record(s) for {COMMITS} commits, \
+         so the backup below has nothing left in the log to lose and this test proves nothing"
+    );
+
+    let artifact = backup_store(&store).expect("backup");
+    let restored = restore(&artifact, fresh_wal(), 64).expect("restore");
+    assert_eq!(
+        restored.statistics().total_nodes(),
+        COMMITS,
+        "the restored store's node cardinality is short of what the source committed. A backup \
+         carries the data image and not the log, so the counter base in that image must already \
+         account for every logged delta (`RecordStore::settle_counts_into_image`, `rmp` #1067)"
+    );
+    assert_eq!(
+        restored.statistics().node_count_for_label(label),
+        COMMITS,
+        "the restored per-label counter is short"
+    );
+}
