@@ -4475,9 +4475,15 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///   entity's LIVE undo-chain head; now conditional, fail-closed. Called by `rollback_logical`
     ///   directly. **Transactional.**
     /// * `repoint_neighbour` — was a whole-record `write_rel` carrying the neighbour's `first_prop`
-    ///   and `undo_ptr` from a stale read; now writes only the chain-pointer words that actually
-    ///   changed, per word rather than per block so two unlinks on the same neighbour cannot revert
-    ///   each other. Reached from `unlink_side_with`'s BOTH branches. **Transactional.**
+    ///   and `undo_ptr` from a stale read. It no longer carries **any** field it does not change:
+    ///   since `rmp` #1054 it stages its updates and applies them through
+    ///   [`patch_chain_words`](Self::patch_chain_words), which writes the back-pointer word (or the
+    ///   two of them, for a self-loop) and the first-in-chain marker bit that goes with it, and not
+    ///   one byte more. Per word rather than per block, so two unlinks on the same neighbour — one
+    ///   facing its start node, one facing its end node — cannot revert each other; and all of it in
+    ///   ONE frame write-latch hold, so a reader taking the frame read latch sees the pointer and its
+    ///   marker either both before or both after (`rmp` #1050). Reached from `unlink_side_with`'s
+    ///   BOTH branches. **Transactional.**
     ///
     /// **Deliberately NOT through it, with the reason stated at the site:**
     ///
@@ -4492,9 +4498,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///   lock: `gc` takes `&self`, and `rmp` #1016 is what would have to re-establish it.
     /// * The DEFERRED WAL UNDO of a whole-record write is a second writer of all three words —
     ///   `rollback_physical` and crash recovery re-apply a pre-image taken before the write. Neither
-    ///   document mentioned this class before `rmp` #1030. It shrank with `repoint_neighbour`'s
-    ///   conversion (each word now carries its own pre-image) but the GC whole-record writers still
-    ///   have it.
+    ///   document mentioned this class before `rmp` #1030. `repoint_neighbour` is out of it entirely
+    ///   since `rmp` #1054: [`patch_chain_words`](Self::patch_chain_words) logs
+    ///   `log_update_redo_only`, so its writes carry **no** pre-image for anything to re-apply. The GC
+    ///   whole-record writers still have it.
     ///
     /// # The three steps, and why they are one
     ///
@@ -10839,6 +10846,54 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// **whole**, which bought the atomicity by carrying `first_prop`, the MVCC header and three
     /// untouched chain words from an unlatched read — a lost update on every one of them.
     ///
+    /// # Why this primitive and NOT a record-layout change (`rmp` #1050's two routes, decided)
+    ///
+    /// `rmp` #1050 put two routes and required the cost of each to be written down, so it is written
+    /// down here rather than left implicit in the fact that one of them shipped.
+    ///
+    /// **Route (a) — move `chain_flags` next to the pointer block** so a single contiguous
+    /// `write_region` covers both. Its declared cost was a format version and a migration path: the
+    /// marker sits at byte `101` of a 102-byte [`RelRecord`], the pointer words at `61..93`, and
+    /// `first_prop` at `93..101` between them, so making the two adjacent reorders the on-disk record
+    /// — `05-storage-format.md` §2.3 bumps, every existing `rels.store` needs converting, and every
+    /// offset constant derived from the layout moves with it. That cost is real, but it is not what
+    /// decided this: route (a) is **unsound for this write**, for two independent reasons, and no
+    /// measurement could have rescued it.
+    ///
+    /// * **A region write cannot be conditional.** [`paging::encode_cas_patch`] is a fixed 20-byte
+    ///   image — `[sentinel][offset: u16][expect: u64][new: u64]` — that compares and stores exactly
+    ///   ONE 8-byte word. A contiguous multi-byte region is therefore necessarily a plain
+    ///   [`paging::encode_patch`], i.e. an unconditional store. But
+    ///   [`repoint_neighbour`](Self::repoint_neighbour)'s write is a *repair* — valid only while the
+    ///   word still names the record being removed — and `rmp` #1054 measured what an unconditional
+    ///   store of that word costs: relationship 30's `end_prev`, published to 34 by the transaction
+    ///   that displaced it, overwritten with 0 by a repair built from an earlier read. Route (a)
+    ///   would have bought reader-atomicity by re-opening that lost update.
+    /// * **The marker byte is shared, so its post-image must be computed under the latch.** One
+    ///   `chain_flags` byte carries BOTH sides' first-in-chain bits, so setting one bit is a
+    ///   read-modify-write two writers can lose — the very defect `rmp` #1028 fixed and the reason
+    ///   `clear_chain_first_flags` existed. A contiguous region write carries a byte computed from
+    ///   the caller's unlatched `read_rel`, which is exactly the stale image that loses the other
+    ///   side's bit. Adjacency changes where the byte lives; it does not make an unlatched
+    ///   read-modify-write safe.
+    ///
+    /// **Route (b) — this function.** No format change and no migration; the price is paid in the log
+    /// and in the staging: each firing word carries its own redo image instead of one image for a
+    /// contiguous block, so a two-sided patch appends up to three records (two words plus the marker)
+    /// where a region write would append one, and callers stage [`ChainWordWrite`] ops instead of
+    /// mutating a decoded record. Recovery pays nothing: [`paging::apply_patch`] already applies both
+    /// image shapes, so there is no new WAL record type, no format version and no change to the
+    /// replay loop.
+    ///
+    /// **Stated honestly: the choice was structural, not measured.** #1050 asked for the two routes to
+    /// be separated "by measurement, not by preference", and they were not — a throughput number
+    /// cannot decide between a route that expresses the required semantics and one that cannot. What
+    /// *was* measured is the premise underneath both: `rmp` #1030's eight-reader run, cited in the
+    /// section above, which is what established that the write has to be one critical section at all.
+    /// Route (b) also landed as a side effect of `rmp` #1054 rather than as a deliberate choice made
+    /// against this list; the list is the reasoning reconstructed and checked against the code, and it
+    /// holds, but it was written after the fact and says so.
+    ///
     /// # Why the redo images differ per op
     ///
     /// A conditional repair logs [`paging::encode_cas_patch`], which carries the comparison into the
@@ -10846,6 +10901,23 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// owned publication logs a plain [`paging::encode_patch`]. The marker byte is an absolute image
     /// and is sound as one because every writer of it now takes this same latch, so log order is
     /// apply order for that byte.
+    ///
+    /// Every one of them is **redo-only**: there is no undo image, so neither `rollback_physical` nor
+    /// crash recovery ever re-applies a pre-image of these words. That is deliberate and is the same
+    /// reasoning [`compare_and_publish_chain_head`](Self::compare_and_publish_chain_head) carries — a
+    /// chain word's inverse is computed at abort time by walking the chain, never restored from an
+    /// image, because an image restores an **id**, and an id only means something while it still names
+    /// the same record (`rmp` #970).
+    ///
+    /// # How this is proved
+    ///
+    /// `crates/graphus-storage/tests/chain_word_atomicity_1050.rs`, in two halves that do not imply
+    /// each other: a WAL extent oracle requiring every image logged against the neighbour's record to
+    /// lie inside the back-pointer word or the marker byte (it fails, redo and undo, the moment the
+    /// whole-record write returns), and eight real reader threads requiring that a live relationship's
+    /// back-pointer and its first-in-chain marker are never observed disagreeing (it fails when the
+    /// single [`with_page_mut_lsn_if`](graphus_bufpool::ConcurrentBufferPool::with_page_mut_lsn_if)
+    /// below is split in two).
     ///
     /// # Errors
     /// Returns a storage error if the record's page cannot be mapped, fetched or written.

@@ -1632,7 +1632,7 @@ stated at the site:
 | `set_owner_first_prop` | whole owner-record write installing `first_prop` | conditional publication, fail-closed | GC |
 | `retire_own_prop_cell` | unconditional 8-byte write of `first_prop` | conditional publication, fail-closed | transactional |
 | `detach_own_deltas` | unconditional header-word write repointing the live `undo_ptr` | conditional publication, fail-closed | transactional |
-| `repoint_neighbour` | whole `RelRecord` write carrying `first_prop` and `undo_ptr` | only the chain-pointer words that changed, one write per word | transactional |
+| `repoint_neighbour` | whole `RelRecord` write carrying `first_prop` and `undo_ptr` | only the back-pointer word(s) that changed and the first-in-chain marker bit beside them — no field it does not change, and all of it in one frame-latch hold (task #1054) | transactional |
 | `undo_own_creation` | zeroes the whole MVCC header, `undo_ptr` included | **unchanged, exempt**: the transaction created the record, the slot has never been visible to another writer, and no chain reaches it by the time this runs — there is no head for anyone to be publishing | transactional |
 | `relink_run_endpoint`, `reclaim_node`, `reclaim_rel`, `gc_splice_corpses` phase 3, `free_undo_chain` | whole-record or header writes carrying head words | unchanged, covered by GC exclusivity | GC only |
 
@@ -1644,7 +1644,41 @@ entry that prepend just linked in. A refusal is therefore not an error at `unlin
 the news that this is no longer the head, and the unlink restarts and takes the neighbour branch.
 Second, `repoint_neighbour` writes **per word, not per block**: two unlinks can legitimately touch the
 same neighbour at once, one facing its start node and one facing its end node, and a block write from
-a stale read would have each revert the other's side.
+a stale read would have each revert the other's side. It no longer carries a single foreign field —
+not `first_prop`, not the MVCC header, not the chain words it does not touch — and it never restores
+one, because its images are redo-only and there is no pre-image for a rollback or a recovery to
+re-apply.
+
+**Non-clobbering and atomic at the same time (task #1050).** Writing less than the whole record and
+writing it atomically were, with the primitives of the time, mutually exclusive, and task #1050 was
+filed on exactly that: a whole-record write is one acquisition of the frame write latch and therefore
+atomic against a reader taking the read latch, but it clobbers; per-word writes do not clobber and are
+not atomic — a reader lands between the re-pointed back-pointer and the marker that has not yet been
+set, which is a state no consistent snapshot contained. The chain-pointer words are contiguous
+(`61..93`) but `chain_flags` sits at `101`, so no single region write covers both.
+
+Task #1050 offered two routes. Moving `chain_flags` next to the pointer block, so one contiguous
+region write covers both, would have cost a format version and a migration path for every existing
+`rels.store` — and would still have been **unsound**, for two reasons independent of that cost: a
+region image is a plain post-image, so it cannot express the compare-and-set the repair needs, which
+re-opens the lost update task #1054 measured and closed; and the marker byte carries both sides' bits, so its
+post-image has to be computed under the latch rather than taken from the caller's unlatched read (the
+shared-byte read-modify-write of task #1028). The route taken instead — `RecordStore::patch_chain_words`,
+a multi-region primitive that takes the frame write latch **once** and applies every staged word and
+the marker inside that one hold — costs no format change and no migration; it pays one WAL record per
+word instead of one per block, and nothing at all in recovery, because `paging::apply_patch` already
+applies both image shapes. The decision was therefore structural rather than measured: no throughput
+number can choose between a route that expresses the required semantics and one that cannot.
+
+Both halves are asserted, separately, in `crates/graphus-storage/tests/chain_word_atomicity_1050.rs`:
+a WAL extent oracle requires every image logged against the neighbour's record to fall inside the
+back-pointer word or the marker byte, and eight real reader threads require that a live relationship's
+back-pointer and its first-in-chain marker are never observed disagreeing. The second is a thread test
+and not a deterministic-simulator one on purpose: `patch_chain_words` runs inside a `NoSwitchScope`, so
+under the DST scheduler no other logical thread can be scheduled anywhere within it and a scheduled
+reader would report a split write as sound. The frame latch is an ordinary reader-writer lock and a
+production reader is not scheduler-mediated, which is why the original measurement needed eight
+OS-level readers.
 
 The GC rows are safe for the same reason the corpse splice's refusal is fail-closed: a GC pass holds
 the store exclusively. That exclusivity is a single-writer convention documented in prose, not a lock —
@@ -1652,9 +1686,9 @@ the store exclusively. That exclusivity is a single-writer convention documented
 
 One writer class neither this section nor the code comments mentioned before #1030: the **deferred WAL
 undo** of a whole-record write is a second writer of all three words, re-applied at
-`rollback_physical` and at crash recovery from a pre-image taken before the write. It shrank with
-`repoint_neighbour`'s conversion — each word now carries its own pre-image — but the GC whole-record
-writers still have it.
+`rollback_physical` and at crash recovery from a pre-image taken before the write. `repoint_neighbour`
+is out of that class entirely since task #1054: `patch_chain_words` logs redo-only records, so its
+writes carry no pre-image for anything to re-apply. The GC whole-record writers still have it.
 
 **How this is proved.** Two suites, deliberately different in kind, because neither can stand in for
 the other:
