@@ -1900,6 +1900,31 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// winner is publishing the same fold, so this is never acquired blocking. Try-lock only creates
     /// no wait edge, which is why this needs no rank in `graphus_core::latch`.
     counts_fold_lock: Mutex<()>,
+    /// Redo-bounding auto-checkpoints that a [`RecordStore::commit`] attempted **after** its
+    /// transaction was already durable and that failed — the count, and the last one's message
+    /// (`rmp` #1079).
+    ///
+    /// Such a failure is not the committer's: the transaction is on stable storage and returning an
+    /// error for it would be an ACID lie (see [`RecordStore::commit`]). But it must not vanish either,
+    /// so it is retained here. A leaf lock touched only on the failure path — nothing is acquired
+    /// while it is held and no successful commit ever takes it — so it needs no rank in
+    /// `graphus_core::latch` and costs the hot path nothing.
+    deferred_checkpoints: (AtomicU64, Mutex<Option<String>>),
+    /// The WAL length at the most recent deferral (`rmp` #1079) — the damper that stops a persistently
+    /// failing device turning every subsequent commit into a full failing checkpoint.
+    ///
+    /// It bounds the retry RATE and nothing else. The debt itself is held by
+    /// `wal_len_at_last_checkpoint`, which a failed checkpoint never advances, so this field can only
+    /// ever postpone the next attempt by one cadence interval — never cancel it. It needs no clearing
+    /// (and therefore cannot be left set by mistake): once a checkpoint succeeds,
+    /// `wal_len_at_last_checkpoint` overtakes it and the `max` below stops reading it.
+    ///
+    /// Every reference engine damps this the same way and for the same reason — PostgreSQL's
+    /// checkpointer sleeps before retrying a failed checkpoint, InnoDB's checkpointer waits out its
+    /// timer, Neo4j reschedules on its own interval — because all three run checkpoints on a paced
+    /// thread rather than on a committer. Graphus reaches the auto-checkpoint from a committer, so the
+    /// pacing has to be explicit.
+    deferred_checkpoint_wal_len: AtomicU64,
 }
 
 /// Default automatic-checkpoint cadence: take a checkpoint every ~64 MiB of appended WAL. Chosen to
@@ -2252,6 +2277,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             counts_fold_lock: Mutex::new(()),
             delta_floors: Mutex::new(BTreeMap::new()),
             meta_chunk_writes: (AtomicU64::new(0), AtomicU64::new(0)),
+            deferred_checkpoints: (AtomicU64::new(0), Mutex::new(None)),
+            deferred_checkpoint_wal_len: AtomicU64::new(0),
         };
         store.init_meta_page()?;
         store.checkpoint_meta(SYSTEM_TXN, true)?;
@@ -2465,6 +2492,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             counts_fold_lock: Mutex::new(()),
             delta_floors: Mutex::new(BTreeMap::new()),
             meta_chunk_writes: (AtomicU64::new(0), AtomicU64::new(0)),
+            deferred_checkpoints: (AtomicU64::new(0), Mutex::new(None)),
+            deferred_checkpoint_wal_len: AtomicU64::new(0),
         };
         // Size the WAL segment seal threshold to the RECOVERED store, so a reopened database immediately
         // uses a segment size matched to its data image rather than the sink's default 64 MiB (`rmp` #706).
@@ -4372,8 +4401,41 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// coordinator's SSI `record_commit` sees a fresh timestamp, byte-identical to before), it is just
     /// not made durable — a harmless post-crash reissue, since the transaction produced no versions.
     ///
+    /// # The error boundary is the durability point (`rmp` #1079)
+    ///
+    /// Everything this method can report as a failure happens **before** the `fdatasync`. Once
+    /// [`harden_wal`](Self::harden_wal) returns, `txn` is durable — recovery will replay it — and from
+    /// that instant an `Err` out of here would be a lie the client cannot act on: retry and the
+    /// transaction lands twice, give up and a write that is on disk is treated as lost.
+    ///
+    /// The one step that used to cross that line is the redo-bounding auto-checkpoint
+    /// (`maybe_checkpoint`). It cannot be moved before the durability point, because what it bounds is
+    /// the redo of records that do not exist until they are appended; and it does not need to be,
+    /// because it is not this transaction's durability. Since `rmp` #1067 the durable cardinality is a
+    /// **base plus every retained delta the base does not name**, and this transaction's delta is in
+    /// the log with its `COMMIT` record: a catalogue image that never lands names fewer transactions,
+    /// it does not lose one. What the failure actually costs is a longer recovery and a WAL prefix that
+    /// stays unreclaimed — an availability concern, never a durability one.
+    ///
+    /// So a failed auto-checkpoint is **deferred**, not returned:
+    /// [`deferred_checkpoints`](Self::deferred_checkpoints) counts it and
+    /// [`last_deferred_checkpoint_error`](Self::last_deferred_checkpoint_error) keeps its message, and
+    /// the next commit retries — `wal_len_at_last_checkpoint` advances only at the END of a successful
+    /// [`checkpoint`](Self::checkpoint), so the cadence predicate stays true and the debt is retained
+    /// by construction rather than by a flag someone has to remember to leave set.
+    ///
+    /// The deferral is scoped to **this** call and nothing else. [`checkpoint`](Self::checkpoint),
+    /// [`checkpoint_if_due`](Self::checkpoint_if_due) and
+    /// [`settle_counts_into_image`](Self::settle_counts_into_image) — the operator-driven, shutdown and
+    /// backup paths — still return the error unchanged, so the fault is silent to nobody who asked.
+    /// This is also what the engine's group-commit path has done since `rmp` #528
+    /// (`checkpoint_after_batch`, which takes the same checkpoint after the same `fdatasync` and logs
+    /// its failure instead of failing the batch); this method was simply never brought into line.
+    ///
     /// # Errors
-    /// Returns a storage error if the catalog cannot be persisted or `txn` is not active.
+    /// Returns a storage error if `txn` is not active, or if the catalog cannot be persisted — both of
+    /// which are decided **before** `txn` becomes durable, so an `Err` here always means the
+    /// transaction did not commit.
     ///
     /// # Panics
     /// Panics if the commit `fdatasync` fails (`04 §4.9`) — for a read-only commit no sync is issued.
@@ -4388,10 +4450,56 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // durable bytes, same fsync placement observationally, same checkpoint cadence).
             Some(_commit_lsn) => {
                 self.harden_wal();
-                self.maybe_checkpoint()?;
+                // THE DURABILITY POINT IS BEHIND US. `txn` is on stable storage and will be replayed
+                // by recovery whatever happens next, so nothing below may be reported as its failure
+                // (`rmp` #1079 — see the section above).
+                if let Err(e) = self.maybe_checkpoint() {
+                    self.defer_failed_checkpoint(&e);
+                }
                 Ok(commit_ts)
             }
         }
+    }
+
+    /// Records a redo-bounding auto-checkpoint that failed **after** its committer was already durable
+    /// (`rmp` #1079), so the failure is retained and observable instead of being returned as that
+    /// committer's error. See [`commit`](Self::commit) for why it is not returned.
+    fn defer_failed_checkpoint(&self, err: &GraphusError) {
+        self.deferred_checkpoints.0.fetch_add(1, Ordering::Relaxed);
+        // Pace the retry off the log position the failure was observed at, so the next attempt waits
+        // out a full cadence interval instead of running on the very next commit.
+        let durable = self.wal.with(|w| w.durable_len());
+        self.deferred_checkpoint_wal_len
+            .fetch_max(durable, Ordering::Relaxed);
+        *self
+            .deferred_checkpoints
+            .1
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(err.to_string());
+    }
+
+    /// How many redo-bounding auto-checkpoints [`commit`](Self::commit) has attempted **after** its
+    /// transaction was durable and found failing (`rmp` #1079), since `create`/`open`.
+    ///
+    /// Non-zero means the store is committing correctly but is not bounding its own recovery redo and
+    /// is not reclaiming its WAL. That is the signal an operator — or the server's per-engine
+    /// maintenance-degraded gate — needs, and it is the only trace such a failure leaves: the commit
+    /// that hit it returned `Ok`, because it had every right to.
+    #[must_use]
+    pub fn deferred_checkpoints(&self) -> u64 {
+        self.deferred_checkpoints.0.load(Ordering::Relaxed)
+    }
+
+    /// The message of the most recent deferred auto-checkpoint failure (`rmp` #1079), or `None` if
+    /// none has occurred. Retained rather than only counted so the fault can be diagnosed from the
+    /// store itself; the counter answers "is it still happening", this answers "what is it".
+    #[must_use]
+    pub fn last_deferred_checkpoint_error(&self) -> Option<String> {
+        self.deferred_checkpoints
+            .1
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Commit-**PREPARE** (cross-transaction group commit, phase 1, `04 §4.2` / `rmp` #528): runs the
@@ -5226,7 +5334,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             return Ok(());
         }
         let durable = self.wal.with(|w| w.durable_len());
-        let since = self.with_commit_durability(|d| d.wal_len_at_last_checkpoint);
+        // The later of "where the last SUCCESSFUL checkpoint left off" and "where the last deferral
+        // was observed" (`rmp` #1079). Only the first of those two carries the debt — it is not
+        // advanced by a failure, so the checkpoint is always still owed — and the second only paces
+        // how often the attempt is repeated while a device keeps refusing it.
+        let since = self
+            .with_commit_durability(|d| d.wal_len_at_last_checkpoint)
+            .max(self.deferred_checkpoint_wal_len.load(Ordering::Relaxed));
         if durable.saturating_sub(since) >= interval {
             self.checkpoint()?;
         }

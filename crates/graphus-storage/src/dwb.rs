@@ -560,6 +560,21 @@ impl<D: BlockDevice> Dwb<D> {
     /// checkpoint never moves the recovery floor backwards), so a late/out-of-order call cannot widen
     /// the window of honoured stale slots.
     ///
+    /// # THE FIELD IS ADVANCED LAST, AND THAT ORDER IS THE WHOLE GUARANTEE (`rmp` #1079)
+    ///
+    /// This used to assign `self.floor` first and write afterwards, which turned a failed write into
+    /// a floor that is durably one value and in memory another — and the monotonic early-return above
+    /// then made the state permanent, because the retry passes the SAME floor, finds it not greater,
+    /// and returns `Ok(())` having written nothing. `RecordStore::checkpoint` takes that `Ok` as "the
+    /// floor is durable" and reclaims the WAL prefix below it, which is precisely the `rmp` #437
+    /// hazard the floor exists to prevent: an eviction-ring slot older than the floor stays honoured,
+    /// so on the next open it can restore a stale committed image over a torn newer home page with
+    /// the redo records that would have rolled it forward already gone.
+    ///
+    /// Assigning last makes every failure fail CLOSED: the in-memory floor still names what is
+    /// durably on the device, the caller's `?` aborts the checkpoint before the reclaim, and the next
+    /// attempt sees `floor > self.floor` and genuinely rewrites the header.
+    ///
     /// # Errors
     /// Returns a storage error if the header write or sync fails.
     pub fn set_floor(&mut self, floor: graphus_core::Lsn) -> Result<()> {
@@ -567,12 +582,14 @@ impl<D: BlockDevice> Dwb<D> {
             // Monotonic: never move the floor backwards (a stale/duplicate call is a no-op).
             return Ok(());
         }
-        self.floor = floor;
         // Re-stamp the batch region header (empty batch) with the new floor and make it durable.
-        let hdr = Self::encode_header(&[], self.floor);
+        let hdr = Self::encode_header(&[], floor);
         self.device
             .write_page(PageId(BATCH_REGION.header_slot), &hdr)?;
-        self.device.sync_data()
+        self.device.sync_data()?;
+        // DURABLE, therefore adoptable.
+        self.floor = floor;
+        Ok(())
     }
 
     /// The current in-memory persisted checkpoint-floor LSN (`rmp` #437; tests/diagnostics).

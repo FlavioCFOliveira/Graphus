@@ -677,6 +677,64 @@ acknowledge the affected commits, and **PANICs the process** (controlled abort) 
 silent data loss. On restart, ARIES recovery brings the database to the last durable consistent
 state. This is mandated by `D-durability-mode` and NFR-1.
 
+### 4.10 The error boundary of a commit
+
+**Every failure a commit can report happens before the durability point** (task **#1079**).
+`RecordStore::commit` (`crates/graphus-storage/src/store.rs`) runs the fallible commit steps, then the
+group-commit `fdatasync` (`harden_wal`), then the redo-bounding auto-checkpoint. That `fdatasync` is
+the durability point and the acknowledgement point at once: once it returns, the transaction is on
+stable storage and recovery will replay it, so an `Err` returned after it would be a lie the client
+cannot act on either way — retry and the transaction lands twice, give up and a write that is on disk
+is treated as lost. **An `Err` out of `commit` therefore always means the transaction did not commit.**
+
+**The auto-checkpoint cannot simply be moved earlier.** What it bounds is the redo of records that do
+not exist until they are appended, so by construction it runs after the `COMMIT` record. The catalogue
+write a commit performs *before* the durability point (`checkpoint_meta`) is a different step, and a
+failure there does correctly abort the commit.
+
+**Deferring it is sound rather than a loss.** Since task #1067 the durable cardinality is a **base plus
+every retained delta the base does not name** (§4.1), and a committing transaction's delta sits in the
+log alongside its `COMMIT` record. The catalogue image is a startup optimization and an enabler of WAL
+reclamation, never the source of truth — every byte of it is WAL-logged, so ARIES redo (§4.8)
+reconstructs it. A catalogue image that never lands names fewer transactions; it loses none. The cost
+of the failure is a longer recovery and a WAL prefix that stays unreclaimed — availability, not
+durability.
+
+**Three properties keep that deferral from failing open**, which is the hazard of any swallowed error:
+
+1. **The retry is structural.** The checkpoint cadence watermark (`wal_len_at_last_checkpoint`)
+   advances only at the end of a *successful* checkpoint, so the cadence predicate stays true and the
+   next commit retries. There is no flag anyone has to remember to leave set.
+2. **The failure is retained and observable on the store itself** — a count of deferred checkpoints and
+   the last failure's message (`RecordStore::deferred_checkpoints` and
+   `RecordStore::last_deferred_checkpoint_error`). A store with a non-zero count is committing
+   correctly but is neither bounding its recovery redo nor reclaiming its WAL. That is the signal an
+   operator needs, and the intended input to the server's per-engine maintenance-degraded gate; until
+   that wiring lands, the same device fault is caught independently by the background maintenance
+   cadence, which already records a maintenance failure and degrades the engine.
+3. **The deferral is scoped to that one call.** The operator-driven, shutdown and backup paths
+   (`RecordStore::checkpoint`, `checkpoint_if_due`, `settle_counts_into_image`) still return the error
+   unchanged.
+
+**The retry is paced, because Graphus reaches this checkpoint from a committer.** PostgreSQL, InnoDB
+and Neo4j all take their checkpoints on a dedicated thread whose timer damps a failing retry for free;
+a committer has no such timer, so an undamped deferral would make every subsequent commit run a full
+checkpoint — flush included — only to fail again. The store therefore records the WAL length at the
+deferral and requires another cadence interval of log before the next attempt. This bounds the retry
+*rate* only: the debt still lives in `wal_len_at_last_checkpoint`, which no failure advances, so the
+pacing can postpone an attempt but never cancel one, and it needs no clearing — a successful
+checkpoint overtakes it.
+
+The engine's group-commit path has behaved this way since task **#528** (`checkpoint_after_batch` in
+`crates/graphus-server/src/engine/mod.rs` takes the same checkpoint after the same `fdatasync` and logs
+a failure rather than failing the batch); task #1079 brings the single-commit path into line with it,
+so the contract no longer depends on which commit path a caller took. The contract is pinned by
+`crates/graphus-storage/tests/commit_error_after_durability_1079.rs`, which injects a device failure of
+the catalogue image write on either side of the durability point and asserts the two different
+outcomes, and repeats the post-durability case against a *different* fallible step of the same
+checkpoint (the WAL prefix reclaim) — because what the contract turns on is the boundary, not the
+identity of the step that failed.
+
 ---
 
 ## 5. MVCC + SSI transaction manager
