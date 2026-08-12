@@ -1,6 +1,6 @@
 //! Integration tests for the public `graphus-txn` API: isolation-level behaviour, the canonical
 //! SSI write-skew (SERIALIZABLE vs SI), lost-update/dirty-write prevention, non-blocking reads,
-//! deadlock detection, and version GC. These exercise the manager's contract end to end
+//! write-write conflict refusal, and version GC. These exercise the manager's contract end to end
 //! (`specification/04-technical-design.md` §5).
 
 use graphus_core::GraphusError;
@@ -111,7 +111,7 @@ fn lost_update_is_prevented_by_write_write_conflict() {
 /// freely writes and commits the very key the reader is reading. Asserted via the API: the reader's
 /// read returns without error/blocking, the writer's write/commit succeed, and the reader keeps
 /// seeing its snapshot. (Single-threaded logic: "never blocks" is shown by reads taking no lock —
-/// the writer is granted the write lock even while the reader's snapshot is open.)
+/// the writer is admitted even while the reader's snapshot is open.)
 #[test]
 fn reads_never_block_writers() {
     let mut m = seeded();
@@ -131,10 +131,22 @@ fn reads_never_block_writers() {
     assert!(m.commit(reader).is_ok());
 }
 
-/// Deadlock detection aborts the youngest on a write-write wait cycle. T1 holds A then wants B; T2
-/// holds B then wants A — a 2-cycle. The younger (T2) is aborted with a retriable error.
+/// First-updater-wins refuses **both** writers of a mutual cross-key conflict, and a refused write
+/// leaves its transaction committable.
+///
+/// T1 writes X then wants Y; T2 writes Y then wants X. Under a blocking lock manager this shape is a
+/// wait-for cycle — the classic deadlock — and would need a detector to break it. Here nothing ever
+/// waits: since `rmp` #971 there is no lock table and no deadlock detector, so each transaction's
+/// second write is simply refused on the spot with a retriable error, and the cycle cannot form.
+///
+/// Two properties are pinned, neither of which
+/// [`lost_update_is_prevented_by_write_write_conflict`] covers (there the two writers contend on the
+/// *same* key and only the second is ever refused):
+///
+/// 1. the refusal is **symmetric** — each writer is refused the key the other holds;
+/// 2. a refused write does **not** poison its transaction — T1 still commits afterwards.
 #[test]
-fn deadlock_aborts_the_youngest() {
+fn mutual_cross_key_conflict_refuses_both_and_the_holder_still_commits() {
     let mut m = seeded();
     let t1 = m.begin_serializable().unwrap();
     let t2 = m.begin_serializable().unwrap();
@@ -142,17 +154,21 @@ fn deadlock_aborts_the_youngest() {
     m.write(t1, X, b"a".to_vec()).unwrap(); // T1 holds X
     m.write(t2, Y, b"b".to_vec()).unwrap(); // T2 holds Y
 
-    // T1 now wants Y (held by T2): with the single-threaded model this is reported as a conflict
-    // rather than a real park, but the wait-for edge is recorded.
-    let _ = m.write(t1, Y, b"a2".to_vec());
-    // T2 wants X (held by T1): this closes the cycle, so the detector fires and aborts the youngest.
-    let r = m.write(t2, X, b"b2".to_vec());
+    // T1 wants Y, held by T2: refused immediately, no wait.
+    let r1 = m.write(t1, Y, b"a2".to_vec());
     assert!(
-        matches!(r, Err(GraphusError::Transaction(_))),
-        "the deadlock victim must get a retriable error; got {r:?}"
+        matches!(r1, Err(GraphusError::Transaction(_))),
+        "T1's write to the key T2 holds must be refused retriably; got {r1:?}"
+    );
+    // T2 wants X, held by T1: refused the same way. Under a blocking manager this is where the cycle
+    // would close; here it is just the mirror image of the refusal above.
+    let r2 = m.write(t2, X, b"b2".to_vec());
+    assert!(
+        matches!(r2, Err(GraphusError::Transaction(_))),
+        "T2's write to the key T1 holds must be refused retriably; got {r2:?}"
     );
 
-    // T1 (the older, surviving transaction) can still commit.
+    // A refused write leaves the transaction usable: T1 still commits the write it did land.
     assert!(m.commit(t1).is_ok());
 }
 

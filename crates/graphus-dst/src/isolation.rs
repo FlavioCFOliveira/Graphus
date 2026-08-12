@@ -243,16 +243,17 @@ mod tests {
 
     /// **Guards `rmp` #967** — the loser of a write–write conflict must not be able to COMMIT.
     ///
-    /// A write–write conflict is refused at two sites that agree on the victim: the coordinator's
-    /// first-updater-wins `LockTable` (`RecordGraph::note_write`) and, since `rmp` #967, the store's
-    /// `RecordStore::ensure_no_conflicting_writer` (`D-property-write-conflict`). Both raise a
-    /// **retriable** `GraphusError::Transaction`, and both document the same contract: the error is
+    /// A write–write conflict is refused first-updater-wins in the storage layer, on the entity's own
+    /// MVCC header, by `RecordStore::ensure_no_conflicting_writer` (`rmp` #967,
+    /// `D-property-write-conflict`) — since `rmp` #971 the sole refusal site, the coordinator's lock
+    /// table having been retired. It raises a
+    /// **retriable** `GraphusError::Transaction` and documents the contract: the error is
     /// captured *so the caller rolls this transaction back*. That caller existed only for auto-commit
     /// statements; an explicit transaction whose write was refused stayed open and **committed
     /// successfully**, reporting success for a write the engine had rejected.
     ///
     /// That is not merely untidy: the refused writer's SSI footprint is announced *before* the refusal
-    /// (`note_write` records the write marker before it acquires the lock), so while it stays open the
+    /// (`note_write` records the write marker before the store call that refuses it), so while it stays open the
     /// holder acquires an outbound rw-edge to a write that never happened, becomes a Case-A pivot and
     /// is aborted — leaving the phantom writer as the sole committer and the counter at its pre-image.
     /// [`write_write_conflict_is_detected`] is the end-to-end oracle for that lost update; this is the

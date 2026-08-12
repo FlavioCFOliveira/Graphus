@@ -88,7 +88,7 @@ const PAGE_SIZE: u64 = 8192;
 /// How long a client waits for a server reply before giving up.
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// How many times a retriable transaction error (an SSI / write-lock conflict) is retried before the
+/// How many times a retriable transaction error (an SSI or write-write conflict) is retried before the
 /// run gives up on that statement. Sensor-sharded ingest should never conflict, so a non-zero retry
 /// count is itself evidence worth reporting.
 const MAX_RETRIES: u32 = 8;
@@ -255,7 +255,7 @@ impl Target {
     }
 }
 
-/// Whether a server failure is a **retriable** transaction conflict (SSI / write-lock) rather than a
+/// Whether a server failure is a **retriable** transaction conflict (SSI or write-write) rather than a
 /// terminal error. Neo4j-compatible clients key off the `TransientError` classification and the
 /// `Neo.TransientError.Transaction.*` code family, which Graphus reproduces.
 fn is_retriable(err: &ClientError) -> bool {

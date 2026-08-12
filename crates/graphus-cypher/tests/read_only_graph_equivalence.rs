@@ -246,7 +246,7 @@ fn populate_label_index(store: &Store, index: &SharedCell<IndexSet>) {
 }
 
 /// A shared coordinated environment over one `Rc`-shared store: the `ssi` tracker (so reads register
-/// SIREAD markers), the lock table, and the populated derived index/column/zone sidecars `attach`
+/// SIREAD markers) and the populated derived index/column/zone sidecars `attach`
 /// requires. Owning the `SharedRef<Store>` here is what lets the test build the off-thread
 /// `StoreReadView` from the very same store the live seam reads.
 struct Coordinated {

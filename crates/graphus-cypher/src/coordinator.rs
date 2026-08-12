@@ -10,7 +10,10 @@
 //!   `rmp` task #45: [`RecordStore::snapshot_ts`] is the begin snapshot, and a `commit` advances it);
 //! - it owns the shared [`SsiTracker`] from `graphus-txn` — the **complete,
 //!   tested** SSI machine — so each transaction's statements contribute non-blocking SIREAD markers
-//!   and rw-antidependency edges, and writes take a first-updater-wins lock;
+//!   and rw-antidependency edges. Write-write conflicts are not handled here: since `rmp` #971 they
+//!   are detected first-updater-wins in the storage layer, on the entity's own MVCC header, by
+//!   `RecordStore::ensure_no_conflicting_writer`, which refuses the second writer retriably without
+//!   ever waiting;
 //! - at [`commit`](TxnCoordinator::commit) it runs SSI validation (SERIALIZABLE only) and aborts a
 //!   **pivot** on a dangerous structure with a retriable serialization error (PostgreSQL safe-retry:
 //!   at least one transaction in any unsafe set commits, no livelock). [`IsolationLevel::Snapshot`]
@@ -1578,7 +1581,6 @@ pub struct TxnCoordinator<D: BlockDevice, S: LogSink> {
     store: SharedRef<RecordStore<D, S>>,
     /// The shared SSI dangerous-structure tracker (`04 §5.4`).
     ssi: SharedCell<SsiTracker>,
-    /// The shared first-updater-wins write-lock table (`04 §5.7`).
     /// The shared derived secondary [`IndexSet`] (`rmp` task #48): the always-present label index
     /// plus any declared node-property indexes. Rebuilt from the store on [`new`](Self::new) and on
     /// [`create_node_property_index`](Self::create_node_property_index), and maintained per write by
@@ -3152,9 +3154,9 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         id: u64,
         registered: &[(u32, u32)],
     ) {
-        // Read this node's label-membership SUPERSET — the live word unioned with every bitmap
-        // `LabelHistory` still retains for it (`rmp` task #904) — in a store borrow released before the
-        // index borrow.
+        // Read this node's label-membership SUPERSET — the live word widened by every label an
+        // `AddLabel` delta on its undo chain could restore (`rmp` task #904) — in a store borrow
+        // released before the index borrow.
         //
         // # Why the superset and not the live word (`rmp` task #904)
         //
@@ -3452,8 +3454,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         index: &SharedCell<IndexSet>,
         id: u64,
     ) {
-        // Read the node's label-membership SUPERSET (`rmp` task #904 — the live word unioned with every
-        // bitmap `LabelHistory` retains, never the raw live word; see
+        // Read the node's label-membership SUPERSET (`rmp` task #904 — the live word widened by every
+        // label an `AddLabel` delta on its undo chain could restore, never the raw live word; see
         // `RecordStore::node_label_superset`), the covered full-text keys and its live property CELLS
         // in one shared borrow scope (`node_label_superset` / `superset_scan_node_properties` are
         // `&self`, `rmp` #337 Slice 2).
@@ -7973,7 +7975,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ///    [`oldest_active_snapshot`](Self::oldest_active_snapshot), so GC cannot reclaim a version the
     ///    walk is still reading;
     /// 3. commit / rollback through [`commit`](Self::commit) and [`rollback`](Self::rollback), which
-    ///    run SSI validation and release the SSI entry, the lock table and the active-set slot under a
+    ///    run SSI validation and release the SSI entry and the active-set slot under a
     ///    drop guard (`rmp` #415) instead of leaking them.
     ///
     /// The DDL cannot be *spuriously* aborted by (3): it announces no predicate write and takes no
@@ -11988,8 +11990,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             .saturating_mul(graphus_io::PAGE_SIZE as u64)
     }
 
-    /// Rolls `txn` back: undoes its writes on the store, forgets its SSI markers, and releases its
-    /// locks.
+    /// Rolls `txn` back: undoes its writes on the store, forgets its SSI markers, and frees its
+    /// active-set slot.
     ///
     /// # Errors
     /// Returns [`GraphusError::Transaction`] if `txn` is not open, or a storage error if the undo
@@ -12180,7 +12182,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
 
     /// Mints one fresh, coordinator-issued [`TxnId`] from [`Self::next_txn_id`](Self#structfield.next_txn_id)
     /// and hands `f` mutable store access under it — **without** registering the id in
-    /// [`active`](Self#structfield.active), the SSI tracker, or the lock table (`rmp` #519, network
+    /// [`active`](Self#structfield.active) or the SSI tracker (`rmp` #519, network
     /// bulk-import Mode A).
     ///
     /// This is the raw, transaction-agnostic sibling of [`with_store_mut`](Self::with_store_mut) (used
@@ -12222,17 +12224,18 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// (the historical ordering), the three pure in-memory cleanups would be skipped and the
     /// transaction would **leak**: it would stay in [`active`](Self#structfield.active) forever, pinning
     /// `oldest_active_snapshot`, freezing the GC watermark (unbounded version accumulation → slow OOM),
-    /// keeping its SSI rw-edges (false-aborting innocent transactions) and holding its locks.
+    /// and keeping its SSI rw-edges (false-aborting innocent transactions).
     ///
-    /// So the in-memory SSI / lock / active-set state is freed **unconditionally**, whether or not the
+    /// So the in-memory SSI / active-set state is freed **unconditionally**, whether or not the
     /// durable undo succeeds, returns `Err`, or panics. This is sound: a half-undone *durable* state is
     /// the store's concern and is reconciled by ARIES recovery on the next open; the in-memory
     /// bookkeeping carries no durability obligation and must never leak. A [`Cleanup`] drop guard runs
     /// the cleanup on every exit path (normal return, `?` early-return, or unwind). The cleanup borrows
-    /// only `ssi` / `locks` (distinct `RefCell`s from `store`) and `active` (no `RefCell`), so it never
-    /// conflicts with the store borrow even when that borrow is being torn down by an unwind. Each step
-    /// is idempotent (`forget` / `release_all` / `HashMap::remove` are no-ops for an absent txn), so a
-    /// double abort cannot double-free.
+    /// only `ssi` / `index` (distinct `RefCell`s from `store`) and `active` (a `Mutex`, not a
+    /// `RefCell`), so it never conflicts with the store borrow even when that borrow is being torn down
+    /// by an unwind. Each step is idempotent (`SsiTracker::forget`, `rollback_ft_spatial_marker` and
+    /// `HashMap::remove` are no-ops for an absent / non-mutator txn), so a double abort cannot
+    /// double-free.
     ///
     /// # Bitmap index repair (`rmp` #453, F-IDX-3)
     ///
@@ -12293,7 +12296,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         }
 
         // Drain this txn's bitmap-dirtied node set BEFORE the undo (`rmp` #453, F-IDX-3): this frees the
-        // per-txn bookkeeping unconditionally — like the SSI/lock leak-safety — so even a panicking undo
+        // per-txn bookkeeping unconditionally — like the SSI leak-safety — so even a panicking undo
         // cannot leak it. The set is complete (statement maintenance has finished by abort time) and the
         // undo never grows it, so draining now loses nothing. Re-derivation runs AFTER a successful undo.
         let dirty_bitmap_nodes = self.index.borrow_mut().take_dirty_bitmap_nodes(txn);
@@ -12309,7 +12312,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             txn,
         };
         // The durable undo runs while the guard is armed. Its borrow of `self.store` is a *different*
-        // `RefCell` from the guard's `ssi`/`locks`, so an `Err` (early `?` return) or a panic both leave
+        // `RefCell` from the guard's `ssi`/`index`, so an `Err` (early `?` return) or a panic both leave
         // the guard free to run its cleanup on scope exit / unwind without a borrow conflict.
         let undo = self.store.borrow_mut().rollback(txn);
         drop(cleanup); // Free the in-memory state now; on `Err`/panic above this same drop runs anyway.
@@ -12497,7 +12500,8 @@ impl<D: BlockDevice, S: LogSink> Statistics for CoordinatorStatistics<D, S> {
 #[cfg(test)]
 mod abort_failure_tests {
     //! `rmp` #415 regression: an abort whose **durable store undo fails or panics** must still free
-    //! the transaction's pure in-memory state (SSI markers, write locks, the `active` entry), so it
+    //! the transaction's pure in-memory state (SSI markers, index rollback markers, the `active`
+    //! entry), so it
     //! can never leak — pinning `oldest_active_snapshot`, freezing the GC watermark into unbounded
     //! version accumulation (slow OOM behind the `rmp` #409 503), or false-aborting innocent
     //! transactions with stale rw-edges.

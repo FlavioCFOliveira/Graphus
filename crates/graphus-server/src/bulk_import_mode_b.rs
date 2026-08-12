@@ -301,7 +301,7 @@ impl BatchRows {
     }
 }
 
-/// Whether `err` is the **retriable** class (`08` §7.2.3's automatic-retry case): a write-write lock
+/// Whether `err` is the **retriable** class (`08` §7.2.3's automatic-retry case): a write-write
 /// conflict, an SSI pivot abort surfaced from a chunk's captured error, or a pivot abort surfaced
 /// from the batch's own `Commit` call. Matched structurally (never by string), per the codebase's
 /// established convention (`crates/graphus-bolt/src/error.rs`: `GraphusError::Transaction` is the

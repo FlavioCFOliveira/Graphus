@@ -6,7 +6,7 @@
 //! Findings covered:
 //! - SEC-197 — `next_txn_id` is `checked_add`-bounded; it can never reach a reserved/illegal `VersionStamp` (CWE-190).
 //! - SEC-198 — active-transaction admission cap + idle reaping bound the in-memory tables and free a frozen GC watermark (CWE-400).
-//! - SEC-199 — the deadlock detector is iterative; a deep wait-for chain cannot overflow the stack (CWE-674), correctness preserved.
+//! - SEC-199 — unbounded wait-for-chain recursion (CWE-674) is now **structurally** impossible: since `rmp` #971 there is no lock table, a writer never waits, and no wait-for chain exists to walk. The tests that pinned the iterative detector went with the mechanism (see below).
 //! - SEC-200 — the timestamp oracle refuses gracefully at exhaustion instead of panicking (CWE-248).
 
 use std::time::Duration;
@@ -152,7 +152,7 @@ fn sec198_reaper_does_not_abort_progressing_txn_after_op() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// SEC-199 — the deadlock detector is iterative: deep chains do not overflow the stack.
+// SEC-199 — no wait-for chain can form, so none can overflow the stack.
 // ---------------------------------------------------------------------------------------------
 
 // SEC-199 (wait-for-graph deadlock detection) had three tests here — a real cycle, a deep acyclic

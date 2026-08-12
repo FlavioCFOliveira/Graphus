@@ -385,9 +385,11 @@ surfaced are both incorporated below.
 a raw `RecordStore` write.** Today's offline `BulkImporter` calls
 `RecordStore::create_node`/`create_rel`/`set_node_property_value` **directly**
 (`crates/graphus-bulk/src/import.rs`), bypassing `graphus-cypher::TxnCoordinator` — the layer that
-owns the shared `SsiTracker` (SIREAD markers, rw-antidependency edges, pivot-abort-at-commit) and
-`LockTable` (first-updater-wins write-write conflicts) that let many concurrent transactions
-safely interleave over one store (`04-technical-design.md` §5.4/§5.7). That bypass is exactly why
+owns the shared `SsiTracker` (SIREAD markers, rw-antidependency edges, pivot-abort-at-commit) that
+lets many concurrent transactions safely interleave over one store (`04-technical-design.md`
+§5.4/§5.7). Write-write conflicts are refused first-updater-wins one layer lower, on the entity's own
+MVCC header by `RecordStore::ensure_no_conflicting_writer` (`D-write-conflict-detection`; the lock
+table this paragraph originally named was retired by rmp #971). That bypass is exactly why
 `BulkImporter` is fast today, and exactly why it is **only safe against a store with zero
 concurrent access** — it registers no conflict-detection state at all. Mode B has concurrent
 access by definition, so it **must** go through the coordinator:

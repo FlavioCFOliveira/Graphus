@@ -6101,7 +6101,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// node that never existed need no version. Skipping it is not an optimisation detail: `CREATE
     /// (:L)` goes through this path, so without the gate a bulk load of N labelled nodes would link N
     /// deltas that nothing can ever read (measured at ~2.9x on a pure label scan when the equivalent
-    /// gate was absent from `LabelHistory` — see [`track_label_history`](Self::track_label_history)).
+    /// gate was absent from the retired `LabelHistory`).
     ///
     /// # Errors
     /// Returns a storage error if a delta cannot be allocated, written, or linked, and

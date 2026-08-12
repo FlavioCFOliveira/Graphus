@@ -23,7 +23,7 @@
 //! The anomalies need statement-interleaved transactions over one node observed at **several explicit
 //! snapshot timestamps** — a seed committing a labelled node; a writer changing the label and staying
 //! *open*; then the same writer committing. Driven at the [`RecordStore`] layer (below the
-//! coordinator's lock table, the unguarded `IsolationLevel::Snapshot` path) it is fully deterministic.
+//! coordinator, on the unguarded `IsolationLevel::Snapshot` path) it is fully deterministic.
 //!
 //! ## The invariant asserted
 //!
@@ -33,11 +33,16 @@
 //!
 //! ## The crash variant proves the durability claim
 //!
-//! The retained versions live **in memory only** ([`graphus_storage::LabelHistory`]). The claim that
-//! justifies this — no reader can survive a restart, so no reader can ever ask for a pre-restart
-//! version — is asserted rather than assumed: after a crash and recovery the history is EMPTY and a
-//! fresh reader still observes the correct COMMITTED label set, because the ARIES undo has already
-//! restored the word itself (`rmp` #772's CAS logical undo).
+//! The retained versions are **durable**: since `rmp` #968 an older label membership is an
+//! `AddLabel` / `RemoveLabel` undo delta on the node's own chain, so it is WAL-logged and recovered
+//! like every other record. That is asserted rather than assumed: after a crash and recovery the
+//! node's label versions are STILL PRESENT, and a fresh reader observes the correct COMMITTED label
+//! set, the word itself having been restored by the ARIES undo (`rmp` #772's CAS logical undo).
+//!
+//! The in-memory design claimed the opposite — that after a crash the history is EMPTY and the
+//! recovered word is authoritative on its own — and that claim was an argument for why the versions
+//! could be *lost*, not a durability guarantee. Asserting its inverse is what makes the difference
+//! between the two designs observable rather than merely described.
 
 use graphus_core::{PageId, Timestamp, TxnId};
 use graphus_io::{BlockDevice, MemBlockDevice};
@@ -161,10 +166,10 @@ pub fn run_label_snapshot_visibility() -> LabelSnapshotReport {
 
 /// Runs the reproduction, then **crashes** (no-force or steal) and recovers.
 ///
-/// Returns `(label_present_after_recovery, history_is_empty_after_recovery)`. The committed state is
-/// "label removed", so after recovery the word must read as removed — and it must do so with an EMPTY
-/// history, which is the point: the in-memory versions are not needed across a restart because no
-/// reader survives one.
+/// Returns `(label_present_after_recovery, label_versions_absent_after_recovery)`. The committed
+/// state is "label removed", so after recovery the word must read as removed — and the node's label
+/// versions must STILL BE THERE, which is the point: since `rmp` #968 they are undo deltas, WAL-logged
+/// and recovered like every other record, so a reader that outlives a restart can still be served.
 #[must_use]
 pub fn run_label_snapshot_visibility_crash(steal: bool) -> (bool, bool) {
     let (store, n, _report) = drive_scenario();
@@ -222,17 +227,19 @@ fn crash_steal(store: Store) -> Store {
 /// Drives the **physical-id-reuse** scenario and returns
 /// `(reused_id_matched, resolved_bitmap, expected_bitmap)`.
 ///
-/// An IN-FLIGHT label writer's retained version is (correctly) unprunable — its stamp resolves to no
-/// commit timestamp — so a GC pass cannot collapse it. If that writer's node is meanwhile deleted by
-/// another transaction and its slot reclaimed in the same pass, the entry outlives the node. Physical
-/// ids are reused (`04 §2.7`), so a brand-new node then inherits it — and because
-/// [`LabelHistory::resolve`](graphus_storage::LabelHistory::resolve) ignores the live word whenever an
-/// entry exists, while the new node retains no version of its own (its creator is its own in-flight
-/// writer, which `RecordStore::track_label_history` deliberately skips), the DEAD node's bitmap is
-/// what the new node reports — permanently.
+/// The hazard this pins, in the shape the in-memory design had it: an IN-FLIGHT label writer's
+/// retained version is (correctly) unprunable — its stamp resolves to no commit timestamp — so a GC
+/// pass cannot collapse it. Were that writer's node meanwhile deleted by another transaction and its
+/// slot reclaimed, the retained version would outlive the node. Physical ids are reused (`04 §2.7`),
+/// so a brand-new node would then inherit it — permanently, because the id-keyed resolver preferred a
+/// retained entry over the live word while the new node retained no version of its own.
 ///
-/// `RecordStore::reclaim_node` purges the entry before the id reaches the free list, which is what
-/// closes this. The GC-time prune alone cannot: the version is unresolvable, hence unprunable.
+/// `rmp` #968 closes both halves, and the scenario pins both. The retained version is now an undo
+/// delta on the record's **own chain**, which is reclaimed with the record, so a reused slot starts at
+/// `undo_ptr == 0` and has nothing to inherit; and the in-flight relabeller holds the node's chain, so
+/// the concurrent delete is REFUSED with a retriable write-write conflict — which makes the dangerous
+/// ordering unreachable rather than merely harmless. Id reuse is still exercised end to end: it
+/// remains the thing that must not leak.
 #[must_use]
 pub fn run_reclaimed_id_reuse() -> (bool, u64, u64) {
     let device = MemBlockDevice::new(0);
@@ -406,15 +413,15 @@ mod tests {
     }
 
     /// `rmp` #767, Finding 4 (adversarial audit), verified through the REAL store rather than by
-    /// poking `LabelHistory`: after the GC pass forgets every committed writer, a `prune` at the
-    /// MAXIMUM watermark must drain the history to zero and disarm the hot-path gate.
+    /// poking the version state directly: after the GC pass forgets every committed writer, a `prune`
+    /// at the MAXIMUM watermark must drain the node's live label deltas to zero.
     ///
     /// While versions carried raw in-flight stamps this was impossible: a forgotten writer's version
-    /// had no resolvable commit timestamp, so no watermark could ever collapse it. The entry leaked
-    /// for the life of the process and pinned `any()` on, putting a lock + map lookup on every label
-    /// re-check in the store.
+    /// had no resolvable commit timestamp, so no watermark could ever collapse it. The version leaked
+    /// for the life of the process and kept the label fast-path gate armed, putting a lock + map lookup
+    /// on every label re-check in the store.
     #[test]
-    fn a_max_watermark_prune_drains_the_history_after_the_registry_forgets() {
+    fn a_max_watermark_prune_drains_the_label_deltas_after_the_registry_forgets() {
         let device = MemBlockDevice::new(0);
         let wal = WalManager::create(MemLogSink::new()).expect("create wal");
         let mut store: Store =
@@ -451,7 +458,7 @@ mod tests {
         assert_eq!(
             store.live_label_delta_census().expect("census").0,
             0,
-            "rmp #767 Finding 4: the label history must drain — an unsettled version is unprunable \
+            "rmp #767 Finding 4: the live label deltas must drain — an unsettled version is unprunable \
              at ANY watermark and leaks for the life of the process"
         );
         assert!(

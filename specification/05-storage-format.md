@@ -454,10 +454,12 @@ only for its disk-backed storage mode and has no Graphus counterpart.
 
 **Why one slot and not one timestamp per delta.** A transaction that touched *k* entities commits with
 **one** write, and all *k* of its deltas become committed at the same instant because each resolves its
-status through this slot. This is what removes the freeze sweep — the in-place rewrite of every
+status through this slot. This is what lets the freeze sweep be retired — the in-place rewrite of every
 committed writer's stamps across `[freeze_low, high_water)`
-(`crates/graphus-storage/src/store.rs:778-786`), a frontier that needs its own release-active audit and
-whose mis-advance was a silent-data-loss defect (rmp #522). Memgraph publishes the same way, in one
+(`RecordStore::freeze_store_headers_incremental`), a frontier that needs its own release-active audit
+and whose mis-advance was a silent-data-loss defect (rmp #522). **The sweep is still present today:**
+the slot removes the *need* for it, but retiring it is separate work (rmp #1069 → #1070 → #1071), and
+until that lands both mechanisms are live. Memgraph publishes the same way, in one
 line: `transaction_.commit_info->timestamp.store(*commit_timestamp_, std::memory_order_release)`
 (`/data/refsrc/memgraph/src/storage/v2/inmemory/storage.cpp:1299`).
 

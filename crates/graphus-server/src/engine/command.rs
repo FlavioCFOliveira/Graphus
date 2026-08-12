@@ -12,7 +12,8 @@
 //! structurally read-only auto-commit statement is captured on the engine thread and then executed
 //! **off-thread** on the reader pool against a cloned MVCC read view, concurrently with the writer and
 //! with other readers (`rmp` tasks #336 + #543, `super::read_pool`). Reads take no locks and never
-//! block a writer (`graphus_txn` — `note_read` never touches the `LockTable`).
+//! block a writer (`graphus_txn` — a read records only a non-blocking SIREAD marker; since `rmp` #971
+//! there is no lock table anywhere in the engine).
 
 use graphus_core::{GraphusError, Value};
 
@@ -787,7 +788,8 @@ pub enum EngineCommand {
     /// row is applied through the ordinary [`graphus_cypher::GraphAccess`] write seam
     /// (`create_node`/`create_rel`) inside the **already-open** transaction `ticket` (opened via the
     /// ordinary [`EngineCommand::Begin`]) — full SIREAD/predicate-marker registration and
-    /// write-locking, so it participates in MVCC/SSI exactly like a concurrent Cypher `CREATE`. Does
+    /// write-write conflict detection, so it participates in MVCC/SSI exactly like a concurrent
+    /// Cypher `CREATE`. Does
     /// **not** commit: the caller (`crate::bulk_import_mode_b`'s batch driver) commits/rolls back the
     /// whole batch itself via the ordinary [`EngineCommand::Commit`]/[`EngineCommand::Rollback`].
     /// Takes **no admission permit** (mirrors [`EngineCommand::BulkImportBatch`]) — Mode B's own
@@ -799,7 +801,7 @@ pub enum EngineCommand {
         chunk: BulkImportModeBChunkInput,
         /// Reply channel: this chunk's outcome (new external-id bindings + row-count deltas), or the
         /// captured/parse/commit-adjacent error. [`GraphusError::Transaction`] is the retriable case
-        /// (a write-write lock conflict or an SSI predicate conflict registered mid-statement);
+        /// (a write-write conflict or an SSI predicate conflict registered mid-statement);
         /// every other variant is terminal (a malformed row, an unknown transaction ticket, an
         /// unknown relationship endpoint).
         reply: Reply<Result<BulkImportModeBChunkOutcome, GraphusError>>,

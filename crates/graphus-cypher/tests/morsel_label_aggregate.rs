@@ -50,7 +50,7 @@ fn fresh() -> Store {
 }
 
 /// A shared coordinated environment over one `Rc`-shared store: the `ssi` tracker (so reads register
-/// SIREAD markers), the lock table, and the populated derived index/column/zone sidecars `attach`
+/// SIREAD markers) and the populated derived index/column/zone sidecars `attach`
 /// requires. Mirrors `tests/read_only_graph_equivalence.rs::Coordinated`.
 struct Coordinated {
     store: SharedRef<Store>,

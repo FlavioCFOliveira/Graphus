@@ -21,7 +21,7 @@
 //! The corruption requires three statement-interleaved transactions over one node — a **seed**
 //! committing a labelled node with a property; **W1** removing the label and staying *open*; **W2**
 //! setting the property and *committing* on top of W1's uncommitted record; then **W1 rolling back**.
-//! Driven at the [`RecordStore`] layer (below the coordinator's lock table — exactly the unguarded
+//! Driven at the [`RecordStore`] layer (below the coordinator — exactly the unguarded
 //! `IsolationLevel::Snapshot` write path the bug is reachable through), it is fully deterministic.
 //!
 //! ## The invariant asserted

@@ -43,7 +43,7 @@
 //! workloads.
 
 // Deterministic hashing (no per-process `RandomState` seed), matching every sibling module in this
-// crate (`store`, `manager`, `snapshot`, `lock`). This is load-bearing for determinism: the SSI
+// crate (`store`, `manager`, `snapshot`). This is load-bearing for determinism: the SSI
 // validator iterates `txns` to choose a pivot-abort victim, and `std::HashMap`'s randomized iteration
 // order would make that choice — and hence which concurrent transaction reports a serialization error
 // — vary run-to-run for the *same* seed, breaking the DST's "same seed ⇒ identical trace" invariant

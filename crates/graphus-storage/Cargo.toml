@@ -97,11 +97,15 @@ graphus-sim = { path = "../graphus-sim" }
 # minimal (no fork/timeout/tempfile), matching the pin already used by `graphus-bolt`.
 proptest = { version = "1", default-features = false, features = ["std"] }
 
-# `loom` model-checks the `rmp` #808 `LabelHistory` lock-free pre-filter publication ordering
-# (`tests/loom_label_filter.rs`): the Release/Acquire arming edge and the rebuild-preserves-survivor
-# property, exhaustively over every legal interleaving. Same pin/convention as `graphus-txn`:
-# a separate test crate, so `loom` is gated on `--cfg loom` and never enters a normal build.
-#   RUSTFLAGS="--cfg loom" cargo test -p graphus-storage --test loom_label_filter --release
+# `loom` model-checks concurrent orderings exhaustively over every legal interleaving. The pin and
+# the convention are the same as `graphus-txn`'s: a `loom` model lives in its own test crate, gated on
+# `--cfg loom`, so it never enters a normal build.
+#   RUSTFLAGS="--cfg loom" cargo test -p graphus-storage --test <model> --release
+#
+# NOTE: this crate currently has **no** `--cfg loom` test. The one that justified this entry model-
+# checked the `rmp` #808 `LabelHistory` lock-free pre-filter, and it went with that mechanism when
+# `rmp` #968 moved label versions onto the undo chain. The pin is kept, registered against
+# `unexpected_cfgs` below, for the next model this crate needs.
 [target.'cfg(loom)'.dev-dependencies]
 loom = "0.7.2"
 

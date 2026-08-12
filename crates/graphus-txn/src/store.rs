@@ -129,7 +129,8 @@ pub trait VersionedStore {
     /// The `xmin` (`created_ts`) stamp word of `key`'s current head (newest) version, or `None` if
     /// the key has no version. Used by the manager to enforce SI **first-committer-wins**: a writer
     /// whose snapshot predates the head's *committed* creator is overwriting a version it cannot see
-    /// (a lost update) and must abort. A head still in-flight is handled by the write lock, not here.
+    /// (a lost update) and must abort. A head still in-flight is handled by first-updater-wins
+    /// admission, not here.
     fn head_xmin(&self, key: Key) -> Option<u64>;
 }
 

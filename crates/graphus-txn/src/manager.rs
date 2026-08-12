@@ -1,5 +1,5 @@
 //! The transaction manager: lifecycle, visibility, SSI validation, write-write conflict handling,
-//! deadlock detection, and version GC, tying together every other module (`04 §5`).
+//! and version GC, tying together every other module (`04 §5`).
 //!
 //! [`TxnManager`] owns the [`TimestampOracle`], the [`CommitRegistry`], the [`SsiTracker`], the
 //! and a [`VersionedStore`]. It is single-threaded by construction (consistent with
@@ -23,8 +23,10 @@
 //!   never waits — it is a pure visibility check plus a non-blocking SIREAD marker.
 //! - **Serializable by default** with **Snapshot Isolation as a documented opt-in**
 //!   ([`IsolationLevel`], `D-isolation-level`).
-//! - **Write-write is the only blocking**, resolved first-updater-wins with deadlock detection
-//!   (`04 §5.7`).
+//! - **Write-write conflicts never block**: first-updater-wins, resolved against the in-memory
+//!   writer set of the open transactions and refused immediately with a retriable
+//!   serialization error (`04 §5.7`). Since `rmp` #971 there is **no lock table, no waiting and no
+//!   deadlock detector** — a writer never waits, so no wait-for cycle can form.
 
 use std::time::{Duration, Instant};
 
@@ -248,8 +250,9 @@ impl<S: VersionedStore, D: Durability> TxnManager<S, D> {
 
     /// Writes `payload` as a new version of `key` on behalf of `txn` (insert or update).
     ///
-    /// Acquires the write lock first-updater-wins; on a write-write conflict the conflicting holder
-    /// is reported. Records the write in the SSI tracker (closing rw-edges with concurrent readers).
+    /// Admits the writer first-updater-wins; on a write-write conflict the conflicting holder
+    /// is reported and this call fails retriably without ever waiting. Records the write in the SSI
+    /// tracker (closing rw-edges with concurrent readers).
     ///
     /// # Errors
     /// - [`GraphusError::Transaction`] if `txn` is not active.
@@ -466,14 +469,11 @@ impl<S: VersionedStore, D: Durability> TxnManager<S, D> {
         }
     }
 
-    /// Acquires the write lock for `txn` on `key`, applying first-updater-wins with deadlock
-    /// detection. On a conflict that is not a deadlock, the *waiter* fails fast with a retriable
-    /// serialization error (the single-threaded model has no thread to park; a multi-threaded
-    /// promotion would block here and retry on release).
     /// Enforces Snapshot Isolation **first-committer-wins** (`04 §5.3`): a writer may not overwrite a
-    /// version it cannot see. After the write lock is held (which already serialises concurrent
-    /// *in-flight* writers of `key`), this rejects the case the lock cannot — a transaction that
-    /// **committed** a write to `key` *after* this transaction's snapshot. Overwriting it would be a
+    /// version it cannot see. After [`acquire_write`](Self::acquire_write) has admitted the writer
+    /// (which already excludes concurrent *in-flight* writers of `key`), this rejects the case that
+    /// admission cannot — a transaction that **committed** a write to `key` *after* this
+    /// transaction's snapshot. Overwriting it would be a
     /// lost update; under SI the later writer aborts with a retriable conflict. This is the property
     /// the SSI dangerous-structure detector *assumes* SI already provides (it only tracks
     /// rw-antidependencies); without it a ww/rw cycle escapes serializability (`rmp` storage audit F9).

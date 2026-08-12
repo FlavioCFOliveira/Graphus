@@ -1314,10 +1314,11 @@ pub(super) struct InFlightInline {
     /// Whether this statement's terminal item was a **retriable serialization failure**
     /// ([`GraphusError::Transaction`]) captured by the write seam (`rmp` #967).
     ///
-    /// A write-write conflict is refused in two places that agree on the victim — the coordinator's
-    /// first-updater-wins [`LockTable`](graphus_txn::LockTable) and, since `rmp` #967, the store's
-    /// `ensure_no_conflicting_writer` (`D-property-write-conflict`) — and both document the same
-    /// contract: the error is captured "so the caller rolls this transaction back". For an
+    /// A write-write conflict is refused in the storage layer, on the entity's own MVCC header, by
+    /// `RecordStore::ensure_no_conflicting_writer` (`rmp` #967, `D-property-write-conflict`). Since
+    /// `rmp` #971 that is the **only** refusal site — the coordinator's first-updater-wins lock table
+    /// is retired — and it documents the contract this flag exists to honour: the error is captured
+    /// "so the caller rolls this transaction back". For an
     /// auto-commit statement the caller is [`finish_autocommit`], which already does. For an
     /// EXPLICIT transaction there was no caller at all, so the refused writer stayed open and
     /// committable; [`finalize_inflight`] now closes that half. See the comment there for the
@@ -1760,19 +1761,18 @@ fn finalize_inflight<D: BlockDevice, S: LogSink>(
         // back HERE, at statement end (`rmp` #967). Committed-data-loss, measured on
         // `graphus-dst`'s `isolation::tests::write_write_conflict_is_detected`:
         //
-        // T1 and T2 both run `MATCH (c:Counter) SET c.v = c.v + 1`. T1 wins the entity — the
-        // coordinator's first-updater-wins `LockTable` grants it the write lock, and (since #967) the
-        // store's `ensure_no_conflicting_writer` names it the holder of the undo chain — so T2's write
-        // is REFUSED with a retriable `GraphusError::Transaction`. But T2's SSI footprint was already
-        // announced (`note_write` records the write marker BEFORE it acquires the lock, and the
-        // predicate pre-image is announced before the store call), so the tracker still believes T2
-        // wrote the node. That phantom write gives T1 an outbound rw-edge, makes T1 a Case-A pivot,
+        // T1 and T2 both run `MATCH (c:Counter) SET c.v = c.v + 1`. T1 wins the entity — the store's
+        // `ensure_no_conflicting_writer` names it the holder of the undo chain (since #967 the sole
+        // refusal site) — so T2's write is REFUSED with a retriable `GraphusError::Transaction`. But
+        // T2's SSI footprint was already announced (`note_write` records the write marker, and the
+        // predicate pre-image is announced, BEFORE the store call that refuses it), so the tracker
+        // still believes T2 wrote the node. That phantom write gives T1 an outbound rw-edge, makes T1 a Case-A pivot,
         // and SSI aborts T1 — the writer that actually succeeded — while T2, whose write never
         // happened, went on to COMMIT as if it had. Net: neither increment survives and the committed
         // value silently stays at the pre-image.
         //
         // Rolling T2 back at statement end retires its phantom footprint (`TxnCoordinator::abort` →
-        // `SsiTracker::forget` + `LockTable::release_all`), so T1 is no longer a pivot and commits its
+        // `SsiTracker::forget`), so T1 is no longer a pivot and commits its
         // increment, and T2's later `COMMIT` correctly fails instead of silently succeeding over a
         // write the engine refused. That is exactly the contract both refusal sites already document —
         // `RecordGraph::note_write`: "captures a retriable serialization error **so the caller rolls

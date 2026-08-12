@@ -816,11 +816,12 @@ pub struct IndexSet {
     ///   independently rejects a stale entry an older reader may genuinely need.
     ///
     ///   Since `rmp` #904 the refill no longer reads the current bitmap at all, here or anywhere: it
-    ///   gates on `RecordStore::node_label_superset`, the union of the live word with every bitmap
-    ///   `LabelHistory` retains. That is what makes the refill of the trees `clear` DOES empty a
+    ///   gates on `RecordStore::node_label_superset`, the live word widened by every label an
+    ///   `AddLabel` delta on the node's undo chain could restore. That is what makes the refill of the
+    ///   trees `clear` DOES empty a
     ///   superset too, and it is why this bullet's argument no longer has to carry them. The exemption
     ///   still stays, because retention is free and the superset reaches only as far back as the
-    ///   retained history: a version the GC prune collapsed is one no live reader can still need, but a
+    ///   retained versions: a version the GC prune collapsed is one no live reader can still need, but a
     ///   surviving entry must not be destroyed on that basis.
     ///
     ///   This entry used to claim the opposite — that emptying `labels` was safe because "any entry the

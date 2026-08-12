@@ -1,13 +1,14 @@
 //! An index rebuild must never lose a COMMITTED label an uncommitted writer had removed (`rmp` #771).
 //!
 //! `IndexSet::clear` used to empty the always-present label tree, and `rebuild_index` then refilled it
-//! from each node's CURRENT inline bitmap. Labels are mutated IN PLACE with **no version chain**, so
-//! that bitmap includes every UNCOMMITTED change and the committed label set exists nowhere the refill
-//! can read it — it survives only in the WAL undo image. A rebuild run while a writer held an
-//! uncommitted `REMOVE n:Person` therefore wrote a **subset**: the entry was destroyed and not
-//! re-inserted. When that writer ROLLED BACK, WAL undo correctly restored the record's label bit, but
-//! nothing restored the index entry — and `MATCH (n:Person)` returned ZERO rows, permanently, for a
-//! label the node demonstrably still carried.
+//! from each node's CURRENT inline bitmap. Labels are mutated IN PLACE and, back then, carried **no
+//! version chain**, so that bitmap included every UNCOMMITTED change and the committed label set
+//! existed nowhere the refill could read it — it survived only in the WAL undo image. (Since `rmp`
+//! #968 the previous membership is an `AddLabel` delta on the node's own undo chain, which is what the
+//! #904 fix below reads.) A rebuild run while a writer held an uncommitted `REMOVE n:Person` therefore
+//! wrote a **subset**: the entry was destroyed and not re-inserted. When that writer ROLLED BACK, WAL
+//! undo correctly restored the record's label bit, but nothing restored the index entry — and
+//! `MATCH (n:Person)` returned ZERO rows, permanently, for a label the node demonstrably still carried.
 //!
 //! The fix makes the refill purely ADDITIVE: `clear` no longer empties the label tree. That is the only
 //! image it may hold, by the false-negative asymmetry — the re-check (in
@@ -37,11 +38,12 @@
 //! — `unique_conflict` received `Some([])`, i.e. "no duplicate", so a live `IS UNIQUE` constraint
 //! ADMITTED a second node with the same value.
 //!
-//! The fix gates the refill on the **union** of the live word and every bitmap `LabelHistory` retains
-//! for the node, so the membership decision is a superset in BOTH directions: it never loses a
-//! committed label an uncommitted writer removed, and never loses an uncommitted one either. Every
-//! consumer of these trees re-checks label membership against the reader's snapshot, so the extra
-//! candidates are false positives the re-check drops.
+//! The fix gates the refill on the **union** of the live word and every label an `AddLabel` delta on
+//! the node's own undo chain could restore (`RecordStore::node_label_superset`), so the membership
+//! decision is a superset in BOTH directions: it never loses a committed label an uncommitted writer
+//! removed, and never loses an uncommitted one either. Every consumer of these trees re-checks label
+//! membership against the reader's snapshot, so the extra candidates are false positives the re-check
+//! drops.
 
 use graphus_core::Value;
 use graphus_cypher::ConstraintKind;

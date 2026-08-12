@@ -249,7 +249,7 @@ fn run_write(coord: &TxnCoordinator<MemBlockDevice, MemLogSink>, src: &str) {
 // =================================================================================================
 
 /// A shared coordinated environment over one `Rc`-shared store: the `ssi` tracker (so reads register
-/// SIREAD markers), the lock table, and the populated derived sidecars `attach` requires. Mirrors
+/// SIREAD markers) and the populated derived sidecars `attach` requires. Mirrors
 /// `tests/morsel_label_aggregate.rs::Coordinated`.
 struct Coordinated {
     store: SharedRef<Store>,

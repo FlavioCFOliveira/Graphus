@@ -17,8 +17,9 @@
 //!   not in `active` with `"commit of inactive txn"`, so a `CREATE CONSTRAINT` that returns `Ok` is
 //!   itself the proof that its transaction was a live member of the active set from `begin` to
 //!   `commit`;
-//! * it **leaks nothing** on either the success or the failure path — the active-set slot, the SSI
-//!   entry and the lock-table entry are all released (`rmp` #415's drop-guard discipline);
+//! * it **leaks nothing** on either the success or the failure path — the active-set slot and the SSI
+//!   entry are both released, so nothing is left pinning the GC watermark (`rmp` #415's drop-guard
+//!   discipline);
 //! * it is **never spuriously aborted**: it announces no predicate write and takes no physical write
 //!   marker, so `detect_pivot_abort`'s read-only exemption applies, and an open reader — however old —
 //!   cannot make a schema change fail.

@@ -148,8 +148,8 @@ pub struct WriterVisibility {
     /// DIFFERENT, unrelated transaction" — a distinction `Option<bool>` cannot express and a test that
     /// only checked for `None` would miss entirely.
     pub reported_uncommitted_writer: Option<TxnId>,
-    /// Whether the label history still carries a version stamped `InFlight(txn)` — i.e. the label
-    /// change has NOT been settled as committed.
+    /// Whether the undo area still carries a label delta belonging to an **unresolved** transaction
+    /// — i.e. the label change has NOT been settled as committed.
     pub holds_inflight_label_versions: bool,
     /// Whether a fresh snapshot resolves the node's labels to the value this transaction wrote. This
     /// is the reader-visible face of the defect: `true` means uncommitted work is being served.
@@ -257,7 +257,8 @@ fn live_bitmap<D: graphus_io::BlockDevice, S: LogSink>(
 }
 
 /// Resolves node `node`'s label bitmap exactly as a reader beginning NOW would: the live word,
-/// arbitrated through the retained label history against a fresh snapshot and the commit registry.
+/// arbitrated through the label versions retained on the node's undo chain against a fresh snapshot
+/// and the commit registry.
 /// This calls the production predicate ([`RecordStore::label_bitmap_at`]), not a re-implementation of
 /// it, so the oracle cannot drift from the read path it is judging.
 fn resolve_labels<D: graphus_io::BlockDevice, S: LogSink>(
@@ -847,8 +848,8 @@ mod tests {
         );
         assert!(
             r.after.holds_inflight_label_versions,
-            "a failed commit must NOT have settled the label history: settling it stamps the versions \
-             `Committed(commit_ts)`, which the rollback's `LabelHistory::forget` — keyed on the \
+            "a failed commit must NOT have settled the label versions: settling them stamps the \
+             versions `Committed(commit_ts)`, which the rollback's retraction — keyed on the \
              in-flight stamp — can no longer find (rmp #955)"
         );
         assert!(

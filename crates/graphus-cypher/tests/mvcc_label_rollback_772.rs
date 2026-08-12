@@ -12,9 +12,12 @@
 //! (whose predecessor the committer had tombstoned on a byte region the whole-record undo does not
 //! restore). The committed value read back as `Null`: an atomicity + durability breach.
 //!
-//! Reachable only through the direct coordinator API under [`IsolationLevel::Snapshot`] writes (an
-//! internal opt-in used by bulk loaders/benches); the default Serializable SSI path aborts the second
-//! writer, so it is not wire-reachable. Both directions are pinned here.
+//! When this was written the anomaly was reachable through the direct coordinator API under
+//! [`IsolationLevel::Snapshot`] writes (an internal opt-in used by bulk loaders/benches), the default
+//! Serializable SSI path being the only thing that aborted the second writer. Since `rmp` #968 a label
+//! change links a delta onto the node's undo chain, so the first writer holds the node and the STORAGE
+//! layer refuses the second at **every** isolation level (`D-write-conflict-detection`) — the anomaly
+//! is now unreachable rather than merely survived. Both directions are still pinned here.
 //!
 //! ## The fix
 //!
@@ -159,9 +162,11 @@ fn si_label_rollback_preserves_concurrent_committed_property() {
     );
 }
 
-/// Serializable direction (the protection that must NOT regress): the SSI/write-lock path refuses the
-/// second writer, so this scenario never reaches a rollback with both writes present. Pinning it
-/// ensures the fix does not let the protection silently degrade into data destruction.
+/// Serializable direction (the protection that must NOT regress): the second writer is refused — the
+/// store's first-updater-wins check (`RecordStore::ensure_no_conflicting_writer`) rejects it at
+/// statement time and its commit is a serialization failure — so this scenario never reaches a
+/// rollback with both writes present. Pinning it ensures the fix does not let the protection silently
+/// degrade into data destruction.
 #[test]
 fn serializable_label_write_refuses_concurrent_property_writer() {
     let mut coord = fresh_coord();
@@ -172,7 +177,7 @@ fn serializable_label_write_refuses_concurrent_property_writer() {
     assert!(err.is_none(), "W1 REMOVE errored: {err:?}");
 
     let w2 = coord.begin_serializable();
-    // The write-write conflict surfaces at statement time (W1 holds the node's write lock).
+    // The write-write conflict surfaces at statement time (W1 holds the node's undo chain).
     let (_r, err) = run_stmt(
         &coord,
         w2,

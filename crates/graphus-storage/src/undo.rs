@@ -22,9 +22,21 @@
 //! A delta carries **no timestamp of its own**. It carries the physical id of a
 //! [`CommitSlot`] shared by every delta of its writing transaction, and that slot is published by a
 //! single store at commit (`04 §5.1.3`). One write therefore commits every delta of a transaction
-//! at the same instant, which is what removes the per-record freeze sweep: a reader resolves a
-//! delta's commit status by loading through the slot rather than by reading a stamp the committer
-//! had to write into each record.
+//! at the same instant: a reader resolves a delta's commit status by loading through the slot
+//! rather than by reading a stamp the committer had to write into each record.
+//!
+//! ### The freeze sweep still runs — the two mechanisms coexist
+//!
+//! The indirection removes the need for a **delta** to carry a settled stamp. It did **not** retire
+//! the per-record freeze sweep, which settles the in-place MVCC headers of the three record stores:
+//! `RecordStore::freeze_store_headers_incremental` still walks `[freeze_low, high_water)` on every
+//! GC pass, and the `freeze_low` frontier is still lowered whenever a fresh in-flight stamp lands
+//! below it — by `note_created` / `note_expired`, and by the in-place property-cell write, which
+//! re-stamps an id the sweep would otherwise never revisit. Both mechanisms are live in the current
+//! code, and any reasoning about this store must account for both.
+//!
+//! Retiring the sweep is its own work, not a side effect of this indirection: `rmp` #1069 → #1070 →
+//! #1071, in that order.
 //!
 //! ## Encoding
 //!

@@ -406,7 +406,7 @@ impl EngineHandle {
     /// (`08` §8) is the resource-bounding mechanism instead.
     ///
     /// # Errors
-    /// [`GraphusError::Transaction`] is the **retriable** case (a write-write lock conflict or an SSI
+    /// [`GraphusError::Transaction`] is the **retriable** case (a write-write conflict or an SSI
     /// predicate conflict registered mid-statement, or an unknown/inactive `ticket`); every other
     /// variant is terminal (a malformed row, an unknown relationship endpoint), or if the engine is
     /// shut down.

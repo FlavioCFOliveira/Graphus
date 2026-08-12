@@ -13,8 +13,10 @@
 //! absence was an isolation defect rather than a missing feature: because the word below is mutated in
 //! place with no version, a label read returned whatever it held at that instant — an uncommitted
 //! writer's change (a dirty read) or one committed after the reader's snapshot (a non-repeatable
-//! read). This module still encodes only the *current* set; the retained older versions live in
-//! [`crate::label_history`], and the read layer resolves through it. Nothing here is snapshot-aware:
+//! read). This module still encodes only the *current* set; the retained older versions live as
+//! [`AddLabel`](crate::undo::UndoAction::AddLabel) / [`RemoveLabel`](crate::undo::UndoAction::RemoveLabel)
+//! deltas on the node's undo chain, and the read layer resolves through
+//! [`label_bitmap_at`](crate::read_view::label_bitmap_at). Nothing here is snapshot-aware:
 //! callers of [`has_label`] / [`token_ids`] must pass a bitmap that is already correct for their
 //! snapshot.
 //!

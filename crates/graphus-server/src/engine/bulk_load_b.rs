@@ -12,7 +12,8 @@
 //! [`TxnCoordinator::statement`], calling the exact same [`graphus_cypher::GraphAccess`] methods
 //! (`create_node`/`create_rel`) an equivalent Cypher `CREATE` would call — never a raw
 //! `RecordStore::create_node`/`create_rel`, and never a "bulk-optimized" shortcut that skips
-//! SIREAD/predicate-marker registration or write-locking (`08` §7.2, explicitly disallowed: "the
+//! SIREAD/predicate-marker registration or write-write conflict detection (`08` §7.2, explicitly
+//! disallowed: "the
 //! audit confirmed this is the one point where cutting a corner reopens a real serializability
 //! hole").
 //!
@@ -131,7 +132,7 @@ pub struct BulkImportModeBChunkOutcome {
 ///   relationship referencing a node that was never committed — terminal, the same clean-error
 ///   convention `graphus_bulk::ingest_rel_row` uses).
 /// - Whatever [`GraphAccess::create_node`]/[`GraphAccess::create_rel`] captured internally
-///   (`graph.take_error()`), most commonly [`GraphusError::Transaction`] on a write-write lock
+///   (`graph.take_error()`), most commonly [`GraphusError::Transaction`] on a write-write
 ///   conflict or an SSI predicate conflict registered **mid-statement** — this is the **retriable**
 ///   case the caller's batch-retry loop (`crate::bulk_import_mode_b`) detects via
 ///   `matches!(err, GraphusError::Transaction(_))`.

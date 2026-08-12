@@ -421,11 +421,12 @@ mod concurrent {
 // anomaly simply moves to the path most production reads actually take.
 //
 // The two seams resolve labels differently in one respect worth pinning: an off-thread reader carries
-// a CLONED `CommitRegistry` (captured at dispatch) but shares the label history LIVE by `Arc`. That
-// combination is deliberate. Sharing the history live is what lets a reader undo a label change
-// committed AFTER it was dispatched — a captured history would have no entry for it and the reader
-// would fall through to the live word, which is the very defect #767 closed. The cloned registry then
-// correctly reports that post-dispatch writer as not-visible.
+// a CLONED `CommitRegistry` (captured at dispatch) but walks the node's undo chain LIVE, out of the
+// `Arc`-shared page cache its `StoreReadView` holds. That combination is deliberate. Reading the chain
+// live is what lets a reader undo a label change committed AFTER it was dispatched — a frozen image
+// would not carry that writer's `AddLabel` delta and the reader would fall through to the live word,
+// which is the very defect #767 closed. The cloned registry then correctly reports that post-dispatch
+// writer as not-visible.
 
 mod off_thread {
     use super::*;
@@ -521,15 +522,15 @@ mod off_thread {
 // The first cut of #767 retained each label version under the writer's RAW `VersionStamp::in_flight`
 // stamp and resolved it through the `CommitRegistry`, exactly as an MVCC record header is resolved.
 // For a record header that is safe, because the GC freeze sweep rewrites the header to
-// `Committed(ts)` BEFORE the pass forgets the writer from the registry. The label history is not a
-// record header: the freeze sweep never walks it, so its stamp stayed in-flight forever while
+// `Committed(ts)` BEFORE the pass forgets the writer from the registry. That retained history was not
+// a record header: the freeze sweep never walked it, so its stamp stayed in-flight forever while
 // `pending_gc_prune` forgot the writer — after which `CommitRegistry::outcome` maps the unknown id to
 // `Aborted`, the version reads as never-committed, and every reader falls back to `base`.
 //
 // Both defects below are therefore GC-cadence-dependent and, being purely in-memory, HEAL ON RESTART
 // while the on-disk word was correct the whole time — the worst possible diagnostic profile. They are
-// pinned here through the real `RecordStore::gc` path rather than by poking `LabelHistory` directly,
-// so they stay honest about reachability.
+// pinned here through the real `RecordStore::gc` path rather than by manipulating the retained label
+// version state directly, so they stay honest about reachability.
 
 mod gc_interaction {
     use super::*;
@@ -594,15 +595,18 @@ mod gc_interaction {
 
     /// **DEFECT 2: a reclaimed physical id handed the NEW node the DEAD node's labels.**
     ///
-    /// `LabelHistory` is keyed by bare physical id, and ids are reused after reclamation (`04 §2.7`).
-    /// An entry outliving its node is inherited by whatever new node takes the slot — and because
-    /// `resolve` ignores the live word whenever an entry exists, while the new node records no version
-    /// of its own (its creator is its own in-flight writer, which `track_label_history` skips), the
-    /// stale value is never overridden.
+    /// The retained label versions were keyed by bare physical id, and ids are reused after
+    /// reclamation (`04 §2.7`). An entry outliving its node was inherited by whatever new node took
+    /// the slot — and because resolution ignored the live word whenever an entry existed, while the
+    /// new node recorded no version of its own (its creator is its own in-flight writer, which the
+    /// tracking skipped), the stale value was never overridden.
     ///
-    /// Closed by purging the node's history in `reclaim_node`, before its id reaches the free list.
-    /// Note the GC-time `prune` is NOT sufficient on its own: a version whose writer the registry has
-    /// forgotten is unprunable, so it would strand there forever.
+    /// Closed by purging the node's versions in `reclaim_node`, before its id reaches the free list.
+    /// A GC-time prune was NOT sufficient on its own: a version whose writer the registry has
+    /// forgotten is unprunable, so it would strand there forever. Since `rmp` #968 the versions are
+    /// `AddLabel` / `RemoveLabel` deltas on the node's own undo chain, and `reclaim_node`'s
+    /// `free_undo_chain` frees them with the record, handing the slot on with `undo_ptr == 0` and
+    /// nothing to inherit.
     #[test]
     fn a_reclaimed_and_reused_node_id_does_not_inherit_the_dead_nodes_labels() {
         let mut store = run_commit("CREATE (:Person {v: 1})", fresh_store(), 1);
@@ -644,7 +648,7 @@ mod gc_interaction {
     /// chain, so what this now pins is that the chain sweep reaches label deltas exactly as it reaches
     /// property ones — a delta the sweep skipped would grow `undo.store` without bound.
     #[test]
-    fn a_full_watermark_gc_pass_drains_the_label_history() {
+    fn a_full_watermark_gc_pass_reclaims_every_label_delta() {
         let mut store = run_commit("CREATE (:Person {v: 1})", fresh_store(), 1);
         store = run_commit("MATCH (n:Person) SET n:Admin", store, 2);
         assert!(
