@@ -58,6 +58,29 @@ pub enum RecordType {
     Alloc = 11,
     /// A store page was freed.
     Free = 12,
+    /// One transaction's **net signed change** to the catalogue's live-record cardinality counters
+    /// (`rmp` #1066); logical, and never a page change.
+    ///
+    /// The other twelve kinds describe a *page*: recovery replays them by writing bytes at a
+    /// [`PageId`]. This one describes an *arithmetic* change to state that lives in the catalogue,
+    /// and it exists because a shared image rewritten in full by every committer cannot be made
+    /// exact under concurrent commits — the image one committer samples does not contain a
+    /// transaction that commits before that image lands, so the last write wins and the committed
+    /// rows are lost (`rmp` #1055). A delta does not have that failure mode: it names only what its
+    /// own transaction changed, so no committer's record can erase another's.
+    ///
+    /// This crate frames the record and stores its payload verbatim; the payload's meaning belongs
+    /// to `graphus-storage`, which owns the counters (the same split as
+    /// [`CheckpointEnd`](RecordType::CheckpointEnd)'s snapshot, in the other direction). The payload
+    /// rides in `redo`, which is safe because [`is_page_change`](RecordType::is_page_change) excludes
+    /// this kind — so recovery's redo pass never hands those bytes to a page — exactly as
+    /// [`Commit`](RecordType::Commit) carries its timestamp there.
+    ///
+    /// It is also **not** [`is_undoable_action`](RecordType::is_undoable_action): a delta belonging
+    /// to a loser is never applied in the first place (the replay admits only committed
+    /// transactions), so there is nothing for the undo pass to compensate. The undo pass walks past
+    /// it along `prev_lsn` like any other control record.
+    CountDelta = 13,
 }
 
 impl RecordType {
@@ -104,6 +127,7 @@ impl RecordType {
             10 => Self::FullPageImage,
             11 => Self::Alloc,
             12 => Self::Free,
+            13 => Self::CountDelta,
             _ => return None,
         })
     }
@@ -193,6 +217,32 @@ impl LogRecord {
             u64::from_le_bytes(b.try_into().expect("8-byte slice"))
         });
         Some(Timestamp(ts))
+    }
+
+    /// Builds a [`CountDelta`](RecordType::CountDelta) record for `txn` carrying `payload` — one
+    /// transaction's net signed change to the catalogue's cardinality counters (`rmp` #1066).
+    ///
+    /// The payload is opaque here: this crate frames and checksums it, and `graphus-storage` decides
+    /// what it means. It rides in `redo` for the same reason a commit timestamp does — a count-delta
+    /// record is never a page change ([`RecordType::is_page_change`] excludes it), so recovery's redo
+    /// pass never replays those bytes as a page image and the field is otherwise unused.
+    #[must_use]
+    pub fn count_delta(txn: TxnId, prev_lsn: Lsn, payload: Vec<u8>) -> Self {
+        let mut r = Self::new(RecordType::CountDelta, txn, PageId(0));
+        r.prev_lsn = prev_lsn;
+        r.redo = payload;
+        r
+    }
+
+    /// The opaque counter payload carried by a [`CountDelta`](RecordType::CountDelta) record
+    /// (`rmp` #1066); `None` for any other record kind.
+    ///
+    /// An empty payload is returned as `Some(&[])` rather than `None`: "a count-delta record whose
+    /// payload is empty" and "not a count-delta record" are different facts, and only the caller can
+    /// say whether the first is malformed.
+    #[must_use]
+    pub fn count_delta_payload(&self) -> Option<&[u8]> {
+        (self.rec_type == RecordType::CountDelta).then_some(&self.redo)
     }
 
     /// The number of bytes this record occupies when encoded.
@@ -396,6 +446,13 @@ impl<'a> LogRecordRef<'a> {
         });
         Some(Timestamp(ts))
     }
+
+    /// The opaque counter payload carried by a [`CountDelta`](RecordType::CountDelta) record; see
+    /// [`LogRecord::count_delta_payload`]. Returns `None` for any other record kind.
+    #[must_use]
+    pub fn count_delta_payload(&self) -> Option<&'a [u8]> {
+        (self.rec_type == RecordType::CountDelta).then_some(self.redo)
+    }
 }
 
 fn read_u32(b: &[u8], off: usize) -> u32 {
@@ -519,10 +576,63 @@ mod tests {
             RecordType::CheckpointBegin,
             RecordType::CheckpointEnd,
             RecordType::Free,
+            RecordType::CountDelta,
         ] {
             assert_eq!(RecordType::from_u8(t as u8), Some(t));
         }
         assert_eq!(RecordType::from_u8(0), None);
         assert_eq!(RecordType::from_u8(250), None);
+    }
+
+    /// **A count-delta record round-trips, and its payload is never treated as a page image**
+    /// (`rmp` #1066).
+    ///
+    /// The second half is the load-bearing one. The payload rides in `redo`, the same field a page
+    /// change puts its after-image in, and recovery's redo pass writes `redo` straight onto
+    /// `page_id` for anything [`RecordType::is_page_change`] admits. This record carries `PageId(0)`
+    /// — the metadata page — so if the classification were ever widened to include it, recovery
+    /// would stamp counter bytes over the catalogue.
+    #[test]
+    fn count_delta_record_round_trips_and_is_not_a_page_change() {
+        let payload = vec![0xA5u8, 0x00, 0xFF, 0x01];
+        let mut r = LogRecord::count_delta(TxnId(11), Lsn(24), payload.clone());
+        assert_eq!(r.count_delta_payload(), Some(&payload[..]));
+        let mut buf = Vec::new();
+        r.encode_to(Lsn(96), &mut buf);
+        let (got, consumed) = LogRecord::decode(&buf).expect("decode");
+        assert_eq!(consumed, buf.len());
+        assert_eq!(got, r);
+        assert_eq!(got.count_delta_payload(), Some(&payload[..]));
+        assert_eq!(got.prev_lsn, Lsn(24));
+        assert_eq!(got.page_id, PageId(0));
+        assert!(
+            !got.rec_type.is_page_change(),
+            "a count-delta payload must never be replayed as a page image: the record names \
+             PageId(0), the metadata page"
+        );
+        assert!(
+            !got.rec_type.is_undoable_action(),
+            "a loser's count delta is never applied, so there is nothing to compensate; the undo \
+             pass must walk past it along prev_lsn"
+        );
+        // The borrowed decoder — the one every recovery scan uses — reads the same payload.
+        let (as_ref, _) = LogRecordRef::decode(&buf).expect("decode borrowed");
+        assert_eq!(as_ref.count_delta_payload(), Some(&payload[..]));
+    }
+
+    /// **`count_delta_payload` distinguishes "not a count-delta record" from "an empty payload".**
+    ///
+    /// A `None` return is the caller's licence to ignore the record entirely; an empty `Some` is a
+    /// record it must decide about. Collapsing the two would let a malformed (zero-length) payload
+    /// be silently skipped instead of reported.
+    #[test]
+    fn count_delta_payload_is_none_only_for_a_different_record_kind() {
+        let upd = LogRecord::new(RecordType::Update, TxnId(1), PageId(3));
+        assert_eq!(upd.count_delta_payload(), None);
+        let commit = LogRecord::commit(TxnId(1), Lsn(0), Timestamp(5));
+        assert_eq!(commit.count_delta_payload(), None);
+        let empty = LogRecord::count_delta(TxnId(1), Lsn(0), Vec::new());
+        assert_eq!(empty.count_delta_payload(), Some(&[][..]));
+        assert_eq!(empty.commit_ts(), None);
     }
 }

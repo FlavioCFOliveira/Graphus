@@ -554,3 +554,50 @@ for each direction:
   > an unintentional hack — removing the bit re-opens the silent-misread path this section exists to
   > close. It is pinned by
   > `crates/graphus-storage/tests/undo_chain.rs::the_head_metadata_page_carries_the_format_tripwire`.
+
+**Every version, and the decision taken for each.** The machinery above (the `GRPHUNDO` block that
+carries the number, and the bit-31 tripwire that makes a pre-#966 build refuse) is version 2's and is
+reused unchanged by every later bump. What each bump has to state is its own compatibility decision:
+whether an older image is **upgraded** or **refused**, and why that is the safe answer.
+
+| Version | Task | What changed | An older image, under this build |
+| --- | --- | --- | --- |
+| 1 | — | the layout before the undo area | — |
+| 2 | #966 | the undo area's two stores, in the `GRPHUNDO` block | **upgraded**: a version-1 image has no chains, which is exactly what an empty undo area describes |
+| 3 | #967 | **no byte moved.** A `props.store` cell's MVCC header no longer carries the property's visibility (`D-property-visibility`) | **refused, with a migration route**, if and only if the image still holds a property tombstone. That is the whole reason the number had to move: versions 2 and 3 are otherwise indistinguishable, so the gate would have had nothing to key on. A tombstone-free legacy image upgrades losslessly, which is the normal state of any store whose GC has caught up (`RecordStore::refuse_legacy_property_tombstones`) |
+| 4 | #1066 | the **applied-transaction set**, in a trailing `GRPHCNTD` block: the transactions whose logged cardinality deltas (`04` §4.1) are already folded into the `Statistics` persisted beside it | **upgraded**, with an empty set |
+
+**Why the version-4 upgrade is lossless, and why the bump was still necessary.** The set's invariant is
+"these transactions are already folded into the counters beside it". For a pre-version-4 image the
+empty set is not an approximation of that store's history, it *is* that history: no build below version
+4 ever wrote a `COUNT-DELTA` record, so no such image's log contains one, and an empty set therefore
+cannot cause anything to be applied a second time. There is nothing to convert and nothing to lose.
+
+The refusal this version buys runs in the **other** direction, and it is the one that matters. An older
+build handed a version-4 image would not merely miss the block: it would rewrite the catalogue
+**without** it, discarding the record of what had already been applied, and the next version-4 build to
+open that store would fold every still-retained delta in a second time. Since #866 answers `count()`
+from that number and nothing recomputes it at open, the result would be a wrong query answer that
+survives every restart. `Meta::decode`'s "a version newer than this build is refused outright" arm is
+what stops it, and it only stops it because the number moved.
+
+**Presence is decided by the version, in both directions.** The counters and the applied set are one
+fact, so neither half may appear without the other:
+
+- an image that declares version 4 and carries **no** set is not an older writer that stopped early —
+  it is an image whose two halves disagree, and reading it would replay deltas already accounted for;
+- an image that declares a version **below** 4 and still carries the set came from no writer at all,
+  since no such build ever emitted the block. Taking its counters while discarding the record of what
+  has been folded into them is the same drift in the opposite direction.
+
+`Meta::decode` therefore requires the block exactly when the version says it should be there, and
+refuses in both directions. Pinned by `crates/graphus-storage/tests/count_delta_wal_replay_1066.rs`.
+
+> **The obligation this creates.** Failing closed here means that anything which *forges* an older
+> image by rewriting the version word must also **cut** the trailing blocks that version does not
+> define, or it produces a store no build could have written and is refused before it reaches whatever
+> it meant to exercise. There is one such forgery in the tree — `rmp` #967's legacy fixture,
+> `crates/graphus-storage/tests/property_undo_chain_967.rs::downgrade_catalog_to` — and its version-2
+> arm truncates at the `GRPHCNTD` magic for exactly this reason. Its version-1 arm truncates at
+> `GRPHUNDO`, which removes both trailing blocks at once and needed no change. Any future block
+> appended to this catalog inherits the same obligation.

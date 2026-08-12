@@ -43,6 +43,7 @@ use graphus_pagemap::PageMapWriter;
 use graphus_txn::{CommitRegistry, Snapshot, TxnOutcome};
 use graphus_wal::{LogSink, WalManager};
 
+use crate::counts_log::{AppliedTxSet, CountDelta, replay_count_deltas};
 use crate::heap::{self, BLOCK_PAYLOAD, HeapBlock, STRINGS_RECORD_SIZE};
 use crate::idalloc::{Allocation, ElementIdAllocator, NULL_ID, SharedReuseBarrier, StoreAllocator};
 use crate::labels;
@@ -764,115 +765,6 @@ struct ActiveTxn {
     begin_ts: Option<Timestamp>,
 }
 
-/// One transaction's pending, not-yet-committed change to the six live-record cardinality counters
-/// of [`Statistics`] (`rmp` #866): a signed net delta per [`CountKey`].
-///
-/// # Why this needs none of [`SchemaUndo`]'s machinery
-///
-/// The catalog-DDL undo of `rmp` #734 needs a per-entry `seq` generation, an owner witness and a
-/// predecessor-chain splice, because a DDL entry holds an **opaque value** on shared unversioned
-/// state: restoring it means "put back what was there before *me*", which is only meaningful while
-/// nobody else has written since, and out-of-order aborts break the chain.
-///
-/// Counters are not values, they are **counts**: integer addition is commutative and associative,
-/// and every delta is exactly invertible by its negation. `committed + d₁ + d₂ − d₁` equals
-/// `committed + d₂` no matter what order the transactions arrive, abort or commit in — so there is
-/// no last-writer question to answer, no generation to witness, no ABA to distinguish and no chain
-/// to splice. That is the whole reason this type is a handful of maps rather than an undo log, and
-/// it is worth stating because the neighbouring [`SchemaUndo`] looks like the template to copy and
-/// is not.
-///
-/// A create/delete pair inside one transaction nets to zero and is **pruned**, so
-/// [`is_empty`](Self::is_empty) is exactly "this transaction has moved no counter", and the maps
-/// stay bounded by the distinct labels/types the transaction actually touched (never by its row
-/// count).
-#[derive(Debug, Default, Clone)]
-struct CountDelta {
-    total_nodes: i64,
-    total_relationships: i64,
-    per_label: BTreeMap<u32, i64>,
-    per_type: BTreeMap<u32, i64>,
-    per_start_label_type: BTreeMap<(u32, u32), i64>,
-    per_type_end_label: BTreeMap<(u32, u32), i64>,
-}
-
-impl CountDelta {
-    /// Accumulates `delta` (always `±1` from a single write) under `key`.
-    fn record(&mut self, key: CountKey, delta: i64) {
-        match key {
-            CountKey::TotalNodes => {
-                self.total_nodes = self.total_nodes.saturating_add(delta);
-            }
-            CountKey::TotalRelationships => {
-                self.total_relationships = self.total_relationships.saturating_add(delta);
-            }
-            CountKey::Label(token) => Self::accumulate(&mut self.per_label, token, delta),
-            CountKey::RelType(token) => Self::accumulate(&mut self.per_type, token, delta),
-            CountKey::StartLabelType(label, ty) => {
-                Self::accumulate(&mut self.per_start_label_type, (label, ty), delta);
-            }
-            CountKey::TypeEndLabel(ty, label) => {
-                Self::accumulate(&mut self.per_type_end_label, (ty, label), delta);
-            }
-        }
-    }
-
-    /// Adds `delta` to one keyed slot, **removing** the entry when it nets back to zero. The pruning
-    /// is what makes "the map is empty" and "every delta is zero" the same statement, which
-    /// [`is_empty`](Self::is_empty) — and therefore the checkpoint fast path — relies on.
-    fn accumulate<K: Ord>(map: &mut BTreeMap<K, i64>, key: K, delta: i64) {
-        match map.entry(key) {
-            std::collections::btree_map::Entry::Occupied(mut slot) => {
-                let next = slot.get().saturating_add(delta);
-                if next == 0 {
-                    slot.remove();
-                } else {
-                    *slot.get_mut() = next;
-                }
-            }
-            std::collections::btree_map::Entry::Vacant(slot) => {
-                if delta != 0 {
-                    slot.insert(delta);
-                }
-            }
-        }
-    }
-
-    /// `true` when this transaction has moved no counter at all — the case for every read-only
-    /// transaction, every pure property write, and every DDL statement.
-    fn is_empty(&self) -> bool {
-        self.total_nodes == 0
-            && self.total_relationships == 0
-            && self.per_label.is_empty()
-            && self.per_type.is_empty()
-            && self.per_start_label_type.is_empty()
-            && self.per_type_end_label.is_empty()
-    }
-
-    /// Un-applies this delta from `stats`, i.e. applies its exact negation. Turns an image that
-    /// **includes** this transaction's pending counts into one that excludes them, which is what both
-    /// the rollback (withdraw my own) and the checkpoint (withdraw every open transaction's) need.
-    fn withdraw_from(&self, stats: &mut Statistics) {
-        stats.apply_count_delta(CountKey::TotalNodes, self.total_nodes.saturating_neg());
-        stats.apply_count_delta(
-            CountKey::TotalRelationships,
-            self.total_relationships.saturating_neg(),
-        );
-        for (&token, &d) in &self.per_label {
-            stats.apply_count_delta(CountKey::Label(token), d.saturating_neg());
-        }
-        for (&token, &d) in &self.per_type {
-            stats.apply_count_delta(CountKey::RelType(token), d.saturating_neg());
-        }
-        for (&(label, ty), &d) in &self.per_start_label_type {
-            stats.apply_count_delta(CountKey::StartLabelType(label, ty), d.saturating_neg());
-        }
-        for (&(ty, label), &d) in &self.per_type_end_label {
-            stats.apply_count_delta(CountKey::TypeEndLabel(ty, label), d.saturating_neg());
-        }
-    }
-}
-
 /// One entry of a transaction's catalog-DDL undo log (`rmp` #734): the schema-catalog entry a
 /// mutation touched, and the value it held **before** that mutation.
 ///
@@ -1285,6 +1177,23 @@ struct CatalogState {
     /// rollback / [`open`](RecordStore::open), so it shares the id high-water marks' durability lifecycle and
     /// is correct after abort and after crash recovery. See [`Statistics`].
     statistics: Arc<Statistics>,
+    /// The transactions whose logged cardinality deltas are already folded into
+    /// [`statistics`](Self#structfield.statistics) (`rmp` #1066).
+    ///
+    /// It lives **here**, beside the counters and under the same rank-10 latch, because the two are
+    /// one fact and every reader of either has to see a state in which they agree — the lesson
+    /// `rmp` #1052 paid for, where a counter image and the deltas withdrawn from it were sampled at
+    /// two instants and their difference was a state of nothing.
+    ///
+    /// [`reload_catalog`](RecordStore::reload_catalog) deliberately does **not** touch it, for
+    /// exactly the reason it no longer touches the counters (`rmp` #1052): the live counters are
+    /// preserved across a rollback rather than reverted to the durable image, so reverting this set
+    /// alone would leave it claiming that deltas the preserved counters still hold have not been
+    /// applied. Preserved together, the pair stays true.
+    ///
+    /// Grown only by the replay at [`open`](RecordStore::open), which is the only thing that folds a
+    /// logged delta in.
+    applied_counts: AppliedTxSet,
 }
 
 /// A **borrow of the statistics catalog**, holding the rank-10 catalog latch open for as long as it
@@ -2079,6 +1988,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 schema_last_seq: HashMap::default(),
                 meta_chain: Vec::new(),
                 statistics: Arc::new(Statistics::new()),
+                // A fresh store has no log to replay, so nothing has been folded in (`rmp` #1066).
+                applied_counts: AppliedTxSet::default(),
             }),
             commit_registry: RwLock::new(CommitRegistry::new()),
             // `rmp` #522 incremental-GC state (pure in-memory; rebuilt from scratch every open). The
@@ -2129,7 +2040,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     pub fn open(device: D, wal: WalManager<S>, pool_capacity: usize) -> Result<Self> {
         let shared = SharedWal::new(wal);
         let pool = ConcurrentBufferPool::with_wal(device, shared.clone(), pool_capacity).shared();
-        let (meta, meta_chain) = Self::read_meta(&pool)?;
+        let (mut meta, meta_chain) = Self::read_meta(&pool)?;
         // Rebuild the Active/Recent Transaction Table from the WAL's commit records (`rmp` task #49):
         // with lazy GC-time freezing a committed version may still carry its writer's in-flight
         // `TxnId` on disk, so visibility/reclamation must resolve that id to the commit timestamp the
@@ -2139,8 +2050,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // references them, so the entries are never consulted and the next GC pass prunes them again.
         let mut commit_registry = CommitRegistry::new();
         let mut unfrozen_commit_lsn = BTreeMap::new();
-        for (committed_txn, ts, lsn) in shared.with(|w| w.committed_transactions())? {
+        // ONE pass over the retained log for both the commit records and the count-delta records
+        // (`rmp` #1066): a reopen already pays two full scans, and a third for state this one
+        // collects at the cost of a `match` arm would be a third CRC verification of every record.
+        let recovered = shared.with(|w| w.recovered_transactions())?;
+        let mut committed_txns: HashSet<TxnId> = HashSet::default();
+        for &(committed_txn, ts, lsn) in &recovered.commits {
             commit_registry.record_commit(committed_txn, ts);
+            committed_txns.insert(committed_txn);
             // Conservatively treat every surviving committed txn as possibly-unfrozen (a pre-crash GC
             // may have frozen some, harmlessly re-included; the next GC pass re-prunes them). This
             // floors WAL reclamation so no commit record an unfrozen version needs is dropped.
@@ -2188,6 +2105,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // Runs after the two page-map reconstructions above so the scan sees every mapped record page,
         // and before anything else touches a property cell.
         Self::refuse_legacy_property_tombstones(&pool, &stores, store_format_version)?;
+        // `rmp` #1066: fold in every logged cardinality delta the durable catalog does not already
+        // account for. Runs after the store has been accepted, so a refused image never reaches it.
+        Self::replay_logged_count_deltas(
+            &mut meta.statistics,
+            &mut meta.applied_counts,
+            &recovered.count_deltas,
+            &committed_txns,
+        )?;
         let shared_len = shared.with(|w| w.durable_len());
         // Restore the transaction-id high-water from the durable WAL so the coordinator's id counter
         // resumes *past* every id already in the log. Without this the counter would restart low and
@@ -2220,6 +2145,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 schema_last_seq: HashMap::default(),
                 meta_chain,
                 statistics: Arc::new(meta.statistics),
+                // Whatever the replay above folded in, so the pair the checkpoint persists agrees
+                // with the counters it persists beside it (`rmp` #1066).
+                applied_counts: meta.applied_counts,
             }),
             commit_registry: RwLock::new(commit_registry),
             // `rmp` #522 incremental-GC state (pure in-memory; rebuilt from scratch every open). The
@@ -2414,26 +2342,35 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         for (slot, store) in stores.iter_mut().zip(self.stores.iter()) {
             *slot = store.to_meta()?;
         }
+        // Clones the whole `Statistics` (counts *and* the `rmp` task #81 property-histogram map): the
+        // histogram blobs ride the same checkpoint-at-commit path as the counts with no
+        // special-casing — `Statistics` is cloned structurally. The SCHEMA half is taken from the
+        // COMMITTED image, not the live one (`rmp` #734): the live `Statistics` also carries any
+        // still-open transaction's uncommitted DDL, and checkpointing that would publish an in-flight
+        // schema change as committed.
+        //
+        // The applied-transaction set comes back from the SAME hold (`rmp` #1066): it names the
+        // transactions whose logged deltas are already folded into those counters, so the two are one
+        // fact and sampling them at two instants would persist a pair describing no state. See
+        // `committed_statistics`.
+        let (statistics, applied_counts) = self.committed_statistics(committing);
         Ok(Meta {
-            // Every catalog this build writes is a format-version-3 image, so a store opened at an
-            // earlier version is UPGRADED by its first checkpoint (`05 §12.6`). From version 1 the
+            // Every catalog this build writes is at this build's format version, so a store opened at
+            // an earlier one is UPGRADED by its first checkpoint (`05 §12.6`). From version 1 the
             // upgrade adds the two (empty) undo-area stores and loses nothing — a version-1 store has
-            // no chains, which is precisely what an empty undo area describes. From version 2 it
-            // changes nothing but the number: version 2 and version 3 differ only in what a property
-            // cell MEANS, and `refuse_legacy_property_tombstones` has already established at `open`
-            // that this image holds no cell whose meaning would change (`rmp` #967).
+            // no chains, which is precisely what an empty undo area describes. From version 2 to 3 it
+            // changes nothing but the number: those two differ only in what a property cell MEANS, and
+            // `refuse_legacy_property_tombstones` has already established at `open` that this image
+            // holds no cell whose meaning would change (`rmp` #967). From version 3 the upgrade adds
+            // the (empty) applied-transaction set, which is what such a store's history says: no build
+            // below version 4 ever wrote a count-delta record (`rmp` #1066).
             format_version: graphus_core::constants::FORMAT_VERSION,
             element_id_next: self.element_ids.peek(),
             commit_ts_hw: self.commit_ts_hw.load(Ordering::Acquire),
             stores,
             tokens: self.with_catalog(|c| (*c.tokens).clone()),
-            // Clones the whole `Statistics` (counts *and* the `rmp` task #81 property-histogram map):
-            // the histogram blobs ride the same checkpoint-at-commit path as the counts with no
-            // special-casing — `Statistics` is cloned structurally. The SCHEMA half is taken from the
-            // COMMITTED image, not the live one (`rmp` #734): the live `Statistics` also carries any
-            // still-open transaction's uncommitted DDL, and checkpointing that would publish an
-            // in-flight schema change as committed. See `committed_statistics`.
-            statistics: self.committed_statistics(committing),
+            statistics,
+            applied_counts,
         })
     }
 
@@ -2940,6 +2877,84 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
              build that wrote it, export the graph from it (`graphus-bulk dump` writes the node and \
              relationship CSV pair), and load that export into a NEW store created by this build."
         )))
+    }
+
+    /// Folds every **committed, not-yet-applied** logged cardinality delta into the recovered
+    /// catalog, and records the transactions it folded (`rmp` #1066).
+    ///
+    /// This is the recovery half of the logged-counter design. The durable catalog carries the
+    /// counters *and* the set of transactions already folded into them
+    /// ([`Meta::applied_counts`](crate::Meta)); the log carries the deltas. The answer a reopened
+    /// store serves is the first plus every delta the set does not name.
+    ///
+    /// # The two filters, and why each one is load-bearing
+    ///
+    /// * **committed** — a delta belongs to the durable counters only if its transaction committed.
+    ///   A loser's delta is in the log (it was appended before the crash) and must never be applied;
+    ///   nothing else would remove it, because recovery's undo pass writes CLRs for *page* changes
+    ///   and a count delta is not one. Recovery's own winner set is therefore the gate, which is why
+    ///   `committed` is passed in rather than re-derived here.
+    /// * **not already applied** — a checkpoint may have folded a delta in and left the record in the
+    ///   log; replaying it again would double-count. That is decided by the SET of transaction ids,
+    ///   never by a log position — see [`AppliedTxSet`] for why a watermark is unsound here and what
+    ///   `rmp` #1062 already paid to learn it.
+    ///
+    /// The two are independent: a transaction may be committed and applied (skip), committed and not
+    /// applied (fold), or uncommitted (skip, and **not** marked applied — it may yet be recovered
+    /// differently, and a set entry for it would be a claim about a transaction that never existed).
+    ///
+    /// # Each filter lives in exactly one place, deliberately
+    ///
+    /// This function applies **only** the committed filter, and hands everything else to
+    /// [`replay_count_deltas`], which owns the applied-set decision. An earlier draft also skipped
+    /// already-applied records here, to avoid decoding a payload it would then discard. That is a
+    /// real saving and it was still wrong: it made the idempotence gate redundant, and a redundant
+    /// control is an **untestable** one. Measured — with the gate inside `replay_count_deltas`
+    /// deliberately removed, `tests/count_delta_wal_replay_1066.rs` stayed green, because this
+    /// duplicate caught what the primary control no longer did. The saving is one payload decode per
+    /// already-applied record, once, at open; the cost was a green suite over a broken mechanism.
+    ///
+    /// # What runs this today
+    ///
+    /// Nothing, in production: no path emits a
+    /// [`RecordType::CountDelta`](graphus_wal::RecordType::CountDelta) record until `rmp` #1067, so
+    /// `records` is empty on every real store and this is one `is_empty` check. It is wired in now,
+    /// with its tests, because the format and the recovery are what #1067 builds the write path onto
+    /// — and because a recovery path first exercised by the change that starts depending on it is a
+    /// recovery path nobody has tested.
+    ///
+    /// # Errors
+    /// Returns a storage error if a record's payload does not decode — a delta this build cannot
+    /// read is refused rather than skipped, because skipping it would silently serve a cardinality
+    /// short of a committed transaction's rows (`04 §4.6`, fail closed).
+    fn replay_logged_count_deltas(
+        statistics: &mut Statistics,
+        applied: &mut AppliedTxSet,
+        records: &[graphus_wal::CountDeltaRecord],
+        committed: &HashSet<TxnId>,
+    ) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let mut admitted: Vec<(TxnId, CountDelta)> = Vec::new();
+        for rec in records {
+            if !committed.contains(&rec.txn_id) {
+                continue;
+            }
+            let delta = CountDelta::decode(&rec.payload).map_err(|e| {
+                GraphusError::Storage(format!(
+                    "refusing to open this store: the count-delta record at WAL offset {} for \
+                     committed transaction {} does not decode ({e}). Its transaction committed, so \
+                     its rows are in the store and its counter change is owed; skipping the record \
+                     would serve a cardinality permanently short of them, and `rmp` #866 answers \
+                     count() from that number with nothing to recompute it (`04 §4.6`)",
+                    rec.lsn.0, rec.txn_id.0
+                ))
+            })?;
+            admitted.push((rec.txn_id, delta));
+        }
+        replay_count_deltas(statistics, applied, admitted.iter().map(|(t, d)| (*t, d)));
+        Ok(())
     }
 
     /// Persists the in-memory catalog to the metadata page as one WAL-logged update under `txn`.
@@ -13198,7 +13213,19 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Costs nothing in the ordinary case: with no open transaction holding DDL or counts — which is
     /// every workload that is not interleaving writes across statements — this is exactly the clone it
     /// always was, plus one `is_empty` check per open transaction.
-    fn committed_statistics(&self, committing: TxnId) -> Statistics {
+    ///
+    /// # The applied-transaction set comes back with it, under the SAME hold (`rmp` #1066)
+    ///
+    /// [`AppliedTxSet`] names the transactions whose logged cardinality deltas are already folded into
+    /// the counters this returns, so the two are one fact and a checkpoint that sampled them at two
+    /// instants would persist a pair that describes no state — a set claiming a delta is folded in
+    /// beside counters that do not contain it makes the next recovery skip a committed transaction's
+    /// rows, or a set that lags makes it fold them in twice. That is `rmp` #1052's lesson applied
+    /// before it can be paid for a second time: the set is immutable after `open` **today**, so the
+    /// tear is not yet reachable, but #1067 starts moving it at commit and "unreachable because
+    /// nothing writes it yet" is exactly the kind of implicit invariant that stops holding without
+    /// anyone noticing. It is returned from inside the hold instead.
+    fn committed_statistics(&self, committing: TxnId) -> (Statistics, AppliedTxSet) {
         // ONE hold over the image AND the deltas withdrawn from it (`rmp` #1052). The two are read
         // together because the answer is their DIFFERENCE, and a difference of two states sampled at
         // two instants is not a state of anything: this method used to clone the live counters under
@@ -13223,8 +13250,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             ResourceId::txn(committing.0),
         );
         let active = &self.active;
-        let (mut committed, mut pending, last_seq) = self.with_catalog(|c| {
+        let (mut committed, applied, mut pending, last_seq) = self.with_catalog(|c| {
             let mut committed = (*c.statistics).clone();
+            // Cloned INSIDE this hold, beside the counters it describes (`rmp` #1066) — see the note
+            // on this method. Cheap: empty in every store this build writes.
+            let applied = c.applied_counts.clone();
             // ONE sweep of the shards for both halves, where there were three. `committed` is
             // withdrawn from in place and the schema logs are accumulated, so a transaction's entry is
             // visited once.
@@ -13262,12 +13292,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // store's own witness map must survive it untouched. Cloned only when there is a log to
             // replay, which is every workload that is not interleaving DDL across statements.
             let last_seq = (!pending.is_empty()).then(|| c.schema_last_seq.clone());
-            (committed, pending, last_seq)
+            (committed, applied, pending, last_seq)
         });
         // The replay works on the three snapshots taken above and touches no shared state, so it sits
         // OUTSIDE the hold: what has to be atomic is the sampling, not the arithmetic.
         let Some(mut last_seq) = last_seq else {
-            return committed;
+            return (committed, applied);
         };
         pending.sort_unstable_by_key(|e| std::cmp::Reverse(e.seq));
         for entry in pending {
@@ -13278,7 +13308,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // rollback splices out the ones that are not), so live chains unwind here without gaps.
             Self::undo_schema_entry(&mut committed, &mut last_seq, &entry);
         }
-        committed
+        (committed, applied)
     }
 
     /// Whether any currently-open transaction still holds pending schema DDL (`rmp` #734) — i.e.

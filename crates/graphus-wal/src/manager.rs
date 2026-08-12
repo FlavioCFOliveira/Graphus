@@ -50,6 +50,36 @@ struct TxnState {
     undo: Vec<UndoEntry>,
 }
 
+/// One [`RecordType::CountDelta`] record recovered from the durable log (`rmp` #1066).
+///
+/// The payload is **opaque** to this crate: `graphus-storage` owns the counters and therefore owns
+/// the payload's meaning. Keeping it as bytes here is what stops the log format from depending on
+/// the catalogue's shape (and keeps the crate graph acyclic — storage depends on this crate, never
+/// the other way round).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CountDeltaRecord {
+    /// The transaction whose net counter change this record carries.
+    pub txn_id: TxnId,
+    /// Where the record sits in the log. Not used to decide whether the delta has been applied —
+    /// that is a set of transaction ids, never a log position, because applies finish out of log
+    /// order — but it is what a diagnostic needs to point at the record it is talking about.
+    pub lsn: Lsn,
+    /// The encoded counter delta, verbatim.
+    pub payload: Vec<u8>,
+}
+
+/// What one pass over the durable log yields for a reopening store
+/// ([`WalManager::recovered_transactions`], `rmp` #1066).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecoveredTransactions {
+    /// Every `COMMIT` record: `(transaction, its MVCC commit timestamp, its LSN)`, in log order.
+    pub commits: Vec<(TxnId, Timestamp, Lsn)>,
+    /// Every [`CountDelta`](RecordType::CountDelta) record, in log order. **Log order carries no
+    /// authority**: it is the order the records were appended in, not the order they were or will be
+    /// applied in, and the replay is defined to be independent of it.
+    pub count_deltas: Vec<CountDeltaRecord>,
+}
+
 /// The write-ahead log over a [`LogSink`].
 pub struct WalManager<S: LogSink> {
     sink: S,
@@ -187,6 +217,43 @@ impl<S: LogSink> WalManager<S> {
     /// # Errors
     /// Propagates a sink read error, or returns a storage error on interior WAL corruption.
     pub fn committed_transactions(&self) -> Result<Vec<(TxnId, Timestamp, Lsn)>> {
+        Ok(self.recovered_transactions()?.commits)
+    }
+
+    /// Everything a reopening store needs from the durable log's **transaction-control** records, in
+    /// **one** pass: the commit records and the count-delta records (`rmp` #1066).
+    ///
+    /// [`committed_transactions`](Self::committed_transactions) is this scan with the deltas
+    /// dropped. They share a pass because a reopen already pays two full scans over the retained log
+    /// (this one and [`max_recovered_txn_id`](Self::max_recovered_txn_id)) and a third would be a
+    /// third CRC verification of every record for state that is collected here for free — the
+    /// per-record work is one `match` on a byte either way, and a log holding no count-delta record
+    /// allocates nothing extra.
+    ///
+    /// The two halves are deliberately **not** cross-filtered here: this returns what the log says,
+    /// and the storage layer decides which deltas may be applied (only a committed transaction's, and
+    /// only one not already folded into the durable catalogue). Keeping the policy out of this crate
+    /// is what lets `graphus-wal` stay ignorant of what a counter is — it frames the payload and
+    /// never interprets it.
+    ///
+    /// # Footprint
+    ///
+    /// The scan itself stays `O(window)` — [`crate::recovery::scan_forward`] reads at most
+    /// `RECOVERY_WINDOW_BYTES` at a time (`rmp` #599) — and the result is `O(#transactions)` in the
+    /// retained log, which is the order [`commits`](RecoveredTransactions::commits) already was and
+    /// the same bound recovery's own analysis phase holds itself to. The one difference worth naming:
+    /// a commit is three words, while a count-delta payload is `O(distinct labels and types that
+    /// transaction touched)` — bounded by the schema, never by the transaction's row count, because
+    /// the delta is a map keyed by counter and not a list of rows. Empty today, since nothing emits
+    /// these records until `rmp` #1067; if a workload ever makes the aggregate matter, the fix is to
+    /// fold each payload as it is scanned rather than to collect them, which the replay's
+    /// order-independence already permits.
+    ///
+    /// # Errors
+    /// Propagates a sink read error, or returns a storage error on interior WAL corruption — see
+    /// [`committed_transactions`](Self::committed_transactions) for why that failure is fatal rather
+    /// than a stopping point.
+    pub fn recovered_transactions(&self) -> Result<RecoveredTransactions> {
         // Bound the read to the sink's `reclaimed_floor()` (`rmp` #525) AND stream it window-by-window
         // (`rmp` #599): this scan runs on EVERY reopen (the store rebuilds its transaction table from
         // it), so it must not allocate a buffer sized by the log's lifetime byte offset nor by the
@@ -195,23 +262,34 @@ impl<S: LogSink> WalManager<S> {
         let base = HEADER_LEN.max(self.sink.reclaimed_floor());
         let durable_len = self.sink.durable_len();
         let window = crate::recovery::RECOVERY_WINDOW_BYTES;
-        let mut out = Vec::new();
+        let mut out = RecoveredTransactions::default();
         let Some(start) =
             crate::recovery::find_first_record_offset(self, base, durable_len, window)?
         else {
             return Ok(out);
         };
         // This scan reads only header fields and the commit-timestamp prefix of `redo` via the
-        // borrowed `LogRecordRef`, so it allocates nothing per record. Probe on: the same
+        // borrowed `LogRecordRef`, so it allocates nothing per record — except for the count-delta
+        // payloads, which are copied out because they must outlive the window. Probe on: the same
         // interior-corruption guard as `recover_from` — fail loud if real committed data follows an
         // undecodable spot, because stopping there would silently drop those transactions from the
         // rebuilt table (an ACID violation); a genuine torn tail just ends the scan.
         let outcome =
             crate::recovery::scan_forward(self, start, durable_len, window, true, |rec, _abs| {
-                if rec.rec_type == RecordType::Commit {
-                    if let Some(ts) = rec.commit_ts() {
-                        out.push((rec.txn_id, ts, rec.lsn));
+                match rec.rec_type {
+                    RecordType::Commit => {
+                        if let Some(ts) = rec.commit_ts() {
+                            out.commits.push((rec.txn_id, ts, rec.lsn));
+                        }
                     }
+                    RecordType::CountDelta => {
+                        out.count_deltas.push(CountDeltaRecord {
+                            txn_id: rec.txn_id,
+                            lsn: rec.lsn,
+                            payload: rec.redo.to_vec(),
+                        });
+                    }
+                    _ => {}
                 }
                 Ok(())
             })?;
@@ -382,6 +460,40 @@ impl<S: LogSink> WalManager<S> {
         let lsn = self.next_lsn();
         self.buf.clear();
         r.encode_header_to(lsn, redo, &[], &mut self.buf);
+        self.sink.append(&self.buf);
+        let st = self.active.entry(txn).or_insert(TxnState {
+            first_lsn: lsn,
+            last_lsn: lsn,
+            undo: Vec::new(),
+        });
+        st.last_lsn = lsn;
+        lsn
+    }
+
+    /// Logs `txn`'s net signed change to the catalogue's cardinality counters (`rmp` #1066).
+    ///
+    /// `payload` is written verbatim into the record's `redo` and is never interpreted here; see
+    /// [`RecordType::CountDelta`] for why the counters are logged as deltas rather than persisted as
+    /// a whole-image rewrite, and [`LogRecord::count_delta`] for why `redo` is the safe field.
+    ///
+    /// The record joins `txn`'s undo back-chain like any other record it logs, so a loser's chain
+    /// still unwinds through it (recovery's undo pass walks past a non-undoable record along
+    /// `prev_lsn`). It creates the transaction's Active-Transaction-Table entry if it has none, for
+    /// the same reason [`log_update_redo_only`](Self::log_update_redo_only) does: the entry is what
+    /// `prev_lsn` chaining and the reclamation floor are computed from, and a record with no entry
+    /// would be unreachable from both.
+    ///
+    /// **Ordering obligation of the caller.** A delta is applied at recovery only for a transaction
+    /// whose `COMMIT` record is in the log, so this must be appended **before** that commit record —
+    /// otherwise the transaction commits durably with its counter change absent from the log, which
+    /// is the whole failure this record exists to remove.
+    pub fn log_count_delta(&mut self, txn: TxnId, payload: &[u8]) -> Lsn {
+        let prev = self.active.get(&txn).map_or(Lsn(0), |s| s.last_lsn);
+        let mut r = LogRecord::new(RecordType::CountDelta, txn, PageId(0));
+        r.prev_lsn = prev;
+        let lsn = self.next_lsn();
+        self.buf.clear();
+        r.encode_header_to(lsn, payload, &[], &mut self.buf);
         self.sink.append(&self.buf);
         let st = self.active.entry(txn).or_insert(TxnState {
             first_lsn: lsn,

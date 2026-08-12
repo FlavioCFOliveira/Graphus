@@ -846,12 +846,33 @@ fn downgrade_catalog_to(image: &mut Image, target: u32) {
     match target {
         // Version 1: cut the trailing block off, which is literally what a pre-#966 image is.
         1 => meta[len_at..len_at + 4].copy_from_slice(&(magic_at as u32).to_le_bytes()),
-        // Version 2: keep the block — its layout is unchanged since #966 — and write 2 into the
-        // version word that follows the magic. That is the WHOLE difference between a version-2 and a
-        // version-3 image, which is exactly why the number had to be bumped for `rmp` #967.
+        // Version 2: keep the undo-area block — its layout is unchanged since #966 — and write 2
+        // into the version word that follows the magic. Between a version-2 and a version-3 image
+        // that number is the ONLY difference, which is exactly why it had to be bumped for
+        // `rmp` #967.
+        //
+        // It is no longer the only surgery, though (`rmp` #1066). A version-4 image carries a
+        // TRAILING applied-transaction-set block after the undo-area one, and no version-2 build
+        // ever wrote such a thing — so an image that declares 2 and still carries it is not a
+        // forgery of a version-2 store, it is a self-contradictory image, and `Meta::decode`
+        // rightly refuses it before any of the #967 gate's semantics are reached. Cutting the block
+        // off is what makes the forgery faithful again, and it is the same cut the version-1 arm
+        // above already performs (that arm truncates at the undo-area magic, so it removes both
+        // blocks at once and needed no change).
         2 => {
             let ver_at = chunk_at + magic_at + 8;
             meta[ver_at..ver_at + 4].copy_from_slice(&2u32.to_le_bytes());
+            let counts_at = meta[chunk_at..chunk_at + chunk_len]
+                .windows(8)
+                .position(|w| w == b"GRPHCNTD")
+                .expect("a current-version catalog carries the applied-counts magic");
+            // The high bit of the framed length is the format flag that makes a pre-#966 build
+            // refuse the head page, and a version-2 image DOES carry it — only the version-1 arm
+            // above clears it, deliberately. Truncating must therefore preserve whatever flag bits
+            // were already there; writing the bare length would silently forge a version-1 header
+            // on an image whose block says 2.
+            let truncated = (counts_at as u32) | (framed & 0x8000_0000);
+            meta[len_at..len_at + 4].copy_from_slice(&truncated.to_le_bytes());
         }
         other => panic!("this fixture only forges versions 1 and 2, not {other}"),
     }

@@ -687,7 +687,23 @@ pub mod constants {
     /// than this constant is **upgraded** on open — unless the upgrade would change what its data
     /// means, in which case it is **refused** with a migration route
     /// (`RecordStore::refuse_legacy_property_tombstones`) — and one newer than it is always refused.
-    pub const FORMAT_VERSION: u32 = 3;
+    ///
+    /// # Version 4 (`rmp` #1066): the applied-transaction set
+    ///
+    /// Version 4 appends one trailing block to the catalog image: the set of transactions whose
+    /// logged cardinality deltas are already folded into the `Statistics` persisted beside it
+    /// (`graphus_storage::AppliedTxSet`). The bump is what stops an older build from reading a
+    /// version-4 image, and it has to: such a build would replay every count-delta record in the log
+    /// — it does not know the record type, so it skips them — and, worse, would rewrite the catalog
+    /// **without** the block, discarding the record of what had already been applied. The next
+    /// version-4 build to open that store would then fold every still-retained delta in a second
+    /// time. A counter that `count()` is answered from would be permanently wrong, silently.
+    ///
+    /// A version-3 image opened by this build is an **upgrade**, not a conversion: the block is
+    /// simply absent and the set decodes empty, which is the truth for it — no build below version 4
+    /// ever wrote a count-delta record, so there is nothing an empty set could cause to be applied
+    /// twice. The first checkpoint rewrites the catalog with the block present.
+    pub const FORMAT_VERSION: u32 = 4;
 
     /// Logical database page size in bytes, decoupled from the OS page size
     /// (`04-technical-design.md` §3.1; the default is subject to spike §12 item 4).

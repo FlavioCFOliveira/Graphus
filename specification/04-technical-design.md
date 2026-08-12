@@ -433,7 +433,7 @@ The WAL is a sequence of segment files of variable-length records. Every record:
 | `lsn` | 8 | this record's Log Sequence Number (monotonic, = file offset based) |
 | `prev_lsn` | 8 | previous LSN **of the same transaction** (back-chain for undo) |
 | `txn_id` | 8 | owning transaction (0 for non-txn records like checkpoints) |
-| `type` | 1 | BEGIN, UPDATE, INSERT, DELETE, COMMIT, ABORT, CLR, CHECKPOINT-BEGIN, CHECKPOINT-END, FULL-PAGE-IMAGE, ALLOC/FREE |
+| `type` | 1 | BEGIN, UPDATE, INSERT, DELETE, COMMIT, ABORT, CLR, CHECKPOINT-BEGIN, CHECKPOINT-END, FULL-PAGE-IMAGE, ALLOC/FREE, COUNT-DELTA |
 | `page_id` | 8 | page affected (where applicable) |
 | `len` | 4 | payload length |
 | `redo` | var | redo image / logical redo (how to re-apply) |
@@ -442,6 +442,31 @@ The WAL is a sequence of segment files of variable-length records. Every record:
 
 Physiological logging: redo is page-oriented (idempotent re-apply keyed on `page_lsn`), undo is
 logical-per-record so a rollback can be applied even after page reorganization.
+
+**`COUNT-DELTA` is the one record kind that does not describe a page** (task **#1066**). It carries one
+transaction's **net signed change** to the catalogue's six live-record cardinality counters, which
+`count()` is answered from since task #866. Those counters used to reach disk only inside the whole
+catalogue image a commit rewrites, and that image cannot be made exact under concurrent committers: a
+checkpoint samples it and writes it later, holding nothing in between, so a transaction that commits
+inside that interval is missing from it — and if that image lands last, its rows never become durable
+(task **#1055**, measured on the deterministic scheduler, which also measured that electing the newest
+image fixes nothing, because on every failing seed the newest image sampled is itself incomplete). A
+delta has no such failure mode: it names only its own transaction's change, so no committer's record
+can erase another's. The approach is Neo4j's — the only surveyed engine (against Neo4j, PostgreSQL,
+InnoDB and Memgraph) that keeps this number **exact** under concurrent commits rather than declaring it
+approximate and scanning to answer.
+
+The payload rides in `redo`, exactly as a `COMMIT` record's timestamp does, and is safe there because
+the type is **not** a page change: recovery's redo pass never hands those bytes to a page. It is not an
+undoable action either — a loser's delta is simply never applied, so there is nothing to compensate,
+and the undo pass walks past it along `prev_lsn`. Recovery folds in every delta whose transaction
+**committed** and whose transaction is not already named by the durable catalogue's
+**applied-transaction set** (`05-storage-format.md` §12.6). The deltas are summed **before** anything is
+applied, not applied one at a time: the counters saturate at `0` and saturation does not commute, so a
+delta that removes rows another delta in the same batch added would clamp if it landed first. Summing
+first is exact integer addition, and that is what makes the recovered catalogue independent of the
+order the records happen to sit in — which is not the order they were applied in once several engine
+workers are running (task #1062).
 
 ### 4.2 Group commit & fdatasync strategy
 

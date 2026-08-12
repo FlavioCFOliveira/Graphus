@@ -72,6 +72,7 @@
 
 pub mod backup;
 pub mod check;
+pub mod counts_log;
 pub mod dwb;
 pub mod heap;
 pub mod idalloc;
@@ -100,6 +101,7 @@ pub use check::{
     IndexAgreement, IndexEntry, LabelBitmapFault, PropertyFault, UndoChainFault, UndoSlotFault,
     Violation, verify_on_open, verify_warm,
 };
+pub use counts_log::{AppliedTxSet, CountDelta, ReplayOutcome, replay_count_deltas};
 pub use dwb::{DWB_EVICT_RING_SLOTS, DWB_MAX_BATCH, Dwb, DwbPageStager, dwb_device_pages};
 /// The page-header codec (checksum / `page_id` / `page_lsn` / type accessors) the storage layer
 /// stamps on every device page, re-exported from `graphus_bufpool` so callers above this crate
@@ -122,9 +124,10 @@ pub use incremental::{
 };
 pub use labels::{LabelError, MAX_INLINE_LABEL_ID, OVERFLOW_BIT};
 pub use meta::{
-    CompositeIndexEntry, ConstraintEntry, ConstraintKind, ConstraintTypeDescriptor, FulltextEntity,
-    FulltextIndexEntry, IndexState, Meta, RelCompositeIndexEntry, SpatialEntity, SpatialIndexEntry,
-    Statistics, StoreMeta, TextIndexEntry, VectorEntity, VectorIndexEntry, VectorSimilarity,
+    CompositeIndexEntry, ConstraintEntry, ConstraintKind, ConstraintTypeDescriptor, CountKey,
+    FulltextEntity, FulltextIndexEntry, IndexState, Meta, RelCompositeIndexEntry, SpatialEntity,
+    SpatialIndexEntry, Statistics, StoreMeta, TextIndexEntry, VectorEntity, VectorIndexEntry,
+    VectorSimilarity,
 };
 pub use propenc::{
     PropDecodeError, PropEncodeError, TAG_BOOL, TAG_FLOAT, TAG_INT, decode_inline, encode_inline,

@@ -52,9 +52,46 @@ const _: () = assert!(
     "the property-model version must be one this build can actually write",
 );
 
+/// The first on-disk format version whose catalog carries the **applied-transaction set** — the
+/// transactions whose logged cardinality deltas are already folded into the persisted
+/// [`Statistics`] (`rmp` #1066, [`crate::counts_log::AppliedTxSet`]).
+///
+/// Named separately from [`FORMAT_VERSION`](graphus_core::constants::FORMAT_VERSION) for the reason
+/// [`PROPERTY_UNDO_CHAIN_FORMAT_VERSION`] is: a later bump for an unrelated layout change must not
+/// move the boundary this gate keys on.
+///
+/// # Why an older image is upgraded rather than refused
+///
+/// Because the upgrade is provably lossless, which is the standing rule for this catalog: a
+/// version-1 image upgrades (it has no undo area, and an empty undo area describes exactly that),
+/// and only an image whose data would **mean** something different is refused
+/// (`RecordStore::refuse_legacy_property_tombstones`). Here the invariant the block carries is "these
+/// transactions are already folded into the counters beside it", and for a pre-version-4 image the
+/// honest empty set says the same thing the store's history does: no build below this version ever
+/// wrote a [`RecordType::CountDelta`](graphus_wal::RecordType::CountDelta) record, so its log
+/// contains none, so an empty set cannot cause anything to be applied a second time. There is
+/// nothing to convert and nothing to lose.
+///
+/// The refusal this version buys runs in the **other** direction, and it is the one that matters: an
+/// older build handed a version-4 image would not merely miss the block, it would rewrite the
+/// catalog without it — throwing away the record of what had already been applied — and a later
+/// version-4 build would then fold every retained delta in a second time. `Meta::decode`'s
+/// `version > FORMAT_VERSION` arm is what stops that, and it only stops it because this number moved.
+pub(crate) const COUNT_DELTA_FORMAT_VERSION: u32 = 4;
+
+const _: () = assert!(
+    COUNT_DELTA_FORMAT_VERSION <= graphus_core::constants::FORMAT_VERSION,
+    "the applied-transaction-set version must be one this build can actually write",
+);
+
 /// Magic word introducing the trailing undo-area block (`rmp` #966). Chosen so a truncated or
 /// garbage tail cannot be mistaken for the block: `b"GRPHUNDO"` read little-endian.
 const UNDO_AREA_MAGIC: u64 = u64::from_le_bytes(*b"GRPHUNDO");
+
+/// Magic word introducing the trailing applied-transaction-set block (`rmp` #1066), chosen on the
+/// same principle as [`UNDO_AREA_MAGIC`]: `b"GRPHCNTD"` read little-endian, so a truncated or
+/// garbage tail cannot be mistaken for the block.
+const APPLIED_COUNTS_MAGIC: u64 = u64::from_le_bytes(*b"GRPHCNTD");
 
 /// The durable catalog stored in the metadata page.
 ///
@@ -87,6 +124,19 @@ pub struct Meta {
     /// Exact, persisted live-record cardinalities for the planner's cardinality estimator
     /// (`rmp` task #79): per-label node counts and per-relationship-type counts.
     pub statistics: Statistics,
+    /// The transactions whose logged cardinality deltas are already folded into
+    /// [`statistics`](Self#structfield.statistics) (`rmp` #1066, format version
+    /// [`COUNT_DELTA_FORMAT_VERSION`] and up).
+    ///
+    /// It lives **in this struct**, and therefore in the same catalog image, because the pair is one
+    /// fact: a set that says "transaction 7 is folded in" is meaningless beside counters that do not
+    /// contain it, and persisting the two separately would let a crash land between them. Written and
+    /// read as a unit, they cannot be observed half-updated.
+    ///
+    /// Empty in every store this build writes: nothing emits a count-delta record until `rmp` #1067.
+    /// A pre-version-4 image decodes it empty, which is the truth for it — see
+    /// [`COUNT_DELTA_FORMAT_VERSION`].
+    pub applied_counts: crate::counts_log::AppliedTxSet,
 }
 
 /// The durable build state of a declared node-property index (`rmp` task #90).
@@ -1282,8 +1332,11 @@ pub(crate) struct CountsImage {
 ///
 /// `Copy` on purpose: it is passed by value through the whole write path and stored in the delta
 /// maps' keys as its payload, never as the enum, so it never allocates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CountKey {
+/// Public since `rmp` #1066: a count change is now a durable WAL payload
+/// ([`crate::counts_log::CountDelta`]), so the address it is applied at is part of a format that
+/// outlives the process rather than a private detail of the write path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CountKey {
     /// [`Statistics::total_nodes`] — the grand-total live-node count (`rmp` task #82).
     TotalNodes,
     /// [`Statistics::total_relationships`] — the grand-total live-relationship count (`rmp` task #82).
@@ -3722,6 +3775,7 @@ impl Meta {
             stores: Default::default(),
             tokens: TokenStore::new(),
             statistics: Statistics::new(),
+            applied_counts: crate::counts_log::AppliedTxSet::default(),
         }
     }
 
@@ -3770,6 +3824,25 @@ impl Meta {
         out.extend_from_slice(&self.format_version.to_le_bytes());
         for s in &self.stores[LEGACY_STORE_COUNT..] {
             Self::encode_store(&mut out, s);
+        }
+        // ---- The applied-transaction-set block (`rmp` #1066): format version 4 and up. ----
+        //
+        // Appended after the undo-area block by the same append-only rule, and introduced by its own
+        // magic word for the same reason that block is: the decoder must be able to tell "an older
+        // image that simply ends here" from "a block it must parse", and a bare length or count would
+        // be indistinguishable from a truncated tail.
+        //
+        // It is written whenever this build writes a catalog, which is always at
+        // `COUNT_DELTA_FORMAT_VERSION` or above — `format_version` is stamped from
+        // `graphus_core::constants::FORMAT_VERSION` by the only two places that build a `Meta` to
+        // encode (`Meta::new` and `RecordStore::snapshot_meta`). `decode` therefore requires the block
+        // to be present exactly when the version says it should be, rather than trusting either half
+        // alone. The gate below is what makes `encode` and `decode` exact inverses at EVERY version,
+        // including one this build only ever reads: re-encoding a decoded version-3 image must
+        // produce a version-3 image, not a version-3 header with a version-4 block behind it.
+        if self.format_version >= COUNT_DELTA_FORMAT_VERSION {
+            out.extend_from_slice(&APPLIED_COUNTS_MAGIC.to_le_bytes());
+            out.extend_from_slice(&self.applied_counts.encode());
         }
         Ok(out)
     }
@@ -3842,6 +3915,57 @@ impl Meta {
             }
             version
         };
+        // ---- The trailing applied-transaction-set block (`rmp` #1066). ----
+        //
+        // Presence is decided by the VERSION, not by whether bytes happen to remain, and it is checked
+        // in BOTH directions. The counters and this set are one fact (see [`Meta::applied_counts`]),
+        // so neither half may appear without the other:
+        //
+        // * a version at or above [`COUNT_DELTA_FORMAT_VERSION`] that carries no block is not an older
+        //   image, it is a damaged one — its counters were written by a build that folds logged deltas
+        //   into them, and opening it would re-apply deltas already accounted for;
+        // * a version below it that still carries a block never came from any writer: no such build
+        //   ever emitted one. That image is self-contradictory, and reading it would take the counters
+        //   of a version-4 store while discarding the record of what has been folded into them.
+        //
+        // Absent-and-below is the ordinary upgrade, and [`COUNT_DELTA_FORMAT_VERSION`] says why it is
+        // lossless.
+        //
+        // # The obligation this puts on anything that forges an older image
+        //
+        // Fail-closed here means a fixture that downgrades a current image by rewriting its version
+        // word must also **cut** the blocks that version does not define, or it forges a store no
+        // build could have written and is refused before reaching whatever it meant to test. That is
+        // not hypothetical: `rmp` #967's legacy fixture (`property_undo_chain_967`'s
+        // `downgrade_catalog_to`) forges a version-2 store exactly that way, and its version-2 arm
+        // truncates at this block's magic for this reason. Its version-1 arm already truncated at the
+        // undo-area magic, which removes both blocks at once, and needed no change.
+        //
+        // Pinned by `a_downgraded_image_still_carrying_a_newer_block_is_refused`.
+        let applied_counts = if format_version >= COUNT_DELTA_FORMAT_VERSION {
+            let magic = read_u64(bytes, &mut cur)?;
+            if magic != APPLIED_COUNTS_MAGIC {
+                return Err(GraphusError::Storage(format!(
+                    "metadata applied-transaction-set block has a bad magic ({magic:#018x}, \
+                     expected {APPLIED_COUNTS_MAGIC:#018x}); format version {format_version} \
+                     requires the block, so this is corruption rather than an older image"
+                )));
+            }
+            crate::counts_log::AppliedTxSet::decode(bytes, &mut cur)?
+        } else {
+            if cur < bytes.len() {
+                return Err(GraphusError::Storage(format!(
+                    "metadata catalog declares format version {format_version}, which has no \
+                     applied-transaction-set block, yet {} byte(s) follow the undo-area block. No \
+                     build below version {COUNT_DELTA_FORMAT_VERSION} ever wrote such a block, so \
+                     this image is self-contradictory rather than merely old; refusing to open \
+                     rather than take its counters while discarding the record of what has already \
+                     been folded into them",
+                    bytes.len() - cur
+                )));
+            }
+            crate::counts_log::AppliedTxSet::default()
+        };
         Ok(Self {
             format_version,
             element_id_next,
@@ -3849,6 +3973,7 @@ impl Meta {
             stores,
             tokens,
             statistics,
+            applied_counts,
         })
     }
 
@@ -3930,26 +4055,37 @@ impl Meta {
     }
 }
 
-fn take(bytes: &[u8], cur: &mut usize, len: usize) -> Result<usize> {
+/// Advances `cur` by `len`, failing closed if the input does not hold that many bytes.
+///
+/// The single bounds-checked cursor step every durable decoder in this crate is built from — the
+/// catalogue image here, and the WAL count-delta payload in [`crate::counts_log`] (`rmp` #1066).
+/// One implementation on purpose: a second one is a second chance to get an `+ len` wrong, and the
+/// `checked_add` is what stops a forged length from wrapping past the bound.
+pub(crate) fn take(bytes: &[u8], cur: &mut usize, len: usize) -> Result<usize> {
     let end = cur
         .checked_add(len)
         .filter(|&e| e <= bytes.len())
-        .ok_or_else(|| GraphusError::Storage("metadata truncated".to_owned()))?;
+        .ok_or_else(|| {
+            GraphusError::Storage(format!(
+                "truncated: {len} byte(s) wanted at offset {cur}, {} available",
+                bytes.len()
+            ))
+        })?;
     *cur = end;
     Ok(end)
 }
 
-fn read_u8(b: &[u8], cur: &mut usize) -> Result<u8> {
+pub(crate) fn read_u8(b: &[u8], cur: &mut usize) -> Result<u8> {
     let end = take(b, cur, 1)?;
     Ok(b[end - 1])
 }
 
-fn read_u32(b: &[u8], cur: &mut usize) -> Result<u32> {
+pub(crate) fn read_u32(b: &[u8], cur: &mut usize) -> Result<u32> {
     let end = take(b, cur, 4)?;
     Ok(u32::from_le_bytes(b[end - 4..end].try_into().expect("4")))
 }
 
-fn read_u64(b: &[u8], cur: &mut usize) -> Result<u64> {
+pub(crate) fn read_u64(b: &[u8], cur: &mut usize) -> Result<u64> {
     let end = take(b, cur, 8)?;
     Ok(u64::from_le_bytes(b[end - 8..end].try_into().expect("8")))
 }

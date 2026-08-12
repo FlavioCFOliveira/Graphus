@@ -175,6 +175,7 @@ fn type_name(b: u8) -> &'static str {
         RecordType::FullPageImage => "FullPageImage",
         RecordType::Alloc => "Alloc",
         RecordType::Free => "Free",
+        RecordType::CountDelta => "CountDelta",
     })
 }
 

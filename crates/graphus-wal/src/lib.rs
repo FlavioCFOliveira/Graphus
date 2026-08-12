@@ -34,7 +34,9 @@ pub mod sink;
 pub(crate) mod test_support;
 
 pub use checkpoint::CheckpointSnapshot;
-pub use manager::{HEADER_LEN, WAL_MAGIC, WAL_VERSION, WalManager};
+pub use manager::{
+    CountDeltaRecord, HEADER_LEN, RecoveredTransactions, WAL_MAGIC, WAL_VERSION, WalManager,
+};
 pub use record::{DecodeError, LogRecord, LogRecordRef, RecordType};
 pub use recovery::{ApplyTarget, RecoveryReport, recover, recover_from};
 pub use sink::{
