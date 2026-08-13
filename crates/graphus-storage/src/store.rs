@@ -1939,15 +1939,35 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// was working?* A releaser samples it beside the floor before writing its image and releases only
     /// if it has not moved. Monotone and never reset, so no ABA: it is a witness, not a state.
     pending_ddl_epoch: AtomicU64,
-    /// Admits **one** counter fold at a time (`rmp` #1067), and only ever through `try_lock`.
+    /// Admits **one owner of [`SYSTEM_TXN`] at a time** (`rmp` #1067, widened by `rmp` #1086).
     ///
-    /// The fold publishes its base by writing a catalogue image under [`SYSTEM_TXN`], and that id is
-    /// one WAL transaction: two threads inside it would share a begin and a commit, and the second
-    /// commit would fail a checkpoint that an ordinary committer is calling — turning a durable
-    /// commit into an error. A checkpoint that loses the race has nothing to wait for, because the
-    /// winner is publishing the same fold, so this is never acquired blocking. Try-lock only creates
-    /// no wait edge, which is why this needs no rank in `graphus_core::latch`.
-    counts_fold_lock: Mutex<()>,
+    /// [`SYSTEM_TXN`] is a *reserved id*, not a per-thread one, so everything that writes under it is
+    /// the same WAL transaction. Two threads inside it share one begin and one commit: the second
+    /// commit finds the entry already gone and fails a checkpoint an ordinary committer is calling —
+    /// turning a durable commit into an error — and, since `rmp` #1086, the first thread's removal of
+    /// the active-table entry can raise a concurrently sampled **redo floor** above a record whose
+    /// page the other thread has not applied yet, which loses that change from redo after a crash.
+    ///
+    /// The set of owners is closed, and every one of them that can race takes this: the counter fold
+    /// ([`fold_counts_for_reclaim`](Self::fold_counts_for_reclaim), by `try_lock`),
+    /// [`settle_counts_into_image`](Self::settle_counts_into_image) (blocking), and
+    /// [`crate::backup::backup_store`]'s MVCC freeze pass, which reaches it through
+    /// [`system_txn_guard`](Self::system_txn_guard). The freeze pass was the one that did **not**,
+    /// which is how the id acquired a second owner without anything connecting the two.
+    ///
+    /// **One entry is deliberately unguarded**: the `checkpoint_meta(SYSTEM_TXN, …)` inside
+    /// [`create`](Self::create). It runs while the store is still a local being constructed — no
+    /// `Arc` has been published, so no second thread can hold a reference to take the lock with — and
+    /// guarding it would only assert against a caller that cannot exist. Named here rather than left
+    /// for the next reader to re-derive: an audit of this invariant is `grep SYSTEM_TXN` plus this
+    /// one exception.
+    ///
+    /// The fold acquires it with `try_lock` and skips its image when it loses — sound because a
+    /// skipped fold reclaims no further than what is already durable, and the clamp below it holds
+    /// regardless of who won. The other two acquire it blocking. Contention is between a checkpoint
+    /// and a backup, both rare, and the guard is never held across a `.await` or another lock, so it
+    /// creates no wait edge and needs no rank in `graphus_core::latch`.
+    system_txn_lock: Mutex<()>,
     /// Redo-bounding auto-checkpoints that a [`RecordStore::commit`] attempted **after** its
     /// transaction was already durable and that failed — the count, and the last one's message
     /// (`rmp` #1079).
@@ -2334,7 +2354,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             drain_progress: std::sync::OnceLock::new(),
             // No exclusive store-open lock until the server installs one ([`hold_open_guard`], #563).
             open_guard: std::sync::OnceLock::new(),
-            counts_fold_lock: Mutex::new(()),
+            system_txn_lock: Mutex::new(()),
             delta_floors: Mutex::new(BTreeMap::new()),
             // No image can be carrying a pending-DDL block yet (`rmp` #1083).
             pending_ddl_floor: AtomicU64::new(u64::MAX),
@@ -2574,7 +2594,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             drain_progress: std::sync::OnceLock::new(),
             // No exclusive store-open lock until the server installs one ([`hold_open_guard`], #563).
             open_guard: std::sync::OnceLock::new(),
-            counts_fold_lock: Mutex::new(()),
+            system_txn_lock: Mutex::new(()),
             delta_floors: Mutex::new(BTreeMap::new()),
             // No image can be carrying a pending-DDL block yet (`rmp` #1083).
             pending_ddl_floor: AtomicU64::new(u64::MAX),
@@ -5475,7 +5495,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// which is the exact predicate for "this fold dirtied a page", because `checkpoint_meta` is the
     /// only thing here that writes one. It is reported rather than inferred by the caller: the fold
     /// declines to write on two independent conditions (nothing owed and no pending-DDL block; or a
-    /// lost race for `counts_fold_lock`), and a caller that tried to re-derive that would be
+    /// lost race for `system_txn_lock`), and a caller that tried to re-derive that would be
     /// duplicating a decision this function already makes.
     ///
     /// [`checkpoint`](Self::checkpoint) uses it to harden the image, because that write lands AFTER
@@ -5559,7 +5579,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // race has nothing to wait for: it reclaims no further than what is already durable, and
             // the winner is publishing the same fold. Try-lock only, so it creates no wait edge and
             // needs no rank (`graphus_core::latch`).
-            if let Ok(_fold) = self.counts_fold_lock.try_lock() {
+            if let Ok(_fold) = self.system_txn_lock.try_lock() {
                 self.checkpoint_meta(SYSTEM_TXN, true)?;
                 wrote_image = true;
                 if owed {
@@ -5705,7 +5725,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // to complete. The lock is outside the rank-10 catalogue latch and nothing that holds an
             // inner latch ever takes it, so waiting here closes no cycle.
             let _fold = self
-                .counts_fold_lock
+                .system_txn_lock
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             self.checkpoint_meta(SYSTEM_TXN, true)?;
@@ -5764,51 +5784,136 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         });
     }
 
+    /// Claims sole ownership of [`SYSTEM_TXN`] for as long as the returned guard lives
+    /// (`rmp` #1086). See [`system_txn_lock`](Self#structfield.system_txn_lock) for why the id needs
+    /// one owner at a time and what a second one costs.
+    ///
+    /// Blocking, because a caller that has already begun the transaction cannot abandon it; the fold
+    /// is the one path that may skip its work instead, and it keeps its `try_lock`. Hold it across
+    /// the **whole** `begin … commit`/`rollback` span, and never across a call that takes it again —
+    /// [`settle_counts_into_image`](Self::settle_counts_into_image) does, so it must sit outside.
+    pub(crate) fn system_txn_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.system_txn_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Samples the **conservative redo floor** a checkpoint may advertise: an LSN below which every
+    /// logged change is provably on its home page once the flush that follows this call has returned
+    /// (`rmp` #1086).
+    ///
+    /// It is `min(oldest active transaction's first LSN, the log's end)`, read in ONE hold of the WAL
+    /// lock. See [`checkpoint`](Self::checkpoint) for the argument; the two properties that carry it
+    /// are that the reads are **atomic** with respect to appends, and that the caller takes this
+    /// **before** its flush, never during.
+    ///
+    /// Shared rather than duplicated: [`crate::backup::backup_store`] marks a checkpoint of its own
+    /// after its own flush, and it made the same unsound "an empty dirty-page table is truthful here"
+    /// claim for the same reason. One definition means one place to be wrong.
+    pub(crate) fn sample_conservative_redo_floor(&self) -> Lsn {
+        self.wal.with(|w| {
+            let end = w.next_lsn();
+            w.oldest_active_first_lsn()
+                .map_or(end, |first| Lsn(first.0.min(end.0)))
+        })
+    }
+
     /// Takes a **checkpoint** (`04 §4.7`, `rmp` storage audit F3), bounding crash-recovery redo to
     /// the work logged since the previous checkpoint instead of replaying the whole history.
     ///
-    /// This is a **sharp** checkpoint: it first flushes every dirty page home (each write-back
+    /// This is a **fuzzy** checkpoint with a conservative redo floor (`rmp` #1086). It samples an LSN
+    /// it can prove — see the section below — then flushes every dirty page home (each write-back
     /// enforces the WAL rule, so the log is durable through the page's `page_lsn` before the page
-    /// lands) and syncs the device, so **every change logged so far is durable on its data page**.
-    /// It then appends a `CHECKPOINT-END` with an empty Dirty Page Table and hardens it. Because the
-    /// flush made everything prior durable, recovery's redo can begin at this checkpoint's LSN (see
-    /// [`graphus_wal::recover`]) — nothing before it needs replay.
+    /// lands) and syncs the device. It then appends a `CHECKPOINT-END` whose Dirty Page Table is that
+    /// one claim, and hardens it. Recovery's redo begins at that floor (see [`graphus_wal::recover`])
+    /// rather than at this checkpoint's own LSN.
     ///
     /// Physical reclamation of the now-redundant WAL prefix (bounding **disk** and the analysis
-    /// scan) is the separate follow-up to this redo-bounding step.
+    /// scan) is the separate follow-up to this redo-bounding step. Its floor is clamped to the same
+    /// LSN, because a record redo may still need is a record reclamation may not drop.
     ///
     /// # Why the flush can happen twice (`rmp` #1085)
     ///
     /// The checkpoint is not only a reader of the data image: the counter fold writes a catalogue
-    /// image of its own (`fold_counts_for_reclaim`, `rmp` #1067 and
-    /// #1083). That write cannot be hoisted above the first flush — it needs the reclaim floor, the
-    /// floor needs the `CHECKPOINT-END` record, and that record's empty Dirty Page Table is only
-    /// truthful because a flush preceded it — so the image is written after the first flush and a
-    /// **second** flush hardens it, taken only when the fold actually wrote. Without it a sharp
-    /// checkpoint returned with the metadata page dirty, holding bytes its stored CRC32C did not cover
-    /// (the checksum is stamped at write-back), which is what `rmp` #1085 measured through the DST
-    /// integrity oracle.
+    /// image of its own (`fold_counts_for_reclaim`, `rmp` #1067 and #1083). That write cannot be
+    /// hoisted above the first flush — it needs the reclaim floor, and the floor needs the
+    /// `CHECKPOINT-END` record — so the image is written after the first flush and a **second** flush
+    /// hardens it, taken only when the fold actually wrote. Without it the checkpoint returned with
+    /// the metadata page dirty, holding bytes its stored CRC32C did not cover (the checksum is
+    /// stamped at write-back), which is what `rmp` #1085 measured through the DST integrity oracle.
     ///
-    /// # The sharpness above holds against THIS thread's writes, not against a concurrent writer
+    /// # The redo floor, and why it is sampled BEFORE the flush (`rmp` #1086)
     ///
-    /// Stated because the paragraph above would otherwise overclaim. The empty Dirty Page Table makes
-    /// recovery's `redo_start` this checkpoint's own LSN, and redo then skips every record below it.
-    /// That is sound only if no page is left dirty carrying a change logged *below* that LSN — which
-    /// the flush guarantees only while nothing else is writing.
+    /// This checkpoint does **not** claim to be sharp, and the difference is committed data.
+    ///
+    /// An empty Dirty Page Table makes recovery's `redo_start` the checkpoint record's own LSN, so
+    /// redo skips every record below it — sound only if no page is left dirty carrying a change
+    /// logged below that LSN, which the flush guarantees only while nothing else is writing.
     /// [`ConcurrentBufferPool::flush_all`](graphus_bufpool::ConcurrentBufferPool::flush_all) says so
     /// itself: a caller needing the stronger barrier "must quiesce writers", which it notes the
-    /// single-threaded engine did by construction. That premise no longer holds — since `rmp`
-    /// #1033/#975 the engine runs `W` workers over one store held by an unlocked `SharedRef`
-    /// (`graphus-cypher`), and `commit` reaches here through
-    /// `maybe_checkpoint` — so a page dirtied by another worker can be
-    /// missed by the flush and then excluded from redo by the very record this method appends.
+    /// single-threaded engine did by construction. Since `rmp` #1033/#975 that premise is false — `W`
+    /// workers share one store, and `commit` reaches here through `maybe_checkpoint` — so a page
+    /// dirtied by another worker was missed by the flush and then excluded from redo by the very
+    /// record this method appends. `graphus-dst`'s `det_scheduler_checkpoint_redo_floor_1086`
+    /// reproduces the loss on named seeds.
     ///
-    /// That is a **pre-existing defect of the empty Dirty Page Table**, not of the fold or of the
-    /// second flush, and it is not closed here: closing it means emitting a real Dirty Page Table (or
-    /// a conservative pre-flush LSN) so the checkpoint is honestly fuzzy, which is a design decision
-    /// with its own task. `rmp` #1085 narrowed the window — the second flush runs entirely after the
-    /// checkpoint record and catches most pages carrying sub-`ckpt_lsn` changes — but narrowing is not
-    /// closing, and no reader of this method should take the sharpness claim as unconditional.
+    /// So the floor is **sampled, not assumed**, and it is
+    /// `min(oldest active transaction's first LSN, the log's end)` taken in ONE hold of the WAL lock
+    /// **before the flush begins**. Nothing appends while that hold is taken, so:
+    ///
+    /// * a change logged **at or after** the sample is at or above the floor, so redo replays it;
+    /// * a change logged **below** the floor belongs to a transaction that was neither active at the
+    ///   sample (or the floor would be at or below its first LSN) nor started after it (or its
+    ///   records would be above the sampled end) — that is, one that had already committed or
+    ///   aborted. Every page write of such a transaction precedes the record that ended it
+    ///   (`commit_prepare` writes its catalogue image and publishes its commit slot *before*
+    ///   `commit_at_no_sync`; a rollback compensates *before* `finish_rollback`), so it was in a
+    ///   frame before this flush began — and a frame dirty when the flush begins is written home by
+    ///   it, or was already written home by an evictor whose write the flush's trailing barrier syncs.
+    ///
+    /// The window is therefore **empty**, not merely narrow. Sampling anywhere inside the flush would
+    /// leave it narrow instead: a page dirtied between the sample and the end of the sweep would be
+    /// excluded again, which is precisely what `rmp` #1085 could only narrow and had to declare.
+    ///
+    /// **That is measured, not argued.** Moving this one sample to after `self.flush()?` loses
+    /// committed records on named seeds (1 and 155 of 256) in `graphus-dst`'s
+    /// `det_scheduler_checkpoint_redo_floor_1086`, which reaches the case through
+    /// [`YieldSite::FrameWriteFlushBatchReleased`](graphus_core::sched::YieldSite): a transaction that
+    /// commits inside a flush, after that flush released its latches, has its page missed by the
+    /// flush **and** has left the active table before the flush returns — so a floor sampled there
+    /// sits above its records. Keep the sample above the flush, or that suite goes red.
+    ///
+    /// ## What the second bullet rests on, stated because it is not free
+    ///
+    /// "The transaction had already ended, so its page writes precede the record that ended it" is a
+    /// claim about **one thread**, and it holds only while a `TxnId` has **one owner** for its whole
+    /// `begin … commit`/`rollback` span. Two threads inside one id break it directly: one thread's
+    /// commit removes the active-table entry while the other is between its `log_update` and its
+    /// apply, and the floor rises above a record whose page is still in the pool.
+    ///
+    /// That is not hypothetical — [`SYSTEM_TXN`] is a *reserved* id, and
+    /// [`crate::backup::backup_store`]'s MVCC freeze pass ran under it without taking the lock the
+    /// counter fold takes, so an online `BACKUP` on one worker overlapping a `COMMIT` on another was
+    /// exactly this shape (`rmp` #1086). Every owner now serialises on
+    /// [`system_txn_lock`](Self#structfield.system_txn_lock), and
+    /// [`WalManager::begin`](graphus_wal::WalManager::begin) no longer resets an existing entry's
+    /// `first_lsn` — so a floor derived from it can no longer jump forward over live records.
+    ///
+    /// Two obligations follow, and they belong to whoever adds the next writer:
+    ///
+    /// 1. a reserved id may only be entered under [`system_txn_guard`](Self::system_txn_guard);
+    /// 2. a logged page write must be made by a transaction that is in the WAL active table with a
+    ///    `first_lsn` at or below that record — which is what makes `oldest_active_first_lsn` a floor
+    ///    rather than a guess.
+    ///
+    /// What this costs is recovery scan work — redo starts earlier and re-applies changes already on
+    /// their pages, which the per-page `page_lsn` gate then skips. It costs nothing in the steady
+    /// state: the floor is normally the oldest open writer's first LSN, which
+    /// [`WalManager::reclaim`] already clamped the reclaim floor to.
+    ///
+    /// A real Dirty Page Table (the ARIES answer, which would bound redo tightly) remains available
+    /// as a later optimisation. It is not a correctness debt, and it is not free: capturing a
+    /// coherent dirty set while other workers write is the same atomicity question one layer up.
     ///
     /// # Errors
     /// Returns a storage error if flushing the dirty pages or syncing the device fails.
@@ -5817,14 +5922,32 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Panics if the checkpoint `fdatasync` fails (`04 §4.9`), inherited from
     /// [`WalManager::checkpoint`].
     pub fn checkpoint(&self) -> Result<()> {
-        // Sharp checkpoint: make every logged change durable on its data page (WAL-before-data is
-        // enforced per page inside the flush), then mark the clean point in the log. When a
-        // doublewrite buffer is attached (`rmp` #384) the home flush is routed through it, so a torn
-        // home write during the checkpoint is repairable from the DWB copy on the next open; without
-        // one it is the historical bare `flush_all`. `flush` selects the right path.
+        // THE REDO FLOOR, AND IT IS SAMPLED HERE — BEFORE THE FLUSH, NOT INSIDE IT (`rmp` #1086).
+        //
+        // See the section of the same name above for why this is the LSN the whole method rests on.
+        // Two properties of this line carry it, and both are about WHERE it is:
+        //
+        // * **Before `self.flush()` below.** A page dirtied between the sample and the end of the
+        //   sweep is exactly the case the floor exists to cover, so a sample taken any later would
+        //   narrow the window instead of emptying it — the outcome `rmp` #1085 had to declare rather
+        //   than close.
+        // * **Atomic against appends**, which is what the helper's single `wal.with` buys: the two
+        //   reads are one observation, nothing can be logged between them, and a transaction that
+        //   begins after that hold has every record above the end this sample saw.
+        let redo_floor = self.sample_conservative_redo_floor();
+        // Make every logged change durable on its data page (WAL-before-data is enforced per page
+        // inside the flush), then mark the clean point in the log. When a doublewrite buffer is
+        // attached (`rmp` #384) the home flush is routed through it, so a torn home write during the
+        // checkpoint is repairable from the DWB copy on the next open; without one it is the
+        // historical bare `flush_all`. `flush` selects the right path.
         self.flush()?;
-        // Reclaim the WAL prefix that recovery no longer needs (`rmp` #114): below the checkpoint
-        // (redo floor — everything before is flushed) AND below the oldest unfrozen committed
+        // `rmp` #1086: THE WINDOW. The flush has returned and the `CHECKPOINT-END` record is not yet
+        // in the log, so a transaction that commits from here on has its `COMMIT` record below that
+        // record with its pages still in the pool. Offered so the deterministic scheduler can place a
+        // committer here; zero-sized with `det-sched` off.
+        sched::yield_at(YieldSite::CheckpointRecordAppend, ResourceId::NONE);
+        // Reclaim the WAL prefix that recovery no longer needs (`rmp` #114): below the REDO FLOOR
+        // (everything before it is provably home) AND below the oldest unfrozen committed
         // transaction's commit record (so an unfrozen in-flight stamp stays resolvable). The WAL
         // additionally clamps to the oldest active transaction's first record (loser undo).
         let oldest_unfrozen =
@@ -5833,14 +5956,26 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // oldest-active-first-lsn), so the doublewrite floor we persist below matches the WAL prefix
         // about to be dropped.
         let (ckpt_lsn, reclaim_floor) = self.wal.with(|w| {
-            let ckpt_lsn = w.checkpoint(&[]);
-            let floor = oldest_unfrozen.map_or(ckpt_lsn.0, |u| ckpt_lsn.0.min(u));
+            // The record carries the sampled floor rather than an empty table, so recovery starts redo
+            // there instead of at this record's LSN (`rmp` #1086).
+            let ckpt_lsn = w.checkpoint_with_redo_floor(redo_floor);
+            // …and reclamation starts from the SAME floor. Redo begins at `redo_floor`, so a byte
+            // below the checkpoint record but at or above the floor is a byte recovery still reads:
+            // flooring reclamation at `ckpt_lsn` here would drop exactly the records the fix above
+            // exists to replay. The two numbers are one decision and must not drift apart.
+            let floor = oldest_unfrozen.map_or(redo_floor.0, |u| redo_floor.0.min(u));
             let floor = w
                 .oldest_active_first_lsn()
                 .map_or(floor, |oldest| floor.min(oldest.0));
             (ckpt_lsn, floor)
         });
-        let _ = ckpt_lsn;
+        debug_assert!(
+            redo_floor.0 <= ckpt_lsn.0,
+            "the redo floor {} was sampled before the checkpoint record at {} was appended, so it \
+             cannot be above it",
+            redo_floor.0,
+            ckpt_lsn.0
+        );
         // THE COUNTER FOLD, and it must happen HERE — after the floor is known and before a single
         // byte below it is dropped (`rmp` #1067). It may LOWER the floor; it never raises it.
         // It also settles the pending-DDL block for the same reason and in the same image

@@ -354,17 +354,33 @@ impl<S: LogSink> WalManager<S> {
     }
 
     /// Logs the start of transaction `txn`.
+    ///
+    /// # It does NOT reset an entry that already exists (`rmp` #1086)
+    ///
+    /// `BEGIN` is lazy since `rmp` #529 — the active-table entry is created by the first
+    /// [`log_update`](Self::log_update) — so this method can legitimately find `txn` already there:
+    /// `RecordStore::checkpoint_meta` maps its pages (and logs them) before it calls this. An
+    /// unconditional `insert` there **overwrote** `first_lsn` with this record's offset, dropping the
+    /// earlier records out of the transaction's own extent and out of the `prev_lsn` back-chain, and
+    /// dropped any `undo` entries the transaction had accumulated.
+    ///
+    /// That matters beyond tidiness: `first_lsn` is what
+    /// [`oldest_active_first_lsn`](Self::oldest_active_first_lsn) reports, and since `rmp` #1086 that
+    /// is one of the two numbers a checkpoint's **redo floor** is derived from. A `first_lsn` that
+    /// jumps forward is a floor that jumps forward with it, over records whose pages may still be in
+    /// the pool. Keeping the earliest offset makes the floor truthful by construction, and preserving
+    /// the `undo` vector keeps a rollback able to undo what was logged before this call.
     pub fn begin(&mut self, txn: TxnId) -> Lsn {
         let mut r = LogRecord::new(RecordType::Begin, txn, PageId(0));
         let lsn = self.append(&mut r);
-        self.active.insert(
-            txn,
-            TxnState {
+        self.active
+            .entry(txn)
+            .and_modify(|st| st.last_lsn = lsn)
+            .or_insert(TxnState {
                 first_lsn: lsn,
                 last_lsn: lsn,
                 undo: Vec::new(),
-            },
-        );
+            });
         lsn
     }
 
@@ -769,6 +785,16 @@ impl<S: LogSink> WalManager<S> {
     /// Returns the `CHECKPOINT-END` LSN (the "last clean checkpoint LSN"). Hardened before
     /// returning.
     ///
+    /// # An EMPTY table is an assertion, not an absence (`rmp` #1086)
+    ///
+    /// Recovery reads an empty DPT as a **sharp** checkpoint and starts redo at this record's own
+    /// LSN, skipping everything below it
+    /// ([`CheckpointSnapshot::redo_start`](crate::CheckpointSnapshot::redo_start)). Passing `&[]` is
+    /// therefore the caller stating that every change logged so far is already durable on its home
+    /// page — which a flush establishes only while **nothing else is writing**. A caller that cannot
+    /// quiesce its writers must not pass `&[]`; it passes a floor it can prove, through
+    /// [`checkpoint_with_redo_floor`](Self::checkpoint_with_redo_floor).
+    ///
     /// # Panics
     /// Panics if the `fdatasync` fails (`§4.9`).
     pub fn checkpoint(&mut self, dirty_page_table: &[(PageId, Lsn)]) -> Lsn {
@@ -785,11 +811,37 @@ impl<S: LogSink> WalManager<S> {
         lsn
     }
 
+    /// Writes a fuzzy checkpoint whose Dirty Page Table is one **conservative** claim: every page may
+    /// be dirty carrying a change logged at or after `redo_floor`
+    /// ([`CheckpointSnapshot::ALL_PAGES`](crate::CheckpointSnapshot::ALL_PAGES)). Recovery therefore
+    /// starts redo at `redo_floor` rather than at this record's LSN, and the caller's reclaim floor
+    /// must be clamped to it too. Returns the `CHECKPOINT-END` LSN, hardened before returning.
+    ///
+    /// This is what a checkpoint taken **without quiescing writers** must use (`rmp` #1086). Such a
+    /// caller cannot enumerate the dirty set — the instant it finished enumerating, another writer
+    /// could dirty a page it had already passed — so it states instead an LSN below which every
+    /// logged change is provably home, and lets redo re-apply more than strictly necessary above it.
+    /// Redo is gated per page by `page_lsn`, so a floor that is too low costs scan work and nothing
+    /// else; a floor that is too high loses committed data.
+    ///
+    /// The floor must be sampled **before** the flush that establishes it, not during: a page dirtied
+    /// between the sample and the end of the flush is exactly the case this exists to cover.
+    ///
+    /// # Panics
+    /// Panics if the `fdatasync` fails (`§4.9`).
+    pub fn checkpoint_with_redo_floor(&mut self, redo_floor: Lsn) -> Lsn {
+        self.checkpoint(&[(CheckpointSnapshot::ALL_PAGES, redo_floor)])
+    }
+
     /// Physically reclaims the durable log below `up_to` (`§4.7`, `rmp` #114), bounding WAL disk and
-    /// the recovery analysis scan. `up_to` is the caller's recovery floor — typically the last
-    /// checkpoint's `redo_start` (after a sharp checkpoint, the checkpoint LSN). This method further
-    /// clamps it to the **oldest active transaction's first LSN**, so a loser's undo back-chain is
-    /// never reclaimed; with that floor the reclaimed prefix is provably unneeded by recovery.
+    /// the recovery analysis scan. `up_to` is the caller's recovery floor, and it must be the LSN
+    /// recovery will actually start redo from — the last checkpoint's `redo_start`, which is the floor
+    /// passed to [`checkpoint_with_redo_floor`](Self::checkpoint_with_redo_floor), or the checkpoint
+    /// record's own LSN after a sharp [`checkpoint(&[])`](Self::checkpoint). Passing the record's LSN
+    /// for a checkpoint that advertised a lower floor deletes exactly the records redo was told to
+    /// read (`rmp` #1086). This method further clamps `up_to` to the **oldest active transaction's
+    /// first LSN**, so a loser's undo back-chain is never reclaimed; with that floor the reclaimed
+    /// prefix is provably unneeded by recovery.
     ///
     /// Byte offsets / LSNs are unchanged (the reclaimed prefix simply reads back as zeros, which
     /// recovery skips). A sink that cannot reclaim (the default [`LogSink::reclaim`]) makes this a

@@ -18,6 +18,26 @@ pub struct CheckpointSnapshot {
 }
 
 impl CheckpointSnapshot {
+    /// The page id of the **wildcard** Dirty Page Table entry: *every* page may be dirty from its
+    /// `recovery_lsn` onwards.
+    ///
+    /// # Why a wildcard exists at all (`rmp` #1086)
+    ///
+    /// A checkpoint taken while other threads are writing cannot enumerate the dirty set: the moment
+    /// it finished enumerating, another writer could dirty a page it had already passed. A caller in
+    /// that position states the one thing it *can* prove — an LSN below which every logged change is
+    /// already on its home page — and names this page id to say the claim is about all of them.
+    /// [`WalManager::checkpoint_with_redo_floor`](crate::WalManager::checkpoint_with_redo_floor) is
+    /// the constructor; [`redo_start`](Self::redo_start) then returns that LSN, so redo begins there
+    /// and skips nothing that might be missing.
+    ///
+    /// **Recovery reads the DPT only through [`redo_start`](Self::redo_start)** — the minimum
+    /// `recovery_lsn` — and never as a set of pages to visit. That is what makes a page id which
+    /// names no page harmless here, and it is a constraint on future changes rather than an
+    /// observation: anything that starts iterating the DPT per page must handle this entry, whose
+    /// meaning is "all of them" and not "page `u64::MAX`".
+    pub const ALL_PAGES: PageId = PageId(u64::MAX);
+
     /// Serialises the snapshot to bytes (little-endian, length-prefixed arrays).
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
@@ -73,6 +93,12 @@ impl CheckpointSnapshot {
 
     /// The LSN redo must start from: the smallest `recovery_lsn` in the DPT, or `None` if the
     /// checkpoint saw no dirty pages.
+    ///
+    /// `None` is a **sharp** checkpoint and means "start at the checkpoint record itself": the caller
+    /// asserted that every change logged before it is already on its home page. Only a caller that
+    /// has quiesced its writers may assert that (see
+    /// [`checkpoint`](crate::WalManager::checkpoint)); a caller that cannot uses
+    /// [`checkpoint_with_redo_floor`](crate::WalManager::checkpoint_with_redo_floor) instead.
     #[must_use]
     pub fn redo_start(&self) -> Option<Lsn> {
         self.dirty_pages.iter().map(|(_, l)| *l).min()
@@ -106,6 +132,20 @@ mod tests {
         let bytes = s.encode();
         assert_eq!(CheckpointSnapshot::decode(&bytes), Some(s.clone()));
         assert_eq!(s.redo_start(), Some(Lsn(40)));
+    }
+
+    #[test]
+    fn a_conservative_snapshot_starts_redo_at_its_floor() {
+        // What `WalManager::checkpoint_with_redo_floor` writes (`rmp` #1086): one wildcard entry
+        // whose LSN is the floor. It must round-trip through the record bytes unchanged — a floor
+        // that decoded as anything higher would put recovery back on the wrong side of the defect —
+        // and `redo_start` must be exactly it.
+        let s = CheckpointSnapshot {
+            dirty_pages: vec![(CheckpointSnapshot::ALL_PAGES, Lsn(4096))],
+            active_txns: vec![(TxnId(7), Lsn(8192))],
+        };
+        assert_eq!(CheckpointSnapshot::decode(&s.encode()), Some(s.clone()));
+        assert_eq!(s.redo_start(), Some(Lsn(4096)));
     }
 
     #[test]

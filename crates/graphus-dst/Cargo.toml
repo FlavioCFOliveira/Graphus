@@ -139,3 +139,7 @@ required-features = ["det-sched"]
 [[test]]
 name = "page_log_apply_order_1062"
 required-features = ["det-sched"]
+
+[[test]]
+name = "det_scheduler_checkpoint_redo_floor_1086"
+required-features = ["det-sched"]

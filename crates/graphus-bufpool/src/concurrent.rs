@@ -1480,9 +1480,18 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
     /// final `sync_all`. Such a page is left dirty (its dirty flag is re-set) and is captured by a
     /// later `flush_all` — so **no committed change is ever lost**, but a returned `Ok` does not mean
     /// "every page dirty at the call instant is now durable". A caller needing that stronger barrier
-    /// (a *sharp* checkpoint) must **quiesce writers** for the duration — which the single-threaded
-    /// storage engine's checkpoint does by construction (it owns the only writer). Do not rely on
-    /// `flush_all` alone as a checkpoint barrier from multiple concurrent writers.
+    /// (a *sharp* checkpoint) must **quiesce writers** for the duration. Do not rely on `flush_all`
+    /// alone as a checkpoint barrier from multiple concurrent writers.
+    ///
+    /// **The engine no longer quiesces anything, and this paragraph used to say it did** — "which the
+    /// single-threaded storage engine's checkpoint does by construction (it owns the only writer)".
+    /// That stopped being true at `rmp` #1033/#975, when `W` workers began sharing one store, and
+    /// nothing re-read this contract when they did: `RecordStore::checkpoint` went on emitting an
+    /// empty dirty-page table, recovery went on reading that as "start redo at the checkpoint record",
+    /// and committed data was lost after a crash (`rmp` #1086). It no longer asks for the barrier: it
+    /// samples a conservative redo floor before calling here and advertises THAT, so what this method
+    /// does guarantee — every frame dirty at entry reaches the device, and the trailing barrier covers
+    /// it — is exactly what its one checkpointing caller now relies on.
     ///
     /// # Errors
     /// Propagates the first WAL-rule, device-write or sync failure.
@@ -1505,8 +1514,9 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
     /// untouched, captured by a later flush.
     ///
     /// The same F12 concurrency contract applies: a selected frame re-dirtied after its latch is
-    /// released here is captured by a later flush; a sharp checkpoint still requires the
-    /// (single-writer) engine to quiesce writers, which it does by construction.
+    /// released here is captured by a later flush, and a *sharp* checkpoint would still require its
+    /// caller to quiesce writers — which the engine has not done since `rmp` #1033/#975, and no longer
+    /// asks for (see [`flush_all`](Self::flush_all) and `rmp` #1086).
     ///
     /// # Errors
     /// Propagates the first WAL-rule, device-write or sync failure.
@@ -1673,6 +1683,16 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
                 meta.dirty = false;
             }
             drop(batch);
+            // `rmp` #1086: THE INSTANT THAT SEPARATES A PRE-FLUSH SAMPLE FROM A POST-FLUSH ONE.
+            //
+            // Every latch is released (the `drop` above takes the guards, the tripwire scope and the
+            // scheduler's release announcement with it) and the writes are behind us, so a page
+            // dirtied from here on is missed by this flush and by the barrier below. That is the
+            // window a checkpoint's redo floor must already be below — and without a yield point here
+            // the deterministic scheduler cannot place a writer in it, because everything from
+            // `FlushBatch::collect` to this line runs as one uninterruptible segment. Zero-sized with
+            // `det-sched` off.
+            sched::yield_at(YieldSite::FrameWriteFlushBatchReleased, ResourceId::NONE);
             return self.barrier_sync_all();
         }
         Err(self.hoist_exhausted("batch flush", &asked))

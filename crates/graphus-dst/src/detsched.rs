@@ -587,34 +587,53 @@ impl Scheduler for DetScheduler {
         self.cv.notify_all();
     }
 
+    /// # A wake-up is not a promise that the child has exited (`rmp` #1086)
+    ///
+    /// This re-checks `finished` in a **loop** rather than returning the first time it gets the token
+    /// back, because [`release_all`](Self::release_all) reopens the WHOLE blocked set — a superset
+    /// wake-up, and deliberately so: a batch flush latches and releases many frames at once, and a
+    /// missed wake-up would be a lost one. The safety argument for that superset is written on
+    /// `FlushBatch`: "a thread woken for a resource still held retries and re-parks". Every waiter
+    /// parked on a frame does exactly that. This one did **not** — it took the token, returned, and
+    /// handed `JoinHandle::join` a child that was still running, so the joiner blocked in `std`'s join
+    /// **holding the token** and no other thread could ever run again. The run then died on the stall
+    /// backstop with `blocked=[]` and nothing to point at, which is the least useful shape a
+    /// deterministic failure can take.
+    ///
+    /// It made every scenario in which a batch flush overlaps a `join` unschedulable — which is why
+    /// `RecordStore::checkpoint` had never been driven under this scheduler, and so why the redo-floor
+    /// defect of `rmp` #1086 could sit behind a green suite. Retrying here restores the invariant the
+    /// superset wake-up already claimed, for this waiter and for any future one.
     fn join_child(&self, id: LogicalThreadId, child: LogicalThreadId) {
         let mut st = self.lock();
-        if st.finished.contains(&child) {
-            // Already gone: parking would wait for a release that has already happened, and the
-            // scheduler would report that lost wake-up as a deadlock.
+        loop {
+            if st.finished.contains(&child) {
+                // Already gone: parking would wait for a release that has already happened, and the
+                // scheduler would report that lost wake-up as a deadlock.
+                self.record(
+                    &mut st,
+                    id,
+                    YieldSite::ThreadJoin,
+                    ResourceId::thread(child),
+                    0,
+                );
+                Self::trip(&st);
+                return;
+            }
+            st.runnable.remove(&id);
+            st.blocked.insert(id, ResourceId::thread(child));
             self.record(
                 &mut st,
                 id,
                 YieldSite::ThreadJoin,
                 ResourceId::thread(child),
-                0,
+                1,
             );
+            st.current = Self::pick_next(&mut st);
+            self.cv.notify_all();
+            st = self.wait_for_token(st, id);
             Self::trip(&st);
-            return;
         }
-        st.runnable.remove(&id);
-        st.blocked.insert(id, ResourceId::thread(child));
-        self.record(
-            &mut st,
-            id,
-            YieldSite::ThreadJoin,
-            ResourceId::thread(child),
-            1,
-        );
-        st.current = Self::pick_next(&mut st);
-        self.cv.notify_all();
-        let st = self.wait_for_token(st, id);
-        Self::trip(&st);
     }
 
     fn history_hash(&self) -> u64 {

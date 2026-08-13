@@ -123,20 +123,36 @@ pub fn backup_store<D: BlockDevice, S: LogSink>(store: &RecordStore<D, S>) -> Re
     //    The freeze txn is committed **only when it actually froze a header** — so a backup of an
     //    already-frozen store (e.g. re-backing-up a freshly-restored store) burns no commit timestamp
     //    and is byte-for-byte idempotent.
+    //     THE ID IS RESERVED, NOT PRIVATE (`rmp` #1086). `TxnId(u64::MAX)` here is the store's
+    //     `SYSTEM_TXN`, the same id the counter fold and `settle_counts_into_image` write under — and
+    //     those two serialise on `system_txn_lock` while this pass did not. Since `rmp` #1033/#975
+    //     puts `W` workers on one store, a `BACKUP` on one worker and a `COMMIT` on another really do
+    //     overlap, and then one thread's `commit(SYSTEM_TXN)` removes the active-table entry the other
+    //     is still writing under. That costs three separate things: the second commit fails with
+    //     "commit of inactive txn" (a durable commit reported as an error), a `begin` wipes the
+    //     freeze pass's retained undo chain (a rollback that undoes nothing while its `ABORT` record
+    //     says otherwise), and — the reason this was found — a redo floor sampled in between rises
+    //     above a record whose page has not been applied yet, which loses it from redo after a crash.
+    //
+    //     The guard is held across the WHOLE span, `begin` through `commit`/`rollback`, and released
+    //     before `settle_counts_into_image` below, which takes the same lock.
     let freeze_txn = graphus_core::TxnId(u64::MAX);
-    let _begin_ts = store.begin(freeze_txn);
-    match store.freeze_committed_headers(freeze_txn) {
-        Ok(0) => {
-            // Nothing to freeze: roll the empty txn back so the meta page (and `commit_ts_hw`) is
-            // untouched, keeping the backup idempotent.
-            store.rollback(freeze_txn)?;
-        }
-        Ok(_) => {
-            store.commit(freeze_txn)?;
-        }
-        Err(e) => {
-            let _ = store.rollback(freeze_txn);
-            return Err(e);
+    {
+        let _system_txn = store.system_txn_guard();
+        let _begin_ts = store.begin(freeze_txn);
+        match store.freeze_committed_headers(freeze_txn) {
+            Ok(0) => {
+                // Nothing to freeze: roll the empty txn back so the meta page (and `commit_ts_hw`) is
+                // untouched, keeping the backup idempotent.
+                store.rollback(freeze_txn)?;
+            }
+            Ok(_) => {
+                store.commit(freeze_txn)?;
+            }
+            Err(e) => {
+                let _ = store.rollback(freeze_txn);
+                return Err(e);
+            }
         }
     }
 
@@ -150,11 +166,23 @@ pub fn backup_store<D: BlockDevice, S: LogSink>(store: &RecordStore<D, S>) -> Re
     //     Folding them into the base first is the same "make the base self-sufficient" step, applied
     //     to the other half of what the WAL was carrying.
     store.settle_counts_into_image()?;
-    // 1. Quiesce: flush every dirty page home (WAL rule enforced on each write-back) and sync.
+    // 0c. Sample the conservative redo floor BEFORE the flush below (`rmp` #1086). It has to be here
+    //     and not after, for the reason `RecordStore::checkpoint` documents at length: a page dirtied
+    //     between the sample and the end of the flush is exactly the case the floor covers.
+    let redo_floor = store.sample_conservative_redo_floor();
+    // 1. Flush every dirty page home (WAL rule enforced on each write-back) and sync.
     store.flush()?;
-    // 2. Mark a clean, recoverable point. The snapshot is taken after a full flush, so no page is
-    //    in-flight; an empty dirty-page table is therefore truthful here.
-    store.with_wal(|w| w.checkpoint(&[]));
+    // 2. Mark a clean, recoverable point in the SOURCE store's log.
+    //
+    //    This used to pass an EMPTY dirty-page table, on the grounds that "the snapshot is taken
+    //    after a full flush, so no page is in-flight". That was true of the single-threaded engine and
+    //    false since `rmp` #1033/#975: the flush is not a barrier against another worker
+    //    (`ConcurrentBufferPool::flush_all` says so itself), so a page dirtied by a concurrent
+    //    committer stayed in the pool while an empty table told recovery to skip every record below
+    //    this marker. Taking a BACKUP would then cost the source store committed data on its next
+    //    crash — the same defect as `rmp` #1086, reached through a second door. The floor sampled
+    //    above is what the marker advertises instead.
+    store.with_wal(|w| w.checkpoint_with_redo_floor(redo_floor));
 
     // 3. Frame the durable image. `mapped_pages` is the authoritative durable set: the metadata
     //    page plus every allocated record-store page (`04 §2.1`). Sort + dedup so the page section

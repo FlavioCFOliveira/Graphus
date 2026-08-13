@@ -131,6 +131,18 @@ pub enum YieldSite {
     /// A frame latch was released (the other half of the protocol: without it the blocked set never
     /// reopens).
     FrameLatchRelease = 20,
+    /// `ConcurrentBufferPool::flush_batch` — the batch's pages are written home and **every latch is
+    /// released**, but the flush has not returned (its trailing durability barrier is still ahead).
+    ///
+    /// The instant that separates "the redo floor was sampled BEFORE the flush" from "sampled after"
+    /// (`rmp` #1086). A page dirtied from here on is missed by this flush entirely — the writes are
+    /// behind it and the barrier covers only what was written — so a floor sampled *after* the flush
+    /// returns can sit above a change whose page is still in the pool, which is the defect. A floor
+    /// sampled before the flush cannot, because every record logged from here on is at or above it.
+    /// Without this site the deterministic scheduler cannot tell the two placements apart: the whole
+    /// of `flush_batch` from the latching onward is one uninterruptible segment. Its guard is
+    /// `graphus-dst`'s `det_scheduler_checkpoint_redo_floor_1086`.
+    FrameWriteFlushBatchReleased = 23,
     // 21 and 22 are deliberately unused. They were reserved for the page-table shard lock, which
     // turned out NOT to be a legal yield point: `fetch` publishes its `Ready` entry under the shard
     // lock while still holding the freshly loaded victim's frame latch, so handing the token over
@@ -166,6 +178,18 @@ pub enum YieldSite {
     /// against a checkpoint that has not started — which is the interleaving the defect needed, and
     /// which the fix has to survive.
     CatalogCommittedImage = 43,
+    /// `RecordStore::checkpoint` — after the home flush has returned, immediately before the
+    /// `CHECKPOINT-END` record is appended.
+    ///
+    /// The instant `rmp` #1086 is about. The flush leaves no page of ITS OWN dirty, but it is not a
+    /// barrier against another worker (`ConcurrentBufferPool::flush_all`'s own contract), so a
+    /// transaction that commits between these two points has its `COMMIT` record BELOW the checkpoint
+    /// record while its pages are still in the pool. Without a yield point here the deterministic
+    /// scheduler cannot place a committer in that window at all — the checkpoint runs straight from
+    /// the flush to the append with nothing in between to hand the token over at — which is the same
+    /// reason [`SnapshotBegin`](Self::SnapshotBegin) exists. Its guard is `graphus-dst`'s
+    /// `det_scheduler_checkpoint_redo_floor_1086`.
+    CheckpointRecordAppend = 44,
 
     // ---- Snapshot acquisition (50..=59) -----------------------------------------------------
     /// `TxnCoordinator::oldest_active_snapshot` — the reclamation floor every GC watermark derives
@@ -250,6 +274,7 @@ impl YieldSite {
                 | Self::FrameWriteFlushUnlogged
                 | Self::FrameWriteSelectVictim
                 | Self::FrameWriteFlushBatch
+                | Self::FrameWriteFlushBatchReleased
         )
     }
 }
@@ -1051,6 +1076,7 @@ mod tests {
             YieldSite::FrameWriteSelectVictim,
             YieldSite::FrameWriteFlushBatch,
             YieldSite::FrameLatchRelease,
+            YieldSite::FrameWriteFlushBatchReleased,
             YieldSite::ThreadSpawn,
             YieldSite::ThreadStart,
             YieldSite::ThreadExit,
@@ -1059,6 +1085,7 @@ mod tests {
             YieldSite::CommitRegistryRecord,
             YieldSite::CommitSettle,
             YieldSite::CatalogCommittedImage,
+            YieldSite::CheckpointRecordAppend,
             YieldSite::SnapshotOldestActive,
             YieldSite::SnapshotReadTaskInputs,
             YieldSite::FreeListPush,
