@@ -14,6 +14,8 @@ use graphus_io::MemBlockDevice;
 use graphus_storage::RecordStore;
 use graphus_storage::check::verify_on_open;
 use graphus_storage::recovery::recover_device;
+// `resolve_commit_ts` moved onto the `rmp` #1069 commit door.
+use graphus_txn::CommitOracle;
 use graphus_wal::{LogSink, MemLogSink, WalManager};
 
 type Store = RecordStore<MemBlockDevice, MemLogSink>;
@@ -87,6 +89,7 @@ fn store_grows_far_past_the_one_page_catalog_cap_and_recovers() {
         store
             .commit_registry()
             .resolve_commit_ts(last.mvcc.created_ts)
+            .unwrap()
             .is_some(),
         "last node's xmin resolves to a commit timestamp through the transaction table"
     );

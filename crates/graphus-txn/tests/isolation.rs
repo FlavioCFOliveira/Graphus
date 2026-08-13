@@ -194,7 +194,7 @@ fn gc_reclaims_past_low_water_and_holds_for_long_reader() {
     assert_eq!(m.store().version_count(), 4); // X: 3 versions, Y: 1
 
     // GC while the reader is open must NOT reclaim the version the reader still needs.
-    let report = m.run_gc();
+    let report = m.run_gc().unwrap();
     assert!(
         report.low_water.is_some(),
         "the open reader pins a watermark"
@@ -210,7 +210,7 @@ fn gc_reclaims_past_low_water_and_holds_for_long_reader() {
     m.commit(reader).unwrap();
 
     // With no active readers, GC reclaims the dead X versions, leaving the two live heads.
-    let report2 = m.run_gc();
+    let report2 = m.run_gc().unwrap();
     assert_eq!(report2.low_water, None);
     assert!(report2.versions_reclaimed >= 2);
     assert_eq!(m.store().version_count(), 2);

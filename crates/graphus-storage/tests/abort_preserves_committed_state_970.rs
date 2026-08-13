@@ -25,7 +25,7 @@
 use graphus_core::{TxnId, Value, VersionStamp};
 use graphus_io::MemBlockDevice;
 use graphus_storage::{Namespace, RecordStore, check::check_store};
-use graphus_txn::{Snapshot, is_visible};
+use graphus_txn::{Snapshot, is_visible_via};
 use graphus_wal::{MemLogSink, WalManager};
 
 type Store = RecordStore<MemBlockDevice, MemLogSink>;
@@ -49,7 +49,11 @@ fn committed_image(s: &Store, observer: TxnId) -> Vec<String> {
     let snapshot = Snapshot::new(observer, s.snapshot_ts());
     let registry = s.commit_registry();
     let visible = |mvcc: graphus_storage::MvccHeader| {
-        mvcc.in_use() && is_visible(snapshot, mvcc.created_ts, mvcc.expired_ts, &registry)
+        // The `rmp` #1069 door is fallible; the in-memory registry never faults, and an oracle fault
+        // in an image-building helper must be loud rather than folded into "not visible".
+        mvcc.in_use()
+            && is_visible_via(&*registry, snapshot, mvcc.created_ts, mvcc.expired_ts)
+                .expect("the in-memory commit registry resolves every stamp")
     };
 
     let mut out = Vec::new();

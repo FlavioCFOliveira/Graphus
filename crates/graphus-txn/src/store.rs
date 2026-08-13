@@ -42,7 +42,7 @@ use crate::snapshot::{CommitRegistry, Snapshot};
 #[cfg(any(test, feature = "test-support"))]
 use crate::oracle::VersionStamp;
 #[cfg(any(test, feature = "test-support"))]
-use crate::visibility::is_visible;
+use crate::visibility::{CommitOracle, is_visible_via};
 
 /// An opaque key identifying a versioned record (a node/relationship/property physical id in the
 /// real store; an arbitrary `u64` in the in-memory reference store).
@@ -101,12 +101,17 @@ pub trait VersionedStore {
 
     /// Returns the payload of the version of `key` visible to `snapshot` (newest visible along the
     /// chain), or `None` if no version is visible.
+    ///
+    /// # Errors
+    /// Propagates a stamp-resolution fault from the [`CommitOracle`](crate::CommitOracle) door
+    /// (`rmp` #1069). A version whose header stamp cannot be resolved must fail the read, never be
+    /// treated as invisible — that would be a silent lost read.
     fn read_visible(
         &self,
         key: Key,
         snapshot: Snapshot,
         registry: &CommitRegistry,
-    ) -> Option<Vec<u8>>;
+    ) -> graphus_core::Result<Option<Vec<u8>>>;
 
     /// Stamps every in-flight version authored by `writer` with the committed `commit_ts` (both
     /// `xmin` it created and `xmax` it set). Called after the WAL `COMMIT` is durable.
@@ -121,7 +126,16 @@ pub trait VersionedStore {
     /// of physical versions reclaimed.
     ///
     /// `None` (no active transactions) means everything not the live head can be reclaimed.
-    fn gc(&mut self, low_water: Option<Timestamp>, registry: &CommitRegistry) -> usize;
+    ///
+    /// # Errors
+    /// Propagates a stamp-resolution fault from the [`CommitOracle`](crate::CommitOracle) door
+    /// (`rmp` #1069). Reclaiming on an unresolved stamp could free a version a live snapshot still
+    /// needs, so the pass fails rather than guessing.
+    fn gc(
+        &mut self,
+        low_water: Option<Timestamp>,
+        registry: &CommitRegistry,
+    ) -> graphus_core::Result<usize>;
 
     /// Total number of physical versions currently stored (across all chains). Test/metric aid.
     fn version_count(&self) -> usize;
@@ -209,12 +223,18 @@ impl VersionedStore for MemVersionedStore {
         key: Key,
         snapshot: Snapshot,
         registry: &CommitRegistry,
-    ) -> Option<Vec<u8>> {
-        let chain = self.chains.get(&key)?;
-        chain
-            .iter()
-            .find(|v| is_visible(snapshot, v.xmin, v.xmax, registry))
-            .map(|v| v.payload.clone())
+    ) -> graphus_core::Result<Option<Vec<u8>>> {
+        let Some(chain) = self.chains.get(&key) else {
+            return Ok(None);
+        };
+        // `?` inside the walk rather than a `find` closure: the door is fallible (`rmp` #1069) and a
+        // fault must abort the read, not be folded into "this version is not visible".
+        for v in chain {
+            if is_visible_via(registry, snapshot, v.xmin, v.xmax)? {
+                return Ok(Some(v.payload.clone()));
+            }
+        }
+        Ok(None)
     }
 
     fn commit_writer(&mut self, writer: TxnId, commit_ts: Timestamp) {
@@ -247,26 +267,44 @@ impl VersionedStore for MemVersionedStore {
         self.chains.retain(|_, c| !c.is_empty());
     }
 
-    fn gc(&mut self, low_water: Option<Timestamp>, registry: &CommitRegistry) -> usize {
+    fn gc(
+        &mut self,
+        low_water: Option<Timestamp>,
+        registry: &CommitRegistry,
+    ) -> graphus_core::Result<usize> {
         let mut reclaimed = 0;
         for chain in self.chains.values_mut() {
             let before = chain.len();
             // A version is dead iff its xmax committed at `≤ low_water` (invisible to every live and
             // future snapshot). With no active transactions, every committed xmax is dead. The live
             // head (xmax == 0) is never reclaimed.
-            chain.retain(|v| {
-                let Some(xmax_commit) = registry.resolve_commit_ts(v.xmax) else {
-                    return true; // live, or expired by an in-flight/aborted writer: keep
-                };
-                match low_water {
-                    Some(mark) => xmax_commit > mark, // keep if still potentially visible
-                    None => false,                    // no readers: reclaim every committed-dead
-                }
+            //
+            // `Vec::retain` takes an infallible predicate, so the fallible door (`rmp` #1069) is run
+            // FIRST over the chain and the verdicts are then applied. Folding a fault into "keep" (or
+            // "drop") inside the closure would hide exactly the failure this phase exists to expose.
+            let mut keep = Vec::with_capacity(before);
+            for v in chain.iter() {
+                keep.push(match registry.resolve_commit_ts(v.xmax)? {
+                    // live, or expired by an in-flight/aborted writer: keep
+                    None => true,
+                    Some(xmax_commit) => match low_water {
+                        Some(mark) => xmax_commit > mark, // keep if still potentially visible
+                        None => false, // no readers: reclaim every committed-dead
+                    },
+                });
+            }
+            let mut verdicts = keep.into_iter();
+            // One verdict per version, in order — `retain` visits the chain in the same order the
+            // loop above walked it. `expect` rather than a default, so a future divergence is loud.
+            chain.retain(|_| {
+                verdicts
+                    .next()
+                    .expect("INVARIANT: one verdict was computed per version, in chain order")
             });
             reclaimed += before - chain.len();
         }
         self.chains.retain(|_, c| !c.is_empty());
-        reclaimed
+        Ok(reclaimed)
     }
 
     fn version_count(&self) -> usize {
@@ -296,9 +334,12 @@ mod tests {
         let reg = CommitRegistry::new();
         s.create_version(1, TxnId(7), b"v1".to_vec()).unwrap();
         // Own write is visible to its author before commit.
-        assert_eq!(s.read_visible(1, snap(7, 100), &reg), Some(b"v1".to_vec()));
+        assert_eq!(
+            s.read_visible(1, snap(7, 100), &reg).unwrap(),
+            Some(b"v1".to_vec())
+        );
         // Invisible to a concurrent reader.
-        assert_eq!(s.read_visible(1, snap(8, 100), &reg), None);
+        assert_eq!(s.read_visible(1, snap(8, 100), &reg).unwrap(), None);
     }
 
     #[test]
@@ -308,9 +349,12 @@ mod tests {
         s.create_version(1, TxnId(7), b"v1".to_vec()).unwrap();
         s.commit_writer(TxnId(7), Timestamp(10));
         reg.record_commit(TxnId(7), Timestamp(10));
-        assert_eq!(s.read_visible(1, snap(9, 20), &reg), Some(b"v1".to_vec()));
+        assert_eq!(
+            s.read_visible(1, snap(9, 20), &reg).unwrap(),
+            Some(b"v1".to_vec())
+        );
         // A snapshot before the commit does not see it.
-        assert_eq!(s.read_visible(1, snap(9, 5), &reg), None);
+        assert_eq!(s.read_visible(1, snap(9, 5), &reg).unwrap(), None);
     }
 
     #[test]
@@ -325,8 +369,14 @@ mod tests {
         s.commit_writer(TxnId(2), Timestamp(20));
         reg.record_commit(TxnId(2), Timestamp(20));
         // Reader at snapshot 15 sees the old version; reader at 25 sees the new one.
-        assert_eq!(s.read_visible(1, snap(9, 15), &reg), Some(b"v1".to_vec()));
-        assert_eq!(s.read_visible(1, snap(9, 25), &reg), Some(b"v2".to_vec()));
+        assert_eq!(
+            s.read_visible(1, snap(9, 15), &reg).unwrap(),
+            Some(b"v1".to_vec())
+        );
+        assert_eq!(
+            s.read_visible(1, snap(9, 25), &reg).unwrap(),
+            Some(b"v2".to_vec())
+        );
         assert_eq!(s.version_count(), 2);
     }
 
@@ -343,7 +393,10 @@ mod tests {
         reg.record_abort(TxnId(2));
         // Only v1 remains, live again.
         assert_eq!(s.version_count(), 1);
-        assert_eq!(s.read_visible(1, snap(9, 50), &reg), Some(b"v1".to_vec()));
+        assert_eq!(
+            s.read_visible(1, snap(9, 50), &reg).unwrap(),
+            Some(b"v1".to_vec())
+        );
     }
 
     #[test]
@@ -356,8 +409,11 @@ mod tests {
         s.expire_version(1, TxnId(2)).unwrap();
         s.commit_writer(TxnId(2), Timestamp(20));
         reg.record_commit(TxnId(2), Timestamp(20));
-        assert_eq!(s.read_visible(1, snap(9, 25), &reg), None); // deleted by snapshot 25
-        assert_eq!(s.read_visible(1, snap(9, 15), &reg), Some(b"v1".to_vec())); // alive at 15
+        assert_eq!(s.read_visible(1, snap(9, 25), &reg).unwrap(), None); // deleted by snapshot 25
+        assert_eq!(
+            s.read_visible(1, snap(9, 15), &reg).unwrap(),
+            Some(b"v1".to_vec())
+        ); // alive at 15
     }
 
     #[test]
@@ -379,10 +435,10 @@ mod tests {
         reg.record_commit(TxnId(2), Timestamp(20));
         assert_eq!(s.version_count(), 2);
         // A reader at snapshot 15 still needs v1: low-water 15 holds it (v1.xmax == 20 > 15).
-        assert_eq!(s.gc(Some(Timestamp(15)), &reg), 0);
+        assert_eq!(s.gc(Some(Timestamp(15)), &reg).unwrap(), 0);
         assert_eq!(s.version_count(), 2);
         // Once the oldest reader is past 20, v1 is dead (xmax 20 ≤ 25).
-        assert_eq!(s.gc(Some(Timestamp(25)), &reg), 1);
+        assert_eq!(s.gc(Some(Timestamp(25)), &reg).unwrap(), 1);
         assert_eq!(s.version_count(), 1);
     }
 }

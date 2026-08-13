@@ -20,6 +20,8 @@ use graphus_core::{Timestamp, TxnId, Value, VersionStamp};
 use graphus_io::MemBlockDevice;
 use graphus_storage::recovery::recover_device;
 use graphus_storage::{Namespace, RecordStore};
+// `resolve_commit_ts` moved onto the `rmp` #1069 commit door; assertions below are unchanged.
+use graphus_txn::CommitOracle;
 use graphus_wal::{LogSink, MemLogSink, WalManager};
 
 type Store = RecordStore<MemBlockDevice, MemLogSink>;
@@ -73,7 +75,9 @@ fn created_ts_stays_inflight_after_commit_and_resolves_through_the_registry() {
         "lazy freeze keeps the committed version's in-flight xmin until GC settles it"
     );
     assert_eq!(
-        s.commit_registry().resolve_commit_ts(mvcc.created_ts),
+        s.commit_registry()
+            .resolve_commit_ts(mvcc.created_ts)
+            .unwrap(),
         Some(Timestamp(1)),
         "the transaction table resolves the in-flight stamp to its commit timestamp"
     );
@@ -102,7 +106,9 @@ fn delete_is_a_tombstone_reclaimed_only_by_gc() {
         VersionStamp::InFlight(TxnId(2))
     );
     assert_eq!(
-        s.commit_registry().resolve_commit_ts(mvcc.expired_ts),
+        s.commit_registry()
+            .resolve_commit_ts(mvcc.expired_ts)
+            .unwrap(),
         Some(Timestamp(2))
     );
     assert_eq!(s.scan_node_ids().unwrap(), vec![id]);
@@ -148,7 +154,9 @@ fn commit_timestamp_high_water_survives_recovery_and_stays_monotonic() {
         VersionStamp::InFlight(TxnId(1))
     );
     assert_eq!(
-        s.commit_registry().resolve_commit_ts(first_mvcc.created_ts),
+        s.commit_registry()
+            .resolve_commit_ts(first_mvcc.created_ts)
+            .unwrap(),
         Some(Timestamp(1)),
         "recovery rebuilt the transaction table from the WAL, so the committed version resolves"
     );
@@ -165,7 +173,8 @@ fn commit_timestamp_high_water_survives_recovery_and_stays_monotonic() {
     );
     assert_eq!(
         s.commit_registry()
-            .resolve_commit_ts(second_mvcc.created_ts),
+            .resolve_commit_ts(second_mvcc.created_ts)
+            .unwrap(),
         Some(Timestamp(2))
     );
 }
@@ -196,7 +205,9 @@ fn lazy_committed_version_survives_recovery_while_a_loser_resolves_invisible() {
         "no GC ran, so the committed version keeps its writer's in-flight stamp"
     );
     assert_eq!(
-        s.commit_registry().resolve_commit_ts(mvcc.created_ts),
+        s.commit_registry()
+            .resolve_commit_ts(mvcc.created_ts)
+            .unwrap(),
         Some(Timestamp(1)),
         "the table rebuilt from the WAL resolves the committed-but-unfrozen version"
     );
@@ -205,7 +216,8 @@ fn lazy_committed_version_survives_recovery_while_a_loser_resolves_invisible() {
     // resolves to "not committed" — invisible to every snapshot.
     assert_eq!(
         s.commit_registry()
-            .resolve_commit_ts(VersionStamp::in_flight(TxnId(2))),
+            .resolve_commit_ts(VersionStamp::in_flight(TxnId(2)))
+            .unwrap(),
         None,
         "an uncommitted (loser) transaction never resolves as committed after recovery"
     );
@@ -314,7 +326,8 @@ fn gc_freezes_committed_headers_and_prunes_the_transaction_table() {
     assert_eq!(s.commit_registry().len(), 1, "only the GC writer remains");
     assert_eq!(
         s.commit_registry()
-            .resolve_commit_ts(VersionStamp::in_flight(t1)),
+            .resolve_commit_ts(VersionStamp::in_flight(t1))
+            .unwrap(),
         None,
         "t1 was pruned — safe, because no header carries its in-flight stamp any more"
     );
@@ -374,14 +387,17 @@ fn a_writer_committing_during_the_gc_window_is_not_pruned() {
         VersionStamp::InFlight(t2)
     );
     assert_eq!(
-        s.commit_registry().resolve_commit_ts(mvcc.created_ts),
+        s.commit_registry()
+            .resolve_commit_ts(mvcc.created_ts)
+            .unwrap(),
         Some(Timestamp(2)),
         "the mid-window committer survives the prune"
     );
     // And t1 is gone (its stamps froze before the prune).
     assert_eq!(
         s.commit_registry()
-            .resolve_commit_ts(VersionStamp::in_flight(t1)),
+            .resolve_commit_ts(VersionStamp::in_flight(t1))
+            .unwrap(),
         None
     );
 }
@@ -418,7 +434,9 @@ fn rolled_back_gc_pass_prunes_nothing_and_strands_no_stamp() {
         "rollback undid the freeze"
     );
     assert_eq!(
-        s.commit_registry().resolve_commit_ts(mvcc.created_ts),
+        s.commit_registry()
+            .resolve_commit_ts(mvcc.created_ts)
+            .unwrap(),
         Some(Timestamp(1)),
         "the rolled-back pass pruned nothing — the restored stamp still resolves"
     );
@@ -471,7 +489,9 @@ fn crash_mid_gc_restores_inflight_stamps_and_a_resolving_table() {
         "recovery rolled the uncommitted freeze back"
     );
     assert_eq!(
-        s.commit_registry().resolve_commit_ts(mvcc.created_ts),
+        s.commit_registry()
+            .resolve_commit_ts(mvcc.created_ts)
+            .unwrap(),
         Some(Timestamp(1)),
         "the table rebuilt from the WAL still resolves the committed writer"
     );

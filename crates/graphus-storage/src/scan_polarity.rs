@@ -38,7 +38,7 @@
 //! * **The cell's own MVCC stamp is no longer the visibility oracle.** `D-property-visibility` makes
 //!   the undo chain the sole oracle for a property's value; the cell's `created_ts` is informative
 //!   and `in_use` keeps only its structural meaning (slot occupancy, corpse threading). So
-//!   [`SupersetProperties::decide`] folds the chain rather than testing `is_visible` per cell.
+//!   [`SupersetProperties::decide`] folds the chain rather than testing `is_visible_via` per cell.
 //!
 //! # Superset — index population
 //!
@@ -207,6 +207,18 @@ pub enum DeltaVerdict {
 }
 
 /// Decides what `snapshot` must do with one delta, given the commit slot the walk resolved for it.
+///
+/// # ⚠ This reads the SLOT's stamp, not a record header's — it must not use [`CommitOracle`]
+///
+/// `slot.commit_ts` and `MvccHeader::created_ts`/`expired_ts` share the [`VersionStamp`] encoding
+/// but are **two different populations of words** (`rmp` #1069). A header stamp is resolved through
+/// the one door, [`graphus_txn::CommitOracle`], and from #1069 phase 3 its payload is a **commit
+/// slot id**. `slot.commit_ts`'s payload is a [`TxnId`](graphus_core::TxnId), now and after phase 3
+/// — see [`CommitSlot::commit_ts`](crate::undo::CommitSlot::commit_ts).
+///
+/// So this function, and [`open_writer_of`], were deliberately left OUT of the #1069 phase-2
+/// migration. Routing them through the door would be type-correct and silently wrong: it would ask
+/// the header oracle to interpret a transaction id as a slot id.
 ///
 /// # Errors
 /// Returns a storage error when the delta is live but its commit slot could not be resolved. That is
@@ -689,6 +701,10 @@ impl DecidedProperties {
 /// The transaction id of the writer a live commit slot belongs to while it is still open, or [`None`]
 /// once it has published a commit timestamp. Used by the write-conflict check
 /// (`D-property-write-conflict`).
+///
+/// Reads the **slot** population of stamps, so it stays out of [`graphus_txn::CommitOracle`] — see
+/// [`delta_verdict`] for the full statement of why the two populations must not share a resolver
+/// (`rmp` #1069).
 #[must_use]
 pub(crate) fn open_writer_of(slot: CommitSlot) -> Option<TxnId> {
     if !slot.in_use() {

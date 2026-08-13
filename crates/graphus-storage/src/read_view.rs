@@ -27,7 +27,7 @@
 //! - **`high_water` is SNAPSHOTTED.** It bounds the id range a scan visits (`1..high_water`), so it
 //!   must not be chased by a concurrent writer. This is MVCC-superset-safe: any id allocated after the
 //!   capture belongs to a writer that commits *after* the reader's snapshot timestamp, so it is
-//!   invisible anyway — visibility is decided **above** this layer by `graphus_txn::is_visible`
+//!   invisible anyway — visibility is decided **above** this layer by `graphus_txn::is_visible_via`
 //!   against the reader's own cloned `CommitRegistry`.
 //!
 //! - **The page map is LIVE.** The original design froze it too, on the argument that "the writer only
@@ -61,10 +61,10 @@ use std::sync::Arc;
 
 use graphus_bufpool::ConcurrentBufferPool;
 use graphus_core::error::{GraphusError, Result};
-use graphus_core::{PageId, Value, VersionStamp};
+use graphus_core::{PageId, Value};
 use graphus_io::BlockDevice;
 use graphus_pagemap::PageMap;
-use graphus_txn::{CommitRegistry, Snapshot, View, is_visible};
+use graphus_txn::{CommitOracle, CommitRegistry, Snapshot, View, is_visible_via};
 use graphus_wal::LogSink;
 
 use crate::heap::{HeapBlock, STRINGS_RECORD_SIZE};
@@ -555,10 +555,10 @@ fn decide_properties<D: BlockDevice, S: LogSink, P: StorePages>(
 /// Whether entity `(kind, id)` **exists** as of `snapshot`, at statement granularity (`rmp` #972,
 /// `04 §5.1.4`).
 ///
-/// [`graphus_txn::is_visible`] answers the same question across *transactions*, from the two header
+/// [`graphus_txn::is_visible_via`] answers the same question across *transactions*, from the two header
 /// words alone. It cannot answer it within one transaction, because the header records only *which*
 /// transaction created or expired the entity and never *which statement of it* — that lives on the
-/// undo chain, where `05 §12.2` froze a `command_id` on every delta. So this refines `is_visible`
+/// undo chain, where `05 §12.2` froze a `command_id` on every delta. So this refines `is_visible_via`
 /// exactly where the header runs out of information, and nowhere else.
 ///
 /// # Why this costs nothing on the paths that do not need it
@@ -596,12 +596,16 @@ pub fn entity_visible_at<D: BlockDevice, S: LogSink, P: StorePages>(
     snapshot: Snapshot,
     registry: &CommitRegistry,
 ) -> Result<bool> {
-    let header_says = is_visible(snapshot, mvcc.created_ts, mvcc.expired_ts, registry);
+    let header_says = is_visible_via(registry, snapshot, mvcc.created_ts, mvcc.expired_ts)?;
     if snapshot.view == View::New || mvcc.undo_ptr == NULL_ID {
         return Ok(header_says);
     }
-    let own = VersionStamp::in_flight(snapshot.owner);
-    if mvcc.created_ts != own && mvcc.expired_ts != own {
+    // "Is this stamp MY own in-flight write?" through the one door (`rmp` #1069), instead of
+    // comparing against an open-coded `VersionStamp::in_flight(snapshot.owner)` word. When the header
+    // stops carrying a `TxnId` (phase 3) this rule changes in `CommitOracle`, not here.
+    if !registry.names_own_write(mvcc.created_ts, snapshot.owner)?
+        && !registry.names_own_write(mvcc.expired_ts, snapshot.owner)?
+    {
         return Ok(header_says);
     }
     let mut exists = header_says;
@@ -1530,7 +1534,7 @@ pub fn incident_rels_typed<D: BlockDevice, S: LogSink, P: StorePages>(
 /// exclusive `&RecordStore` and the write/commit/GC/alloc path is untouched.
 ///
 /// It carries **no** snapshot/visibility logic of its own: a returned record's `xmin`/`xmax` is
-/// filtered by `graphus_txn::is_visible` against the caller's own cloned `CommitRegistry` and
+/// filtered by `graphus_txn::is_visible_via` against the caller's own cloned `CommitRegistry` and
 /// snapshot timestamp, exactly as the `&RecordStore` path is filtered above this layer. Capturing the
 /// `high_water` bound at dispatch is MVCC-superset-safe (a later-allocated id commits after the
 /// reader's snapshot and is invisible anyway), so the view sees a strict superset of the ids the

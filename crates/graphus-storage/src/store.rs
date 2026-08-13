@@ -40,7 +40,7 @@ use graphus_core::{
 use graphus_freezefloor::FreezeFloor;
 use graphus_io::{BlockDevice, PAGE_SIZE};
 use graphus_pagemap::PageMapWriter;
-use graphus_txn::{CommitRegistry, Snapshot, TxnOutcome};
+use graphus_txn::{CommitOracle, CommitRegistry, Snapshot, StampOutcome};
 use graphus_wal::{LogSink, WalManager};
 
 use crate::counts_log::{AppliedTxSet, CountDelta, replay_count_deltas};
@@ -488,7 +488,7 @@ impl StorePages for [FixedStore; STORE_COUNT] {
 ///
 /// > A snapshot taken at timestamp `V` sees every transaction whose commit timestamp is `<= V`.
 ///
-/// Every reader in the engine already *assumes* it — `graphus_txn::visibility::is_visible` decides a
+/// Every reader in the engine already *assumes* it — `graphus_txn::visibility::is_visible_via` decides a
 /// committed creator visible exactly when `ts <= snapshot.ts`, and `scan_polarity::delta_verdict`
 /// stops the undo walk on the same test. Nothing was *establishing* it.
 ///
@@ -1530,7 +1530,7 @@ struct Maintenance {
     /// MVCC version history for the node **label bitmap** (`rmp` task #767).
     ///
     /// The label word is mutated IN PLACE inside the node record, so — unlike a property, which is a
-    /// separate MVCC-versioned `PropRecord` — it has no version for `graphus_txn::is_visible` to
+    /// separate MVCC-versioned `PropRecord` — it has no version for `graphus_txn::is_visible_via` to
     /// filter. Without this, a label read returned whatever the word held at that instant: an
     /// uncommitted writer's change was visible to a concurrent reader (a **dirty read**) and a
     /// committed one was visible to a reader whose snapshot predated it (a **non-repeatable read**).
@@ -4252,7 +4252,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // `note_created`'s `lower_freeze_low` was enough. After #967 a `SET`/`REMOVE` of an existing key
         // restamps an EXISTING id, which is very often far BELOW the frontier — so the incremental
         // freeze sweep (`[freeze_low, high_water)`) never revisits it, the stamp is never settled to
-        // `Committed(ts)`, and once the registry forgets that writer `is_visible` reads the stamp as
+        // `Committed(ts)`, and once the registry forgets that writer `is_visible_via` reads the stamp as
         // unresolvable. That is the exact #522 silent-lost-committed-data shape, reopened from a new
         // direction; `debug_assert_freeze_complete` caught it (DST
         // `bulk_load_mid_abort_wal_bound_590` / `reader_store_growth`, "in-use Prop record N still
@@ -4842,7 +4842,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///
     /// Resolving against the live map is sound precisely because the map is **monotone**: pages are
     /// only ever appended, never remapped or removed, and page growth is never undone by a rollback
-    /// (`rmp` #239). Locating a post-snapshot record is harmless — `graphus_txn::is_visible` still
+    /// (`rmp` #239). Locating a post-snapshot record is harmless — `graphus_txn::is_visible_via` still
     /// filters it out above. The capture is now also strictly cheaper: one `Arc` refcount bump per
     /// store instead of a full copy of every store's page list on every read dispatch.
     ///
@@ -4908,7 +4908,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// [`capture_read_meta`](Self::capture_read_meta)d [`MetaSnapshot`]. The view exposes the same read
     /// surface the Cypher layer drives, computed purely from `(pool, meta)`; it carries no
     /// snapshot/visibility logic of its own (the caller filters returned records by
-    /// `graphus_txn::is_visible` against its own cloned `CommitRegistry`, exactly as the `&self` read
+    /// `graphus_txn::is_visible_via` against its own cloned `CommitRegistry`, exactly as the `&self` read
     /// methods are filtered above this layer). Slice 3a is single-threaded and behaviour-preserving
     /// (the view is proven byte-identical to the `&self` methods); Slice 3b moves it onto reader
     /// threads.
@@ -7677,7 +7677,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // head belongs to a transaction that "is neither itself nor committed before its own start
         // timestamp" — and only the first was implemented. The gap is not academic: a head committed
         // at `commit_ts > begin_ts` is, by the visibility rule this store runs on
-        // (`graphus_txn::visibility::is_visible`: a committed creator is visible iff
+        // (`graphus_txn::visibility::is_visible_via`: a committed creator is visible iff
         // `ts <= snapshot.ts`), a version this writer CANNOT SEE. So it read the value underneath and
         // is about to overwrite the one on top with a result computed from the older one. Two
         // acknowledged increments, one increment applied.
@@ -7791,7 +7791,18 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // that view read the live word and see a label statement 2 has just added. The gate therefore
         // tests "created by this **statement**", which is the exact condition under which no view of
         // any statement can ask what the node's labels were before.
-        if VersionStamp::from_raw(creator) == VersionStamp::InFlight(txn)
+        // "Does `creator` name MY OWN write?" through the one commit door (`rmp` #1069) — the same
+        // question `is_visible_via` asks of a header, and byte-for-byte the former
+        // `VersionStamp::from_raw(creator) == VersionStamp::InFlight(txn)`.
+        //
+        // Bound to a `let` so the registry read guard is provably released before the delta writes
+        // below, rather than resting on the `if`-condition temporary scope.
+        let creator_is_own_write = self
+            .commit_registry
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .names_own_write(creator, txn)?;
+        if creator_is_own_write
             && self
                 .active
                 .with(txn, |a| {
@@ -9028,18 +9039,28 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// expiry, and that expiry **committed** at or before `watermark` — so no live or future
     /// snapshot can still observe it (`04 §5.5`). A still-in-flight or yet-uncommitted tombstone is
     /// not reclaimable.
-    fn is_reclaimable(mvcc: MvccHeader, watermark: Timestamp, registry: &CommitRegistry) -> bool {
+    ///
+    /// # Errors
+    /// Propagates a stamp-resolution fault from the [`CommitOracle`](graphus_txn::CommitOracle) door
+    /// (`rmp` #1069). An expiry that cannot be resolved must never be read as "reclaimable" — that
+    /// would free a version a live snapshot can still observe — nor silently as "not reclaimable",
+    /// which would hide a durable read fault behind a deferred reclamation.
+    fn is_reclaimable(
+        mvcc: MvccHeader,
+        watermark: Timestamp,
+        registry: &CommitRegistry,
+    ) -> Result<bool> {
         if !mvcc.in_use() {
-            return false;
+            return Ok(false);
         }
-        // Resolve the expiry stamp through the Active/Recent Transaction Table (`rmp` task #49): a
+        // Resolve the expiry stamp through the one commit door (`rmp` task #49, `rmp` #1069): a
         // frozen tombstone carries `Committed(ts)` directly; a lazily-committed one still carries the
         // deleter's in-flight `TxnId`, which the registry maps to its commit timestamp. A live
         // (`xmax == 0`), still-in-flight, or aborted expiry resolves to `None` and is not reclaimable.
-        match registry.resolve_commit_ts(mvcc.expired_ts) {
+        Ok(match registry.resolve_commit_ts(mvcc.expired_ts)? {
             Some(ts) => ts <= watermark,
             None => false,
-        }
+        })
     }
 
     /// Garbage-collects MVCC tombstones under `txn`: physically reclaims every relationship, node
@@ -9315,7 +9336,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // SAME invariant over a bounded rotating id window (so full-store coverage every N passes at a
         // fixed O(window) per-pass cost), and reports any stranded committed stamp it finds — the tier
         // that runs in production, where the full scan does not. See [`audit_freeze_frontier_window`].
-        let (freeze_violations, first_freeze_violation) = self.audit_freeze_frontier_window();
+        let (freeze_violations, first_freeze_violation) = self.audit_freeze_frontier_window()?;
 
         if freeze_violations == 0 {
             // Normal path: schedule the table prune. Every writer recorded as committed at this point had
@@ -9402,7 +9423,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Returns `(violation_count, first_violation)` for this pass's windows. Read-only + best-effort: a
     /// page-read error surfaces nothing and leaves the cursor put (the next pass retries) rather than
     /// failing the GC pass — a transient read fault must not turn a maintenance tick into an abort.
-    fn audit_freeze_frontier_window(&self) -> (u64, Option<FreezeFrontierViolation>) {
+    fn audit_freeze_frontier_window(&self) -> Result<(u64, Option<FreezeFrontierViolation>)> {
         let mut violations = 0u64;
         let mut first: Option<FreezeFrontierViolation> = None;
         // The three MVCC stores (heap `Strings` blocks carry no version stamps). Each advances its own
@@ -9427,8 +9448,15 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 // is `Some` only for an in-flight stamp whose writer the registry records as Committed).
                 // A genuinely-open writer's stamp maps to `None` (correctly not a violation — it is frozen
                 // once that writer commits), so this never fires on legitimately in-flight data.
-                if self.frozen_word(mvcc.created_ts).is_some()
-                    || self.frozen_word(mvcc.expired_ts).is_some()
+                // A stamp that cannot be RESOLVED is a different failure from a page that cannot be
+                // READ, and it is deliberately NOT folded into the best-effort `continue` above: the
+                // caller treats `violations == 0` as licence to prune the transaction table, so
+                // answering "no violation" on a fault would fail OPEN — precisely the `rmp` #522
+                // silent-lost-committed-data direction. It propagates and the GC pass fails instead,
+                // which leaves every committed writer in the table. Unreachable in phase 2 (the
+                // in-memory registry never faults); load-bearing from `rmp` #1069 phase 3 on.
+                if self.frozen_word(mvcc.created_ts)?.is_some()
+                    || self.frozen_word(mvcc.expired_ts)?.is_some()
                 {
                     violations += 1;
                     if first.is_none() {
@@ -9451,7 +9479,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             };
             self.with_maintenance(|m| m.freeze_audit_from[ki] = advanced);
         }
-        (violations, first)
+        Ok((violations, first))
     }
 
     /// Reads just the 25-byte MVCC header of record `id` in `kind`'s store (freeze-sweep helper —
@@ -9470,19 +9498,30 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Active/Recent Transaction Table records as committed (`rmp` task #59). `None` for the `0`
     /// sentinel, an already-committed stamp, and a still-in-flight or aborted writer (an aborted
     /// writer's stamps are reverted by its rollback's WAL undo, never frozen).
-    fn frozen_word(&self, word: u64) -> Option<u64> {
-        match VersionStamp::from_raw(word) {
-            VersionStamp::InFlight(writer) => match self
-                .commit_registry
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .outcome(writer)
-            {
-                TxnOutcome::Committed(ts) => Some(VersionStamp::committed(ts)),
-                TxnOutcome::InFlight | TxnOutcome::Aborted => None,
-            },
-            VersionStamp::None | VersionStamp::Committed(_) => None,
+    fn frozen_word(&self, word: u64) -> Result<Option<u64>> {
+        let registry = self
+            .commit_registry
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Both halves go through the `rmp` #1069 door, and together they are byte-for-byte the
+        // former `match VersionStamp::from_raw(word) { InFlight(w) => registry.outcome(w), .. }`:
+        //
+        // * `names_writer` is `Some` exactly for the old `InFlight(_)` arm — an ALREADY-frozen
+        //   `Committed` word and the `0` sentinel both answer `None`, which is what keeps this from
+        //   "re-freezing" a word that needs no patch (and from reporting a spurious audit violation);
+        // * `resolve_stamp` then supplies that writer's outcome.
+        //
+        // Asking `resolve_stamp` alone would be WRONG here: it maps an already-committed word to
+        // `Committed(ts)` too, so every frozen record would look freezable for ever.
+        if registry.names_writer(word)?.is_none() {
+            return Ok(None);
         }
+        Ok(match registry.resolve_stamp(word)? {
+            StampOutcome::Committed(ts) => Some(VersionStamp::committed(ts)),
+            // Still open, aborted (its stamps are reverted by its rollback's WAL undo, never frozen),
+            // or the sentinel.
+            StampOutcome::None | StampOutcome::InFlight(_) | StampOutcome::Aborted => None,
+        })
     }
 
     /// **Debug-only invariant check** for the `rmp` #522 incremental-freeze prune (the W1 regression
@@ -9497,7 +9536,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// `[freeze_low, high_water)`) is what surfaces a stamp stranded **below** the frontier;
     /// [`frozen_word`](Self::frozen_word)`.is_some()` is the exact "unfrozen committed stamp" predicate
     /// the sweep clears. A firing means a committed version would be forgotten while still keyed by an
-    /// unresolvable in-flight `TxnId` — which [`is_visible`](graphus_txn::is_visible) reads as
+    /// unresolvable in-flight `TxnId` — which [`is_visible_via`](graphus_txn::is_visible_via) reads as
     /// **invisible**, i.e. silent lost committed data (the class the frontier carry-forward fix in
     /// [`is_inflight_of_inflight_writer`](Self::is_inflight_of_inflight_writer) closes). Compiled out in
     /// an ordinary release build (the full-store scan is O(store) per GC pass), but **opt-in for release**
@@ -9510,9 +9549,16 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             let in_use = read_view::scan_in_use_mvcc(&self.pool, &self.stores, kind)
                 .expect("W1 freeze-completeness guard reads only in-use MVCC headers");
             for &(id, mvcc) in &in_use {
+                // `.expect` matches the `.expect` on the scan above: this is a debug-only invariant
+                // guard, so an unresolvable stamp (`rmp` #1069) is a loud failure of the guard
+                // itself, never a quietly-passed assertion.
+                let unfrozen = |word: u64| {
+                    self.frozen_word(word)
+                        .expect("W1 freeze-completeness guard resolves every header stamp")
+                        .is_some()
+                };
                 assert!(
-                    self.frozen_word(mvcc.created_ts).is_none()
-                        && self.frozen_word(mvcc.expired_ts).is_none(),
+                    !unfrozen(mvcc.created_ts) && !unfrozen(mvcc.expired_ts),
                     "rmp #522 freeze-frontier invariant VIOLATED: in-use {kind:?} record {id} still \
                      bears an unfrozen committed-writer in-flight stamp (xmin={:#018x}, \
                      xmax={:#018x}) after the freeze sweep. Its writer committed but the incremental \
@@ -9589,11 +9635,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         let in_use = read_view::scan_in_use_mvcc(&self.pool, &self.stores, kind)?;
         let mut frozen = 0usize;
         for (i, &(id, mvcc)) in in_use.iter().enumerate() {
-            if let Some(word) = self.frozen_word(mvcc.created_ts) {
+            if let Some(word) = self.frozen_word(mvcc.created_ts)? {
                 self.patch_header_word(kind, id, MVCC_OFF_CREATED_TS, word, txn)?;
                 frozen += 1;
             }
-            if let Some(word) = self.frozen_word(mvcc.expired_ts) {
+            if let Some(word) = self.frozen_word(mvcc.expired_ts)? {
                 self.patch_header_word(kind, id, MVCC_OFF_EXPIRED_TS, word, txn)?;
                 frozen += 1;
             }
@@ -9636,11 +9682,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // stamp after this pass. If none, advance to `high_water` (everything at/above `from` settled).
         let mut new_low = high_water;
         for (i, &(id, mvcc)) in in_use.iter().enumerate() {
-            if let Some(word) = self.frozen_word(mvcc.created_ts) {
+            if let Some(word) = self.frozen_word(mvcc.created_ts)? {
                 self.patch_header_word(kind, id, MVCC_OFF_CREATED_TS, word, txn)?;
                 frozen += 1;
             }
-            if let Some(word) = self.frozen_word(mvcc.expired_ts) {
+            if let Some(word) = self.frozen_word(mvcc.expired_ts)? {
                 self.patch_header_word(kind, id, MVCC_OFF_EXPIRED_TS, word, txn)?;
                 frozen += 1;
             }
@@ -9650,8 +9696,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             }
             // Still bearing an in-flight-writer stamp (a committed writer's stamp was just frozen above,
             // so it no longer counts)? Then it must stay covered by the frontier for a later pass.
-            if self.is_inflight_of_inflight_writer(mvcc.created_ts)
-                || self.is_inflight_of_inflight_writer(mvcc.expired_ts)
+            if self.is_inflight_of_inflight_writer(mvcc.created_ts)?
+                || self.is_inflight_of_inflight_writer(mvcc.expired_ts)?
             {
                 new_low = new_low.min(id);
             }
@@ -9701,14 +9747,22 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// stamp whenever a maintenance GC ran while that writer was in-flight (an explicit `BEGIN … RUN
     /// …` spanning engine commands). When the writer then committed, the next incremental sweep skipped
     /// those records (now below the frontier), left their committed stamps **unfrozen**, and the GC
-    /// prune forgot the writer — so [`is_visible`](graphus_txn::is_visible) resolved the version's
+    /// prune forgot the writer — so [`is_visible_via`](graphus_txn::is_visible_via) resolved the version's
     /// stamp against a now-unknown (→ aborted) writer and read the committed value as **invisible**:
     /// silent lost committed data (regression `tests/incremental_freeze_inflight_writer.rs`). Testing
     /// live membership in `active` is the correct "the writer might still commit, so keep covering it"
     /// signal.
-    fn is_inflight_of_inflight_writer(&self, word: u64) -> bool {
-        matches!(VersionStamp::from_raw(word), VersionStamp::InFlight(w)
-            if self.is_txn_active(w))
+    fn is_inflight_of_inflight_writer(&self, word: u64) -> Result<bool> {
+        // `names_writer`, NOT `resolve_stamp`: the door's `StampOutcome::InFlight` arm is dead
+        // through the `CommitRegistry` (an unresolved writer maps to `Aborted`), so routing this
+        // predicate through the outcome would silently re-make the `rmp` #522 defect this method
+        // exists to fix. The identity comes from the word; the liveness from `active`.
+        let writer = self
+            .commit_registry
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .names_writer(word)?;
+        Ok(writer.is_some_and(|w| self.is_txn_active(w)))
     }
 
     /// Reclaims the reclaimable MVCC tombstones of `kind` (`Rel` or `Node`) under `txn` (`rmp` #522).
@@ -9749,7 +9803,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                     .commit_registry
                     .read()
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
-            ) && (kind != StoreKind::Node || !self.has_live_incident_rels(id)?);
+            )? && (kind != StoreKind::Node
+                || !self.has_live_incident_rels(id)?);
             if reclaimable {
                 match kind {
                     StoreKind::Rel => self.reclaim_rel(txn, id)?,
@@ -11496,7 +11551,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// order. This includes MVCC tombstones not yet GC'd (a deleted node keeps its slot until
     /// reclamation, `04 §5.5`): whether a returned node is *visible* to a given reader is decided by
     /// the snapshot/visibility layer above (`graphus-cypher`'s `RecordStoreGraph`, `04 §5.3`), which
-    /// filters these ids through `graphus_txn::is_visible` on each record's `xmin`/`xmax`.
+    /// filters these ids through `graphus_txn::is_visible_via` on each record's `xmin`/`xmax`.
     ///
     /// The node store's physical-id space is `1..high_water` (id `0` is the reserved null pointer
     /// and real records start at id `1`, `04 §2.2`); this walks that range and keeps the ids whose
@@ -11945,7 +12000,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
 
     /// Whether entity `(kind, id)` exists as of `snapshot`, at statement granularity (`rmp` #972).
     ///
-    /// The statement-granular twin of [`graphus_txn::is_visible`], which the header words alone
+    /// The statement-granular twin of [`graphus_txn::is_visible_via`], which the header words alone
     /// cannot answer — see [`read_view::entity_visible_at`] for the rule and for why the ordinary
     /// read pays nothing for it.
     ///
@@ -12811,14 +12866,20 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             let is_empty_cell = prop.mvcc.in_use()
                 && prop.type_tag == undo::TYPE_TAG_ABSENT
                 && prop.value_inline == NULL_ID;
-            let is_tombstone = is_empty_cell
-                && !owner_has_chain
-                && self
-                    .commit_registry
+            // `&&` is spelled as a nested `if` because the third conjunct now goes through the
+            // fallible commit door (`rmp` #1069) and `?` cannot appear inside a `&&` chain. The
+            // short-circuit order is preserved exactly: an unresolvable stamp fails the sweep only
+            // for a cell that is already empty and whose owner has no chain — never for a cell the
+            // old chain would have skipped before ever asking.
+            let is_tombstone = if is_empty_cell && !owner_has_chain {
+                self.commit_registry
                     .read()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .resolve_commit_ts(prop.mvcc.created_ts)
-                    .is_some_and(|ts| ts <= watermark);
+                    .resolve_commit_ts(prop.mvcc.created_ts)?
+                    .is_some_and(|ts| ts <= watermark)
+            } else {
+                false
+            };
             // A dead-link property **corpse** (`rmp` #172): a `!in_use` record not on the free list,
             // left by an aborted/crashed property creation whose header-only undo cleared in-use while
             // PRESERVING its `next_prop` body (so live walks thread through it to the committed
@@ -13564,7 +13625,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///
     /// This is [`superset_scan_node_properties`](Self::superset_scan_node_properties) narrowed by
     /// [`SupersetProperties::decide`] against this store's [`CommitRegistry`] — that is, by the same
-    /// [`graphus_txn::is_visible`] predicate the query read path applies, so the caller decides over
+    /// [`graphus_txn::is_visible_via`] predicate the query read path applies, so the caller decides over
     /// exactly the graph a `MATCH` in the same transaction would return.
     ///
     /// Use it wherever the answer is **final**: nothing downstream re-checks a constraint verdict, so
@@ -17297,6 +17358,7 @@ mod tests {
         assert!(
             s.commit_registry()
                 .resolve_commit_ts(post.mvcc.created_ts)
+                .unwrap()
                 .is_some(),
             "the transaction table resolves the property version's in-flight xmin to its commit ts"
         );
@@ -17386,6 +17448,7 @@ mod tests {
         assert!(
             s.commit_registry()
                 .resolve_commit_ts(s.node(h).unwrap().mvcc.expired_ts)
+                .unwrap()
                 .is_some(),
             "H's tombstone resolves to T2's commit ts — the delete survived"
         );
@@ -18135,7 +18198,7 @@ mod tests {
 
         // The full-range window audit (frontier-agnostic) MUST catch it.
         s.with_maintenance(|m| m.freeze_audit_from = [1; STORE_COUNT]);
-        let (violations, first) = s.audit_freeze_frontier_window();
+        let (violations, first) = s.audit_freeze_frontier_window().unwrap();
         assert!(
             violations >= 1,
             "the release-active audit must detect the stranded committed stamp (got {violations})"
@@ -18161,7 +18224,7 @@ mod tests {
         assert!(frozen >= 1, "the freeze sweep settled the committed stamp");
 
         s.with_maintenance(|m| m.freeze_audit_from = [1; STORE_COUNT]);
-        let (violations_after, first_after) = s.audit_freeze_frontier_window();
+        let (violations_after, first_after) = s.audit_freeze_frontier_window().unwrap();
         assert_eq!(
             violations_after, 0,
             "after a proper freeze the audit must be SILENT (no stranded stamp remains)"
@@ -18266,7 +18329,7 @@ mod tests {
         let t0 = Instant::now();
         let mut sink = 0u64;
         for _ in 0..ITERS {
-            let (v, _) = s.audit_freeze_frontier_window();
+            let (v, _) = s.audit_freeze_frontier_window().unwrap();
             sink = sink.wrapping_add(v);
         }
         let audit_ns = t0.elapsed().as_nanos() / ITERS as u128;
@@ -18290,8 +18353,8 @@ mod tests {
                 .unwrap();
                 let mut bad = 0u64;
                 for (_, mvcc) in &recs {
-                    if s.frozen_word(mvcc.created_ts).is_some()
-                        || s.frozen_word(mvcc.expired_ts).is_some()
+                    if s.frozen_word(mvcc.created_ts).unwrap().is_some()
+                        || s.frozen_word(mvcc.expired_ts).unwrap().is_some()
                     {
                         bad += 1;
                     }
@@ -18310,8 +18373,8 @@ mod tests {
         for kind in [StoreKind::Node, StoreKind::Rel, StoreKind::Prop] {
             let in_use = read_view::scan_in_use_mvcc(&s.pool, &s.stores, kind).unwrap();
             for &(_, mvcc) in &in_use {
-                if s.frozen_word(mvcc.created_ts).is_some()
-                    || s.frozen_word(mvcc.expired_ts).is_some()
+                if s.frozen_word(mvcc.created_ts).unwrap().is_some()
+                    || s.frozen_word(mvcc.expired_ts).unwrap().is_some()
                 {
                     fullsink += 1;
                 }

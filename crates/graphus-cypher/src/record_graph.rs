@@ -14,7 +14,7 @@
 //! **`strings.store` String/List property overflow heap + node-property removal** (#43), and
 //! **relationship properties** (#44, over [`RelRecord.first_prop`], the relationship analogue of
 //! the node-property path, sharing the same `props.store` chain + `strings.store` overflow heap),
-//! and **MVCC snapshot visibility** (#45 — every read is filtered through `graphus_txn::is_visible`
+//! and **MVCC snapshot visibility** (#45 — every read is filtered through `graphus_txn::is_visible_via`
 //! against each record's frozen `xmin`/`xmax`, so a query reads a consistent point-in-time graph;
 //! see [`begin_at_snapshot`](RecordStoreGraph::begin_at_snapshot)), **SSI serializable concurrency**
 //! (#46), **per-value property MVCC** (#50), and **index-accelerated label/property scans** (#48).
@@ -32,9 +32,9 @@
 //! | **Label-membership MVCC** (snapshot-consistent label reads, no dirty read) | **supported** (#767) — the label word is mutated IN PLACE, so its older versions are retained as `AddLabel` / `RemoveLabel` undo deltas on the node's own undo chain (#968 — durable, on the same chain as every other version) and every label read resolves through that chain against the reader's snapshot ([`label_bitmap_at`](Self::label_bitmap_at)). Before #767 labels were read LIVE: a committed `REMOVE n:L` was visible to an older snapshot (non-repeatable read) and an *uncommitted* one to any concurrent reader (dirty read) | — |
 //! | **Relationship properties** — read (`r.k`, `properties(r)`), create (`CREATE ()-[:T {..}]->()`), `SET`/`REMOVE`, inline **and** `String`/`List` overflow | **supported** (#44) over [`RelRecord.first_prop`] (`04 §2.3`/§2.1, `05 §9`); `delete_rel` frees the chain (no leak) | a `Map`/`Bytes`/temporal value, or a heterogeneous/nested `List`, captures the same runtime error as a node property |
 //! | **Index-accelerated** label / property scans | **supported** (#48) — when driven by a [`TxnCoordinator`](crate::coordinator::TxnCoordinator) the seam holds a derived [`IndexSet`](crate::index_set::IndexSet): a label scan seeks the label index then re-checks, and `index_seek_eq`/`index_seek_range` seek the property index then re-check exactly the scan+filter residual, returning the same visible rows. Standalone (no coordinator) falls back to scan+filter | — |
-//! | **MVCC snapshot visibility** (consistent reads, own-writes, tombstone visibility, crash-safe) | **supported** (#45) — reads filtered by `graphus_txn::is_visible` on each record's `xmin`/`xmax`; delete is an MVCC tombstone reclaimed by GC | — |
+//! | **MVCC snapshot visibility** (consistent reads, own-writes, tombstone visibility, crash-safe) | **supported** (#45) — reads filtered by `graphus_txn::is_visible_via` on each record's `xmin`/`xmax`; delete is an MVCC tombstone reclaimed by GC | — |
 //! | **Serializable concurrency / SSI** (write-skew abort, write-write first-updater-wins) | **supported** (#46) via [`TxnCoordinator`](crate::coordinator::TxnCoordinator) — this seam records SIREAD markers and rw-edges into the shared `SsiTracker`, and the coordinator aborts a pivot at commit with a retriable serialization error | — |
-//! | **Per-value property MVCC** (snapshot-consistent property reads, no dirty read) | **supported** (#50) — a property overwrite/removal MVCC-tombstones the old `PropRecord` and prepends the new one; [`read_node_props`](Self::read_node_props) filters the chain by `is_visible` (newest-visible-wins), and GC reclaims tombstoned versions | — |
+//! | **Per-value property MVCC** (snapshot-consistent property reads, no dirty read) | **supported** (#50) — a property overwrite/removal MVCC-tombstones the old `PropRecord` and prepends the new one; [`read_node_props`](Self::read_node_props) filters the chain by `is_visible_via` (newest-visible-wins), and GC reclaims tombstoned versions | — |
 //! | Index-range (predicate) SSI markers | **deferred (#48)** | read markers are node/relationship-level, so a full label/all-nodes scan reads every node (a safe SSI over-abort until index-range markers arrive with index wiring, #48) |
 //!
 //! [`RelRecord.first_prop`]: graphus_storage::record::RelRecord
@@ -83,7 +83,7 @@ use graphus_index::similarity_score;
 use graphus_io::BlockDevice;
 use graphus_storage::{ConstraintKind, IndexState, MvccHeader, Namespace, RecordStore, StoreKind};
 use graphus_txn::{
-    CommitRegistry, PredicateRead, Snapshot, SsiReadBuffer, SsiTracker, View, is_visible,
+    CommitRegistry, PredicateRead, Snapshot, SsiReadBuffer, SsiTracker, View, is_visible_via,
 };
 use graphus_wal::LogSink;
 
@@ -301,7 +301,7 @@ pub struct RecordStoreGraph<D: BlockDevice, S: LogSink> {
     /// The single transaction this query runs in.
     txn: TxnId,
     /// This query's MVCC read snapshot (`04 §5.3`, `rmp` task #45): every read is filtered through
-    /// [`is_visible`] against each record's frozen `xmin`/`xmax`, so the query sees a consistent
+    /// [`is_visible_via`] against each record's frozen `xmin`/`xmax`, so the query sees a consistent
     /// point-in-time graph — only versions committed at or before its begin timestamp, plus its own
     /// in-flight writes, and not versions another transaction committed later or deleted.
     snapshot: Snapshot,
@@ -1020,12 +1020,16 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     /// [`column_witness_still_valid`](Self::column_witness_still_valid) tests as a cache witness.
     /// Entity existence goes through [`entity_visible`](Self::entity_visible) instead, which refines
     /// this to statement granularity (`rmp` #972).
-    fn visible_header(&self, mvcc: MvccHeader) -> bool {
-        is_visible(
+    ///
+    /// # Errors
+    /// Propagates a stamp-resolution fault from the [`CommitOracle`](graphus_txn::CommitOracle) door
+    /// (`rmp` #1069). Fail closed on it (`rmp` #733) — never fall back to a default verdict.
+    fn visible_header(&self, mvcc: MvccHeader) -> Result<bool, GraphusError> {
+        is_visible_via(
+            &self.registry,
             self.snapshot,
             mvcc.created_ts,
             mvcc.expired_ts,
-            &self.registry,
         )
     }
 
@@ -1384,7 +1388,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     /// to `None`.
     ///
     /// POLARITY — DECISION (`rmp` #967). It used to keep the first record of the key that
-    /// [`is_visible`] accepted while walking the prepend-ordered chain, which was sound only while
+    /// [`is_visible_via`] accepted while walking the prepend-ordered chain, which was sound only while
     /// every version of a key was a cell carrying its own MVCC stamps. After #967 the newest version
     /// is written **in place** and the old value descends onto the node's undo chain, so the version
     /// is chosen by [`RecordStore::decision_scan_node_properties`] — the same walk the off-thread
@@ -1419,7 +1423,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     ///
     /// POLARITY — DECISION (`rmp` tasks #50, #967). A property overwrite used to prepend a new
     /// `PropRecord` and tombstone the old one, so the chain held **multiple versions per key** and
-    /// this method resolved them itself with [`is_visible`] on each record's `xmin`/`xmax`. After
+    /// this method resolved them itself with [`is_visible_via`] on each record's `xmin`/`xmax`. After
     /// `rmp` #967 the newest version is written **in place** and the old value descends onto the
     /// node's undo chain (`D-property-visibility` makes that chain the sole oracle), so the resolution
     /// is [`RecordStore::decision_scan_node_properties`] — the same walk the off-thread reader pool
@@ -3992,9 +3996,24 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             // and only when the witness re-check passes do we **materialize** (clone) its value from
             // the shared decode — late materialization (`rmp` task #375).
             let node = NodeId(id);
-            let cache_row = cached_index.get(&id).copied().filter(|&i| {
-                self.columnar_entry_is_fresh(&node_rec, cached_witnesses[i], prop_key)
-            });
+            // `Option::filter` cannot host a `?`, and folding an oracle fault into "not fresh" would
+            // serve the authoritative read path a fault it never sees (`rmp` #1069). So the freshness
+            // probe is run explicitly and a fault ends the pass through the same capture path the
+            // label read above uses (`rmp` #733).
+            let cache_row = match cached_index.get(&id).copied() {
+                Some(i) => {
+                    match self.columnar_entry_is_fresh(&node_rec, cached_witnesses[i], prop_key) {
+                        Ok(true) => Some(i),
+                        Ok(false) => None,
+                        Err(e) => {
+                            self.note_candidates(examined, hidden, filtered);
+                            self.capture(e);
+                            return Some(ColumnarPass::default());
+                        }
+                    }
+                }
+                None => None,
+            };
             let value = match cache_row {
                 Some(i) => {
                     // Fresh: the cached value IS the node's snapshot-visible newest value of the key.
@@ -4050,15 +4069,22 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     /// channel). Records **no** SSI marker (the per-node SIREAD is recorded by the caller for the node
     /// key; re-reading the property record is an internal freshness probe, not an additional read of a
     /// distinct conflict key — the property value belongs to the same node the caller already marked).
+    ///
+    /// # Errors
+    /// Propagates a stamp-resolution fault from the [`CommitOracle`](graphus_txn::CommitOracle) door
+    /// (`rmp` #1069). Note the asymmetry with the property **read** fault just below, which declines
+    /// the cache and falls back to the authoritative row read: a fallback is legitimate for a page
+    /// that could not be read (the row read will hit the same fault and surface it), but an
+    /// unresolvable stamp must not be quietly turned into "the cache is stale".
     fn columnar_entry_is_fresh(
         &self,
         node_rec: &graphus_storage::record::NodeRecord,
         witness: crate::column_cache::ColumnWitness,
         prop_key: u32,
-    ) -> bool {
+    ) -> Result<bool, GraphusError> {
         // Witness 1: the chain head must be byte-identical (no key added since rebuild).
         if node_rec.first_prop != witness.node_first_prop {
-            return false;
+            return Ok(false);
         }
         // Witnesses 2-4: the cached cell must still hold the same key, the same value bytes, the same
         // creating stamp — and be visible to this snapshot.
@@ -4070,13 +4096,18 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // our own current statement produced can never be served from the cache under either view.
         let prop = match self.store.borrow().property(witness.prop_pid) {
             Ok(p) => p,
-            Err(_) => return false, // a read fault: decline the cache, fall back to the row read.
+            Err(_) => return Ok(false), // a read fault: decline the cache, fall back to the row read.
         };
-        prop.key == prop_key
-            && prop.type_tag == witness.type_tag
-            && prop.value_inline == witness.value_inline
-            && prop.mvcc.created_ts == witness.created_ts
-            && self.visible_header(prop.mvcc)
+        if prop.key != prop_key
+            || prop.type_tag != witness.type_tag
+            || prop.value_inline != witness.value_inline
+            || prop.mvcc.created_ts != witness.created_ts
+        {
+            return Ok(false);
+        }
+        // Last, and only once the cheap byte witnesses agree — preserving the former `&&` chain's
+        // short-circuit exactly, so a mismatched cell never asks the oracle at all.
+        self.visible_header(prop.mvcc)
     }
 
     /// `rmp` task #780 — OVER-FETCH. `k` hits from the graph become FEWER than `k` rows once the

@@ -15,8 +15,6 @@ use rustc_hash::FxHashMap as HashMap;
 
 use graphus_core::{CommandId, Timestamp, TxnId};
 
-use crate::oracle::VersionStamp;
-
 /// The isolation level a transaction runs at (`D-isolation-level`).
 ///
 /// Both levels read from a consistent MVCC snapshot (`04 §5.3`); they differ **only** at commit:
@@ -275,6 +273,13 @@ impl CommitRegistry {
     /// The recorded outcome of `txn`. An unknown id is treated as [`TxnOutcome::Aborted`]: it was
     /// either never committed, or already GC'd because it is provably invisible — both mean its
     /// writes are not visible (`04 §5.3`).
+    ///
+    /// This takes a [`TxnId`], not a header word: turning a **header stamp** into an outcome is the
+    /// job of [`CommitOracle`](crate::CommitOracle), which this type implements
+    /// (`crate::visibility`). `rmp` #1069 made that the single door, so a caller holding a raw
+    /// `created_ts`/`expired_ts` must go through
+    /// [`resolve_stamp`](crate::CommitOracle::resolve_stamp) rather than decoding the word itself
+    /// and calling this.
     #[must_use]
     pub fn outcome(&self, txn: TxnId) -> TxnOutcome {
         self.outcomes
@@ -282,29 +287,15 @@ impl CommitRegistry {
             .copied()
             .unwrap_or(TxnOutcome::Aborted)
     }
-
-    /// Resolves a raw header word into the committed timestamp of its writer, if any.
-    ///
-    /// Returns:
-    /// - `Some(ts)` when the word is a committed timestamp, or an in-flight `TxnId` that the
-    ///   registry has since recorded as committed at `ts`;
-    /// - `None` when the word is the `0` sentinel, or names an in-flight or aborted writer.
-    #[must_use]
-    pub fn resolve_commit_ts(&self, word: u64) -> Option<Timestamp> {
-        match VersionStamp::from_raw(word) {
-            VersionStamp::None => None,
-            VersionStamp::Committed(ts) => Some(ts),
-            VersionStamp::InFlight(txn) => match self.outcome(txn) {
-                TxnOutcome::Committed(ts) => Some(ts),
-                TxnOutcome::InFlight | TxnOutcome::Aborted => None,
-            },
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `resolve_commit_ts` is a provided method of the `rmp` #1069 door, not an inherent method of
+    // the registry any more; the assertions below are unchanged, only the `?`-shaped return is.
+    use crate::oracle::VersionStamp;
+    use crate::visibility::CommitOracle;
 
     /// The whole of statement-level isolation is one comparison operator per view, so it is asserted
     /// directly rather than only through the storage paths that consume it (`04 §5.1.4`).
@@ -401,7 +392,8 @@ mod tests {
         let reg = CommitRegistry::new();
         assert_eq!(reg.outcome(TxnId(9)), TxnOutcome::Aborted);
         assert_eq!(
-            reg.resolve_commit_ts(VersionStamp::in_flight(TxnId(9))),
+            reg.resolve_commit_ts(VersionStamp::in_flight(TxnId(9)))
+                .unwrap(),
             None
         );
     }
@@ -411,11 +403,11 @@ mod tests {
         let mut reg = CommitRegistry::new();
         let word = VersionStamp::in_flight(TxnId(3));
         reg.register_begin(TxnId(3));
-        assert_eq!(reg.resolve_commit_ts(word), None); // in flight
+        assert_eq!(reg.resolve_commit_ts(word).unwrap(), None); // in flight
         reg.record_commit(TxnId(3), Timestamp(50));
-        assert_eq!(reg.resolve_commit_ts(word), Some(Timestamp(50)));
+        assert_eq!(reg.resolve_commit_ts(word).unwrap(), Some(Timestamp(50)));
         reg.record_abort(TxnId(3));
-        assert_eq!(reg.resolve_commit_ts(word), None); // aborted
+        assert_eq!(reg.resolve_commit_ts(word).unwrap(), None); // aborted
     }
 
     #[test]
@@ -448,7 +440,8 @@ mod tests {
     fn committed_word_resolves_without_registry_entry() {
         let reg = CommitRegistry::new();
         assert_eq!(
-            reg.resolve_commit_ts(VersionStamp::committed(Timestamp(8))),
+            reg.resolve_commit_ts(VersionStamp::committed(Timestamp(8)))
+                .unwrap(),
             Some(Timestamp(8))
         );
     }

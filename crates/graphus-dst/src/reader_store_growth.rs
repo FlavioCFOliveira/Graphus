@@ -56,7 +56,7 @@
 //!    is the defect. Pre-fix this fires; post-fix it does not.
 //! 2. **Isolation** (the ACID obligation the fix must not trade away) — making the location oracle LIVE
 //!    must NOT make post-snapshot data VISIBLE. The reader filters everything it locates through
-//!    `graphus_txn::is_visible` against its own snapshot timestamp and its own cloned `CommitRegistry`,
+//!    `graphus_txn::is_visible_via` against its own snapshot timestamp and its own cloned `CommitRegistry`,
 //!    exactly as `graphus-cypher`'s `VisCtx` does, and must see **exactly** the pre-snapshot committed
 //!    state — not one record more. A fix that made the reader see the writer's fresh commits would
 //!    trade an internal error for a snapshot-isolation breach, which is strictly worse.
@@ -70,7 +70,7 @@
 use graphus_core::{TxnId, Value};
 use graphus_io::MemBlockDevice;
 use graphus_storage::{NULL_ID, Namespace, RecordStore};
-use graphus_txn::{Snapshot, is_visible};
+use graphus_txn::{Snapshot, is_visible_via};
 use graphus_wal::{MemLogSink, WalManager};
 
 use crate::rng::DetRng;
@@ -249,13 +249,17 @@ pub fn run_reader_vs_store_growth(seed: u64) -> ReaderGrowthReport {
                 .iter()
                 .copied()
                 .filter(|id| {
+                    // Through the `rmp` #1069 door. The reader's cloned in-memory registry never
+                    // faults; a fault would be a defect in the door, so this oracle panics rather
+                    // than quietly dropping the edge from the visible set it is asserting over.
                     view.rel(*id).is_ok_and(|r| {
-                        is_visible(
+                        is_visible_via(
+                            &registry,
                             reader_snapshot,
                             r.mvcc.created_ts,
                             r.mvcc.expired_ts,
-                            &registry,
                         )
+                        .expect("resolve rel stamp")
                     })
                 })
                 .collect();
@@ -298,7 +302,7 @@ pub fn run_reader_vs_store_growth(seed: u64) -> ReaderGrowthReport {
         }
     }
     // ORACLE 2 (isolation), through the DECISION-polarity read — the production rule, rather than a
-    // hand-rolled `is_visible` fold over cell stamps, which `D-property-visibility` retired.
+    // hand-rolled `is_visible_via` fold over cell stamps, which `D-property-visibility` retired.
     match view.decision_scan_node_properties(hub, reader_snapshot) {
         Err(e) => read_failures.push(format!("decision_scan_node_properties(hub): {e}")),
         Ok(decided) => {

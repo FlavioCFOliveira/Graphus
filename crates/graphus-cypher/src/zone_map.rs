@@ -45,7 +45,7 @@
 //!   **candidates**, never rows: [`candidate_ranges_eq`](ZoneMap::candidate_ranges_eq) /
 //!   [`candidate_ids_eq`](ZoneMap::candidate_ids_eq) hand an id superset to a seam that owns the
 //!   reader's `(Snapshot, CommitRegistry)` pair — `RecordStoreGraph::zone_scan_eq`, which re-checks
-//!   through `label_bitmap_at` + `is_visible` exactly as every index seek does (`rmp` #958). This
+//!   through `label_bitmap_at` + `is_visible_via` exactly as every index seek does (`rmp` #958). This
 //!   module holds no snapshot and therefore decides nothing about visibility.
 //!
 //! # The maintenance invariant a caller must uphold

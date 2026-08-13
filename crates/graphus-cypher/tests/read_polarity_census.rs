@@ -77,7 +77,7 @@
 //!
 //! * `graphus_cypher::read_source::{read_node_props, read_rel_props, read_node_prop_one,
 //!   read_rel_prop_one}` and their `RecordStoreGraph` twins — these resolve at the reader's snapshot
-//!   through `decision_scan_*`. Before `rmp` #967 they read the superset and folded `is_visible` over
+//!   through `decision_scan_*`. Before `rmp` #967 they read the superset and folded `is_visible_via` over
 //!   each record themselves, which was sound only while every version of a key was a cell with its own
 //!   MVCC stamps; `D-property-visibility` made the undo chain the sole oracle, so the fold moved into
 //!   the storage-side walk. Both the inline `RecordStore` path and the off-thread `StoreReadView` path
@@ -97,7 +97,7 @@
 //! * The zone map's *consumer* is `RecordStoreGraph::zone_scan_eq`, and it is deliberately **not**
 //!   listed under "live word" below: it performs no raw read at all. The pruning layer yields
 //!   candidates and the statement seam decides them through `read_source::index_seek_eq_recheck`, i.e.
-//!   `label_bitmap_at` + `is_visible`, exactly as every node equality seek does (`rmp` #958). Pinned by
+//!   `label_bitmap_at` + `is_visible_via`, exactly as every node equality seek does (`rmp` #958). Pinned by
 //!   `the_zone_map_consumer_decides_through_the_shared_recheck`.
 //!
 //! ## Live word — write-path enforcement and total-fallback memoization
@@ -134,7 +134,7 @@
 //!
 //! * `TxnCoordinator::validate_existing_against_constraint` /
 //!   `validate_existing_rels_against_constraint` and the helpers they drive — every entity is filtered
-//!   by `is_visible` and every value resolved through `decision_scan_*`. The one raw read that remains
+//!   by `is_visible_via` and every value resolved through `decision_scan_*`. The one raw read that remains
 //!   is the node's label word, decoded off the record the visibility filter has just read, and it is
 //!   sound **only** while the `rmp` #902 guard refuses the DDL whenever another transaction holds
 //!   uncommitted state. That coupling is pinned by
@@ -515,7 +515,7 @@ fn a_pruning_rebuild_summarizes_every_property_version() {
 
 /// **THE `rmp` #958 RE-CHECK SHAPE, as a check.** The zone map's consumer decides its candidates
 /// through the one lifted re-check body every node equality seek shares, so the label is resolved with
-/// `label_bitmap_at` and the version with `is_visible`, at the reader's snapshot.
+/// `label_bitmap_at` and the version with `is_visible_via`, at the reader's snapshot.
 ///
 /// The defect this replaces re-checked candidates against the raw live label word and `mvcc.in_use()`
 /// **and returned rows**, so a dirty read in either direction reached the caller unrepaired. Any future

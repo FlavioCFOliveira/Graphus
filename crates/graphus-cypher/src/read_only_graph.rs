@@ -68,7 +68,7 @@ pub struct ReadOnlyGraph<D: BlockDevice, S: LogSink> {
     view: StoreReadView<D, S>,
     /// The owned, `Send + Sync` token dictionary (`id ↔ name`), captured alongside the view.
     tokens: TokenSnapshot,
-    /// This reader's MVCC read snapshot (`04 §5.3`): every read is filtered through `is_visible` against
+    /// This reader's MVCC read snapshot (`04 §5.3`): every read is filtered through `is_visible_via` against
     /// each record's frozen `xmin`/`xmax`, so the reader sees a consistent point-in-time graph.
     snapshot: Snapshot,
     /// The cloned commit registry that resolves an in-flight writer to its commit outcome, captured at

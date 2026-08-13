@@ -696,7 +696,7 @@ pub struct DegreeOutcome {
 /// 1. **Location** — no read fails (`"{kind} store page N not allocated"` is the defect; it surfaced
 ///    to clients as `Neo.DatabaseError.General.UnknownError`).
 /// 2. **Isolation** — the records the reader can now LOCATE past its snapshot stay INVISIBLE to it:
-///    filtered by `is_visible` against its own snapshot + `CommitRegistry`, it sees exactly the
+///    filtered by `is_visible_via` against its own snapshot + `CommitRegistry`, it sees exactly the
 ///    pre-snapshot committed state, and its `scan_*` bound stays snapshotted.
 ///
 /// Non-vacuous by construction: the run fails if the writer did not actually add store pages after the

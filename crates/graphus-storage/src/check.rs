@@ -1564,6 +1564,21 @@ fn check_label_bitmaps(cat: &Catalog, scan: &Scan, report: &mut ConsistencyRepor
 ///   store. That retarget is the point of `rmp` #966: before the undo area existed `undo_ptr` was
 ///   always `0`, so any bound accepted it; now it addresses a different store and only that store's
 ///   high-water bounds it. The chain *below* the head is validated by [`check_undo_chains`].
+///
+/// # Why this does NOT go through the commit door (`rmp` #1069)
+///
+/// Every other reader of a header stamp now resolves it through
+/// [`graphus_txn::CommitOracle`] — deliberately not this one, and the omission is stated rather
+/// than left to be rediscovered. The checks here are about the **physical encoding**: is the word
+/// the `0` sentinel, and are two *already-frozen* committed words in order. They ask nothing of a
+/// transaction's outcome and hold no [`CommitRegistry`](graphus_txn::CommitRegistry) to ask it of.
+///
+/// Routing them through the door would also change what they mean: `resolve_stamp` maps a
+/// lazily-committed in-flight word to `Committed(ts)`, so the inversion test would start comparing
+/// pairs it deliberately does not compare today (see the bullet above). The faithful gate spelling,
+/// should this ever need one, is the `frozen_word` recipe — `names_writer(w)?.is_none()` first, then
+/// `resolve_stamp` — and it needs a registry threaded in. `rmp` #1069 phase 3 rewrites what these
+/// words hold, so that is the moment to decide it, not this one.
 fn check_mvcc_headers(cat: &Catalog, scan: &Scan, report: &mut ConsistencyReport) {
     let mut check = |kind: StoreKind, id: u64, mvcc: MvccHeader| {
         if VersionStamp::from_raw(mvcc.created_ts) == VersionStamp::None {

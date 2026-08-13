@@ -34,13 +34,14 @@ use std::time::{Duration, Instant};
 // and never iterated in an order-observable way, so the faster non-cryptographic hash is safe.
 use rustc_hash::FxHashMap as HashMap;
 
-use graphus_core::{GraphusError, Result, Timestamp, TxnId, VersionStamp};
+use graphus_core::{GraphusError, Result, Timestamp, TxnId};
 
 use crate::gc::{GcReport, collect};
 use crate::oracle::TimestampOracle;
 use crate::snapshot::{CommitRegistry, IsolationLevel, Snapshot};
 use crate::ssi::SsiTracker;
 use crate::store::{Key, VersionedStore};
+use crate::visibility::{CommitOracle, StampOutcome};
 
 /// A durability hook invoked on commit, *before* a transaction's effects are made visible.
 ///
@@ -245,7 +246,7 @@ impl<S: VersionedStore, D: Durability> TxnManager<S, D> {
         // SIREAD marker first (SSI tracking is independent of whether a version is visible — a read
         // of a key still establishes the rw relationship if a concurrent writer overwrites it).
         self.ssi.record_read(txn, key);
-        Ok(self.store.read_visible(key, snapshot, &self.registry))
+        self.store.read_visible(key, snapshot, &self.registry)
     }
 
     /// Writes `payload` as a new version of `key` on behalf of `txn` (insert or update).
@@ -373,12 +374,17 @@ impl<S: VersionedStore, D: Durability> TxnManager<S, D> {
     /// every committed writer's in-flight stamps at `commit_writer`, so no version header a reader
     /// can still consult resolves through a settled entry; the `≤ low_water` gate additionally
     /// matches the SSI retention rule (see [`SsiTracker::prune_committed`]).
-    pub fn run_gc(&mut self) -> GcReport {
+    ///
+    /// # Errors
+    /// Propagates a stamp-resolution fault from the store's GC pass (`rmp` #1069). The registry and
+    /// SSI prunes are then **not** run, which is the fail-closed direction: forgetting a writer whose
+    /// versions could not be judged is exactly the `rmp` #522 silent-lost-committed-data class.
+    pub fn run_gc(&mut self) -> Result<GcReport> {
         let low_water = self.oracle.low_water_mark();
-        let mut report = collect(&mut self.store, low_water, &self.registry);
+        let mut report = collect(&mut self.store, low_water, &self.registry)?;
         report.txns_pruned = self.registry.prune_settled(low_water);
         self.ssi.prune_committed(low_water);
-        report
+        Ok(report)
     }
 
     /// The current GC low-water mark (oldest active begin timestamp), for observability/tests.
@@ -488,8 +494,15 @@ impl<S: VersionedStore, D: Durability> TxnManager<S, D> {
             )));
         };
         let snapshot_ts = active.snapshot.ts;
+        // Through the `rmp` #1069 door, and byte-for-byte the former
+        // `VersionStamp::Committed(ts) = VersionStamp::from_raw(xmin)`: `names_writer` is `None`
+        // exactly for the `0` sentinel and an already-frozen committed word, and `resolve_stamp`
+        // then returns that same word's timestamp without consulting the table. Asking
+        // `resolve_stamp` ALONE would additionally catch a lazily-settled foreign commit, which is a
+        // different — and, for this harness, unreachable — predicate; phase 2 changes no semantics.
         if let Some(xmin) = self.store.head_xmin(key)
-            && let VersionStamp::Committed(committed_ts) = VersionStamp::from_raw(xmin)
+            && self.registry.names_writer(xmin)?.is_none()
+            && let StampOutcome::Committed(committed_ts) = self.registry.resolve_stamp(xmin)?
             && committed_ts > snapshot_ts
         {
             return Err(GraphusError::Transaction(format!(
@@ -653,7 +666,7 @@ mod tests {
         let late = m.begin_serializable().unwrap();
         m.write(late, 9, b"late".to_vec()).unwrap();
         m.commit(late).unwrap();
-        let report = m.run_gc();
+        let report = m.run_gc().unwrap();
         assert_eq!(report.txns_pruned, 3);
         assert_eq!(
             m.registry_len(),
@@ -666,7 +679,7 @@ mod tests {
         m.commit(reader).unwrap();
 
         // With no active transactions, everything settles.
-        let report = m.run_gc();
+        let report = m.run_gc().unwrap();
         assert!(report.txns_pruned >= 2);
         assert_eq!(m.registry_len(), 0);
     }

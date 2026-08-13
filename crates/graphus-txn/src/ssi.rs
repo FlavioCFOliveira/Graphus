@@ -608,7 +608,7 @@ impl SsiTracker {
     ///
     /// `commit_ts == begin_ts` counts as **not** concurrent — `b` began at a timestamp that includes
     /// `a`, so `b` read `a`'s writes and owes it no rw-antidependency edge. That is the same reading
-    /// `crate::visibility::is_visible` gives the same two numbers (a committed creator is visible iff
+    /// `crate::visibility::is_visible_via` gives the same two numbers (a committed creator is visible iff
     /// `ts <= snapshot.ts`), and the two must agree: an edge is what stops a transaction acting on a
     /// value it did not see, so declining to form one is only sound if it did see it.
     ///

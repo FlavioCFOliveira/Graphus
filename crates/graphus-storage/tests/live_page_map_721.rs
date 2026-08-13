@@ -82,7 +82,7 @@ fn reader_view_follows_rel_chain_onto_a_page_allocated_after_its_snapshot() {
 
     // (3) The reader — still on its pre-growth view — walks the hub's chain. It must NOT fail: the
     // page map is the location oracle, and locating a record is not the same as making it visible.
-    // Records committed after the snapshot are filtered ABOVE this layer by `is_visible`; the read
+    // Records committed after the snapshot are filtered ABOVE this layer by `is_visible_via`; the read
     // path's only job is to be able to READ them.
     let walked = view
         .incident_rels(hub)

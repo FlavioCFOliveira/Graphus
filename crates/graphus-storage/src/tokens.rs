@@ -222,7 +222,7 @@ impl TokenStore {
 /// The dictionary is append-only and shared behind an [`Arc`]: a token interned **after** the snapshot
 /// is captured belongs to a writer committing **after** the reader's snapshot timestamp, so the records
 /// referencing it are invisible to the reader anyway (visibility is decided above this layer by
-/// `graphus_txn::is_visible`). The snapshot is thus a strict superset of the tokens the reader could
+/// `graphus_txn::is_visible_via`). The snapshot is thus a strict superset of the tokens the reader could
 /// legally surface, and resolving an id it does meet is always correct.
 ///
 /// Cloning a `TokenSnapshot` is one [`Arc`] refcount bump (no dictionary copy). It is captured by

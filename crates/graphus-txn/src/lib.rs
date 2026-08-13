@@ -5,7 +5,12 @@
 //! crate. It implements:
 //!
 //! - **MVCC visibility** to the letter of `04 §5.3` ([`visibility`]): a transaction reads from a
-//!   consistent snapshot; reads take **no locks** and never block writers (`§5.7`, NFR-4).
+//!   consistent snapshot; reads take **no locks** and never block writers (`§5.7`, NFR-4). Every
+//!   header stamp is resolved through **one fallible door**, [`CommitOracle`] (`rmp` #1069); the
+//!   former infallible `is_visible` free function was **removed**, not deprecated, so no caller can
+//!   decide visibility around it. [`CommitOracle`] serves the record header
+//!   (`created_ts`/`expired_ts`) and **never** `graphus_storage::undo::CommitSlot::commit_ts`, which
+//!   shares the [`VersionStamp`] encoding but is a different population of words.
 //! - **Statement-level isolation** (`§5.1.4`, `rmp` #972): a [`Snapshot`] names not only the
 //!   transaction and its begin timestamp but the **statement** within it ([`graphus_core::CommandId`])
 //!   and which side of that statement the read is taken on ([`View`]). `View::New` is
@@ -90,4 +95,4 @@ pub use ssi::{PredicateRead, SsiReadBuffer, SsiTracker};
 #[cfg(any(test, feature = "test-support"))]
 pub use store::MemVersionedStore;
 pub use store::{Key, Version, VersionedStore};
-pub use visibility::is_visible;
+pub use visibility::{CommitOracle, StampOutcome, is_visible_via};

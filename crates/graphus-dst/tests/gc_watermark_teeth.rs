@@ -88,7 +88,7 @@ fn build() -> Fixture {
 /// The mechanism moved with `rmp` #967 and this helper moved with it, because a helper that resolved
 /// a version some *other* way would stop testing what the production reader does. Before #967 every
 /// version of a key was a `props.store` cell with its own MVCC stamps, so the resolution was "walk
-/// the prepend-ordered chain, keep the first record `is_visible` accepts". After #967 the newest
+/// the prepend-ordered chain, keep the first record `is_visible_via` accepts". After #967 the newest
 /// version is written in place and the old value descends onto the node's undo chain, which
 /// `D-property-visibility` makes the sole oracle — so the resolution is the store's decision-polarity
 /// walk, the same one `read_node_prop_one` now calls.

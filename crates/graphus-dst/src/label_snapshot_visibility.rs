@@ -7,7 +7,7 @@
 //! A node's label set is a `u64` bitmap **inside** the node record, mutated in place. A property, by
 //! contrast, is a separate `PropRecord` carrying its own MVCC header, so a property overwrite
 //! MVCC-tombstones the old version and prepends the new one (`rmp` #50) and a reader resolves
-//! newest-**visible**-wins. The label word had no version at all, so `graphus_txn::is_visible` had
+//! newest-**visible**-wins. The label word had no version at all, so `graphus_txn::is_visible_via` had
 //! nothing to filter and every label read returned whatever the word held at that instant. Two
 //! anomalies followed:
 //!

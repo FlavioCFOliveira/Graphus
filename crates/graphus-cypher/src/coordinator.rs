@@ -71,7 +71,7 @@ use crate::shared_cell::{SharedCell, SharedRef};
 
 use graphus_core::Value;
 use graphus_core::error::{GraphusError, Result};
-use graphus_core::{Lsn, Timestamp, TxnId, VersionStamp};
+use graphus_core::{Lsn, Timestamp, TxnId};
 
 /// One version of one property, as the index build sees it: the MVCC stamps plus the decoded value
 /// (`rmp` task #766). `RecordStore::superset_scan_node_property_values` /
@@ -89,7 +89,7 @@ struct PropVersion {
 /// visible from the view owned by `owner` (`TxnId(0)` for the committed view), or [`None`] if it is
 /// visible at no instant.
 ///
-/// This is [`graphus_txn::is_visible`] turned inside-out: rather than testing one snapshot, it returns
+/// This is [`graphus_txn::is_visible_via`] turned inside-out: rather than testing one snapshot, it returns
 /// the whole *contiguous* span of snapshots that see `v`. Visibility is monotone in the snapshot time —
 /// the creator becomes visible at one stamp (clause 1) and the expirer hides it at a later one
 /// (clause 2), `04 §5.3` — so the visible snapshots are exactly one interval, and each stamp that bounds
@@ -106,13 +106,18 @@ struct PropVersion {
 /// the version from `owner` at every instant). Those two cases are handled explicitly before the
 /// resolver; everything else — committed, foreign in-flight, aborted, or the `0`/live sentinel — is what
 /// [`CommitRegistry::resolve_commit_ts`] already classifies.
+///
+/// # Errors
+/// Propagates a stamp-resolution fault from the [`CommitOracle`] door (`rmp` #1069). A candidate
+/// whose validity interval cannot be computed must fail the DDL, never silently contribute no
+/// tuple — that is a dropped candidate, i.e. an admitted committed duplicate on a KEY constraint.
 fn visible_instant_range(
     v: &PropVersion,
     owner: TxnId,
     registry: &CommitRegistry,
     instants: &[Timestamp],
     instant_index: &HashMap<Timestamp, usize>,
-) -> Option<(usize, usize)> {
+) -> Result<Option<(usize, usize)>> {
     let n = instants.len();
     // First instant index at or after `ts`. Every resolved commit stamp is an instant, so the map hits;
     // the `partition_point` fallback keeps a (never-taken) miss sound rather than panicking inside a DDL.
@@ -124,24 +129,26 @@ fn visible_instant_range(
     };
     // `lo` = first instant whose snapshot sees the creator (clause 1). An own uncommitted creator is
     // seen from `t = 0`; otherwise the resolver decides — `None` means visible at no instant.
-    let lo = match VersionStamp::from_raw(v.xmin) {
-        VersionStamp::InFlight(w) if w == owner => 0,
-        _ => match registry.resolve_commit_ts(v.xmin) {
+    let lo = if registry.names_own_write(v.xmin, owner)? {
+        0
+    } else {
+        match registry.resolve_commit_ts(v.xmin)? {
             Some(ts) => idx_of(ts),
-            None => return None,
-        },
+            None => return Ok(None),
+        }
     };
     // `hi` = first instant whose snapshot has the expirer hide it (clause 2); `n` when nothing hides it.
     // An own uncommitted deletion hides from `t = 0` (an empty span); otherwise the resolver decides —
     // `None` (the `0`/live sentinel, a foreign in-flight, or an aborted expirer) never hides it.
-    let hi = match VersionStamp::from_raw(v.xmax) {
-        VersionStamp::InFlight(w) if w == owner => 0,
-        _ => match registry.resolve_commit_ts(v.xmax) {
+    let hi = if registry.names_own_write(v.xmax, owner)? {
+        0
+    } else {
+        match registry.resolve_commit_ts(v.xmax)? {
             Some(ts) => idx_of(ts),
             None => n,
-        },
+        }
     };
-    (lo < hi).then_some((lo, hi))
+    Ok((lo < hi).then_some((lo, hi)))
 }
 
 /// Path-halving "next still-empty slot" lookup for the newest-priority interval fill in
@@ -252,10 +259,14 @@ fn composite_tuple_hash(tuple: &[Value]) -> u64 {
 /// trade for an UNBOUNDED chain. At the full-rebuild level the same 3-key scenario went `227 ms → 63 ms`
 /// at `V = 1024` (the recorded `rmp` #766 residual measured `249 ms`), the remainder being the rebuild's
 /// own linear store/insert floor. `construction_scales_sub_quadratically` guards the shape.
+///
+/// # Errors
+/// Propagates a stamp-resolution fault from the [`CommitOracle`] door (`rmp` #1069) — see
+/// [`visible_instant_range`] for why a fault must fail the DDL rather than drop a candidate.
 fn composite_candidate_tuples(
     per_key: &[Vec<&PropVersion>],
     registry: &CommitRegistry,
-) -> Vec<Vec<Value>> {
+) -> Result<Vec<Vec<Value>>> {
     // The instant grid + the in-flight writer views. `instants` = distinct committed stamps (resolved
     // through the registry, never the raw word — see `visible_instant_range`) UNION `{0}`; a `BTreeSet`
     // yields them SORTED and deduped in `O(V log V)` — the old `Vec::contains` de-dup here was itself
@@ -266,12 +277,14 @@ fn composite_candidate_tuples(
     for versions in per_key {
         for v in versions {
             for raw in [v.xmin, v.xmax] {
-                match registry.resolve_commit_ts(raw) {
+                match registry.resolve_commit_ts(raw)? {
                     Some(ts) => {
                         instant_set.insert(ts);
                     }
                     None => {
-                        if let VersionStamp::InFlight(w) = VersionStamp::from_raw(raw)
+                        // The writer the word NAMES, through the door — never `resolve_stamp`, whose
+                        // `InFlight` arm is dead through the registry (`rmp` #522 / #778).
+                        if let Some(w) = registry.names_writer(raw)?
                             && !writers.contains(&w)
                         {
                             writers.push(w);
@@ -314,7 +327,7 @@ fn composite_candidate_tuples(
             // Newest-first so a newer version claims a shared instant; older versions fill only the gaps.
             for &v in versions {
                 let Some((lo, hi)) =
-                    visible_instant_range(v, owner, registry, &instants, &instant_index)
+                    visible_instant_range(v, owner, registry, &instants, &instant_index)?
                 else {
                     continue; // visible at no instant from this view
                 };
@@ -352,7 +365,7 @@ fn composite_candidate_tuples(
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// The **in-flight** (unresolved) transaction holding the NEWEST version of some `covered` property
@@ -407,39 +420,54 @@ fn composite_candidate_tuples(
 /// therefore always either committed or held by a still-active writer, and this predicate is exact for
 /// the #766 overwrite window. (A concurrent *delete* of the newest version — `xmax` in-flight — is a
 /// distinct, narrower window not covered here.)
+///
+/// # Errors
+/// Propagates a stamp-resolution fault from the [`CommitOracle`] door (`rmp` #1069). An
+/// unresolvable stamp must fail the build, never read as "no active writer" — that answer promotes
+/// the index to `Online` over a value nobody verified, which is the whole hole this gate closes.
 fn active_writer_holds_newest_covered(
     chain: &[(u64, PropRecord)],
     covered: &[u32],
+    registry: &CommitRegistry,
     is_active: impl Fn(TxnId) -> bool,
-) -> Option<TxnId> {
-    let held_by_active = |word: u64| match VersionStamp::from_raw(word) {
-        VersionStamp::InFlight(w) if is_active(w) => Some(w),
-        VersionStamp::InFlight(_) | VersionStamp::Committed(_) | VersionStamp::None => None,
+) -> Result<Option<TxnId>> {
+    // `names_writer`, NOT `resolve_stamp`: the door's `InFlight` arm is dead through the registry
+    // (an unresolved writer maps to `Aborted`), so asking the OUTCOME here would make this whole gate
+    // a no-op — the exact `rmp` #522 / #778 defect the doc above warns about. The identity comes
+    // from the word; the liveness from the store's Active Transaction Table via `is_active`.
+    let held_by_active = |word: u64| -> Result<Option<TxnId>> {
+        Ok(registry.names_writer(word)?.filter(|w| is_active(*w)))
     };
-    covered.iter().find_map(|&key| {
+    for &key in covered {
         // Newest-first: the FIRST occurrence of `key` in the chain is its newest version.
-        chain
-            .iter()
-            .find(|(_, prop)| prop.key == key)
-            .and_then(|(_, prop)| {
-                // BOTH MVCC stamps, because before `rmp` #967 each half of an uncommitted change hid
-                // behind a different one. `created_ts` caught `SET n.p = …` (the writer PREPENDED a new
-                // version, so its dirty value was the chain head); `expired_ts` caught `REMOVE n.p` (the
-                // writer TOMBSTONED in place WITHOUT prepending, so the head was still the committed
-                // record and only its expiry stamp named the writer). Checking `created_ts` alone left
-                // the removal half of this window open — MEASURED: the build baked the doomed value, and
-                // once the removal committed the index kept matching a term the entity no longer has.
-                //
-                // After `rmp` #967 BOTH halves restamp `created_ts` of the SAME cell: a `SET` rewrites it
-                // in place and a `REMOVE` empties it in place (`D-property-removal`), and a property
-                // operation never writes `expired_ts` again. So `created_ts` alone would now suffice and
-                // `expired_ts` is always `0` here; the second probe is kept because it costs one compare
-                // against a word that is now invariantly zero and it fails closed against any older store
-                // image (or any future path) that still carries an expiry stamp on a property cell.
-                held_by_active(prop.mvcc.created_ts)
-                    .or_else(|| held_by_active(prop.mvcc.expired_ts))
-            })
-    })
+        let Some((_, prop)) = chain.iter().find(|(_, prop)| prop.key == key) else {
+            continue;
+        };
+        // BOTH MVCC stamps, because before `rmp` #967 each half of an uncommitted change hid
+        // behind a different one. `created_ts` caught `SET n.p = …` (the writer PREPENDED a new
+        // version, so its dirty value was the chain head); `expired_ts` caught `REMOVE n.p` (the
+        // writer TOMBSTONED in place WITHOUT prepending, so the head was still the committed
+        // record and only its expiry stamp named the writer). Checking `created_ts` alone left
+        // the removal half of this window open — MEASURED: the build baked the doomed value, and
+        // once the removal committed the index kept matching a term the entity no longer has.
+        //
+        // After `rmp` #967 BOTH halves restamp `created_ts` of the SAME cell: a `SET` rewrites it
+        // in place and a `REMOVE` empties it in place (`D-property-removal`), and a property
+        // operation never writes `expired_ts` again. So `created_ts` alone would now suffice and
+        // `expired_ts` is always `0` here; the second probe is kept because it costs one compare
+        // against a word that is now invariantly zero and it fails closed against any older store
+        // image (or any future path) that still carries an expiry stamp on a property cell.
+        // Two sequential probes rather than `a.or(b)`: `or` is eager, and evaluating the second
+        // probe after the first already answered would surface an oracle fault the pre-#1069
+        // `or_else` never reached. The short-circuit is preserved exactly.
+        if let Some(w) = held_by_active(prop.mvcc.created_ts)? {
+            return Ok(Some(w));
+        }
+        if let Some(w) = held_by_active(prop.mvcc.expired_ts)? {
+            return Ok(Some(w));
+        }
+    }
+    Ok(None)
 }
 
 /// One candidate value of one property together with the **validity interval** the composite build
@@ -561,11 +589,19 @@ fn stamped_candidates(chain: &SupersetProperties, entity_created_ts: u64) -> Vec
 /// Equivalence guard for the `rmp` #774 merge-sweep: `composite_candidate_tuples` must produce the SAME
 /// candidate SET as the pre-#774 `find`-per-instant construction, for ANY chain — a wrong tuple here is a
 /// dropped candidate, i.e. an admitted committed duplicate on a NODE KEY / REL KEY (`rmp` #683 / #765).
-/// The oracle below is that former construction, verbatim in shape (per-instant `graphus_txn::is_visible`
+/// The oracle below is that former construction, verbatim in shape (per-instant `graphus_txn::is_visible_via`
 /// + `Vec::contains` dedup), so the two agreeing pins the sweep to the exact semantics it replaced.
 #[cfg(test)]
 mod composite_sweep_equivalence {
     use super::*;
+    use graphus_core::VersionStamp;
+
+    /// The in-memory registry never faults, so the oracle below keeps its infallible shape and every
+    /// assertion in this module is unchanged; only the `?`-shaped calls into the `rmp` #1069 door are
+    /// new. A fault here would be a bug in the door itself, so it panics rather than being folded in.
+    fn expect<T>(r: Result<T>) -> T {
+        r.expect("the in-memory commit registry resolves every stamp")
+    }
 
     /// The pre-#774 construction: one tuple per (view, instant) via a linear `find`, deduped by
     /// structural `PartialEq`. This is the reference the sweep must match, so it is intentionally the
@@ -576,14 +612,14 @@ mod composite_sweep_equivalence {
         for versions in per_key {
             for v in versions {
                 for raw in [v.xmin, v.xmax] {
-                    match registry.resolve_commit_ts(raw) {
+                    match expect(registry.resolve_commit_ts(raw)) {
                         Some(ts) => {
                             if !instants.contains(&ts) {
                                 instants.push(ts);
                             }
                         }
                         None => {
-                            if let VersionStamp::InFlight(w) = VersionStamp::from_raw(raw)
+                            if let Some(w) = expect(registry.names_writer(raw))
                                 && !writers.contains(&w)
                             {
                                 writers.push(w);
@@ -606,12 +642,12 @@ mod composite_sweep_equivalence {
                     match versions
                         .iter()
                         .find(|v| {
-                            graphus_txn::is_visible(
+                            expect(graphus_txn::is_visible_via(
+                                registry,
                                 Snapshot::new(owner, t),
                                 v.xmin,
                                 v.xmax,
-                                registry,
-                            )
+                            ))
                         })
                         .map(|v| &v.value)
                         .filter(|v| !v.is_null())
@@ -633,7 +669,8 @@ mod composite_sweep_equivalence {
 
     /// Asserts the sweep and the oracle emit the same SET of tuples (order-independent, both deduped).
     fn assert_same_set(per_key: &[Vec<&PropVersion>], registry: &CommitRegistry) {
-        let got = composite_candidate_tuples(per_key, registry);
+        let got = composite_candidate_tuples(per_key, registry)
+            .expect("the in-memory commit registry resolves every stamp");
         let want = oracle(per_key, registry);
         let subset =
             |a: &[Vec<Value>], b: &[Vec<Value>]| a.iter().all(|x| b.iter().any(|y| x == y));
@@ -756,7 +793,7 @@ mod composite_sweep_equivalence {
             (0..5)
                 .map(|_| {
                     let t = std::time::Instant::now();
-                    std::hint::black_box(composite_candidate_tuples(&per_key, reg));
+                    std::hint::black_box(composite_candidate_tuples(&per_key, reg).unwrap());
                     t.elapsed().as_nanos()
                 })
                 .min()
@@ -879,7 +916,8 @@ use graphus_storage::{
     VectorIndexEntry, VectorSimilarity,
 };
 use graphus_txn::{
-    CommitRegistry, IsolationLevel, PredicateRead, Snapshot, SsiReadBuffer, SsiTracker, is_visible,
+    CommitOracle, CommitRegistry, IsolationLevel, PredicateRead, Snapshot, SsiReadBuffer,
+    SsiTracker, is_visible_via,
 };
 use graphus_wal::LogSink;
 
@@ -3125,7 +3163,21 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 // negative for every reader resolving a different one; because this tree backs NODE KEY,
                 // that missing candidate makes the write path's duplicate check ADMIT A COMMITTED
                 // DUPLICATE (`rmp` #765 / #683).
-                for tuple in composite_candidate_tuples(&per_key, &registry) {
+                // An unresolvable stamp (`rmp` #1069) marks the build INCOMPLETE and stops,
+                // exactly as the store-read faults above do (`rmp` #733): an index published over
+                // candidates nobody could compute would let the write path admit a committed
+                // duplicate on a KEY constraint.
+                let tuples = match composite_candidate_tuples(&per_key, &registry) {
+                    Ok(t) => t,
+                    // Marked through the guard ALREADY HELD, never `Self::note_rebuild_gap(index)`:
+                    // that helper re-acquires the same `SharedCell`, which is a re-entrant
+                    // acquisition — a deadlock in release and a tripwire panic in debug (`rmp` #1010).
+                    Err(_) => {
+                        idx.note_rebuild_gap();
+                        return;
+                    }
+                };
+                for tuple in tuples {
                     idx.insert_composite(
                         IndexWriter::Population,
                         *label_token,
@@ -3422,7 +3474,21 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             if any_version {
                 // One tuple per observable view — the construction of `composite_candidate_tuples`,
                 // applied to the relationship tree (`rmp` task #766).
-                for tuple in composite_candidate_tuples(&per_key, &registry) {
+                // An unresolvable stamp (`rmp` #1069) marks the build INCOMPLETE and stops,
+                // exactly as the store-read faults above do (`rmp` #733): an index published over
+                // candidates nobody could compute would let the write path admit a committed
+                // duplicate on a KEY constraint.
+                let tuples = match composite_candidate_tuples(&per_key, &registry) {
+                    Ok(t) => t,
+                    // Marked through the guard ALREADY HELD, never `Self::note_rebuild_gap(index)`:
+                    // that helper re-acquires the same `SharedCell`, which is a re-entrant
+                    // acquisition — a deadlock in release and a tripwire panic in debug (`rmp` #1010).
+                    Err(_) => {
+                        idx.note_rebuild_gap();
+                        return;
+                    }
+                };
+                for tuple in tuples {
                     idx.insert_rel_composite(
                         IndexWriter::Population,
                         type_token,
@@ -3501,9 +3567,26 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // the committed one — the #766 loss the full-text consumer cannot repair (it re-checks
         // visibility + label but NOT terms). Record the conflict and do NOT bake this node, so the build
         // stays `Populating` (readers decline to the snapshot-correct scan) until the writer resolves.
-        if let Some(writer) = active_writer_holds_newest_covered(&chain, &covered, |w| {
-            store.borrow().is_txn_active(w)
-        }) {
+        // An unresolvable stamp (`rmp` #1069) makes the gate unanswerable, so the build is marked
+        // INCOMPLETE and stops — the same fail-closed answer the store-read faults above give
+        // (`rmp` #733). Reading it as "no active writer" would promote the index over a value the
+        // gate never got to judge, which is the #766 loss this gate exists to prevent.
+        // The registry is borrowed as a READ GUARD, not cloned: this runs once per entity in an
+        // O(store) rebuild, and `is_txn_active` reads the Active Transaction Table, never the
+        // registry, so holding it across the closure cannot self-deadlock.
+        let conflicting_writer = {
+            let registry = store.borrow().commit_registry();
+            match active_writer_holds_newest_covered(&chain, &covered, &registry, |w| {
+                store.borrow().is_txn_active(w)
+            }) {
+                Ok(w) => w,
+                Err(_) => {
+                    Self::note_rebuild_gap(index);
+                    return;
+                }
+            }
+        };
+        if let Some(writer) = conflicting_writer {
             index.borrow_mut().note_ft_build_conflict(writer);
             return;
         }
@@ -3602,9 +3685,26 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // in-flight writer holding the newest version of a covered property means a newest-wins bake
         // would lose the committed value, so record the conflict and do NOT bake (the build stays
         // `Populating`, readers decline to the scan) until the writer resolves.
-        if let Some(writer) = active_writer_holds_newest_covered(&chain, &covered, |w| {
-            store.borrow().is_txn_active(w)
-        }) {
+        // An unresolvable stamp (`rmp` #1069) makes the gate unanswerable, so the build is marked
+        // INCOMPLETE and stops — the same fail-closed answer the store-read faults above give
+        // (`rmp` #733). Reading it as "no active writer" would promote the index over a value the
+        // gate never got to judge, which is the #766 loss this gate exists to prevent.
+        // The registry is borrowed as a READ GUARD, not cloned: this runs once per entity in an
+        // O(store) rebuild, and `is_txn_active` reads the Active Transaction Table, never the
+        // registry, so holding it across the closure cannot self-deadlock.
+        let conflicting_writer = {
+            let registry = store.borrow().commit_registry();
+            match active_writer_holds_newest_covered(&chain, &covered, &registry, |w| {
+                store.borrow().is_txn_active(w)
+            }) {
+                Ok(w) => w,
+                Err(_) => {
+                    Self::note_rebuild_gap(index);
+                    return;
+                }
+            }
+        };
+        if let Some(writer) = conflicting_writer {
             index.borrow_mut().note_ft_build_conflict(writer);
             return;
         }
@@ -3958,9 +4058,22 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 .collect();
             let mut keys = Vec::new();
             for (reg_label, prop_key) in covering {
-                if let Some(writer) = active_writer_holds_newest_covered(&chain, &[prop_key], |w| {
-                    store.borrow().is_txn_active(w)
-                }) {
+                // Fail closed on an unresolvable stamp (`rmp` #1069 / #733), exactly as the chain
+                // read above does: an unjudged key must not be baked as conflict-free.
+                // A read guard, not a clone — see the full-text build for why.
+                let conflicting_writer = {
+                    let registry = store.borrow().commit_registry();
+                    match active_writer_holds_newest_covered(&chain, &[prop_key], &registry, |w| {
+                        store.borrow().is_txn_active(w)
+                    }) {
+                        Ok(w) => w,
+                        Err(_) => {
+                            Self::note_rebuild_gap(index);
+                            return;
+                        }
+                    }
+                };
+                if let Some(writer) = conflicting_writer {
                     index
                         .borrow_mut()
                         .note_vector_build_conflict(reg_label, prop_key, writer);
@@ -4085,9 +4198,22 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 if reg_type != type_token {
                     continue;
                 }
-                if let Some(writer) = active_writer_holds_newest_covered(&chain, &[prop_key], |w| {
-                    store.borrow().is_txn_active(w)
-                }) {
+                // Fail closed on an unresolvable stamp (`rmp` #1069 / #733), exactly as the chain
+                // read above does: an unjudged key must not be baked as conflict-free.
+                // A read guard, not a clone — see the full-text build for why.
+                let conflicting_writer = {
+                    let registry = store.borrow().commit_registry();
+                    match active_writer_holds_newest_covered(&chain, &[prop_key], &registry, |w| {
+                        store.borrow().is_txn_active(w)
+                    }) {
+                        Ok(w) => w,
+                        Err(_) => {
+                            Self::note_rebuild_gap(index);
+                            return;
+                        }
+                    }
+                };
+                if let Some(writer) = conflicting_writer {
                     index
                         .borrow_mut()
                         .note_vector_rel_build_conflict(reg_type, prop_key, writer);
@@ -8151,7 +8277,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// are resolved through the same snapshot by
     /// [`node_value_for_key`](Self::node_value_for_key). Before `rmp` task #902 neither filter existed,
     /// so a constraint the live data satisfies was refused over data no query can reach; `rmp` task #903
-    /// then replaced the raw stamp tests with the production [`is_visible`] predicate.
+    /// then replaced the raw stamp tests with the production [`is_visible_via`] predicate.
     ///
     /// This is the exact opposite polarity to an index *population*, which may legitimately read raw
     /// (`rmp` #765/#766/#771): a candidate index is a superset whose seek re-checks visibility, whereas
@@ -8209,13 +8335,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             // reclaims it, and GC has no automatic trigger (`rmp` #305), so judging it anyway refused a
             // valid constraint indefinitely. `rmp` task #902 filtered on a raw `expired_ts != 0`, sound
             // only under the "no writer is open" precondition; the walk now runs inside a real
-            // transaction, so the filter is the production [`is_visible`] predicate and the decision is
+            // transaction, so the filter is the production [`is_visible_via`] predicate and the decision is
             // made over exactly the node set a `MATCH` in this transaction would return. PostgreSQL
             // draws the same line in its index build: dead and recently-dead tuples may still be
             // *indexed* for older snapshots, but are always "excluded from unique-checking"
             // (`heapam_handler.c`, `HEAPTUPLE_RECENTLY_DEAD`).
             let rec = self.store.borrow().node(id)?;
-            if !self.visible_to(ctx.snapshot, rec.mvcc.created_ts, rec.mvcc.expired_ts) {
+            if !self.visible_to(ctx.snapshot, rec.mvcc.created_ts, rec.mvcc.expired_ts)? {
                 continue;
             }
             // A node whose labels cannot be read **fails the DDL** (`rmp` task #733). This used to
@@ -8442,7 +8568,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// has no automatic trigger (`rmp` #305) — so a caller who did not apply the visibility filter read
     /// a committed `REMOVE n.email` as a present value, and `CREATE CONSTRAINT … IS UNIQUE` was refused
     /// over a duplicate no `MATCH` can find. That was `rmp` task #902; `rmp` task #903 replaced its raw
-    /// `expired_ts != 0` patch with the production [`is_visible`] predicate, and `rmp` task #905 moved
+    /// `expired_ts != 0` patch with the production [`is_visible_via`] predicate, and `rmp` task #905 moved
     /// the narrowing itself into [`SupersetProperties::decide`] so that **the resolution can no longer
     /// be skipped**: the only value of this parameter type is one a [`Snapshot`] produced.
     ///
@@ -8474,7 +8600,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
 
     /// Whether the entity version carrying the MVCC stamps `created_ts` / `expired_ts` is visible to
     /// `snapshot` (`rmp` task #903) — the constraint walk's node/relationship filter, delegating to the
-    /// one production visibility predicate [`is_visible`] so the walk judges exactly the graph a
+    /// one production visibility predicate [`is_visible_via`] so the walk judges exactly the graph a
     /// `MATCH` in the same transaction would.
     ///
     /// # Why this stays on the `New` polarity (`04 §5.1.4`, `rmp` #972)
@@ -8492,13 +8618,18 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// It is therefore also correct that this takes the header words alone rather than the
     /// chain-walking `entity_visible_at`: under `New` the two agree by construction, so consulting the
     /// chain would cost I/O to reach the same verdict.
-    fn visible_to(&self, snapshot: Snapshot, created_ts: u64, expired_ts: u64) -> bool {
+    ///
+    /// # Errors
+    /// Propagates a stamp-resolution fault from the [`CommitOracle`] door (`rmp` #1069). A record
+    /// whose visibility cannot be resolved **fails the DDL**, exactly as an unreadable label word
+    /// does (`rmp` #733): a constraint accepted over data nobody could judge is a schema that lies.
+    fn visible_to(&self, snapshot: Snapshot, created_ts: u64, expired_ts: u64) -> Result<bool> {
         let store = self.store.borrow();
-        is_visible(
+        is_visible_via(
+            &store.commit_registry_snapshot(),
             snapshot.with_view(graphus_txn::View::New),
             created_ts,
             expired_ts,
-            &store.commit_registry_snapshot(),
         )
     }
 
@@ -8552,7 +8683,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             // A relationship the DDL's snapshot cannot see is not part of the graph the constraint
             // governs (`rmp` tasks #902, #903) — the relationship twin of the node visibility filter,
             // for the same reason and with the same soundness argument.
-            if !self.visible_to(ctx.snapshot, rec.mvcc.created_ts, rec.mvcc.expired_ts) {
+            if !self.visible_to(ctx.snapshot, rec.mvcc.created_ts, rec.mvcc.expired_ts)? {
                 continue;
             }
             if rec.type_id != type_token {

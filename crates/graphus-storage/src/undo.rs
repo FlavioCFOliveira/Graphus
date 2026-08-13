@@ -448,6 +448,21 @@ pub struct CommitSlot {
     /// The writer's `TxnId` in the in-flight [`VersionStamp`](graphus_core::VersionStamp) encoding
     /// while the transaction is open, and its commit timestamp once it has committed. Written
     /// exactly once, by a single store, at commit — this is the commit indirection point.
+    ///
+    /// # ⚠ This word is NOT a record-header stamp, and must never go through [`CommitOracle`]
+    ///
+    /// Two unrelated populations of words share the [`VersionStamp`](graphus_core::VersionStamp)
+    /// encoding, and the compiler cannot tell them apart — both are `u64` (`rmp` #1069):
+    ///
+    /// | Population | Payload | Resolved by |
+    /// | --- | --- | --- |
+    /// | record header (`MvccHeader::created_ts` / `expired_ts`) | a **commit slot id** from `rmp` #1069 phase 3 | [`graphus_txn::CommitOracle`] — the one door |
+    /// | **this** field | a `TxnId`, now and after phase 3 | [`crate::scan_polarity::delta_verdict`] and `open_writer_of`, in this crate |
+    ///
+    /// Passing this word to [`resolve_stamp`](graphus_txn::CommitOracle::resolve_stamp) is a
+    /// type-correct call that produces **silently wrong visibility**: it would resolve a slot id as
+    /// though it were a transaction id. The two resolvers stay separate deliberately, and
+    /// `delta_verdict` was deliberately left untouched by the #1069 phase-2 migration.
     pub commit_ts: u64,
     /// The owning transaction's id, retained after commit for recovery and diagnostics.
     pub txn_id: u64,

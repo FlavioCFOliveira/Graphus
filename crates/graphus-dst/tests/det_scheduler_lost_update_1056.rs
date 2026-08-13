@@ -19,7 +19,7 @@
 //! admit was committed, read the pre-`C` value of the counter, and computed its increment from it.
 //!
 //! Every reader in the engine treats `commit_ts <= snapshot.ts` as "visible"
-//! (`graphus_txn::visibility::is_visible`, `scan_polarity::delta_verdict`), and
+//! (`graphus_txn::visibility::is_visible_via`, `scan_polarity::delta_verdict`), and
 //! `SsiTracker::are_concurrent` treats it as "committed before it began" and forms no
 //! rw-antidependency edge. All three were reading a timestamp that did not mean what they took it to
 //! mean. `RecordStore`'s `CommitSequencer` is what makes it mean that now: the horizon

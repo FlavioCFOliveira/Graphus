@@ -66,7 +66,7 @@
 //!   imported) and not weakened: "live" is the slot being in use **and** the record carrying no MVCC
 //!   tombstone (`expired_ts == 0`), which is what the counters mean.
 //! * [`Counters::by_visible_scan`] — the same scan filtered by the real MVCC predicate
-//!   ([`graphus_txn::is_visible`]) at a fresh snapshot over the store's own
+//!   ([`graphus_txn::is_visible_via`]) at a fresh snapshot over the store's own
 //!   [`commit_registry`](graphus_storage::RecordStore::commit_registry). This is the
 //!   **`count()`-shaped answer**: the number a `MATCH (n:Person) RETURN count(n)` must produce. It is
 //!   asserted at the storage layer rather than through the Cypher layer because `graphus-dst` cannot
@@ -102,7 +102,7 @@ use std::collections::BTreeMap;
 use graphus_core::{PageId, TxnId};
 use graphus_io::{BlockDevice, MemBlockDevice};
 use graphus_storage::{Namespace, RecordStore};
-use graphus_txn::{Snapshot, is_visible};
+use graphus_txn::{Snapshot, is_visible_via};
 use graphus_wal::{LogSink, MemLogSink, WalManager};
 
 use crate::catalog_rollback_undo::Crash;
@@ -218,7 +218,7 @@ impl Counters {
     }
 
     /// The **`count()`-shaped** oracle: the same scan filtered by the production MVCC visibility
-    /// predicate ([`graphus_txn::is_visible`]) at a fresh snapshot over the store's own
+    /// predicate ([`graphus_txn::is_visible_via`]) at a fresh snapshot over the store's own
     /// [`commit_registry`](RecordStore::commit_registry) — i.e. the number a
     /// `MATCH (n:Person) RETURN count(n)` must produce for a reader that starts now.
     ///
@@ -243,7 +243,10 @@ impl Counters {
         let mut visible_node = BTreeMap::new();
         for id in store.scan_node_ids().expect("scan nodes") {
             let mvcc = store.node(id).expect("read node").mvcc;
-            let visible = is_visible(snapshot, mvcc.created_ts, mvcc.expired_ts, &registry);
+            // Through the `rmp` #1069 door. The in-memory registry never faults; an oracle fault in
+            // an ORACLE would be a defect in the door itself, so it panics like every other read here.
+            let visible = is_visible_via(&registry, snapshot, mvcc.created_ts, mvcc.expired_ts)
+                .expect("resolve node stamp");
             visible_node.insert(id, visible);
             if !visible {
                 continue;
@@ -255,12 +258,14 @@ impl Counters {
         }
         for id in store.scan_rel_ids().expect("scan rels") {
             let rel = store.rel(id).expect("read rel");
-            if !is_visible(
+            if !is_visible_via(
+                &registry,
                 snapshot,
                 rel.mvcc.created_ts,
                 rel.mvcc.expired_ts,
-                &registry,
-            ) {
+            )
+            .expect("resolve rel stamp")
+            {
                 continue;
             }
             out.total_relationships += 1;

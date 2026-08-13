@@ -372,7 +372,7 @@ fn a_node_created_by_an_earlier_statement_has_its_labels_versioned() {
 /// terminate without any planner barrier.
 ///
 /// The record header records *which transaction* created the node and never *which statement of
-/// it*, so `graphus_txn::is_visible` cannot answer this: it says "own in-flight write, visible" and
+/// it*, so `graphus_txn::is_visible_via` cannot answer this: it says "own in-flight write, visible" and
 /// stops. The answer lives on the undo chain, in the `DeleteObject` delta the creation wrote.
 #[test]
 fn a_node_created_by_this_statement_does_not_exist_to_its_own_old_view() {

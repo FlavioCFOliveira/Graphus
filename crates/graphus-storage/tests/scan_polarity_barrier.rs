@@ -73,10 +73,14 @@ fn decided_properties_is_constructed_in_exactly_one_place() {
          reconstruction paths cannot disagree about the answer",
     );
     assert!(
-        !decide_body.contains("is_visible("),
+        !decide_body.contains("is_visible"),
         "`decide` must NOT consult the retired per-cell oracle: after `rmp` #967 a property cell's \
          own `created_ts`/`expired_ts` decides nothing, and reading it back in would resurrect the \
-         very mechanism `D-property-visibility` retired",
+         very mechanism `D-property-visibility` retired. The literal is the BARE name and not \
+         `is_visible(`, because `rmp` #1069 renamed the header oracle to `is_visible_via` — which \
+         does not contain `is_visible(`, so the paren-suffixed form this barrier used to carry \
+         stopped matching the very symbol it guards, and would have passed over a `decide` that \
+         called it",
     );
 }
 

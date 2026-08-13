@@ -11,7 +11,7 @@
 //!   5. A second maintenance GC runs — its prune forgets `t2` from the commit registry.
 //!
 //! A fresh reader at the latest snapshot MUST still see `n.v = 2` (a committed value). This asserts
-//! that through the real MVCC visibility path (`graphus_txn::is_visible`) — NOT merely the physical
+//! that through the real MVCC visibility path (`graphus_txn::is_visible_via`) — NOT merely the physical
 //! chain length, which stays 1 even when the value is unresolvable.
 
 use graphus_core::{TxnId, Value};
@@ -32,7 +32,7 @@ fn fresh() -> Store {
 /// production read path does.
 ///
 /// **Semantic equivalent of** the retired hand-rolled fold (walk the `first_prop` chain, keep the
-/// first record `graphus_txn::is_visible` accepts). That fold encoded the retired oracle — the
+/// first record `graphus_txn::is_visible_via` accepts). That fold encoded the retired oracle — the
 /// cell's own `created_ts`/`expired_ts` — which after `rmp` #967's `D-property-visibility` decides
 /// nothing. It is replaced by the store's own decision-polarity read, which is *stronger* here: the
 /// helper can no longer drift from the production rule, because it now IS the production rule.

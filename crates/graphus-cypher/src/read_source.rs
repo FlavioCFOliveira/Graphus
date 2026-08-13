@@ -8,7 +8,7 @@
 //! OLTP **reads** onto reader threads, where the store cannot be `&`-aliased; Slice 3a gave us the owned,
 //! `Send + Sync` [`StoreReadView`] (the decode surface over
 //! `(Arc<pool>, MetaSnapshot)`) plus the [`TokenSnapshot`] (the
-//! `id ↔ name` resolution surface). What remains is the **visibility heart** — MVCC `is_visible`
+//! `id ↔ name` resolution surface). What remains is the **visibility heart** — MVCC `is_visible_via`
 //! filtering, id/token mapping, the per-candidate SIREAD markers, the newest-visible-wins property fold,
 //! the deterministic key/label sort, the self-delete/tombstone handling. Duplicating that for the reader
 //! would risk silent drift from the live path (and so a serializability or visibility bug).
@@ -49,7 +49,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::{BTreeSet, HashMap};
 
 use graphus_core::error::GraphusError;
-use graphus_core::{TxnId, Value, VersionStamp};
+use graphus_core::{TxnId, Value};
 use graphus_index::fulltext::Analyzer;
 use graphus_index::keycodec::{encode_equality_canonical, encode_single};
 use graphus_io::BlockDevice;
@@ -58,7 +58,7 @@ use graphus_storage::{
     DecidedProperties, MvccHeader, Namespace, RecordStore, StoreKind, StoreReadView,
     SupersetProperties, TokenSnapshot, labels,
 };
-use graphus_txn::{CommitRegistry, PredicateRead, Snapshot, is_visible};
+use graphus_txn::{CommitOracle, CommitRegistry, PredicateRead, Snapshot, is_visible_via};
 use graphus_wal::LogSink;
 
 use crate::graph_access::{
@@ -194,7 +194,7 @@ pub trait StoreReadSource {
     /// Whether the node / relationship `(kind, id)` carrying `mvcc` **exists** as of `snapshot`, at
     /// statement granularity (`04 §5.1.4`, `rmp` #972).
     ///
-    /// `graphus_txn::is_visible` answers the same question across *transactions*, from the two header
+    /// `graphus_txn::is_visible_via` answers the same question across *transactions*, from the two header
     /// words alone. It cannot answer it **within** one transaction: the header records which
     /// transaction created or expired the entity and never which statement of it, so a row the current
     /// statement is creating is indistinguishable from one an earlier statement created. That
@@ -1328,13 +1328,17 @@ impl VisCtx<'_> {
     /// Kept distinct from [`visible`](Self::visible) rather than merged: a caller that reaches for this
     /// on a node or a relationship silently loses statement granularity, and a differently-named method
     /// makes that a visible choice instead of an invisible default.
+    ///
+    /// # Errors
+    /// Propagates a stamp-resolution fault from the [`CommitOracle`](graphus_txn::CommitOracle) door
+    /// (`rmp` #1069). Fail closed on it (`rmp` #733) — never fall back to a default verdict.
     #[inline]
-    pub fn visible_header(&self, mvcc: MvccHeader) -> bool {
-        is_visible(
+    pub fn visible_header(&self, mvcc: MvccHeader) -> Result<bool, GraphusError> {
+        is_visible_via(
+            self.registry,
             self.snapshot,
             mvcc.created_ts,
             mvcc.expired_ts,
-            self.registry,
         )
     }
 
@@ -1365,11 +1369,19 @@ impl VisCtx<'_> {
     ///
     /// Side-effect-free (no SIREAD marker): a transaction inspecting its *own* tombstone has no
     /// rw-dependency to record, so this must not perturb serializability.
+    ///
+    /// # Errors
+    /// Propagates a stamp-resolution fault from the [`CommitOracle`](graphus_txn::CommitOracle) door
+    /// (`rmp` #1069). Fail closed on it (`rmp` #733): a self-delete question that cannot be resolved
+    /// must not read as "not self-deleted".
     #[inline]
-    pub fn deleted_by_self(&self, mvcc: MvccHeader) -> bool {
-        let creator_visible = is_visible(self.snapshot, mvcc.created_ts, 0, self.registry);
-        creator_visible
-            && VersionStamp::from_raw(mvcc.expired_ts) == VersionStamp::InFlight(self.txn)
+    pub fn deleted_by_self(&self, mvcc: MvccHeader) -> Result<bool, GraphusError> {
+        if !is_visible_via(self.registry, self.snapshot, mvcc.created_ts, 0)? {
+            return Ok(false);
+        }
+        // "Is this expiry stamp MY own in-flight write?" — through the one door (`rmp` #1069) rather
+        // than the open-coded `VersionStamp::from_raw(x) == VersionStamp::InFlight(self.txn)`.
+        self.registry.names_own_write(mvcc.expired_ts, self.txn)
     }
 }
 
@@ -3066,7 +3078,16 @@ pub fn rel_data_including_deleted<S: StoreReadSource, K: ReadSink>(
             return None;
         }
     };
-    if !visible && !ctx.deleted_by_self(rec.mvcc) {
+    let self_deleted = match ctx.deleted_by_self(rec.mvcc) {
+        Ok(v) => v,
+        // Fail closed exactly as the chain-read fault above does (`rmp` #733): capture and yield no
+        // row, never a type read taken off an unresolved stamp.
+        Err(e) => {
+            sink.capture(e);
+            return None;
+        }
+    };
+    if !visible && !self_deleted {
         return None;
     }
     let rel_type = src
@@ -3109,7 +3130,15 @@ pub fn entity_deleted_by_txn<S: StoreReadSource, K: ReadSink>(
             }
         },
     };
-    ctx.deleted_by_self(mvcc)
+    match ctx.deleted_by_self(mvcc) {
+        Ok(v) => v,
+        // Same fail-closed discipline as the two record reads above (`rmp` #733, `rmp` #1069): an
+        // unresolvable stamp is captured and surfaces, it is not silently read as "not self-deleted".
+        Err(e) => {
+            sink.capture(e);
+            false
+        }
+    }
 }
 
 /// The body of `RecordStoreGraph::node_property` (`GraphAccess::node_property`): the single value of
@@ -3608,7 +3637,7 @@ pub fn incident_rels<S: StoreReadSource, K: ReadSink>(
 /// never-interned key short-circuits to `None`.
 ///
 /// POLARITY — DECISION (`rmp` #967). It used to walk the prepend-ordered chain and keep the first
-/// record `is_visible` accepted, which worked only while every version of a key was a cell with its
+/// record `is_visible_via` accepted, which worked only while every version of a key was a cell with its
 /// own MVCC stamps. After #967 the newest version is written **in place** and the old value lives on
 /// the entity's undo chain, so the version is selected by the chain walk
 /// ([`StoreReadSource::decision_scan_node_properties`]) — the same body the off-thread reader pool

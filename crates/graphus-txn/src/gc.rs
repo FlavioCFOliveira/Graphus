@@ -35,18 +35,20 @@ pub struct GcReport {
 ///
 /// This is the store-facing half of GC; the manager additionally forgets fully-dead transactions
 /// from its registries (see [`crate::manager`]).
-#[must_use]
+///
+/// # Errors
+/// Propagates a stamp-resolution fault from [`VersionedStore::gc`] (`rmp` #1069).
 pub fn collect<S: VersionedStore>(
     store: &mut S,
     low_water: Option<Timestamp>,
     registry: &CommitRegistry,
-) -> GcReport {
-    let versions_reclaimed = store.gc(low_water, registry);
-    GcReport {
+) -> graphus_core::Result<GcReport> {
+    let versions_reclaimed = store.gc(low_water, registry)?;
+    Ok(GcReport {
         low_water,
         versions_reclaimed,
         txns_pruned: 0,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -67,7 +69,7 @@ mod tests {
         reg.record_commit(TxnId(2), Timestamp(20));
 
         // No active readers -> watermark None -> the dead v1 is reclaimed.
-        let report = collect(&mut s, None, &reg);
+        let report = collect(&mut s, None, &reg).unwrap();
         assert_eq!(report.versions_reclaimed, 1);
         assert_eq!(report.low_water, None);
         assert_eq!(s.version_count(), 1);
