@@ -14,8 +14,9 @@
 //!
 //! * `publish_commit_slot` counts `undo_links`, so an unregistered delta is **not counted**;
 //! * `detach_own_deltas` frees `undo_links`, so an unregistered delta is **not freed** by the abort;
-//! * `free_own_commit_slot` hands the slot id back to the allocator on the strength of "every delta
-//!   naming it is gone";
+//! * the abort retires the transaction's commit slot on the strength of "every delta naming it is
+//!   gone" — and, before `rmp` #1069, that retirement (`free_own_commit_slot`, now
+//!   `retire_own_commit_slot`) also handed the id straight back to the allocator;
 //! * the consistency checker's census counts every **live** delta naming a slot.
 //!
 //! So before `rmp` #1053 the refused delta outlived its transaction: live, on no chain, and still

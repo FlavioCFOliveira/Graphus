@@ -468,11 +468,33 @@ line: `transaction_.commit_info->timestamp.store(*commit_timestamp_, std::memory
 as committed, so the earlier write is not observable as a partial commit; publishing `commit_ts` last
 is what makes a reader see either the whole transaction or none of it.
 
-**Reclamation.** GC decrements `delta_count` as it reclaims each of the transaction's deltas and frees
-the slot when the count reaches zero. The invariant is that **a slot outlives its last delta**: no
-delta may ever refer to a freed or reused slot, because a delta's committed-ness is only knowable
-through it. An **aborting** transaction never uses the count: it applies and frees its own deltas
-itself (§12.5), and frees its slot with them.
+**Reclamation, and why it is a proof rather than a count** (task **#1069**). GC still decrements
+`delta_count` as it reclaims each of the transaction's deltas, and the count is still cross-checked
+against a full census of `undo.store` by the consistency checker — a disagreement means a delta was
+lost, resurrected, or attributed to the wrong transaction. What the count no longer does is **decide
+when the slot may be freed**. The invariant is that **a slot outlives its last reference**: no
+delta and no MVCC record header may ever name a freed or reused slot, because what they name it for —
+the writer's committed-ness — is knowable only through it.
+
+The count cannot express that invariant, because it counts only one of the two populations that name
+a slot. A record header's `created_ts` / `expired_ts` name the slot of the transaction that created or
+expired the version (§7, §9), so the count would reach zero while headers still resolve through it,
+and a slot freed there is reusable at once — the next transaction to take it rewrites it, and every
+header still naming it silently changes which transaction it attributes the version to. Slot ids are
+recycled; the `TxnId`s the header used to carry never were, which is why the count was sufficient
+before and is not now.
+
+Reclamation is therefore decided by a **census of references**: a slot is reachable when a live delta
+names it in `commit_info`, **or** a record header names it, **or** it belongs to an open transaction.
+Every other path — the GC's chain reclamation, a live abort, and a physical abort's cleanup — retires
+a slot by clearing its `in_use` bit and arming that census, and none of them returns an id to the
+allocator. An **aborting** transaction still applies and frees its own deltas itself (§12.5) and
+retires its slot with them; what changed is that retiring is not freeing.
+
+A retired slot is then **parked** rather than freed, and re-enters circulation one collection pass
+later, under `D-orphan-slot-parking` — the same restraint the record stores already apply, and for a
+sharper reason here: a slot id handed straight back is rewritten by the next writer, so the window
+between "proved unreachable" and "reused" must not be zero.
 
 ### 12.5 Durability, recovery, and rollback
 

@@ -174,6 +174,67 @@ pub(crate) const ALL_STORE_KINDS: [StoreKind; STORE_COUNT] = [
 /// carry a header but are never visibility-checked; the undo area's records carry none at all.
 const MVCC_STORE_KINDS: [StoreKind; 3] = [StoreKind::Node, StoreKind::Rel, StoreKind::Prop];
 
+/// What one **full scan of the three MVCC record stores** tells the undo area's reference census
+/// (`rmp` #966, extended by #1069).
+///
+/// Both halves come from the same [`MvccHeader`] read, so collecting the second costs two field
+/// reads and no extra I/O.
+struct FullStoreCensus {
+    /// Every non-zero `undo_ptr` in the store — the half of the **delta**-reference census the undo
+    /// store cannot supply on its own.
+    chain_heads: std::collections::BTreeSet<u64>,
+    /// Every `commit.store` slot named by an in-use record's `created_ts` / `expired_ts` — the half
+    /// of the **slot**-reference census that `rmp` #1069 exists to add. See
+    /// [`slot_named_by_header_word`].
+    slots_named_by_headers: std::collections::BTreeSet<u64>,
+}
+
+/// The `commit.store` slot an MVCC header word names, if it names one (`rmp` #1069).
+///
+/// # The one seam `rmp` #1069 narrows, and why it is already live
+///
+/// A header word is one of three things (`04 §5.2`): the `0` sentinel, a **settled**
+/// `Committed(ts)` timestamp, or an **unsettled** stamp whose payload identifies the writer that
+/// has yet to settle. Only the third can name a slot, and the first two are excluded here for the
+/// reason they carry no writer identity at all.
+///
+/// The payload of an unsettled stamp is what `rmp` #1069 changes: today it is the writer's
+/// [`TxnId`], resolvable only through the in-memory [`CommitRegistry`](graphus_txn::CommitRegistry);
+/// afterwards it is the writer's `commit.store` slot, exactly as [`UndoDelta::commit_info`] already
+/// is. This function reads the payload as a slot id in **both** worlds, and that is deliberate
+/// rather than premature:
+///
+/// * after #1069 it is **exact**;
+/// * before #1069 it is an **over-approximation** — a `TxnId` that happens to fall inside
+///   `commit.store`'s id space pins a slot that no header really names. An over-approximation of
+///   the reference set can only make the census decline to free a slot, never free one it should
+///   have kept, so it errs in the one direction that is safe. It costs at most a deferred
+///   reclamation, and only for the low ids a young store hands out; a `TxnId` climbs away from the
+///   commit store's high-water almost immediately, because a slot id is recycled and a `TxnId`
+///   never is.
+///
+/// Being live in both worlds is the point: the census branch that consumes this is load-bearing and
+/// testable **today**, so #1069 lands on a mechanism that has already been proved rather than on one
+/// that has never once returned a non-empty answer.
+fn slot_named_by_header_word(word: u64) -> Option<u64> {
+    match VersionStamp::from_raw(word) {
+        VersionStamp::InFlight(writer) => Some(writer.0),
+        VersionStamp::None | VersionStamp::Committed(_) => None,
+    }
+}
+
+/// Which of an MVCC header's two version stamps (`05 §7`) a caller means.
+///
+/// Exists for [`RecordStore::stamp_header_commit_slot_for_test`], so the field is named rather than
+/// passed as a byte offset a caller could get wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MvccStampField {
+    /// `created_ts` (`xmin`): the transaction that created this version.
+    Created,
+    /// `expired_ts` (`xmax`): the transaction that ended it; `0` while the version is live.
+    Expired,
+}
+
 impl StoreKind {
     /// The fixed record size of this store in bytes.
     #[must_use]
@@ -6918,9 +6979,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             //   * the census the consistency checker runs counts every LIVE delta naming a slot.
             //
             // Left as it was, the delta therefore survives its transaction — live, on no chain, and
-            // still naming a commit slot that [`free_own_commit_slot`](Self::free_own_commit_slot)
-            // hands back to the allocator on the strength of "every delta naming it is gone". The
-            // next transaction to take that slot id commits and publishes ITS count, and the census
+            // still naming a commit slot the abort retires
+            // ([`retire_own_commit_slot`](Self::retire_own_commit_slot)) on the strength of "every
+            // delta naming it is gone". Since `rmp` #1069 that retirement no longer hands the slot
+            // straight back to the allocator — the census does, and it WOULD see this delta and
+            // decline — but the defence stays here, where it is exact and immediate, rather than
+            // being left to a sweep that runs later and can be deferred (see
+            // "Defence in depth shadows the primary control"). The failure it prevents: the next
+            // transaction to take that slot id commits and publishes ITS count, and the census
             // finds one delta too many: `DeltaCountMismatch { recorded: n, actual: n + 1 }`, durable
             // and reproduced through WAL recovery, on the slot of an entirely innocent committed
             // transaction. That is `rmp` #1053, and it needs two writers because the only thing that
@@ -7397,13 +7463,34 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         Ok(())
     }
 
-    /// Decrements commit slot `slot`'s `delta_count` for one reclaimed delta and frees the slot when
-    /// the count reaches zero (`05 §12.4`).
+    /// Decrements commit slot `slot`'s `delta_count` for one reclaimed delta, and **arms the
+    /// reference census** when the count reaches zero (`05 §12.4`).
     ///
-    /// The invariant this maintains is that **a slot outlives its last delta**: no delta may ever
-    /// refer to a freed or reused slot, because a delta's committed-ness is only knowable through it.
+    /// # The invariant, restated: a slot outlives its last REFERENCE (`rmp` #1069)
+    ///
+    /// This method used to *free* the slot at `remaining == 0`, on the reading that a slot's last
+    /// delta is its last reference. That reading was only ever true because nothing else named a
+    /// slot. It stops being true the moment an MVCC record **header** can name one — which is what
+    /// `rmp` #1069 does to `created_ts` / `expired_ts`, moving them off the in-memory-resolvable
+    /// [`TxnId`] and onto the `commit.store` slot the way [`UndoDelta::commit_info`] already is.
+    ///
+    /// The difference is structural rather than one of degree: a `TxnId` is **never recycled**, so a
+    /// stale one merely fails to resolve; a slot id **is** recycled — the moment it is on the free
+    /// list [`commit_slot_for`](Self::commit_slot_for) can hand it to the next transaction and
+    /// overwrite it — so a header naming a slot freed one reference too early silently names a
+    /// **different transaction**. That is not a lost reclamation, it is a wrong answer about
+    /// committed data.
+    ///
+    /// So a count is no longer accepted as a proof. `delta_count` is still maintained exactly — it is
+    /// the accounting cross-check the consistency checker enforces
+    /// ([`UndoSlotFault::DeltaCountMismatch`](crate::check::UndoSlotFault)), and a **live committed
+    /// slot carrying `0` is now a legitimate state** — but the decision to return a slot to the free
+    /// list belongs to one place only: the reference census in
+    /// [`gc_sweep_undo_orphans`](Self::gc_sweep_undo_orphans), which counts *every* reference kind
+    /// (live deltas, MVCC headers, open transactions) rather than one of them.
+    ///
     /// An **aborted** transaction's slot never carries a count (it never committed), so it is left
-    /// alone here and reclaimed by the orphan sweep once nothing names it.
+    /// alone here and the census reclaims it once nothing names it.
     fn release_commit_slot(&self, slot: u64, txn: TxnId) -> Result<()> {
         let Some(rec) = self.read_commit_slot(slot)? else {
             return Ok(());
@@ -7411,18 +7498,30 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         if !rec.in_use() {
             // A corpse slot: its transaction aborted, so there is no count to decrement. Whether it is
             // still named by another corpse delta is a question only a reference sweep can answer.
-            self.with_maintenance(|m| m.undo_orphan_slots_possible = true);
+            self.arm_undo_orphan_census();
             return Ok(());
         }
         let remaining = rec.delta_count.saturating_sub(1);
         self.patch_commit_slot_word(slot, undo::COMMIT_OFF_DELTA_COUNT, remaining, txn)?;
         if remaining == 0 {
-            let (rel_page, off) = paging::record_location(slot, undo::COMMIT_RECORD_SIZE);
-            let dev = self.device_page(StoreKind::Commit, rel_page)?;
-            self.write_region(dev, off + undo::COMMIT_OFF_FLAGS, &[0u8], txn)?;
-            self.free_push(StoreKind::Commit, slot, txn);
+            // A HINT, not a decision (`rmp` #1069). `saturating_sub` floors at zero, so this fires
+            // again on a slot already at `0` — which costs one census pass and can never free
+            // anything the census has not independently proved unreachable. The fail-closed direction
+            // for an arming flag is to arm too often, never too rarely.
+            self.arm_undo_orphan_census();
         }
         Ok(())
+    }
+
+    /// Arms the undo area's **reference census** ([`gc_sweep_undo_orphans`](Self::gc_sweep_undo_orphans)):
+    /// something may have stopped naming a commit slot, so the next GC pass must recount.
+    ///
+    /// Every path that retires a commit slot ends here rather than at
+    /// [`free_push`](Self::free_push) (`rmp` #1069): retiring a slot is a local observation, whereas
+    /// returning one to the free list is a global claim about the whole store, and only the census
+    /// can make it.
+    fn arm_undo_orphan_census(&self) {
+        self.with_maintenance(|m| m.undo_orphan_slots_possible = true);
     }
 
     /// **The write-conflict check** (`D-property-write-conflict`, ratified 2026-08-03): refuses a
@@ -8013,9 +8112,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// which is safe. A leaked slot is reclaimed later by the GC chain sweep or its orphan pass.
     fn reclaim_aborted_undo(&self, links: &[UndoLink], commit_slot: Option<u64>) {
         if links.is_empty() {
-            // No delta ⇒ nothing can name the slot, so an allocated-but-unused slot is free again.
-            if let Some(slot) = commit_slot {
-                self.free_orphan_slot(StoreKind::Commit, slot);
+            // No delta ⇒ no DELTA can name the slot. That is not the same as nothing naming it
+            // (`rmp` #1069): an MVCC header outlives the chain it was written beside, so the claim
+            // "unreferenced" is the census's to make, not this path's. Arm it.
+            if commit_slot.is_some() {
+                self.arm_undo_orphan_census();
             }
             return;
         }
@@ -8047,22 +8148,18 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 ),
             }
         }
-        let mut any_threaded = false;
         for link in links {
-            if still_threaded.contains(&link.delta) {
-                any_threaded = true;
-            } else {
+            if !still_threaded.contains(&link.delta) {
                 self.free_orphan_slot(StoreKind::Undo, link.delta);
             }
         }
-        match commit_slot {
-            // A threaded corpse delta still names this slot, so the slot must outlive it (`05 §12.4`).
-            // It carries no delta count (it never committed), so only a reference sweep can free it.
-            Some(_) if any_threaded => {
-                self.with_maintenance(|m| m.undo_orphan_slots_possible = true)
-            }
-            Some(slot) => self.free_orphan_slot(StoreKind::Commit, slot),
-            None => {}
+        // The slot goes to the census either way (`rmp` #1069). This used to branch on whether a
+        // threaded corpse delta survived — freeing the slot outright when none did — and that
+        // distinction is now meaningless: "no delta names it" was never the same statement as
+        // "nothing names it", and an MVCC header stamped by this transaction outlives the chain the
+        // rollback just detached. The census is what closes the gap, so both arms arm it.
+        if commit_slot.is_some() {
+            self.arm_undo_orphan_census();
         }
     }
 
@@ -8113,10 +8210,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// # Errors
     /// Returns a storage error if a chain is malformed or a write fails.
     fn gc_reclaim_undo_chains(&self, txn: TxnId, watermark: Timestamp) -> Result<usize> {
-        // The chain-head census, collected only on the pass that scans the record stores anyway. It is
-        // what lets the orphan sweep below free a delta a CRASH stranded (see
+        // The full-store census, collected only on the pass that scans the record stores anyway. Its
+        // chain-head half is what lets the orphan sweep below free a delta a CRASH stranded (see
         // [`gc_sweep_undo_orphans`](Self::gc_sweep_undo_orphans)).
-        let chain_heads = if self.with_maintenance(|m| m.gc_full_scan_pending) {
+        let full_census = if self.with_maintenance(|m| m.gc_full_scan_pending) {
             Some(self.seed_pending_undo_chains()?)
         } else {
             None
@@ -8145,8 +8242,24 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // The reference sweep runs when something may have been stranded: a rollback that left a
         // threaded corpse, or the first pass after `open` (which is where a crash-stranded delta is
         // collected — and the only pass that holds the chain-head census it needs).
-        if self.with_maintenance(|m| m.undo_orphan_slots_possible) || chain_heads.is_some() {
-            freed += self.gc_sweep_undo_orphans(txn, chain_heads.as_ref())?;
+        //
+        // # The gate stays conditional, and the condition now covers commit-slot reclamation too
+        //
+        // `rmp` #1069 made this sweep the ONLY place a commit slot returns to the free list, so the
+        // gate stopped being "did something odd happen?" and became "is the store's steady-state
+        // reclamation path armed?". Running it unconditionally on every pass was the alternative and
+        // was rejected: the sweep is `O(undo high-water)` and reclaims nothing when nothing has been
+        // released, so an unconditional sweep would buy nothing and cost a full undo-store scan per
+        // GC tick.
+        //
+        // What makes the condition sufficient is that EVERY path that retires a commit slot arms it,
+        // through the single door [`arm_undo_orphan_census`](Self::arm_undo_orphan_census):
+        // [`release_commit_slot`](Self::release_commit_slot) when a committed slot's count reaches
+        // zero, [`retire_own_commit_slot`](Self::retire_own_commit_slot) on a logical abort,
+        // [`reclaim_aborted_undo`](Self::reclaim_aborted_undo) on a physical one — and the sweep
+        // itself re-arms when it had to DEFER a slot, so a deferral is never a permanent leak.
+        if self.with_maintenance(|m| m.undo_orphan_slots_possible) || full_census.is_some() {
+            freed += self.gc_sweep_undo_orphans(txn, full_census.as_ref())?;
         }
         Ok(freed)
     }
@@ -8163,7 +8276,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         }
         let Some(slot) = self.read_commit_slot(delta.commit_info)? else {
             // The slot is gone, so nothing can resolve this delta's status any more. That must never
-            // happen (`05 §12.4`: a slot outlives its last delta) and the checker reports it; treat the
+            // happen (`05 §12.4`: a slot outlives its last reference) and the checker reports it; treat the
             // delta as live here so GC never compounds the damage by freeing more.
             return Ok(false);
         };
@@ -8179,35 +8292,93 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     }
 
     /// Rebuilds [`pending_undo_chains`](Self#structfield.pending_undo_chains) by scanning the three
-    /// versioned stores for a non-zero `undo_ptr`.
+    /// versioned stores for a non-zero `undo_ptr`, and returns the [`FullStoreCensus`] the same scan
+    /// yields.
     ///
     /// Runs only on the first GC pass after `open` (the `gc_full_scan_pending` gate every other
     /// full-store sweep shares), which is exactly what a crash-recovered store needs: the pending set
     /// is in-memory only, so without this a recovered store would never reclaim the chains ARIES redo
     /// rebuilt for it.
-    /// Also returns the set of **chain heads** it saw — every non-zero `undo_ptr` in the store. That
-    /// set is the half of the delta-reference census the undo store cannot supply on its own, and it
-    /// is what lets [`gc_sweep_undo_orphans`](Self::gc_sweep_undo_orphans) free a delta a **crash**
-    /// stranded (see that method).
-    fn seed_pending_undo_chains(&self) -> Result<std::collections::BTreeSet<u64>> {
-        let mut heads = std::collections::BTreeSet::new();
+    ///
+    /// The chain-head half is what lets [`gc_sweep_undo_orphans`](Self::gc_sweep_undo_orphans) free a
+    /// delta a **crash** stranded (see that method). The header half is a *superset* contribution to
+    /// the slot census: this scan covers `1..high_water` in full, where the every-pass census
+    /// ([`census_slots_named_by_headers`](Self::census_slots_named_by_headers)) covers only the
+    /// records that can still bear an unsettled stamp. Contributing it costs nothing and makes the
+    /// one pass with the least in-memory knowledge — the first after a crash — the most conservative.
+    ///
+    /// Only **in-use** records contribute a stamp, the same rule the delta census applies to a
+    /// free-listed delta's stale body: a slot nothing can read is not a reference.
+    fn seed_pending_undo_chains(&self) -> Result<FullStoreCensus> {
+        let mut census = FullStoreCensus {
+            chain_heads: std::collections::BTreeSet::new(),
+            slots_named_by_headers: std::collections::BTreeSet::new(),
+        };
         for kind in MVCC_STORE_KINDS {
             let hw = self.store(kind).alloc.high_water();
             for id in 1..hw {
-                let head = self.read_mvcc(kind, id)?.undo_ptr;
-                if head != NULL_ID {
+                let mvcc = self.read_mvcc(kind, id)?;
+                if mvcc.undo_ptr != NULL_ID {
                     self.with_maintenance(|m| m.pending_undo_chains.insert((kind as u8, id)));
-                    heads.insert(head);
+                    census.chain_heads.insert(mvcc.undo_ptr);
+                }
+                if mvcc.in_use() {
+                    census
+                        .slots_named_by_headers
+                        .extend(slot_named_by_header_word(mvcc.created_ts));
+                    census
+                        .slots_named_by_headers
+                        .extend(slot_named_by_header_word(mvcc.expired_ts));
                 }
             }
         }
-        Ok(heads)
+        Ok(census)
     }
 
-    /// The undo area's **reference sweep**: frees every delta and every commit slot that nothing names
-    /// any more (`rmp` #966). Returns how many deltas it freed.
+    /// Every `commit.store` slot an MVCC record header may still name, collected on **every** pass
+    /// that runs the reference census (`rmp` #1069).
     ///
-    /// It is the reclaimer of last resort, for the two lifetimes the precise paths cannot cover:
+    /// # Why the range is `[freeze_low, high_water)` and why that is exact
+    ///
+    /// A header word names a slot only while it is **unsettled** — see
+    /// [`slot_named_by_header_word`]. The freeze frontier
+    /// ([`freeze_low`](Self#structfield.freeze_low)) is defined as the smallest id that may still
+    /// carry an unsettled stamp, and the whole store already rests on that definition: every in-use
+    /// record below it has had its committed writers' stamps frozen to `Committed(ts)`, a record
+    /// still bearing an **open** writer's stamp holds the frontier down
+    /// ([`is_inflight_of_inflight_writer`](Self::is_inflight_of_inflight_writer)), and a fresh stamp
+    /// lowers it ([`lower_freeze_low`](Self::lower_freeze_low)). A stamp stranded below the frontier
+    /// is already silent lost committed data, which is why
+    /// [`debug_assert_freeze_complete`](Self::debug_assert_freeze_complete) scans the FULL range to
+    /// assert it cannot happen. So this census adds no new risk class: it is exactly as sound as the
+    /// freeze sweep, and it is bounded by the same frontier that keeps the sweep affordable rather
+    /// than by an `O(store)` scan on every GC pass.
+    ///
+    /// # Errors
+    /// Returns a storage error if a record page cannot be read. The caller must then free **nothing**
+    /// — an unreadable census is not an empty one.
+    fn census_slots_named_by_headers(&self) -> Result<std::collections::BTreeSet<u64>> {
+        let mut named = std::collections::BTreeSet::new();
+        for kind in MVCC_STORE_KINDS {
+            // Same budget discipline as the freeze sweep, which scans this very range: a large store
+            // must not let one scan look like a stalled drain.
+            self.bump_drain_progress();
+            let from = self.freeze_low[kind as usize].get();
+            for (_, mvcc) in read_view::scan_in_use_mvcc_from(&self.pool, &self.stores, kind, from)?
+            {
+                named.extend(slot_named_by_header_word(mvcc.created_ts));
+                named.extend(slot_named_by_header_word(mvcc.expired_ts));
+            }
+        }
+        Ok(named)
+    }
+
+    /// The undo area's **reference sweep**: retires every delta and every commit slot that nothing
+    /// names any more (`rmp` #966, #1069). Returns how many deltas it freed.
+    ///
+    /// Since `rmp` #1069 it is not a reclaimer of last resort for commit slots but **the** reclaimer:
+    /// no other code path returns a `commit.store` id to circulation. It still covers two lifetimes
+    /// the precise paths cannot reach on their own:
     ///
     /// * **A delta a crash stranded.** A creation writes its delta and then the record that names it.
     ///   A crash between the two leaves a delta the ARIES undo turns into a corpse but that no chain
@@ -8215,28 +8386,56 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///   [`reclaim_aborted_undo`](Self::reclaim_aborted_undo) knows exactly which deltas the aborting
     ///   transaction linked — nothing in memory survives a crash to say so. Only a census can.
     /// * **An aborted transaction's slot that a threaded corpse delta still named** when its rollback
-    ///   ran. Such a slot never carries a `delta_count` (it never committed), so the count rule of
-    ///   `05 §12.4` cannot free it either.
+    ///   ran. Such a slot never carries a `delta_count` (it never committed), so the retired count
+    ///   rule of `05 §12.4` could not have freed it either.
     ///
-    /// **The census.** A delta is reachable exactly when it is some record's `undo_ptr` or some live
-    /// delta's `next`; a slot is reachable exactly when some live delta names it as `commit_info`. The
-    /// undo-store scan supplies the `next` and `commit_info` halves; `chain_heads` supplies the
-    /// `undo_ptr` half, and is `Some` only on a pass that has just scanned the record stores for it
-    /// ([`seed_pending_undo_chains`](Self::seed_pending_undo_chains)). Without it the delta phase is
-    /// skipped rather than guessed — a skipped reclamation is a bounded leak, a wrong one is corruption.
+    /// # The census
     ///
-    /// Two conservative rules, both in the safe direction:
+    /// A delta is reachable exactly when it is some record's `undo_ptr` or some live delta's `next`.
+    ///
+    /// A slot is reachable exactly when **a live delta names it as `commit_info`, OR an in-use MVCC
+    /// record header names it in `created_ts` / `expired_ts`, OR it belongs to an open transaction.**
+    /// The second disjunct is what `rmp` #1069 adds, and it is the difference between counting and
+    /// proving: the retired rule freed a slot when its last *delta* went, which was only ever the
+    /// last *reference* because nothing else could name one. `rmp` #1069 makes a header name one, and
+    /// a slot id — unlike a `TxnId` — is recycled, so one reference missed is one committed version
+    /// silently re-attributed to another transaction.
+    ///
+    /// Where each half comes from: the undo-store scan supplies `next` and `commit_info`;
+    /// [`census_slots_named_by_headers`](Self::census_slots_named_by_headers) supplies the header
+    /// half on **every** pass, bounded by the freeze frontier; and `full_census` supplies the
+    /// `undo_ptr` half plus a full-range widening of the header half, and is `Some` only on a pass
+    /// that has just scanned the record stores
+    /// ([`seed_pending_undo_chains`](Self::seed_pending_undo_chains)). Without it the **delta** phase
+    /// is skipped rather than guessed — a skipped reclamation is a bounded leak, a wrong one is
+    /// corruption. The **slot** phase needs no such gate, because its header half is always available.
+    ///
+    /// Three conservative rules, all in the safe direction:
     ///
     /// * a **freed** delta's body is not rewritten when it is freed (only its flag is cleared), so its
     ///   stale `next` must not be counted as a reference — free-listed deltas are excluded from the
-    ///   census;
-    /// * a slot owned by a **still-open** transaction is never freed, because that transaction may be
-    ///   between allocating its slot and linking its first delta, at which instant nothing names it.
+    ///   census, and so are the headers of records that are not in use;
+    /// * a slot owned by a **still-open** transaction is never retired, because that transaction may
+    ///   be between allocating its slot and linking its first delta, at which instant nothing names it;
+    /// * a retired slot is **parked**, not freed. It re-enters circulation one pass later, through
+    ///   [`gc_reclaim_orphan_slots`](Self::gc_reclaim_orphan_slots).
     ///
-    /// If the GC pass that ran this sweep later **rolls back**, its frees are undone by the WAL while
-    /// the in-memory gate stays cleared, so the next sweep is deferred to the following post-open full
-    /// pass. That is a bounded space leak and never a correctness problem: an orphan is unreachable by
-    /// construction, so nothing resolves through it either way.
+    /// # Phases E and F are deliberately NOT reordered (`rmp` #1069)
+    ///
+    /// This sweep runs inside phase F, and phase E — the freeze sweep that settles the very headers
+    /// the census reads — runs after it. So on the pass that reclaims a transaction's last chain, its
+    /// headers still name its slot and the census defers. Moving the freeze before phase F would close
+    /// that window and save one pass of latency, and it was considered and **declined**: with the
+    /// release discipline of `rmp` #1069 in place, phase F frees no slot at all, so the window is a
+    /// deferral and never a wrong answer. Reordering two GC phases to buy one pass of reclamation
+    /// latency is not worth the risk of disturbing an order the property sweep and the tombstone prune
+    /// also depend on. The deferral is made self-healing instead, by re-arming the gate.
+    ///
+    /// If the GC pass that ran this sweep later **rolls back**, its writes are undone by the WAL while
+    /// the parked ids stay parked in memory; the next pass's `!in_use` re-check finds them live again
+    /// and drops them, so they are simply re-proved by a later census. That is a bounded space leak
+    /// and never a correctness problem: an orphan is unreachable by construction, so nothing resolves
+    /// through it either way.
     ///
     /// # It reports no [`DeadIndexKey`] (`rmp` #992), deliberately
     ///
@@ -8251,8 +8450,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     fn gc_sweep_undo_orphans(
         &self,
         txn: TxnId,
-        chain_heads: Option<&std::collections::BTreeSet<u64>>,
+        full_census: Option<&FullStoreCensus>,
     ) -> Result<usize> {
+        let chain_heads = full_census.map(|c| &c.chain_heads);
         let undo_hw = self.store(StoreKind::Undo).alloc.high_water();
         // Snapshot the free list ONCE per loop instead of probing it per id (`rmp` #1012).
         // `free_contains` takes the store's allocation latch, so the old per-id probe turned what used
@@ -8264,6 +8464,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // sloppiness: phase 1 FREES deltas, so phase 2 must see a list that already contains them —
         // a delta phase 1 reclaimed must not go on holding its commit slot referenced, or the slot
         // leaks. Sharing a pre-phase-1 image would be a behaviour change, and a silent one.
+        // Disarm BEFORE the census reads anything, and re-arm at the end only for what this pass
+        // deferred (`rmp` #1069). The order matters: the flag used to be cleared *after* the sweep,
+        // which silently swallowed any arming that landed while the sweep was running — this sweep
+        // yields (`YieldSite::FreeListPush`), so a rollback interleaving there could retire a slot
+        // whose census this pass had already passed, and see its arming erased. Clearing first makes
+        // such an arming survive: the worst case becomes one extra census pass, instead of a slot
+        // that waits for an unrelated event to arm the gate again.
+        self.with_maintenance(|m| m.undo_orphan_slots_possible = false);
         let undo_free = self.free_id_set(StoreKind::Undo);
         let mut freed_deltas = 0usize;
         if let Some(heads) = chain_heads {
@@ -8314,32 +8522,82 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                     }
                     acc
                 });
+        // The THIRD reference kind, and the reason this sweep exists at all since `rmp` #1069: an
+        // MVCC record header that names a slot. Collected on every pass (see
+        // [`census_slots_named_by_headers`](Self::census_slots_named_by_headers)), and widened by the
+        // full-store scan on the pass that ran one. A read error propagates: an unreadable census is
+        // not an empty one, and freeing on the strength of one would be exactly the corruption this
+        // sweep is here to prevent.
+        let mut named_by_header = self.census_slots_named_by_headers()?;
+        if let Some(census) = full_census {
+            named_by_header.extend(&census.slots_named_by_headers);
+        }
         let commit_hw = self.store(StoreKind::Commit).alloc.high_water();
-        // This loop DOES free commit slots as it goes, and the snapshot is still exact — worth stating
-        // so it is not "fixed" into a per-id probe again. Each iteration frees at most its own `id`,
-        // and `id` ascends, so everything the loop has added to the live list is strictly BELOW the id
-        // the next iteration tests. The snapshot and the live list therefore agree on every id this
-        // loop ever asks about.
+        // This loop RETIRES commit slots as it goes, and both snapshots stay exact — worth stating so
+        // it is not "fixed" into a per-id probe again. Each iteration touches at most its own `id`,
+        // and `id` ascends, so everything the loop has changed is strictly BELOW the id the next
+        // iteration tests.
         let commit_free = self.free_id_set(StoreKind::Commit);
+        let parked =
+            self.with_maintenance(|m| m.pending_orphan_slots[StoreKind::Commit as usize].clone());
+        // Whether this pass had to DEFER a slot it would otherwise have retired. It re-arms the gate,
+        // so a deferral costs one pass instead of waiting for an unrelated event to arm it again —
+        // the self-healing shape the property sweep uses for `pending_empty_prop_cells`. Without it a
+        // store that goes quiet right after its last commit would strand that commit's slot until the
+        // next reopen, because the deferral below is guaranteed on the pass that reclaims the chain:
+        // this sweep runs inside phase F, and phase E — which settles the headers still naming the
+        // slot — runs after it.
+        let mut deferred = false;
         for id in 1..commit_hw {
-            if referenced.contains(&id) || open.contains(&id) || commit_free.contains(&id) {
+            if referenced.contains(&id)
+                || open.contains(&id)
+                || commit_free.contains(&id)
+                || parked.contains(&id)
+            {
                 continue;
             }
             let Some(slot) = self.read_commit_slot(id)? else {
                 continue;
             };
-            if slot.in_use() {
-                // A committed slot with no surviving delta: the `delta_count` rule owns it and has
-                // already freed it, so reaching here means the count and the references disagree. The
-                // checker reports that; do not act on it.
+            if named_by_header.contains(&id) {
+                // An MVCC header still resolves through this slot. Recycling it here is precisely the
+                // silent re-attribution `rmp` #1069 exists to prevent — the header would go on naming
+                // the id while `commit_slot_for` handed it to an unrelated transaction.
+                deferred = true;
                 continue;
             }
             let (rel_page, off) = paging::record_location(id, undo::COMMIT_RECORD_SIZE);
             let dev = self.device_page(StoreKind::Commit, rel_page)?;
-            self.write_region(dev, off, &[0u8; undo::COMMIT_RECORD_SIZE], txn)?;
-            self.free_push(StoreKind::Commit, id, txn);
+            if slot.in_use() {
+                // A COMMITTED slot nothing names any more. Until `rmp` #1069 this branch was
+                // unreachable-by-design — the `delta_count` rule was supposed to have freed the slot
+                // already, and reaching here meant the count and the references disagreed — and the
+                // sweep declined to act. Now the count decides nothing and this is the ordinary
+                // steady-state exit for every committed transaction's slot. One byte is written, the
+                // same byte the retired count rule wrote at exactly this moment, so what changed is
+                // WHO proves the slot is unreachable, not what is left on the page.
+                self.write_region(dev, off + undo::COMMIT_OFF_FLAGS, &[0u8], txn)?;
+            } else {
+                // A corpse slot: an aborted or crashed transaction's. Zeroed whole, as before — a
+                // zeroed slot decodes as no slot at all (`05 §12.3`), which is the strongest possible
+                // statement that nothing may resolve through it.
+                self.write_region(dev, off, &[0u8; undo::COMMIT_RECORD_SIZE], txn)?;
+            }
+            // PARKED, not freed (`D-orphan-slot-parking`, `rmp` #1069). The id goes back into
+            // circulation on a LATER pass, through
+            // [`gc_reclaim_orphan_slots`](Self::gc_reclaim_orphan_slots), never in the same instant it
+            // stopped being named: an off-thread reader may hold a pointer into the slot it captured
+            // before this pass began, and an in-memory index may still carry a posting derived from
+            // it. Same discipline, and the same reason, as the node / relationship / delta slots.
+            self.with_maintenance(|m| {
+                m.pending_orphan_slots[StoreKind::Commit as usize].insert(id)
+            });
         }
-        self.with_maintenance(|m| m.undo_orphan_slots_possible = false);
+        // Re-arm, never assign: the gate was cleared at the top, so anything that armed it while this
+        // sweep ran must survive. `deferred` adds this pass's own reason to come back.
+        if deferred {
+            self.arm_undo_orphan_census();
+        }
         Ok(freed_deltas)
     }
 
@@ -8941,13 +9199,19 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             sched::yield_at(YieldSite::GcPhaseC, ResourceId::txn(txn.0));
             reclaimed += self.reclaim_pending(StoreKind::Node, txn, watermark)?;
 
-            // ---- Phase B2: return the slots a logical rollback ORPHANED (`rmp` #970, AC 7), and
-            // the deltas a REFUSED publication retired (`rmp` #1053). ----
+            // ---- Phase B2: return the slots a logical rollback ORPHANED (`rmp` #970, AC 7), the
+            // deltas a REFUSED publication retired (`rmp` #1053), and the COMMIT SLOTS the previous
+            // pass's reference census proved unreachable (`rmp` #1069). ----
             // The abort unlinked these from every chain and zeroed their headers but deliberately did
             // not list them (see `pending_orphan_slots`); a refused publication never linked its
-            // delta at all. They are reachable from nothing either way, so this is a pure accounting
-            // step — but it is still guarded on the record actually being retired, so a slot some
-            // later writer has legitimately re-used cannot be double-freed.
+            // delta at all; a census-proved commit slot has had its `in_use` bit cleared. They are
+            // reachable from nothing either way, so this is a pure accounting step — but it is still
+            // guarded on the record actually being retired, so a slot some later writer has
+            // legitimately re-used cannot be double-freed.
+            //
+            // It runs BEFORE phase F, and that placement is what makes the commit-slot parking a
+            // parking: the census that proves a slot unreachable lives inside phase F, so its
+            // parkings are always listed by the NEXT pass and never by the one that proved them.
             sched::yield_at(YieldSite::GcPhaseB2, ResourceId::txn(txn.0));
             reclaimed += self.gc_reclaim_orphan_slots(txn)?;
 
@@ -9010,6 +9274,16 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // only the records added since the last pass (`rmp` #522). Runs AFTER the reclamation sweeps so
         // reclaimed slots (no longer `in_use`) are skipped. After this pass no in-use record references
         // any writer the registry records as committed, which is the precondition for the prune below.
+        //
+        // ORDER vs phase F (`rmp` #1069): the freeze is deliberately NOT hoisted above phase F. Doing
+        // so would settle the headers before F's reference census reads them, closing the one-pass
+        // window in which a just-reclaimed transaction's headers still name its commit slot. That is a
+        // RECLAMATION-LATENCY choice, not a correctness one, and it was declined: since #1069 phase F
+        // frees no commit slot at all — it only parks what its census has proved unreachable — so the
+        // window can produce a deferral and never a wrong answer, and the sweep re-arms its own gate so
+        // the deferral costs exactly one pass. Reordering two GC phases buys that one pass at the price
+        // of disturbing an order the property sweep (phase D) and the tombstone prune below both read
+        // as given. See `gc_sweep_undo_orphans`.
         let mut frozen = 0usize;
         let mut freeze_scanned = 0u64;
         for kind in [StoreKind::Rel, StoreKind::Node, StoreKind::Prop] {
@@ -10032,18 +10306,26 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 )));
             }
         }
-        self.free_own_commit_slot(slot, txn)
+        self.retire_own_commit_slot(slot, txn)
     }
 
     /// Returns to the free list every slot a logical rollback orphaned (`rmp` #970, acceptance
-    /// criterion 7) or a refused publication retired (`rmp` #1053), and returns how many it
-    /// reclaimed.
+    /// criterion 7), a refused publication retired (`rmp` #1053), or the undo area's reference census
+    /// proved unreachable (`rmp` #1069), and returns how many it reclaimed.
     ///
-    /// Exact rather than census-based: the abort itself parked these ids, and it is the operation that
-    /// made them unreachable, so no store scan is needed to establish it. The `!in_use` guard is
-    /// nonetheless kept — a slot a later transaction has legitimately re-used through some other path
-    /// must never be double-freed (`rmp` #578 in reverse) — and an id that fails it is simply dropped
-    /// from the set rather than retried forever.
+    /// **This is the one door back into circulation**, for all four stores it covers. Whoever parks an
+    /// id is the one that proves it unreachable; this function only carries that proof across a pass
+    /// boundary, which is what keeps a freed id from being allocatable in the same instant it stopped
+    /// being named (`D-orphan-slot-parking`).
+    ///
+    /// The proof itself comes two ways. For a node, relationship or delta slot it is **exact**: the
+    /// abort or the refusal is itself the operation that made the id unreachable, so no store scan is
+    /// needed to establish it. For a **commit** slot it is **census-based**
+    /// ([`gc_sweep_undo_orphans`](Self::gc_sweep_undo_orphans)), because a slot is named from three
+    /// directions — live deltas, MVCC headers, open transactions — and no single operation can speak
+    /// for all three. Either way the `!in_use` guard is kept — a slot a later transaction has
+    /// legitimately re-used through some other path must never be double-freed (`rmp` #578 in
+    /// reverse) — and an id that fails it is simply dropped from the set rather than retried forever.
     ///
     /// The set is in memory only. A crash before a GC pass therefore leaves the retired slots
     /// unlisted; they are `!in_use` on the page, so nothing can read them and nothing is corrupted —
@@ -10094,6 +10376,36 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 reclaimed += 1;
             }
         }
+        // The commit store's twin (`rmp` #1069). Every commit slot now reaches the free list through
+        // here and nowhere else: [`gc_sweep_undo_orphans`](Self::gc_sweep_undo_orphans) is the only
+        // thing that parks one, and it parks a slot only once its census has proved that no live
+        // delta, no MVCC header and no open transaction names it.
+        //
+        // The pass boundary is the point, not an artefact of where this call sits: this phase runs
+        // BEFORE phase F, so a slot the census parks in one pass is listed at the start of the NEXT
+        // one. A commit slot therefore never becomes allocatable in the same pass in which it stopped
+        // being named — the `rmp` #588 hazard shape, and the reason `D-orphan-slot-parking` exists for
+        // the record stores. It matters more for a commit slot than for a record slot, because
+        // recycling one does not merely resurrect a stale posting: it re-attributes a version to a
+        // different transaction.
+        //
+        // Same `!in_use` re-check as the deltas above, and for the same reason — only a slot nothing
+        // has legitimately taken over may be listed. A zeroed slot (an aborted transaction's, which
+        // the sweep zeroes whole) reads as `None` and is as retired as `!in_use`.
+        let slots: Vec<u64> = self
+            .with_maintenance(|m| {
+                std::mem::take(&mut m.pending_orphan_slots[StoreKind::Commit as usize])
+            })
+            .into_iter()
+            .collect();
+        for id in slots {
+            if self.read_commit_slot(id)?.is_some_and(|s| s.in_use()) {
+                continue;
+            }
+            if self.free_push(StoreKind::Commit, id, txn) {
+                reclaimed += 1;
+            }
+        }
         Ok(reclaimed)
     }
 
@@ -10104,7 +10416,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// wrong here (the cell has just taken it back — see
     /// [`undo_own_property`](Self::undo_own_property)). It also decrements the commit slot's
     /// `delta_count`, which an aborted transaction never published; the slot is freed once, by
-    /// [`free_own_commit_slot`](Self::free_own_commit_slot).
+    /// [`retire_own_commit_slot`](Self::retire_own_commit_slot).
     ///
     /// # Errors
     /// Returns a storage error if the delta's page cannot be written.
@@ -10116,15 +10428,28 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         Ok(())
     }
 
-    /// Frees the commit slot of an aborting transaction, once every delta naming it is gone.
+    /// **Retires** the commit slot of an aborting transaction, once every delta naming it is gone:
+    /// clears its `in_use` bit and arms the reference census.
+    ///
+    /// It does **not** return the slot to the free list (`rmp` #1069, hence "retire" rather than
+    /// "free"). Detaching this transaction's deltas proves no *delta* names the slot; it proves
+    /// nothing about the MVCC headers this transaction stamped, which the logical rollback restores
+    /// but which a concurrently-committed writer may have re-stamped on top of. Only
+    /// [`gc_sweep_undo_orphans`](Self::gc_sweep_undo_orphans) counts every reference kind, so only it
+    /// may free the slot — and then only through the one-pass parking of
+    /// [`gc_reclaim_orphan_slots`](Self::gc_reclaim_orphan_slots).
+    ///
+    /// Clearing `in_use` here stays load-bearing and immediate: it is what makes the slot read as an
+    /// **aborted** transaction's, so [`delta_is_dead`](Self::delta_is_dead) and the read path resolve
+    /// any surviving corpse delta correctly the instant the rollback returns.
     ///
     /// # Errors
     /// Returns a storage error if the slot's page cannot be written.
-    fn free_own_commit_slot(&self, slot: u64, txn: TxnId) -> Result<()> {
+    fn retire_own_commit_slot(&self, slot: u64, txn: TxnId) -> Result<()> {
         let (rel_page, off) = paging::record_location(slot, undo::COMMIT_RECORD_SIZE);
         let dev = self.device_page(StoreKind::Commit, rel_page)?;
         self.write_region(dev, off + undo::COMMIT_OFF_FLAGS, &[0u8], txn)?;
-        self.free_push(StoreKind::Commit, slot, txn);
+        self.arm_undo_orphan_census();
         Ok(())
     }
 
@@ -14068,6 +14393,53 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         )
     }
 
+    /// Writes one raw version-stamp word into record `id`'s `created_ts` or `expired_ts` — a
+    /// **forging accessor for tests** (`rmp` #1069), in the spirit of
+    /// [`stamp_property_tombstone_for_test`](Self::stamp_property_tombstone_for_test).
+    ///
+    /// It exists to construct the one state this build's write path cannot yet produce and the next
+    /// task's will produce as a matter of course: an MVCC header that **names a commit slot**. Until
+    /// `rmp` #1069 lands, a header's unsettled stamp carries the writer's [`TxnId`], so the census
+    /// branch that keeps a named slot alive
+    /// ([`gc_sweep_undo_orphans`](Self::gc_sweep_undo_orphans)) is never reached by a production
+    /// write — and a branch that has never once returned a non-empty answer is a branch nobody has
+    /// tested. This accessor is what makes it testable **now**, so #1069 inherits a proved mechanism
+    /// instead of a decorative one.
+    ///
+    /// It takes a raw word rather than a slot id so a test can *both* make a header name a slot
+    /// (`VersionStamp::in_flight(TxnId(slot))` — byte-identical to what #1069's write path will
+    /// write, so the test observes the real encoding and not a stand-in) *and* take the name away
+    /// again by restoring the settled word it captured first. Proving the census frees the slot once
+    /// nothing names it is half the property; a forge with no inverse could only prove the other half.
+    ///
+    /// Not a repair tool and not a write path: it patches one header word under `txn`, leaving every
+    /// other invariant to the caller. A store this is used on is, until the caller restores it, one
+    /// this build considers ill-formed.
+    ///
+    /// # Errors
+    /// Returns a storage error if `id`'s page is not allocated or the patch write fails.
+    pub fn force_header_stamp_for_test(
+        &self,
+        txn: TxnId,
+        kind: StoreKind,
+        id: u64,
+        field: MvccStampField,
+        word: u64,
+    ) -> Result<()> {
+        let offset = match field {
+            MvccStampField::Created => MVCC_OFF_CREATED_TS,
+            MvccStampField::Expired => MVCC_OFF_EXPIRED_TS,
+        };
+        self.patch_header_word(kind, id, offset, word, txn)?;
+        // The frontier must cover the record this wrote an unsettled stamp onto, exactly as the
+        // production write path's `note_created` / `note_expired` do — otherwise the every-pass header
+        // census, which scans `[freeze_low, high_water)`, would legitimately never look at it and a
+        // test aimed at that census would prove nothing. Lowering is unconditional because it is
+        // always safe: it only ever widens a scan.
+        self.lower_freeze_low(kind, id);
+        Ok(())
+    }
+
     /// Empties both directional relationship-count projections — an **inspection accessor for tests**
     /// (`rmp` task #856).
     ///
@@ -15871,6 +16243,22 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         )
     }
 
+    /// Whether `commit.store` id `slot` is on the free list — i.e. whether the next transaction to
+    /// ask for a slot may be handed this one.
+    ///
+    /// An **inspection accessor for tests** (`rmp` #1069). Since a commit slot is retired (its
+    /// `in_use` bit cleared) one pass before it is listed (`D-orphan-slot-parking`), "retired" and
+    /// "reusable" became two distinct observable states, and a test that could only see the first
+    /// could not tell parking from an immediate free — which is the whole property.
+    #[must_use]
+    pub fn commit_slot_is_free_for_test(&self, slot: u64) -> bool {
+        self.store(StoreKind::Commit)
+            .alloc
+            .lock()
+            .free()
+            .contains(slot)
+    }
+
     /// The commit-info slot at `commit.store` id `slot` — the indirection point through which every
     /// delta of one transaction resolves its commit status (`04 §5.1.3`). `None` for a zeroed slot.
     ///
@@ -17598,11 +17986,31 @@ mod tests {
         s.create_rel(t, rt, hub, hub).unwrap();
         s.rollback(t).unwrap();
 
-        // Drive the INCREMENTAL GC to steady state (two passes so watermark-gated reclaims complete).
-        gc_pass(&mut s, next);
-        next += 1;
-        gc_pass(&mut s, next);
-        next += 1;
+        // Drive the INCREMENTAL GC to steady state — to a FIXPOINT, not to a fixed pass count.
+        //
+        // This used to be exactly two passes, calibrated to a pipeline in which every reclamation
+        // completed within one watermark-gated retry. Since `rmp` #1069 a commit slot takes longer by
+        // design: one pass reclaims its chain, a later pass's census proves it unreachable, and a
+        // later one still lists it (`D-orphan-slot-parking`). A fixed count would be asserting the
+        // SCHEDULE, and this test is about EQUIVALENCE — that a full scan finds nothing an
+        // incremental sweep would have missed. Running to a fixpoint says exactly that, and says it
+        // more strongly: it still fails if the incremental sweep genuinely cannot reach something,
+        // because then the loop never converges and the positive control below fires.
+        const MAX_PASSES: usize = 12;
+        let mut converged = false;
+        for _ in 0..MAX_PASSES {
+            let report = gc_pass(&mut s, next);
+            next += 1;
+            if report.reclaimed == 0 && report.frozen == 0 && report.undo_deltas_reclaimed == 0 {
+                converged = true;
+                break;
+            }
+        }
+        assert!(
+            converged,
+            "positive control: the incremental GC must reach a fixpoint within {MAX_PASSES} passes, \
+             or it is not reclaiming what it claims to reclaim"
+        );
 
         // Fingerprint the store: every in-use record's (id, xmin, xmax) per kind + the free lists.
         let fingerprint = |s: &mut Store| -> Vec<(u8, u64, u64, u64)> {

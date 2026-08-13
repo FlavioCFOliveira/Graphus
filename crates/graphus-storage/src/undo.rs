@@ -25,6 +25,25 @@
 //! at the same instant: a reader resolves a delta's commit status by loading through the slot
 //! rather than by reading a stamp the committer had to write into each record.
 //!
+//! ### A slot outlives its last REFERENCE, which is not its last delta (`rmp` #1069)
+//!
+//! A slot id is **recycled**: once it is on `commit.store`'s free list the next transaction takes it
+//! and overwrites it. So everything that still names a slot must be gone before it is listed, and
+//! "gone" has to be *proved*, not inferred from a count.
+//!
+//! `delta_count` is still maintained exactly, and the consistency checker still enforces it against
+//! the deltas that name the slot — but it no longer authorises anything. It stopped being a
+//! sufficient proof the moment a second kind of reference appeared: `rmp` #1069 moves the record
+//! headers' `created_ts` / `expired_ts` off the never-recycled [`TxnId`](graphus_core::TxnId) and
+//! onto the slot, exactly as `commit_info` already is, and a header outlives the chain that was
+//! written beside it. **A live slot carrying `delta_count == 0` is therefore a legitimate state.**
+//!
+//! One place decides a slot is unreachable — the reference census in
+//! `RecordStore::gc_sweep_undo_orphans`, which counts live deltas, in-use MVCC headers and open
+//! transactions — and one place returns it to the free list, a GC pass later:
+//! `RecordStore::gc_reclaim_orphan_slots` (`D-orphan-slot-parking`). Every other path that finishes
+//! with a slot only clears its `in_use` bit and arms the census.
+//!
 //! ### The freeze sweep still runs — the two mechanisms coexist
 //!
 //! The indirection removes the need for a **delta** to carry a settled stamp. It did **not** retire
@@ -132,6 +151,9 @@ pub const COMMIT_OFF_COMMIT_TS: usize = C_OFF_COMMIT_TS;
 
 /// Byte offset of a commit slot's `delta_count` word. Written **before** `commit_ts` at commit
 /// (`05 §12.4`, normative ordering) and decremented by GC as each delta is reclaimed.
+///
+/// Since `rmp` #1069 the count is **accounting, not authority**: reaching zero no longer frees the
+/// slot. See the module note "A slot outlives its last REFERENCE".
 pub const COMMIT_OFF_DELTA_COUNT: usize = C_OFF_DELTA_COUNT;
 
 /// The seven delta actions (`05 §12.3`, `04 §5.1.1`).
@@ -431,6 +453,11 @@ pub struct CommitSlot {
     pub txn_id: u64,
     /// `0` while the transaction is open; the number of deltas the transaction created once it has
     /// committed, decremented by GC as each one is reclaimed.
+    ///
+    /// It reaching `0` on a **live** slot is a legitimate state since `rmp` #1069: the count records
+    /// how many deltas are left, and no longer decides when the slot may be reclaimed. The
+    /// consistency checker enforces it against a full census of the undo store all the same, which
+    /// is what makes a lost or double-counted delta detectable.
     pub delta_count: u64,
 }
 

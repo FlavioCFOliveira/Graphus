@@ -207,7 +207,7 @@ pub enum UndoChainFault {
     },
     /// A delta's `commit_info` names a slot that holds no commit-info record, so the delta's
     /// committed-ness is unknowable — the one thing `05 §12.4` promises can never happen ("a slot
-    /// outlives its last delta").
+    /// outlives its last reference").
     CommitInfoDangling {
         /// The `commit.store` id the delta names.
         commit_info: u64,
@@ -298,8 +298,30 @@ pub enum UndoSlotFault {
         reason: String,
     },
     /// A **committed** transaction's slot records a `delta_count` that does not equal the number of
-    /// unreclaimed deltas naming it (`05 §12.4`). Either GC has lost count — and the slot will be
-    /// freed while deltas still resolve through it — or a delta has been lost.
+    /// unreclaimed deltas naming it (`05 §12.4`): GC has lost count, or a delta has been lost or
+    /// double-counted.
+    ///
+    /// # What this proves, and what it stopped proving (`rmp` #1069)
+    ///
+    /// Until `rmp` #1069 the count was what *authorised* freeing the slot, so a mismatch also meant
+    /// "the slot is about to be freed while deltas still resolve through it". It no longer decides
+    /// anything: the reference census does, from the deltas themselves. So the consequence is now the
+    /// narrower — and still serious — one above, and **a live committed slot recording `0` is a
+    /// legitimate state**, not the contradiction it used to be.
+    ///
+    /// The rule's detection power is unchanged, which is the point of keeping it exactly as it was
+    /// rather than relaxing it to accommodate the new state: it is the one place that cross-checks
+    /// the store's own accounting against a full census of the undo store, and it is what catches a
+    /// delta that was lost, resurrected, or attributed to the wrong transaction — the `rmp` #1053
+    /// shape, which surfaced here and nowhere else. The equality already admits `recorded == 0 &&
+    /// actual == 0`, so nothing had to be weakened for `rmp` #1069 to land.
+    ///
+    /// What is **not** checked here, deliberately: that a slot named by an MVCC record header is
+    /// still live. Before `rmp` #1069 a header's unsettled stamp carries a `TxnId`, not a slot id, so
+    /// such a rule would fire on a healthy store wherever a `TxnId` happened to coincide with a freed
+    /// slot id. It becomes checkable — and should be added, as the header twin of
+    /// [`FreedButReferenced`](UndoSlotFault::FreedButReferenced) — the moment #1069 makes the payload
+    /// mean what the rule would assume.
     DeltaCountMismatch {
         /// The count the slot records.
         recorded: u64,
@@ -1625,12 +1647,14 @@ fn check_mvcc_headers(cat: &Catalog, scan: &Scan, report: &mut ConsistencyReport
 /// * no reachable delta is on the **free list** ([`UndoChainFault::FreedDeltaReachable`]), which
 ///   would let a later allocation overwrite a version some snapshot still needs;
 /// * every delta's `commit_info` addresses a **live** commit slot
-///   ([`UndoChainFault::CommitInfoDangling`]) — `05 §12.4`'s "a slot outlives its last delta", which
+///   ([`UndoChainFault::CommitInfoDangling`]) — `05 §12.4`'s "a slot outlives its last reference", which
 ///   is what makes a delta's committed-ness knowable at all;
 /// * a **committed** slot's `delta_count` equals the number of unreclaimed deltas naming it
 ///   ([`UndoSlotFault::DeltaCountMismatch`]). Only committed slots are checked: `05 §12.4` gives an
 ///   open transaction's slot the value `0` by definition, and an aborted transaction's slot never
-///   publishes a count.
+///   publishes a count. Since `rmp` #1069 the count authorises nothing — a committed slot recording
+///   `0` is live and legitimate — but the equality is enforced exactly as before, because it is the
+///   store's only cross-check of its own accounting against a full census of the undo store.
 ///
 /// Chains hanging off **corpse** records are walked too, not just off live ones: a corpse still
 /// anchors whatever survived it, and a leaked chain is exactly what this pass exists to catch.
@@ -1757,6 +1781,12 @@ fn check_undo_chains(cat: &Catalog, scan: &Scan, report: &mut ConsistencyReport)
     // The reference census, over EVERY delta rather than only the reachable ones: `delta_count`
     // counts unreclaimed deltas (`05 §12.4`), and a delta stops being unreclaimed when GC frees its
     // slot, not when it stops being reachable.
+    //
+    // `rmp` #1069 did not touch this loop, and that is a deliberate outcome rather than an oversight.
+    // The state it introduced — a live committed slot whose last delta is gone — presents here as
+    // `recorded == 0, actual == 0`, which the equality below already accepts. Relaxing the comparison
+    // to admit it (say, by skipping slots recording `0`) would have thrown away the ability to detect
+    // a slot whose deltas all leaked, so the rule stays exact.
     let mut references: BTreeMap<u64, u64> = BTreeMap::new();
     for id in &scan.live_deltas {
         let Some(delta) = scan.deltas.get(id) else {

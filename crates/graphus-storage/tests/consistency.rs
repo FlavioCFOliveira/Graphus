@@ -1755,7 +1755,7 @@ fn a_delta_naming_an_out_of_range_commit_slot_is_flagged() {
 
 /// A commit slot that has been **erased while deltas still name it** is flagged: their
 /// committed-ness becomes unknowable, and `05 §12.4` promises that can never happen ("a slot
-/// outlives its last delta"). This is the exact damage a premature slot reclamation would do.
+/// outlives its last reference"). This is the exact damage a premature slot reclamation would do.
 #[test]
 fn a_delta_whose_commit_slot_is_gone_is_flagged() {
     let (mut s, _a, _eid) = store_with_chains();
@@ -1789,8 +1789,14 @@ fn a_delta_whose_commit_slot_is_gone_is_flagged() {
 }
 
 /// A committed slot whose `delta_count` disagrees with the number of unreclaimed deltas naming it is
-/// flagged (`05 §12.4`): the count is what decides when the slot may be freed, so a wrong one frees
-/// it while deltas still resolve through it.
+/// flagged (`05 §12.4`): a wrong count means a delta has been lost, resurrected, or attributed to
+/// the wrong transaction, and this is the only place the store's own accounting is cross-checked
+/// against a full census of the undo store.
+///
+/// Since `rmp` #1069 the count no longer *decides* when the slot may be freed — the reference census
+/// does — so the consequence is no longer "it frees the slot while deltas still resolve through it".
+/// The rule itself is unchanged and is asserted here at full strength, which is what keeps that
+/// change from having quietly cost detection power.
 #[test]
 fn a_commit_slot_with_a_wrong_delta_count_is_flagged() {
     let (mut s, _a, _eid) = store_with_chains();

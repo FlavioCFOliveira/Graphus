@@ -12,7 +12,8 @@
 use graphus_core::{TxnId, VersionStamp};
 use graphus_io::MemBlockDevice;
 use graphus_storage::{
-    Namespace, RecordStore, StoreKind, StorePages, UndoAction, check::check_store, verify_on_open,
+    MvccStampField, Namespace, RecordStore, StoreKind, StorePages, UndoAction, check::check_store,
+    verify_on_open,
 };
 use graphus_wal::{LogSink, MemLogSink, WalManager};
 
@@ -33,6 +34,33 @@ fn in_txn<R>(store: &mut Store, txn: u64, f: impl FnOnce(&mut Store, TxnId) -> R
     let out = f(store, txn);
     store.commit(txn).expect("commit");
     out
+}
+
+/// Runs up to `passes` GC passes at the latest watermark, stopping as soon as `done` holds, and
+/// returns whether it does. Transaction ids run `first_txn..first_txn + passes`, so each call site
+/// picks a base that cannot collide with the ids its test uses elsewhere.
+///
+/// Needed since `rmp` #1069: reclaiming a commit slot is no longer a single-pass event. One pass
+/// reclaims the chain, a later pass's census proves the slot unreachable and retires it, and a later
+/// one still lists it (`D-orphan-slot-parking`). A test that asserted on a fixed number of passes
+/// would be pinning the *schedule* rather than the property.
+fn drive_gc_until(
+    store: &mut Store,
+    first_txn: u64,
+    passes: u64,
+    done: impl Fn(&Store) -> bool,
+) -> bool {
+    for i in 0..passes {
+        if done(store) {
+            return true;
+        }
+        let txn = TxnId(first_txn + i);
+        let watermark = store.snapshot_ts();
+        store.begin(txn);
+        store.gc(txn, watermark).expect("gc");
+        store.commit(txn).expect("commit gc");
+    }
+    done(store)
 }
 
 fn assert_consistent(store: &mut Store, when: &str) {
@@ -222,6 +250,11 @@ fn the_checker_accepts_a_chain_before_and_after_gc() {
     });
     assert_consistent(&mut s, "before GC");
     assert_eq!(s.version_chain(StoreKind::Node, a).expect("chain").len(), 1);
+    // Captured while the chain still exists — after the pass below there is nothing left to read it
+    // from, which is precisely the point.
+    let slot_id = s.version_chain(StoreKind::Node, a).expect("chain")[0]
+        .1
+        .commit_info;
 
     // A GC pass at a watermark past the creating commit: every delta on every chain is committed at
     // or below it, so all three chains are reclaimable.
@@ -248,17 +281,40 @@ fn the_checker_accepts_a_chain_before_and_after_gc() {
             "{kind:?} {id}'s chain is fully reclaimed, so its `undo_ptr` is detached"
         );
     }
-    // The commit slot goes with the last delta that named it (`05 §12.4`: a slot outlives its last
-    // delta, and not one pass longer).
+    // The deltas go with the chain, in the same pass.
     let (free_deltas, free_slots) = s.undo_area_free_counts();
     assert_eq!(
         free_deltas, 5,
         "all five deltas are back on the free list (`rmp` #969 adds one per relationship end)"
     );
+    // The commit slot does NOT (`rmp` #1069). This assertion used to read `free_slots == 1`, on the
+    // retired rule that a slot's last delta is its last reference. It is replaced rather than
+    // dropped, by the statement that rule was standing in for and by its completion: the slot
+    // survives the pass that reclaimed its last delta, and a later census — the only thing that
+    // counts every reference kind — is what reclaims it. Asserting BOTH halves is strictly stronger
+    // than the count-based assertion it replaces, which could not distinguish "reclaimed on proof"
+    // from "reclaimed on a count that happened to be right".
     assert_eq!(
-        free_slots, 1,
-        "the transaction's commit slot is reclaimed once its last delta is (`05 §12.4`)"
+        free_slots, 0,
+        "a commit slot outlives its last delta: reclaiming the chain must not put it back on the \
+         free list (`rmp` #1069)"
     );
+    assert!(
+        s.commit_slot(slot_id)
+            .expect("read slot")
+            .expect("occupied")
+            .in_use(),
+        "and it is still a live slot, not a corpse: nothing has proved it unreachable yet"
+    );
+
+    // Completion: driven far enough, the census proves it unreachable and the parking pass lists it.
+    assert!(
+        drive_gc_until(&mut s, 100, 6, |s| s.undo_area_free_counts().1 == 1),
+        "the census must eventually reclaim the slot, or `rmp` #1069 has traded a premature free \
+         for a permanent leak (free slots {})",
+        s.undo_area_free_counts().1
+    );
+    assert_consistent(&mut s, "after the census reclaimed the commit slot");
 }
 
 /// GC must **not** reclaim a chain a live snapshot can still reach: a delta committed *after* the
@@ -309,7 +365,8 @@ fn gc_keeps_a_chain_a_live_snapshot_can_still_reach() {
 // ============================================================================================
 
 /// A rolled-back transaction leaves **no** reachable delta and no chain head: its physical undo
-/// reverts the chain-head publication, and its delta / commit slots return to their free lists.
+/// reverts the chain-head publication, its delta slots return to the free list, and its commit slot
+/// is retired at once and reclaimed by the census (`rmp` #1069).
 ///
 /// **Non-vacuity.** The positive control is the pre-rollback assertion that the chain really existed
 /// and the free lists really were empty — without it, "no reachable delta after rollback" is
@@ -332,6 +389,9 @@ fn a_rolled_back_transaction_leaves_no_reachable_delta() {
         1,
         "the aborting transaction really did link a delta"
     );
+    let aborted_slot = s.version_chain(StoreKind::Node, doomed).expect("chain")[0]
+        .1
+        .commit_info;
     let doomed_delta = s.node(doomed).expect("node").mvcc.undo_ptr;
     assert_ne!(doomed_delta, 0);
     s.rollback(txn).expect("rollback");
@@ -346,13 +406,227 @@ fn a_rolled_back_transaction_leaves_no_reachable_delta() {
         survivor_head,
         "an unrelated committed entity's chain head is untouched by the rollback"
     );
+    // The aborted transaction's DELTA slots are reusable again immediately: the rollback itself is
+    // the operation that made them unreachable, so no census is owed.
     let (free_deltas, free_slots) = s.undo_area_free_counts();
     assert!(
-        free_deltas > 0 && free_slots > 0,
-        "the aborted transaction's delta and commit slots are reusable again \
-         (deltas {free_deltas}, slots {free_slots})"
+        free_deltas > 0,
+        "the aborted transaction's delta slots are reusable again (deltas {free_deltas})"
+    );
+    // Its COMMIT slot is not (`rmp` #1069). This assertion used to read `free_slots > 0`; it is
+    // replaced by the two statements that rule was standing in for, which together are strictly
+    // stronger than "it is on the free list":
+    //
+    //   1. the slot is RETIRED at once — `in_use` clear, so any corpse delta that survived the abort
+    //      still resolves through it and reads "aborted transaction", which is the property the
+    //      immediate free was really carrying;
+    //   2. it is NOT reusable at once, because detaching this transaction's deltas proves nothing
+    //      about the MVCC headers it stamped. Only the census speaks for those.
+    assert_eq!(
+        free_slots, 0,
+        "an aborting transaction's commit slot is retired, not handed straight back to the \
+         allocator (`rmp` #1069)"
+    );
+    assert!(
+        !s.commit_slot(aborted_slot)
+            .expect("read slot")
+            .expect("occupied")
+            .in_use(),
+        "but it IS retired at once: a surviving corpse delta must read it as an aborted \
+         transaction's the instant the rollback returns"
+    );
+
+    // Completion: the census reclaims it, so retiring-without-freeing is not a leak.
+    assert!(
+        drive_gc_until(&mut s, 100, 6, |s| s.undo_area_free_counts().1 > 0),
+        "the census must eventually return the aborted transaction's slot to the free list"
     );
     assert_consistent(&mut s, "after a rollback");
+}
+
+// ============================================================================================
+// Commit-slot reachability: a slot outlives its last REFERENCE, not its last delta (`rmp` #1069).
+// ============================================================================================
+
+/// **The test that gives the header branch of the census its teeth.**
+///
+/// It forges an MVCC header word that *names a commit slot* — the state `rmp` #1069 will make
+/// ordinary and that this build's write path cannot yet produce — and proves two things about it:
+/// the census refuses to reclaim a slot a header names, and it reclaims that very slot as soon as
+/// the word stops naming it.
+///
+/// # The design, and why each half is needed
+///
+/// Two committed transactions leave two commit slots, and the forge is applied **before** any GC
+/// pass, so one single census decides both: node `a`'s `created_ts` is made to name transaction
+/// `b`'s slot. The first pass then reclaims both chains — after which neither slot has a single
+/// delta left, and from the retired count rule's point of view both are free for the taking — and
+/// its census retires the **control** slot and declines the **treatment** slot.
+///
+/// One pass, one census, two slots, one difference between them. That contrast is what makes the
+/// assertion mean something: a census that simply failed to reach the treatment slot would have
+/// failed to reach the control slot too, and the test would fail on the control.
+///
+/// The transactions are given ids well above the commit store's id space on purpose. Before
+/// `rmp` #1069 a header's unsettled stamp carries a `TxnId`, which
+/// [`slot_named_by_header_word`] conservatively reads as a slot id (see its docs); with small ids
+/// those coincidences would pin slots by accident and the control would survive for the wrong
+/// reason. Keeping them apart is what leaves the forge as the only thing naming a slot.
+///
+/// The pin is also made to **persist across passes** rather than lasting a single census, so that
+/// the second half proves what it claims. The freeze sweep settles an unsettled stamp whose writer
+/// has resolved, and raises the frontier past a record it considers finished; a stamp naming a
+/// still-**open** writer does neither. So the forged word names a transaction that is left open —
+/// one that writes nothing, and therefore owns no commit slot of its own, or the `open` disjunct
+/// would be what saved the slot instead of the header disjunct.
+///
+/// # Non-vacuity
+///
+/// * Against the build **before** `rmp` #1069 — the count rule freeing a slot at
+///   `delta_count == 0` — the pass that reclaims the chains puts both slots straight back on the
+///   free list, and the treatment assertion fails.
+/// * Against **this** build with only the `named_by_header` disjunct removed from the census, the
+///   treatment slot is retired in the same pass as the control and the `in_use` assertion fails.
+///   That is the decisive control, because it isolates this task's actual line.
+/// * The second half (the slot IS reclaimed once the word no longer names it) is the positive
+///   control against the opposite failure: a census that never frees anything would satisfy the
+///   first half trivially and turn `rmp` #1069 into a permanent commit-slot leak.
+#[test]
+fn the_census_keeps_a_commit_slot_an_mvcc_header_still_names() {
+    let mut s = fresh();
+    let a = in_txn(&mut s, 40, |s, txn| s.create_node(txn).expect("a").0);
+    let control_slot = s.version_chain(StoreKind::Node, a).expect("chain")[0]
+        .1
+        .commit_info;
+    let b = in_txn(&mut s, 41, |s, txn| s.create_node(txn).expect("b").0);
+    let pinned_slot = s.version_chain(StoreKind::Node, b).expect("chain")[0]
+        .1
+        .commit_info;
+    assert_ne!(
+        control_slot, pinned_slot,
+        "the two transactions must own DIFFERENT slots, or there is no control"
+    );
+
+    // The writer that keeps the forged word unsettled: open, and deliberately writes nothing, so it
+    // owns no commit slot and cannot be what protects `pinned_slot`.
+    let holder = TxnId(pinned_slot);
+    s.begin(holder);
+
+    // The forge: node `a`'s `created_ts` is made to name `pinned_slot`, in exactly the encoding
+    // `rmp` #1069's write path will use. The word it replaces is captured so the second half can put
+    // it back.
+    let original = s
+        .read_mvcc_for_test(StoreKind::Node, a)
+        .expect("read header")
+        .created_ts;
+    let forge = TxnId(200);
+    s.begin(forge);
+    s.force_header_stamp_for_test(
+        forge,
+        StoreKind::Node,
+        a,
+        MvccStampField::Created,
+        VersionStamp::in_flight(holder),
+    )
+    .expect("forge the header stamp");
+    s.commit(forge).expect("commit forge");
+
+    // Now the passes. The control must be retired; the treatment must not.
+    assert!(
+        drive_gc_until(&mut s, 300, 6, |s| {
+            !s.commit_slot(control_slot)
+                .expect("read slot")
+                .expect("occupied")
+                .in_use()
+        }),
+        "the control slot must be retired by the census — without that this test proves nothing \
+         about the treatment slot"
+    );
+    assert!(
+        s.version_chain(StoreKind::Node, b)
+            .expect("chain")
+            .is_empty(),
+        "positive control: the treatment slot's own chain is gone, so no DELTA is what keeps it \
+         alive — only the forged header can be"
+    );
+    assert!(
+        s.commit_slot(pinned_slot)
+            .expect("read slot")
+            .expect("occupied")
+            .in_use(),
+        "a commit slot an MVCC header still names must NOT be retired: recycling it would leave \
+         that header naming an unrelated transaction (`rmp` #1069)"
+    );
+    assert!(
+        !s.commit_slot_is_free_for_test(pinned_slot),
+        "and it must certainly not be on the free list, where the next transaction would take it"
+    );
+
+    // Second half: take the name away, and the same census reclaims the same slot.
+    let unforge = TxnId(400);
+    s.begin(unforge);
+    s.force_header_stamp_for_test(
+        unforge,
+        StoreKind::Node,
+        a,
+        MvccStampField::Created,
+        original,
+    )
+    .expect("restore the header stamp");
+    s.commit(unforge).expect("commit restore");
+    assert!(
+        drive_gc_until(&mut s, 500, 6, |s| s
+            .commit_slot_is_free_for_test(pinned_slot)),
+        "once nothing names it, the census must reclaim the very slot it was declining to touch"
+    );
+
+    s.rollback(holder).expect("release the holder");
+    assert_consistent(&mut s, "after a forged header pin was released");
+}
+
+/// A commit slot the census retires is **not reusable in the same instant**: it is parked, and a
+/// later pass lists it (`D-orphan-slot-parking`, `rmp` #1069).
+///
+/// The hazard the parking closes is the commit store's sharper version of the one it closes for
+/// record slots: an off-thread reader that captured a pointer into the slot before the pass began
+/// does not merely find a resurrected posting if the id is recycled — it finds an entirely different
+/// transaction's commit status where it left one it was mid-way through resolving.
+///
+/// **Non-vacuity.** The `retired` positive control is what stops this passing on a census that never
+/// retires anything: without it, "not on the free list" is satisfied by a build that does nothing at
+/// all. The final assertion is the other control — parking must be a delay, not a leak.
+#[test]
+fn a_retired_commit_slot_is_parked_before_it_becomes_reusable() {
+    let mut s = fresh();
+    let n = in_txn(&mut s, 1, |s, txn| s.create_node(txn).expect("create").0);
+    let slot = s.version_chain(StoreKind::Node, n).expect("chain")[0]
+        .1
+        .commit_info;
+
+    // Stop at the exact pass that retires the slot — `in_use` clear is the census's own signature.
+    let retired = drive_gc_until(&mut s, 100, 6, |s| {
+        !s.commit_slot(slot)
+            .expect("read slot")
+            .expect("occupied")
+            .in_use()
+    });
+    assert!(
+        retired,
+        "positive control: the census must actually retire the slot, else the assertion below is \
+         about a slot nothing ever touched"
+    );
+    assert!(
+        !s.commit_slot_is_free_for_test(slot),
+        "the pass that retired the slot must NOT have listed it: a commit slot never becomes \
+         allocatable in the same instant it stops being named (`D-orphan-slot-parking`)"
+    );
+
+    // And parking is a delay, not a leak.
+    assert!(
+        drive_gc_until(&mut s, 200, 6, |s| s.commit_slot_is_free_for_test(slot)),
+        "a later pass must list it, or parking has become a permanent leak"
+    );
+    assert_consistent(&mut s, "after a parked commit slot was listed");
 }
 
 // ============================================================================================
@@ -747,8 +1021,16 @@ fn an_orphan_undo_page_left_by_an_aborted_transaction_does_not_brick_open() {
 // Regression: the undo area must PLATEAU under sustained create/delete churn (`rmp` #966).
 // ============================================================================================
 
-/// Sustained churn — create entities, delete them, reclaim, repeat — must leave `undo.store`'s
-/// physical-id high-water **flat**. Every delta a reclaimed entity accumulated must come back.
+/// Sustained churn — create entities, delete them, reclaim, repeat — must leave the physical-id
+/// high-water of **both** undo-area stores flat. Every delta a reclaimed entity accumulated must
+/// come back, and so must every transaction's commit slot.
+///
+/// The `commit.store` half is the `rmp` #1069 regression guard. That task took the decision to free
+/// a commit slot away from the `delta_count` rule and gave it to the reference census, on the
+/// grounds that a count is not a proof — and the one way to pay for that safety without noticing is
+/// to stop reclaiming slots at all. A leak there is per **transaction**, not per entity, and it is
+/// exactly as silent as the delta leak this test was originally written for: nothing errs, nothing
+/// fails the consistency checker, and the store just grows. Only counting catches it.
 ///
 /// # The defect this pins closed, and why it needed its own test
 ///
@@ -783,7 +1065,9 @@ fn the_undo_store_plateaus_under_sustained_create_delete_churn() {
     });
 
     let undo_high_water = |s: &Store| s.read_view().meta().high_water(StoreKind::Undo);
+    let commit_high_water = |s: &Store| s.read_view().meta().high_water(StoreKind::Commit);
     let mut warm_high_water = 0u64;
+    let mut warm_commit_high_water = 0u64;
     let mut total_reclaimed = 0usize;
     let mut next = 2u64;
 
@@ -823,6 +1107,7 @@ fn the_undo_store_plateaus_under_sustained_create_delete_churn() {
 
         if round == WARMUP {
             warm_high_water = undo_high_water(&s);
+            warm_commit_high_water = commit_high_water(&s);
         } else if round > WARMUP {
             assert_eq!(
                 undo_high_water(&s),
@@ -832,6 +1117,15 @@ fn the_undo_store_plateaus_under_sustained_create_delete_churn() {
                  reused (see this test's docs: the `reclaim_node` ordering)",
                 undo_high_water(&s)
             );
+            assert_eq!(
+                commit_high_water(&s),
+                warm_commit_high_water,
+                "round {round}: `commit.store` must not grow once the churn is in steady state — \
+                 its high-water went {warm_commit_high_water} -> {}. Since `rmp` #1069 a slot is \
+                 reclaimed by the census and re-listed a pass later, so this is the assertion that \
+                 says that path still completes rather than merely being safe",
+                commit_high_water(&s)
+            );
         }
     }
 
@@ -839,6 +1133,11 @@ fn the_undo_store_plateaus_under_sustained_create_delete_churn() {
     assert!(
         warm_high_water > 1,
         "positive control: deltas must actually have been allocated (high-water {warm_high_water})"
+    );
+    assert!(
+        warm_commit_high_water > 1,
+        "positive control: commit slots must actually have been allocated (high-water \
+         {warm_commit_high_water})"
     );
     assert!(
         total_reclaimed >= PER_ROUND * 3 * (ROUNDS as usize - 2),

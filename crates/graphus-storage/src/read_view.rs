@@ -497,7 +497,7 @@ fn collect_undo_history<D: BlockDevice, S: LogSink, P: StorePages>(
     if let Some((id, commit_info)) = fault {
         return Err(GraphusError::Storage(format!(
             "undo delta {id} names commit slot {commit_info} which holds no record; a slot must \
-             outlive its last delta (`05 §12.4`), so this version cannot be resolved"
+             outlive its last reference (`05 §12.4`), so this version cannot be resolved"
         )));
     }
     Ok(out)

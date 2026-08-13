@@ -210,7 +210,7 @@ pub enum DeltaVerdict {
 ///
 /// # Errors
 /// Returns a storage error when the delta is live but its commit slot could not be resolved. That is
-/// the one thing `05 §12.4` promises can never happen ("a slot outlives its last delta"), so it is
+/// the one thing `05 §12.4` promises can never happen ("a slot outlives its last reference"), so it is
 /// **failed closed** rather than guessed: a delta whose commit status is unknowable could be either
 /// visible or invisible, and picking one would silently corrupt the reconstructed version.
 pub(crate) fn delta_verdict(
@@ -228,7 +228,7 @@ pub(crate) fn delta_verdict(
     let Some(slot) = slot else {
         return Err(GraphusError::Storage(format!(
             "undo delta {delta_id} names commit slot {} which holds no record; a slot must outlive \
-             its last delta (`05 §12.4`), so this version cannot be resolved",
+             its last reference (`05 §12.4`), so this version cannot be resolved",
             delta.commit_info
         )));
     };
@@ -605,7 +605,7 @@ impl SupersetProperties {
     ///
     /// # Errors
     /// Returns a storage error if a live delta's commit slot could not be resolved. That is the one
-    /// thing `05 §12.4` promises can never happen ("a slot outlives its last delta"), so the
+    /// thing `05 §12.4` promises can never happen ("a slot outlives its last reference"), so the
     /// reconstruction is failed **closed** rather than completed from a partial chain: a
     /// partially-undone image is a value no transaction ever wrote.
     pub fn decide(self, snapshot: Snapshot) -> Result<DecidedProperties> {
@@ -962,7 +962,7 @@ mod tests {
         let chain = SupersetProperties::from_chain(vec![cell(1, 7, 2, 0xBB)], vec![orphan]);
         let err = chain.decide(snapshot_at(9, 1)).expect_err("fails closed");
         assert!(
-            format!("{err}").contains("slot must outlive its last delta"),
+            format!("{err}").contains("slot must outlive its last reference"),
             "the error must name the invariant that failed: {err}",
         );
     }
