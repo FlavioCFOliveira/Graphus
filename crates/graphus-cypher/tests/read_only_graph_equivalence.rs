@@ -299,7 +299,6 @@ impl Coordinated {
             store.read_view(),
             store.token_snapshot(),
             snapshot,
-            store.commit_registry_snapshot(),
             txn,
             SsiReadBuffer::new(txn),
         )
@@ -745,7 +744,6 @@ fn self_delete_visibility_is_identical() {
     // own in-flight tombstones are visible to its self-delete discriminator. The live seam is
     // standalone here (no coordinator needed — this path records no SIREAD markers), and the reader uses
     // the same snapshot + registry.
-    let registry = s.commit_registry_snapshot();
     let view = s.read_view();
     let tokens = s.token_snapshot();
     let live = RecordStoreGraph::begin_at_snapshot(s, writer, committed_ts);
@@ -753,7 +751,6 @@ fn self_delete_visibility_is_identical() {
         view,
         tokens,
         Snapshot::new(writer, committed_ts),
-        registry,
         writer,
         SsiReadBuffer::new(writer),
     );

@@ -44,7 +44,8 @@
 //! * **The per-row re-check is snapshot-correct, and lives above this module.** A zone map produces
 //!   **candidates**, never rows: [`candidate_ranges_eq`](ZoneMap::candidate_ranges_eq) /
 //!   [`candidate_ids_eq`](ZoneMap::candidate_ids_eq) hand an id superset to a seam that owns the
-//!   reader's `(Snapshot, CommitRegistry)` pair — `RecordStoreGraph::zone_scan_eq`, which re-checks
+//!   reader's snapshot and the store's own commit oracle (`rmp` #1069 phase 3) —
+//!   `RecordStoreGraph::zone_scan_eq`, which re-checks
 //!   through `label_bitmap_at` + `is_visible_via` exactly as every index seek does (`rmp` #958). This
 //!   module holds no snapshot and therefore decides nothing about visibility.
 //!

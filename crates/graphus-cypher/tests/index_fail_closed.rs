@@ -1715,7 +1715,6 @@ fn the_off_thread_label_filter_fails_closed_on_a_read_fault() {
         inputs.view,
         inputs.tokens,
         inputs.snapshot,
-        inputs.registry,
         txn,
         SsiReadBuffer::new(txn),
     );
@@ -1737,7 +1736,6 @@ fn the_off_thread_label_filter_fails_closed_on_a_read_fault() {
         inputs2.view,
         inputs2.tokens,
         inputs2.snapshot,
-        inputs2.registry,
         txn2,
         SsiReadBuffer::new(txn2),
     );

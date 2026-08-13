@@ -456,13 +456,13 @@ pub struct CommitSlot {
     ///
     /// | Population | Payload | Resolved by |
     /// | --- | --- | --- |
-    /// | record header (`MvccHeader::created_ts` / `expired_ts`) | a **commit slot id** from `rmp` #1069 phase 3 | [`graphus_txn::CommitOracle`] — the one door |
-    /// | **this** field | a `TxnId`, now and after phase 3 | [`crate::scan_polarity::delta_verdict`] and `open_writer_of`, in this crate |
+    /// | record header (`MvccHeader::created_ts` / `expired_ts`) | a **commit slot id** since `rmp` #1069 phase 3, typed [`HeaderStamp`](graphus_core::HeaderStamp) | [`graphus_txn::CommitOracle`] — the one door |
+    /// | **this** field | a `TxnId`, before phase 3 and after it | [`crate::scan_polarity::delta_verdict`] and `open_writer_of`, in this crate |
     ///
     /// Passing this word to [`resolve_stamp`](graphus_txn::CommitOracle::resolve_stamp) is a
-    /// type-correct call that produces **silently wrong visibility**: it would resolve a slot id as
-    /// though it were a transaction id. The two resolvers stay separate deliberately, and
-    /// `delta_verdict` was deliberately left untouched by the #1069 phase-2 migration.
+    /// type-correct call that produces **silently wrong visibility**: it would resolve a `TxnId` as
+    /// though it were a slot id. The two resolvers stay separate deliberately, and `delta_verdict`
+    /// was left untouched by both the #1069 phase-2 migration and the phase-3 flip.
     pub commit_ts: u64,
     /// The owning transaction's id, retained after commit for recovery and diagnostics.
     pub txn_id: u64,

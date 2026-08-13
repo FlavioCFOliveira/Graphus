@@ -49,6 +49,8 @@
 //! catalog); this module owns only the **block codec** ([`HeapBlock`]) and the layout constants, kept
 //! here and unit-tested in isolation exactly like [`crate::record`].
 
+use graphus_core::TxnId;
+
 use crate::record::{MVCC_HEADER_SIZE, MvccHeader};
 
 /// Bytes of payload carried by one heap block (the block record minus its header overhead).
@@ -87,12 +89,35 @@ pub struct HeapBlock {
 
 impl HeapBlock {
     /// A fresh, live, in-use block carrying `chunk` (which must be at most [`BLOCK_PAYLOAD`] bytes)
-    /// and pointing at `next_block`.
+    /// and pointing at `next_block`, attributed to `creator`.
+    ///
+    /// # ⚠ `creator` is written RAW, and is not a [`HeaderStamp`](graphus_core::HeaderStamp)
+    ///
+    /// It lands in the block's [`MvccHeader::created_ts`] field, which everywhere else in the engine
+    /// holds a *stamp* — a `0` sentinel, a settled timestamp, or (since `rmp` #1069 phase 3) a
+    /// `commit.store` slot id. This one is none of those: it is the writer's [`TxnId`] with no
+    /// encoding applied at all, and it has been since `rmp` #410.
+    ///
+    /// That is **sound, and it is not a stamp in disguise**, because `strings.store` is not a
+    /// versioned store ([`StoreKind::is_versioned`](crate::store::StoreKind::is_versioned) is `false`
+    /// for it): a heap block has no visibility of its own, is never frozen, never tombstoned, never
+    /// anchored to an undo chain, and — decisively — this field is never passed to
+    /// [`CommitOracle`](graphus_txn::CommitOracle). Its one and only consumer is the `rmp` #398
+    /// orphan-page well-formedness check, which tests it for **non-zero** and nothing else; `rmp`
+    /// #410 asserts at the write site that `TxnId(0)` never reaches here for exactly that reason.
+    ///
+    /// Stating it matters because the two conventions now read the same bytes differently and both
+    /// readings are wrong here: a raw `TxnId` decodes as `HeaderStamp::Committed(Timestamp(txn.0))`,
+    /// i.e. as a *settled* stamp naming a timestamp that was never issued. Nothing resolves it, so
+    /// nothing observes that — but a future reader who assumes "every `created_ts` is a
+    /// `HeaderStamp`" would be quietly wrong, and this doc plus the [`TxnId`] parameter type are what
+    /// stop that assumption from being invisible. Taking a `TxnId` rather than a `u64` also makes a
+    /// stamp word unpassable here by mistake.
     ///
     /// # Panics
     /// Panics if `chunk` is longer than [`BLOCK_PAYLOAD`] (an internal invariant of the chunker).
     #[must_use]
-    pub fn new(created_ts: u64, chunk: &[u8], next_block: u64) -> Self {
+    pub fn new(creator: TxnId, chunk: &[u8], next_block: u64) -> Self {
         assert!(
             chunk.len() <= BLOCK_PAYLOAD,
             "heap chunk {} exceeds block payload {BLOCK_PAYLOAD}",
@@ -101,7 +126,8 @@ impl HeapBlock {
         let mut payload = [0u8; BLOCK_PAYLOAD];
         payload[..chunk.len()].copy_from_slice(chunk);
         Self {
-            mvcc: MvccHeader::live(created_ts),
+            // Raw, unencoded — see the doc above. NOT `HeaderStamp::committed`/`slot`.
+            mvcc: MvccHeader::live(creator.0),
             // A chunk is at most BLOCK_PAYLOAD (<= u16::MAX), so this cast is lossless.
             len: chunk.len() as u16,
             next_block,
@@ -187,7 +213,7 @@ mod tests {
     #[test]
     fn block_round_trips_every_field() {
         let chunk: Vec<u8> = (0..BLOCK_PAYLOAD as u8).collect();
-        let b = HeapBlock::new(7, &chunk, 42);
+        let b = HeapBlock::new(TxnId(7), &chunk, 42);
         let mut buf = [0u8; STRINGS_RECORD_SIZE];
         b.encode(&mut buf);
         let got = HeapBlock::decode(&buf);
@@ -201,7 +227,7 @@ mod tests {
 
     #[test]
     fn empty_chunk_block_is_in_use_with_zero_len() {
-        let b = HeapBlock::new(1, &[], 0);
+        let b = HeapBlock::new(TxnId(1), &[], 0);
         assert_eq!(b.len, 0);
         assert_eq!(b.next_block, 0);
         assert!(b.bytes().is_empty());
@@ -211,7 +237,7 @@ mod tests {
     #[test]
     fn bytes_clamps_a_corrupt_overlong_len() {
         // A corrupt record could carry len > BLOCK_PAYLOAD; bytes() must never index past payload.
-        let mut b = HeapBlock::new(1, &[1, 2, 3], 0);
+        let mut b = HeapBlock::new(TxnId(1), &[1, 2, 3], 0);
         b.len = u16::MAX;
         assert_eq!(b.bytes().len(), BLOCK_PAYLOAD);
     }
@@ -220,7 +246,7 @@ mod tests {
     #[should_panic(expected = "exceeds block payload")]
     fn new_rejects_an_overlong_chunk() {
         let too_big = vec![0u8; BLOCK_PAYLOAD + 1];
-        let _ = HeapBlock::new(1, &too_big, 0);
+        let _ = HeapBlock::new(TxnId(1), &too_big, 0);
     }
 
     #[test]

@@ -212,7 +212,7 @@ pub enum DeltaVerdict {
 ///
 /// `slot.commit_ts` and `MvccHeader::created_ts`/`expired_ts` share the [`VersionStamp`] encoding
 /// but are **two different populations of words** (`rmp` #1069). A header stamp is resolved through
-/// the one door, [`graphus_txn::CommitOracle`], and from #1069 phase 3 its payload is a **commit
+/// the one door, [`graphus_txn::CommitOracle`], and since #1069 phase 3 its payload is a **commit
 /// slot id**. `slot.commit_ts`'s payload is a [`TxnId`](graphus_core::TxnId), now and after phase 3
 /// — see [`CommitSlot::commit_ts`](crate::undo::CommitSlot::commit_ts).
 ///

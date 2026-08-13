@@ -10,7 +10,15 @@
 //!   former infallible `is_visible` free function was **removed**, not deprecated, so no caller can
 //!   decide visibility around it. [`CommitOracle`] serves the record header
 //!   (`created_ts`/`expired_ts`) and **never** `graphus_storage::undo::CommitSlot::commit_ts`, which
-//!   shares the [`VersionStamp`] encoding but is a different population of words.
+//!   shares the bit layout but is a different population of words — since `rmp` #1069 phase 3 the
+//!   two have distinct types ([`graphus_core::HeaderStamp`] and [`VersionStamp`]) precisely because
+//!   the compiler cannot otherwise tell them apart.
+//!
+//!   The implementor of that door is now `graphus_storage::RecordStore` (and its off-thread twin
+//!   `StoreReadView`), which resolves a header stamp against the **durable** commit slot the word
+//!   names. This crate's [`CommitRegistry`] is no longer a `CommitOracle`: it still records commit
+//!   outcomes by `TxnId`, and [`RegistryOracle`] is the explicitly-named way to resolve the
+//!   populations that still carry one — see its docs for the two legitimate uses.
 //! - **Statement-level isolation** (`§5.1.4`, `rmp` #972): a [`Snapshot`] names not only the
 //!   transaction and its begin timestamp but the **statement** within it ([`graphus_core::CommandId`])
 //!   and which side of that statement the read is taken on ([`View`]). `View::New` is
@@ -95,4 +103,4 @@ pub use ssi::{PredicateRead, SsiReadBuffer, SsiTracker};
 #[cfg(any(test, feature = "test-support"))]
 pub use store::MemVersionedStore;
 pub use store::{Key, Version, VersionedStore};
-pub use visibility::{CommitOracle, StampOutcome, is_visible_via};
+pub use visibility::{CommitOracle, RegistryOracle, StampOutcome, is_visible_via};

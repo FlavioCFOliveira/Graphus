@@ -83,7 +83,7 @@ A single Cargo workspace, Edition 2024, 64-bit-only targets (`D-target-matrix`).
 | `graphus-wal` | lib | WAL record format, log writer with group commit, LSN allocation, checkpointer, ARIES analysis/redo/undo, recovery driver. |
 | `graphus-bufpool` | lib | Frame table, page latches, pin counts, eviction (CLOCK/2Q), prefetch, write-back coordination with WAL (WAL rule). |
 | `graphus-chainhead` | lib | The **prepend publication protocol** every chain head in the storage core shares — `first_rel`, `first_prop` and the MVCC `undo_ptr` (§5.7.1): the four ordered steps, the retry a refused publication demands, and the `ChainHead` trait that states the two obligations the underlying medium must honour. A true **leaf**: it depends on no other crate, and that is a requirement rather than an accident. `--cfg loom` is a global rustflag, so a protocol that must be model-checked cannot live in a crate that reaches `graphus-bufpool`, whose own loom seam would then stop matching. `#![forbid(unsafe_code)]`. |
-| `graphus-freezefloor` | lib | The **freeze frontier** of the fixed-record stores (§5.6): the lower bound below which the incremental GC's freeze sweep has already visited every record, and the three — and only three — operations its algebra admits. It **descends** by `fetch_min` (a writer announcing a stamp below it), it **rises** only by a compare-exchange against the value the sweep started from (so a descent that lands mid-sweep refuses the raise instead of being swallowed), and it is stored into only to initialise it. A plain store in either of the first two roles strands a committed writer's stamp below the frontier, where no later sweep visits it — the silent-data-loss shape of tasks `#522` and `#778`. A true **leaf** for the same reason as `graphus-chainhead`, and the type is the one `RecordStore` holds, so the `loom` models check the production cell rather than a copy of it. `#![forbid(unsafe_code)]`. |
+| `graphus-freezefloor` | lib | The **freeze frontier** of the fixed-record stores (§5.6): the lower bound below which the incremental GC's freeze sweep has already visited every record, and the three — and only three — operations its algebra admits. It **descends** by `fetch_min` (a writer announcing a stamp below it), it **rises** only by a compare-exchange against the value the sweep started from (so a descent that lands mid-sweep refuses the raise instead of being swallowed), and it is stored into only to initialise it. A plain store in either of the first two roles strands a committed writer's stamp below the frontier, where no later sweep visits it — the silent-data-loss shape of tasks `#522` and `#778`. **That shape is closed since task `#1069`**: a stranded stamp still names its commit slot and still resolves (§5.3), so a mis-advanced frontier now costs a stamp that is never settled and a slot that is never reclaimed, not a committed version that reads as absent. The frontier is a performance frontier from here on, and task `#1070` retires it. A true **leaf** for the same reason as `graphus-chainhead`, and the type is the one `RecordStore` holds, so the `loom` models check the production cell rather than a copy of it. `#![forbid(unsafe_code)]`. |
 | `graphus-storage` | lib | Page formats; node/relationship/property/label record codecs; index-free adjacency chains; token/dictionary store; free-space management; element-ID→physical-ID map. |
 | `graphus-index` | lib | B+-tree, token-lookup index, composite & relationship-property indexes; constraint checks; index recovery. |
 | `graphus-txn` | lib | Transaction lifecycle, MVCC version chains and their undo deltas, visibility, SSI conflict tracker, timestamp oracle, version GC, write-conflict detection (§5.7), latch policy. |
@@ -204,16 +204,16 @@ MVCC header so versioning is intrinsic to the store, not bolted on.
 All layouts below are the **logical fields**; sizes are the design target, and the frozen byte-exact
 layouts are in `05-storage-format.md` §9. The §12 version-storage spike that once gated this section
 is **resolved** (`D-version-representation`, 2026-08-02): the MVCC header is **inline** in every
-record, and `version_ptr` is the head of that entity's unified undo-delta chain (§5.1).
+record, and `undo_ptr` is the head of that entity's unified undo-delta chain (§5.1).
 
 **Common MVCC record header (in every node/rel/property record):**
 
 | Field | Bytes | Meaning |
 | --- | --- | --- |
 | `flags` | 1 | in-use, is-tombstone, has-overflow, dense-node bits |
-| `xmin` | 8 | creating transaction's commit timestamp (or txid while uncommitted) |
-| `xmax` | 8 | deleting/superseding transaction's commit timestamp (0 = live) |
-| `version_ptr` | 8 | physical id of older version (undo/version chain head; 0 = none) |
+| `xmin` | 8 | the creating transaction's **header stamp**: its commit timestamp once settled, or — while unsettled — the physical id of that transaction's slot in `commit.store`, never its `TxnId` (task #1069; §5.3 and `05-storage-format.md` §7) |
+| `xmax` | 8 | the expiring transaction's header stamp, in the same encoding; `0` = live |
+| `undo_ptr` | 8 | physical id of older version (undo/version chain head; 0 = none) |
 
 **Node record (`nodes.store`), fixed 40–48 B target:**
 
@@ -946,13 +946,21 @@ version GC already uses (§5.5).
 every delta of its transaction, and that slot is published by a single atomic store at commit.** This
 one indirection is the load-bearing part of the whole design, and it is worth stating why in full.
 
-Without it, committing a transaction that touched *k* records means writing *k* timestamps, and every
-one of those writes must be made durable and must be found again after a crash. Graphus pays that cost
-today: a committed writer's records keep an in-flight stamp until a **freeze sweep** rewrites each one
-in place, scanning `[freeze_low, high_water)` across all three stores
-(`crates/graphus-storage/src/store.rs:778-786`). The frontier is a correctness-critical invariant of
-its own, it has needed its own release-active audit (`store.rs:571-576`), and moving it past a live
-writer caused a silent-data-loss defect (rmp #522). With the indirection, commit is **one atomic store
+**Since task #1069 the record header goes through the same slot** (`05-storage-format.md` §7). The
+paragraph below described the cost Graphus was still paying because it did not: the header was the one
+axis of the store decided outside the unified chain, and the freeze sweep existed to pay for it. That
+sweep still runs — retiring it is task #1070 — but it is no longer the thing that makes an unsettled
+stamp resolvable, and so it is no longer load-bearing for correctness: a stamp resolves through its
+slot whether the sweep has reached it or not. What the sweep now buys is that a settled stamp costs no
+indirection to read.
+
+Without the indirection, committing a transaction that touched *k* records means writing *k*
+timestamps, and every one of those writes must be made durable and must be found again after a crash.
+That was the cost the header used to pay: a committed writer's records kept an in-flight stamp until a
+**freeze sweep** rewrote each one in place, scanning `[freeze_low, high_water)` across all three
+stores. The frontier is a correctness-critical invariant of its own, it has needed its own
+release-active audit, and moving it past a live writer caused a silent-data-loss defect (rmp #522).
+With the indirection, commit is **one atomic store
 into one slot**, and every delta of that transaction becomes committed at the same instant, because
 every one of them reads its timestamp through the slot. Memgraph does exactly this, in one line:
 `transaction_.commit_info->timestamp.store(*commit_timestamp_, std::memory_order_release)`
@@ -969,18 +977,29 @@ answer to the same problem the freeze sweep answers here. The shared commit slot
 instead of answering it.
 
 **Consequences to hold.** The slot is per-transaction, so it must outlive the transaction object and
-be reclaimed only when the last delta referring to it is reclaimed. It is read on every visibility
+be reclaimed only when **every** reference to it is gone — which since #1069 means deltas *and* record
+headers, and is why reclamation is a census rather than a count (`05-storage-format.md` §12.4). It is
+read on every visibility
 decision, so it is a read-mostly, heavily-shared cache line and must be sized and padded accordingly
 (§10.2). And because the slot is published by a single release store, **every delta of the transaction
 becomes committed at the same instant** — which is atomicity (the **A** of ACID) expressed directly in
 the data structure rather than reconstructed by a sweep.
 
-That single store settles the deltas; it is not the whole of publication. A commit also has to appear
-in the in-memory commit registry, which is what resolves an in-flight stamp still sitting in a record
-header, so publication is **two writes in two media** and cannot be made instantaneous the way
-Memgraph's is. What guarantees that no reader ever observes the transaction half-published is
-therefore not the store's atomicity but the horizon of §5.2: the commit timestamp stays unpublished —
-and no snapshot may reach it — until both writes are done.
+That single store settles the deltas — and, since #1069, the record headers with them. It is still
+not the whole of publication: a commit also has to appear in the **in-memory commit registry**, so
+publication remains **two writes in two media** and cannot be made instantaneous the way Memgraph's
+is. What that second write is for has changed, and the distinction matters: it is no longer what
+resolves a record header — the slot is (§5.3). What the registry remains is the process's record of
+**commit outcomes keyed by `TxnId`**, rebuilt from the log's commit records when a store is opened,
+and therefore the only thing that can translate a stamp whose payload really is a `TxnId`. The commit
+path still depends on it in that role, which is why the entry is published where it is: the in-memory
+label-version history retained by the store is settled from its in-flight form to `Committed(ts)`
+immediately afterwards, and it can only be settled while the registry still holds the writer.
+
+What guarantees that no reader ever observes the transaction half-published is therefore not the
+store's atomicity but the horizon of §5.2: the commit timestamp stays unpublished — and no snapshot
+may reach it — until both writes are done. That rule is unchanged by #1069, because the second write
+still publishes state a concurrent reader may consult.
 
 #### 5.1.4 Statement-level isolation: `command_id`
 
@@ -1086,7 +1105,7 @@ read that can observe a change:
   the walk **stops**. This gives statement granularity to the two folds that already walked the
   chain — a property's value and a node's label bitmap.
 - `read_view::entity_visible_at` decides whether a node or a relationship **exists** as of the
-  snapshot, which is also what makes an edge traversable. It refines `graphus_txn::is_visible`
+  snapshot, which is also what makes an edge traversable. It refines `graphus_txn::is_visible_via`
   exactly where the two header words run out of information, by applying the transaction's own
   `DeleteObject` / `RecreateObject` deltas.
 
@@ -1282,15 +1301,24 @@ A central **timestamp oracle** issues monotonically increasing logical timestamp
 - **commit timestamp** issued at the start of commit, after SSI validation succeeds. Issuing it and
   making it visible are **two distinct instants**, and the second one is what a snapshot may observe.
 
-Uncommitted versions are tagged with the writer's `TxnId` (distinguished from committed timestamps by
-a high bit) so visibility checks can resolve in-flight writers via the Active Transaction Table.
+A version whose writer has not yet settled its stamp is tagged with the **physical id of that
+writer's slot in `commit.store`**, distinguished from a committed timestamp by a high bit (task
+**#1069**; `05-storage-format.md` §7 freezes the encoding, §5.3 below specifies the resolution).
+Until #1069 the tag was the writer's `TxnId` and a visibility check resolved it through the in-memory
+Active/Recent Transaction Table; it now resolves through the durable slot, so the answer no longer
+depends on process memory.
+
+**The commit slot's own `commit_ts` word keeps the older convention** — its payload is a `TxnId`
+(`05-storage-format.md` §12.4). The two populations share one bit layout, and neither may be
+resolved by the other's oracle: doing so is a well-formed question about the wrong transaction, and
+it answers silently.
 
 **The snapshot invariant is normative** (`D-published-snapshot-horizon`, ratified 2026-08-12, task
 **#1056**):
 
 > A snapshot taken at timestamp `V` sees every transaction whose commit timestamp is at or below `V`.
 
-Every reader in the engine already *assumed* it. `graphus_txn::visibility::is_visible` admits a
+Every reader in the engine already *assumed* it. `graphus_txn::visibility::is_visible_via` admits a
 committed creator exactly when its commit timestamp is ≤ the snapshot's, the chain walk of §5.3 stops
 on the same test, and the SSI tracker of §5.4 reads `commit_ts ≤ begin_ts` as "committed before it
 began" and therefore forms no rw-antidependency edge. What no mechanism did was **establish** it.
@@ -1298,7 +1326,10 @@ began" and therefore forms no rw-antidependency edge. What no mechanism did was 
 **Why the allocation clock is not a snapshot.** A commit publishes itself in two writes in two media —
 the durable commit-info slot of §5.1.3, then the in-memory commit registry — while the commit
 timestamp is issued *before* both. Handing out the allocation clock as a begin timestamp therefore
-promises a reader a commit that neither visibility oracle will yet admit. While one thread owned the
+promises a reader a commit that no oracle will yet admit. (When this defect was found there were two
+oracles, and the sentence read "neither"; since task #1069 a record header resolves through the slot
+alone — §5.3. The argument is unchanged either way, because the timestamp is issued before the
+**first** of the two writes.) While one thread owned the
 write path the two instants could not be told apart; under `D-multi-writer` they can, and a
 transaction that begins inside that window reads the pre-commit value of every record the committing
 transaction wrote. When that transaction is itself a writer, it computes its own write from the value
@@ -1371,23 +1402,41 @@ A transaction `T` with snapshot `s` sees version `v` iff:
 1. `v.xmin` is committed with `commit_ts(xmin) ≤ s`, **and**
 2. `v.xmax` is 0, OR `v.xmax` is uncommitted, OR `v.xmax` aborted, OR `commit_ts(xmax) > s`.
 
-A transaction always sees its **own** uncommitted writes (its `TxnId` matches). This yields
-Snapshot Isolation reads; SSI (below) upgrades correctness to Serializable without adding read
-locks.
+A transaction always sees its **own** uncommitted writes. This yields Snapshot Isolation reads; SSI
+(below) upgrades correctness to Serializable without adding read locks.
+
+**Both clauses resolve through one oracle, and since task #1069 there is only one**
+(`D-version-representation`). A header stamp that is not yet settled names the writer's **commit
+slot** (§5.1.3),
+not its `TxnId`, so `xmin` and `xmax` are answered by the same durable indirection a delta is answered
+by: the slot says committed-at-`ts`, still open, or aborted, and it says so from the data rather than
+from any in-memory table. "Its own write" is therefore "this stamp names **my** slot", and it is the
+slot — never a cached shortcut — that has the final word.
+
+Two properties follow, and both are load-bearing elsewhere in this document. Resolving a stamp can now
+**fail**, because it reads a page; a read that cannot resolve a version fails closed and is never
+answered with a guess. And the answer no longer depends on process memory, which is what makes a
+backup image self-sufficient (`05-storage-format.md` §7 and §11) and what removes the *need* for the
+machinery the old in-memory oracle required in order to stay bounded — the per-record freeze sweep,
+its frontier, and the WAL reclamation floor that held a committed transaction's log record down until
+its stamps were settled. **All three still exist**; #1069 demoted them from correctness to
+performance, and task **#1070** is what removes them.
 
 **This two-clause rule is the answer *between* transactions, and it is complete as such.** It is not
 the whole answer *within* one, and it structurally cannot be: the two header words record **which
 transaction** created or expired a version and never **which statement of it**, because
 `05-storage-format.md` §12.2 put the `command_id` on the undo **delta** rather than in the live
 record. So the "own uncommitted writes" override above is stated at *transaction* granularity, which
-is the strongest answer those two words support. `graphus_txn::is_visible` implements exactly this
-rule and deliberately answers nothing finer.
+is the strongest answer those two words support. `graphus_txn::is_visible_via` implements exactly this
+rule and deliberately answers nothing finer. It takes a `CommitOracle` rather than a table, and it is
+the **only** way to decide a header's visibility: the former `is_visible` was removed rather than
+deprecated, so that no caller can reach that decision without going through the oracle.
 
 **Statement granularity is resolved one layer down, against the entity's undo chain** (§5.1.4). Two
 functions divide the work and neither duplicates the other:
 
 - `graphus_storage::read_view::entity_visible_at` answers **existence** — whether a node or a
-  relationship is there as of the reader's statement. It starts from `is_visible`'s verdict and
+  relationship is there as of the reader's statement. It starts from `is_visible_via`'s verdict and
   refines it only where the header cannot decide, by applying the reader's own transaction's
   `DeleteObject` and `RecreateObject` deltas. Under `View::New` the two answers are identical by
   construction, so the refinement costs one comparison and no chain walk.
@@ -1594,13 +1643,22 @@ contract between §5 and the rest of the engine.
   the oldest active begin timestamp — but the reclaimable unit becomes the delta below that watermark
   as well as the dead record. Two obligations follow: a delta may not be reclaimed while any live
   snapshot can still reach it through a chain, and the transaction's commit-info slot (§5.1.3) may not
-  be reclaimed while any delta still refers to it.
+  be reclaimed while **anything still names it**. Since task #1069 that second obligation is decided
+  by a **census of references** and not by a count of deltas: a slot is reachable when a live delta
+  names it in `commit_info`, **or** an in-use record header names it in `xmin`/`xmax`, **or** it
+  belongs to an open transaction. Slot ids are recycled, so one missed reference silently
+  re-attributes a committed version to another transaction. A slot the census has proved unreachable
+  is then **parked** for one collection pass before its id returns to the allocator
+  (`05-storage-format.md` §12.4).
 
-**What disappears from this interface.** The freeze sweep does. Today a committed writer's records
-carry in-flight stamps until a sweep rewrites each one in place across
-`[freeze_low, high_water)` (`crates/graphus-storage/src/store.rs:778-786`); with the commit
-indirection point (§5.1.3) a transaction's commit timestamp is published once, so there is nothing
-left to rewrite and no frontier to maintain.
+**What disappears from this interface.** The freeze sweep does — as an *obligation*, since task
+#1069, and as *code* with task #1070. A committed writer's records carry unsettled stamps until a
+sweep rewrites each one in place across `[freeze_low, high_water)`
+(`RecordStore::freeze_store_headers_incremental`); with the commit indirection point (§5.1.3) a
+transaction's commit timestamp is published once, and since #1069 the record header reads it through
+that same slot, so there is nothing a reader needs the sweep to have done. The sweep and its frontier
+are still present and still run on every GC pass: settling a stamp spares every later reader an
+indirection, which is a performance argument and no longer a correctness one.
 
 ### 5.7 Latches, conflict detection, and multi-writer execution
 

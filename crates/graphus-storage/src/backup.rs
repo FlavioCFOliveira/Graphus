@@ -113,48 +113,49 @@ const DIGEST_LEN: usize = 4;
 /// Panics if the checkpoint's `fdatasync` fails (`04 §4.9`), inherited from
 /// [`WalManager::checkpoint`].
 pub fn backup_store<D: BlockDevice, S: LogSink>(store: &RecordStore<D, S>) -> Result<Vec<u8>> {
-    // 0. Freeze every committed-but-unfrozen MVCC header so the captured image is **MVCC-resolvable
-    //    without the WAL** (`rmp` task #149). A restored store opens with a fresh, empty WAL (the
-    //    backup carries the data image, not the log), so a version still keyed by its writer's
-    //    in-flight `TxnId` would be unresolvable and read as invisible. Settling them to their durable
-    //    `Committed(ts)` form first makes the base self-sufficient. This runs as a tiny self-contained
-    //    transaction (`begin → freeze → commit`) under a reserved id; it only rewrites header words to
-    //    the commit timestamps the records already committed at, so it changes no query-visible state.
-    //    The freeze txn is committed **only when it actually froze a header** — so a backup of an
-    //    already-frozen store (e.g. re-backing-up a freshly-restored store) burns no commit timestamp
-    //    and is byte-for-byte idempotent.
-    //     THE ID IS RESERVED, NOT PRIVATE (`rmp` #1086). `TxnId(u64::MAX)` here is the store's
-    //     `SYSTEM_TXN`, the same id the counter fold and `settle_counts_into_image` write under — and
-    //     those two serialise on `system_txn_lock` while this pass did not. Since `rmp` #1033/#975
-    //     puts `W` workers on one store, a `BACKUP` on one worker and a `COMMIT` on another really do
-    //     overlap, and then one thread's `commit(SYSTEM_TXN)` removes the active-table entry the other
-    //     is still writing under. That costs three separate things: the second commit fails with
-    //     "commit of inactive txn" (a durable commit reported as an error), a `begin` wipes the
-    //     freeze pass's retained undo chain (a rollback that undoes nothing while its `ABORT` record
-    //     says otherwise), and — the reason this was found — a redo floor sampled in between rises
-    //     above a record whose page has not been applied yet, which loses it from redo after a crash.
+    // 0. THE PRE-BACKUP HEADER FREEZE IS GONE (`rmp` #1069 phase 3), because what it existed to
+    //    guarantee is now guaranteed by the image itself.
     //
-    //     The guard is held across the WHOLE span, `begin` through `commit`/`rollback`, and released
-    //     before `settle_counts_into_image` below, which takes the same lock.
-    let freeze_txn = graphus_core::TxnId(u64::MAX);
-    {
-        let _system_txn = store.system_txn_guard();
-        let _begin_ts = store.begin(freeze_txn);
-        match store.freeze_committed_headers(freeze_txn) {
-            Ok(0) => {
-                // Nothing to freeze: roll the empty txn back so the meta page (and `commit_ts_hw`) is
-                // untouched, keeping the backup idempotent.
-                store.rollback(freeze_txn)?;
-            }
-            Ok(_) => {
-                store.commit(freeze_txn)?;
-            }
-            Err(e) => {
-                let _ = store.rollback(freeze_txn);
-                return Err(e);
-            }
-        }
-    }
+    //    It read: "freeze every committed-but-unfrozen MVCC header so the captured image is
+    //    MVCC-resolvable without the WAL (`rmp` task #149). A restored store opens with a fresh,
+    //    empty WAL, so a version still keyed by its writer's in-flight `TxnId` would be unresolvable
+    //    and read as invisible."
+    //
+    //    That premise was exactly right and is now false. An unsettled header stamp no longer names a
+    //    `TxnId` translatable only by the in-memory Active/Recent Transaction Table; it names a slot
+    //    in `commit.store`, which is one of the six stores this backup captures. The image therefore
+    //    carries its own commit oracle, and a restored store resolves every version from the data
+    //    alone — settled or not. There is nothing left for the freeze to make self-sufficient.
+    //
+    //    Removing it is not merely tidy. Kept, it would have turned a working operator flow into a
+    //    hard failure: a chain restore replays a base plus increments, the increments capture pages
+    //    the base's freeze never saw, so a restored chain carries unsettled stamps. Under phase 3 the
+    //    freeze would (for the first time) find them and rewrite their headers — dirtying pages whose
+    //    `page_lsn` was inherited from the ORIGINAL store's log, which the restored store does not
+    //    have. `set_page_lsn` is monotonic, so those frames can never satisfy the WAL-before-data
+    //    check and the flush fails closed: `BACKUP` of a restored chain would error out.
+    //
+    //    Two consequences worth stating plainly rather than leaving to be rediscovered:
+    //
+    //    * **Before phase 3 those restored increments were silently unreadable.** Their stamps named
+    //      writers no table could translate, and an unknown writer resolves as aborted — a committed
+    //      version read as invisible. Phase 3 fixes that as a side effect of having one oracle.
+    //    * **The monotonic-`page_lsn` hazard above is untouched, not fixed.** A restored image's
+    //      pages still claim LSNs from a log that no longer exists, so a restored store that dirties
+    //      such a page without raising its LSN can never flush it. That is pre-existing and out of
+    //      this task's scope; it is recorded here because this is where the evidence surfaced.
+    //
+    //    Settling a stamp remains a real optimisation — it removes an indirection from every later
+    //    read — and the sweep that does it on every GC pass, `freeze_store_headers_incremental`, is
+    //    untouched. It is simply no longer a *correctness* precondition for a backup.
+    //
+    //    One consequence is worth naming rather than leaving to be rediscovered:
+    //    [`RecordStore::freeze_committed_headers`] — the WHOLE-store variant, as opposed to the
+    //    frontier-based one the GC runs — was called from here and from nowhere else, so it now has
+    //    **no caller in the workspace**. It is deliberately retained rather than deleted: `rmp` #1069
+    //    does not retire the freeze machinery (that is #1070, which owns the decision), and it is the
+    //    operation the format-version-6 migration route names — performed by the *previous* build, on
+    //    an image this build refuses. #1070 must decide whether it survives that retirement.
 
     // 0b. Make the CARDINALITY self-sufficient without the WAL too (`rmp` #1067), for exactly the
     //     reason step 0 makes the MVCC headers self-sufficient. Since #1067 the durable counters are

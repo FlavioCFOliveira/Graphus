@@ -44,6 +44,46 @@ impl<'a> Counting<'a> {
     }
 }
 
+/// Forwards the `rmp` #1069 commit door untouched: this decorator counts record decodes, and a
+/// header-stamp resolution is not one.
+impl graphus_txn::CommitOracle for Counting<'_> {
+    fn resolve_stamp(
+        &self,
+        word: u64,
+    ) -> Result<graphus_txn::StampOutcome, graphus_core::error::GraphusError> {
+        self.inner.resolve_stamp(word)
+    }
+    fn names_writer(
+        &self,
+        word: u64,
+    ) -> Result<Option<graphus_core::TxnId>, graphus_core::error::GraphusError> {
+        self.inner.names_writer(word)
+    }
+    fn names_own_write(
+        &self,
+        word: u64,
+        owner: graphus_core::TxnId,
+    ) -> Result<bool, graphus_core::error::GraphusError> {
+        self.inner.names_own_write(word, owner)
+    }
+    fn resolve_for(
+        &self,
+        word: u64,
+        owner: graphus_core::TxnId,
+    ) -> Result<(graphus_txn::StampOutcome, bool), graphus_core::error::GraphusError> {
+        self.inner.resolve_for(word, owner)
+    }
+    fn audit_visibility(
+        &self,
+        snapshot: graphus_txn::Snapshot,
+        xmin: u64,
+        xmax: u64,
+        verdict: bool,
+    ) {
+        self.inner.audit_visibility(snapshot, xmin, xmax, verdict);
+    }
+}
+
 impl StoreReadSource for Counting<'_> {
     fn node(&self, id: u64) -> Result<NodeRecord, graphus_core::error::GraphusError> {
         self.inner.node(id)
@@ -79,10 +119,8 @@ impl StoreReadSource for Counting<'_> {
         id: u64,
         mvcc: graphus_storage::MvccHeader,
         snapshot: graphus_txn::Snapshot,
-        registry: &graphus_txn::CommitRegistry,
     ) -> Result<bool, graphus_core::error::GraphusError> {
-        self.inner
-            .entity_visible_at(kind, id, mvcc, snapshot, registry)
+        self.inner.entity_visible_at(kind, id, mvcc, snapshot)
     }
     fn superset_scan_node_properties(
         &self,
@@ -184,10 +222,8 @@ fn typed_expand_skips_nonmatching_reads_and_marks() {
     }
     s.commit(txn).unwrap();
 
-    let registry = s.commit_registry_snapshot();
     let ctx = VisCtx {
         snapshot: Snapshot::new(TxnId(99), s.snapshot_ts()),
-        registry: &registry,
         txn: TxnId(99),
     };
 
@@ -255,10 +291,8 @@ fn untyped_expand_marks_and_returns_all() {
     }
     s.commit(txn).unwrap();
 
-    let registry = s.commit_registry_snapshot();
     let ctx = VisCtx {
         snapshot: Snapshot::new(TxnId(99), s.snapshot_ts()),
-        registry: &registry,
         txn: TxnId(99),
     };
     let src = Counting::new(&s);

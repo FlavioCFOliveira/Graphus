@@ -32,7 +32,7 @@
 //! Run with `cargo test -p graphus-storage --test property_undo_chain_967`.
 
 use graphus_bufpool::page;
-use graphus_core::{GraphusError, PageId, Timestamp, TxnId, Value, VersionStamp};
+use graphus_core::{GraphusError, HeaderStamp, PageId, Timestamp, TxnId, Value, VersionStamp};
 use graphus_io::{BlockDevice, MemBlockDevice, Page};
 use graphus_storage::{Namespace, RecordStore, recovery};
 use graphus_txn::Snapshot;
@@ -809,7 +809,7 @@ fn open_image(image: &Image) -> Result<Store, GraphusError> {
     RecordStore::open(device, wal, 256)
 }
 
-/// Rewrites `image`'s metadata page into a genuine catalog of format version `target` (1 or 2).
+/// Rewrites `image`'s metadata page into a genuine catalog of format version `target` (1, 2 or 5).
 ///
 /// Both surgeries produce a real image rather than a mutilated one, because of how the catalog is
 /// laid out (`meta.rs::encode`):
@@ -874,7 +874,18 @@ fn downgrade_catalog_to(image: &mut Image, target: u32) {
             let truncated = (counts_at as u32) | (framed & 0x8000_0000);
             meta[len_at..len_at + 4].copy_from_slice(&truncated.to_le_bytes());
         }
-        other => panic!("this fixture only forges versions 1 and 2, not {other}"),
+        // Version 5: write 5 into the version word and cut NOTHING (`rmp` #1069). Version 6 adds no
+        // block and moves no byte — it changes what an unsettled MVCC stamp MEANS — so a version-5
+        // image is byte-for-byte this image with a different number, which is exactly the property
+        // that made the bump mandatory. Note what this arm deliberately does NOT do: it does not
+        // touch the framed length, so the format flag bit in its high bit is preserved. Clearing it
+        // would forge a version-1 header onto an image whose block says 5, and the fixture would be
+        // testing its own self-contradiction instead of the gate.
+        5 => {
+            let ver_at = chunk_at + magic_at + 8;
+            meta[ver_at..ver_at + 4].copy_from_slice(&5u32.to_le_bytes());
+        }
+        other => panic!("this fixture only forges versions 1, 2 and 5, not {other}"),
     }
     page::write_checksum(meta);
 }
@@ -1029,4 +1040,141 @@ fn a_legacy_store_carrying_a_property_tombstone_is_refused_at_open() {
             "with its data intact — the upgrade is lossless, which is why it is allowed",
         );
     }
+}
+
+// ===========================================================================================
+// 8. Refusing a pre-#1069 image rather than misreading its MVCC stamps
+// ===========================================================================================
+//
+// These live beside the #967 gate rather than in a file of their own because they need the same
+// apparatus — `capture`, `open_image`, `downgrade_catalog_to` — and that apparatus is the whole
+// point: forging a genuine older image, not a mutilated one, is what makes a version gate testable
+// at all. The two gates are also the same class of defect (`04 §5.2`, `05 §12.6`): identical bytes,
+// changed meaning.
+
+/// A store whose in-use records still carry **unsettled** MVCC stamps: one committed node with one
+/// property, and **no GC pass**, so nothing has been settled to a commit timestamp.
+///
+/// This is the shape the `rmp` #1069 gate must catch. It is deliberately the opposite of
+/// [`legacy_shaped_store`], whose GC pass settles every stamp — that one is the control.
+fn unsettled_store(key_name: &str) -> (Store, u32) {
+    let s = fresh();
+    let key = s
+        .intern_token(Namespace::PropKey, key_name)
+        .expect("intern");
+    let t1 = TxnId(1);
+    s.begin(t1);
+    let (n, _) = s.create_node(t1).expect("create node");
+    s.set_node_property_value(t1, n, key, &Value::Integer(7))
+        .expect("set");
+    s.commit(t1).expect("commit");
+    // NO gc: the node's and the cell's `created_ts` still name `t1`'s commit slot.
+    (s, key)
+}
+
+/// Every in-use record of the three MVCC stores whose `created_ts`/`expired_ts` is unsettled.
+fn unsettled_count(s: &Store) -> usize {
+    let mut n = 0;
+    for id in s.scan_node_ids().expect("scan nodes") {
+        let m = s.node(id).expect("node").mvcc;
+        n += usize::from(HeaderStamp::from_raw(m.created_ts).slot_id().is_some());
+        n += usize::from(HeaderStamp::from_raw(m.expired_ts).slot_id().is_some());
+    }
+    n
+}
+
+/// **`rmp` #1069 phase 3.** An image written before the bump, still carrying an unsettled MVCC
+/// stamp, must be **refused** at open — and an image written before the bump that is fully settled
+/// must **open**, because nothing in it can be misread.
+///
+/// # What the refusal prevents
+///
+/// Before version 6 an unsettled `created_ts`/`expired_ts` held the writer's `TxnId`; from version 6
+/// it holds the physical id of that writer's slot in `commit.store`. The encodings are
+/// byte-identical, so this build would resolve such a stamp against whatever transaction happens to
+/// own the slot numbered like the old writer's id: a committed version read as absent, an aborted
+/// one read as present, or a hard read fault. Silent misattribution of committed data — the class
+/// the version-3 gate exists for, applied to the other half of the header.
+///
+/// # Non-vacuity, three controls
+///
+/// 1. **Selectivity within the version.** The same forged version-5 image with every stamp SETTLED
+///    opens, at that version, with its data intact. A gate that refused every legacy store would
+///    pass the refusal assertion perfectly and fail this one.
+/// 2. **Selectivity across versions.** The same UNSETTLED image at the CURRENT version opens and
+///    reads correctly, so the refusal is attributable to the version number and to nothing else.
+/// 3. **The subject really is present.** The unsettled image is asserted to carry at least one
+///    unsettled stamp before it is forged, so the refusal cannot be passing on an empty scan.
+#[test]
+fn a_pre_1069_image_carrying_an_unsettled_stamp_is_refused_at_open() {
+    // ---- Control 3 + control 2: the CURRENT-version unsettled image opens and reads correctly. ----
+    let (mut s, key) = unsettled_store("v");
+    assert!(
+        unsettled_count(&s) > 0,
+        "the fixture must actually carry an unsettled stamp, or the refusal below proves nothing",
+    );
+    let unsettled = capture(&mut s);
+    drop(s);
+
+    let current =
+        open_image(&unsettled).expect("a current-version image is not refused by this gate");
+    assert_eq!(
+        current.opened_format_version(),
+        graphus_core::constants::FORMAT_VERSION,
+    );
+    let node = current.scan_node_ids().expect("scan")[0];
+    assert_eq!(
+        current_value(&current, node, key),
+        Some(Value::Integer(7)),
+        "and it reads correctly, because its stamps name slots this build understands",
+    );
+    drop(current);
+
+    // ---- The refusal: the same image, forged as version 5. ----
+    let mut forged = unsettled.clone();
+    downgrade_catalog_to(&mut forged, 5);
+    let err = open_image(&forged)
+        .err()
+        .expect("a version-5 image carrying an unsettled MVCC stamp MUST be refused");
+    let msg = format!("{err}");
+    for expected in [
+        "refusing to open",
+        "format version 5",
+        "WRITER'S TRANSACTION ID",
+        "commit.store",
+        "force a full freeze",
+    ] {
+        assert!(
+            msg.contains(expected),
+            "the refusal must be actionable — missing {expected:?} in: {msg}",
+        );
+    }
+    assert!(
+        msg.contains("Node store record") || msg.contains("Prop store record"),
+        "and it must name the first offending record: {msg}",
+    );
+
+    // ---- Control 1: the SAME forgery over a fully SETTLED image opens, with its data intact. ----
+    let (mut clean, _prop, clean_key) = legacy_shaped_store("v");
+    assert_eq!(
+        unsettled_count(&clean),
+        0,
+        "the control image must be fully settled, or it is not a control",
+    );
+    let mut clean_image = capture(&mut clean);
+    drop(clean);
+    downgrade_catalog_to(&mut clean_image, 5);
+    let opened = open_image(&clean_image)
+        .unwrap_or_else(|e| panic!("a fully settled version-5 image must open: {e}"));
+    assert_eq!(
+        opened.opened_format_version(),
+        5,
+        "and it really is being read as a version-5 image",
+    );
+    let node = opened.scan_node_ids().expect("scan")[0];
+    assert_eq!(
+        current_value(&opened, node, clean_key),
+        Some(Value::Integer(7)),
+        "with its data intact — the upgrade is lossless, which is why it is allowed",
+    );
 }

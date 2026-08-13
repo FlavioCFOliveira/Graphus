@@ -19,7 +19,9 @@
 //! * a [`StoreReadView`] — `#[derive(Clone)]` over `(Arc<pool>, MetaSnapshot)`; cloning it is a handful
 //!   of `Arc` refcount bumps, **no page copy**;
 //! * a [`TokenSnapshot`] — `Clone` is one `Arc` bump;
-//! * this query's pinned [`Snapshot`] (`Copy`) and a clone of its [`CommitRegistry`];
+//! * this query's pinned [`Snapshot`] (`Copy`) and the owning `TxnId`. No commit-registry clone
+//!   since `rmp` #1069 phase 3: an unsettled record stamp names a slot in `commit.store`, which the
+//!   morsel's own captured read view already reads;
 //! * its **own** fresh [`SsiReadBuffer`] (`Send`, no shared lock).
 //!
 //! The morsel reads through the already-source-generic `read_source::filter_label_candidates` /
@@ -83,7 +85,7 @@ use std::time::Instant;
 use graphus_core::error::GraphusError;
 use graphus_core::{TxnId, Value};
 use graphus_storage::{StoreReadView, TokenSnapshot};
-use graphus_txn::{CommitRegistry, PredicateRead, Snapshot, SsiReadBuffer};
+use graphus_txn::{PredicateRead, Snapshot, SsiReadBuffer};
 
 use graphus_io::BlockDevice;
 use graphus_wal::LogSink;
@@ -789,7 +791,8 @@ pub struct MorselGroupOutcome {
 /// `&mut dyn GraphAccess` — drive the morsel read without ever naming `D`/`S`.
 pub trait MorselSource: Send + Sync {
     /// Filters the contiguous candidate slice `ids` to the nodes that **currently** carry
-    /// `label_token` and are **visible** to `snapshot` (resolved through `registry`), reads each
+    /// `label_token` and are **visible** to `snapshot` (resolved through the source's own
+    /// `commit.store` — `rmp` #1069 phase 3), reads each
     /// survivor's `property` value (newest-visible-wins), and records the per-candidate SIREAD markers
     /// into a fresh [`SsiReadBuffer`] tagged with `txn` (`rmp` task #339). Returns the survivors'
     /// values, the morsel's visible-label-carrying count, the buffer, and the first read error.
@@ -804,7 +807,6 @@ pub trait MorselSource: Send + Sync {
         property: &str,
         txn: TxnId,
         snapshot: Snapshot,
-        registry: &CommitRegistry,
     ) -> MorselReadOutcome;
 
     /// Filters the contiguous candidate slice `ids` to visible, label-carrying nodes, then for each
@@ -849,7 +851,6 @@ pub trait MorselSource: Send + Sync {
         params: &BoundParameters,
         txn: TxnId,
         snapshot: Snapshot,
-        registry: &CommitRegistry,
         deadline: Option<Instant>,
     ) -> MorselRowsOutcome;
 
@@ -885,7 +886,6 @@ pub trait MorselSource: Send + Sync {
         params: &BoundParameters,
         txn: TxnId,
         snapshot: Snapshot,
-        registry: &CommitRegistry,
         deadline: Option<Instant>,
     ) -> MorselExpandOutcome;
 
@@ -927,7 +927,6 @@ pub trait MorselSource: Send + Sync {
         params: &BoundParameters,
         txn: TxnId,
         snapshot: Snapshot,
-        registry: &CommitRegistry,
         deadline: Option<Instant>,
     ) -> MorselGroupOutcome;
 
@@ -969,7 +968,6 @@ pub trait MorselSource: Send + Sync {
         params: &BoundParameters,
         txn: TxnId,
         snapshot: Snapshot,
-        registry: &CommitRegistry,
         deadline: Option<Instant>,
     ) -> MorselGroupOutcome;
 
@@ -1000,7 +998,6 @@ pub trait MorselSource: Send + Sync {
         params: &BoundParameters,
         txn: TxnId,
         snapshot: Snapshot,
-        registry: &CommitRegistry,
         deadline: Option<Instant>,
     ) -> MorselGroupOutcome;
 
@@ -1052,14 +1049,9 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         property: &str,
         txn: TxnId,
         snapshot: Snapshot,
-        registry: &CommitRegistry,
     ) -> MorselReadOutcome {
         let src = self.source();
-        let ctx = VisCtx {
-            snapshot,
-            registry,
-            txn,
-        };
+        let ctx = VisCtx { snapshot, txn };
         // A per-morsel sink: the morsel's own SIREAD buffer (tagged with the query txn) + its own first
         // captured error. No shared lock — every morsel mutates only its own sink.
         let sink = MorselSink::new(txn);
@@ -1091,7 +1083,6 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         params: &BoundParameters,
         txn: TxnId,
         snapshot: Snapshot,
-        registry: &CommitRegistry,
         deadline: Option<Instant>,
     ) -> MorselRowsOutcome {
         // Build a `Send`, off-thread read-only `GraphAccess` over a CHEAP CLONE of this source (a few
@@ -1105,7 +1096,6 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             self.view.clone(),
             self.tokens.clone(),
             snapshot,
-            registry.clone(),
             txn,
             SsiReadBuffer::new(txn),
         );
@@ -1240,7 +1230,6 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         params: &BoundParameters,
         txn: TxnId,
         snapshot: Snapshot,
-        registry: &CommitRegistry,
         deadline: Option<Instant>,
     ) -> MorselExpandOutcome {
         // Build a `Send`, off-thread read-only `GraphAccess` over a CHEAP CLONE of this source (a few
@@ -1254,7 +1243,6 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             self.view.clone(),
             self.tokens.clone(),
             snapshot,
-            registry.clone(),
             txn,
             SsiReadBuffer::new(txn),
         );
@@ -1394,7 +1382,6 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         params: &BoundParameters,
         txn: TxnId,
         snapshot: Snapshot,
-        registry: &CommitRegistry,
         deadline: Option<Instant>,
     ) -> MorselGroupOutcome {
         // Build a `Send`, off-thread read-only `GraphAccess` over a CHEAP CLONE of this source (a few
@@ -1406,7 +1393,6 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             self.view.clone(),
             self.tokens.clone(),
             snapshot,
-            registry.clone(),
             txn,
             SsiReadBuffer::new(txn),
         );
@@ -1537,7 +1523,6 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         params: &BoundParameters,
         txn: TxnId,
         snapshot: Snapshot,
-        registry: &CommitRegistry,
         deadline: Option<Instant>,
     ) -> MorselGroupOutcome {
         // Off-thread read-only `GraphAccess` over a CHEAP CLONE of this source (the `rmp` #336 Slice-3b-i
@@ -1550,7 +1535,6 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             self.view.clone(),
             self.tokens.clone(),
             snapshot,
-            registry.clone(),
             txn,
             SsiReadBuffer::new(txn),
         );
@@ -1757,7 +1741,6 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         params: &BoundParameters,
         txn: TxnId,
         snapshot: Snapshot,
-        registry: &CommitRegistry,
         deadline: Option<Instant>,
     ) -> MorselGroupOutcome {
         // Off-thread read-only `GraphAccess` over a CHEAP CLONE of this source (the `rmp` #336 Slice-3b-i
@@ -1771,7 +1754,6 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             self.view.clone(),
             self.tokens.clone(),
             snapshot,
-            registry.clone(),
             txn,
             SsiReadBuffer::new(txn),
         );
@@ -2109,7 +2091,7 @@ pub fn is_pure_per_row_expr(expr: &Expr) -> bool {
 /// The concrete, `(D, S)`-free, `Send` bundle the `RecordStoreGraph::morsel_label_scan` seam hands the
 /// executor's morsel tier (`rmp` task #339): the authoritative candidate-id vector for a label scan,
 /// the resolved label token, an erased [`MorselSource`] over the engine-thread-captured read view, and
-/// the visibility inputs (pinned snapshot + cloned commit registry + the query txn).
+/// the visibility inputs (pinned snapshot + the query txn).
 ///
 /// The coarse predicate footprint (`PredicateRead::Label` + `mark_all_live_nodes`) is **already
 /// registered on the engine thread** by the seam impl before this bundle is returned, so taking the
@@ -2130,8 +2112,6 @@ pub struct MorselLabelScan {
     pub source: Box<dyn MorselSource>,
     /// This query's pinned MVCC read snapshot.
     pub snapshot: Snapshot,
-    /// A clone of this query's commit registry (resolves an in-flight writer to its outcome).
-    pub registry: CommitRegistry,
     /// The transaction this query runs in (every morsel's markers are tagged with it).
     pub txn: TxnId,
     /// The per-statement wall-clock **deadline** (`rmp` #476), or `None` when no statement timeout is
@@ -2146,7 +2126,7 @@ pub struct MorselLabelScan {
 // `rmp` #339, Slice 3a: `MorselLabelScan` must be `Send` so the tier can move morsels onto the worker
 // pool. A compile-time assertion (no runtime body): it fails to build the instant a non-`Send` field is
 // introduced. `Box<dyn MorselSource>` is `Send` because the trait is `Send + Sync`; `Vec<u64>` / `u32`
-// / `Snapshot` / `CommitRegistry` / `TxnId` are plain `Send` data.
+// / `Snapshot` / `TxnId` are plain `Send` data.
 const _: () = {
     fn assert_send<T: Send>() {}
     fn assert_morsel_label_scan() {
@@ -2167,7 +2147,6 @@ impl MorselLabelScan {
             property,
             self.txn,
             self.snapshot,
-            &self.registry,
         )
     }
 
@@ -2198,7 +2177,6 @@ impl MorselLabelScan {
             params,
             self.txn,
             self.snapshot,
-            &self.registry,
             self.deadline,
         )
     }
@@ -2222,7 +2200,6 @@ impl MorselLabelScan {
             params,
             self.txn,
             self.snapshot,
-            &self.registry,
             self.deadline,
         )
     }
@@ -2246,7 +2223,6 @@ impl MorselLabelScan {
             params,
             self.txn,
             self.snapshot,
-            &self.registry,
             self.deadline,
         )
     }
@@ -2271,7 +2247,6 @@ impl MorselLabelScan {
             params,
             self.txn,
             self.snapshot,
-            &self.registry,
             self.deadline,
         )
     }
@@ -2838,7 +2813,7 @@ fn frontier_morsel_bounds(n: usize, threads: usize) -> Vec<(usize, usize)> {
 /// hands the executor, *before* it materializes the frontier anchors. Unlike
 /// [`MorselLabelScan`] the seam registers **no** coarse predicate footprint (there is no label scan to
 /// guard — see [`MorselFrontierScan`]); it only captures the owned, `Send`, cheap-cloneable
-/// [`MorselSource`] + the pinned snapshot / commit registry / txn. The executor drains the earlier
+/// [`MorselSource`] + the pinned snapshot / txn. The executor drains the earlier
 /// sub-plan serially, dedups the anchors, and combines them with this into a [`MorselFrontierScan`].
 #[must_use]
 pub struct MorselFrontierSource {
@@ -2846,8 +2821,6 @@ pub struct MorselFrontierSource {
     pub source: Box<dyn MorselSource>,
     /// This query's pinned MVCC read snapshot.
     pub snapshot: Snapshot,
-    /// A clone of this query's commit registry.
-    pub registry: CommitRegistry,
     /// The transaction this query runs in.
     pub txn: TxnId,
 }
@@ -2870,8 +2843,6 @@ pub struct MorselFrontierScan {
     pub source: Box<dyn MorselSource>,
     /// This query's pinned MVCC read snapshot.
     pub snapshot: Snapshot,
-    /// A clone of this query's commit registry (resolves an in-flight writer to its outcome).
-    pub registry: CommitRegistry,
     /// The transaction this query runs in (every morsel's markers are tagged with it).
     pub txn: TxnId,
     /// The per-statement wall-clock deadline (`rmp` #476), set by the executor before dispatch.
@@ -2908,7 +2879,6 @@ impl MorselFrontierScan {
                 params,
                 self.txn,
                 self.snapshot,
-                &self.registry,
                 self.deadline,
             )
     }

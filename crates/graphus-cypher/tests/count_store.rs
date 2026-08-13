@@ -859,7 +859,6 @@ fn offthread_graph(
         inputs.view,
         inputs.tokens,
         inputs.snapshot,
-        inputs.registry,
         txn,
         graphus_txn::SsiReadBuffer::new(txn),
     )
@@ -1035,7 +1034,6 @@ fn an_uncaptured_count_declines_rather_than_reporting_zero() {
         inputs.view,
         inputs.tokens,
         inputs.snapshot,
-        inputs.registry,
         reader,
         graphus_txn::SsiReadBuffer::new(reader),
     );

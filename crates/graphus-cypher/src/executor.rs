@@ -6282,7 +6282,6 @@ fn try_morsel_frontier_fof_aggregate(
         anchors,
         source: fsrc.source,
         snapshot: fsrc.snapshot,
-        registry: fsrc.registry,
         txn: fsrc.txn,
         // The per-statement wall-clock budget (`rmp` #476), so a runaway parallel expand abandons rather
         // than pinning every core.

@@ -19,7 +19,7 @@ pub use value::Value;
 pub use value::numeric::cmp_int_float;
 pub use value::spatial::{Crs, Point, total_f64};
 pub use value::temporal::{Date, Duration, LocalDateTime, LocalTime, ZonedDateTime, ZonedTime};
-pub use version::{MAX_TIMESTAMP, VersionStamp};
+pub use version::{HeaderStamp, MAX_TIMESTAMP, VersionStamp};
 
 /// Calendar conversions, validated construction, openCypher component
 /// accessors, ISO-8601 parsing/formatting, and arithmetic for the temporal
@@ -215,6 +215,107 @@ pub mod version {
         }
     }
 
+    /// A typed view over the single `u64` stored in an MVCC **record header**'s
+    /// `created_ts`/`expired_ts` field, from `rmp` #1069 phase 3 on.
+    ///
+    /// # Why this is a different type from [`VersionStamp`]
+    ///
+    /// The two share the **bit layout** exactly — `0` is the sentinel, the high bit discriminates,
+    /// the low 63 bits are the payload — and differ in what the payload *means*:
+    ///
+    /// | Type | High bit set means | Resolved by |
+    /// | --- | --- | --- |
+    /// | [`VersionStamp`] | the payload is a [`TxnId`] | the in-memory Active/Recent Transaction Table |
+    /// | [`HeaderStamp`] | the payload is a **`commit.store` slot id** | a durable read of that slot |
+    ///
+    /// Before `rmp` #1069 phase 3 a record header carried the first form, which is why resolving it
+    /// needed an in-memory table (and therefore an `O(N)` freeze sweep, a freeze frontier and a WAL
+    /// retention floor). It now carries the second, so the durable commit slot is the **single**
+    /// commit oracle. [`VersionStamp`] is untouched and keeps serving
+    /// `graphus_storage::undo::CommitSlot::commit_ts`, whose payload is and stays a [`TxnId`].
+    ///
+    /// Both populations are `u64` and both decode through either type without complaint, so the
+    /// compiler cannot catch a mix-up — **two populations, two types** is the only guard, and it is
+    /// the reason this type exists rather than a second set of helpers on [`VersionStamp`].
+    /// Resolving a slot id as though it were a transaction id (or the reverse) is a type-correct
+    /// call that produces silently wrong visibility.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum HeaderStamp {
+        /// The sentinel `0`: no creator recorded, or (for `expired_ts`) the version is live.
+        None,
+        /// A settled (frozen) stamp: the creating/expiring transaction's commit timestamp, readable
+        /// with no indirection at all.
+        Committed(Timestamp),
+        /// An unsettled stamp: the physical id of the writer's slot in `commit.store`, whose
+        /// `commit_ts` says what became of it.
+        Slot(u64),
+    }
+
+    impl HeaderStamp {
+        /// Decodes the raw header word into a typed stamp.
+        #[must_use]
+        pub fn from_raw(word: u64) -> Self {
+            if word == 0 {
+                Self::None
+            } else if word & INFLIGHT_BIT != 0 {
+                Self::Slot(word & PAYLOAD_MASK)
+            } else {
+                Self::Committed(Timestamp(word))
+            }
+        }
+
+        /// Encodes this stamp back into the raw header word.
+        #[must_use]
+        pub fn to_raw(self) -> u64 {
+            match self {
+                Self::None => 0,
+                Self::Committed(ts) => ts.0,
+                Self::Slot(id) => INFLIGHT_BIT | (id & PAYLOAD_MASK),
+            }
+        }
+
+        /// The commit slot this word names, if it names one — `None` for the sentinel and for an
+        /// already-settled `Committed` word, neither of which resolves through `commit.store`.
+        ///
+        /// This is the reachability question the undo area's reference census asks of every in-use
+        /// record header (`rmp` #1069 phase 1): a slot that a header still names must never be
+        /// returned to circulation.
+        #[must_use]
+        pub fn slot_id(self) -> Option<u64> {
+            match self {
+                Self::Slot(id) => Some(id),
+                Self::None | Self::Committed(_) => None,
+            }
+        }
+
+        /// The header word naming commit slot `id`.
+        ///
+        /// # Panics
+        /// Panics if `id` is `0` (the `NULL_ID` no store ever allocates) or does not fit in 63 bits,
+        /// because either would corrupt the discriminant — `0` would make the word indistinguishable
+        /// from a real slot reference that resolves nowhere. These are store invariants, not user
+        /// input.
+        #[must_use]
+        pub fn slot(id: u64) -> u64 {
+            assert!(id != 0, "slot id 0 is NULL_ID and is never allocated");
+            assert!(
+                id & INFLIGHT_BIT == 0,
+                "commit slot id must fit in 63 bits for the header-stamp discriminant"
+            );
+            Self::Slot(id).to_raw()
+        }
+
+        /// The header word for a settled version created/expired at `ts`.
+        ///
+        /// Byte-identical to [`VersionStamp::committed`] — a settled word carries no indirection, so
+        /// the two populations agree on it exactly, and a store frozen before `rmp` #1069 phase 3
+        /// reads correctly under either convention.
+        #[must_use]
+        pub fn committed(ts: Timestamp) -> u64 {
+            Self::Committed(ts).to_raw()
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -251,6 +352,53 @@ pub mod version {
         #[should_panic(expected = "reserved")]
         fn inflight_zero_txn_panics() {
             let _ = VersionStamp::in_flight(TxnId(0));
+        }
+
+        // ---- `HeaderStamp` (`rmp` #1069 phase 3) ----
+
+        #[test]
+        fn header_stamp_round_trips_each_class() {
+            assert_eq!(HeaderStamp::from_raw(0), HeaderStamp::None);
+            assert_eq!(
+                HeaderStamp::from_raw(HeaderStamp::committed(Timestamp(7))),
+                HeaderStamp::Committed(Timestamp(7))
+            );
+            assert_eq!(
+                HeaderStamp::from_raw(HeaderStamp::slot(42)),
+                HeaderStamp::Slot(42)
+            );
+        }
+
+        #[test]
+        fn header_stamp_slot_id_names_only_unsettled_words() {
+            assert_eq!(HeaderStamp::from_raw(0).slot_id(), None);
+            assert_eq!(
+                HeaderStamp::from_raw(HeaderStamp::committed(Timestamp(7))).slot_id(),
+                None
+            );
+            assert_eq!(
+                HeaderStamp::from_raw(HeaderStamp::slot(42)).slot_id(),
+                Some(42)
+            );
+        }
+
+        /// The bit LAYOUT is unchanged by `rmp` #1069 phase 3 — only the payload's meaning is. This
+        /// pins that: a slot-id word and a `TxnId` word with the same numeric payload are the SAME
+        /// bytes, which is exactly why the format version had to be bumped (a pre-phase-3 image read
+        /// under the new convention is silently misread, in both directions).
+        #[test]
+        fn header_and_version_stamps_share_the_bit_layout() {
+            assert_eq!(HeaderStamp::slot(42), VersionStamp::in_flight(TxnId(42)));
+            assert_eq!(
+                HeaderStamp::committed(Timestamp(7)),
+                VersionStamp::committed(Timestamp(7))
+            );
+        }
+
+        #[test]
+        #[should_panic(expected = "NULL_ID")]
+        fn header_stamp_slot_zero_panics() {
+            let _ = HeaderStamp::slot(0);
         }
     }
 }
@@ -667,6 +815,9 @@ pub mod constants {
     /// | 1 | — | Three record stores plus the `strings.store` overflow heap; `undo_ptr` reserved in every record header and permanently `0`. |
     /// | 2 | `rmp` #966 | The **undo area** (`05-storage-format.md` §12): the `undo.store` delta store and the `commit.store` commit-info store, and `undo_ptr` as the live head of an entity's version chain. A **layout** change. |
     /// | 3 | `rmp` #967 | A property cell's MVCC header no longer carries its visibility (`D-property-visibility`): the newest value lives in the cell and every older one on the owning entity's undo chain, so `expired_ts` is never stamped on a property cell again. A **meaning** change at identical layout — see below. |
+    /// | 4 | `rmp` #1066 | The trailing **applied-transaction-set** catalog block — see below. |
+    /// | 5 | `rmp` #1083 | The trailing **pending-DDL** catalog block — see below. |
+    /// | 6 | `rmp` #1069 | A record header's unsettled stamp names a **`commit.store` slot** instead of a `TxnId`. A **meaning** change at identical layout — see below. |
     ///
     /// # Why a meaning change bumps the version too
     ///
@@ -723,7 +874,32 @@ pub mod constants {
     /// decodes to "no pending DDL", which is the truth for it — a version-4 image already folded its
     /// committing transaction's DDL into the counters' `Statistics`, so there is nothing left to
     /// attribute and nothing to lose.
-    pub const FORMAT_VERSION: u32 = 5;
+    ///
+    /// # Version 6 (`rmp` #1069): a record header's unsettled stamp names a commit slot
+    ///
+    /// Version 6 moves not one byte. It changes what two `u64`s **mean**, and it is therefore the
+    /// same class of bump as version 3 — the class this constant exists to express.
+    ///
+    /// Until version 6, an unsettled `MvccHeader::created_ts` / `expired_ts` carried the writer's
+    /// [`TxnId`](crate::TxnId) ([`VersionStamp`](crate::VersionStamp)), translatable only by an
+    /// **in-memory** table. From version 6 it carries the physical id of that writer's slot in
+    /// `commit.store` ([`HeaderStamp`](crate::HeaderStamp)) — the same durable oracle the undo deltas
+    /// already resolved through — so the engine has one commit oracle instead of two.
+    ///
+    /// The two encodings are **bit-identical**: same sentinel, same high-bit discriminant, same
+    /// 63-bit payload. That is precisely why the bump is mandatory rather than optional. A small
+    /// `TxnId` is a perfectly plausible slot id and a small slot id is a perfectly plausible `TxnId`,
+    /// so a mis-versioned image is misread **silently, in both directions**, and the misreading
+    /// attributes a committed version to an unrelated transaction — a wrong answer that looks like
+    /// data.
+    ///
+    /// A pre-version-6 image is therefore not blindly refused but **examined**, exactly as version 3
+    /// examines property tombstones: an image in which no in-use record carries an unsettled stamp is
+    /// completely settled, has nothing that can be misread, and opens. One that does carry an
+    /// unsettled stamp is refused with the offending record named, and with a migration route that is
+    /// better than version 3's export/import — opening it with the previous build and forcing a full
+    /// freeze settles every stamp, after which it opens here (`RecordStore::refuse_legacy_txn_stamps`).
+    pub const FORMAT_VERSION: u32 = 6;
 
     /// Logical database page size in bytes, decoupled from the OS page size
     /// (`04-technical-design.md` §3.1; the default is subject to spike §12 item 4).

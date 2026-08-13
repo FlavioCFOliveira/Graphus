@@ -74,12 +74,11 @@ fn snap(store: &Store, txn: TxnId, view: View) -> Snapshot {
 /// Both gates a label scan owes are applied, in the order the engine applies them: the entity must
 /// exist to the snapshot, and it must carry the label *as of* that snapshot.
 fn scan_labelled(store: &Store, snapshot: Snapshot) -> Vec<u64> {
-    let registry = store.commit_registry_snapshot();
     let mut out = Vec::new();
     for id in store.scan_node_ids().expect("scan node ids") {
         let rec = store.node(id).expect("read node");
         if !store
-            .entity_visible_at(StoreKind::Node, id, rec.mvcc, snapshot, &registry)
+            .entity_visible_at(StoreKind::Node, id, rec.mvcc, snapshot)
             .expect("existence at snapshot")
         {
             continue;

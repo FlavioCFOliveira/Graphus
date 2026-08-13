@@ -16,7 +16,7 @@
 //!
 //! # `Send`, not `Sync`
 //!
-//! Construction captures the view, token snapshot, read snapshot, a cloned commit registry, and a fresh
+//! Construction captures the view, token snapshot, read snapshot, and a fresh
 //! owned [`SsiReadBuffer`] — all on the engine thread under the reader's pinned snapshot — and the whole
 //! graph is then **moved** to one reader thread, which mutates it (the buffer, the captured-error cell)
 //! through `&self` via [`RefCell`]. `RefCell<T: Send>` is `Send` but `!Sync`, which is exactly right: the
@@ -46,7 +46,7 @@ use graphus_core::error::GraphusError;
 use graphus_core::{TxnId, Value};
 use graphus_io::BlockDevice;
 use graphus_storage::{Namespace, StoreReadView, TokenSnapshot};
-use graphus_txn::{CommitRegistry, PredicateRead, Snapshot, SsiReadBuffer, View};
+use graphus_txn::{PredicateRead, Snapshot, SsiReadBuffer, View};
 use graphus_wal::LogSink;
 
 use crate::graph_access::{
@@ -71,9 +71,6 @@ pub struct ReadOnlyGraph<D: BlockDevice, S: LogSink> {
     /// This reader's MVCC read snapshot (`04 §5.3`): every read is filtered through `is_visible_via` against
     /// each record's frozen `xmin`/`xmax`, so the reader sees a consistent point-in-time graph.
     snapshot: Snapshot,
-    /// The cloned commit registry that resolves an in-flight writer to its commit outcome, captured at
-    /// dispatch (a writer committing later is excluded by the `ts` filter regardless).
-    registry: CommitRegistry,
     /// The transaction this read runs in.
     txn: TxnId,
     /// The reader's **owned** SIREAD-marker buffer (`rmp` #341 + #336): every read appends its markers
@@ -120,9 +117,14 @@ pub struct ReadOnlyGraph<D: BlockDevice, S: LogSink> {
 
 impl<D: BlockDevice, S: LogSink> ReadOnlyGraph<D, S> {
     /// Builds an off-thread read-only graph from the engine-thread-captured pieces (`rmp` task #336,
-    /// Slice 3b-i): the store read `view`, the `tokens` snapshot, this reader's read `snapshot`, a clone
-    /// of the commit `registry`, the `txn` id, and a **fresh, empty** [`SsiReadBuffer`] for `txn` to
-    /// accumulate SIREAD markers into.
+    /// Slice 3b-i): the store read `view`, the `tokens` snapshot, this reader's read `snapshot`, the
+    /// `txn` id, and a **fresh, empty** [`SsiReadBuffer`] for `txn` to accumulate SIREAD markers into.
+    ///
+    /// It takes **no commit registry** since `rmp` #1069 phase 3. It used to carry a clone of the
+    /// in-memory table, because that was the only thing that could translate an unsettled record stamp
+    /// into a commit outcome, and the clone had to be captured on the engine thread. A stamp now names
+    /// a slot in `commit.store`, which this reader's own `view` reads — so the answer is durable, is
+    /// resolved by the same mechanism the inline path uses, and needs nothing captured at dispatch.
     ///
     /// All arguments are captured on the engine thread under the reader's pinned snapshot; the resulting
     /// graph is then `Send` and may be moved to a reader thread (Slice 3b-ii). The `buffer` must be
@@ -131,7 +133,6 @@ impl<D: BlockDevice, S: LogSink> ReadOnlyGraph<D, S> {
         view: StoreReadView<D, S>,
         tokens: TokenSnapshot,
         snapshot: Snapshot,
-        registry: CommitRegistry,
         txn: TxnId,
         buffer: SsiReadBuffer,
     ) -> Self {
@@ -148,7 +149,6 @@ impl<D: BlockDevice, S: LogSink> ReadOnlyGraph<D, S> {
             view,
             tokens,
             snapshot,
-            registry,
             txn,
             buffer: RefCell::new(Some(buffer)),
             error: RefCell::new(None),
@@ -223,12 +223,14 @@ impl<D: BlockDevice, S: LogSink> ReadOnlyGraph<D, S> {
             .unwrap_or_else(|| SsiReadBuffer::new(self.txn))
     }
 
-    /// This reader's visibility context (snapshot + registry + txn) for the lifted read body.
+    /// This reader's visibility context (snapshot + txn) for the lifted read body.
+    ///
+    /// It carries no commit oracle: since `rmp` #1069 phase 3 a header stamp is resolved by the
+    /// SOURCE — the view's own `commit.store` — which the lifted body already holds.
     #[inline]
-    fn ctx(&self) -> VisCtx<'_> {
+    fn ctx(&self) -> VisCtx {
         VisCtx {
             snapshot: self.snapshot,
-            registry: &self.registry,
             txn: self.txn,
         }
     }
@@ -865,7 +867,6 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         Some(crate::morsel::MorselFrontierSource {
             source,
             snapshot: self.snapshot,
-            registry: self.registry.clone(),
             txn: self.txn,
         })
     }
@@ -992,7 +993,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
 // `rmp` #336, Slice 3b-i: `ReadOnlyGraph<D, S>` must be `Send` (moved to one reader thread) and `!Sync`
 // (owned by that one reader, never shared). A compile-time assertion (no runtime body): it fails to
 // build the instant a non-`Send` field is introduced. The owned fields are all `Send + Sync`
-// (`StoreReadView` / `TokenSnapshot` from Slice 3a, `Snapshot` `Copy`, `CommitRegistry`/`TxnId` plain
+// (`StoreReadView` / `TokenSnapshot` from Slice 3a, `Snapshot` `Copy`, `TxnId` plain
 // data) except the interior-mutability cells — the two `RefCell<…>` and the `rmp` #991 `ReadTally`'s
 // `Cell<u64>`s — which are `Send` (their contents are) and `!Sync`: exactly the bound we want. Asserted both for the concrete DST instantiation and generically
 // over the `D, S: Send + Sync` bound the view's own `Send + Sync` requires.

@@ -36,7 +36,7 @@
 use graphus_core::{CommandId, TxnId, Value};
 use graphus_io::MemBlockDevice;
 use graphus_storage::{RecordStore, StoreKind};
-use graphus_txn::{CommitRegistry, Snapshot, View};
+use graphus_txn::{Snapshot, View};
 use graphus_wal::{MemLogSink, WalManager};
 
 type Store = RecordStore<MemBlockDevice, MemLogSink>;
@@ -83,9 +83,9 @@ fn has_label_at(s: &Store, node: u64, snapshot: Snapshot) -> bool {
 }
 
 /// Whether `snapshot` sees `node` at all.
-fn exists_at(s: &Store, node: u64, snapshot: Snapshot, registry: &CommitRegistry) -> bool {
+fn exists_at(s: &Store, node: u64, snapshot: Snapshot) -> bool {
     let rec = s.node(node).expect("read node record");
-    s.entity_visible_at(StoreKind::Node, node, rec.mvcc, snapshot, registry)
+    s.entity_visible_at(StoreKind::Node, node, rec.mvcc, snapshot)
         .expect("existence at snapshot")
 }
 
@@ -377,7 +377,6 @@ fn a_node_created_by_an_earlier_statement_has_its_labels_versioned() {
 #[test]
 fn a_node_created_by_this_statement_does_not_exist_to_its_own_old_view() {
     let s = fresh();
-    let registry = s.commit_registry_snapshot();
 
     let t = TxnId(1);
     s.begin(t);
@@ -385,18 +384,18 @@ fn a_node_created_by_this_statement_does_not_exist_to_its_own_old_view() {
     let (n, _) = s.create_node(t).expect("create node");
 
     assert!(
-        exists_at(&s, n, snap(&s, t, View::New), &registry),
+        exists_at(&s, n, snap(&s, t, View::New)),
         "NEW sees the node it just created — CREATE, SET and DELETE all depend on this"
     );
     assert!(
-        !exists_at(&s, n, snap(&s, t, View::Old), &registry),
+        !exists_at(&s, n, snap(&s, t, View::Old)),
         "OLD does not: the node was not there when the statement started, which is exactly why a \
          scan cannot re-scan what it is creating"
     );
 
     s.begin_command(t); // statement 2
     assert!(
-        exists_at(&s, n, snap(&s, t, View::Old), &registry),
+        exists_at(&s, n, snap(&s, t, View::Old)),
         "an earlier statement's creation is part of what statement 2 started from"
     );
     s.commit(t).expect("commit");
@@ -408,7 +407,6 @@ fn a_node_created_by_this_statement_does_not_exist_to_its_own_old_view() {
 fn a_node_deleted_by_this_statement_still_exists_to_its_own_old_view() {
     let mut s = fresh();
     let n = seed_committed_node(&mut s, 1, 10);
-    let registry = s.commit_registry_snapshot();
 
     let t = TxnId(2);
     s.begin(t);
@@ -416,17 +414,17 @@ fn a_node_deleted_by_this_statement_still_exists_to_its_own_old_view() {
     s.delete_node(t, n).expect("delete node");
 
     assert!(
-        !exists_at(&s, n, snap(&s, t, View::New), &registry),
+        !exists_at(&s, n, snap(&s, t, View::New)),
         "NEW sees its own deletion"
     );
     assert!(
-        exists_at(&s, n, snap(&s, t, View::Old), &registry),
+        exists_at(&s, n, snap(&s, t, View::Old)),
         "OLD still sees the node the statement started with"
     );
 
     s.begin_command(t); // statement 2
     assert!(
-        !exists_at(&s, n, snap(&s, t, View::Old), &registry),
+        !exists_at(&s, n, snap(&s, t, View::Old)),
         "statement 1's deletion is settled as far as statement 2 is concerned"
     );
     s.commit(t).expect("commit");
@@ -437,7 +435,6 @@ fn a_node_deleted_by_this_statement_still_exists_to_its_own_old_view() {
 #[test]
 fn a_node_created_and_deleted_in_one_statement_is_absent_under_both_views() {
     let s = fresh();
-    let registry = s.commit_registry_snapshot();
 
     let t = TxnId(1);
     s.begin(t);
@@ -445,9 +442,9 @@ fn a_node_created_and_deleted_in_one_statement_is_absent_under_both_views() {
     let (n, _) = s.create_node(t).expect("create node");
     s.delete_node(t, n).expect("delete it again");
 
-    assert!(!exists_at(&s, n, snap(&s, t, View::New), &registry));
+    assert!(!exists_at(&s, n, snap(&s, t, View::New)));
     assert!(
-        !exists_at(&s, n, snap(&s, t, View::Old), &registry),
+        !exists_at(&s, n, snap(&s, t, View::Old)),
         "undoing the deletion restores a node that undoing the creation then removes again"
     );
     s.commit(t).expect("commit");
@@ -468,7 +465,6 @@ fn a_node_created_and_deleted_in_one_statement_is_absent_under_both_views() {
 fn neither_view_changes_what_another_transaction_sees() {
     let mut s = fresh();
     let n = seed_committed_node(&mut s, 1, 10);
-    let registry = s.commit_registry_snapshot();
 
     let writer = TxnId(2);
     s.begin(writer);
@@ -493,7 +489,7 @@ fn neither_view_changes_what_another_transaction_sees() {
             "{view:?}: another transaction's uncommitted label removal is invisible"
         );
         assert!(
-            exists_at(&s, n, r, &registry),
+            exists_at(&s, n, r),
             "{view:?}: the committed node is there for the reader"
         );
     }
@@ -561,7 +557,6 @@ fn a_statementless_write_survives_a_later_statements_old_view() {
 #[test]
 fn the_default_view_is_exactly_read_your_own_writes() {
     let mut s = fresh();
-    let registry = s.commit_registry_snapshot();
     let n = seed_committed_node(&mut s, 1, 10);
 
     let t = TxnId(2);
@@ -580,7 +575,7 @@ fn the_default_view_is_exactly_read_your_own_writes() {
     s.begin_command(t);
     let (fresh_node, _) = s.create_node(t).expect("create");
     assert!(
-        exists_at(&s, fresh_node, snap(&s, t, View::New), &registry),
+        exists_at(&s, fresh_node, snap(&s, t, View::New)),
         "and a freshly created node is there for its creator"
     );
     s.commit(t).expect("commit");

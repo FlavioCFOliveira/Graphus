@@ -111,6 +111,36 @@ const _: () = assert!(
     "the pending-DDL block version must be one this build can actually write",
 );
 
+/// The first on-disk format version in which an **unsettled** MVCC record stamp names the writer's
+/// `commit.store` slot rather than the writer's `TxnId` (`rmp` #1069 phase 3).
+///
+/// Named separately from [`FORMAT_VERSION`](graphus_core::constants::FORMAT_VERSION) for the reason
+/// [`PROPERTY_UNDO_CHAIN_FORMAT_VERSION`] is: a later bump for an unrelated layout change must not
+/// move the boundary the gate (`RecordStore::refuse_legacy_txn_stamps`) keys on.
+///
+/// # Why the gate is conditional rather than blind
+///
+/// The two conventions are **bit-identical** — same sentinel, same high-bit discriminant, same
+/// 63-bit payload — so a mis-versioned image is misread in silence, in both directions, and the
+/// misreading attributes a committed version to an unrelated transaction. What a version bump buys
+/// is therefore the chance to *look*, exactly as version 3's did: an image in which no in-use record
+/// carries an unsettled stamp has nothing that either convention could misread, and is opened.
+///
+/// # And why its migration route is better than version 3's
+///
+/// Version 3's hazard was irrecoverable — no rewrite could say which property cells had been
+/// removals — so its only route was export and re-import. This one is not: settling every stamp is a
+/// *supported operation of the build that wrote the image*
+/// ([`RecordStore::freeze_committed_headers`](crate::RecordStore::freeze_committed_headers), which
+/// the backup path already invokes). Opening the store with the previous build and forcing a full
+/// freeze leaves an image both conventions read identically. The gate's message says so.
+pub(crate) const COMMIT_SLOT_STAMP_FORMAT_VERSION: u32 = 6;
+
+const _: () = assert!(
+    COMMIT_SLOT_STAMP_FORMAT_VERSION <= graphus_core::constants::FORMAT_VERSION,
+    "the commit-slot-stamp version must be one this build can actually write",
+);
+
 /// Magic word introducing the trailing applied-transaction-set block (`rmp` #1066), chosen on the
 /// same principle as [`UNDO_AREA_MAGIC`]: `b"GRPHCNTD"` read little-endian, so a truncated or
 /// garbage tail cannot be mistaken for the block.

@@ -11,8 +11,11 @@
 //! satisfied when `xmin` names `T`'s own in-flight write), and an own-uncommitted `xmax` hides the
 //! version from its own author too (a transaction does not see what it has itself deleted).
 //!
-//! The two header words are raw `u64`s. This module is **pure** — no mutation, no locking — which is
-//! exactly why reads never block writers (`04 §5.7`, NFR-4).
+//! The two header words are raw `u64`s. This module is **pure** — no mutation, no locking, no shared
+//! state of its own — which is exactly why reads never block writers (`04 §5.7`, NFR-4). Since
+//! `rmp` #1069 phase 3 the *oracle* it calls into does read a page, so a visibility decision is no
+//! longer free; it is still lock-free with respect to writers, which is the property that matters
+//! here, and it costs nothing at all once a version's stamp has been settled by GC.
 //!
 //! # The door (`rmp` #1069)
 //!
@@ -23,6 +26,7 @@
 //! | What became of the transaction this word names? | [`resolve_stamp`](CommitOracle::resolve_stamp) |
 //! | Which writer does this word name, whatever became of it? | [`names_writer`](CommitOracle::names_writer) |
 //! | Does this word name **my own** write? | [`names_own_write`](CommitOracle::names_own_write) |
+//! | Both of the two above, in **one** resolution | [`resolve_for`](CommitOracle::resolve_for) |
 //! | At which timestamp did this word's transaction commit? | [`resolve_commit_ts`](CommitOracle::resolve_commit_ts) |
 //! | Does this pair of words make the version visible to me? | [`is_visible_via`] |
 //!
@@ -30,27 +34,32 @@
 //! directly: the former `graphus_txn::is_visible` was removed rather than deprecated, so a caller
 //! cannot bypass the door by accident. That is a guarantee by types, not a `grep` convention.
 //!
-//! The door is **fallible** because resolving a stamp is about to become a durable read: `rmp` #1069
-//! re-points `MvccHeader.created_ts`/`expired_ts` at the commit slot in `commit.store`, and a slot
-//! read can fail. Phase 2 (this code) changes only *where* the question is asked; the answers are
-//! byte-for-byte those of the pre-#1069 predicate. A caller must never answer an unresolvable stamp
-//! with a default — an existence question that cannot be resolved fails the read (`rmp` #733).
+//! The door is **fallible** because resolving a stamp *is* a durable read: `rmp` #1069 phase 3
+//! re-pointed `MvccHeader.created_ts`/`expired_ts` at the commit slot in `commit.store`, and a slot
+//! read can fail. A caller must never answer an unresolvable stamp with a default — an existence
+//! question that cannot be resolved fails the read (`rmp` #733).
 //!
-//! # ⚠ Two populations share the [`VersionStamp`] encoding — this door serves only ONE
+//! # ⚠ Two populations, two types — this door serves only ONE
 //!
-//! `VersionStamp` is used by two unrelated sets of words, and confusing them produces **wrong
-//! visibility that compiles in silence**:
+//! Two unrelated sets of `u64` words share one bit layout, and confusing them produces **wrong
+//! visibility that compiles in silence**. Since `rmp` #1069 phase 3 each has its own type:
 //!
-//! - the **record header** — `MvccHeader.created_ts` / `expired_ts`. *This* is the population this
-//!   door resolves. From `rmp` #1069 phase 3 its payload is a **commit slot id**.
-//! - the **commit slot** — `graphus_storage::undo::CommitSlot.commit_ts`. Its payload is, and stays,
-//!   a `TxnId`. It is resolved by `graphus_storage::scan_polarity::delta_verdict` and
-//!   `open_writer_of`, which must **not** be routed through this door.
+//! - the **record header** — `MvccHeader.created_ts` / `expired_ts`, typed
+//!   [`HeaderStamp`](graphus_core::HeaderStamp), payload a **commit slot id**. *This* is the
+//!   population this door resolves.
+//! - the **commit slot** — `graphus_storage::undo::CommitSlot.commit_ts`, typed
+//!   [`VersionStamp`], payload a `TxnId`, now and for ever. It is resolved by
+//!   `graphus_storage::scan_polarity::delta_verdict` and `open_writer_of`, which must **not** be
+//!   routed through this door.
 //!
-//! A header word and a slot word are both `u64` and both decode through [`VersionStamp`], so the
-//! compiler cannot tell them apart. Passing a slot's `commit_ts` to [`resolve_stamp`](CommitOracle::resolve_stamp)
-//! is a type-correct, silently-wrong call. The eventual fix is a distinct type per population; until
-//! then this warning is the guard.
+//! The two types are the guard, and they are only a partial one: both decode any `u64` without
+//! complaint, so passing a slot's `commit_ts` to [`resolve_stamp`](CommitOracle::resolve_stamp) is
+//! still a type-correct, silently-wrong call. What the split buys is that every *intentional* use
+//! names the population it means, so a mix-up is now a visible choice at the call site rather than
+//! an invisible default.
+//!
+//! [`RegistryOracle`] is the one place where the header population is deliberately read with the
+//! *old* convention — see its docs before using it.
 //!
 //! ## What this module deliberately cannot answer (`rmp` #972)
 //!
@@ -88,20 +97,24 @@ pub enum StampOutcome {
     Committed(Timestamp),
     /// The word's transaction is recorded as still running.
     ///
-    /// # ⚠ Unreachable through [`CommitRegistry`] today (the dead-`InFlight` class)
+    /// # Answerable since `rmp` #1069 phase 3 — but still not the liveness question
     ///
-    /// [`CommitRegistry::outcome`] gains an entry only when a transaction **resolves**, and maps an
-    /// unknown id to [`TxnOutcome::Aborted`] — so a genuinely running writer resolves as
-    /// [`Aborted`](Self::Aborted), never as this variant. Any gate written as
-    /// `resolve_stamp(w)? == StampOutcome::InFlight(_)` is therefore **dead — always false**, which
-    /// is the documented root cause of `rmp` #522 and `rmp` #778. The live-writer question is
-    /// `graphus_storage::RecordStore::is_txn_active`, never this variant.
+    /// A slot-backed oracle answers this **truthfully**: a `commit.store` slot that is in use and
+    /// still carries its writer's in-flight stamp is a *durable* record of a transaction that
+    /// neither committed nor aborted. Before phase 3 this arm was dead — [`CommitRegistry::outcome`]
+    /// gains an entry only when a transaction **resolves** and maps an unknown id to
+    /// [`TxnOutcome::Aborted`], so a running writer read as [`Aborted`](Self::Aborted). That is the
+    /// documented root cause of `rmp` #522 and `rmp` #778, and it is why
+    /// [`RegistryOracle`] still cannot produce this variant.
     ///
-    /// The variant exists because the *slot-backed* oracle of `rmp` #1069 phase 3 can answer it
-    /// truthfully (an open commit slot is a durable record of a running writer), and because
-    /// collapsing it into `Aborted` here would erase the distinction phase 3 needs. Reproducing the
-    /// current registry semantics exactly — including this dead arm — is this phase's whole mandate;
-    /// the arm is **reported, not repaired** here.
+    /// **It is nevertheless not the "is this writer alive?" predicate.** A slot says the transaction
+    /// *had not resolved when its slot was last written*; a crash leaves loser slots in exactly that
+    /// state until recovery, and a transaction on another node of the same process is alive only if
+    /// the Active Transaction Table says so. A gate whose subject is liveness — "keep covering this
+    /// record because its writer may still commit" — must ask
+    /// `graphus_storage::RecordStore::is_txn_active`, and combine it with the *identity*
+    /// [`names_writer`](CommitOracle::names_writer) gives it. See
+    /// `RecordStore::is_inflight_of_inflight_writer` for the worked reasoning.
     InFlight(TxnId),
     /// The word's transaction aborted, or is not known to the oracle at all — which means the same
     /// thing for visibility: its writes are never visible (`04 §5.3`).
@@ -110,21 +123,13 @@ pub enum StampOutcome {
 
 /// The single door through which a **record header** stamp word is resolved (`rmp` #1069).
 ///
-/// Implemented by [`CommitRegistry`] today. Phase 3 re-points the header at the durable commit slot,
-/// and the implementation behind this trait is the only thing that changes: every caller in the
-/// workspace already asks its question here.
+/// Implemented by `graphus_storage::RecordStore` and `graphus_storage::StoreReadView`, which resolve
+/// a header's [`HeaderStamp::Slot`](graphus_core::HeaderStamp::Slot) against the durable
+/// `commit.store` — the single commit oracle since phase 3. [`RegistryOracle`] implements it over the
+/// in-memory table for the two populations that still carry a `TxnId` payload.
 ///
 /// Read the module docs before implementing or calling: this trait resolves **header** stamps only,
 /// never `CommitSlot.commit_ts`.
-///
-/// # A note for phase 3, recorded now rather than rediscovered
-///
-/// [`is_visible_via`] asks the door **twice** per word — once for the own-write override, once for
-/// the outcome. Against the in-memory table that is two `u64` bit tests plus one hash lookup, i.e.
-/// nothing; against `commit.store` it would be two slot reads. The seam a slot-backed implementor
-/// will want is therefore a combined "resolve this word *relative to* this owner" primitive, added
-/// **beside** these methods rather than by open-coding the two questions back at the call sites —
-/// which is exactly what this task removed.
 pub trait CommitOracle {
     /// What became of the transaction that `word` names.
     ///
@@ -161,6 +166,40 @@ pub trait CommitOracle {
         Ok(self.names_writer(word)? == Some(owner))
     }
 
+    /// Both questions [`is_visible_via`] asks of one word, answered from **one** resolution
+    /// (`rmp` #1069): what became of the transaction the word names, and whether that transaction is
+    /// `owner` itself.
+    ///
+    /// The default composes the two methods above, which is exactly right for an oracle whose
+    /// resolution is free. It exists to be **overridden** by one whose resolution is a durable read:
+    /// asking the two questions separately reads the same commit slot twice per header word, i.e.
+    /// four reads per record where one suffices. Callers should prefer this over the pair whenever
+    /// they want both answers; a caller that wants only one still asks for only one.
+    ///
+    /// # Errors
+    /// A storage fault while resolving the stamp. As everywhere on this door, never answered with a
+    /// default (`rmp` #733).
+    fn resolve_for(&self, word: u64, owner: TxnId) -> Result<(StampOutcome, bool)> {
+        Ok((
+            self.resolve_stamp(word)?,
+            self.names_own_write(word, owner)?,
+        ))
+    }
+
+    /// Debug-time cross-check hook: `self` has just decided that `(xmin, xmax)` is `verdict` for
+    /// `snapshot` (`rmp` #1069 AC 2).
+    ///
+    /// The default does nothing, and an implementor that overrides it is expected to make the body
+    /// `debug_assertions`-only so a release build optimises the call away entirely. It exists so the
+    /// slot-backed oracle can compare its **verdict** — never its outcome — against the one the
+    /// pre-#1069 [`CommitRegistry`] would have produced over the same records, on every read the
+    /// whole DST battery performs, without a new test per scenario.
+    ///
+    /// Deliberately infallible and return-less: an audit that could fail the read would be a second
+    /// oracle in the answer path, which is the very thing `rmp` #1069 removes. It diverges loudly or
+    /// it says nothing.
+    fn audit_visibility(&self, _snapshot: Snapshot, _xmin: u64, _xmax: u64, _verdict: bool) {}
+
     /// The commit timestamp of the transaction `word` names, if it has one.
     ///
     /// Returns:
@@ -179,12 +218,35 @@ pub trait CommitOracle {
     }
 }
 
-/// The in-memory Active/Recent Transaction Table as a [`CommitOracle`].
+/// The in-memory Active/Recent Transaction Table as a [`CommitOracle`], for the words whose payload
+/// really is a [`TxnId`].
 ///
-/// Infallible today — every method wraps its answer in `Ok` — because the table is a `HashMap` in
-/// this process. The `Result` is the seam `rmp` #1069 phase 3 needs, when the same questions are
-/// answered by reading a commit slot out of `commit.store`.
-impl CommitOracle for CommitRegistry {
+/// # ⚠ This is NOT the record-header oracle any more (`rmp` #1069 phase 3)
+///
+/// `impl CommitOracle for CommitRegistry` was **removed**, not renamed, and this wrapper is not a
+/// restoration of it. The difference is the whole point of the phase: a bare
+/// `registry.resolve_stamp(w)` compiled everywhere and read a record header — whose payload is now a
+/// `commit.store` slot id — as though the payload were a transaction id. Naming the wrapper makes
+/// every remaining use of the old convention a deliberate, greppable, reviewable act. A record
+/// header must be resolved by the store (`graphus_storage::RecordStore` /
+/// `graphus_storage::StoreReadView`), never here.
+///
+/// There are exactly two legitimate uses:
+///
+/// 1. **Populations that still carry a `TxnId`.** The in-memory reference store
+///    (`crate::store::MemVersionedStore`) stamps its own headers with
+///    [`VersionStamp::in_flight`](crate::oracle::VersionStamp::in_flight) and resolves them here; it
+///    has no `commit.store` and never touches a record header.
+/// 2. **The `rmp` #1069 AC 2 equivalence audit.** The slot-backed oracle reconstructs, byte for
+///    byte, the word the pre-phase-3 build would have written and checks that this oracle reaches
+///    the same *verdict* — see [`CommitOracle::audit_visibility`].
+///
+/// Infallible: every method wraps its answer in `Ok`, because the table is a `HashMap` in this
+/// process. It therefore cannot produce [`StampOutcome::InFlight`] (see that variant's docs).
+#[derive(Debug, Clone, Copy)]
+pub struct RegistryOracle<'a>(pub &'a CommitRegistry);
+
+impl CommitOracle for RegistryOracle<'_> {
     fn resolve_stamp(&self, word: u64) -> Result<StampOutcome> {
         Ok(match VersionStamp::from_raw(word) {
             VersionStamp::None => StampOutcome::None,
@@ -192,7 +254,7 @@ impl CommitOracle for CommitRegistry {
             // An unknown id maps to `Aborted` here exactly as `outcome` documents: it either never
             // committed, or GC already forgot it because it is provably invisible. Both mean "not
             // visible". This is also why `StampOutcome::InFlight` is unreachable through this impl.
-            VersionStamp::InFlight(txn) => match self.outcome(txn) {
+            VersionStamp::InFlight(txn) => match self.0.outcome(txn) {
                 TxnOutcome::Committed(ts) => StampOutcome::Committed(ts),
                 TxnOutcome::InFlight => StampOutcome::InFlight(txn),
                 TxnOutcome::Aborted => StampOutcome::Aborted,
@@ -230,10 +292,15 @@ pub fn is_visible_via(
 ) -> Result<bool> {
     // Short-circuited exactly as the former `creator_visible(..) && !expirer_hides(..)` was: an
     // invisible creator never asks the oracle about the expirer.
-    if !creator_visible(oracle, snapshot, xmin)? {
-        return Ok(false);
-    }
-    Ok(!expirer_hides(oracle, snapshot, xmax)?)
+    let verdict = if creator_visible(oracle, snapshot, xmin)? {
+        !expirer_hides(oracle, snapshot, xmax)?
+    } else {
+        false
+    };
+    // The `rmp` #1069 AC 2 cross-check, on EVERY visibility decision the engine makes. A no-op
+    // unless the oracle overrides it, and overridden only under `debug_assertions`.
+    oracle.audit_visibility(snapshot, xmin, xmax, verdict);
+    Ok(verdict)
 }
 
 /// Clause 1: is the version's **creator** visible to `snapshot`?
@@ -242,12 +309,15 @@ pub fn is_visible_via(
 /// at `commit_ts ≤ s`. An in-flight write by *another* transaction, an aborted creator, or the `0`
 /// sentinel is not visible.
 fn creator_visible(oracle: &impl CommitOracle, snapshot: Snapshot, xmin: u64) -> Result<bool> {
-    // Own uncommitted write: always visible to its author, and asked FIRST because the oracle has no
-    // entry for a writer that has not resolved yet and would answer `Aborted`.
-    if oracle.names_own_write(xmin, snapshot.owner)? {
+    // ONE resolution, both answers (`rmp` #1069): against a slot-backed oracle the pair
+    // `names_own_write` + `resolve_stamp` would read the same commit slot twice.
+    let (outcome, own) = oracle.resolve_for(xmin, snapshot.owner)?;
+    // Own uncommitted write: always visible to its author, and tested FIRST because an oracle has no
+    // settled answer for a writer that has not resolved yet.
+    if own {
         return Ok(true);
     }
-    Ok(match oracle.resolve_stamp(xmin)? {
+    Ok(match outcome {
         StampOutcome::Committed(ts) => ts <= snapshot.ts,
         StampOutcome::None | StampOutcome::InFlight(_) | StampOutcome::Aborted => false,
     })
@@ -259,11 +329,13 @@ fn creator_visible(oracle: &impl CommitOracle, snapshot: Snapshot, xmin: u64) ->
 /// snapshot owner's *own* uncommitted deletion. It is **not** hidden when `xmax` is `0`, names
 /// another in-flight writer, names an aborted writer, or committed at `commit_ts > s`.
 fn expirer_hides(oracle: &impl CommitOracle, snapshot: Snapshot, xmax: u64) -> Result<bool> {
+    // ONE resolution, both answers — see `creator_visible`.
+    let (outcome, own) = oracle.resolve_for(xmax, snapshot.owner)?;
     // We deleted it ourselves in this transaction: we no longer see it.
-    if oracle.names_own_write(xmax, snapshot.owner)? {
+    if own {
         return Ok(true);
     }
-    Ok(match oracle.resolve_stamp(xmax)? {
+    Ok(match outcome {
         StampOutcome::Committed(ts) => ts <= snapshot.ts,
         // Live, uncommitted or aborted: does not hide the version.
         StampOutcome::None | StampOutcome::InFlight(_) | StampOutcome::Aborted => false,
@@ -291,7 +363,8 @@ mod tests {
     /// The former free function's shape, so every assertion below is unchanged from the pre-#1069
     /// suite: only the plumbing (`?` on an infallible oracle) is new.
     fn is_visible(snapshot: Snapshot, xmin: u64, xmax: u64, reg: &CommitRegistry) -> bool {
-        is_visible_via(reg, snapshot, xmin, xmax).expect("the in-memory registry never faults")
+        is_visible_via(&RegistryOracle(reg), snapshot, xmin, xmax)
+            .expect("the in-memory registry never faults")
     }
 
     // ---- Clause 1: creator visibility ----
@@ -414,28 +487,31 @@ mod tests {
         reg.record_abort(TxnId(3));
         reg.register_begin(TxnId(4));
 
-        assert_eq!(reg.resolve_stamp(0).unwrap(), StampOutcome::None);
         assert_eq!(
-            reg.resolve_stamp(committed(5)).unwrap(),
+            RegistryOracle(&reg).resolve_stamp(0).unwrap(),
+            StampOutcome::None
+        );
+        assert_eq!(
+            RegistryOracle(&reg).resolve_stamp(committed(5)).unwrap(),
             StampOutcome::Committed(Timestamp(5)),
             "an already-frozen word resolves without consulting the table at all"
         );
         assert_eq!(
-            reg.resolve_stamp(inflight(2)).unwrap(),
+            RegistryOracle(&reg).resolve_stamp(inflight(2)).unwrap(),
             StampOutcome::Committed(Timestamp(8)),
             "a lazily-settled commit resolves through the table"
         );
         assert_eq!(
-            reg.resolve_stamp(inflight(3)).unwrap(),
+            RegistryOracle(&reg).resolve_stamp(inflight(3)).unwrap(),
             StampOutcome::Aborted
         );
         assert_eq!(
-            reg.resolve_stamp(inflight(9)).unwrap(),
+            RegistryOracle(&reg).resolve_stamp(inflight(9)).unwrap(),
             StampOutcome::Aborted,
             "an UNKNOWN writer resolves as aborted — the rule snapshot.rs:outcome documents"
         );
         assert_eq!(
-            reg.resolve_stamp(inflight(4)).unwrap(),
+            RegistryOracle(&reg).resolve_stamp(inflight(4)).unwrap(),
             StampOutcome::InFlight(TxnId(4)),
             "only an explicitly registered begin ever reaches the InFlight arm"
         );
@@ -451,11 +527,11 @@ mod tests {
     fn a_writer_the_registry_never_saw_resolves_as_aborted_not_in_flight() {
         let reg = CommitRegistry::new();
         assert_eq!(
-            reg.resolve_stamp(inflight(42)).unwrap(),
+            RegistryOracle(&reg).resolve_stamp(inflight(42)).unwrap(),
             StampOutcome::Aborted
         );
         assert_ne!(
-            reg.resolve_stamp(inflight(42)).unwrap(),
+            RegistryOracle(&reg).resolve_stamp(inflight(42)).unwrap(),
             StampOutcome::InFlight(TxnId(42))
         );
     }
@@ -468,13 +544,25 @@ mod tests {
         reg.record_commit(TxnId(2), Timestamp(8));
         reg.record_abort(TxnId(3));
 
-        assert_eq!(reg.names_writer(0).unwrap(), None);
-        assert_eq!(reg.names_writer(committed(5)).unwrap(), None);
+        assert_eq!(RegistryOracle(&reg).names_writer(0).unwrap(), None);
+        assert_eq!(
+            RegistryOracle(&reg).names_writer(committed(5)).unwrap(),
+            None
+        );
         // Committed and aborted alike: the word still NAMES its writer.
-        assert_eq!(reg.names_writer(inflight(2)).unwrap(), Some(TxnId(2)));
-        assert_eq!(reg.names_writer(inflight(3)).unwrap(), Some(TxnId(3)));
+        assert_eq!(
+            RegistryOracle(&reg).names_writer(inflight(2)).unwrap(),
+            Some(TxnId(2))
+        );
+        assert_eq!(
+            RegistryOracle(&reg).names_writer(inflight(3)).unwrap(),
+            Some(TxnId(3))
+        );
         // And a writer nobody has ever heard of.
-        assert_eq!(reg.names_writer(inflight(99)).unwrap(), Some(TxnId(99)));
+        assert_eq!(
+            RegistryOracle(&reg).names_writer(inflight(99)).unwrap(),
+            Some(TxnId(99))
+        );
     }
 
     /// `names_own_write` is exactly the former open-coded
@@ -485,7 +573,7 @@ mod tests {
         for word in [0, committed(5), inflight(7), inflight(8)] {
             for owner in [TxnId(7), TxnId(8)] {
                 assert_eq!(
-                    reg.names_own_write(word, owner).unwrap(),
+                    RegistryOracle(&reg).names_own_write(word, owner).unwrap(),
                     VersionStamp::from_raw(word) == VersionStamp::InFlight(owner),
                     "word {word:#018x} vs owner {owner:?}"
                 );
@@ -497,15 +585,20 @@ mod tests {
     #[test]
     fn resolve_commit_ts_follows_the_door() {
         let mut reg = CommitRegistry::new();
-        assert_eq!(reg.resolve_commit_ts(0).unwrap(), None);
+        assert_eq!(RegistryOracle(&reg).resolve_commit_ts(0).unwrap(), None);
         assert_eq!(
-            reg.resolve_commit_ts(committed(8)).unwrap(),
+            RegistryOracle(&reg)
+                .resolve_commit_ts(committed(8))
+                .unwrap(),
             Some(Timestamp(8))
         );
-        assert_eq!(reg.resolve_commit_ts(inflight(9)).unwrap(), None);
+        assert_eq!(
+            RegistryOracle(&reg).resolve_commit_ts(inflight(9)).unwrap(),
+            None
+        );
         reg.record_commit(TxnId(9), Timestamp(50));
         assert_eq!(
-            reg.resolve_commit_ts(inflight(9)).unwrap(),
+            RegistryOracle(&reg).resolve_commit_ts(inflight(9)).unwrap(),
             Some(Timestamp(50))
         );
     }

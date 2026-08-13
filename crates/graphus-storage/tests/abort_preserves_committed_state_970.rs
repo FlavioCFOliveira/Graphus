@@ -47,13 +47,12 @@ fn fresh() -> Store {
 /// entities compare equal.
 fn committed_image(s: &Store, observer: TxnId) -> Vec<String> {
     let snapshot = Snapshot::new(observer, s.snapshot_ts());
-    let registry = s.commit_registry();
     let visible = |mvcc: graphus_storage::MvccHeader| {
-        // The `rmp` #1069 door is fallible; the in-memory registry never faults, and an oracle fault
-        // in an image-building helper must be loud rather than folded into "not visible".
+        // The `rmp` #1069 door is fallible, and the STORE is the oracle since phase 3. A fault in an
+        // image-building helper must be loud rather than folded into "not visible".
         mvcc.in_use()
-            && is_visible_via(&*registry, snapshot, mvcc.created_ts, mvcc.expired_ts)
-                .expect("the in-memory commit registry resolves every stamp")
+            && is_visible_via(s, snapshot, mvcc.created_ts, mvcc.expired_ts)
+                .expect("the store resolves every header stamp")
     };
 
     let mut out = Vec::new();

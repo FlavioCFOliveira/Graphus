@@ -238,14 +238,14 @@ impl Counters {
         // A reader ticket distinct from every writer, so no in-flight write is ever visible as
         // "our own" (the same device `reader_store_growth` uses).
         let snapshot = Snapshot::new(TxnId(u64::MAX), store.snapshot_ts());
-        let registry = store.commit_registry_snapshot();
         let mut out = Self::default();
         let mut visible_node = BTreeMap::new();
         for id in store.scan_node_ids().expect("scan nodes") {
             let mvcc = store.node(id).expect("read node").mvcc;
-            // Through the `rmp` #1069 door. The in-memory registry never faults; an oracle fault in
-            // an ORACLE would be a defect in the door itself, so it panics like every other read here.
-            let visible = is_visible_via(&registry, snapshot, mvcc.created_ts, mvcc.expired_ts)
+            // Through the `rmp` #1069 door, over the STORE — which since phase 3 is the oracle
+            // itself. A fault in an ORACLE would be a defect in the door, so it panics like every
+            // other read here.
+            let visible = is_visible_via(&*store, snapshot, mvcc.created_ts, mvcc.expired_ts)
                 .expect("resolve node stamp");
             visible_node.insert(id, visible);
             if !visible {
@@ -258,13 +258,8 @@ impl Counters {
         }
         for id in store.scan_rel_ids().expect("scan rels") {
             let rel = store.rel(id).expect("read rel");
-            if !is_visible_via(
-                &registry,
-                snapshot,
-                rel.mvcc.created_ts,
-                rel.mvcc.expired_ts,
-            )
-            .expect("resolve rel stamp")
+            if !is_visible_via(&*store, snapshot, rel.mvcc.created_ts, rel.mvcc.expired_ts)
+                .expect("resolve rel stamp")
             {
                 continue;
             }

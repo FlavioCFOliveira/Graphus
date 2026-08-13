@@ -54,6 +54,19 @@
 //! only the MVCC header, never a whole record, and are not on the visible-property read path. They
 //! are deliberately not counted.
 //!
+//! # Suppression, and the one thing it is for
+//!
+//! [`suppressed`] turns counting off for the duration of a closure. It exists for reads the engine
+//! performs **about** an answer rather than **to produce** one, of which there is exactly one today:
+//! the `rmp` #1069 AC 2 equivalence audit, which re-reads a commit slot under `debug_assertions` to
+//! reconstruct the word the pre-#1069 build would have written. Counting those would make a
+//! structural proof measure the auditor instead of the read path — and it would do so only in a
+//! debug build, so the number would depend on the profile, which is exactly the property a
+//! structural proof is chosen for.
+//!
+//! It is deliberately not a general "quiet down here" knob: anything that suppresses a count can
+//! hide a walk, so a second caller needs the same argument this one makes.
+//!
 //! # Cost
 //!
 //! **Feature off (the default, and every production build): zero.** [`note_prop_read`] and
@@ -99,24 +112,54 @@ mod imp {
         static UNDO_READS: Cell<u64> = const { Cell::new(0) };
         /// `commit.store` slot reads performed by this thread since the last [`reset`].
         static COMMIT_READS: Cell<u64> = const { Cell::new(0) };
+        /// Nesting depth of [`super::suppressed`] scopes on this thread; counting is off above `0`.
+        static SUPPRESS: Cell<u32> = const { Cell::new(0) };
+    }
+
+    /// Whether the calling thread is currently inside a [`super::suppressed`] scope.
+    #[inline]
+    fn off() -> bool {
+        SUPPRESS.with(Cell::get) != 0
     }
 
     /// Records one `props.store` record read on the calling thread.
     #[inline]
     pub fn note_prop_read() {
-        PROP_READS.with(|c| c.set(c.get().wrapping_add(1)));
+        if !off() {
+            PROP_READS.with(|c| c.set(c.get().wrapping_add(1)));
+        }
     }
 
     /// Records one `undo.store` delta read on the calling thread.
     #[inline]
     pub fn note_undo_read() {
-        UNDO_READS.with(|c| c.set(c.get().wrapping_add(1)));
+        if !off() {
+            UNDO_READS.with(|c| c.set(c.get().wrapping_add(1)));
+        }
     }
 
     /// Records one `commit.store` slot read on the calling thread.
     #[inline]
     pub fn note_commit_slot_read() {
-        COMMIT_READS.with(|c| c.set(c.get().wrapping_add(1)));
+        if !off() {
+            COMMIT_READS.with(|c| c.set(c.get().wrapping_add(1)));
+        }
+    }
+
+    /// Runs `f` with this thread's counting turned off, restoring it afterwards (panic-safe).
+    pub fn suppressed<T>(f: impl FnOnce() -> T) -> T {
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                SUPPRESS.with(|c| c.set(c.get().saturating_sub(1)));
+            }
+        }
+        SUPPRESS.with(|c| c.set(c.get().saturating_add(1)));
+        // RAII rather than a trailing decrement: `f` may unwind (the debug-only equivalence audit
+        // this exists for diverges by panicking), and a leaked suppression would silently zero every
+        // later measurement.
+        let _restore = Restore;
+        f()
     }
 
     /// Zeroes every counter on the calling thread.
@@ -150,9 +193,15 @@ mod imp {
     /// No-op: the `read-probe` feature is off, so the read path carries no instrumentation.
     #[inline(always)]
     pub fn note_commit_slot_read() {}
+
+    /// No-op wrapper: with no counters there is nothing to suppress.
+    #[inline(always)]
+    pub fn suppressed<T>(f: impl FnOnce() -> T) -> T {
+        f()
+    }
 }
 
-pub use imp::{note_commit_slot_read, note_prop_read, note_undo_read};
+pub use imp::{note_commit_slot_read, note_prop_read, note_undo_read, suppressed};
 
 /// Record reads attributed to one measured region, per store (`rmp` #967 AC 2).
 ///

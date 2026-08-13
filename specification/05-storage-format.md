@@ -127,12 +127,51 @@ this prefix and are finalized with `graphus-storage`.
 | Offset | Size | Field | Notes |
 | --- | --- | --- | --- |
 | 0 | 1 | `flags` | bit 0 `in_use`; bit 1 `dense` (node); remaining reserved. |
-| 1 | 8 | `created_ts` | commit timestamp / `TxnId` that created this version. |
-| 9 | 8 | `expired_ts` | commit timestamp that expired it; `0` = live (latest). |
+| 1 | 8 | `created_ts` | the creating transaction's **header stamp**: its commit timestamp once settled, or the physical id of its slot in `commit.store` (§12.4) while unsettled. |
+| 9 | 8 | `expired_ts` | the expiring transaction's header stamp, same encoding; `0` = live (latest). |
 | 17 | 8 | `undo_ptr` | physical id, in `undo.store` (§12), of the **head of this entity's undo-delta chain**; `0` = none. |
 
 → **25-byte MVCC record header.** Node and relationship records additionally carry the **16-byte
 stable `ElementId`** (`D-element-id`) immediately after this prefix; property records do not.
+
+**The header stamp, and why it names a slot rather than a transaction** (task **#1069**, format
+version **6**). Both stamps are one `u64` read through `HeaderStamp`: `0` is the sentinel; a word with
+the high bit **clear** is a settled commit `Timestamp`; a word with the high bit **set** carries, in
+its low 63 bits, the physical id of the writer's slot in `commit.store`. The bit layout is the one
+`VersionStamp` already used — the high-bit discrimination of `04-technical-design.md` §5.2 — and what
+changed in version 6 is the **meaning of the high-bit payload**, from the writer's `TxnId` to its
+slot id.
+
+The change exists so that the store has **one** commit oracle rather than two. A delta already
+resolved through the slot (§12.4); the header did not, and a `TxnId` is translatable only by the
+in-memory Active/Recent Transaction Table. Three mechanisms existed to keep that second oracle
+usable: the per-record freeze sweep, which rewrites a committed writer's stamps in place; the
+`freeze_low` frontier, which bounds that sweep; and the WAL reclamation floor, which holds a
+committed transaction's log record alive until its stamps are settled, so that a restart can rebuild
+the table that translates them. A stamp that names a slot is resolvable from the **data alone**.
+
+**All three mechanisms are still present — this change did not remove them.** Retiring them is task
+**#1070**. What this change removed is their standing: none of them is what makes an unsettled stamp
+resolvable any more. Settling a stamp is now an optimisation, because a settled word is read with no
+indirection at all; it is no longer a precondition for reading the version.
+
+Three consequences are normative rather than incidental:
+
+* **A backup image is self-sufficient.** `commit.store` is one of the stores a backup captures, so a
+  restored store resolves every version, settled or not, with no log and no table. The pre-backup
+  header freeze that task #149 introduced for exactly this reason is retired with this change, and a
+  restored **chain** — whose increments carry stamps the base's freeze never saw — became readable
+  rather than silently invisible. Stated in full in §11.
+* **The stamp became a recycled id, and that is load-bearing.** A `TxnId` is never reused; a slot id
+  is. Every physical undo that restores one of these words therefore restores an *identifier*, whose
+  soundness now rests on the reclamation rule stated in §12.4: no slot is freed, and none is recycled,
+  while any header still names it.
+* **Resolving an unsettled stamp reads a page, so it can fail.** A word naming a slot the store
+  cannot read or cannot decode is an **error**, never a guessed verdict: the read fails closed
+  (`04-technical-design.md` §5.3). A settled word costs no read at all.
+
+Two populations share this encoding and must never be confused: the record header, whose payload is a
+slot id, and `CommitSlot.commit_ts` (§12.4), whose payload is and remains a `TxnId`.
 
 **`undo_ptr` — its meaning.** `undo_ptr` is the **only** anchor of an entity's
 version history: it holds the physical id of the newest delta on that entity's chain, each delta
@@ -299,8 +338,25 @@ ids — is detected even if a per-page checksum were re-faked.
 wrong version/page-size, page-count mismatch, a flipped digest, and a misplaced framing `page_id`).
 Restore writes the verified pages onto a fresh device and **runs the consistency checker** (§ the
 checker in `graphus-storage`): a backup that frames an internally-inconsistent image (even one that
-passes both integrity layers) is rejected rather than served. Online / incremental backup and
-point-in-time recovery are deferred to Phase 2; this is the offline path only.
+passes both integrity layers) is rejected rather than served. This section freezes the **full**
+artifact only. Incremental backup chains and point-in-time recovery were delivered later (task #71,
+a Phase-2 capability delivered ahead of schedule — `00-overview.md` §6): a chain is one full artifact
+plus an ordered list of verbatim WAL byte ranges, restored by replaying that log through the ordinary
+three-phase ARIES recovery of `04-technical-design.md` §4.8 up to the chosen cut. Their framing is
+not frozen here.
+
+**A restored image carries its own commit oracle** (task **#1069**). A restored store is opened over a
+**fresh, empty** WAL — the artifact carries the data image, not the log — so every version in it must
+be resolvable from the captured pages alone. Since #1069 it is: `commit.store` (§12.4) is one of the
+stores the page section above captures, and an unsettled record stamp names a slot in it (§7). Two
+things follow, and both are normative:
+
+- The **pre-capture header freeze** that task #149 added for exactly this reason is retired. Nothing
+  has to be rewritten before a capture in order to make the image self-sufficient.
+- A restored **chain** is readable. Its increments carry pages whose stamps no freeze of the base
+  could have settled, and before #1069 those stamps named transactions that the restored store's
+  empty log could not translate — an unknown writer resolves as aborted, so a committed version read
+  as **invisible**. That was silent loss of committed data on an operator flow, and it is closed.
 
 ---
 
@@ -450,16 +506,18 @@ only for its disk-backed storage mode and has no Graphus counterpart.
 | 1 | 7 | — | reserved, must be zero. |
 | 8 | 8 | `commit_ts` | **the commit indirection point.** Carries the writer's `TxnId` in the in-flight `VersionStamp` encoding while the transaction is open, and its commit timestamp once it has committed. Written exactly once, by a single store, at commit. |
 | 16 | 8 | `txn_id` | the owning transaction's id, retained after commit for recovery and diagnostics. |
-| 24 | 8 | `delta_count` | `0` while the transaction is open; set at commit to the number of deltas the transaction created, then decremented by GC as each one is reclaimed. |
+| 24 | 8 | `delta_count` | `0` while the transaction is open; set at commit to the number of deltas the transaction created, then decremented by GC as each one is reclaimed. Since task **#1069** it is an accounting cross-check and **not** a reclamation trigger — a live committed slot carrying `0` is a legitimate state, and the slot is freed by the reference census below. |
 
 **Why one slot and not one timestamp per delta.** A transaction that touched *k* entities commits with
 **one** write, and all *k* of its deltas become committed at the same instant because each resolves its
-status through this slot. This is what lets the freeze sweep be retired — the in-place rewrite of every
-committed writer's stamps across `[freeze_low, high_water)`
-(`RecordStore::freeze_store_headers_incremental`), a frontier that needs its own release-active audit
-and whose mis-advance was a silent-data-loss defect (rmp #522). **The sweep is still present today:**
-the slot removes the *need* for it, but retiring it is separate work (rmp #1069 → #1070 → #1071), and
-until that lands both mechanisms are live. Memgraph publishes the same way, in one
+status through this slot. Since task **#1069** the record headers of those *k* entities resolve
+through it too (§7), so the slot is now the store's **only** commit oracle. This is what lets the
+freeze sweep be retired — the in-place rewrite of every committed writer's stamps across
+`[freeze_low, high_water)` (`RecordStore::freeze_store_headers_incremental`), a frontier that needs its
+own release-active audit and whose mis-advance was a silent-data-loss defect (rmp #522). **The sweep is
+still present today:** #1069 removed the *need* for it — nothing now depends on it to resolve a stamp —
+but removing the code is separate work (rmp #1070, then #1071), and until that lands the sweep still
+runs on every GC pass as an optimisation. Memgraph publishes the same way, in one
 line: `transaction_.commit_info->timestamp.store(*commit_timestamp_, std::memory_order_release)`
 (`/data/refsrc/memgraph/src/storage/v2/inmemory/storage.cpp:1299`).
 
@@ -538,6 +596,19 @@ between "proved unreachable" and "reused" must not be zero.
   terminate, every `commit_info` must address a live slot, and a **committed** slot's `delta_count` must
   equal the number of unreclaimed deltas that name it (an open transaction's slot carries `0`).
 
+  Task **#1069** changed what two of those obligations prove, and left one gap open deliberately.
+  The `delta_count` equality is no longer what authorises freeing a slot, so a mismatch now means
+  only that GC has lost count or that a delta was lost, resurrected or misattributed — and **a live
+  committed slot recording `0` is a legitimate state** rather than a contradiction. The rule is kept
+  exactly as it was, because it is the one place that cross-checks the store's accounting against a
+  full census of `undo.store`. The gap: the checker does **not** verify that a slot named by a
+  **record header** is still live. That rule was not checkable before #1069 — a header carried a
+  `TxnId`, so it would have fired wherever a `TxnId` coincided with a freed slot id — and #1069 makes
+  it checkable without yet adding it. It belongs here as the header twin of the existing
+  "freed slot still named by a delta" fault, and it is **not implemented today**. The checker
+  otherwise needs no commit oracle at all: every header check it runs is a pure bit test, and both
+  the `0` sentinel and a settled word are byte-identical under the old and the new conventions.
+
 ### 12.6 Format version
 
 Adding these two stores and bringing `undo_ptr` to life is an **incompatible on-disk layout change**:
@@ -590,6 +661,16 @@ whether an older image is **upgraded** or **refused**, and why that is the safe 
 | 2 | #966 | the undo area's two stores, in the `GRPHUNDO` block | **upgraded**: a version-1 image has no chains, which is exactly what an empty undo area describes |
 | 3 | #967 | **no byte moved.** A `props.store` cell's MVCC header no longer carries the property's visibility (`D-property-visibility`) | **refused, with a migration route**, if and only if the image still holds a property tombstone. That is the whole reason the number had to move: versions 2 and 3 are otherwise indistinguishable, so the gate would have had nothing to key on. A tombstone-free legacy image upgrades losslessly, which is the normal state of any store whose GC has caught up (`RecordStore::refuse_legacy_property_tombstones`) |
 | 4 | #1066 | the **applied-transaction set**, in a trailing `GRPHCNTD` block: the transactions whose logged cardinality deltas (`04` §4.1) are already folded into the `Statistics` persisted beside it | **upgraded**, with an empty set |
+| 5 | #1083 | the **pending-DDL block**: the schema catalog of the transaction whose commit wrote the image, attributed to it by name instead of folded into the committed `Statistics` | **upgraded**, with the block absent — a version-4 image folded that DDL straight into its `Statistics`, so there is nothing left to attribute. The refusal that matters runs the other way: an older build would ignore the block, and a committed `CREATE CONSTRAINT` whose only durable record is that block would vanish |
+| 6 | #1069 | **no byte moved.** The high-bit payload of `created_ts` / `expired_ts` names the writer's **commit slot** instead of its `TxnId` (§7, `HeaderStamp`) | **refused, with a migration route**, if and only if some in-use record still carries an unsettled stamp. Versions 5 and 6 are otherwise indistinguishable, which is why the number had to move: a small `TxnId` is a perfectly plausible slot id, so each convention misreads the other silently, and a misread attributes a committed version to an unrelated transaction. An image in which every stamp is settled has nothing either convention could misread, and is opened (`RecordStore::refuse_legacy_txn_stamps`) |
+
+**Why version 6's migration route is better than version 3's, and why that is worth stating.** Version
+3's hazard was irrecoverable — no rewrite could say which property cells had been removals — so its
+only route was export and re-import. This one is not. Settling every stamp is a *supported operation of
+the build that wrote the image*: `RecordStore::freeze_committed_headers`, which that build's own backup
+path already invoked. Opening the store with the previous build and forcing a full freeze leaves an
+image both conventions read identically. The gate's error message says exactly that, and names the
+first offending record — store kind, id, and the raw word — rather than merely refusing.
 
 **Why the version-4 upgrade is lossless, and why the bump was still necessary.** The set's invariant is
 "these transactions are already folded into the counters beside it". For a pre-version-4 image the

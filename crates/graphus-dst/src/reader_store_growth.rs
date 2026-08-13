@@ -172,7 +172,6 @@ pub fn run_reader_vs_store_growth(seed: u64) -> ReaderGrowthReport {
     let view = s.read_view();
     // A reader ticket distinct from every writer below.
     let reader_snapshot = Snapshot::new(TxnId(u64::MAX), s.snapshot_ts());
-    let registry = s.commit_registry_snapshot();
     let pages_before = s.store_page_count();
 
     // The survivors as the reader must still see them, and the id watermark that separates
@@ -249,17 +248,14 @@ pub fn run_reader_vs_store_growth(seed: u64) -> ReaderGrowthReport {
                 .iter()
                 .copied()
                 .filter(|id| {
-                    // Through the `rmp` #1069 door. The reader's cloned in-memory registry never
-                    // faults; a fault would be a defect in the door, so this oracle panics rather
-                    // than quietly dropping the edge from the visible set it is asserting over.
+                    // Through the `rmp` #1069 door, over the reader's OWN VIEW — which since
+                    // phase 3 resolves a record stamp against `commit.store` exactly as the inline
+                    // path does, with no captured registry clone. A fault would be a defect in the
+                    // door, so this oracle panics rather than quietly dropping the edge from the
+                    // visible set it is asserting over.
                     view.rel(*id).is_ok_and(|r| {
-                        is_visible_via(
-                            &registry,
-                            reader_snapshot,
-                            r.mvcc.created_ts,
-                            r.mvcc.expired_ts,
-                        )
-                        .expect("resolve rel stamp")
+                        is_visible_via(&view, reader_snapshot, r.mvcc.created_ts, r.mvcc.expired_ts)
+                            .expect("resolve rel stamp")
                     })
                 })
                 .collect();

@@ -500,9 +500,15 @@ impl<S: VersionedStore, D: Durability> TxnManager<S, D> {
         // then returns that same word's timestamp without consulting the table. Asking
         // `resolve_stamp` ALONE would additionally catch a lazily-settled foreign commit, which is a
         // different — and, for this harness, unreachable — predicate; phase 2 changes no semantics.
+        //
+        // [`RegistryOracle`] rather than the store's slot-backed oracle, and that is correct HERE
+        // and nowhere near a record header: `self.store` is the manager's in-memory
+        // [`VersionedStore`], whose `xmin` carries a `TxnId` exactly as it always did (`rmp` #1069
+        // phase 3 re-pointed the *record header* population only). See `RegistryOracle`'s docs.
+        let oracle = crate::visibility::RegistryOracle(&self.registry);
         if let Some(xmin) = self.store.head_xmin(key)
-            && self.registry.names_writer(xmin)?.is_none()
-            && let StampOutcome::Committed(committed_ts) = self.registry.resolve_stamp(xmin)?
+            && oracle.names_writer(xmin)?.is_none()
+            && let StampOutcome::Committed(committed_ts) = oracle.resolve_stamp(xmin)?
             && committed_ts > snapshot_ts
         {
             return Err(GraphusError::Transaction(format!(

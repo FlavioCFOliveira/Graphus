@@ -87,7 +87,6 @@ fn store_grows_far_past_the_one_page_catalog_cap_and_recovers() {
     // but the Active/Recent Transaction Table resolves it to its commit timestamp.
     assert!(
         store
-            .commit_registry()
             .resolve_commit_ts(last.mvcc.created_ts)
             .unwrap()
             .is_some(),

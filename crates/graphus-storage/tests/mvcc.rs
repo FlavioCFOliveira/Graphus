@@ -16,15 +16,47 @@
 //!   once the freeze is durable — bounding the table (`rmp` task #59); a rolled-back or crashed GC
 //!   pass prunes nothing and leaves every restored in-flight stamp resolvable.
 
-use graphus_core::{Timestamp, TxnId, Value, VersionStamp};
+use graphus_core::{HeaderStamp, Timestamp, TxnId, Value, VersionStamp};
 use graphus_io::MemBlockDevice;
 use graphus_storage::recovery::recover_device;
 use graphus_storage::{Namespace, RecordStore};
-// `resolve_commit_ts` moved onto the `rmp` #1069 commit door; assertions below are unchanged.
-use graphus_txn::CommitOracle;
+// `resolve_commit_ts` moved onto the `rmp` #1069 commit door. `RegistryOracle` is the deliberate,
+// named way to ask the IN-MEMORY table about a `TxnId`-payload word — the only population that still
+// carries one; a record header is asked of the STORE.
+use graphus_txn::{CommitOracle, RegistryOracle};
 use graphus_wal::{LogSink, MemLogSink, WalManager};
 
 type Store = RecordStore<MemBlockDevice, MemLogSink>;
+
+/// Asserts `word` is an **unsettled** header stamp that names `txn`'s write.
+///
+/// Since `rmp` #1069 phase 3 the word carries `txn`'s **commit-slot id**, not `txn` itself, so the
+/// identity is recovered from the store rather than decoded out of the bits. Testing both halves —
+/// "unsettled" *and* "names this writer" — is what keeps this assertion as strong as the
+/// `VersionStamp::InFlight(txn)` equality it replaced.
+#[track_caller]
+fn assert_unsettled_by(s: &Store, word: u64, txn: TxnId, msg: &str) {
+    assert!(
+        HeaderStamp::from_raw(word).slot_id().is_some(),
+        "{msg}: expected an unsettled stamp, got {:?}",
+        HeaderStamp::from_raw(word)
+    );
+    assert_eq!(
+        s.names_writer(word).expect("resolve the stamp's writer"),
+        Some(txn),
+        "{msg}"
+    );
+}
+
+/// Asserts `word` is a **settled** header stamp carrying commit timestamp `ts`.
+#[track_caller]
+fn assert_settled_at(word: u64, ts: u64, msg: &str) {
+    assert_eq!(
+        HeaderStamp::from_raw(word),
+        HeaderStamp::Committed(Timestamp(ts)),
+        "{msg}"
+    );
+}
 
 fn fresh() -> Store {
     let device = MemBlockDevice::new(0);
@@ -55,9 +87,11 @@ fn created_ts_stays_inflight_after_commit_and_resolves_through_the_registry() {
     // Before commit: xmin is the writer's in-flight TxnId, xmax is the live sentinel, and no commit
     // timestamp has been issued yet.
     let mvcc = s.node(id).unwrap().mvcc;
-    assert_eq!(
-        VersionStamp::from_raw(mvcc.created_ts),
-        VersionStamp::InFlight(txn)
+    assert_unsettled_by(
+        &s,
+        mvcc.created_ts,
+        txn,
+        "the stamp is unsettled and names this writer",
     );
     assert_eq!(mvcc.expired_ts, 0);
     assert_eq!(s.snapshot_ts(), Timestamp(0));
@@ -69,15 +103,14 @@ fn created_ts_stays_inflight_after_commit_and_resolves_through_the_registry() {
     // that stamp to the commit timestamp (1), and the snapshot high-water advanced. GC freezes the
     // header to `Committed(1)` later; until then this resolution is what makes the version visible.
     let mvcc = s.node(id).unwrap().mvcc;
-    assert_eq!(
-        VersionStamp::from_raw(mvcc.created_ts),
-        VersionStamp::InFlight(txn),
-        "lazy freeze keeps the committed version's in-flight xmin until GC settles it"
+    assert_unsettled_by(
+        &s,
+        mvcc.created_ts,
+        txn,
+        "lazy freeze keeps the committed version's in-flight xmin until GC settles it",
     );
     assert_eq!(
-        s.commit_registry()
-            .resolve_commit_ts(mvcc.created_ts)
-            .unwrap(),
+        s.resolve_commit_ts(mvcc.created_ts).unwrap(),
         Some(Timestamp(1)),
         "the transaction table resolves the in-flight stamp to its commit timestamp"
     );
@@ -101,14 +134,14 @@ fn delete_is_a_tombstone_reclaimed_only_by_gc() {
     assert!(mvcc.in_use(), "a tombstone keeps its slot in use until GC");
     // Lazy freeze (`rmp` task #49): xmax keeps the deleter's in-flight TxnId; the transaction table
     // resolves it to its commit timestamp (2), which is how GC and readers see the deletion.
-    assert_eq!(
-        VersionStamp::from_raw(mvcc.expired_ts),
-        VersionStamp::InFlight(TxnId(2))
+    assert_unsettled_by(
+        &s,
+        mvcc.expired_ts,
+        TxnId(2),
+        "the stamp is unsettled and names this writer",
     );
     assert_eq!(
-        s.commit_registry()
-            .resolve_commit_ts(mvcc.expired_ts)
-            .unwrap(),
+        s.resolve_commit_ts(mvcc.expired_ts).unwrap(),
         Some(Timestamp(2))
     );
     assert_eq!(s.scan_node_ids().unwrap(), vec![id]);
@@ -149,14 +182,14 @@ fn commit_timestamp_high_water_survives_recovery_and_stays_monotonic() {
     // the WAL commit records** (each carries its commit_ts), resolves that stamp to the commit
     // timestamp. This is exactly what makes a committed-but-unfrozen version survive a crash.
     let first_mvcc = s.node(first).unwrap().mvcc;
-    assert_eq!(
-        VersionStamp::from_raw(first_mvcc.created_ts),
-        VersionStamp::InFlight(TxnId(1))
+    assert_unsettled_by(
+        &s,
+        first_mvcc.created_ts,
+        TxnId(1),
+        "the stamp is unsettled and names this writer",
     );
     assert_eq!(
-        s.commit_registry()
-            .resolve_commit_ts(first_mvcc.created_ts)
-            .unwrap(),
+        s.resolve_commit_ts(first_mvcc.created_ts).unwrap(),
         Some(Timestamp(1)),
         "recovery rebuilt the transaction table from the WAL, so the committed version resolves"
     );
@@ -167,14 +200,14 @@ fn commit_timestamp_high_water_survives_recovery_and_stays_monotonic() {
     s.commit(TxnId(2)).unwrap();
     assert_eq!(s.snapshot_ts(), Timestamp(2));
     let second_mvcc = s.node(second).unwrap().mvcc;
-    assert_eq!(
-        VersionStamp::from_raw(second_mvcc.created_ts),
-        VersionStamp::InFlight(TxnId(2))
+    assert_unsettled_by(
+        &s,
+        second_mvcc.created_ts,
+        TxnId(2),
+        "the stamp is unsettled and names this writer",
     );
     assert_eq!(
-        s.commit_registry()
-            .resolve_commit_ts(second_mvcc.created_ts)
-            .unwrap(),
+        s.resolve_commit_ts(second_mvcc.created_ts).unwrap(),
         Some(Timestamp(2))
     );
 }
@@ -199,15 +232,14 @@ fn lazy_committed_version_survives_recovery_while_a_loser_resolves_invisible() {
     // The committed version's header is unfrozen, yet the rebuilt table resolves it to ts 1.
     let mvcc = s.node(committed_node).unwrap().mvcc;
     assert!(mvcc.in_use(), "the committed node survives recovery");
-    assert_eq!(
-        VersionStamp::from_raw(mvcc.created_ts),
-        VersionStamp::InFlight(TxnId(1)),
-        "no GC ran, so the committed version keeps its writer's in-flight stamp"
+    assert_unsettled_by(
+        &s,
+        mvcc.created_ts,
+        TxnId(1),
+        "no GC ran, so the committed version keeps its writer's in-flight stamp",
     );
     assert_eq!(
-        s.commit_registry()
-            .resolve_commit_ts(mvcc.created_ts)
-            .unwrap(),
+        s.resolve_commit_ts(mvcc.created_ts).unwrap(),
         Some(Timestamp(1)),
         "the table rebuilt from the WAL resolves the committed-but-unfrozen version"
     );
@@ -215,7 +247,7 @@ fn lazy_committed_version_survives_recovery_while_a_loser_resolves_invisible() {
     // The loser left no commit record, so the table has no entry for it: its in-flight stamp
     // resolves to "not committed" — invisible to every snapshot.
     assert_eq!(
-        s.commit_registry()
+        RegistryOracle(&s.commit_registry())
             .resolve_commit_ts(VersionStamp::in_flight(TxnId(2)))
             .unwrap(),
         None,
@@ -288,22 +320,25 @@ fn gc_freezes_committed_headers_and_prunes_the_transaction_table() {
     s.commit(t3).unwrap(); // the freeze is durable: the prune applies now
 
     // (i) The headers are self-describing `Committed(ts)` stamps.
-    assert_eq!(
-        VersionStamp::from_raw(s.node(a).unwrap().mvcc.created_ts),
-        VersionStamp::Committed(Timestamp(1))
+    assert_settled_at(
+        s.node(a).unwrap().mvcc.created_ts,
+        1,
+        "the stamp is settled at this timestamp",
     );
     let rel = s.rel(r).unwrap();
     assert!(
         rel.mvcc.in_use(),
         "the tombstone survives (older snapshots may need it)"
     );
-    assert_eq!(
-        VersionStamp::from_raw(rel.mvcc.created_ts),
-        VersionStamp::Committed(Timestamp(1))
+    assert_settled_at(
+        rel.mvcc.created_ts,
+        1,
+        "the stamp is settled at this timestamp",
     );
-    assert_eq!(
-        VersionStamp::from_raw(rel.mvcc.expired_ts),
-        VersionStamp::Committed(Timestamp(2))
+    assert_settled_at(
+        rel.mvcc.expired_ts,
+        2,
+        "the stamp is settled at this timestamp",
     );
     // The property cell: ONE record, rewritten in place, so `p1 == p2` and its `xmin` carries the
     // overwriting transaction. Its `xmax` is `0` and stays `0` for ever — the retired tombstone.
@@ -312,10 +347,10 @@ fn gc_freezes_committed_headers_and_prunes_the_transaction_table() {
         "the overwrite reuses the cell rather than allocating"
     );
     let cell = s.property(p1).unwrap();
-    assert_eq!(
-        VersionStamp::from_raw(cell.mvcc.created_ts),
-        VersionStamp::Committed(Timestamp(2)),
-        "the cell's creator stamp froze to the overwriting transaction's commit ts"
+    assert_settled_at(
+        cell.mvcc.created_ts,
+        2,
+        "the cell's creator stamp froze to the overwriting transaction's commit ts",
     );
     assert_eq!(
         cell.mvcc.expired_ts, 0,
@@ -325,7 +360,7 @@ fn gc_freezes_committed_headers_and_prunes_the_transaction_table() {
     // (ii) The table shrank to exactly the writers not yet frozen: only the GC transaction itself.
     assert_eq!(s.commit_registry().len(), 1, "only the GC writer remains");
     assert_eq!(
-        s.commit_registry()
+        RegistryOracle(&s.commit_registry())
             .resolve_commit_ts(VersionStamp::in_flight(t1))
             .unwrap(),
         None,
@@ -382,20 +417,20 @@ fn a_writer_committing_during_the_gc_window_is_not_pruned() {
 
     // t2's version still carries an in-flight stamp (not frozen this pass) and MUST resolve.
     let mvcc = s.node(b).unwrap().mvcc;
-    assert_eq!(
-        VersionStamp::from_raw(mvcc.created_ts),
-        VersionStamp::InFlight(t2)
+    assert_unsettled_by(
+        &s,
+        mvcc.created_ts,
+        t2,
+        "the stamp is unsettled and names this writer",
     );
     assert_eq!(
-        s.commit_registry()
-            .resolve_commit_ts(mvcc.created_ts)
-            .unwrap(),
+        s.resolve_commit_ts(mvcc.created_ts).unwrap(),
         Some(Timestamp(2)),
         "the mid-window committer survives the prune"
     );
     // And t1 is gone (its stamps froze before the prune).
     assert_eq!(
-        s.commit_registry()
+        RegistryOracle(&s.commit_registry())
             .resolve_commit_ts(VersionStamp::in_flight(t1))
             .unwrap(),
         None
@@ -419,24 +454,18 @@ fn rolled_back_gc_pass_prunes_nothing_and_strands_no_stamp() {
     let report = s.gc(t2, s.snapshot_ts()).unwrap();
     assert_eq!(report.frozen, 1);
     assert_eq!(report.prune_scheduled, 1);
-    assert_eq!(
-        VersionStamp::from_raw(s.node(a).unwrap().mvcc.created_ts),
-        VersionStamp::Committed(Timestamp(1)),
-        "the freeze is applied in-cache before the rollback"
+    assert_settled_at(
+        s.node(a).unwrap().mvcc.created_ts,
+        1,
+        "the freeze is applied in-cache before the rollback",
     );
     s.rollback(t2).unwrap();
 
     // The WAL undo restored the in-flight stamp, and the table still resolves it: no prune ran.
     let mvcc = s.node(a).unwrap().mvcc;
+    assert_unsettled_by(&s, mvcc.created_ts, t1, "rollback undid the freeze");
     assert_eq!(
-        VersionStamp::from_raw(mvcc.created_ts),
-        VersionStamp::InFlight(t1),
-        "rollback undid the freeze"
-    );
-    assert_eq!(
-        s.commit_registry()
-            .resolve_commit_ts(mvcc.created_ts)
-            .unwrap(),
+        s.resolve_commit_ts(mvcc.created_ts).unwrap(),
         Some(Timestamp(1)),
         "the rolled-back pass pruned nothing — the restored stamp still resolves"
     );
@@ -446,9 +475,10 @@ fn rolled_back_gc_pass_prunes_nothing_and_strands_no_stamp() {
     s.begin(t3);
     s.gc(t3, s.snapshot_ts()).unwrap();
     s.commit(t3).unwrap();
-    assert_eq!(
-        VersionStamp::from_raw(s.node(a).unwrap().mvcc.created_ts),
-        VersionStamp::Committed(Timestamp(1))
+    assert_settled_at(
+        s.node(a).unwrap().mvcc.created_ts,
+        1,
+        "the stamp is settled at this timestamp",
     );
     assert_eq!(
         s.commit_registry().len(),
@@ -483,15 +513,14 @@ fn crash_mid_gc_restores_inflight_stamps_and_a_resolving_table() {
     // The loser GC's freeze was undone; the rebuilt table resolves the restored in-flight stamp.
     let mvcc = s.node(a).unwrap().mvcc;
     assert!(mvcc.in_use());
-    assert_eq!(
-        VersionStamp::from_raw(mvcc.created_ts),
-        VersionStamp::InFlight(t1),
-        "recovery rolled the uncommitted freeze back"
+    assert_unsettled_by(
+        &s,
+        mvcc.created_ts,
+        t1,
+        "recovery rolled the uncommitted freeze back",
     );
     assert_eq!(
-        s.commit_registry()
-            .resolve_commit_ts(mvcc.created_ts)
-            .unwrap(),
+        s.resolve_commit_ts(mvcc.created_ts).unwrap(),
         Some(Timestamp(1)),
         "the table rebuilt from the WAL still resolves the committed writer"
     );
@@ -502,9 +531,10 @@ fn crash_mid_gc_restores_inflight_stamps_and_a_resolving_table() {
     let report = s.gc(t3, s.snapshot_ts()).unwrap();
     assert_eq!(report.frozen, 1);
     s.commit(t3).unwrap();
-    assert_eq!(
-        VersionStamp::from_raw(s.node(a).unwrap().mvcc.created_ts),
-        VersionStamp::Committed(Timestamp(1))
+    assert_settled_at(
+        s.node(a).unwrap().mvcc.created_ts,
+        1,
+        "the stamp is settled at this timestamp",
     );
     assert_eq!(
         s.commit_registry().len(),
@@ -535,10 +565,10 @@ fn frozen_headers_survive_a_crash_and_stale_entries_reprune() {
     // The frozen header is durable; the rebuilt table again holds every WAL-committed writer —
     // t1, t2, and the create-time system catalog transaction (its commit record carries the ts-0
     // sentinel) — stale but harmless, since no header references any of them any more.
-    assert_eq!(
-        VersionStamp::from_raw(s.node(a).unwrap().mvcc.created_ts),
-        VersionStamp::Committed(Timestamp(1)),
-        "the committed freeze survived the crash"
+    assert_settled_at(
+        s.node(a).unwrap().mvcc.created_ts,
+        1,
+        "the committed freeze survived the crash",
     );
     assert_eq!(
         s.commit_registry().len(),

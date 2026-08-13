@@ -28,7 +28,9 @@
 //!   must not be chased by a concurrent writer. This is MVCC-superset-safe: any id allocated after the
 //!   capture belongs to a writer that commits *after* the reader's snapshot timestamp, so it is
 //!   invisible anyway — visibility is decided **above** this layer by `graphus_txn::is_visible_via`
-//!   against the reader's own cloned `CommitRegistry`.
+//!   against the view's own [`PagesOracle`], which resolves an unsettled stamp through the view's own
+//!   `commit.store`. Before `rmp` #1069 that oracle was a **cloned `CommitRegistry`**; a reader thread
+//!   needs no such clone any more, because the answer is in the data the view already maps.
 //!
 //! - **The page map is LIVE.** The original design froze it too, on the argument that "the writer only
 //!   appends, so a reader scanning `1..high_water` only ever indexes already-existing entries; any id
@@ -61,10 +63,10 @@ use std::sync::Arc;
 
 use graphus_bufpool::ConcurrentBufferPool;
 use graphus_core::error::{GraphusError, Result};
-use graphus_core::{PageId, Value};
+use graphus_core::{HeaderStamp, PageId, TxnId, Value, VersionStamp};
 use graphus_io::BlockDevice;
 use graphus_pagemap::PageMap;
-use graphus_txn::{CommitOracle, CommitRegistry, Snapshot, View, is_visible_via};
+use graphus_txn::{CommitOracle, Snapshot, StampOutcome, View, is_visible_via};
 use graphus_wal::LogSink;
 
 use crate::heap::{HeapBlock, STRINGS_RECORD_SIZE};
@@ -183,6 +185,151 @@ pub trait StorePages {
     /// `high_water <= addressable capacity` invariant, `rmp` #479), and it grows with the writer — so it
     /// can never false-positive on a legitimate walk while still terminating any genuine cycle.
     fn mapped_page_count(&self, kind: StoreKind) -> u64;
+}
+
+/// The **record-header commit oracle**: resolves a [`HeaderStamp`] against the durable
+/// `commit.store` (`rmp` #1069 phase 3).
+///
+/// This is the one and only resolver of a record header's `created_ts` / `expired_ts`. Before phase
+/// 3 the header named a `TxnId` and only the in-memory [`CommitRegistry`] could translate it, which
+/// forced an `O(N)` freeze sweep, a freeze frontier and a WAL retention floor to exist purely so the
+/// translation could not be lost. The header now names the writer's commit slot, and the slot is
+/// durable — so the deltas and the headers resolve through the **same** oracle and a restart, a
+/// registry prune or a GC pass can no longer make a committed version unreadable.
+///
+/// # It fails closed, always
+///
+/// A word that names a slot the store cannot read, cannot decode, or that was never written is an
+/// **error**, never a guessed verdict (`rmp` #733). That is the whole reason the door is fallible:
+/// a header naming an unreadable slot is corruption or a lost slot, and answering "invisible" would
+/// turn either into silent lost committed data — the `rmp` #522 shape this task exists to make
+/// structurally impossible.
+///
+/// # It is unbound to any transaction
+///
+/// It knows nothing of the Active Transaction Table, so [`names_own_write`](CommitOracle::names_own_write)
+/// costs it a slot read. [`RecordStore`](crate::store::RecordStore) implements the door itself and
+/// overrides that with an in-memory comparison; this bare form is what the off-thread reader
+/// ([`StoreReadView`]) uses, where no such table is reachable and every reader is read-only anyway.
+///
+/// # ⚠ A verdict is now `f(header, slot)` — two pages, two latches
+///
+/// The header word and the slot it names live on different pages and are read under separate frame
+/// latches, so the pair is not observed atomically. What that window can and cannot do:
+///
+/// * **The values themselves are monotone.** A header word goes `Slot(k)` → `Committed(ts)` (the
+///   freeze) or is reverted by its writer's undo; a slot goes open → published, or has its `in_use`
+///   bit cleared by an abort. So reading a slightly older header and a slightly newer slot yields the
+///   verdict of *some* instant, never a state that never existed.
+/// * **The one hazard is identity, not value**: if the header is settled *and* slot `k` is then
+///   reclaimed and re-handed to another transaction between the two reads, a very slow reader would
+///   resolve `k` against the wrong writer. `rmp` #1069 phase 1 is what bounds this — a slot dies only
+///   by a census that counts header references, and a retired slot is **parked for a full GC pass**
+///   before it re-enters circulation, so the window a reader would have to lose is a whole
+///   maintenance cycle rather than a few instructions.
+/// * **It is not a new class.** `undo.store`'s delta path has resolved `delta.commit_info` this way
+///   since `rmp` #966, under the same two-latch shape and the same discipline. Phase 3 extends the
+///   existing arrangement from deltas to headers; it does not introduce it.
+///
+/// Stated here because the symptom in a release build would be a *wrong value*, not a panic — so it
+/// is proved by value-level tests (`tests/commit_slot_oracle_1069.rs`), never by a `debug_assert`.
+pub struct PagesOracle<'a, D: BlockDevice, S: LogSink, P: StorePages> {
+    pool: &'a Pool<D, S>,
+    pages: &'a P,
+}
+
+impl<'a, D: BlockDevice, S: LogSink, P: StorePages> PagesOracle<'a, D, S, P> {
+    /// The oracle reading `pool`/`pages`' `commit.store`.
+    pub fn new(pool: &'a Pool<D, S>, pages: &'a P) -> Self {
+        Self { pool, pages }
+    }
+
+    /// The slot `word` names, read and validated — the one primitive the door's methods share.
+    ///
+    /// `Ok(None)` when the word names no slot at all (the `0` sentinel or an already-settled
+    /// `Committed` word). Otherwise the decoded slot, or an error.
+    ///
+    /// # Errors
+    /// A storage fault reading the slot's page, a slot that does not decode, or a header naming a
+    /// slot that was never written — all fail closed.
+    fn slot_of(&self, word: u64) -> Result<Option<CommitSlot>> {
+        let Some(id) = HeaderStamp::from_raw(word).slot_id() else {
+            return Ok(None);
+        };
+        match read_commit_slot(self.pool, self.pages, id)? {
+            Some(slot) => Ok(Some(slot)),
+            // A header naming a zeroed slot is unreachable in a healthy store — `rmp` #1069 phase 1
+            // made a slot unreclaimable while any header names it — so this is corruption, and the
+            // only safe answer is to fail the read.
+            None => Err(GraphusError::Storage(format!(
+                "MVCC header stamp {word:#018x} names commit slot {id}, which was never written"
+            ))),
+        }
+    }
+}
+
+/// What a decoded [`CommitSlot`] says about its transaction — the shared body of every slot-backed
+/// [`CommitOracle`] in this crate (`rmp` #1069 phase 3).
+///
+/// The rules, in the order the slot's own lifecycle produces them:
+///
+/// * `!in_use` — an **aborted** transaction's corpse slot. Its writes are never visible.
+/// * `commit_ts` still carrying the writer's in-flight stamp — the transaction had not resolved when
+///   the slot was last written, i.e. it is genuinely open (or a crash's loser, until recovery).
+/// * `commit_ts` carrying a timestamp — **committed** at that timestamp, and this is the commit
+///   indirection point: publishing this one word commits every delta and every header the
+///   transaction stamped, at one instant.
+///
+/// Note which type decodes `commit_ts`: [`VersionStamp`], never [`HeaderStamp`]. The slot's word is
+/// the OTHER population, and it keeps its `TxnId` payload for ever (`rmp` #1069).
+///
+/// # Errors
+/// A slot whose `commit_ts` is `0` cannot occur (`CommitSlot::decode` rejects a zeroed slot and a
+/// real slot always opens with a non-zero in-flight stamp), so it is reported as corruption rather
+/// than folded into any outcome.
+pub(crate) fn slot_outcome(slot: CommitSlot, id: u64) -> Result<StampOutcome> {
+    if !slot.in_use() {
+        return Ok(StampOutcome::Aborted);
+    }
+    match VersionStamp::from_raw(slot.commit_ts) {
+        VersionStamp::Committed(ts) => Ok(StampOutcome::Committed(ts)),
+        VersionStamp::InFlight(txn) => Ok(StampOutcome::InFlight(txn)),
+        VersionStamp::None => Err(GraphusError::Storage(format!(
+            "commit slot {id} is in use but carries no commit stamp"
+        ))),
+    }
+}
+
+impl<D: BlockDevice, S: LogSink, P: StorePages> CommitOracle for PagesOracle<'_, D, S, P> {
+    fn resolve_stamp(&self, word: u64) -> Result<StampOutcome> {
+        match HeaderStamp::from_raw(word) {
+            HeaderStamp::None => Ok(StampOutcome::None),
+            HeaderStamp::Committed(ts) => Ok(StampOutcome::Committed(ts)),
+            HeaderStamp::Slot(id) => {
+                let slot = self.slot_of(word)?.expect("a `Slot` word names a slot");
+                slot_outcome(slot, id)
+            }
+        }
+    }
+
+    fn names_writer(&self, word: u64) -> Result<Option<TxnId>> {
+        // IDENTITY, never outcome: the slot retains `txn_id` after commit and after abort alike, so
+        // this answers "which transaction stamped this word" for every unsettled word — exactly what
+        // the registry-backed predecessor answered by decoding the `TxnId` out of the word itself.
+        Ok(self.slot_of(word)?.map(|slot| TxnId(slot.txn_id)))
+    }
+
+    fn resolve_for(&self, word: u64, owner: TxnId) -> Result<(StampOutcome, bool)> {
+        // ONE slot read for both answers — the reason this method exists (`rmp` #1069).
+        match HeaderStamp::from_raw(word) {
+            HeaderStamp::None => Ok((StampOutcome::None, false)),
+            HeaderStamp::Committed(ts) => Ok((StampOutcome::Committed(ts), false)),
+            HeaderStamp::Slot(id) => {
+                let slot = self.slot_of(word)?.expect("a `Slot` word names a slot");
+                Ok((slot_outcome(slot, id)?, slot.txn_id == owner.0))
+            }
+        }
+    }
 }
 
 /// The upper bound on the number of records `kind`'s store can currently address: the live number of
@@ -587,24 +734,25 @@ fn decide_properties<D: BlockDevice, S: LogSink, P: StorePages>(
 /// fault is **never** answered with the header's own verdict: an entity whose existence cannot be
 /// resolved must fail the read, not be guessed either way (the fail-closed-on-read-fault contract,
 /// `rmp` #733).
-pub fn entity_visible_at<D: BlockDevice, S: LogSink, P: StorePages>(
+pub fn entity_visible_at<D: BlockDevice, S: LogSink, P: StorePages, O: CommitOracle>(
     pool: &Pool<D, S>,
     pages: &P,
     kind: StoreKind,
     id: u64,
     mvcc: MvccHeader,
     snapshot: Snapshot,
-    registry: &CommitRegistry,
+    oracle: &O,
 ) -> Result<bool> {
-    let header_says = is_visible_via(registry, snapshot, mvcc.created_ts, mvcc.expired_ts)?;
+    let header_says = is_visible_via(oracle, snapshot, mvcc.created_ts, mvcc.expired_ts)?;
     if snapshot.view == View::New || mvcc.undo_ptr == NULL_ID {
         return Ok(header_says);
     }
-    // "Is this stamp MY own in-flight write?" through the one door (`rmp` #1069), instead of
-    // comparing against an open-coded `VersionStamp::in_flight(snapshot.owner)` word. When the header
-    // stops carrying a `TxnId` (phase 3) this rule changes in `CommitOracle`, not here.
-    if !registry.names_own_write(mvcc.created_ts, snapshot.owner)?
-        && !registry.names_own_write(mvcc.expired_ts, snapshot.owner)?
+    // "Is this stamp MY own write?" through the one door (`rmp` #1069), instead of comparing against
+    // an open-coded stamp word. Since phase 3 the header names a commit slot, so the rule lives in
+    // `CommitOracle` — as an id comparison against the owner's own slot, not a `TxnId` comparison —
+    // and not here.
+    if !oracle.names_own_write(mvcc.created_ts, snapshot.owner)?
+        && !oracle.names_own_write(mvcc.expired_ts, snapshot.owner)?
     {
         return Ok(header_says);
     }
@@ -1052,6 +1200,51 @@ pub fn scan_property_tombstones<D: BlockDevice, S: LogSink, P: StorePages>(
         }
         Ok(())
     })?;
+    Ok((count, first))
+}
+
+/// The first **unsettled** MVCC stamp a legacy-image scan met: which store, which record, and the
+/// raw word — everything an operator needs to act on the refusal (`rmp` #1069).
+pub type UnsettledStamp = (StoreKind, u64, u64);
+
+/// Every **unsettled** MVCC stamp carried by an in-use record of the three versioned stores, for the
+/// `rmp` #1069 legacy-image gate (`RecordStore::refuse_legacy_txn_stamps`).
+///
+/// Returns the count and the lowest-addressed offender as `(kind, id, word)`. "Unsettled" is the
+/// same bit test on both sides of the version boundary — a non-zero word with the high bit set —
+/// which is exactly why the gate is needed: the bytes do not distinguish a `TxnId` payload from a
+/// commit-slot payload, only the format version does.
+///
+/// A fully settled image carries none of these, and can therefore be opened by a build of either
+/// convention without any word being misread.
+///
+/// # Errors
+/// Returns a storage error if a store page cannot be read. The caller must then **refuse**: an
+/// unreadable census is not an empty one.
+pub fn scan_unsettled_stamps<D: BlockDevice, S: LogSink, P: StorePages>(
+    pool: &Pool<D, S>,
+    pages: &P,
+) -> Result<(usize, Option<UnsettledStamp>)> {
+    let mut count = 0usize;
+    let mut first: Option<UnsettledStamp> = None;
+    for kind in [StoreKind::Node, StoreKind::Rel, StoreKind::Prop] {
+        for_each_record_slot(pool, pages, kind, 1, |id, rec| {
+            let mvcc = MvccHeader::read(&rec[..MVCC_HEADER_SIZE]);
+            if !mvcc.in_use() {
+                return Ok(());
+            }
+            for word in [mvcc.created_ts, mvcc.expired_ts] {
+                if HeaderStamp::from_raw(word).slot_id().is_some() {
+                    count += 1;
+                    // The walk is ascending by id within a store, and the stores are visited in a
+                    // fixed order, so the first hit is deterministic — which matters for an error
+                    // message an operator is meant to act on.
+                    first.get_or_insert((kind, id, word));
+                }
+            }
+            Ok(())
+        })?;
+    }
     Ok((count, first))
 }
 
@@ -1534,8 +1727,10 @@ pub fn incident_rels_typed<D: BlockDevice, S: LogSink, P: StorePages>(
 /// exclusive `&RecordStore` and the write/commit/GC/alloc path is untouched.
 ///
 /// It carries **no** snapshot/visibility logic of its own: a returned record's `xmin`/`xmax` is
-/// filtered by `graphus_txn::is_visible_via` against the caller's own cloned `CommitRegistry` and
-/// snapshot timestamp, exactly as the `&RecordStore` path is filtered above this layer. Capturing the
+/// filtered by `graphus_txn::is_visible_via` against the view's own [`commit_oracle`](Self::commit_oracle)
+/// and snapshot timestamp, exactly as the `&RecordStore` path is filtered above this layer. (Before
+/// `rmp` #1069 that oracle was a cloned `CommitRegistry`, which is why the clone appears in this
+/// type's history and no longer in its code.) Capturing the
 /// `high_water` bound at dispatch is MVCC-superset-safe (a later-allocated id commits after the
 /// reader's snapshot and is invisible anyway), so the view sees a strict superset of the ids the
 /// reader could legally observe and the visibility filter above removes the rest.
@@ -1552,6 +1747,28 @@ pub fn incident_rels_typed<D: BlockDevice, S: LogSink, P: StorePages>(
 pub struct StoreReadView<D: BlockDevice, S: LogSink> {
     pool: Arc<Pool<D, S>>,
     meta: MetaSnapshot,
+}
+
+/// The off-thread reader resolves a record header through the **same** durable oracle the inline
+/// path uses (`rmp` #1069 phase 3) — delegating to [`StoreReadView::commit_oracle`].
+///
+/// Implemented on the view itself, rather than leaving callers to build a [`PagesOracle`], so that a
+/// reader thread can pass `&view` wherever `&store` goes and the two paths cannot drift apart. It
+/// deliberately does **not** override [`names_own_write`](CommitOracle::names_own_write): the view
+/// has no Active Transaction Table to shortcut through, and every reader it serves is read-only, so
+/// the durable answer is both the only one available and the correct one.
+impl<D: BlockDevice, S: LogSink> CommitOracle for StoreReadView<D, S> {
+    fn resolve_stamp(&self, word: u64) -> Result<StampOutcome> {
+        self.commit_oracle().resolve_stamp(word)
+    }
+
+    fn names_writer(&self, word: u64) -> Result<Option<TxnId>> {
+        self.commit_oracle().names_writer(word)
+    }
+
+    fn resolve_for(&self, word: u64, owner: TxnId) -> Result<(StampOutcome, bool)> {
+        self.commit_oracle().resolve_for(word, owner)
+    }
 }
 
 impl<D: BlockDevice, S: LogSink> Clone for StoreReadView<D, S> {
@@ -1682,9 +1899,19 @@ impl<D: BlockDevice, S: LogSink> StoreReadView<D, S> {
         id: u64,
         mvcc: MvccHeader,
         snapshot: Snapshot,
-        registry: &CommitRegistry,
     ) -> Result<bool> {
-        entity_visible_at(&self.pool, &self.meta, kind, id, mvcc, snapshot, registry)
+        entity_visible_at(&self.pool, &self.meta, kind, id, mvcc, snapshot, self)
+    }
+
+    /// This view's record-header commit oracle (`rmp` #1069 phase 3): a [`PagesOracle`] over the
+    /// view's own `commit.store`.
+    ///
+    /// The off-thread reader resolves a header stamp through exactly the mechanism the inline path
+    /// does — which is the `rmp` #755 / #768 / #769 / #770 parity rule applied to visibility itself,
+    /// and the reason a reader thread needs no `CommitRegistry` clone at all any more.
+    #[must_use]
+    pub fn commit_oracle(&self) -> PagesOracle<'_, D, S, MetaSnapshot> {
+        PagesOracle::new(&self.pool, &self.meta)
     }
 
     /// Whether node `id` carries the label with `label_token_id`. See [`node_has_label`].

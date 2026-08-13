@@ -1570,7 +1570,6 @@ fn rebuild_gate_declines_the_capture_for_an_older_snapshot() {
                 inputs.view,
                 inputs.tokens,
                 inputs.snapshot,
-                inputs.registry,
                 reader,
                 graphus_txn::SsiReadBuffer::new(reader),
             )

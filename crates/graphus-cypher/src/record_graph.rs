@@ -82,9 +82,7 @@ use graphus_index::kinds::DEFAULT_HISTOGRAM_BUCKETS;
 use graphus_index::similarity_score;
 use graphus_io::BlockDevice;
 use graphus_storage::{ConstraintKind, IndexState, MvccHeader, Namespace, RecordStore, StoreKind};
-use graphus_txn::{
-    CommitRegistry, PredicateRead, Snapshot, SsiReadBuffer, SsiTracker, View, is_visible_via,
-};
+use graphus_txn::{PredicateRead, Snapshot, SsiReadBuffer, SsiTracker, View, is_visible_via};
 use graphus_wal::LogSink;
 
 /// Tag bit distinguishing a relationship key from a node key in the shared [`SsiTracker`]
@@ -305,11 +303,6 @@ pub struct RecordStoreGraph<D: BlockDevice, S: LogSink> {
     /// point-in-time graph — only versions committed at or before its begin timestamp, plus its own
     /// in-flight writes, and not versions another transaction committed later or deleted.
     snapshot: Snapshot,
-    /// Resolves any still-in-flight writer to its commit outcome (`04 §5.3`). Eager commit-time
-    /// settling makes committed records self-describing, so this stays empty even under the
-    /// concurrent execution the coordinator drives (a committed writer's headers are settled, never
-    /// observed as in-flight by a concurrent reader).
-    registry: CommitRegistry,
     /// When this graph is driven by a [`TxnCoordinator`](crate::coordinator::TxnCoordinator), the
     /// shared SSI conflict tracker every concurrent transaction records its SIREAD markers and writes
     /// into, so the coordinator can detect a dangerous structure and abort a pivot at commit
@@ -406,16 +399,14 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // this begin therefore stay on this consistent snapshot.
         store.begin(txn);
         let snapshot = snapshot_at_current_command(&store, txn, store.snapshot_ts());
-        // Snapshot the store's Active/Recent Transaction Table at begin (`rmp` task #49): reads
-        // resolve an on-disk in-flight stamp to its commit timestamp through this. A later commit is
-        // correctly excluded whether or not this snapshot captured it (visibility filters by `ts`),
-        // and own in-flight writes are visible via the owner rule, not the table.
-        let registry = store.commit_registry_snapshot();
+        // No commit-registry clone since `rmp` #1069 phase 3: an unsettled record stamp names a slot
+        // in the store's own `commit.store`, so the store this seam already holds IS the oracle. The
+        // clone that used to be taken here (`rmp` task #49) resolved the same question from an
+        // in-memory table, and was the reason a reader had to capture one at begin.
         Self {
             store: SharedRef::new(store),
             txn,
             snapshot,
-            registry,
             ssi: None,
             // Standalone path: no coordinator ⇒ no tracker to merge into; the guard's appends are
             // no-ops, so reads register no SIREAD markers exactly as before (`rmp` #341).
@@ -460,11 +451,6 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         zones: SharedCell<crate::zone_map::ZoneMap>,
         csr: Option<SharedCell<crate::csr_adjacency::CsrAdjacency>>,
     ) -> Self {
-        // Snapshot the shared store's Active/Recent Transaction Table for this statement's reads
-        // (`rmp` task #49). Cloning at attach is consistent with snapshot isolation: a transaction
-        // that commits later is excluded by the `ts` filter regardless, and this statement's own
-        // in-flight writes resolve via the owner rule.
-        let registry = store.borrow().commit_registry_snapshot();
         // **`rmp` #972.** The statement counter's single source of truth is the `RecordStore`, never a
         // copy held by the coordinator: one explicit transaction runs many statements over many
         // `RecordStoreGraph` instances, and each new instance must pick the counter up where the
@@ -480,7 +466,6 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             store,
             txn,
             snapshot,
-            registry,
             ssi: Some(ssi),
             read_buffer,
             error: RefCell::new(None),
@@ -938,13 +923,11 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     /// (`04 §5.3`). Primarily an MVCC-visibility testing seam.
     pub fn begin_at_snapshot(store: RecordStore<D, S>, txn: TxnId, ts: Timestamp) -> Self {
         store.begin(txn);
-        let registry = store.commit_registry_snapshot();
         let snapshot = snapshot_at_current_command(&store, txn, ts);
         Self {
             store: SharedRef::new(store),
             txn,
             snapshot,
-            registry,
             ssi: None,
             // Standalone snapshot path: no coordinator ⇒ no tracker; the guard's appends are no-ops
             // (reads register no SIREAD markers, exactly as before — `rmp` #341).
@@ -1025,12 +1008,12 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     /// Propagates a stamp-resolution fault from the [`CommitOracle`](graphus_txn::CommitOracle) door
     /// (`rmp` #1069). Fail closed on it (`rmp` #733) — never fall back to a default verdict.
     fn visible_header(&self, mvcc: MvccHeader) -> Result<bool, GraphusError> {
-        is_visible_via(
-            &self.registry,
-            self.snapshot,
-            mvcc.created_ts,
-            mvcc.expired_ts,
-        )
+        // The STORE is the oracle since `rmp` #1069 phase 3: an unsettled stamp names a slot in its
+        // `commit.store`. The borrow is taken here rather than threaded because the one caller
+        // (`columnar_entry_is_fresh`) has provably released its own before asking — a re-borrow while
+        // one is held is a re-entrant `SharedCell` acquisition (`rmp` #1010).
+        let store = self.store.borrow();
+        is_visible_via(store, self.snapshot, mvcc.created_ts, mvcc.expired_ts)
     }
 
     /// Whether the node / relationship `(kind, id)` carrying `mvcc` **exists** as of this query's
@@ -1084,7 +1067,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         id: u64,
         mvcc: MvccHeader,
     ) -> Result<bool, GraphusError> {
-        store.entity_visible_at(kind, id, mvcc, self.snapshot, &self.registry)
+        store.entity_visible_at(kind, id, mvcc, self.snapshot)
     }
 
     /// The label bitmap node `id` presents to this query's snapshot (`rmp` task #767), given the
@@ -1109,15 +1092,14 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         store.label_bitmap_at(id, live, head, self.snapshot)
     }
 
-    /// This statement's visibility context (snapshot + registry + txn) for the shared lifted read body
+    /// This statement's visibility context (snapshot + txn) for the shared lifted read body
     /// (`rmp` task #336, Slice 3b-i). The read methods pass this and a [`LiveSource`] over the live
     /// store to [`crate::read_source`], so they run the **same** code the off-thread
     /// [`ReadOnlyGraph`](crate::read_only_graph::ReadOnlyGraph) runs — preserving exact behaviour.
     #[inline]
-    fn vis_ctx(&self) -> VisCtx<'_> {
+    fn vis_ctx(&self) -> VisCtx {
         VisCtx {
             snapshot: self.snapshot,
-            registry: &self.registry,
             txn: self.txn,
         }
     }
@@ -3703,7 +3685,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     /// The zone map is owned by the [`TxnCoordinator`](crate::coordinator::TxnCoordinator) and shared
     /// with this seam, and the pruning half of the work is genuinely coordinator-level: a `[min, max]`
     /// interval is a statement about physical id ranges, not about visibility. The *deciding* half is
-    /// not. It needs the `(Snapshot, CommitRegistry)` pair that only a statement owns, and the
+    /// not. It needs the snapshot that only a statement owns, and the
     /// coordinator has neither — which is exactly how the previous `TxnCoordinator::zone_scan_eq` came
     /// to re-check candidates against the **raw live** label word and `mvcc.in_use()`, a dirty read in
     /// both directions (it returned a row an uncommitted writer had created and would roll back, and
@@ -4622,7 +4604,6 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             label_token,
             source,
             snapshot: self.snapshot,
-            registry: self.registry.clone(),
             txn: self.txn,
             // The seam never knows the statement deadline (an executor-time concern); the morsel tier
             // sets it from the cursor's `CancellationToken` before dispatch (`rmp` #476).
@@ -4655,7 +4636,6 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         Some(crate::morsel::MorselFrontierSource {
             source,
             snapshot: self.snapshot,
-            registry: self.registry.clone(),
             txn: self.txn,
         })
     }

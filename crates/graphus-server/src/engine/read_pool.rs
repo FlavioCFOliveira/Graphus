@@ -73,7 +73,8 @@ pub struct ReadTask<D: BlockDevice, S: LogSink> {
     /// The bound parameters for this execution.
     pub bound: graphus_cypher::BoundParameters,
     /// The owned, engine-thread-captured store read view + token snapshot + read snapshot + commit
-    /// registry clone + fresh SIREAD buffer.
+    /// fresh SIREAD buffer. It carries no commit-registry clone since `rmp` #1069 phase 3: the
+    /// captured `view` resolves a record stamp against its own `commit.store`.
     pub inputs: ReadTaskInputs<D, S>,
     /// This auto-commit read's Bolt causal **bookmark** (`rmp` task #813), minted on the engine thread at
     /// dispatch from the DB's durable-write high-water (`"<db>:<durable_write_commit_ts>"`). Carried on
@@ -172,7 +173,6 @@ pub fn run_read_task<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send +
         view,
         tokens,
         snapshot,
-        registry,
         buffer,
         fulltext,
         index_candidates,
@@ -188,7 +188,7 @@ pub fn run_read_task<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send +
     // `index_seek_eq` — the engine thread pre-ran the seek and handed over the raw candidate ids, and the
     // reader re-checks them through the same lifted body the inline seam uses. An empty capture (any
     // non-indexed read, or a gate refusal) simply declines to the exact scan, as before.
-    let mut graph = ReadOnlyGraph::new(view, tokens, snapshot, registry, txn, buffer)
+    let mut graph = ReadOnlyGraph::new(view, tokens, snapshot, txn, buffer)
         // The captured count-store memo (`rmp` #866) lets an off-thread ungrouped `count()` over a bare
         // label/type scan answer from a counter instead of reading every record. An empty capture — no
         // count-store operator in the plan, or an equivalence predicate that did not hold on the engine

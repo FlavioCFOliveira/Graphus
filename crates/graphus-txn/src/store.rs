@@ -42,7 +42,7 @@ use crate::snapshot::{CommitRegistry, Snapshot};
 #[cfg(any(test, feature = "test-support"))]
 use crate::oracle::VersionStamp;
 #[cfg(any(test, feature = "test-support"))]
-use crate::visibility::{CommitOracle, is_visible_via};
+use crate::visibility::{CommitOracle, RegistryOracle, is_visible_via};
 
 /// An opaque key identifying a versioned record (a node/relationship/property physical id in the
 /// real store; an arbitrary `u64` in the in-memory reference store).
@@ -230,7 +230,10 @@ impl VersionedStore for MemVersionedStore {
         // `?` inside the walk rather than a `find` closure: the door is fallible (`rmp` #1069) and a
         // fault must abort the read, not be folded into "this version is not visible".
         for v in chain {
-            if is_visible_via(registry, snapshot, v.xmin, v.xmax)? {
+            // [`RegistryOracle`], NOT the store's slot-backed oracle: this reference store keeps
+            // the pre-`rmp` #1069 convention — its `xmin`/`xmax` carry a `TxnId`, not a
+            // `commit.store` slot id (it has no commit store). See `RegistryOracle`'s docs.
+            if is_visible_via(&RegistryOracle(registry), snapshot, v.xmin, v.xmax)? {
                 return Ok(Some(v.payload.clone()));
             }
         }
@@ -284,7 +287,7 @@ impl VersionedStore for MemVersionedStore {
             // "drop") inside the closure would hide exactly the failure this phase exists to expose.
             let mut keep = Vec::with_capacity(before);
             for v in chain.iter() {
-                keep.push(match registry.resolve_commit_ts(v.xmax)? {
+                keep.push(match RegistryOracle(registry).resolve_commit_ts(v.xmax)? {
                     // live, or expired by an in-flight/aborted writer: keep
                     None => true,
                     Some(xmax_commit) => match low_water {

@@ -27,7 +27,7 @@
 //! So the live store and the off-thread view differ on the read path in **exactly one** capability
 //! (token name ↔ id). [`StoreReadSource`] captures the union of both categories. The visibility/id/token/
 //! marker bodies are then lifted into the free functions below, generic over `S: StoreReadSource` and
-//! `K: ReadSink`, parameterised by a [`VisCtx`] (the snapshot + commit registry + txn id that decide
+//! `K: ReadSink`, parameterised by a [`VisCtx`] (the snapshot + txn id that decide
 //! visibility) and a `&K` sink (where SIREAD markers and the first captured error go). The sink is a
 //! **static** generic (not `&dyn`), so it monomorphises per concrete graph and the hot per-edge
 //! `note_read` inlines with no vtable dispatch — keeping the lifted read path at parity with the prior
@@ -58,7 +58,7 @@ use graphus_storage::{
     DecidedProperties, MvccHeader, Namespace, RecordStore, StoreKind, StoreReadView,
     SupersetProperties, TokenSnapshot, labels,
 };
-use graphus_txn::{CommitOracle, CommitRegistry, PredicateRead, Snapshot, is_visible_via};
+use graphus_txn::{CommitOracle, PredicateRead, Snapshot, StampOutcome, is_visible_via};
 use graphus_wal::LogSink;
 
 use crate::graph_access::{
@@ -142,7 +142,15 @@ pub fn csr_adjacency_enabled() -> bool {
 /// visibility, token name-mapping, the newest-visible-wins fold and the SIREAD markers are applied
 /// **above** this surface by the lifted body, exactly as `RecordStoreGraph` applied them above the
 /// store.
-pub trait StoreReadSource {
+/// # It is also the record-header commit oracle (`rmp` #1069 phase 3)
+///
+/// [`CommitOracle`] is a **supertrait** rather than a parameter threaded beside the source, and that
+/// is the same parity argument the rest of this trait rests on: since phase 3 a header stamp names a
+/// slot in `commit.store`, so resolving it is a *read of the very store this source reads*. Making
+/// one type answer both means the inline path and the off-thread reader cannot resolve visibility by
+/// different mechanisms — the `rmp` #755 / #768 / #769 / #770 defect family, applied to visibility
+/// itself. It is also what let the reader thread stop carrying a `CommitRegistry` clone.
+pub trait StoreReadSource: CommitOracle {
     /// Decodes the node record at physical id `id`. (The `RecordStore::node` / `StoreReadView::node`
     /// twin.) An unallocated id is a storage `Err`, which the caller treats as "does not exist".
     fn node(&self, id: u64) -> Result<NodeRecord, GraphusError>;
@@ -216,7 +224,6 @@ pub trait StoreReadSource {
         id: u64,
         mvcc: MvccHeader,
         snapshot: Snapshot,
-        registry: &CommitRegistry,
     ) -> Result<bool, GraphusError>;
 
     /// The **superset**-polarity read of `node_id`'s property chain, head to tail (newest first).
@@ -302,6 +309,26 @@ pub trait StoreReadSource {
 /// so the live path runs the same code as the off-thread path.
 pub struct LiveSource<'a, D: BlockDevice, S: LogSink>(pub &'a RecordStore<D, S>);
 
+/// The live store IS the record-header commit oracle (`rmp` #1069 phase 3), so this source forwards
+/// the door as it forwards every other read — one mechanism for both paths.
+impl<D: BlockDevice, S: LogSink> CommitOracle for LiveSource<'_, D, S> {
+    fn resolve_stamp(&self, word: u64) -> Result<StampOutcome, GraphusError> {
+        self.0.resolve_stamp(word)
+    }
+    fn names_writer(&self, word: u64) -> Result<Option<TxnId>, GraphusError> {
+        self.0.names_writer(word)
+    }
+    fn names_own_write(&self, word: u64, owner: TxnId) -> Result<bool, GraphusError> {
+        self.0.names_own_write(word, owner)
+    }
+    fn resolve_for(&self, word: u64, owner: TxnId) -> Result<(StampOutcome, bool), GraphusError> {
+        self.0.resolve_for(word, owner)
+    }
+    fn audit_visibility(&self, snapshot: Snapshot, xmin: u64, xmax: u64, verdict: bool) {
+        self.0.audit_visibility(snapshot, xmin, xmax, verdict);
+    }
+}
+
 impl<D: BlockDevice, S: LogSink> StoreReadSource for LiveSource<'_, D, S> {
     fn node(&self, id: u64) -> Result<NodeRecord, GraphusError> {
         self.0.node(id)
@@ -336,9 +363,8 @@ impl<D: BlockDevice, S: LogSink> StoreReadSource for LiveSource<'_, D, S> {
         id: u64,
         mvcc: MvccHeader,
         snapshot: Snapshot,
-        registry: &CommitRegistry,
     ) -> Result<bool, GraphusError> {
-        self.0.entity_visible_at(kind, id, mvcc, snapshot, registry)
+        self.0.entity_visible_at(kind, id, mvcc, snapshot)
     }
     fn superset_scan_node_properties(
         &self,
@@ -401,6 +427,21 @@ pub struct ReadViewSource<'a, D: BlockDevice, S: LogSink> {
     pub tokens: &'a TokenSnapshot,
 }
 
+/// The reader thread's view resolves a header stamp against the SAME durable `commit.store` the
+/// inline path reads (`rmp` #1069 phase 3) — which is why a reader no longer carries a
+/// `CommitRegistry` clone at all.
+impl<D: BlockDevice, S: LogSink> CommitOracle for ReadViewSource<'_, D, S> {
+    fn resolve_stamp(&self, word: u64) -> Result<StampOutcome, GraphusError> {
+        self.view.resolve_stamp(word)
+    }
+    fn names_writer(&self, word: u64) -> Result<Option<TxnId>, GraphusError> {
+        self.view.names_writer(word)
+    }
+    fn resolve_for(&self, word: u64, owner: TxnId) -> Result<(StampOutcome, bool), GraphusError> {
+        self.view.resolve_for(word, owner)
+    }
+}
+
 impl<D: BlockDevice, S: LogSink> StoreReadSource for ReadViewSource<'_, D, S> {
     fn node(&self, id: u64) -> Result<NodeRecord, GraphusError> {
         self.view.node(id)
@@ -435,10 +476,8 @@ impl<D: BlockDevice, S: LogSink> StoreReadSource for ReadViewSource<'_, D, S> {
         id: u64,
         mvcc: MvccHeader,
         snapshot: Snapshot,
-        registry: &CommitRegistry,
     ) -> Result<bool, GraphusError> {
-        self.view
-            .entity_visible_at(kind, id, mvcc, snapshot, registry)
+        self.view.entity_visible_at(kind, id, mvcc, snapshot)
     }
     fn superset_scan_node_properties(
         &self,
@@ -1279,24 +1318,28 @@ impl ReadTally {
 // =================================================================================================
 
 /// The visibility inputs the lifted read body filters every record through (`rmp` task #336, Slice
-/// 3b-i): this query's read [`Snapshot`], the [`CommitRegistry`] that resolves an in-flight writer to
-/// its outcome, and the owning [`TxnId`] (for the same-transaction self-delete discriminator).
+/// 3b-i): this query's read [`Snapshot`] and the owning [`TxnId`] (for the same-transaction
+/// self-delete discriminator).
 ///
-/// Bundling them lets the lifted functions take one `&VisCtx` instead of three borrows, and keeps the
+/// Bundling them lets the lifted functions take one `&VisCtx` instead of two borrows, and keeps the
 /// visibility logic ([`visible`](VisCtx::visible) / [`deleted_by_self`](VisCtx::deleted_by_self))
 /// identical between the live and off-thread paths — it is the single copy of the visibility heart.
+///
+/// It carries **no commit oracle** since `rmp` #1069 phase 3, and that is not an omission: resolving
+/// a header stamp became a read of `commit.store`, so the thing that can answer it is the
+/// [`StoreReadSource`] the body is already holding. Every method here that needs the door therefore
+/// takes `src`, which is also what stops the two paths from ever resolving visibility through
+/// different mechanisms.
 #[derive(Clone, Copy)]
-pub struct VisCtx<'a> {
+pub struct VisCtx {
     /// This query's MVCC read snapshot (`04 §5.3`): a version is visible iff its creator committed at
     /// or before `snapshot.ts` (or is this transaction's own write) and its expirer does not hide it.
     pub snapshot: Snapshot,
-    /// Resolves a still-in-flight writer's `TxnId` to its commit outcome.
-    pub registry: &'a CommitRegistry,
     /// The transaction this query runs in (the self-delete discriminator owner).
     pub txn: TxnId,
 }
 
-impl VisCtx<'_> {
+impl VisCtx {
     /// Whether the node / relationship `(kind, id)` carrying `mvcc` **exists** as of this query's
     /// snapshot (`04 §5.3`), at statement granularity (`04 §5.1.4`, `rmp` #972). The one place the read
     /// body consults MVCC for existence.
@@ -1319,7 +1362,7 @@ impl VisCtx<'_> {
         id: u64,
         mvcc: MvccHeader,
     ) -> Result<bool, GraphusError> {
-        src.entity_visible_at(kind, id, mvcc, self.snapshot, self.registry)
+        src.entity_visible_at(kind, id, mvcc, self.snapshot)
     }
 
     /// The header-only, cross-transaction visibility test (`04 §5.3`), for the callers whose subject is
@@ -1333,13 +1376,12 @@ impl VisCtx<'_> {
     /// Propagates a stamp-resolution fault from the [`CommitOracle`](graphus_txn::CommitOracle) door
     /// (`rmp` #1069). Fail closed on it (`rmp` #733) — never fall back to a default verdict.
     #[inline]
-    pub fn visible_header(&self, mvcc: MvccHeader) -> Result<bool, GraphusError> {
-        is_visible_via(
-            self.registry,
-            self.snapshot,
-            mvcc.created_ts,
-            mvcc.expired_ts,
-        )
+    pub fn visible_header<S: StoreReadSource>(
+        &self,
+        src: &S,
+        mvcc: MvccHeader,
+    ) -> Result<bool, GraphusError> {
+        is_visible_via(src, self.snapshot, mvcc.created_ts, mvcc.expired_ts)
     }
 
     /// The label bitmap `id` presents to this query's snapshot (`rmp` task #767), given the `live`
@@ -1375,13 +1417,18 @@ impl VisCtx<'_> {
     /// (`rmp` #1069). Fail closed on it (`rmp` #733): a self-delete question that cannot be resolved
     /// must not read as "not self-deleted".
     #[inline]
-    pub fn deleted_by_self(&self, mvcc: MvccHeader) -> Result<bool, GraphusError> {
-        if !is_visible_via(self.registry, self.snapshot, mvcc.created_ts, 0)? {
+    pub fn deleted_by_self<S: StoreReadSource>(
+        &self,
+        src: &S,
+        mvcc: MvccHeader,
+    ) -> Result<bool, GraphusError> {
+        if !is_visible_via(src, self.snapshot, mvcc.created_ts, 0)? {
             return Ok(false);
         }
-        // "Is this expiry stamp MY own in-flight write?" — through the one door (`rmp` #1069) rather
-        // than the open-coded `VersionStamp::from_raw(x) == VersionStamp::InFlight(self.txn)`.
-        self.registry.names_own_write(mvcc.expired_ts, self.txn)
+        // "Is this expiry stamp MY own uncommitted write?" — through the one door (`rmp` #1069)
+        // rather than an open-coded stamp comparison. Since phase 3 the answer is an id comparison
+        // against the owner's own commit slot, which is why it belongs to the oracle and not here.
+        src.names_own_write(mvcc.expired_ts, self.txn)
     }
 }
 
@@ -3078,7 +3125,7 @@ pub fn rel_data_including_deleted<S: StoreReadSource, K: ReadSink>(
             return None;
         }
     };
-    let self_deleted = match ctx.deleted_by_self(rec.mvcc) {
+    let self_deleted = match ctx.deleted_by_self(src, rec.mvcc) {
         Ok(v) => v,
         // Fail closed exactly as the chain-read fault above does (`rmp` #733): capture and yield no
         // row, never a type read taken off an unresolved stamp.
@@ -3130,7 +3177,7 @@ pub fn entity_deleted_by_txn<S: StoreReadSource, K: ReadSink>(
             }
         },
     };
-    match ctx.deleted_by_self(mvcc) {
+    match ctx.deleted_by_self(src, mvcc) {
         Ok(v) => v,
         // Same fail-closed discipline as the two record reads above (`rmp` #733, `rmp` #1069): an
         // unresolvable stamp is captured and surfaces, it is not silently read as "not self-deleted".

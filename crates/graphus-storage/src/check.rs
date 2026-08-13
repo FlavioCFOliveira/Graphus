@@ -1573,12 +1573,19 @@ fn check_label_bitmaps(cat: &Catalog, scan: &Scan, report: &mut ConsistencyRepor
 /// the `0` sentinel, and are two *already-frozen* committed words in order. They ask nothing of a
 /// transaction's outcome and hold no [`CommitRegistry`](graphus_txn::CommitRegistry) to ask it of.
 ///
-/// Routing them through the door would also change what they mean: `resolve_stamp` maps a
-/// lazily-committed in-flight word to `Committed(ts)`, so the inversion test would start comparing
+/// Routing them through the door would also change what they mean: `resolve_stamp` maps an unsettled
+/// word to `Committed(ts)` once its writer has committed, so the inversion test would start comparing
 /// pairs it deliberately does not compare today (see the bullet above). The faithful gate spelling,
-/// should this ever need one, is the `frozen_word` recipe — `names_writer(w)?.is_none()` first, then
-/// `resolve_stamp` — and it needs a registry threaded in. `rmp` #1069 phase 3 rewrites what these
-/// words hold, so that is the moment to decide it, not this one.
+/// should this ever need one, is the [`frozen_word`](crate::RecordStore) recipe — the pure bit test
+/// `HeaderStamp::from_raw(w).slot_id().is_some()` first, then `resolve_stamp` — and it needs the
+/// store threaded in, because since `rmp` #1069 phase 3 resolving a stamp is a durable read of
+/// `commit.store`, not a table lookup.
+///
+/// **Phase 3 re-decided this and kept the answer.** The words these checks inspect changed meaning —
+/// an unsettled stamp names a commit slot, not a `TxnId` — and none of the three checks depends on
+/// that meaning: the `0` sentinel is the sentinel under both conventions, and a settled `Committed`
+/// word is byte-identical under both. So the physical checks stay physical, and the consistency
+/// checker keeps being able to run without a commit oracle at all.
 fn check_mvcc_headers(cat: &Catalog, scan: &Scan, report: &mut ConsistencyReport) {
     let mut check = |kind: StoreKind, id: u64, mvcc: MvccHeader| {
         if VersionStamp::from_raw(mvcc.created_ts) == VersionStamp::None {

@@ -132,7 +132,7 @@ pub use meta::{
 pub use propenc::{
     PropDecodeError, PropEncodeError, TAG_BOOL, TAG_FLOAT, TAG_INT, decode_inline, encode_inline,
 };
-pub use read_view::{MetaSnapshot, StoreMetaSnapshot, StorePages, StoreReadView};
+pub use read_view::{MetaSnapshot, PagesOracle, StoreMetaSnapshot, StorePages, StoreReadView};
 pub use record::{
     ChainSide, MVCC_HEADER_SIZE, MvccHeader, NODE_RECORD_SIZE, NodeRecord, PROP_RECORD_SIZE,
     PropRecord, REL_RECORD_SIZE, RelRecord,

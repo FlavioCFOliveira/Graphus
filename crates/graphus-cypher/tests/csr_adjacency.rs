@@ -125,11 +125,8 @@ fn build_multigraph() -> (Store, u64, usize) {
     (s, hub, visible_likes)
 }
 
-fn ctx_for(s: &Store) -> (graphus_txn::CommitRegistry, Snapshot) {
-    (
-        s.commit_registry_snapshot(),
-        Snapshot::new(TxnId(99), s.snapshot_ts()),
-    )
+fn ctx_for(s: &Store) -> Snapshot {
+    Snapshot::new(TxnId(99), s.snapshot_ts())
 }
 
 /// **Guarantee 1 (the mandatory regression test):** a typed expand with the CSR consulted (ON) returns
@@ -138,10 +135,9 @@ fn ctx_for(s: &Store) -> (graphus_txn::CommitRegistry, Snapshot) {
 #[test]
 fn csr_on_equals_csr_off_visible_edges_and_markers() {
     let (s, hub, expected_likes) = build_multigraph();
-    let (registry, snapshot) = ctx_for(&s);
+    let snapshot = ctx_for(&s);
     let ctx = VisCtx {
         snapshot,
-        registry: &registry,
         txn: TxnId(99),
     };
     let t_like = s.token_id(Namespace::RelType, "LIKE").unwrap();
@@ -213,10 +209,9 @@ fn csr_on_equals_csr_off_visible_edges_and_markers() {
 #[test]
 fn csr_on_equals_csr_off_both_direction() {
     let (s, hub, _) = build_multigraph();
-    let (registry, snapshot) = ctx_for(&s);
+    let snapshot = ctx_for(&s);
     let ctx = VisCtx {
         snapshot,
-        registry: &registry,
         txn: TxnId(99),
     };
     let t_like = s.token_id(Namespace::RelType, "LIKE").unwrap();
@@ -270,6 +265,47 @@ fn csr_eliminates_nonmatching_chain_reads() {
         rel_calls: Cell<usize>,
         typed_calls: Cell<usize>,
     }
+    /// The decorator forwards the `rmp` #1069 commit door untouched: it counts record decodes, and a
+    /// header-stamp resolution is not one — inserting a count here would make the structural proof
+    /// measure the decorator instead of the read path.
+    impl graphus_txn::CommitOracle for Counting<'_> {
+        fn resolve_stamp(
+            &self,
+            word: u64,
+        ) -> Result<graphus_txn::StampOutcome, graphus_core::error::GraphusError> {
+            self.inner.resolve_stamp(word)
+        }
+        fn names_writer(
+            &self,
+            word: u64,
+        ) -> Result<Option<graphus_core::TxnId>, graphus_core::error::GraphusError> {
+            self.inner.names_writer(word)
+        }
+        fn names_own_write(
+            &self,
+            word: u64,
+            owner: graphus_core::TxnId,
+        ) -> Result<bool, graphus_core::error::GraphusError> {
+            self.inner.names_own_write(word, owner)
+        }
+        fn resolve_for(
+            &self,
+            word: u64,
+            owner: graphus_core::TxnId,
+        ) -> Result<(graphus_txn::StampOutcome, bool), graphus_core::error::GraphusError> {
+            self.inner.resolve_for(word, owner)
+        }
+        fn audit_visibility(
+            &self,
+            snapshot: graphus_txn::Snapshot,
+            xmin: u64,
+            xmax: u64,
+            verdict: bool,
+        ) {
+            self.inner.audit_visibility(snapshot, xmin, xmax, verdict);
+        }
+    }
+
     impl StoreReadSource for Counting<'_> {
         fn node(&self, id: u64) -> Result<NodeRecord, graphus_core::error::GraphusError> {
             self.inner.node(id)
@@ -309,10 +345,8 @@ fn csr_eliminates_nonmatching_chain_reads() {
             id: u64,
             mvcc: graphus_storage::MvccHeader,
             snapshot: graphus_txn::Snapshot,
-            registry: &graphus_txn::CommitRegistry,
         ) -> Result<bool, graphus_core::error::GraphusError> {
-            self.inner
-                .entity_visible_at(kind, id, mvcc, snapshot, registry)
+            self.inner.entity_visible_at(kind, id, mvcc, snapshot)
         }
         fn superset_scan_node_properties(
             &self,
@@ -367,10 +401,9 @@ fn csr_eliminates_nonmatching_chain_reads() {
     }
 
     let (s, hub, expected_likes) = build_multigraph();
-    let (registry, snapshot) = ctx_for(&s);
+    let snapshot = ctx_for(&s);
     let ctx = VisCtx {
         snapshot,
-        registry: &registry,
         txn: TxnId(99),
     };
     let t_like = s.token_id(Namespace::RelType, "LIKE").unwrap();

@@ -442,7 +442,6 @@ mod off_thread {
             store.read_view(),
             store.token_snapshot(),
             snapshot,
-            store.commit_registry_snapshot(),
             TxnId(txn),
             SsiReadBuffer::new(TxnId(txn)),
         )

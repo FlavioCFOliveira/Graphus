@@ -23,13 +23,14 @@
 use std::cell::RefCell;
 
 use graphus_core::error::{GraphusError, Result};
-use graphus_core::{PageId, TxnId};
+use graphus_core::{HeaderStamp, PageId, TxnId, Value};
 use graphus_io::{BlockDevice, MemBlockDevice, PAGE_SIZE, Page};
 use graphus_storage::{
     ChainLinks, ChainManifest, ConstraintEntry, ConstraintKind, LinkCodec, Namespace, Plain,
-    RecordStore, RestoreTarget, backup_store, begin_chain, capture_increment,
+    RecordStore, RestoreTarget, StoreKind, backup_store, begin_chain, capture_increment,
     restore_chain_file_atomic, restore_onto, restore_to, verify_chain, verify_on_open,
 };
+use graphus_txn::Snapshot;
 use graphus_wal::{MemLogSink, WalManager};
 
 type Store = RecordStore<MemBlockDevice, MemLogSink>;
@@ -1063,5 +1064,153 @@ fn a_committed_declaration_at_the_chain_tail_survives_the_restore_1083() {
         "a COMMITTED constraint at the tail of the restored chain is missing: the pending-DDL \
          block was dropped because the log that decides it was thrown away (`rmp` #1083)"
     );
+    verify_on_open(&reopened, &[]).expect("the restored store must be consistent");
+}
+
+// =================================================================================================
+// N+1. `rmp` #1069 — the versions an INCREMENT carried are still readable after the restore.
+// =================================================================================================
+
+/// **A committed version whose MVCC stamp travelled in an increment, unsettled, must still be
+/// visible — and carry its value — after the chain is restored.**
+///
+/// # The defect this pins, and why it was silent
+///
+/// A chain restores to a device and is opened over a **fresh, empty WAL**: the artifact carries the
+/// data image, not the log. So the restored store's in-memory Active/Recent Transaction Table starts
+/// empty, and before `rmp` #1069 phase 3 that table was the **only** thing that could translate a
+/// record header's unsettled stamp — which held the writer's `TxnId`. An id the table does not know
+/// resolves as [`TxnOutcome::Aborted`](graphus_txn::TxnOutcome), i.e. **invisible**.
+///
+/// The base escaped this by accident: `backup_store` froze every committed header before capturing
+/// it, precisely so the base image would be self-sufficient without its log. **An increment never
+/// did.** `capture_increment` copies raw WAL bytes and freezes nothing, so every transaction that
+/// committed after the base — and that no GC pass had settled — arrived in the restored store with a
+/// stamp nothing could resolve. Those rows were on disk, intact, and read as absent.
+///
+/// That is silent loss of committed data, with no error, no corruption and nothing for the
+/// consistency checker to flag: the image is perfectly well-formed, it is merely unreadable. Phase 3
+/// removes it by making the header name a slot in `commit.store`, which the image carries — so the
+/// restored store resolves the version from the data alone, and the pre-backup freeze became
+/// unnecessary and was retired.
+///
+/// # Why it is asserted by VALUE
+///
+/// In a release build the symptom of this class is a **wrong answer**, not a panic: the row is
+/// simply not returned. So the test reads the property back and compares the integer, rather than
+/// resting on any `debug_assert`.
+///
+/// # Non-vacuity
+///
+/// Three premises are asserted rather than assumed, because each one silently makes the test prove
+/// nothing if it fails to hold:
+///
+/// 1. the increment's version really is **unsettled** when it is captured (no GC has run) — a
+///    settled stamp needs no oracle at all and the test would pass on any build;
+/// 2. the restored store's transaction table really is **empty**, which is the mechanism;
+/// 3. the base's row is checked too, so a restore that lost *everything* could not pass by
+///    coincidence.
+#[test]
+fn a_restored_chain_still_reads_the_versions_its_increment_carried() {
+    let store = fresh(64);
+    let key = store
+        .intern_token(Namespace::PropKey, "v")
+        .expect("intern propkey");
+
+    // ---- Committed before the base. ----
+    let base_txn = TxnId(1);
+    store.begin(base_txn);
+    let (base_node, _) = store.create_node(base_txn).expect("create base node");
+    store
+        .set_node_property_value(base_txn, base_node, key, &Value::Integer(11))
+        .expect("set base value");
+    store.commit(base_txn).expect("commit base txn");
+
+    let (mut manifest, base_link) = begin_chain(&store, &Plain).expect("begin chain");
+
+    // ---- Committed AFTER the base, with no GC pass: this is what the increment carries. ----
+    let inc_txn = TxnId(2);
+    store.begin(inc_txn);
+    let (inc_node, _) = store.create_node(inc_txn).expect("create increment node");
+    store
+        .set_node_property_value(inc_txn, inc_node, key, &Value::Integer(22))
+        .expect("set increment value");
+    store.commit(inc_txn).expect("commit increment txn");
+
+    // PREMISE 1: the increment's version is UNSETTLED. Nothing has rewritten its `created_ts` to a
+    // commit timestamp, so resolving it needs the oracle — which is the whole subject of this test.
+    let inc_mvcc = store.node(inc_node).expect("read increment node").mvcc;
+    assert!(
+        HeaderStamp::from_raw(inc_mvcc.created_ts)
+            .slot_id()
+            .is_some(),
+        "NON-VACUITY: the increment's version must still carry an unsettled stamp when it is \
+         captured — a settled one is readable from the word alone and proves nothing here \
+         (created_ts = {:#018x})",
+        inc_mvcc.created_ts,
+    );
+
+    let links = ChainLinks {
+        base: base_link,
+        increments: vec![capture_increment(&store, &mut manifest, &Plain).expect("capture")],
+    };
+
+    // ---- Restore at Latest onto a fresh device and open it over a FRESH, EMPTY WAL. ----
+    let mut restored = MemBlockDevice::new(0);
+    restore_to(
+        &manifest,
+        &links,
+        RestoreTarget::Latest,
+        &mut restored,
+        &Plain,
+    )
+    .expect("restore chain");
+    let wal = WalManager::create(MemLogSink::new()).expect("fresh wal");
+    let reopened = RecordStore::open(restored, wal, 64).expect("open the restored store");
+
+    // PREMISE 2: the in-memory table really is empty. It is the mechanism of the defect — with
+    // entries in it the old build would have resolved these stamps too, and the test would be
+    // measuring nothing.
+    assert!(
+        reopened.commit_registry().is_empty(),
+        "NON-VACUITY: a restored store opens over an empty WAL, so its Active/Recent Transaction \
+         Table must be empty — that emptiness is exactly why the durable commit slot has to be the \
+         oracle",
+    );
+
+    // ---- The assertion, by value. ----
+    let snapshot = Snapshot::new(TxnId(u64::MAX - 1), reopened.snapshot_ts());
+    // PREMISE 3 is the `base_node` row: a restore that lost everything cannot pass by coincidence.
+    for (node, want, which) in [(base_node, 11i64, "base"), (inc_node, 22, "increment")] {
+        let mvcc = reopened
+            .node(node)
+            .unwrap_or_else(|e| panic!("the {which}'s node record must be readable: {e}"))
+            .mvcc;
+        assert!(
+            reopened
+                .entity_visible_at(StoreKind::Node, node, mvcc, snapshot)
+                .unwrap_or_else(|e| panic!(
+                    "resolving the {which}'s existence must not fault: {e}"
+                )),
+            "the {which}'s committed node is on disk but reads as ABSENT after the restore — its \
+             stamp resolves against nothing (created_ts = {:#018x})",
+            mvcc.created_ts,
+        );
+        let candidate = reopened
+            .decision_scan_node_properties(node, snapshot)
+            .unwrap_or_else(|e| panic!("reading the {which}'s properties must not fault: {e}"))
+            .visible_version(key)
+            .unwrap_or_else(|| {
+                panic!("the {which}'s committed property reads as ABSENT after the restore")
+            });
+        assert_eq!(
+            reopened
+                .decode_property_value(candidate.type_tag, candidate.value_inline)
+                .expect("decode the restored value"),
+            Value::Integer(want),
+            "the {which}'s committed value must survive the restore intact",
+        );
+    }
+
     verify_on_open(&reopened, &[]).expect("the restored store must be consistent");
 }

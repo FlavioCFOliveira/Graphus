@@ -35,7 +35,7 @@ use graphus_bufpool::page::{self, HEADER_SIZE};
 use graphus_core::error::{GraphusError, Result};
 use graphus_core::sched::{self, ResourceId, YieldSite};
 use graphus_core::{
-    CommandId, ElementId, Lsn, MAX_TIMESTAMP, PageId, Timestamp, TxnId, VersionStamp,
+    CommandId, ElementId, HeaderStamp, Lsn, MAX_TIMESTAMP, PageId, Timestamp, TxnId, VersionStamp,
 };
 use graphus_freezefloor::FreezeFloor;
 use graphus_io::{BlockDevice, PAGE_SIZE};
@@ -50,10 +50,10 @@ use crate::idalloc::{
 };
 use crate::labels;
 use crate::meta::{
-    CompositeIndexEntry, ConstraintEntry, CountKey, CountsImage, FulltextIndexEntry, IndexState,
-    LEGACY_FORMAT_VERSION, Meta, PROPERTY_UNDO_CHAIN_FORMAT_VERSION, RelCompositeIndexEntry,
-    SchemaKey, SchemaValue, SpatialIndexEntry, Statistics, StoreMeta, TextIndexEntry, VectorEntity,
-    VectorIndexEntry,
+    COMMIT_SLOT_STAMP_FORMAT_VERSION, CompositeIndexEntry, ConstraintEntry, CountKey, CountsImage,
+    FulltextIndexEntry, IndexState, LEGACY_FORMAT_VERSION, Meta,
+    PROPERTY_UNDO_CHAIN_FORMAT_VERSION, RelCompositeIndexEntry, SchemaKey, SchemaValue,
+    SpatialIndexEntry, Statistics, StoreMeta, TextIndexEntry, VectorEntity, VectorIndexEntry,
 };
 use crate::paging;
 use crate::read_view::{self, MetaSnapshot, StoreMetaSnapshot, StorePages, StoreReadView};
@@ -198,34 +198,191 @@ struct FullStoreCensus {
 /// has yet to settle. Only the third can name a slot, and the first two are excluded here for the
 /// reason they carry no writer identity at all.
 ///
-/// The payload of an unsettled stamp is what `rmp` #1069 changes: today it is the writer's
-/// [`TxnId`], resolvable only through the in-memory [`CommitRegistry`](graphus_txn::CommitRegistry);
-/// afterwards it is the writer's `commit.store` slot, exactly as [`UndoDelta::commit_info`] already
-/// is. This function reads the payload as a slot id in **both** worlds, and that is deliberate
-/// rather than premature:
+/// The payload of an unsettled stamp is what `rmp` #1069 changed: it was the writer's [`TxnId`],
+/// resolvable only through the in-memory [`CommitRegistry`](graphus_txn::CommitRegistry); since
+/// phase 3 it is the writer's `commit.store` slot, exactly as [`UndoDelta::commit_info`] already
+/// was. This function was written in phase 1 to read the payload as a slot id in **both** worlds —
+/// an over-approximation before the flip (a `TxnId` landing inside `commit.store`'s id space pins a
+/// slot no header really names, which can only defer a reclamation, never lose one), and **exact**
+/// after it. That is why the census branch that consumes it was load-bearing and testable before
+/// the write path changed, instead of landing on a mechanism that had never once returned a
+/// non-empty answer.
 ///
-/// * after #1069 it is **exact**;
-/// * before #1069 it is an **over-approximation** — a `TxnId` that happens to fall inside
-///   `commit.store`'s id space pins a slot that no header really names. An over-approximation of
-///   the reference set can only make the census decline to free a slot, never free one it should
-///   have kept, so it errs in the one direction that is safe. It costs at most a deferred
-///   reclamation, and only for the low ids a young store hands out; a `TxnId` climbs away from the
-///   commit store's high-water almost immediately, because a slot id is recycled and a `TxnId`
-///   never is.
-///
-/// Being live in both worlds is the point: the census branch that consumes this is load-bearing and
-/// testable **today**, so #1069 lands on a mechanism that has already been proved rather than on one
-/// that has never once returned a non-empty answer.
+/// It is now a thin alias for [`HeaderStamp::slot_id`], kept as a named function because the census
+/// reads as a statement about *references*, not about bit layouts.
 fn slot_named_by_header_word(word: u64) -> Option<u64> {
-    match VersionStamp::from_raw(word) {
-        VersionStamp::InFlight(writer) => Some(writer.0),
-        VersionStamp::None | VersionStamp::Committed(_) => None,
+    HeaderStamp::from_raw(word).slot_id()
+}
+
+/// The live store as the **record-header commit oracle** (`rmp` #1069 phase 3).
+///
+/// Resolution is [`read_view::PagesOracle`] over this store's own `commit.store` — the same body the
+/// off-thread [`StoreReadView`](crate::read_view::StoreReadView) uses, so the inline and off-thread
+/// paths cannot answer a visibility question by different mechanisms (the `rmp` #755/#768/#769/#770
+/// parity rule).
+///
+/// Two things the bare pages oracle cannot do are added here, both because this type owns the
+/// Active Transaction Table:
+///
+/// * [`names_own_write`](CommitOracle::names_own_write) can answer **yes** without a durable read, by
+///   comparing the word's slot id against the owner's own slot (the shortcut is one-sided — see the
+///   method);
+/// * [`audit_visibility`](CommitOracle::audit_visibility) cross-checks every verdict against the
+///   pre-#1069 in-memory oracle under `debug_assertions` (`rmp` #1069 AC 2).
+impl<D: BlockDevice, S: LogSink> CommitOracle for RecordStore<D, S> {
+    fn resolve_stamp(&self, word: u64) -> Result<StampOutcome> {
+        self.commit_oracle().resolve_stamp(word)
+    }
+
+    fn names_writer(&self, word: u64) -> Result<Option<TxnId>> {
+        self.commit_oracle().names_writer(word)
+    }
+
+    fn names_own_write(&self, word: u64, owner: TxnId) -> Result<bool> {
+        let Some(slot) = HeaderStamp::from_raw(word).slot_id() else {
+            // The `0` sentinel and an already-settled word name no writer at all, so they can never
+            // be anyone's own uncommitted write. No read, exactly as before phase 3.
+            return Ok(false);
+        };
+        // The fast path, and the reason this method is overridden at all: a transaction has exactly
+        // ONE commit slot (`commit_slot_for` allocates it once and caches it), so for an owner the
+        // store still holds active the question "does this word name your write?" is an id compare,
+        // not a durable read. `is_visible_via` asks it for `xmin` and again for `xmax` on every
+        // record it filters, and on the write path both words are typically the reader's own.
+        //
+        // `with` (not `with_entry`): materialising an entry here would make a read-only transaction
+        // look like a writer to every other consumer of the table.
+        //
+        // ONE-SIDED, AND THAT IS NOT AN OPTIMISATION DETAIL. A match proves the word names `owner`'s
+        // slot — slot ids are unique per transaction and phase 1 guarantees a named slot is never
+        // recycled — so `true` may be answered from memory. A **mismatch proves nothing**: the
+        // active-table entry is in-memory bookkeeping and can be less complete than the durable
+        // truth. The entry is re-initialised by `begin`, so a caller that re-enters an id which
+        // already has records on disk (the off-thread-reader equivalence harness does exactly this,
+        // to build a seam over an in-flight writer) sees `commit_slot == None` beside headers that
+        // genuinely name that writer's slot. Answering `false` there loses the transaction's own
+        // writes from its own view — which is what an earlier draft of this method did, and what
+        // `read_only_graph_equivalence::self_delete_visibility_is_identical` caught.
+        if self.active.with(owner, |a| a.commit_slot).flatten() == Some(slot) {
+            return Ok(true);
+        }
+        // Everything else — a different slot, no entry, an entry with no slot yet — is decided by the
+        // durable record, which is authoritative in every case and merely slower.
+        Ok(self.names_writer(word)? == Some(owner))
+    }
+
+    fn resolve_for(&self, word: u64, owner: TxnId) -> Result<(StampOutcome, bool)> {
+        // No fast path is possible here and none is needed: the OUTCOME requires the slot, and the
+        // slot carries `txn_id`, so the own-write half comes free from the read the outcome already
+        // paid for.
+        self.commit_oracle().resolve_for(word, owner)
+    }
+
+    /// The `rmp` #1069 AC 2 equivalence oracle, on **every** visibility decision this store makes.
+    ///
+    /// It reconstructs, byte for byte, the header words the pre-phase-3 build would have written —
+    /// `VersionStamp::in_flight(TxnId(slot.txn_id))` for a word that now names a slot — and asserts
+    /// that the in-memory [`CommitRegistry`], asked about those words, reaches the **same verdict**.
+    /// The whole DST battery therefore exercises the new oracle seed by seed, with no new test per
+    /// scenario.
+    ///
+    /// # Verdicts, never outcomes
+    ///
+    /// The two oracles legitimately disagree on the *outcome* of one word: a commit publishes its
+    /// durable slot before it registers in memory (`rmp` #973), so inside that window the slot says
+    /// `Committed(ts)` while the registry still says `Aborted`. Comparing outcomes would fire on a
+    /// correct engine. Comparing **verdicts** does not, because `D-published-snapshot-horizon`
+    /// guarantees no live snapshot carries `s >= ts` until both halves have published — so within the
+    /// window both oracles answer "invisible", by different routes. That makes this check a live
+    /// proof of the horizon discipline rather than a tautology: were a snapshot ever issued inside
+    /// the window, the two verdicts would diverge and this would say so.
+    ///
+    /// # And only where the registry HAS an answer — a premise the DST battery corrected
+    ///
+    /// The check was first written believing the publish window above was the *only* legitimate
+    /// divergence. It is not, and the deterministic backup/restore scenarios said so on the first
+    /// run: **a store opened over an image whose log does not carry the commits has an empty
+    /// Active/Recent Transaction Table beside a fully-populated `commit.store`.** A restore from
+    /// backup is exactly that — the artifact carries the data image, not the log — so every committed
+    /// version in it resolves from its slot and from nothing else.
+    ///
+    /// That divergence is not a defect to report; it **is** the phase. Before it, those rows read as
+    /// invisible, because an id the table does not know resolves as aborted: a restored chain silently
+    /// lost every version whose stamp the base's freeze had not settled. So the audit fires only where
+    /// the registry has something to preserve — the writer is one it **recorded**
+    /// ([`CommitRegistry::knows`]) or one this store still holds **active**. Comparing a real answer
+    /// against a documented default is not a comparison.
+    ///
+    /// The horizon tooth survives the narrowing intact, and that is why the condition is a
+    /// disjunction rather than just `knows`: a transaction inside the `rmp` #973 publish window has
+    /// not yet registered but **is still in the active set**, so the window is still audited on every
+    /// read that crosses it.
+    ///
+    /// It is `debug_assertions`-only and it **panics** on divergence rather than returning an error:
+    /// an audit that could fail a read would be a second oracle in the answer path, which is the very
+    /// thing this task removes.
+    #[cfg_attr(not(debug_assertions), allow(unused_variables))]
+    fn audit_visibility(&self, snapshot: Snapshot, xmin: u64, xmax: u64, verdict: bool) {
+        #[cfg(debug_assertions)]
+        {
+            // If neither word names a slot, the two oracles are the SAME FUNCTION on these inputs:
+            // `HeaderStamp` and `VersionStamp` decode a `0` sentinel and a settled `Committed(ts)`
+            // word identically, and neither consults anything. Comparing them would be a tautology,
+            // and paying a registry lock per settled record — the overwhelming majority — for a
+            // tautology is not a cost this build should carry.
+            if HeaderStamp::from_raw(xmin).slot_id().is_none()
+                && HeaderStamp::from_raw(xmax).slot_id().is_none()
+            {
+                return;
+            }
+            // The audit's own slot reads are NOT reads the engine performs to answer the query, so
+            // they must not land in the `read-probe` counters the structural proof reads (`rmp`
+            // #1069 AC 4). Suppression is scoped and panic-safe.
+            crate::read_probe::suppressed(|| {
+                let Ok(rebuilt_min) = self.pre_1069_word(xmin) else {
+                    return; // an unresolvable stamp already failed the read; nothing to compare.
+                };
+                let Ok(rebuilt_max) = self.pre_1069_word(xmax) else {
+                    return;
+                };
+                let registry = self
+                    .commit_registry
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // Does the registry have anything to preserve about these two words? See the doc
+                // above: a writer it neither recorded nor still holds active is one it cannot answer
+                // for, and its `Aborted` fallback is a stated default, not a verdict.
+                let has_an_answer = |rebuilt: u64| match VersionStamp::from_raw(rebuilt) {
+                    VersionStamp::InFlight(w) => registry.knows(w) || self.is_txn_active(w),
+                    // The sentinel and a settled word are decoded identically by both oracles.
+                    VersionStamp::None | VersionStamp::Committed(_) => true,
+                };
+                if !has_an_answer(rebuilt_min) || !has_an_answer(rebuilt_max) {
+                    return;
+                }
+                let legacy = graphus_txn::is_visible_via(
+                    &graphus_txn::RegistryOracle(&registry),
+                    snapshot,
+                    rebuilt_min,
+                    rebuilt_max,
+                )
+                .expect("the in-memory registry never faults");
+                assert_eq!(
+                    verdict, legacy,
+                    "rmp #1069 AC2: the slot-backed oracle and the pre-#1069 registry disagree on \
+                     VISIBILITY.\n  snapshot        = {snapshot:?}\n  xmin (slot form) = \
+                     {xmin:#018x}\n  xmax (slot form) = {xmax:#018x}\n  xmin (txn form)  = \
+                     {rebuilt_min:#018x}\n  xmax (txn form)  = {rebuilt_max:#018x}\n  slot oracle \
+                     verdict = {verdict}\n  registry verdict    = {legacy}"
+                );
+            });
+        }
     }
 }
 
 /// Which of an MVCC header's two version stamps (`05 §7`) a caller means.
 ///
-/// Exists for [`RecordStore::stamp_header_commit_slot_for_test`], so the field is named rather than
+/// Exists for [`RecordStore::force_header_stamp_for_test`], so the field is named rather than
 /// passed as a byte offset a caller could get wrong.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MvccStampField {
@@ -2508,6 +2665,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // Runs after the two page-map reconstructions above so the scan sees every mapped record page,
         // and before anything else touches a property cell.
         Self::refuse_legacy_property_tombstones(&pool, &stores, store_format_version)?;
+        // `rmp` #1069: a pre-version-6 image may carry MVCC stamps whose payload is a `TxnId`, which
+        // this build would read as a `commit.store` slot id. Same placement rationale as the gate
+        // above: after both page-map reconstructions, before anything resolves a header.
+        Self::refuse_legacy_txn_stamps(&pool, &stores, store_format_version)?;
         // `rmp` #1083: DECIDE THE PENDING-DDL BLOCK.
         //
         // The image's schema half is committed state; the block beside it is the schema DDL of the
@@ -3557,6 +3718,59 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         )))
     }
 
+    /// Refuses an image whose MVCC stamps predate `rmp` #1069 phase 3 **and still carry an unsettled
+    /// one**, naming the first offender and the migration route.
+    ///
+    /// # What would go wrong without it
+    ///
+    /// A record header's unsettled `created_ts` / `expired_ts` used to hold the writer's [`TxnId`];
+    /// from format version [`COMMIT_SLOT_STAMP_FORMAT_VERSION`] it holds the physical id of that
+    /// writer's slot in `commit.store`. The encodings are **byte-identical** — the same sentinel, the
+    /// same high-bit discriminant, the same 63-bit payload — so nothing about the word itself says
+    /// which population it belongs to. A small `TxnId` is a perfectly plausible slot id, and a small
+    /// slot id is a perfectly plausible `TxnId`.
+    ///
+    /// So an old image opened by this build resolves each such stamp against whatever transaction
+    /// happens to own the slot numbered like the old writer's id: a committed version becomes
+    /// invisible, an aborted one becomes visible, or the read fails outright. That is silent
+    /// misattribution of committed data, which is worse than a failed startup — the same class the
+    /// version-3 gate exists for, and the same remedy.
+    ///
+    /// # Conditional, not blind — and the condition is exact
+    ///
+    /// Only an **unsettled** stamp is ambiguous. A `0` sentinel means the same thing under both
+    /// conventions, and a settled `Committed(ts)` word is byte-identical under both (see
+    /// `HeaderStamp::committed`). An image in which every in-use record is fully settled therefore
+    /// contains nothing either build could misread, and is opened — the upgrade is genuinely
+    /// lossless, and refusing it would be a false alarm that costs an operator a migration for
+    /// nothing.
+    ///
+    /// The scan covers the three versioned stores in full (not `[freeze_low, high_water)`): the
+    /// frontier is in-memory state that a freshly-opened store has not yet established, so the only
+    /// honest bound at `open` is the whole id space. It runs once, at open, on an image that is by
+    /// construction one version behind.
+    ///
+    /// # Errors
+    /// The refusal itself, or a storage error if a record page cannot be read — an unreadable census
+    /// is not an empty one, so a read fault refuses too rather than opening.
+    fn refuse_legacy_txn_stamps(
+        pool: &ConcurrentBufferPool<D, SharedWal<S>>,
+        stores: &[FixedStore; STORE_COUNT],
+        format_version: u32,
+    ) -> Result<()> {
+        if format_version >= COMMIT_SLOT_STAMP_FORMAT_VERSION {
+            return Ok(());
+        }
+        let (count, first) = read_view::scan_unsettled_stamps(pool, stores)?;
+        let Some((kind, id, word)) = first else {
+            // A fully settled legacy image: no word in it can be misread, so the upgrade is lossless.
+            return Ok(());
+        };
+        Err(GraphusError::Storage(format!(
+            "refusing to open this store: it carries on-disk format version {format_version}, in              which an unsettled MVCC record stamp holds the WRITER'S TRANSACTION ID, and it still              holds {count} such stamp(s) — the first on the {kind:?} store record {id}, word              {word:#018x}. From format version {COMMIT_SLOT_STAMP_FORMAT_VERSION} the same bits mean              the physical id of that writer's slot in commit.store (`rmp` #1069), and the two              encodings are byte-identical, so this build would resolve each of those stamps against              an unrelated transaction — silently reporting committed data as absent, or aborted data              as present. Refusing to open rather than misread (`05 §12.6`). To migrate, no export is              needed: open this store with the build that wrote it and force a full freeze of the              committed headers (the same sweep the backup path performs), which settles every stamp              to its commit timestamp — a fully settled image is read identically by both builds, and              this build will then open it."
+        )))
+    }
+
     /// Folds every **committed, not-yet-applied** logged cardinality delta into the recovered
     /// catalog, and records the transactions it folded (`rmp` #1066).
     ///
@@ -4484,6 +4698,30 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// **Test seam** (`rmp` #1069 AC 1): erases `txn` from the in-memory Active/Recent Transaction
+    /// Table, without the durable freeze that would normally have to precede it.
+    ///
+    /// This exists to make one specific experiment possible: **destroy the only thing that could
+    /// translate a pre-#1069 record stamp, and then read the row.** Before phase 3 the answer was
+    /// that the row vanished — [`CommitRegistry::outcome`] maps an unknown id to
+    /// [`Aborted`](graphus_txn::TxnOutcome::Aborted), so a committed version whose writer the table
+    /// had forgotten read as invisible. That is `rmp` #522's silent-lost-committed-data shape, and it
+    /// is why the freeze sweep, the freeze frontier and the WAL retention floor all had to exist.
+    /// Since phase 3 the stamp names a durable commit slot, so the row survives — and this seam is
+    /// what lets a test say so.
+    ///
+    /// It is a **violation of the engine's own discipline** (the prune is only ever run after a
+    /// durable freeze), so a caller must wrap its reads in
+    /// [`without_commit_oracle_audit`] — the AC 2 cross-check compares against exactly the invariant
+    /// this breaks. Nothing in the engine calls this.
+    #[doc(hidden)]
+    pub fn forget_committed_writer_for_test(&self, txn: TxnId) {
+        self.commit_registry
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .forget(txn);
+    }
+
     /// Whether `txn` is a **live, unresolved** transaction of this store: it has
     /// [`begin`](Self::begin)-ed and has neither committed nor rolled back.
     ///
@@ -5327,9 +5565,19 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // COMMIT SETTLED. Every fallible step has succeeded, so — and not one line earlier — this
         // transaction becomes committed-visible and its bookkeeping is released.
         //
-        // The registry entry is PUBLISHED here rather than before `checkpoint_meta` (`rmp` #955). It is
-        // what resolves an in-flight `xmin`/`xmax` stamp, and every record this transaction wrote still
-        // carries one, so writing it earlier meant that a `checkpoint_meta` failure left the whole
+        // The registry entry is PUBLISHED here rather than before `checkpoint_meta` (`rmp` #955).
+        //
+        // Since `rmp` #1069 the registry no longer resolves a header stamp — an unsettled `xmin`/`xmax`
+        // names this transaction's commit slot, and the slot is the oracle. The ordering below is kept
+        // for the reason it was introduced, which survives the change: the registry is still the
+        // authority for `outcome`/`is_txn_active`, which the SSI tracker, the GC watermark and the
+        // equivalence audit all read, so an entry published before the last fallible step would still
+        // announce a transaction that `checkpoint_meta` may yet refuse. The slot itself is published
+        // even later, and for the same reason.
+        //
+        // The paragraph this replaced said the registry "is what resolves an in-flight `xmin`/`xmax`
+        // stamp, and every record this transaction wrote still carries one", so writing it earlier
+        // meant that a `checkpoint_meta` failure left the whole
         // uncommitted write set resolving as `Committed(commit_ts)` — a dirty read of data the caller
         // is about to roll back, and a permanent one if that rollback also fails. Publishing it after
         // the last fallible step makes the absence of an entry (which
@@ -5853,6 +6101,20 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// is the one path that may skip its work instead, and it keeps its `try_lock`. Hold it across
     /// the **whole** `begin … commit`/`rollback` span, and never across a call that takes it again —
     /// [`settle_counts_into_image`](Self::settle_counts_into_image) does, so it must sit outside.
+    ///
+    /// # It has no caller today, deliberately (`rmp` #1069 phase 3)
+    ///
+    /// Its one caller was `backup_store`'s pre-backup MVCC freeze, which phase 3 retired: an
+    /// unsettled header now names a durable commit slot the backup image already carries, so there is
+    /// nothing for a freeze to make self-sufficient. One reserved-id entry point fewer is a *gain*
+    /// under `rmp` #1086's own argument — the audit of that invariant is `grep SYSTEM_TXN`.
+    ///
+    /// It is kept, and kept `#[allow(dead_code)]` rather than deleted, because it is the **contract**
+    /// obligation #1086 states for whoever adds the next reserved-id writer ("a reserved id may only
+    /// be entered under `system_txn_guard`"). Deleting the door would leave the rule with nothing to
+    /// point at, and the next author would take the lock by hand — or not at all, which is precisely
+    /// the defect #1086 fixed.
+    #[allow(dead_code)]
     pub(crate) fn system_txn_guard(&self) -> std::sync::MutexGuard<'_, ()> {
         self.system_txn_lock
             .lock()
@@ -6750,6 +7012,41 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         read_view::read_commit_slot(&self.pool, &self.stores, id)
     }
 
+    /// This store's record-header commit oracle (`rmp` #1069 phase 3): a
+    /// [`PagesOracle`](read_view::PagesOracle) over its own `commit.store`.
+    ///
+    /// Private, and deliberately so: the public seam is
+    /// [`CommitOracle`](graphus_txn::CommitOracle) implemented on `RecordStore` itself, which adds
+    /// the own-write fast path and the AC 2 audit. A caller reaching for the bare pages oracle would
+    /// silently opt out of both.
+    fn commit_oracle(&self) -> read_view::PagesOracle<'_, D, S, [FixedStore; STORE_COUNT]> {
+        read_view::PagesOracle::new(&self.pool, &self.stores)
+    }
+
+    /// The header word a **pre-`rmp` #1069-phase-3** build would have written for the same version:
+    /// `VersionStamp::in_flight(TxnId)` where the word now carries `HeaderStamp::Slot`, and the word
+    /// itself where it is already settled or the `0` sentinel.
+    ///
+    /// The AC 2 equivalence audit's half that has to touch storage — see
+    /// [`audit_visibility`](graphus_txn::CommitOracle::audit_visibility). It exists as a named method
+    /// rather than inline in the audit so the reconstruction is stated once, testably, in the
+    /// vocabulary of the two conventions it bridges.
+    ///
+    /// # Errors
+    /// Propagates a fault reading the named commit slot.
+    #[cfg(debug_assertions)]
+    fn pre_1069_word(&self, word: u64) -> Result<u64> {
+        match HeaderStamp::from_raw(word).slot_id() {
+            None => Ok(word),
+            Some(id) => match self.read_commit_slot(id)? {
+                Some(slot) => Ok(VersionStamp::in_flight(TxnId(slot.txn_id))),
+                None => Err(GraphusError::Storage(format!(
+                    "commit slot {id} named by header stamp {word:#018x} was never written"
+                ))),
+            },
+        }
+    }
+
     /// Returns a physical id for a fresh `undo.store` delta: a reclaimed id when one is available,
     /// otherwise the next id of this store's **slab**.
     ///
@@ -6870,6 +7167,27 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// # Errors
     /// Returns a storage error if the slot cannot be allocated or written.
     fn commit_slot_for(&self, txn: TxnId) -> Result<u64> {
+        // The reserved [`SYSTEM_TXN`] never gets a slot, and this is the single door where one is
+        // born — so this one assertion covers every header stamp in the engine.
+        //
+        // # Why it has to be stated, now that arithmetic no longer states it (`rmp` #1069 phase 3)
+        //
+        // `SYSTEM_TXN` is `TxnId(u64::MAX)`, and before phase 3 a header carried
+        // `VersionStamp::in_flight(txn)`, which asserts the id fits in 63 bits. Stamping a header
+        // under `SYSTEM_TXN` therefore PANICKED, and that arithmetic impossibility — not any policy —
+        // is why it never happened. A header now carries a small, perfectly encodable slot id, so the
+        // barrier evaporated and only scattered `txn != SYSTEM_TXN` guards would have remained.
+        //
+        // It must hold because `SYSTEM_TXN` **never commits and never aborts**: it writes only the
+        // catalog, it is never in the active set, and nothing ever publishes or corpses a slot for it.
+        // A header naming such a slot would be unresolvable for ever — not "invisible", which is at
+        // least an answer, but a hard read fault on every access to that record (the door fails
+        // closed, `rmp` #733). One reserved id would poison a row permanently.
+        assert!(
+            txn != SYSTEM_TXN,
+            "SYSTEM_TXN must never own a commit slot: it neither commits nor aborts, so a record \
+             header naming its slot would be unresolvable for ever (rmp #1069)"
+        );
         if let Some(id) = self.active.with(txn, |a| a.commit_slot).flatten() {
             return Ok(id);
         }
@@ -7795,13 +8113,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // question `is_visible_via` asks of a header, and byte-for-byte the former
         // `VersionStamp::from_raw(creator) == VersionStamp::InFlight(txn)`.
         //
-        // Bound to a `let` so the registry read guard is provably released before the delta writes
-        // below, rather than resting on the `if`-condition temporary scope.
-        let creator_is_own_write = self
-            .commit_registry
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .names_own_write(creator, txn)?;
+        // Bound to a `let` so nothing of the resolution outlives the question, rather than resting
+        // on the `if`-condition temporary scope.
+        let creator_is_own_write = self.names_own_write(creator, txn)?;
         if creator_is_own_write
             && self
                 .active
@@ -9048,16 +9362,16 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     fn is_reclaimable(
         mvcc: MvccHeader,
         watermark: Timestamp,
-        registry: &CommitRegistry,
+        oracle: &impl CommitOracle,
     ) -> Result<bool> {
         if !mvcc.in_use() {
             return Ok(false);
         }
         // Resolve the expiry stamp through the one commit door (`rmp` task #49, `rmp` #1069): a
-        // frozen tombstone carries `Committed(ts)` directly; a lazily-committed one still carries the
-        // deleter's in-flight `TxnId`, which the registry maps to its commit timestamp. A live
-        // (`xmax == 0`), still-in-flight, or aborted expiry resolves to `None` and is not reclaimable.
-        Ok(match registry.resolve_commit_ts(mvcc.expired_ts)? {
+        // settled tombstone carries `Committed(ts)` directly; an unsettled one names the deleter's
+        // commit slot, which the durable oracle resolves to its commit timestamp. A live
+        // (`xmax == 0`), still-open, or aborted expiry resolves to `None` and is not reclaimable.
+        Ok(match oracle.resolve_commit_ts(mvcc.expired_ts)? {
             Some(ts) => ts <= watermark,
             None => false,
         })
@@ -9494,30 +9808,45 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         read_view::read_mvcc(&self.pool, &self.stores, kind, id)
     }
 
-    /// The `Committed(ts)` word to freeze `word` to, if it is the in-flight stamp of a writer the
-    /// Active/Recent Transaction Table records as committed (`rmp` task #59). `None` for the `0`
-    /// sentinel, an already-committed stamp, and a still-in-flight or aborted writer (an aborted
-    /// writer's stamps are reverted by its rollback's WAL undo, never frozen).
+    /// The settled `Committed(ts)` word to freeze `word` to, if `word` names the commit slot of a
+    /// transaction that has committed (`rmp` task #59, `rmp` #1069). `None` for the `0` sentinel, an
+    /// already-settled stamp, an open writer, and an aborted one (whose stamps are reverted by its
+    /// rollback's WAL undo, never frozen).
+    ///
+    /// # What this gate asks, after `rmp` #1069 phase 3
+    ///
+    /// The two-part shape is **unchanged** — an identity pre-gate, then the outcome — and the reason
+    /// for the pre-gate is unchanged too: [`resolve_stamp`](CommitOracle::resolve_stamp) maps an
+    /// already-settled word to `Committed(ts)` as well, so asking the outcome alone would make every
+    /// frozen record look freezable for ever (and would report a spurious frontier-audit violation on
+    /// each one). What changed is what the pre-gate costs and what the arms mean:
+    ///
+    /// * the pre-gate is now a **pure bit test** on the word — `HeaderStamp::slot_id().is_some()` —
+    ///   instead of a probe of an in-memory table. It is stated directly rather than through
+    ///   `names_writer`, which since phase 3 answers the same question by *reading the slot*: this
+    ///   sweep visits every record in `[freeze_low, high_water)`, so paying a durable read merely to
+    ///   discover that a settled word needs no work would be a per-record tax for nothing.
+    /// * the `InFlight` arm was **dead** before phase 3 (an unresolved writer read as `Aborted`
+    ///   through the registry — `rmp` #522 / #778) and mapped to `None` by luck. It is now genuinely
+    ///   reachable, and mapping it to `None` is the deliberate rule: an open transaction's stamp
+    ///   cannot be settled, and a later pass will settle it once the writer commits.
+    ///
+    /// # And what a missed freeze now costs
+    ///
+    /// Before phase 3, a stamp the sweep failed to settle became **silent lost committed data** the
+    /// moment the registry forgot its writer: nothing else could translate the `TxnId`. Since phase 3
+    /// the word names a durable slot, so an unsettled stamp resolves correctly for ever — it merely
+    /// costs one extra indirection per read. The freeze sweep is therefore a **performance** device
+    /// now, where it used to be a correctness one, and the frontier machinery around it
+    /// ([`is_inflight_of_inflight_writer`](Self::is_inflight_of_inflight_writer),
+    /// [`debug_assert_freeze_complete`](Self::debug_assert_freeze_complete)) keeps its teeth without
+    /// carrying that weight. Retiring any of it is explicitly **not** this task.
     fn frozen_word(&self, word: u64) -> Result<Option<u64>> {
-        let registry = self
-            .commit_registry
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Both halves go through the `rmp` #1069 door, and together they are byte-for-byte the
-        // former `match VersionStamp::from_raw(word) { InFlight(w) => registry.outcome(w), .. }`:
-        //
-        // * `names_writer` is `Some` exactly for the old `InFlight(_)` arm — an ALREADY-frozen
-        //   `Committed` word and the `0` sentinel both answer `None`, which is what keeps this from
-        //   "re-freezing" a word that needs no patch (and from reporting a spurious audit violation);
-        // * `resolve_stamp` then supplies that writer's outcome.
-        //
-        // Asking `resolve_stamp` alone would be WRONG here: it maps an already-committed word to
-        // `Committed(ts)` too, so every frozen record would look freezable for ever.
-        if registry.names_writer(word)?.is_none() {
+        if HeaderStamp::from_raw(word).slot_id().is_none() {
             return Ok(None);
         }
-        Ok(match registry.resolve_stamp(word)? {
-            StampOutcome::Committed(ts) => Some(VersionStamp::committed(ts)),
+        Ok(match self.resolve_stamp(word)? {
+            StampOutcome::Committed(ts) => Some(HeaderStamp::committed(ts)),
             // Still open, aborted (its stamps are reverted by its rollback's WAL undo, never frozen),
             // or the sentinel.
             StampOutcome::None | StampOutcome::InFlight(_) | StampOutcome::Aborted => None,
@@ -9731,38 +10060,75 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         Ok((frozen, scanned))
     }
 
-    /// Whether `word` is an in-flight stamp of a writer that is **still open** (`rmp` #522, the
-    /// freeze-frontier's carry-forward test): such a stamp cannot be frozen yet — its writer has not
+    /// Whether `word` is an **unsettled** stamp of a writer that is still open (`rmp` #522, the
+    /// freeze-frontier's carry-forward test): such a stamp cannot be settled yet — its writer has not
     /// committed, so [`frozen_word`](Self::frozen_word) declines it — and its record MUST stay covered
-    /// by the frontier so a later pass (after the writer commits) freezes it. A committed-writer stamp
-    /// (frozen this pass) and an aborted-writer stamp (reverted by that writer's undo) both return
-    /// `false`.
+    /// by the frontier so a later pass (after the writer commits) settles it. A committed writer's
+    /// stamp (frozen this pass) and an aborted writer's stamp (reverted by that writer's undo) both
+    /// return `false`.
     ///
-    /// **Openness is tested against the store's [`active`](Self#structfield.active) set, NOT
-    /// `commit_registry.outcome(w) == InFlight`.** The [`CommitRegistry`] only ever records a writer at
-    /// *commit* ([`record_commit`](graphus_txn::CommitRegistry)) — a begun-but-uncommitted writer has
-    /// no entry, and [`outcome`](graphus_txn::CommitRegistry::outcome) maps an unknown id to
-    /// `Aborted`, never `InFlight`. So the old `outcome(w) == InFlight` predicate was **dead — always
-    /// `false`** — which raised the frontier PAST records still bearing a genuinely open writer's
-    /// stamp whenever a maintenance GC ran while that writer was in-flight (an explicit `BEGIN … RUN
-    /// …` spanning engine commands). When the writer then committed, the next incremental sweep skipped
-    /// those records (now below the frontier), left their committed stamps **unfrozen**, and the GC
-    /// prune forgot the writer — so [`is_visible_via`](graphus_txn::is_visible_via) resolved the version's
-    /// stamp against a now-unknown (→ aborted) writer and read the committed value as **invisible**:
-    /// silent lost committed data (regression `tests/incremental_freeze_inflight_writer.rs`). Testing
-    /// live membership in `active` is the correct "the writer might still commit, so keep covering it"
-    /// signal.
+    /// # What this gate asks, and why it changed with `rmp` #1069 phase 3
+    ///
+    /// It now asks the **outcome**: `resolve_stamp(word) == InFlight(_)`. That is a reversal of the
+    /// phase-2 rule, and it is deliberate — the reason the outcome was refused is gone, and the exact
+    /// predicate this method wants is expressible for the first time.
+    ///
+    /// **Why the outcome was refused before.** Through the [`CommitRegistry`] the `InFlight` arm was
+    /// **dead — always `false`**: the table gains an entry only when a transaction *resolves*
+    /// ([`record_commit`](graphus_txn::CommitRegistry)), and
+    /// [`outcome`](graphus_txn::CommitRegistry::outcome) maps an unknown id to `Aborted`. Writing the
+    /// gate that way raised the frontier PAST records still bearing a genuinely open writer's stamp
+    /// whenever a maintenance GC ran while that writer was in flight (an explicit `BEGIN … RUN …`
+    /// spanning engine commands). When the writer committed, the next incremental sweep skipped those
+    /// records (now below the frontier), left their stamps unfrozen, and the GC prune forgot the
+    /// writer — so the version resolved against a now-unknown (→ aborted) writer and read as
+    /// **invisible**: silent lost committed data (`rmp` #522, regression
+    /// `tests/incremental_freeze_inflight_writer.rs`). The workaround was to ask *identity* from the
+    /// word and *liveness* from the store's [`active`](Self#structfield.active) set.
+    ///
+    /// **Why the outcome is now part of the question.** A commit slot is a **durable** record of a
+    /// transaction's state, so `InFlight` means precisely "this slot has not been published". Combine
+    /// that with liveness and the predicate becomes *exact* — it is the set of words
+    /// [`frozen_word`](Self::frozen_word) declines **today but may accept later**. Enumerate what a
+    /// header word can be:
+    ///
+    /// | word | `frozen_word` | can a later pass settle it? | cover it? |
+    /// | --- | --- | --- | --- |
+    /// | `0` / already settled | `None` | never | no |
+    /// | names an aborted (corpse) slot | `None` | never — an abort's stamps are reverted by its rollback's undo | no |
+    /// | names a published slot | `Some(..)` | settled by this very pass | no |
+    /// | names an unpublished slot, writer **still active** | `None` | **yes**, once it commits | **yes** |
+    /// | names an unpublished slot, writer **gone** (a crash or backup loser) | `None` | never — nothing will ever publish it | no |
+    ///
+    /// Only the fourth row must hold the frontier down, and it is exactly
+    /// `InFlight(w) && is_txn_active(w)`. Each half alone is an over-approximation, and each in a
+    /// different direction:
+    ///
+    /// * identity + liveness (the phase-2 form) also covers rows 3 — a published slot of a writer
+    ///   that has not yet left `active` — costing a needless carry-forward;
+    /// * outcome alone also covers row 5, and that one is not merely wasteful: a store restored from
+    ///   a backup taken while a writer was in flight keeps such a slot **for ever**, so the frontier
+    ///   would be pinned at that record for the life of the store and every GC pass would rescan from
+    ///   there. A permanent scan-cost leak, not a bounded one.
+    ///
+    /// Asking both is therefore not belt-and-braces; it is the predicate itself, expressible for the
+    /// first time because half of it is now answerable.
+    ///
+    /// **The stakes also changed.** Before phase 3, raising the frontier past a record that still
+    /// needed settling was silent lost committed data (the whole of `rmp` #522). Since phase 3 the
+    /// word names a durable slot, so a stranded stamp merely costs one indirection per read for ever
+    /// — this predicate protects a *cost*, not a *correctness* property. It is nevertheless kept
+    /// exact, because a frontier that drifts is how the earlier defect became invisible.
     fn is_inflight_of_inflight_writer(&self, word: u64) -> Result<bool> {
-        // `names_writer`, NOT `resolve_stamp`: the door's `StampOutcome::InFlight` arm is dead
-        // through the `CommitRegistry` (an unresolved writer maps to `Aborted`), so routing this
-        // predicate through the outcome would silently re-make the `rmp` #522 defect this method
-        // exists to fix. The identity comes from the word; the liveness from `active`.
-        let writer = self
-            .commit_registry
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .names_writer(word)?;
-        Ok(writer.is_some_and(|w| self.is_txn_active(w)))
+        // The durable half: has this writer resolved either way? `?` first, so a read fault fails the
+        // sweep rather than quietly answering "no need to cover" (`rmp` #733).
+        let StampOutcome::InFlight(writer) = self.resolve_stamp(word)? else {
+            return Ok(false);
+        };
+        // The in-memory half: might it still commit? `is_txn_active`, never
+        // `commit_registry.outcome(w) == InFlight` — that predicate is dead through the registry and
+        // mistaking the two is `rmp` #522 / #778.
+        Ok(self.is_txn_active(writer))
     }
 
     /// Reclaims the reclaimable MVCC tombstones of `kind` (`Rel` or `Node`) under `txn` (`rmp` #522).
@@ -9796,15 +10162,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 self.with_maintenance(|m| m.pending_tombstones[kind as usize].remove(&id));
                 continue;
             }
-            let reclaimable = Self::is_reclaimable(
-                mvcc,
-                watermark,
-                &self
-                    .commit_registry
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            )? && (kind != StoreKind::Node
-                || !self.has_live_incident_rels(id)?);
+            let reclaimable = Self::is_reclaimable(mvcc, watermark, self)?
+                && (kind != StoreKind::Node || !self.has_live_incident_rels(id)?);
             if reclaimable {
                 match kind {
                     StoreKind::Rel => self.reclaim_rel(txn, id)?,
@@ -11518,9 +11877,16 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     pub fn create_node(&self, txn: TxnId) -> Result<(u64, ElementId)> {
         let id = self.alloc_id(StoreKind::Node, txn)?;
         let eid = self.element_ids.alloc()?;
-        // Stamp `xmin` with the writer's in-flight `TxnId` (`04 §5.2`); `commit` settles it to the
-        // commit timestamp. Until then the version is visible only to its own transaction.
-        let mut rec = NodeRecord::new(eid, VersionStamp::in_flight(txn));
+        // Stamp `xmin` with the writer's **commit slot** (`04 §5.2`, `rmp` #1069 phase 3); publishing
+        // that slot settles this version and every other one the transaction stamped, at one instant.
+        // Until then the version is visible only to its own transaction.
+        //
+        // The record's header-only creation undo (`write_node_create`, below) reverts the whole
+        // header, so an abort restores a word carrying a **recyclable id** rather than a value. That
+        // is sound only because `rmp` #1069 phase 1 made a slot unreclaimable while any header still
+        // names it; without that guarantee an abort could resurrect a stamp pointing at a slot since
+        // re-handed to another transaction. See `commit_slot_for`.
+        let mut rec = NodeRecord::new(eid, HeaderStamp::slot(self.commit_slot_for(txn)?));
         // The version chain's first link (`04 §5.1.1`, `05 §12.3`): creating an entity writes a
         // `DeleteObject` delta, because deleting it is what undoes the creation. The delta is written
         // FIRST and its id rides into the record's own first write as `undo_ptr` — see
@@ -11616,11 +11982,17 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.note_entity_deleted(StoreKind::Node, id, txn)?;
         // `rmp` #301: compare-and-set undo for the tombstone stamp, so a non-LIFO abort never clobbers
         // a header word a concurrently-interleaved transaction has since re-stamped.
+        //
+        // `rmp` #1069 phase 3: the word written here — and therefore the pre-image the CAS undo
+        // restores — is a commit **slot id**, not a timestamp. Restoring an id is only sound while no
+        // named slot can be recycled, which phase 1 guarantees (a slot dies by proof of
+        // unreachability, and a header naming it is a reference). If that ever relaxes, this undo
+        // starts restoring a pointer to another transaction's slot.
         self.patch_header_word_cas(
             StoreKind::Node,
             id,
             MVCC_OFF_EXPIRED_TS,
-            VersionStamp::in_flight(txn),
+            HeaderStamp::slot(self.commit_slot_for(txn)?),
             txn,
         )?;
         self.note_expired(txn, StoreKind::Node, id);
@@ -12012,9 +12384,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         id: u64,
         mvcc: MvccHeader,
         snapshot: Snapshot,
-        registry: &CommitRegistry,
     ) -> Result<bool> {
-        read_view::entity_visible_at(&self.pool, &self.stores, kind, id, mvcc, snapshot, registry)
+        // `self` IS the oracle since `rmp` #1069 phase 3: the header names a commit slot in this
+        // store's own `commit.store`, so no caller has to (or may) supply a resolver.
+        read_view::entity_visible_at(&self.pool, &self.stores, kind, id, mvcc, snapshot, self)
     }
 
     // --------------------------- relationship CRUD --------------------------
@@ -12053,8 +12426,16 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         let id = self.alloc_id(StoreKind::Rel, txn)?;
         let eid = self.element_ids.alloc()?;
         self.note_created(txn, StoreKind::Rel, id);
-        // Stamp `xmin` with the writer's in-flight `TxnId` (`04 §5.2`); settled at commit.
-        let mut rel = RelRecord::new(eid, VersionStamp::in_flight(txn), type_id, start, end);
+        // Stamp `xmin` with the writer's **commit slot** (`04 §5.2`, `rmp` #1069 phase 3); settled by
+        // publishing that slot. The header-only creation undo restores an id, not a value — sound
+        // only because a named slot is never recycled (phase 1); see `create_node`.
+        let mut rel = RelRecord::new(
+            eid,
+            HeaderStamp::slot(self.commit_slot_for(txn)?),
+            type_id,
+            start,
+            end,
+        );
         // The creation's `DeleteObject` delta, written before the record that names it, exactly as for
         // a node ([`creation_chain_head`](Self::creation_chain_head)). Both branches below write the
         // record through `write_rel_create`, whose header-only creation undo reverts `undo_ptr` along
@@ -12369,12 +12750,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // Link the `RecreateObject` delta BEFORE the in-place mutation (`04 §5.1.2`, steps 3 then 4).
         self.note_entity_deleted(StoreKind::Rel, id, txn)?;
         // `rmp` #301: compare-and-set undo for the tombstone stamp (non-LIFO-safe, see
-        // [`patch_header_word_cas`](Self::patch_header_word_cas)).
+        // [`patch_header_word_cas`](Self::patch_header_word_cas)). Since `rmp` #1069 phase 3 the CAS
+        // undo restores a commit **slot id**; see the twin in `delete_node` for why that is sound.
         self.patch_header_word_cas(
             StoreKind::Rel,
             id,
             MVCC_OFF_EXPIRED_TS,
-            VersionStamp::in_flight(txn),
+            HeaderStamp::slot(self.commit_slot_for(txn)?),
             txn,
         )?;
         self.note_expired(txn, StoreKind::Rel, id);
@@ -12872,10 +13254,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // for a cell that is already empty and whose owner has no chain — never for a cell the
             // old chain would have skipped before ever asking.
             let is_tombstone = if is_empty_cell && !owner_has_chain {
-                self.commit_registry
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .resolve_commit_ts(prop.mvcc.created_ts)?
+                self.resolve_commit_ts(prop.mvcc.created_ts)?
                     .is_some_and(|ts| ts <= watermark)
             } else {
                 false
@@ -13552,10 +13931,16 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // whether the popped id became a live-referenced corpse (walk this node's prop chain) or a
         // reclaimable dead slot.
         self.note_popped_prop_owner(txn, pid, StoreKind::Node, node_id);
-        // Stamp `xmin` with the writer's in-flight `TxnId` (`04 §5.2`; per-value MVCC, `rmp` task
-        // #50); `commit` settles it to the commit timestamp. Until then the version is visible only
-        // to its own transaction.
-        let mut prop = PropRecord::new(VersionStamp::in_flight(txn), key, type_tag, value_inline);
+        // Stamp `xmin` with the writer's **commit slot** (`04 §5.2`; per-value MVCC, `rmp` task #50;
+        // `rmp` #1069 phase 3); publishing the slot settles it. Until then the version is visible only
+        // to its own transaction. The header-only creation undo restores an id, not a value — sound
+        // only because a named slot is never recycled (phase 1); see `create_node`.
+        let mut prop = PropRecord::new(
+            HeaderStamp::slot(self.commit_slot_for(txn)?),
+            key,
+            type_tag,
+            value_inline,
+        );
         prop.next_prop = node.first_prop;
         // Header-only creation undo for the prop + compare-and-set logical undo for the owner's
         // `first_prop` head (`rmp` #172). A loser's abort then reverts only the prop's in-use bit (its
@@ -13722,7 +14107,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             Some((pid, cell)) => {
                 self.link_set_property(kind, entity, key, cell.type_tag, cell.value_inline, txn)?;
                 let mut next = cell;
-                next.mvcc.created_ts = VersionStamp::in_flight(txn);
+                // `rmp` #1069 phase 3: the cell's `created_ts` now names this writer's commit slot.
+                // `write_prop_cell`'s undo is a FLAT pre-image of the whole cell, so an abort restores
+                // the previous writer's **slot id** — sound only while a named slot cannot be
+                // recycled (phase 1); see `create_node`.
+                next.mvcc.created_ts = HeaderStamp::slot(self.commit_slot_for(txn)?);
                 next.type_tag = type_tag;
                 next.value_inline = value_inline;
                 self.write_prop_cell(pid, &next, txn)?;
@@ -13816,7 +14205,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// is exactly the single-owner rule that makes the empty cell safe to reclaim later.
     fn empty_prop_cell(&self, pid: u64, cell: PropRecord, txn: TxnId) -> Result<()> {
         let mut empty = cell;
-        empty.mvcc.created_ts = VersionStamp::in_flight(txn);
+        // `rmp` #1069 phase 3: a commit slot id, restored as an id by `write_prop_cell`'s flat
+        // pre-image undo — see the `SET` twin above for why that is sound.
+        empty.mvcc.created_ts = HeaderStamp::slot(self.commit_slot_for(txn)?);
         empty.type_tag = undo::TYPE_TAG_ABSENT;
         empty.value_inline = NULL_ID;
         self.write_prop_cell(pid, &empty, txn)?;
@@ -13952,7 +14343,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         );
         for chunk in chunks {
             let id = self.alloc_id(StoreKind::Strings, txn)?;
-            let block = HeapBlock::new(txn.0, chunk, next);
+            let block = HeapBlock::new(txn, chunk, next);
             self.write_block(id, &block, txn)?;
             next = id;
             head = id;
@@ -14226,9 +14617,15 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         let pid = self.alloc_id(StoreKind::Prop, txn)?;
         // `rmp` #581: remember the owner of a reused prop slot for the rollback corpse check.
         self.note_popped_prop_owner(txn, pid, StoreKind::Rel, rel_id);
-        // Stamp `xmin` with the writer's in-flight `TxnId` (`04 §5.2`; per-value MVCC, `rmp` task
-        // #50); `commit` settles it to the commit timestamp.
-        let mut prop = PropRecord::new(VersionStamp::in_flight(txn), key, type_tag, value_inline);
+        // Stamp `xmin` with the writer's **commit slot** (`04 §5.2`; per-value MVCC, `rmp` task #50;
+        // `rmp` #1069 phase 3); publishing the slot settles it. The header-only creation undo restores
+        // an id, not a value — sound only because a named slot is never recycled (phase 1).
+        let mut prop = PropRecord::new(
+            HeaderStamp::slot(self.commit_slot_for(txn)?),
+            key,
+            type_tag,
+            value_inline,
+        );
         prop.next_prop = rel.first_prop;
         // Header-only creation undo + compare-and-set head undo (`rmp` #172), mirroring
         // `add_node_property`: a loser's abort never severs an unrelated committed property version
@@ -14458,20 +14855,20 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// **forging accessor for tests** (`rmp` #1069), in the spirit of
     /// [`stamp_property_tombstone_for_test`](Self::stamp_property_tombstone_for_test).
     ///
-    /// It exists to construct the one state this build's write path cannot yet produce and the next
-    /// task's will produce as a matter of course: an MVCC header that **names a commit slot**. Until
-    /// `rmp` #1069 lands, a header's unsettled stamp carries the writer's [`TxnId`], so the census
-    /// branch that keeps a named slot alive
-    /// ([`gc_sweep_undo_orphans`](Self::gc_sweep_undo_orphans)) is never reached by a production
-    /// write — and a branch that has never once returned a non-empty answer is a branch nobody has
-    /// tested. This accessor is what makes it testable **now**, so #1069 inherits a proved mechanism
-    /// instead of a decorative one.
+    /// It was written in phase 1 to construct the one state the write path could not yet produce and
+    /// phase 3's produces as a matter of course: an MVCC header that **names a commit slot**. Before
+    /// phase 3 a header's unsettled stamp carried the writer's [`TxnId`], so the census branch that
+    /// keeps a named slot alive ([`gc_sweep_undo_orphans`](Self::gc_sweep_undo_orphans)) was never
+    /// reached by a production write — and a branch that has never once returned a non-empty answer
+    /// is a branch nobody has tested. This accessor made it testable *before* the write path changed,
+    /// so phase 3 inherited a proved mechanism instead of a decorative one.
     ///
     /// It takes a raw word rather than a slot id so a test can *both* make a header name a slot
-    /// (`VersionStamp::in_flight(TxnId(slot))` — byte-identical to what #1069's write path will
-    /// write, so the test observes the real encoding and not a stand-in) *and* take the name away
-    /// again by restoring the settled word it captured first. Proving the census frees the slot once
-    /// nothing names it is half the property; a forge with no inverse could only prove the other half.
+    /// ([`HeaderStamp::slot`] — and note that phase 1 spelled the same bits
+    /// `VersionStamp::in_flight(TxnId(slot))`, because the two encodings are byte-identical, which is
+    /// exactly why phase 3 had to bump the format version) *and* take the name away again by
+    /// restoring the settled word it captured first. Proving the census frees the slot once nothing
+    /// names it is half the property; a forge with no inverse could only prove the other half.
     ///
     /// Not a repair tool and not a write path: it patches one header word under `txn`, leaving every
     /// other invariant to the caller. A store this is used on is, until the caller restores it, one
@@ -17339,28 +17736,30 @@ mod tests {
         let pid = s
             .set_node_property_value(t1, n, key, &Value::Integer(42))
             .unwrap();
-        // Before commit, the new version's `xmin` is the writer's in-flight TxnId (per-value MVCC).
+        // Before commit, the new version's `xmin` is UNSETTLED and names the writer's commit slot
+        // (per-value MVCC; `rmp` #1069 phase 3 replaced the writer's `TxnId` with its slot id).
         let pre = s.property(pid).unwrap();
         assert_eq!(
-            VersionStamp::from_raw(pre.mvcc.created_ts),
-            VersionStamp::InFlight(t1)
+            HeaderStamp::from_raw(pre.mvcc.created_ts).slot_id(),
+            Some(s.commit_slot_for(t1).unwrap()),
+            "the new version's xmin names its writer's commit slot"
         );
+        assert_eq!(s.names_writer(pre.mvcc.created_ts).unwrap(), Some(t1));
         s.commit(t1).unwrap();
-        // After commit (lazy GC-time freezing, `rmp` task #49): `xmin` is NOT settled — it keeps the
-        // writer's in-flight TxnId — but the Active/Recent Transaction Table resolves it to the
-        // commit timestamp. Per-value property versions resolve through the same table as node/rel
-        // versions; GC freezes the header later.
+        // After commit (lazy GC-time settling, `rmp` task #49): `xmin` is NOT rewritten — it still
+        // names the slot — but the slot has been published, so the durable oracle resolves it to the
+        // commit timestamp. Per-value property versions resolve through the same slot as node/rel
+        // versions; GC settles the header later.
         let post = s.property(pid).unwrap();
-        assert_eq!(
-            VersionStamp::from_raw(post.mvcc.created_ts),
-            VersionStamp::InFlight(t1)
+        assert!(
+            HeaderStamp::from_raw(post.mvcc.created_ts)
+                .slot_id()
+                .is_some(),
+            "commit publishes the slot, it does not rewrite the header"
         );
         assert!(
-            s.commit_registry()
-                .resolve_commit_ts(post.mvcc.created_ts)
-                .unwrap()
-                .is_some(),
-            "the transaction table resolves the property version's in-flight xmin to its commit ts"
+            s.resolve_commit_ts(post.mvcc.created_ts).unwrap().is_some(),
+            "the published commit slot resolves the property version's xmin to its commit ts"
         );
         assert_eq!(
             post.mvcc.expired_ts, 0,
@@ -17411,11 +17810,16 @@ mod tests {
         let t2 = TxnId(3);
         s.begin(t1);
         s.begin(t2);
+        // The stamps are the writers' COMMIT SLOT ids since `rmp` #1069 phase 3, taken through the
+        // one door a slot is born at — a hand-built `VersionStamp::in_flight(t)` word would now name
+        // a slot that was never written, and the oracle fails closed on it (correctly).
+        let slot1 = s.commit_slot_for(t1).unwrap();
+        let slot2 = s.commit_slot_for(t2).unwrap();
         s.patch_header_word_cas(
             StoreKind::Node,
             h,
             MVCC_OFF_EXPIRED_TS,
-            VersionStamp::in_flight(t1),
+            HeaderStamp::slot(slot1),
             t1,
         )
         .unwrap();
@@ -17423,13 +17827,13 @@ mod tests {
             StoreKind::Node,
             h,
             MVCC_OFF_EXPIRED_TS,
-            VersionStamp::in_flight(t2),
+            HeaderStamp::slot(slot2),
             t2,
         )
         .unwrap();
         assert_eq!(
-            VersionStamp::from_raw(s.node(h).unwrap().mvcc.expired_ts),
-            VersionStamp::InFlight(t2),
+            HeaderStamp::from_raw(s.node(h).unwrap().mvcc.expired_ts),
+            HeaderStamp::Slot(slot2),
             "T2's stamp is the current xmax before the non-LIFO abort"
         );
 
@@ -17438,16 +17842,15 @@ mod tests {
         // it no-ops and T2's stamp is PRESERVED. A plain pre-image undo would restore 0 (a clobber).
         s.rollback(t1).unwrap();
         assert_eq!(
-            VersionStamp::from_raw(s.node(h).unwrap().mvcc.expired_ts),
-            VersionStamp::InFlight(t2),
+            HeaderStamp::from_raw(s.node(h).unwrap().mvcc.expired_ts),
+            HeaderStamp::Slot(slot2),
             "rmp #301: T1's non-LIFO abort must NOT clobber T2's concurrent xmax stamp"
         );
 
         // T2 commits: its tombstone stands (no lost update). Then GC + consistency check.
         s.commit(t2).unwrap();
         assert!(
-            s.commit_registry()
-                .resolve_commit_ts(s.node(h).unwrap().mvcc.expired_ts)
+            s.resolve_commit_ts(s.node(h).unwrap().mvcc.expired_ts)
                 .unwrap()
                 .is_some(),
             "H's tombstone resolves to T2's commit ts — the delete survived"

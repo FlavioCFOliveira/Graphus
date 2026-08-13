@@ -270,16 +270,31 @@ impl CommitRegistry {
         before - self.outcomes.len()
     }
 
+    /// Whether the table has a **recorded** outcome for `txn`, as opposed to falling back to the
+    /// [`TxnOutcome::Aborted`] default [`outcome`](Self::outcome) returns for an unknown id.
+    ///
+    /// This is a **diagnostic** distinction, never a visibility one: for deciding what a reader sees,
+    /// "aborted" and "never heard of" mean the same thing and [`outcome`](Self::outcome) rightly
+    /// collapses them. It exists so a cross-check can tell "the table disagrees" from "the table has
+    /// nothing to say" — the `rmp` #1069 AC 2 equivalence audit is the one caller, and the difference
+    /// is load-bearing for it: a store opened over an image whose log does not carry the commits (a
+    /// restore from backup, most of all) has an EMPTY table beside a fully-populated `commit.store`,
+    /// and comparing a real answer against a default is not a comparison.
+    #[must_use]
+    pub fn knows(&self, txn: TxnId) -> bool {
+        self.outcomes.contains_key(&txn)
+    }
+
     /// The recorded outcome of `txn`. An unknown id is treated as [`TxnOutcome::Aborted`]: it was
     /// either never committed, or already GC'd because it is provably invisible — both mean its
     /// writes are not visible (`04 §5.3`).
     ///
     /// This takes a [`TxnId`], not a header word: turning a **header stamp** into an outcome is the
-    /// job of [`CommitOracle`](crate::CommitOracle), which this type implements
-    /// (`crate::visibility`). `rmp` #1069 made that the single door, so a caller holding a raw
-    /// `created_ts`/`expired_ts` must go through
-    /// [`resolve_stamp`](crate::CommitOracle::resolve_stamp) rather than decoding the word itself
-    /// and calling this.
+    /// job of [`CommitOracle`](crate::CommitOracle), and since `rmp` #1069 phase 3 the implementor
+    /// that answers for a record header is the **store** (a header names a slot in `commit.store`),
+    /// not this table. This type is no longer a `CommitOracle` at all; the deliberate,
+    /// explicitly-named way to resolve a `TxnId`-payload word through it is
+    /// [`RegistryOracle`](crate::RegistryOracle).
     #[must_use]
     pub fn outcome(&self, txn: TxnId) -> TxnOutcome {
         self.outcomes
@@ -293,9 +308,12 @@ impl CommitRegistry {
 mod tests {
     use super::*;
     // `resolve_commit_ts` is a provided method of the `rmp` #1069 door, not an inherent method of
-    // the registry any more; the assertions below are unchanged, only the `?`-shaped return is.
+    // the registry any more; the assertions below are unchanged, only the `?`-shaped return and the
+    // explicit [`RegistryOracle`] wrapper are. The registry stopped being the record-header oracle
+    // in #1069 phase 3 — it still resolves the `TxnId`-payload populations, which is what these
+    // tests are about.
     use crate::oracle::VersionStamp;
-    use crate::visibility::CommitOracle;
+    use crate::visibility::{CommitOracle, RegistryOracle};
 
     /// The whole of statement-level isolation is one comparison operator per view, so it is asserted
     /// directly rather than only through the storage paths that consume it (`04 §5.1.4`).
@@ -392,7 +410,8 @@ mod tests {
         let reg = CommitRegistry::new();
         assert_eq!(reg.outcome(TxnId(9)), TxnOutcome::Aborted);
         assert_eq!(
-            reg.resolve_commit_ts(VersionStamp::in_flight(TxnId(9)))
+            RegistryOracle(&reg)
+                .resolve_commit_ts(VersionStamp::in_flight(TxnId(9)))
                 .unwrap(),
             None
         );
@@ -403,11 +422,14 @@ mod tests {
         let mut reg = CommitRegistry::new();
         let word = VersionStamp::in_flight(TxnId(3));
         reg.register_begin(TxnId(3));
-        assert_eq!(reg.resolve_commit_ts(word).unwrap(), None); // in flight
+        assert_eq!(RegistryOracle(&reg).resolve_commit_ts(word).unwrap(), None); // in flight
         reg.record_commit(TxnId(3), Timestamp(50));
-        assert_eq!(reg.resolve_commit_ts(word).unwrap(), Some(Timestamp(50)));
+        assert_eq!(
+            RegistryOracle(&reg).resolve_commit_ts(word).unwrap(),
+            Some(Timestamp(50))
+        );
         reg.record_abort(TxnId(3));
-        assert_eq!(reg.resolve_commit_ts(word).unwrap(), None); // aborted
+        assert_eq!(RegistryOracle(&reg).resolve_commit_ts(word).unwrap(), None); // aborted
     }
 
     #[test]
@@ -440,7 +462,8 @@ mod tests {
     fn committed_word_resolves_without_registry_entry() {
         let reg = CommitRegistry::new();
         assert_eq!(
-            reg.resolve_commit_ts(VersionStamp::committed(Timestamp(8)))
+            RegistryOracle(&reg)
+                .resolve_commit_ts(VersionStamp::committed(Timestamp(8)))
                 .unwrap(),
             Some(Timestamp(8))
         );

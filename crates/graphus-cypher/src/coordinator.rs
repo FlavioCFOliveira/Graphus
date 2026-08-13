@@ -95,17 +95,19 @@ struct PropVersion {
 /// (clause 2), `04 §5.3` — so the visible snapshots are exactly one interval, and each stamp that bounds
 /// it is itself an instant (it was collected from some version's `xmin` / `xmax`).
 ///
-/// Stamps resolve through the `registry`, NEVER from the raw word: a commit settles LAZILY, so a
-/// long-committed version still reads `InFlight(w)` and only the registry knows its real commit instant.
-/// Deciding visibility from the raw stamp alone would split a node's versions into disjoint per-writer
-/// views and drop the tuple that mixes one writer's committed value with another's — the missing
-/// candidate this whole construction exists to prevent. That premise fell during `rmp` #766.
+/// Stamps resolve through the `oracle`, NEVER from the raw word: a commit settles LAZILY, so a
+/// long-committed version still carries an unsettled stamp and only the oracle knows its real commit
+/// instant (since `rmp` #1069 phase 3 that oracle is the store's own `commit.store`, not an
+/// in-memory table). Deciding visibility from the raw stamp alone would split a node's versions into
+/// disjoint per-writer views and drop the tuple that mixes one writer's committed value with
+/// another's — the missing candidate this whole construction exists to prevent. That premise fell
+/// during `rmp` #766.
 ///
 /// The one exception the resolver cannot express is the owner's OWN uncommitted write: it has no commit
 /// timestamp yet is visible to `owner` from `t = 0` (an own uncommitted deletion, symmetrically, hides
 /// the version from `owner` at every instant). Those two cases are handled explicitly before the
 /// resolver; everything else — committed, foreign in-flight, aborted, or the `0`/live sentinel — is what
-/// [`CommitRegistry::resolve_commit_ts`] already classifies.
+/// [`CommitOracle::resolve_commit_ts`] already classifies.
 ///
 /// # Errors
 /// Propagates a stamp-resolution fault from the [`CommitOracle`] door (`rmp` #1069). A candidate
@@ -114,7 +116,7 @@ struct PropVersion {
 fn visible_instant_range(
     v: &PropVersion,
     owner: TxnId,
-    registry: &CommitRegistry,
+    oracle: &impl CommitOracle,
     instants: &[Timestamp],
     instant_index: &HashMap<Timestamp, usize>,
 ) -> Result<Option<(usize, usize)>> {
@@ -129,10 +131,10 @@ fn visible_instant_range(
     };
     // `lo` = first instant whose snapshot sees the creator (clause 1). An own uncommitted creator is
     // seen from `t = 0`; otherwise the resolver decides — `None` means visible at no instant.
-    let lo = if registry.names_own_write(v.xmin, owner)? {
+    let lo = if oracle.names_own_write(v.xmin, owner)? {
         0
     } else {
-        match registry.resolve_commit_ts(v.xmin)? {
+        match oracle.resolve_commit_ts(v.xmin)? {
             Some(ts) => idx_of(ts),
             None => return Ok(None),
         }
@@ -140,10 +142,10 @@ fn visible_instant_range(
     // `hi` = first instant whose snapshot has the expirer hide it (clause 2); `n` when nothing hides it.
     // An own uncommitted deletion hides from `t = 0` (an empty span); otherwise the resolver decides —
     // `None` (the `0`/live sentinel, a foreign in-flight, or an aborted expirer) never hides it.
-    let hi = if registry.names_own_write(v.xmax, owner)? {
+    let hi = if oracle.names_own_write(v.xmax, owner)? {
         0
     } else {
-        match registry.resolve_commit_ts(v.xmax)? {
+        match oracle.resolve_commit_ts(v.xmax)? {
             Some(ts) => idx_of(ts),
             None => n,
         }
@@ -265,7 +267,7 @@ fn composite_tuple_hash(tuple: &[Value]) -> u64 {
 /// [`visible_instant_range`] for why a fault must fail the DDL rather than drop a candidate.
 fn composite_candidate_tuples(
     per_key: &[Vec<&PropVersion>],
-    registry: &CommitRegistry,
+    oracle: &impl CommitOracle,
 ) -> Result<Vec<Vec<Value>>> {
     // The instant grid + the in-flight writer views. `instants` = distinct committed stamps (resolved
     // through the registry, never the raw word — see `visible_instant_range`) UNION `{0}`; a `BTreeSet`
@@ -277,14 +279,15 @@ fn composite_candidate_tuples(
     for versions in per_key {
         for v in versions {
             for raw in [v.xmin, v.xmax] {
-                match registry.resolve_commit_ts(raw)? {
+                match oracle.resolve_commit_ts(raw)? {
                     Some(ts) => {
                         instant_set.insert(ts);
                     }
                     None => {
-                        // The writer the word NAMES, through the door — never `resolve_stamp`, whose
-                        // `InFlight` arm is dead through the registry (`rmp` #522 / #778).
-                        if let Some(w) = registry.names_writer(raw)?
+                        // The writer the word NAMES, through the door — never `resolve_stamp`: an
+                        // aborted writer must still contribute its view here, and the OUTCOME would
+                        // collapse it away (`rmp` #522 / #778).
+                        if let Some(w) = oracle.names_writer(raw)?
                             && !writers.contains(&w)
                         {
                             writers.push(w);
@@ -327,7 +330,7 @@ fn composite_candidate_tuples(
             // Newest-first so a newer version claims a shared instant; older versions fill only the gaps.
             for &v in versions {
                 let Some((lo, hi)) =
-                    visible_instant_range(v, owner, registry, &instants, &instant_index)?
+                    visible_instant_range(v, owner, oracle, &instants, &instant_index)?
                 else {
                     continue; // visible at no instant from this view
                 };
@@ -428,15 +431,43 @@ fn composite_candidate_tuples(
 fn active_writer_holds_newest_covered(
     chain: &[(u64, PropRecord)],
     covered: &[u32],
-    registry: &CommitRegistry,
+    oracle: &impl CommitOracle,
     is_active: impl Fn(TxnId) -> bool,
 ) -> Result<Option<TxnId>> {
-    // `names_writer`, NOT `resolve_stamp`: the door's `InFlight` arm is dead through the registry
-    // (an unresolved writer maps to `Aborted`), so asking the OUTCOME here would make this whole gate
-    // a no-op — the exact `rmp` #522 / #778 defect the doc above warns about. The identity comes
-    // from the word; the liveness from the store's Active Transaction Table via `is_active`.
+    // # What this gate asks, after `rmp` #1069 phase 3
+    //
+    // Identity + liveness, exactly as before — **widened**, not replaced, by the outcome.
+    //
+    // The phase-2 rule was "`names_writer`, NOT `resolve_stamp`", because the door's `InFlight` arm
+    // was dead through the registry and asking the OUTCOME would have made this whole gate a no-op
+    // (`rmp` #522 / #778). Phase 3 makes the outcome answerable, so the temptation is to replace the
+    // pair with `resolve_stamp(word) == InFlight(_)`. That is **refused here**, and the reason is
+    // specific to this gate rather than general:
+    //
+    // this predicate has NO snapshot. It reads the chain head raw, to decide whether the value it is
+    // about to bake into a derived index is settled. A commit publishes its durable slot at
+    // `commit_prepare` and only afterwards finishes committing — and a failure in between rolls the
+    // publication back. Inside that window the slot already reads `Committed` while the transaction
+    // is still in `active` and its value is not yet final. A snapshot-taking reader is protected from
+    // that window by `D-published-snapshot-horizon`; this gate is not, because it takes no snapshot.
+    // So the outcome alone would let the build bake a value whose transaction had not finished.
+    //
+    // The outcome is nevertheless added as a second disjunct, because it catches what identity +
+    // liveness cannot: a writer that is genuinely unresolved but absent from the Active Transaction
+    // Table. Both disjuncts point the same way — hold the build — so widening is free of risk.
     let held_by_active = |word: u64| -> Result<Option<TxnId>> {
-        Ok(registry.names_writer(word)?.filter(|w| is_active(*w)))
+        // The IDENTITY of the writer the word names (never the outcome, which would collapse an
+        // aborted or a settling writer away), filtered by liveness from the store's Active
+        // Transaction Table.
+        if let Some(w) = oracle.names_writer(word)?.filter(|w| is_active(*w)) {
+            return Ok(Some(w));
+        }
+        // The durable second opinion: an unpublished commit slot is a writer that has resolved
+        // neither way, whatever the in-memory table says.
+        Ok(match oracle.resolve_stamp(word)? {
+            StampOutcome::InFlight(w) => Some(w),
+            StampOutcome::None | StampOutcome::Committed(_) | StampOutcome::Aborted => None,
+        })
     };
     for &key in covered {
         // Newest-first: the FIRST occurrence of `key` in the chain is its newest version.
@@ -595,10 +626,23 @@ fn stamped_candidates(chain: &SupersetProperties, entity_created_ts: u64) -> Vec
 mod composite_sweep_equivalence {
     use super::*;
     use graphus_core::VersionStamp;
+    use graphus_txn::{CommitRegistry, RegistryOracle};
 
-    /// The in-memory registry never faults, so the oracle below keeps its infallible shape and every
-    /// assertion in this module is unchanged; only the `?`-shaped calls into the `rmp` #1069 door are
-    /// new. A fault here would be a bug in the door itself, so it panics rather than being folded in.
+    /// # Why this module resolves through [`RegistryOracle`] and not through a store
+    ///
+    /// The property this module pins is **algebraic**: for the same oracle, the sweep and the
+    /// reference construction must select the same tuple set. Nothing about it depends on where the
+    /// commit outcomes come from, and the `PropVersion`s here are synthetic — no store ever wrote
+    /// them. So the cheapest oracle that can answer is the right one, and the words are built with
+    /// `VersionStamp::in_flight`, which is the population `RegistryOracle` serves.
+    ///
+    /// This is one of the two uses `RegistryOracle`'s docs sanction. The production callers of
+    /// `composite_candidate_tuples` pass the STORE, whose headers name commit slots.
+    ///
+    /// The in-memory registry never faults, so the reference below keeps its infallible shape and
+    /// every assertion in this module is unchanged; only the `?`-shaped calls into the `rmp` #1069
+    /// door are new. A fault here would be a bug in the door itself, so it panics rather than being
+    /// folded in.
     fn expect<T>(r: Result<T>) -> T {
         r.expect("the in-memory commit registry resolves every stamp")
     }
@@ -606,7 +650,7 @@ mod composite_sweep_equivalence {
     /// The pre-#774 construction: one tuple per (view, instant) via a linear `find`, deduped by
     /// structural `PartialEq`. This is the reference the sweep must match, so it is intentionally the
     /// slow, obviously-correct shape.
-    fn oracle(per_key: &[Vec<&PropVersion>], registry: &CommitRegistry) -> Vec<Vec<Value>> {
+    fn oracle(per_key: &[Vec<&PropVersion>], registry: &RegistryOracle<'_>) -> Vec<Vec<Value>> {
         let mut instants: Vec<Timestamp> = vec![Timestamp(0)];
         let mut writers: Vec<TxnId> = Vec::new();
         for versions in per_key {
@@ -669,6 +713,7 @@ mod composite_sweep_equivalence {
 
     /// Asserts the sweep and the oracle emit the same SET of tuples (order-independent, both deduped).
     fn assert_same_set(per_key: &[Vec<&PropVersion>], registry: &CommitRegistry) {
+        let registry = &RegistryOracle(registry);
         let got = composite_candidate_tuples(per_key, registry)
             .expect("the in-memory commit registry resolves every stamp");
         let want = oracle(per_key, registry);
@@ -787,7 +832,7 @@ mod composite_sweep_equivalence {
                 .collect()
         }
         // Min of a few runs: least-noisy estimator of the intrinsic cost.
-        fn min_nanos(store: &[Vec<PropVersion>], reg: &CommitRegistry) -> u128 {
+        fn min_nanos(store: &[Vec<PropVersion>], reg: &RegistryOracle<'_>) -> u128 {
             let per_key: Vec<Vec<&PropVersion>> =
                 store.iter().map(|c| c.iter().collect()).collect();
             (0..5)
@@ -800,6 +845,7 @@ mod composite_sweep_equivalence {
                 .unwrap()
         }
         let reg = CommitRegistry::new();
+        let reg = RegistryOracle(&reg);
         let small = chains(256);
         let large = chains(1024); // 4x
         // Warm up so the ratio reflects steady state, not first-touch allocation.
@@ -916,8 +962,8 @@ use graphus_storage::{
     VectorIndexEntry, VectorSimilarity,
 };
 use graphus_txn::{
-    CommitOracle, CommitRegistry, IsolationLevel, PredicateRead, Snapshot, SsiReadBuffer,
-    SsiTracker, is_visible_via,
+    CommitOracle, IsolationLevel, PredicateRead, Snapshot, SsiReadBuffer, SsiTracker, StampOutcome,
+    is_visible_via,
 };
 use graphus_wal::LogSink;
 
@@ -1446,7 +1492,7 @@ pub struct IndexBuildTotals {
 /// Every field is `Send` (compile-asserted just below), so the whole bundle moves cleanly
 /// to a reader thread. It holds **no** `Rc`/`RefCell` and no live borrow of the store: the
 /// [`StoreReadView`] is an `Arc`-shared page cache over an owned metadata snapshot, the
-/// [`CommitRegistry`] is a clone, and the [`SsiReadBuffer`] is freshly minted for the reader.
+/// [`SsiReadBuffer`] is freshly minted for the reader.
 pub struct ReadTaskInputs<D: BlockDevice, S: LogSink> {
     /// The owned decode surface over the committed store (`Arc<pool>` + `MetaSnapshot`).
     pub view: StoreReadView<D, S>,
@@ -1454,8 +1500,6 @@ pub struct ReadTaskInputs<D: BlockDevice, S: LogSink> {
     pub tokens: TokenSnapshot,
     /// This reader's MVCC read snapshot (begin timestamp + owner txn).
     pub snapshot: Snapshot,
-    /// A clone of the store's commit registry (resolves an in-flight writer to its outcome).
-    pub registry: CommitRegistry,
     /// A fresh, empty SIREAD-marker buffer tagged with the reader's txn.
     pub buffer: SsiReadBuffer,
     /// A `Send + Sync` snapshot of the declared full-text index catalogue (`rmp` task #546), so an
@@ -1482,7 +1526,7 @@ pub struct ReadTaskInputs<D: BlockDevice, S: LogSink> {
 // body) that fails to build the instant a non-`Send` field is introduced — making the off-thread
 // dispatch's safety explicit here rather than only as a distant error at the `SyncSender<ReadTask>`
 // send site. Every field is `Send`: `StoreReadView`/`TokenSnapshot` are `Send + Sync` (Slice 3a),
-// `Snapshot` is `Copy`, and `CommitRegistry`/`SsiReadBuffer` are plain owned data. Asserted both for
+// `Snapshot` is `Copy`, and `SsiReadBuffer` is plain owned data. Asserted both for
 // the concrete DST instantiation and generically over the `D, S: Send + Sync` bound the view requires.
 const _: () = {
     fn assert_send<T: Send>() {}
@@ -3082,7 +3126,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         //
         // The membership gate is the LIVE-OR-RETAINED label superset, never the raw live word
         // (`rmp` task #904) — see `RecordStore::node_label_superset`.
-        let (label_tokens, props, registry): (Vec<u32>, Vec<(u32, PropVersion)>, CommitRegistry) = {
+        let (label_tokens, props): (Vec<u32>, Vec<(u32, PropVersion)>) = {
             let store = store.borrow();
             let labels = match store.node_label_superset(id) {
                 Ok(l) => l,
@@ -3131,11 +3175,15 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     }
                 }
             }
-            // The registry resolves lazily-stamped commits (see `visible_instant_range`).
-            (labels, props, store.commit_registry_snapshot())
+            (labels, props)
         };
 
         let mut idx = index.borrow_mut();
+        // The record-header commit oracle (`rmp` #1069 phase 3): the store itself, resolving each
+        // unsettled stamp against its durable `commit.store`. ONE borrow for the whole loop — the
+        // per-iteration re-borrow this replaced would be a re-entrant `SharedCell` acquisition
+        // (`rmp` #1010). Nothing inside the loop touches the store, so holding it is free.
+        let oracle = store.borrow();
         for (label_token, property_tokens) in registered {
             if !label_tokens.contains(label_token) {
                 continue; // node does not carry this composite index's label
@@ -3167,7 +3215,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 // exactly as the store-read faults above do (`rmp` #733): an index published over
                 // candidates nobody could compute would let the write path admit a committed
                 // duplicate on a KEY constraint.
-                let tuples = match composite_candidate_tuples(&per_key, &registry) {
+                let tuples = match composite_candidate_tuples(&per_key, oracle) {
                     Ok(t) => t,
                     // Marked through the guard ALREADY HELD, never `Self::note_rebuild_gap(index)`:
                     // that helper re-acquires the same `SharedCell`, which is a re-entrant
@@ -3406,7 +3454,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // CURRENT image, so a REL KEY would lose the candidate that catches a committed duplicate —
         // `rmp` #683) and rather than `superset_scan_rel_property_values`, which strips the stamps
         // the per-view tuple construction needs.
-        let (props, registry): (Vec<(u32, PropVersion)>, CommitRegistry) = {
+        let props: Vec<(u32, PropVersion)> = {
             let store = store.borrow();
             // The relationship's own creation stamp is the `xmin` floor for a value whose installing
             // write has already been reclaimed off the undo chain (see [`stamped_candidates`]).
@@ -3446,11 +3494,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     }
                 }
             }
-            // The registry resolves lazily-stamped commits (see `visible_instant_range`).
-            (out, store.commit_registry_snapshot())
+            out
         };
 
         let mut idx = index.borrow_mut();
+        // The record-header commit oracle (`rmp` #1069 phase 3) — see the node twin above for why the
+        // borrow is taken once, outside the loop.
+        let oracle = store.borrow();
         for (reg_type, property_tokens) in registered {
             if *reg_type != type_token {
                 continue; // relationship does not carry this composite index's type
@@ -3478,7 +3528,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 // exactly as the store-read faults above do (`rmp` #733): an index published over
                 // candidates nobody could compute would let the write path admit a committed
                 // duplicate on a KEY constraint.
-                let tuples = match composite_candidate_tuples(&per_key, &registry) {
+                let tuples = match composite_candidate_tuples(&per_key, oracle) {
                     Ok(t) => t,
                     // Marked through the guard ALREADY HELD, never `Self::note_rebuild_gap(index)`:
                     // that helper re-acquires the same `SharedCell`, which is a re-entrant
@@ -3571,14 +3621,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // INCOMPLETE and stops — the same fail-closed answer the store-read faults above give
         // (`rmp` #733). Reading it as "no active writer" would promote the index over a value the
         // gate never got to judge, which is the #766 loss this gate exists to prevent.
-        // The registry is borrowed as a READ GUARD, not cloned: this runs once per entity in an
-        // O(store) rebuild, and `is_txn_active` reads the Active Transaction Table, never the
-        // registry, so holding it across the closure cannot self-deadlock.
+        // ONE store borrow serves both halves of the gate (`rmp` #1069 phase 3): the store is the
+        // record-header commit oracle AND the owner of the Active Transaction Table. Re-borrowing for
+        // the liveness closure would be a re-entrant `SharedCell` acquisition (`rmp` #1010); two
+        // shared uses of the same guard are not.
         let conflicting_writer = {
-            let registry = store.borrow().commit_registry();
-            match active_writer_holds_newest_covered(&chain, &covered, &registry, |w| {
-                store.borrow().is_txn_active(w)
-            }) {
+            let s = store.borrow();
+            match active_writer_holds_newest_covered(&chain, &covered, s, |w| s.is_txn_active(w)) {
                 Ok(w) => w,
                 Err(_) => {
                     Self::note_rebuild_gap(index);
@@ -3689,14 +3738,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // INCOMPLETE and stops — the same fail-closed answer the store-read faults above give
         // (`rmp` #733). Reading it as "no active writer" would promote the index over a value the
         // gate never got to judge, which is the #766 loss this gate exists to prevent.
-        // The registry is borrowed as a READ GUARD, not cloned: this runs once per entity in an
-        // O(store) rebuild, and `is_txn_active` reads the Active Transaction Table, never the
-        // registry, so holding it across the closure cannot self-deadlock.
+        // ONE store borrow serves both halves of the gate (`rmp` #1069 phase 3): the store is the
+        // record-header commit oracle AND the owner of the Active Transaction Table. Re-borrowing for
+        // the liveness closure would be a re-entrant `SharedCell` acquisition (`rmp` #1010); two
+        // shared uses of the same guard are not.
         let conflicting_writer = {
-            let registry = store.borrow().commit_registry();
-            match active_writer_holds_newest_covered(&chain, &covered, &registry, |w| {
-                store.borrow().is_txn_active(w)
-            }) {
+            let s = store.borrow();
+            match active_writer_holds_newest_covered(&chain, &covered, s, |w| s.is_txn_active(w)) {
                 Ok(w) => w,
                 Err(_) => {
                     Self::note_rebuild_gap(index);
@@ -4060,11 +4108,11 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             for (reg_label, prop_key) in covering {
                 // Fail closed on an unresolvable stamp (`rmp` #1069 / #733), exactly as the chain
                 // read above does: an unjudged key must not be baked as conflict-free.
-                // A read guard, not a clone — see the full-text build for why.
+                // ONE store borrow for both halves — see the full-text build for why.
                 let conflicting_writer = {
-                    let registry = store.borrow().commit_registry();
-                    match active_writer_holds_newest_covered(&chain, &[prop_key], &registry, |w| {
-                        store.borrow().is_txn_active(w)
+                    let s = store.borrow();
+                    match active_writer_holds_newest_covered(&chain, &[prop_key], s, |w| {
+                        s.is_txn_active(w)
                     }) {
                         Ok(w) => w,
                         Err(_) => {
@@ -4200,11 +4248,11 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 }
                 // Fail closed on an unresolvable stamp (`rmp` #1069 / #733), exactly as the chain
                 // read above does: an unjudged key must not be baked as conflict-free.
-                // A read guard, not a clone — see the full-text build for why.
+                // ONE store borrow for both halves — see the full-text build for why.
                 let conflicting_writer = {
-                    let registry = store.borrow().commit_registry();
-                    match active_writer_holds_newest_covered(&chain, &[prop_key], &registry, |w| {
-                        store.borrow().is_txn_active(w)
+                    let s = store.borrow();
+                    match active_writer_holds_newest_covered(&chain, &[prop_key], s, |w| {
+                        s.is_txn_active(w)
                     }) {
                         Ok(w) => w,
                         Err(_) => {
@@ -8624,9 +8672,10 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// whose visibility cannot be resolved **fails the DDL**, exactly as an unreadable label word
     /// does (`rmp` #733): a constraint accepted over data nobody could judge is a schema that lies.
     fn visible_to(&self, snapshot: Snapshot, created_ts: u64, expired_ts: u64) -> Result<bool> {
+        // The store IS the record-header oracle (`rmp` #1069 phase 3) — no registry clone.
         let store = self.store.borrow();
         is_visible_via(
-            &store.commit_registry_snapshot(),
+            store,
             snapshot.with_view(graphus_txn::View::New),
             created_ts,
             expired_ts,
@@ -10925,7 +10974,6 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             view: store.read_view(),
             tokens: store.token_snapshot(),
             snapshot,
-            registry: store.commit_registry_snapshot(),
             buffer: SsiReadBuffer::new(txn),
             // `rmp` #546: capture the full-text catalogue so an off-thread `db.index.fulltext.
             // queryNodes` resolves the index by name and recomputes matches from this snapshot. Small
