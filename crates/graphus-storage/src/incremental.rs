@@ -798,6 +798,19 @@ pub fn restore_to<D: BlockDevice, C: LinkCodec>(
     let sink = SliceLogSink::new(wal_bytes);
     let mut wal = WalManager::open(sink)?;
     recover_device_from(&mut wal, device, manifest.base_lsn)?;
+    // 5. RESOLVE THE PENDING-DDL BLOCK WHILE THE DECIDING LOG IS STILL IN HAND (`rmp` #1083).
+    //
+    // Redo above re-materialised the metadata page exactly as it stood, which since #1083 may
+    // include a block naming the transaction whose commit wrote that image. `RecordStore::open`
+    // resolves such a block against the `COMMIT` records in its log and DEFAULTS TO DROP — and the
+    // restored database is opened over a **fresh, empty** WAL (`restore_chain_file_atomic` verifies
+    // with a throwaway one, and the server resets the log outright). Left to that open, a committed
+    // `CREATE CONSTRAINT` at the tail of the restored chain would simply vanish.
+    //
+    // So the decision is taken here, against `wal` — the very log the cut was made in — and written
+    // to the device. Every later open then reads a catalogue that needs no log to interpret, which
+    // is the same property `backup_store` buys for the counters with `settle_counts_into_image`.
+    crate::recovery::resolve_pending_ddl_on_device(&wal, device)?;
     Ok(RestoreOutcome {
         requested: target,
         restored_lsn: Lsn(cut.cut_lsn),

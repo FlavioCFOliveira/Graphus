@@ -703,7 +703,27 @@ pub mod constants {
     /// simply absent and the set decodes empty, which is the truth for it — no build below version 4
     /// ever wrote a count-delta record, so there is nothing an empty set could cause to be applied
     /// twice. The first checkpoint rewrites the catalog with the block present.
-    pub const FORMAT_VERSION: u32 = 4;
+    ///
+    /// # Version 5 (`rmp` #1083): the committing transaction's pending schema DDL, attributed
+    ///
+    /// Version 5 appends a second trailing block: the schema-catalog DDL of the transaction whose
+    /// commit wrote the image, carried **beside** the committed catalogue instead of inside it, and
+    /// named by its transaction id. Until version 5 that DDL was folded into the persisted
+    /// `Statistics` itself — the only route a committing `CREATE INDEX` / `CREATE CONSTRAINT` had to
+    /// disk — so an image written by a transaction that then never committed left its DDL durable. A
+    /// phantom `UNIQUE` constraint rejects writes that must be admitted, which is a correctness
+    /// violation and not a cosmetic one. From version 5 the image carries only COMMITTED schema and
+    /// `open` applies the block only for a transaction whose `COMMIT` record recovery found.
+    ///
+    /// The bump stops an older build from reading a version-5 image, and it has to for the same
+    /// reason version 4's did in the opposite direction: such a build would ignore the block, so a
+    /// committed `CREATE CONSTRAINT` whose only durable record is that block would silently vanish.
+    ///
+    /// A version-4 image opened by this build is an **upgrade**: the block is simply absent and
+    /// decodes to "no pending DDL", which is the truth for it — a version-4 image already folded its
+    /// committing transaction's DDL into the counters' `Statistics`, so there is nothing left to
+    /// attribute and nothing to lose.
+    pub const FORMAT_VERSION: u32 = 5;
 
     /// Logical database page size in bytes, decoupled from the OS page size
     /// (`04-technical-design.md` §3.1; the default is subject to spike §12 item 4).

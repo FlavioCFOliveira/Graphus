@@ -125,9 +125,9 @@ pub use incremental::{
 pub use labels::{LabelError, MAX_INLINE_LABEL_ID, OVERFLOW_BIT};
 pub use meta::{
     CompositeIndexEntry, ConstraintEntry, ConstraintKind, ConstraintTypeDescriptor, CountKey,
-    FulltextEntity, FulltextIndexEntry, IndexState, Meta, RelCompositeIndexEntry, SpatialEntity,
-    SpatialIndexEntry, Statistics, StoreMeta, TextIndexEntry, VectorEntity, VectorIndexEntry,
-    VectorSimilarity,
+    FulltextEntity, FulltextIndexEntry, IndexState, Meta, PendingSchema, RelCompositeIndexEntry,
+    SpatialEntity, SpatialIndexEntry, Statistics, StoreMeta, TextIndexEntry, VectorEntity,
+    VectorIndexEntry, VectorSimilarity,
 };
 pub use propenc::{
     PropDecodeError, PropEncodeError, TAG_BOOL, TAG_FLOAT, TAG_INT, decode_inline, encode_inline,

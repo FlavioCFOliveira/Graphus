@@ -488,6 +488,13 @@ pub enum FreeListFault {
     /// The same id appears more than once on the free list (double-free).
     Duplicate,
     /// A freed id's record is still in use (a live record sitting on the free list).
+    ///
+    /// Unreachable through `RecordStore::open` since `rmp` #1083: that path NARROWS every decoded
+    /// free list to the ids whose records are unused, because a committing GC pass that becomes a
+    /// recovery loser leaves exactly this contradiction, and reporting it turned a recoverable crash
+    /// into a database that refuses to serve. The arm stays because the pass may be run against any
+    /// catalog, and it is pinned by
+    /// `check::tests::a_freed_id_whose_record_is_still_in_use_is_reported`.
     StillInUse,
     /// A freed id is referenced by some live incidence/property chain.
     ReferencedByLiveChain,
@@ -743,6 +750,13 @@ pub fn verify_warm<D: BlockDevice, S: LogSink>(
 // ===========================================================================================
 
 /// A read-only snapshot of the per-store catalog the checker needs.
+///
+/// `Default` is derived so the per-pass checks can be unit-tested against a fabricated catalog
+/// (`rmp` #1083): since `RecordStore::open` now NARROWS a free list to the ids whose records are
+/// unused, a store cannot be opened into the state [`check_free_lists`] reports as
+/// [`FreeListFault::StillInUse`], and the only honest way left to exercise that arm is to hand it
+/// the state directly.
+#[derive(Default)]
 struct Catalog {
     high_water: [u64; STORE_COUNT],
     free: [Vec<u64>; STORE_COUNT],
@@ -782,6 +796,9 @@ impl Catalog {
 }
 
 /// The live-record picture derived by a single forward scan of every store.
+///
+/// `Default` is derived for the reason given on [`Catalog`].
+#[derive(Default)]
 struct Scan {
     /// Live (in-use, not freed) node ids -> their record.
     live_nodes: BTreeMap<u64, NodeRecord>,
@@ -1961,5 +1978,102 @@ mod tests {
         let e = IndexEntry::rid(42);
         assert_eq!(e.rid, 42);
         assert!(e.key.is_empty());
+    }
+
+    /// A catalog whose `kind` free list holds `free`, with room for those ids under the mark.
+    fn catalog_with_free(kind: StoreKind, free: &[u64]) -> Catalog {
+        let mut cat = Catalog {
+            high_water: [1; STORE_COUNT],
+            ..Catalog::default()
+        };
+        cat.high_water[kind as usize] = free.iter().copied().max().unwrap_or(0) + 1;
+        cat.free[kind as usize] = free.to_vec();
+        cat
+    }
+
+    /// A freed id whose on-disk record still reads `in_use` is a live record sitting on the free
+    /// list, and the free-list pass must report it.
+    ///
+    /// # Why this is a unit test and no longer a disk-image one
+    ///
+    /// `tests/consistency.rs` used to reach this arm by resurrecting a freed record on the durable
+    /// image and reopening. Since `rmp` #1083 `RecordStore::open` NARROWS every free list to the ids
+    /// whose records are unused, so that state is healed before the checker ever sees it — which is
+    /// the point of the heal, and which makes the old route structurally unable to test this arm.
+    /// Handing the pass the contradiction directly is what keeps the arm covered rather than
+    /// silently dead.
+    #[test]
+    fn a_freed_id_whose_record_is_still_in_use_is_reported() {
+        for kind in ALL_STORE_KINDS {
+            let cat = catalog_with_free(kind, &[7]);
+            let mut scan = Scan::default();
+            scan.freed[kind as usize].insert(7);
+            scan.freed_but_in_use[kind as usize].insert(7);
+            let mut report = ConsistencyReport::default();
+            check_free_lists(&cat, &scan, &mut report);
+            assert!(
+                report.violations.iter().any(|v| matches!(
+                    v,
+                    Violation::FreeList { kind: k, id: 7, detail: FreeListFault::StillInUse }
+                        if *k == kind
+                )),
+                "{kind:?}: no StillInUse violation for the freed-but-in-use id: {:?}",
+                report.violations
+            );
+        }
+    }
+
+    /// The same pass over the same catalog with the contradiction REMOVED must report nothing — the
+    /// positive control, without which the assertion above would also pass on a check that reported
+    /// every freed id.
+    #[test]
+    fn a_freed_id_whose_record_is_unused_is_not_reported() {
+        for kind in ALL_STORE_KINDS {
+            let cat = catalog_with_free(kind, &[7]);
+            let mut scan = Scan::default();
+            scan.freed[kind as usize].insert(7);
+            let mut report = ConsistencyReport::default();
+            check_free_lists(&cat, &scan, &mut report);
+            assert!(
+                report.is_consistent(),
+                "{kind:?}: a clean free list was reported: {:?}",
+                report.violations
+            );
+        }
+    }
+
+    /// A freed relationship id that a live node's incidence chain still points at is
+    /// dangling-by-reuse, and is the OTHER half of the free-list pass — the half `rmp` #1083's
+    /// open-time narrowing deliberately does not heal, because an id that is not in use yet is still
+    /// referenced is a dead-link corpse rather than the GC-loser residue that narrowing exists for.
+    #[test]
+    fn a_freed_id_a_live_chain_still_reaches_is_reported() {
+        let cat = catalog_with_free(StoreKind::Rel, &[7]);
+        let mut scan = Scan::default();
+        scan.freed[StoreKind::Rel as usize].insert(7);
+        scan.live_nodes.insert(
+            1,
+            NodeRecord {
+                mvcc: MvccHeader::live(1),
+                element_id: graphus_core::ElementId(1),
+                first_rel: 7,
+                first_prop: NULL_ID,
+                labels: 0,
+            },
+        );
+        let mut report = ConsistencyReport::default();
+        check_free_lists(&cat, &scan, &mut report);
+        assert!(
+            report.violations.iter().any(|v| matches!(
+                v,
+                Violation::FreeList {
+                    kind: StoreKind::Rel,
+                    id: 7,
+                    detail: FreeListFault::ReferencedByLiveChain
+                }
+            )),
+            "no ReferencedByLiveChain violation for the still-referenced freed id: {:?}",
+            report.violations
+        );
     }
 }

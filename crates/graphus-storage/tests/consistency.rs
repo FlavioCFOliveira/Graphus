@@ -1294,11 +1294,28 @@ fn corrupt_self_loop_internal_link_is_flagged() {
     );
 }
 
-/// (g) Free-list sanity: a freed id that is still in use (a live record sitting on the free list)
-/// → a `StillInUse` free-list violation. We model this by re-marking a deleted record live on disk
-/// while it remains on the recovered free list.
+/// (g) Free-list sanity, `rmp` #1083: a durable free list naming an id whose record still reads
+/// `in_use` is **narrowed at open**, so the store serves instead of refusing.
+///
+/// # What this used to assert, and why it changed
+///
+/// It asserted the checker's [`FreeListFault::StillInUse`] arm by resurrecting a freed record on
+/// the durable image and reopening. That state is exactly what a committing GC pass leaves when it
+/// becomes a recovery LOSER — its record clears are undone while the image it wrote still lists the
+/// ids as free — and reporting it made a **recoverable crash** end in a database that refuses to
+/// serve. Since `rmp` #1083 `RecordStore::open` narrows every free list to the ids whose records are
+/// unused, which is what PostgreSQL does with the free space map and Neo4j with `IndexedIdGenerator`:
+/// a free list is DERIVED state, and the record is what is authoritative.
+///
+/// Narrowing is safe in the only direction that matters: dropping an id means the allocator will not
+/// reuse it, so no narrowing can hand out a live slot — the worst case is a slot left unallocated
+/// until a later GC pass re-lists it.
+///
+/// The checker's arm is still covered, by `check::tests::a_freed_id_whose_record_is_still_in_use_is_reported`,
+/// which hands the pass the contradiction directly — the only honest route left now that a store
+/// cannot be *opened* into that state.
 #[test]
-fn corrupt_free_list_still_in_use_is_flagged() {
+fn a_freed_id_whose_record_is_still_in_use_is_narrowed_out_at_open() {
     let mut s = fresh(64);
     let txn = TxnId(1);
     s.begin(txn);
@@ -1313,37 +1330,54 @@ fn corrupt_free_list_still_in_use_is_flagged() {
 
     let mut img = DiskImage::capture(&mut s);
     {
-        // Uncorrupted: b is freed and its record is not in use -> consistent.
+        // Uncorrupted: b is freed and its record is not in use -> consistent, and b IS on the list.
+        // That last part is this test's non-vacuity guard: without it, a narrowing that dropped
+        // nothing and a durable image that never listed `b` look identical below.
         let mut clean = img.open();
+        assert!(
+            clean.free_ids(StoreKind::Node).contains(&b),
+            "the GC pass did not list b={b} as free, so there is nothing for the narrowing to \
+             remove and this test proves nothing: {:?}",
+            clean.free_ids(StoreKind::Node)
+        );
         assert!(report(&mut clean).is_consistent());
     }
 
-    // Corrupt: resurrect b's record to "in use" on disk while it stays on the free list.
+    // Resurrect b's record to "in use" on disk while it stays on the free list — the state a
+    // committing GC pass leaves behind when it becomes a recovery loser.
     let (page_id, off) = img.locate(StoreKind::Node, eid_b.0);
     let mut node = img.read_node_at(page_id, off);
     node.mvcc = graphus_storage::MvccHeader::live(99);
     img.write_node_at(page_id, off, &node);
 
     let mut store = img.open();
+    assert!(
+        !store.free_ids(StoreKind::Node).contains(&b),
+        "b={b} is still on the free list although its record reads in_use, so the next allocation \
+         would hand out a live record's slot (`rmp` #1083): {:?}",
+        store.free_ids(StoreKind::Node)
+    );
     let r = report(&mut store);
     assert!(
-        r.violations.iter().any(|v| matches!(
+        !r.violations.iter().any(|v| matches!(
             v,
             Violation::FreeList { id, detail: FreeListFault::StillInUse, .. } if *id == b
         )),
-        "expected a StillInUse free-list violation for b={b}: {:?}",
+        "the narrowing left a StillInUse contradiction standing, so the store still refuses to \
+         serve after a recoverable crash: {:?}",
         r.violations
     );
     let _ = a;
 }
 
-/// (g2) Regression (storage audit, finding 7 / SEV 1): the **strings.store** (heap) free list must be
-/// validated too. Before the fix, the free-list loop iterated only [Node, Rel, Prop], so a corrupt
-/// heap free list went entirely unchecked (the `StoreKind::Strings` match arm was dead code). Here a
-/// freed heap block is resurrected to "in use" on disk while it stays on the strings free list — a
-/// `StillInUse` contradiction that must now be flagged.
+/// (g2) The **strings.store** (heap) free list is narrowed at open exactly as the node one is
+/// (`rmp` #1083) — the heap half of the previous test, kept because the storage audit's finding 7
+/// (SEV 1) was precisely that the heap store had been left out of a free-list pass.
+///
+/// A freed heap block is resurrected to "in use" on disk while it stays on the strings free list;
+/// the narrowing must drop it there too, not only for the MVCC record stores.
 #[test]
-fn corrupt_strings_free_list_still_in_use_is_flagged() {
+fn a_freed_heap_block_whose_record_is_still_in_use_is_narrowed_out_at_open() {
     let mut s = fresh(64);
     let txn = TxnId(1);
     s.begin(txn);
@@ -1369,10 +1403,19 @@ fn corrupt_strings_free_list_still_in_use_is_flagged() {
     gc_pass(&mut s, TxnId(3));
 
     let mut img = DiskImage::capture(&mut s);
+    let clean_free_blocks;
     {
         // Uncorrupted: the block is freed and its record is not in use -> consistent (the strings
         // free list is now actually validated, and it is clean here -> no false positive).
         let mut clean = img.open();
+        // Non-vacuity: the GC really did list heap blocks as free, so the narrowing below has
+        // something to remove. Counted on the CLEAN image — counting it after the corruption would
+        // count what the narrowing already removed.
+        clean_free_blocks = clean.free_ids(StoreKind::Strings).len();
+        assert!(
+            clean_free_blocks > 0,
+            "the GC pass freed no heap block, so this test proves nothing"
+        );
         assert!(
             report(&mut clean).is_consistent(),
             "a clean strings free list must pass: {:?}",
@@ -1380,16 +1423,22 @@ fn corrupt_strings_free_list_still_in_use_is_flagged() {
         );
     }
 
-    // Corrupt: resurrect the freed block's record to "in use" on disk while it remains on the strings
-    // free list.
+    // Resurrect the freed block's record to "in use" on disk while it remains on the strings free
+    // list — the heap twin of the GC-loser residue.
     let mut block = img.read_value_block_at(page_id, off);
     block.mvcc = graphus_storage::MvccHeader::live(99);
     img.write_value_block_at(page_id, off, &block);
 
     let mut store = img.open();
+    assert!(
+        store.free_ids(StoreKind::Strings).len() < clean_free_blocks,
+        "the resurrected heap block is still on the strings free list ({} of {clean_free_blocks} \
+         freed blocks kept), so the next allocation would hand out a live block's slot (`rmp` #1083)",
+        store.free_ids(StoreKind::Strings).len()
+    );
     let r = report(&mut store);
     assert!(
-        r.violations.iter().any(|v| matches!(
+        !r.violations.iter().any(|v| matches!(
             v,
             Violation::FreeList {
                 kind: StoreKind::Strings,
@@ -1397,10 +1446,17 @@ fn corrupt_strings_free_list_still_in_use_is_flagged() {
                 ..
             }
         )),
-        "expected a StillInUse violation on the strings free list: {:?}",
+        "the narrowing left a StillInUse contradiction standing on the strings free list: {:?}",
         r.violations
     );
-    assert!(verify_on_open(&store, &[]).is_err());
+    // And the store SERVES. That is the whole point of narrowing rather than reporting: the state
+    // this test stages is what a committing GC pass leaves when it becomes a recovery loser, and
+    // refusing to open on it turned a recoverable crash into a database that will not start.
+    assert!(
+        verify_on_open(&store, &[]).is_ok(),
+        "the store still refuses to open after the free list was narrowed: {:?}",
+        verify_on_open(&store, &[])
+    );
 }
 
 /// (h) Termination on corruption: a deliberately cyclic incidence-chain pointer must be reported as

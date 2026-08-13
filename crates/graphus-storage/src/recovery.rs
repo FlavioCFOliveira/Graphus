@@ -166,6 +166,158 @@ pub fn recover_device_from<S: LogSink, D: BlockDevice>(
     Ok(report)
 }
 
+/// **Resolves the catalogue's pending-DDL block against the log that decides it, on the device**
+/// (`rmp` #1083) — for a restore that replays a WAL onto a device and then **discards** it.
+///
+/// # Why a restore must do this and a crash recovery must not
+///
+/// The block (`crate::meta::PendingSchema`) names the transaction whose commit wrote the catalogue
+/// image, and `RecordStore::open` applies it only if it finds that transaction's `COMMIT` record —
+/// **defaulting to drop**. That decision is only meaningful against the log the image was written
+/// against. A crash recovery reopens over that same log, so `open` decides correctly and nothing
+/// else is needed.
+///
+/// An **incremental / point-in-time restore does not**. Its increments are raw WAL bytes, so redo
+/// re-materialises the metadata page exactly as it stood — block included — and the restored
+/// database is then opened over a *fresh, empty* WAL. `committed_txns` would be empty, the block
+/// would be dropped, and a **committed** `CREATE CONSTRAINT` at the tail of the restored chain would
+/// be gone. That is silent loss of committed schema, so the decision is taken HERE, while the
+/// deciding log is still in hand, and written down.
+///
+/// # What it writes
+///
+/// The resolved catalogue, over the existing metadata-page chain, with no WAL record. That is sound
+/// because it is not a transactional change: it replaces an image with the image that same log says
+/// it means, at a point where the device is quiescent and the log is about to be thrown away.
+///
+/// The re-encoded payload is never longer than the one it replaces — folding moves the block's
+/// schema into the committed half and drops the (duplicate) block, and dropping removes it outright
+/// — so the existing chain always has room, and chunks past the new end are written empty exactly as
+/// [`RecordStore::checkpoint_meta`](crate::RecordStore) writes them.
+///
+/// A no-op when the image carries no block, which is every image written outside a DDL commit.
+///
+/// # Errors
+/// Propagates a device read/write failure, or a storage error if the metadata chain is unreadable,
+/// cyclic, or decodes to a catalogue this build cannot read.
+pub fn resolve_pending_ddl_on_device<S: LogSink, D: BlockDevice>(
+    wal: &WalManager<S>,
+    device: &mut D,
+) -> Result<()> {
+    let (mut meta, chain) = read_device_meta(device)?;
+    let Some(pending) = meta.pending_ddl.take() else {
+        return Ok(());
+    };
+    // The same predicate `RecordStore::open` applies, against the log that is about to be discarded.
+    let committed = wal
+        .recovered_transactions()?
+        .commits
+        .iter()
+        .any(|&(txn, _, _)| txn.0 == pending.txn);
+    if committed {
+        meta.statistics.adopt_schema_from(pending.schema);
+    }
+    write_device_meta(device, &chain, &meta.encode()?)?;
+    device.sync_all()
+}
+
+/// Reads and decodes the catalogue by walking the metadata-page chain **directly on the device**,
+/// returning it with the page ids it spans (head first).
+///
+/// The buffer-pool twin is `RecordStore::read_meta`; this exists because a restore holds a bare
+/// device and no pool. The framing is the same: `len: u32 | next: u64 | chunk` at
+/// [`page::HEADER_SIZE`], with bit 31 of `len` the format tripwire rather than a length.
+fn read_device_meta<D: BlockDevice>(device: &mut D) -> Result<(crate::meta::Meta, Vec<PageId>)> {
+    let mut payload = Vec::new();
+    let mut chain = vec![PageId(0)];
+    let mut page = PageId(0);
+    let mut buf = Box::new([0u8; PAGE_SIZE]);
+    loop {
+        device.read_page(page, &mut buf)?;
+        let framed = u32::from_le_bytes(
+            buf[page::HEADER_SIZE..page::HEADER_SIZE + 4]
+                .try_into()
+                .expect("4-byte slice"),
+        );
+        let chunk_len = (framed & 0x7fff_ffff) as usize;
+        let next = u64::from_le_bytes(
+            buf[page::HEADER_SIZE + 4..page::HEADER_SIZE + 12]
+                .try_into()
+                .expect("8-byte slice"),
+        );
+        let start = page::HEADER_SIZE + 12;
+        if start + chunk_len > buf.len() {
+            return Err(graphus_core::GraphusError::Storage(
+                "metadata chunk runs past the page".to_owned(),
+            ));
+        }
+        payload.extend_from_slice(&buf[start..start + chunk_len]);
+        if next == 0 {
+            break;
+        }
+        let next = PageId(next);
+        // The same cycle guard `RecordStore::read_meta` applies, for the same reason: a damaged
+        // chain must fail rather than loop for ever.
+        if chain.contains(&next) {
+            return Err(graphus_core::GraphusError::Storage(
+                "metadata chain is cyclic or points at the head page".to_owned(),
+            ));
+        }
+        chain.push(next);
+        page = next;
+    }
+    Ok((crate::meta::Meta::decode(&payload)?, chain))
+}
+
+/// Writes `payload` back over the metadata-page `chain`, preserving each page's header and the head
+/// page's format tripwire, and stamping a fresh checksum.
+///
+/// # Errors
+/// Returns a storage error if `payload` does not fit the chain it was given — which cannot happen
+/// for the shrinking rewrite [`resolve_pending_ddl_on_device`] performs, and is checked rather than
+/// assumed because writing a truncated catalogue would be unrecoverable.
+fn write_device_meta<D: BlockDevice>(
+    device: &mut D,
+    chain: &[PageId],
+    payload: &[u8],
+) -> Result<()> {
+    /// Bytes of catalogue one metadata page carries (mirrors `store::META_CHUNK_CAP`).
+    const CHUNK_CAP: usize = PAGE_SIZE - page::HEADER_SIZE - 12;
+    /// Bit 31 of the framed length: the format tripwire on the head page (`store::META_FORMAT_V2_FLAG`).
+    const FORMAT_FLAG: u32 = 0x8000_0000;
+
+    if payload.len() > chain.len() * CHUNK_CAP {
+        return Err(graphus_core::GraphusError::Storage(format!(
+            "the resolved catalogue is {} bytes but its {} metadata page(s) hold {}; refusing to \
+             write a truncated catalogue (`rmp` #1083)",
+            payload.len(),
+            chain.len(),
+            chain.len() * CHUNK_CAP
+        )));
+    }
+    let mut buf = Box::new([0u8; PAGE_SIZE]);
+    for (i, &page_id) in chain.iter().enumerate() {
+        // Read-modify-write: the page's own header (type, id, `page_lsn`) must survive untouched.
+        device.read_page(page_id, &mut buf)?;
+        let lo = (i * CHUNK_CAP).min(payload.len());
+        let hi = ((i + 1) * CHUNK_CAP).min(payload.len());
+        let chunk = &payload[lo..hi];
+        let next = chain.get(i + 1).map_or(0, |p| p.0);
+        let framed = if i == 0 {
+            chunk.len() as u32 | FORMAT_FLAG
+        } else {
+            chunk.len() as u32
+        };
+        let at = page::HEADER_SIZE;
+        buf[at..at + 4].copy_from_slice(&framed.to_le_bytes());
+        buf[at + 4..at + 12].copy_from_slice(&next.to_le_bytes());
+        buf[at + 12..at + 12 + chunk.len()].copy_from_slice(chunk);
+        page::write_checksum(&mut buf);
+        device.write_page(page_id, &buf)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

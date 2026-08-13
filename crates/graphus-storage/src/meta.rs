@@ -88,10 +88,82 @@ const _: () = assert!(
 /// garbage tail cannot be mistaken for the block: `b"GRPHUNDO"` read little-endian.
 const UNDO_AREA_MAGIC: u64 = u64::from_le_bytes(*b"GRPHUNDO");
 
+/// The first on-disk format version whose catalog carries the **pending-DDL block** — the schema
+/// catalog of the transaction whose commit wrote the image, attributed to it by name instead of
+/// folded into the committed [`Statistics`] (`rmp` #1083, [`PendingSchema`]).
+///
+/// Named separately from [`FORMAT_VERSION`](graphus_core::constants::FORMAT_VERSION) for the reason
+/// [`COUNT_DELTA_FORMAT_VERSION`] is: a later bump for an unrelated layout change must not move the
+/// boundary this gate keys on.
+///
+/// # Why an older image is upgraded rather than refused
+///
+/// A version-4 image folded its committing transaction's DDL straight into the `Statistics` it
+/// persisted, so there is nothing left to attribute: decoding the block absent says exactly what
+/// such an image means, and the first checkpoint this build takes rewrites the catalog with the
+/// block present. The refusal runs in the other direction and is the one that matters: an older
+/// build handed a version-5 image would ignore the block entirely, and a committed
+/// `CREATE CONSTRAINT` whose only durable record is that block would vanish without trace.
+pub(crate) const PENDING_DDL_FORMAT_VERSION: u32 = 5;
+
+const _: () = assert!(
+    PENDING_DDL_FORMAT_VERSION <= graphus_core::constants::FORMAT_VERSION,
+    "the pending-DDL block version must be one this build can actually write",
+);
+
 /// Magic word introducing the trailing applied-transaction-set block (`rmp` #1066), chosen on the
 /// same principle as [`UNDO_AREA_MAGIC`]: `b"GRPHCNTD"` read little-endian, so a truncated or
 /// garbage tail cannot be mistaken for the block.
 const APPLIED_COUNTS_MAGIC: u64 = u64::from_le_bytes(*b"GRPHCNTD");
+
+/// Magic word introducing the trailing pending-DDL block (`rmp` #1083), chosen on the same
+/// principle as [`UNDO_AREA_MAGIC`]: `b"GRPHPDDL"` read little-endian.
+const PENDING_DDL_MAGIC: u64 = u64::from_le_bytes(*b"GRPHPDDL");
+
+/// The **uncommitted** schema catalog of the one transaction whose commit wrote this image
+/// (`rmp` #1083), carried beside the committed catalogue and attributed to that transaction by name.
+///
+/// # Why this exists at all
+///
+/// A schema DDL change — an index or constraint declaration, a histogram — logs no data record. Its
+/// only route to disk is the catalogue image `RecordStore::checkpoint_meta` writes at commit, and
+/// that checkpoint runs *before* the `COMMIT` record. `committed_statistics` therefore had to keep
+/// the committing transaction's DDL in the image it built, while stripping every other open
+/// transaction's — and an image written by a transaction that then never committed left that
+/// transaction's DDL durable. Since `rmp` #1063 the image is logged redo-only, so no undo takes it
+/// back either. A phantom `UNIQUE` constraint **rejects writes that must be admitted**.
+///
+/// The treatment is `rmp` #1067's, applied to the schema half: the image carries only committed
+/// state, and the committing transaction's own contribution reaches disk **attributed to it**, so
+/// `open` can decide. It is applied iff recovery found that transaction's `COMMIT` record, and
+/// dropped otherwise.
+///
+/// # Only one transaction can ever be pending in an image
+///
+/// `committed_statistics` strips the pending DDL of every open transaction except the committing
+/// one, so the set of transactions with unpersisted DDL inside an image is a singleton by
+/// construction — which is why this is an `Option` and not a map. `RecordStore::snapshot_meta`
+/// asserts it rather than assuming it.
+///
+/// # Why the payload is a whole `Statistics`
+///
+/// The twelve schema-catalog maps have twelve different value types, and [`Statistics::encode`] is
+/// the codec that already round-trips all of them. Reusing it verbatim is what keeps this block from
+/// becoming a thirteenth place where a new catalog map has to be remembered: a map added to
+/// `Statistics` rides this block the day it is added. The counters in this `Statistics` are zero and
+/// meaningless — `open` merges only the schema half back, through
+/// [`Statistics::adopt_schema_from`], which is the exact primitive for "take the DDL, keep the
+/// counters".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingSchema {
+    /// The transaction whose commit wrote this image, and whose DDL [`schema`](Self::schema)
+    /// carries. `open` applies the block iff recovery found this transaction's `COMMIT` record.
+    pub txn: u64,
+    /// The committed catalogue **plus** `txn`'s own pending DDL — i.e. the schema half of the image
+    /// a pre-`rmp`-#1083 build would have written. Its cardinality counters are zero and are never
+    /// read: the counters are the base beside this block (`rmp` #1067).
+    pub schema: Statistics,
+}
 
 /// The durable catalog stored in the metadata page.
 ///
@@ -137,6 +209,15 @@ pub struct Meta {
     /// A pre-version-4 image decodes it empty, which is the truth for it — see
     /// [`COUNT_DELTA_FORMAT_VERSION`].
     pub applied_counts: crate::counts_log::AppliedTxSet,
+    /// The pending schema DDL of the transaction whose commit wrote this image (`rmp` #1083, format
+    /// version [`PENDING_DDL_FORMAT_VERSION`] and up) — see [`PendingSchema`].
+    ///
+    /// `None` for every image written outside a DDL-bearing commit, which is nearly all of them: a
+    /// reclaim's `SYSTEM_TXN` checkpoint is never in the active set, and an ordinary write commit
+    /// holds no schema undo. A pre-version-5 image decodes it `None`, which is the truth for it: such
+    /// an image folded its committing transaction's DDL into
+    /// [`statistics`](Self#structfield.statistics) itself.
+    pub pending_ddl: Option<PendingSchema>,
 }
 
 /// The durable build state of a declared node-property index (`rmp` task #90).
@@ -3776,6 +3857,8 @@ impl Meta {
             tokens: TokenStore::new(),
             statistics: Statistics::new(),
             applied_counts: crate::counts_log::AppliedTxSet::default(),
+            // A fresh catalog has no committing transaction and therefore no pending DDL.
+            pending_ddl: None,
         }
     }
 
@@ -3843,6 +3926,30 @@ impl Meta {
         if self.format_version >= COUNT_DELTA_FORMAT_VERSION {
             out.extend_from_slice(&APPLIED_COUNTS_MAGIC.to_le_bytes());
             out.extend_from_slice(&self.applied_counts.encode());
+        }
+        // ---- The pending-DDL block (`rmp` #1083): format version 5 and up. ----
+        //
+        // Appended LAST by the same append-only rule, introduced by its own magic word for the same
+        // reason, and gated on the version in BOTH directions for the reason the block above is: a
+        // decoded version-4 image re-encoded must produce a version-4 image, not a version-4 header
+        // with a version-5 block behind it.
+        //
+        // The presence byte is written even when nothing is pending — which is the overwhelmingly
+        // common case — so the block is a fixed 9 bytes on an ordinary commit rather than a
+        // variable-length one, and the checkpoint's "this page already holds these bytes" comparison
+        // (`RecordStore::meta_page_already_holds`) keeps seeing an unchanged tail.
+        if self.format_version >= PENDING_DDL_FORMAT_VERSION {
+            out.extend_from_slice(&PENDING_DDL_MAGIC.to_le_bytes());
+            match &self.pending_ddl {
+                None => out.push(0),
+                Some(p) => {
+                    out.push(1);
+                    out.extend_from_slice(&p.txn.to_le_bytes());
+                    let schema = p.schema.encode();
+                    out.extend_from_slice(&(schema.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&schema);
+                }
+            }
         }
         Ok(out)
     }
@@ -3966,6 +4073,78 @@ impl Meta {
             }
             crate::counts_log::AppliedTxSet::default()
         };
+        // ---- The trailing pending-DDL block (`rmp` #1083). ----
+        //
+        // Decided by the VERSION and checked in both directions, exactly as the block above is, and
+        // for a sharper reason: this block is the ONLY durable record of a committing transaction's
+        // schema DDL. A version-5 image that carries no block is not an older image, it is a damaged
+        // one — its `statistics` holds committed schema only, so silently accepting it would discard
+        // whatever the committing transaction declared. A version-4 image that carries one never came
+        // from any writer.
+        //
+        // # The obligation this puts on anything that forges an older image
+        //
+        // The same one [`COUNT_DELTA_FORMAT_VERSION`] states: a fixture that downgrades a current
+        // image by rewriting its version word must CUT the blocks that version does not define, and
+        // must preserve the head chunk's format flag (`META_FORMAT_V2_FLAG`, bit 31) when it rewrites
+        // the framed length — writing the bare length silently forges a version-1 header. Cutting at
+        // the applied-counts magic removes this block with it, which is what
+        // `property_undo_chain_967`'s `downgrade_catalog_to` version-2 arm already does.
+        let pending_ddl = if format_version >= PENDING_DDL_FORMAT_VERSION {
+            let magic = read_u64(bytes, &mut cur)?;
+            if magic != PENDING_DDL_MAGIC {
+                return Err(GraphusError::Storage(format!(
+                    "metadata pending-DDL block has a bad magic ({magic:#018x}, expected \
+                     {PENDING_DDL_MAGIC:#018x}); format version {format_version} requires the \
+                     block, so this is corruption rather than an older image"
+                )));
+            }
+            match read_u8(bytes, &mut cur)? {
+                0 => None,
+                1 => {
+                    let txn = read_u64(bytes, &mut cur)?;
+                    let len = read_u32(bytes, &mut cur)? as usize;
+                    let end = take(bytes, &mut cur, len)?;
+                    Some(PendingSchema {
+                        txn,
+                        schema: Statistics::decode(&bytes[cur - len..end])?,
+                    })
+                }
+                other => {
+                    return Err(GraphusError::Storage(format!(
+                        "metadata pending-DDL block has presence byte {other}, which is neither \
+                         absent (0) nor present (1)"
+                    )));
+                }
+            }
+        } else {
+            // Reachable only at exactly [`COUNT_DELTA_FORMAT_VERSION`]: every version below it was
+            // already refused above for the same reason, by the applied-counts arm.
+            if cur < bytes.len() {
+                return Err(GraphusError::Storage(format!(
+                    "metadata catalog declares format version {format_version}, which has no \
+                     pending-DDL block, yet {} byte(s) follow the applied-transaction-set block. No \
+                     build below version {PENDING_DDL_FORMAT_VERSION} ever wrote such a block, so \
+                     this image is self-contradictory rather than merely old; refusing to open \
+                     rather than take a catalogue whose committed half was written under a \
+                     different rule",
+                    bytes.len() - cur
+                )));
+            }
+            None
+        };
+        // NO FORMAT TOLERATES UNEXPLAINED TRAILING BYTES, the newest included. Every arm above
+        // refuses bytes it cannot account for; without this the CURRENT version would be the one
+        // exception, and the next trailing block's "checked in both directions" claim would be
+        // resting on nothing.
+        if cur < bytes.len() {
+            return Err(GraphusError::Storage(format!(
+                "metadata catalog at format version {format_version} is fully decoded, yet {} \
+                 byte(s) follow its last block; refusing to open an image this build cannot \
+                 account for",
+                bytes.len() - cur
+            )));
+        }
         Ok(Self {
             format_version,
             element_id_next,
@@ -3974,6 +4153,7 @@ impl Meta {
             tokens,
             statistics,
             applied_counts,
+            pending_ddl,
         })
     }
 

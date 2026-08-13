@@ -63,6 +63,7 @@ pub mod mix;
 pub mod mode_b_batch_size_measurement;
 pub mod model;
 pub mod multi_writer_coordinator;
+pub mod pending_ddl_phantom;
 pub mod reader_store_growth;
 pub mod rng;
 pub mod rollback_undo_fault;

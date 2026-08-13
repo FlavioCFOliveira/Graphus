@@ -26,9 +26,9 @@ use graphus_core::error::{GraphusError, Result};
 use graphus_core::{PageId, TxnId};
 use graphus_io::{BlockDevice, MemBlockDevice, PAGE_SIZE, Page};
 use graphus_storage::{
-    ChainLinks, ChainManifest, LinkCodec, Namespace, Plain, RecordStore, RestoreTarget,
-    backup_store, begin_chain, capture_increment, restore_chain_file_atomic, restore_onto,
-    restore_to, verify_chain, verify_on_open,
+    ChainLinks, ChainManifest, ConstraintEntry, ConstraintKind, LinkCodec, Namespace, Plain,
+    RecordStore, RestoreTarget, backup_store, begin_chain, capture_increment,
+    restore_chain_file_atomic, restore_onto, restore_to, verify_chain, verify_on_open,
 };
 use graphus_wal::{MemLogSink, WalManager};
 
@@ -972,4 +972,96 @@ fn chain_artifact_file_round_trip_preserves_all_committed_nodes() {
     }
 
     let _ = std::fs::remove_file(&path);
+}
+
+// =================================================================================================
+// N. `rmp` #1083 — a committed declaration at the tail of the chain survives the restore.
+// =================================================================================================
+
+/// **A `CREATE CONSTRAINT` that commits as the LAST catalogue-writing transaction of the chain must
+/// still be there after the chain is restored.**
+///
+/// # The defect this pins
+///
+/// Since `rmp` #1083 the catalogue image carries only COMMITTED schema; the DDL of the transaction
+/// whose commit wrote the image travels beside it in a pending-DDL block, and
+/// `RecordStore::open` applies that block only if it finds that transaction's `COMMIT` record —
+/// **defaulting to drop**.
+///
+/// An increment is raw WAL bytes, so redo re-materialises the metadata page exactly as it stood,
+/// block included. The restored database is then opened over a **fresh, empty** WAL (this test does
+/// it explicitly; `restore_chain_file_atomic` does it with a throwaway WAL, and the server resets
+/// the log outright). Without the resolution `restore_to` now performs against the log it just
+/// replayed, `committed_txns` is empty, the block is dropped, and the constraint is gone — silent
+/// loss of committed schema.
+///
+/// # Non-vacuity
+///
+/// Asserted before the restore: the DDL transaction is the last catalogue writer, so the image the
+/// chain carries really is the one with the block. Without that, a restore that happened to capture
+/// a later block-free image would pass while proving nothing.
+#[test]
+fn a_committed_declaration_at_the_chain_tail_survives_the_restore_1083() {
+    let mut store = fresh(64);
+    commit_edge(&mut store, TxnId(1), "KNOWS");
+    let (mut manifest, base_link) = begin_chain(&store, &Plain).expect("begin chain");
+    let mut links = ChainLinks {
+        base: base_link,
+        increments: Vec::new(),
+    };
+
+    // Some ordinary work, captured.
+    commit_edge(&mut store, TxnId(2), "LIKES");
+    links
+        .increments
+        .push(capture_increment(&store, &mut manifest, &Plain).expect("capture"));
+
+    // …then the schema migration, as the LAST catalogue-writing commit of the chain.
+    let label = store
+        .intern_token(Namespace::Label, "Person")
+        .expect("intern");
+    let key = store
+        .intern_token(Namespace::PropKey, "email")
+        .expect("intern");
+    let ddl = TxnId(3);
+    store.begin(ddl);
+    store.set_constraint(
+        ddl,
+        "c_email".to_owned(),
+        ConstraintEntry {
+            label_token: label,
+            property_tokens: vec![key],
+            kind: ConstraintKind::Unique,
+            type_descriptor: None,
+        },
+    );
+    store.commit(ddl).expect("the declaration commits");
+    assert!(
+        store.constraint("c_email").is_some(),
+        "NON-VACUITY: the declaration is not even live before the capture"
+    );
+    links
+        .increments
+        .push(capture_increment(&store, &mut manifest, &Plain).expect("capture the migration"));
+
+    // Restore the chain at Latest onto a fresh device, then open it over a FRESH, EMPTY WAL —
+    // which is what every production restore route does.
+    let mut restored = MemBlockDevice::new(0);
+    restore_to(
+        &manifest,
+        &links,
+        RestoreTarget::Latest,
+        &mut restored,
+        &Plain,
+    )
+    .expect("restore chain");
+    let wal = WalManager::create(MemLogSink::new()).expect("fresh wal");
+    let reopened = RecordStore::open(restored, wal, 64).expect("open the restored store");
+
+    assert!(
+        reopened.constraint("c_email").is_some(),
+        "a COMMITTED constraint at the tail of the restored chain is missing: the pending-DDL \
+         block was dropped because the log that decides it was thrown away (`rmp` #1083)"
+    );
+    verify_on_open(&reopened, &[]).expect("the restored store must be consistent");
 }

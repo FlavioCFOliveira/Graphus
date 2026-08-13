@@ -45,7 +45,9 @@ use graphus_wal::{LogSink, WalManager};
 
 use crate::counts_log::{AppliedTxSet, CountDelta, replay_count_deltas};
 use crate::heap::{self, BLOCK_PAYLOAD, HeapBlock, STRINGS_RECORD_SIZE};
-use crate::idalloc::{Allocation, ElementIdAllocator, NULL_ID, SharedReuseBarrier, StoreAllocator};
+use crate::idalloc::{
+    Allocation, ElementIdAllocator, FreeList, NULL_ID, SharedReuseBarrier, StoreAllocator,
+};
 use crate::labels;
 use crate::meta::{
     CompositeIndexEntry, ConstraintEntry, CountKey, CountsImage, FulltextIndexEntry, IndexState,
@@ -1891,6 +1893,52 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// the fold read this map, so its record's offset is above the log position the checkpoint
     /// record already occupies, and therefore above any floor that checkpoint can compute.
     delta_floors: Mutex<BTreeMap<u64, usize>>,
+    /// The WAL offset below which reclamation may run freely while a catalogue image carrying a
+    /// **pending-DDL block** can still be the durable one (`rmp` #1083); [`u64::MAX`] when none can.
+    ///
+    /// # What it protects, stated as the failure it removes
+    ///
+    /// The block names a transaction, and `open` applies it only if it finds that transaction's
+    /// `COMMIT` record in the RETAINED log. Reclaim the prefix holding that record while the image is
+    /// still the durable one and the decision inverts: a committed `CREATE CONSTRAINT` whose only
+    /// durable record is that block is read as a phantom and dropped. Attributing state to a
+    /// transaction is only sound while the log can still say what that transaction did, so the two
+    /// obligations arrive together — the same pairing `rmp` #1067 made between a count delta and
+    /// `counts_cov_durable`.
+    ///
+    /// # Why a single value and not a set
+    ///
+    /// Only the LAST image written can be the durable one, and only the value recorded for it can
+    /// matter — but which write lands last is exactly what this store does not control (`rmp` #1055),
+    /// so the OLDEST outstanding offset is kept (`fetch_min`) and the clamp is conservative for every
+    /// image that could be standing. It is released by
+    /// [`fold_counts_for_reclaim`](RecordStore::fold_counts_for_reclaim) and
+    /// [`settle_counts_into_image`](RecordStore::settle_counts_into_image), each of which first makes
+    /// a block-free image durable — the same image, the same lock and the same instant the counter
+    /// fold uses, because both are the same obligation: do not drop a log record the durable
+    /// catalogue still depends on.
+    pending_ddl_floor: AtomicU64,
+    /// How many pending-DDL images have been written, ever — the witness that makes the release of
+    /// [`pending_ddl_floor`](Self#structfield.pending_ddl_floor) sound (`rmp` #1083).
+    ///
+    /// # The hole this closes, stated as the interleaving
+    ///
+    /// `fetch_min` makes a SECOND registration a no-op whenever an older floor is already standing,
+    /// so the floor value alone cannot distinguish "the obligation I observed" from "the obligation I
+    /// observed, plus one that `fetch_min` swallowed". A releaser that keys on the value alone can
+    /// therefore discharge an obligation it never settled:
+    ///
+    /// ```text
+    ///   floor = N1 (an already-superseded image)
+    ///   releaser: observes N1, writes the block-free image I_S
+    ///   committer T: writes I_T (carrying block(T)) AFTER I_S, fetch_min(N3 > N1) — NO-OP
+    ///   releaser: compare_exchange(N1 -> MAX) SUCCEEDS, and T's COMMIT record is now unprotected
+    /// ```
+    ///
+    /// The count answers exactly the question the value cannot: *was a new obligation created while I
+    /// was working?* A releaser samples it beside the floor before writing its image and releases only
+    /// if it has not moved. Monotone and never reset, so no ABA: it is a witness, not a state.
+    pending_ddl_epoch: AtomicU64,
     /// Admits **one** counter fold at a time (`rmp` #1067), and only ever through `try_lock`.
     ///
     /// The fold publishes its base by writing a catalogue image under [`SYSTEM_TXN`], and that id is
@@ -2076,12 +2124,24 @@ impl<D: BlockDevice, S: LogSink> graphus_chainhead::ChainHead for PageChainHead<
 /// rank-10 catalogue latch, and a value assembled from two of these sampled at two instants
 /// describes no state the store was ever in (`rmp` #1052, and #1066/#1067 one layer up).
 struct CommittedImage {
-    /// The committed catalogue: the live [`Statistics`] with every OTHER open transaction's pending
-    /// schema DDL undone (`rmp` #734) and its pending counts withdrawn (`rmp` #866).
+    /// The committed catalogue: the live [`Statistics`] with **every** open transaction's pending
+    /// schema DDL undone (`rmp` #734/#1083) and every other one's pending counts withdrawn
+    /// (`rmp` #866).
     ///
     /// Since `rmp` #1067 the SCHEMA half of this is what reaches disk; the counter half does not —
-    /// see [`base`](Self#structfield.base).
+    /// see [`base`](Self#structfield.base). Since `rmp` #1083 the committing transaction's own DDL
+    /// is undone here too and travels in [`pending_schema`](Self#structfield.pending_schema)
+    /// instead, so what this field holds is committed schema and nothing else.
     committed: Statistics,
+    /// The committing transaction's own pending schema DDL, or [`None`] when it holds none
+    /// (`rmp` #1083).
+    ///
+    /// `Some` carries [`committed`](Self#structfield.committed)'s schema **plus** that
+    /// transaction's DDL — the schema half of the image a pre-#1083 build would have written — with
+    /// zero counters. `RecordStore::snapshot_meta` puts it in the catalogue's pending-DDL block,
+    /// attributed to the committing transaction, and `open` applies it only if recovery found that
+    /// transaction's `COMMIT` record.
+    pending_schema: Option<Statistics>,
     /// The counters the image persists in place of `committed`'s: the durable base
     /// ([`CatalogState::counts_base`](CatalogState#structfield.counts_base)).
     base: CountsImage,
@@ -2276,6 +2336,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             open_guard: std::sync::OnceLock::new(),
             counts_fold_lock: Mutex::new(()),
             delta_floors: Mutex::new(BTreeMap::new()),
+            // No image can be carrying a pending-DDL block yet (`rmp` #1083).
+            pending_ddl_floor: AtomicU64::new(u64::MAX),
+            pending_ddl_epoch: AtomicU64::new(0),
             meta_chunk_writes: (AtomicU64::new(0), AtomicU64::new(0)),
             deferred_checkpoints: (AtomicU64::new(0), Mutex::new(None)),
             deferred_checkpoint_wal_len: AtomicU64::new(0),
@@ -2364,6 +2427,28 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // Runs after the two page-map reconstructions above so the scan sees every mapped record page,
         // and before anything else touches a property cell.
         Self::refuse_legacy_property_tombstones(&pool, &stores, store_format_version)?;
+        // `rmp` #1083: DECIDE THE PENDING-DDL BLOCK.
+        //
+        // The image's schema half is committed state; the block beside it is the schema DDL of the
+        // one transaction whose commit wrote the image, and its `COMMIT` record is the only thing
+        // that says whether that DDL happened. Found ⇒ merge the block's twelve DDL maps over the
+        // committed ones (`adopt_schema_from` takes the schema and leaves the counters, which belong
+        // to the base). Not found ⇒ drop it, and the phantom index / constraint goes with it.
+        //
+        // Fail-safe by construction, and in the direction that matters: the DEFAULT is to drop. A
+        // block whose transaction is not in the retained log is discarded, so the only way a
+        // declaration survives is a `COMMIT` record naming it. What keeps that from throwing away a
+        // COMMITTED declaration is the reclaim floor `checkpoint()` holds while such a block can
+        // still be the durable image (`fold_counts_for_reclaim`).
+        //
+        // Runs BEFORE `replay_logged_count_deltas`, which touches only the counters, so the two are
+        // independent — but the order is written down rather than left to chance, because the two
+        // halves of the same `Statistics` are being reconstructed from two different sources.
+        if let Some(pending) = meta.pending_ddl.take() {
+            if committed_txns.contains(&TxnId(pending.txn)) {
+                meta.statistics.adopt_schema_from(pending.schema);
+            }
+        }
         // `rmp` #1066: fold in every logged cardinality delta the durable catalog does not already
         // account for. Runs after the store has been accepted, so a refused image never reaches it.
         Self::replay_logged_count_deltas(
@@ -2491,14 +2576,102 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             open_guard: std::sync::OnceLock::new(),
             counts_fold_lock: Mutex::new(()),
             delta_floors: Mutex::new(BTreeMap::new()),
+            // No image can be carrying a pending-DDL block yet (`rmp` #1083).
+            pending_ddl_floor: AtomicU64::new(u64::MAX),
+            pending_ddl_epoch: AtomicU64::new(0),
             meta_chunk_writes: (AtomicU64::new(0), AtomicU64::new(0)),
             deferred_checkpoints: (AtomicU64::new(0), Mutex::new(None)),
             deferred_checkpoint_wal_len: AtomicU64::new(0),
         };
+        // `rmp` #1083: rebuild each free list from what the records actually say, instead of undoing
+        // the image that claimed them. Runs after every page-map reconstruction above, so the records
+        // it reads are addressable, and before the store serves anybody.
+        store.narrow_free_lists_to_unused_records();
         // Size the WAL segment seal threshold to the RECOVERED store, so a reopened database immediately
         // uses a segment size matched to its data image rather than the sink's default 64 MiB (`rmp` #706).
         store.apply_adaptive_wal_segment_target();
         Ok(store)
+    }
+
+    /// Drops from every store's free list any id whose record still reads `in_use` — the free-list
+    /// half of `rmp` #1083, and the only half that needs no format change.
+    ///
+    /// # Why a free list is REBUILT rather than undone
+    ///
+    /// A free list is **derived** state: an id is free exactly when its record is not in use. It is
+    /// the record that is authoritative, and the list is a cache of where to look. So the fail-safe
+    /// answer at `open` is to recompute the list against the records instead of trying to work out
+    /// which transaction's pushes to take back — which is technique (iv), recompute-on-recovery, and
+    /// is what PostgreSQL does with the free space map (never WAL-logged, its writes are hints, a
+    /// corrupt page is zeroed rather than raised) and what Neo4j does with `IndexedIdGenerator`
+    /// (rebuilt by a scan when it is not cleanly shut down). Neither engine undoes a shared free
+    /// structure transactionally, and the survey behind this task found no engine that does.
+    ///
+    /// # The state this repairs, and why it was a database refusing to serve
+    ///
+    /// A free-list PUSH is eager — [`free_push`](Self::free_push) lists the id the moment the record
+    /// is cleared — and `snapshot_meta` keeps the COMMITTING transaction's pushes in the image
+    /// because that image is their only route to disk (`rmp` #1063). Only a GC pass ever pushes, and
+    /// `checkpoint_meta` runs inside that pass's own commit, so a GC pass that reaches its checkpoint
+    /// and then becomes a recovery LOSER has its record clears undone — restoring the records to
+    /// `in_use` — while the image it wrote still lists those ids as free. `check_free_lists` reports
+    /// exactly that contradiction as [`FreeListFault::StillInUse`](crate::check::FreeListFault), and
+    /// a store that refuses to serve is not an acceptable resting state for a recoverable crash.
+    ///
+    /// # Narrowing can only ever LOSE reusable space, never hand out a live slot
+    ///
+    /// The direction is the whole safety argument. Removing an id from a free list means the
+    /// allocator will not reuse it, so no narrowing can cause a double allocation; the worst case is
+    /// a slot that stays unallocated until a later GC pass re-lists it, which that pass will do the
+    /// next time it sweeps. Widening — adding an id — is the dangerous direction and is not done
+    /// here.
+    ///
+    /// # What it does NOT cover, stated rather than glossed
+    ///
+    /// [`FreeListFault::ReferencedByLiveChain`](crate::check::FreeListFault) is untouched, and does
+    /// not need to be for this defect: the mechanism is a GC pass whose record clears are UNDONE, and
+    /// an undone clear restores the `in_use` bit, which is what this keys on. A freed id that is not
+    /// in use yet is still reached by a live chain is a dead-link corpse, which is legitimate
+    /// (`rmp` #220) and is repaired by the GC's run-based splice rather than by narrowing a list.
+    fn narrow_free_lists_to_unused_records(&self) {
+        for kind in ALL_STORE_KINDS {
+            let ids = self.store(kind).alloc.free_ids();
+            let mut narrowed = FreeList::new();
+            let mut dropped = 0usize;
+            for id in ids {
+                // An UNREADABLE record keeps its place on the list. Corruption is `verify_on_open`'s
+                // to report, and guessing "free" over a page this cannot read would be the widening
+                // direction — the one that hands out a live slot.
+                if self.record_slot_in_use(kind, id).unwrap_or(false) {
+                    dropped += 1;
+                    continue;
+                }
+                narrowed.push(id);
+            }
+            if dropped > 0 {
+                self.store(kind).alloc.lock().replace_free(narrowed);
+            }
+        }
+    }
+
+    /// Whether the record at physical id `id` of `kind` still occupies its slot, for
+    /// [`narrow_free_lists_to_unused_records`](Self::narrow_free_lists_to_unused_records).
+    ///
+    /// The three MVCC stores and the overflow heap carry the frozen `05 §7` header, so "occupied" is
+    /// its `in_use` flag; the undo area's two stores carry no MVCC header and answer with their own
+    /// (`rmp` #966), where a zeroed slot is not occupied at all.
+    ///
+    /// # Errors
+    /// Propagates the read error of an unreadable (e.g. checksum-failed) record page.
+    fn record_slot_in_use(&self, kind: StoreKind, id: u64) -> Result<bool> {
+        Ok(match kind {
+            StoreKind::Node => self.read_node(id)?.mvcc.in_use(),
+            StoreKind::Rel => self.read_rel(id)?.mvcc.in_use(),
+            StoreKind::Prop => self.read_prop(id)?.mvcc.in_use(),
+            StoreKind::Strings => self.read_block(id)?.mvcc.in_use(),
+            StoreKind::Undo => self.read_delta(id)?.is_some_and(UndoDelta::in_use),
+            StoreKind::Commit => self.read_commit_slot(id)?.is_some_and(CommitSlot::in_use),
+        })
     }
 
     /// The largest real transaction id present in the durable WAL when this store was opened (`0` for a
@@ -2671,12 +2844,20 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // its own vacuity guard: the durable list came back EMPTY.
         //
         // So the asymmetry is the same one the counts and the DDL use, and for the same reason: this
-        // image is the only route those frees have to disk. What it leaves open is the same residual
-        // too — a committing GC pass that becomes a recovery LOSER has its record clears undone while
-        // its image still lists the ids. That is tracked with the DDL half in `rmp` #1083, is detected
-        // fail-closed at `open` by `check_free_lists` (`StillInUse`) rather than silently reused, and
-        // is not closed by excluding the committing transaction — that trade buys it with a
-        // guaranteed leak on every successful GC pass, which is the worse of the two.
+        // image is the only route those frees have to disk. The residual it left — a committing GC
+        // pass that becomes a recovery LOSER, whose record clears are undone while its image still
+        // lists the ids — is CLOSED by `rmp` #1083, and closed on the OTHER side, at `open`:
+        // [`narrow_free_lists_to_unused_records`](Self::narrow_free_lists_to_unused_records) drops
+        // from every decoded list any id whose record still reads `in_use`.
+        //
+        // The DDL half of #1083 needed an attributed durable block; this half needed nothing durable
+        // at all, and the difference is what a free list IS. It is DERIVED state — an id is free
+        // exactly when its record is not in use — so it can be recomputed from the records instead of
+        // undone, which is what PostgreSQL does with the free space map and Neo4j with
+        // `IndexedIdGenerator`. Narrowing can only ever forget reusable space, never hand out a live
+        // slot, so the fail-safe direction is available here and is taken. Excluding the committing
+        // transaction remains the WRONG trade: it buys the same property with a guaranteed leak on
+        // every successful GC pass.
         self.active.fold_all((), |(), txn, a| {
             if txn == committing {
                 return;
@@ -2704,6 +2885,48 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             store: self,
             cov: sample.coverage,
         };
+        // THE COMMITTING TRANSACTION'S OWN DDL RIDES AN ATTRIBUTED BLOCK, NOT THE IMAGE (`rmp` #1083).
+        //
+        // `sample.committed`'s schema half is now COMMITTED state and nothing else, and what this
+        // transaction declared travels beside it named by its id, to be applied at `open` only if
+        // recovery finds its `COMMIT` record. That is the treatment `rmp` #1067 gave the counters,
+        // and the reason is the same one, sharpened: a DDL change logs no data record, so this image
+        // was its ONLY route to disk — and an image written by a transaction that then never commits
+        // left that DDL durable, with `rmp` #1063's redo-only logging no longer taking it back. A
+        // phantom `UNIQUE` constraint REJECTS WRITES THAT MUST BE ADMITTED.
+        //
+        // ONLY ONE TRANSACTION CAN BE PENDING IN AN IMAGE, and it is asserted rather than assumed:
+        // `committed_statistics` builds the block from `committing`'s undo log alone and strips every
+        // other open transaction's DDL from the image, so the set of transactions with unpersisted
+        // DDL inside this image is a singleton by construction. [`SYSTEM_TXN`] is never in `active`,
+        // so a reclaim's checkpoint contributes nothing and the block is `None`.
+        debug_assert!(
+            sample.pending_schema.is_none() || self.is_txn_active(committing),
+            "the catalogue image carries pending DDL attributed to {committing:?}, which is not an \
+             open transaction — nothing will ever decide whether that DDL committed (`rmp` #1083)"
+        );
+        // The SINGLETON itself is not asserted here, and the reason is worth writing down rather
+        // than leaving as an omission. It is structural: `owned` is built inside
+        // `committed_statistics` from `committing`'s undo log alone, so any assertion phrased over
+        // this method's inputs merely restates the branch that produced them. An assertion over the
+        // committed half is worse than tautological — it is WRONG: an entry that legitimately
+        // DECLINED (superseded by a transaction that committed) leaves a value differing from its
+        // `prev`, and is indistinguishable from a leak by inspection alone. A first draft of exactly
+        // that assertion fired on
+        // `a_superseded_write_by_the_committer_contributes_nothing_to_the_block_1083`.
+        //
+        // So the property is pinned where it can be decided — by tests that construct the
+        // interleavings and read the two halves apart:
+        // `a_bystander_writing_the_same_key_after_the_committer_leaves_the_image_committed_1083`
+        // (an open bystander's write never reaches the committed half) and
+        // `pending_ddl_phantom::an_open_bystanders_ddl_is_never_in_the_image` (end to end, through
+        // crash and recovery, reading the block's `txn` off the metadata page).
+        let pending_ddl = sample
+            .pending_schema
+            .map(|schema| crate::meta::PendingSchema {
+                txn: committing.0,
+                schema,
+            });
         // THE COUNTERS THAT REACH DISK ARE THE BASE, NOT THE LIVE ONES (`rmp` #1067).
         //
         // This one line is what closes `rmp` #1055's two classes. The live counters are rewritten by
@@ -2714,10 +2937,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // the claim smaller and true: "these counters account for exactly these transactions". What
         // it leaves out is in the log, and recovery adds it back.
         //
-        // The SCHEMA half of `sample.committed` is kept as it is: DDL has no delta record, so its
-        // durability still rides this image (and `rmp` #1055's classes still reach it — recorded in
-        // the task's report rather than fixed here, because closing it needs the same delta treatment
-        // and is a task of its own).
+        // The SCHEMA half of `sample.committed` is COMMITTED state since `rmp` #1083; the committing
+        // transaction's own DDL is in `pending_ddl` above. `rmp` #1055's image-inversion class still
+        // reaches the schema half either way — a stale image landing last loses a committed
+        // transaction's DDL whether that DDL sits in the image or in the block — and that is `rmp`
+        // #1084, unchanged by this task in either direction.
         let mut statistics = sample.committed;
         statistics.restore_counts(sample.base);
         let applied_counts = sample.applied;
@@ -2731,7 +2955,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 // `refuse_legacy_property_tombstones` has already established at `open` that this image
                 // holds no cell whose meaning would change (`rmp` #967). From version 3 the upgrade adds
                 // the (empty) applied-transaction set, which is what such a store's history says: no build
-                // below version 4 ever wrote a count-delta record (`rmp` #1066).
+                // below version 4 ever wrote a count-delta record (`rmp` #1066). From version 4 it adds
+                // the pending-DDL block, absent on a version-4 image because such an image folded its
+                // committing transaction's DDL into the statistics instead (`rmp` #1083).
                 format_version: graphus_core::constants::FORMAT_VERSION,
                 element_id_next: self.element_ids.peek(),
                 commit_ts_hw: self.commit_ts_hw.load(Ordering::Acquire),
@@ -2739,6 +2965,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 tokens: self.with_catalog(|c| (*c.tokens).clone()),
                 statistics,
                 applied_counts,
+                pending_ddl,
             },
             coverage,
         ))
@@ -3373,14 +3600,17 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// * **`element_id_next`, `commit_ts_hw`, the stores' high-water marks** — monotone in memory,
     ///   so a *later-sampled* image can only be ahead (`rmp` #1023).
     /// * **free lists** — sampled COMMITTED rather than live, by the exclusion in
-    ///   [`snapshot_meta`](Self::snapshot_meta) that this task added; **device-page maps** are live
-    ///   state and never restored from an image (`rmp` #1023/#721).
+    ///   [`snapshot_meta`](Self::snapshot_meta) that this task added, and NARROWED at `open` to the
+    ///   ids whose records are unused (`rmp` #1083), because a free list is derived state that can be
+    ///   recomputed rather than undone; **device-page maps** are live state and never restored from
+    ///   an image (`rmp` #1023/#721).
     /// * **live-record counters** — a base plus the set of transactions folded into it since `rmp`
     ///   #1067; a loser's delta is in the log and recovery's committed set is what admits it, and the
     ///   `_coverage` guard below stops a reclaim dropping a delta this image does not account for.
-    /// * **schema DDL** — [`committed_statistics`](Self::committed_statistics) already strips every
-    ///   *other* open transaction's pending DDL (`rmp` #734); the committing one's is the residual
-    ///   below.
+    /// * **schema DDL** — [`committed_statistics`](Self::committed_statistics) strips every open
+    ///   transaction's pending DDL, the committing one included (`rmp` #734/#1083); that one's own
+    ///   contribution travels beside the image in the pending-DDL block, named by its transaction id,
+    ///   and `open` applies it only for a transaction whose `COMMIT` record recovery found.
     ///
     /// # What this argument does NOT establish, stated rather than glossed
     ///
@@ -3397,28 +3627,25 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// #1084 and which cannot be a plain lock: the span contains scheduler yield points that
     /// `det_scheduler_checkpoint_inversion_1055` attributes its whole measurement from.
     ///
-    /// # The one residual, named rather than assumed
+    /// # The residual `rmp` #1063 named here is CLOSED by `rmp` #1083
     ///
-    /// `committed_statistics` keeps the **committing** transaction's own DDL by name, so an image
-    /// written by a transaction that then never commits carries that DDL, and redo-only leaves it
-    /// durable until the next catalogue write. The window is bounded rather than open-ended: a
-    /// rollback that discards its own DDL sets `catalog_dirty`
-    /// ([`rollback_physical`](Self::rollback_physical)'s `adopt_schema_from` branch — which fires
-    /// *because of* this change, since the reloaded image now differs from the corrected one), so the
-    /// next commit rewrites the catalogue without it, and the in-memory schema is corrected
-    /// immediately in either rollback flavour. What is left is a crash inside that window.
+    /// It was: `committed_statistics` kept the **committing** transaction's own DDL by name, because
+    /// this image was that DDL's only route to disk, so an image written by a transaction that then
+    /// never committed left its DDL durable — and redo-only no longer takes it back. A phantom
+    /// `UNIQUE` constraint rejects writes that must be admitted, so this was a correctness violation
+    /// and not a cosmetic one. Half of it was pre-existing (a slot-owning transaction already took
+    /// [`rollback_logical`](Self::rollback_logical), which reverts no bytes) and half was #1063's own
+    /// regression (a **DDL-only** transaction owns no slot, so it took
+    /// [`rollback_physical`](Self::rollback_physical), whose `compensate_one` did revert this page).
     ///
-    /// Be precise about how much of this is new, because half of it is not. A transaction that owns a
-    /// commit slot already took [`rollback_logical`](Self::rollback_logical), which reverts no bytes
-    /// and writes an `ABORT` — so its image already stayed on the page, and the `ABORT` already kept
-    /// recovery from treating it as a loser. But a **DDL-only** transaction owns no slot, so it took
-    /// [`rollback_physical`](Self::rollback_physical), whose `compensate_one` did revert this page.
-    /// For that class the exposure IS new, and saying otherwise would be an unaudited claim.
-    ///
-    /// What closes it is the treatment `rmp` #1067 gave the counters — the DDL reaching disk as its
-    /// own logged delta, applied only for a transaction recovery finds committed — which
-    /// [`snapshot_meta`](Self::snapshot_meta) already names as a task of its own. Tracked as `rmp`
-    /// #1083, with the regression recorded there rather than left implicit.
+    /// #1083 applies #1067's treatment to the schema half: the image carries only COMMITTED DDL, and
+    /// the committing transaction's own contribution reaches disk **attributed to it**, in the
+    /// catalogue's pending-DDL block ([`crate::meta::PendingSchema`]). `open` applies that block only
+    /// for a transaction whose `COMMIT` record recovery found. The obligation that comes with
+    /// attributing state to a transaction is that the log must still be able to say what that
+    /// transaction did, which is
+    /// [`pending_ddl_floor`](Self#structfield.pending_ddl_floor), registered at the end of this
+    /// method.
     fn checkpoint_meta(&self, txn: TxnId, commit: bool) -> Result<()> {
         // Heal any store whose mark outruns its mapped pages BEFORE the image is built, so the floor
         // in `to_meta` is a floor and not a trap (`rmp` #1014, criterion 7).
@@ -3433,6 +3660,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // binding it to `_` — reopens the one window this design has, and it is #1055's window
         // exactly: an image whose base stops short of what has already been reclaimed.
         let (meta, _coverage) = self.snapshot_meta(txn)?;
+        let carries_pending_ddl = meta.pending_ddl.is_some();
         let payload = meta.encode()?;
         // Split the catalog into [`META_CHUNK_CAP`]-byte chunks across the metadata-page chain. At
         // least one page (the head) is always written, even for an empty chunk.
@@ -3535,6 +3763,35 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
 
         if commit {
             self.wal.with(|w| w.commit(txn))?;
+        }
+        // THE FLOOR THAT KEEPS THE BLOCK DECIDABLE (`rmp` #1083), registered here and not earlier.
+        //
+        // `next_lsn` is where the next record will go, and `txn`'s `COMMIT` record — the thing `open`
+        // will look for — is appended after this method returns, so it lands at or above this offset.
+        // Holding reclamation at it therefore keeps that record readable for as long as this image
+        // can still be the durable one. Registering it BEFORE the page writes would be pointless
+        // (there is nothing to protect until an image with a block exists) and registering it after
+        // the `COMMIT` record would leave the window this closes.
+        //
+        // `fetch_min` because the OLDEST outstanding offset is the safe one: which of two concurrent
+        // committers' images lands last is not something this store controls (`rmp` #1055), so the
+        // clamp must be conservative for every image that could be standing.
+        if carries_pending_ddl {
+            // THE FLOOR MUST LAND BELOW THE `COMMIT` RECORD IT PROTECTS, and with `commit` set this
+            // method has ALREADY appended one a few lines above — so sampling here would put the
+            // floor above it and invert the whole mechanism. Unreachable today (every `commit = true`
+            // caller passes [`SYSTEM_TXN`], which is never in the active set and so never carries a
+            // block), and asserted rather than left as a trap for the next caller.
+            debug_assert!(
+                !commit,
+                "a catalogue image carrying pending DDL was written with its WAL transaction already                  committed, so the floor registered below would sit ABOVE the COMMIT record it                  exists to keep readable (`rmp` #1083)"
+            );
+            let next = self.wal.with(|w| w.next_lsn().0);
+            self.pending_ddl_floor.fetch_min(next, Ordering::AcqRel);
+            // BUMPED AFTER the floor, and it is the release side of the pairing: a releaser that
+            // reads the epoch after its own image has landed either sees this increment (and
+            // declines to release) or was ordered entirely before this registration.
+            self.pending_ddl_epoch.fetch_add(1, Ordering::AcqRel);
         }
         Ok(())
     }
@@ -5253,7 +5510,26 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             c.counts_cov_lsn = c.counts_cov_lsn.max(target);
             (target, true)
         });
-        if owed {
+        // THE PENDING-DDL BLOCK IS SETTLED BY THE SAME IMAGE (`rmp` #1083).
+        //
+        // The obligation, stated: while a catalogue image carrying a pending-DDL block can still be
+        // the durable one, the `COMMIT` record of the transaction that block names must stay in the
+        // retained log. `open` reads that record to decide whether to apply the block or drop it, and
+        // the default is to drop — so reclaiming it out from under a still-durable block inverts the
+        // decision, and a COMMITTED `CREATE CONSTRAINT` whose only durable record is that block is
+        // read as a phantom and discarded. Attributing state to a transaction is sound only while the
+        // log can still say what that transaction did; that is the same pairing `rmp` #1067 made
+        // between a count-delta record and `counts_cov_durable`.
+        //
+        // [`SYSTEM_TXN`] is never in the active set, so `committed_statistics` contributes nothing for
+        // it: the image below carries NO block, and carries every committed DDL as ordinary committed
+        // state. `WalManager::commit` hardens before returning, so once it has, no `open` can read
+        // the old block back.
+        //
+        // Read BEFORE the write, so the release below clears only what that image superseded.
+        let ddl_observed = self.pending_ddl_floor.load(Ordering::Acquire);
+        let ddl_epoch = self.pending_ddl_epoch.load(Ordering::Acquire);
+        if owed || ddl_observed != u64::MAX {
             // One at a time, and never waiting: the write below runs under `SYSTEM_TXN`, and two
             // threads inside it would share one WAL transaction — the second `commit` would find it
             // already gone and fail a checkpoint that a *committer* is calling, turning a durable
@@ -5263,7 +5539,26 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // needs no rank (`graphus_core::latch`).
             if let Ok(_fold) = self.counts_fold_lock.try_lock() {
                 self.checkpoint_meta(SYSTEM_TXN, true)?;
-                self.with_catalog_mut(|c| c.counts_cov_durable = c.counts_cov_durable.max(target));
+                if owed {
+                    self.with_catalog_mut(|c| {
+                        c.counts_cov_durable = c.counts_cov_durable.max(target);
+                    });
+                }
+                // RELEASED ONLY IF NO NEW OBLIGATION APPEARED WHILE THE IMAGE WAS BEING WRITTEN.
+                //
+                // The epoch is what makes that decidable: `fetch_min` swallows a second registration
+                // whose offset is higher than the standing one, so the floor VALUE alone cannot say
+                // whether a block landed after this call read it — and releasing on the value alone
+                // discharges an obligation this image never settled (see `pending_ddl_epoch`).
+                // Unchanged epoch ⇒ the image written above is the last one, and it carries no block.
+                if self.pending_ddl_epoch.load(Ordering::Acquire) == ddl_epoch {
+                    let _ = self.pending_ddl_floor.compare_exchange(
+                        ddl_observed,
+                        u64::MAX,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    );
+                }
             }
         }
         // THE FLOOR IS CLAMPED BY WHAT IS STILL OWED, IN RELEASE AND NOT ONLY IN DEBUG.
@@ -5274,6 +5569,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // the registration floor keeps a record that is still being positioned out of reach — but a
         // debug assertion is no protection at all in the build that ships, and what it would be
         // protecting is a committed transaction's cardinality with no second copy anywhere.
+        //
+        // The pending-DDL floor joins the same clamp (`rmp` #1083), and for the same reason it is a
+        // clamp rather than an assertion: if the image above was not written — a lost try-lock, a
+        // failed write — the block is still the durable one, and the `COMMIT` record that decides it
+        // must stay readable. Re-read AFTER the release so a block written during this call is
+        // honoured too.
+        let ddl_floor = self.pending_ddl_floor.load(Ordering::Acquire);
         Ok(self.with_catalog(|c| {
             let owed = c.pending_counts.first_key_value().map_or(u64::MAX, |(&lsn, _)| lsn);
             debug_assert!(
@@ -5281,7 +5583,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 "a count delta at an LSN below the durable coverage is still pending, so reclaiming \
                  to that coverage would drop a record whose delta no image accounts for"
             );
-            target.min(c.counts_cov_durable).min(owed)
+            target.min(c.counts_cov_durable).min(owed).min(ddl_floor)
         }))
     }
 
@@ -5358,7 +5660,22 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // the same latitude every other page in the snapshot has.
             true
         });
-        if folded {
+        // THE PENDING-DDL BLOCK MUST GO TOO, and for the identical reason (`rmp` #1083).
+        //
+        // The block names a transaction and is applied at `open` only if that transaction's `COMMIT`
+        // record is in the log. A backup carries the data image and NOT the log, and a restored store
+        // opens on a fresh empty one — so a block that reached the snapshot would be dropped at
+        // restore whatever its transaction did, and a **committed** declaration whose only durable
+        // record is that block would be gone. That is the counters' failure exactly, one field over:
+        // state whose verdict lives in a log the snapshot does not carry.
+        //
+        // Same "write no page when nothing is owed" discipline as above, and it matters for the same
+        // measured reason: re-backing-up a freshly restored store must touch no page. Nothing sets
+        // this floor on such a store — it is registered only by an image that carried a block, which
+        // needs an open DDL transaction — so the idempotent path stays byte-for-byte idempotent.
+        let ddl_observed = self.pending_ddl_floor.load(Ordering::Acquire);
+        let ddl_epoch = self.pending_ddl_epoch.load(Ordering::Acquire);
+        if folded || ddl_observed != u64::MAX {
             // Blocking, unlike the checkpoint's `try_lock`: a backup that silently skipped this
             // because a checkpoint held the lock would capture an image the log is no longer there
             // to complete. The lock is outside the rank-10 catalogue latch and nothing that holds an
@@ -5368,6 +5685,19 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             self.checkpoint_meta(SYSTEM_TXN, true)?;
+            // Guarded by the epoch, and here it matters MORE than in the reclaim fold: that caller's
+            // release is bounded by a floor it computes in the same call (`target <= ckpt_lsn`), so a
+            // block written afterwards is above it anyway. This one computes no floor at all and its
+            // release persists, so an unguarded exchange would leave a block-carrying image in the
+            // captured artifact with nothing keeping its verdict readable.
+            if self.pending_ddl_epoch.load(Ordering::Acquire) == ddl_epoch {
+                let _ = self.pending_ddl_floor.compare_exchange(
+                    ddl_observed,
+                    u64::MAX,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                );
+            }
         }
         Ok(())
     }
@@ -5456,6 +5786,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         let _ = ckpt_lsn;
         // THE COUNTER FOLD, and it must happen HERE — after the floor is known and before a single
         // byte below it is dropped (`rmp` #1067). It may LOWER the floor; it never raises it.
+        // It also settles the pending-DDL block for the same reason and in the same image
+        // (`rmp` #1083): the durable image may still name a transaction whose `COMMIT` record decides
+        // its DDL, and that record must not be dropped underneath it.
         let reclaim_floor = self.fold_counts_for_reclaim(reclaim_floor)?;
         // DOUBLEWRITE FLOOR (`rmp` #437): persist the reclaim floor durably in the DWB **before** the
         // WAL prefix below it is reclaimed. On the next open, eviction-ring recovery ignores any ring
@@ -10325,7 +10658,38 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// durable image was both unnecessary and unsafe.
     fn reload_catalog(&self) -> Result<()> {
         self.with_catalog_mut(|c| c.catalog_reloads += 1);
-        let (meta, meta_chain) = Self::read_meta(&self.pool)?;
+        let (mut meta, meta_chain) = Self::read_meta(&self.pool)?;
+        // THE PENDING-DDL BLOCK IS FOLDED BACK IN HERE (`rmp` #1083), and leaving it out was a
+        // regression this task nearly shipped.
+        //
+        // Since #1083 the image's committed half no longer carries the DDL of the transaction whose
+        // commit wrote it — that DDL travels in the block beside it. This method installs the image's
+        // schema half as the in-memory schema, so an image read WITHOUT its block is one committed
+        // declaration short: a transaction commits `CREATE CONSTRAINT`, an unrelated transaction rolls
+        // back, and the constraint is gone from memory. Not merely gone — the NEXT checkpoint would
+        // then write an image whose committed half lacks it and whose block is absent, making the loss
+        // permanent. `open` and this method read the same bytes and must reconstruct the same
+        // catalogue.
+        //
+        // The condition is "not an OPEN transaction", not "committed", and the difference is what is
+        // decidable here. `open` can ask the log; a live reload cannot — a committed transaction that
+        // a GC pass has already forgotten reads as `Aborted` from the commit registry, so keying on
+        // the outcome would drop committed DDL on a fail-OPEN answer. "Still open" is exact and
+        // fail-safe for the two cases that matter: the ROLLING-BACK transaction is still in the active
+        // set at this point (its entry is removed after this returns), so its own DDL is correctly
+        // discarded, and a concurrent open transaction's is discarded here and layered back by the
+        // `rmp` #534 superset-preserve block in the caller.
+        //
+        // What it leaves is `rmp` #1063's residual seen through the reload path rather than the crash
+        // path: a transaction that wrote its image and then ABORTED still has its DDL folded back here,
+        // exactly as it did before #1083 when that DDL sat in the committed half. So this is no worse
+        // than the behaviour it replaces, and it is stated rather than discovered — closing it needs an
+        // outcome oracle that is fail-safe for a forgotten committed writer, which the registry is not.
+        if let Some(pending) = meta.pending_ddl.take() {
+            if !self.is_txn_active(TxnId(pending.txn)) {
+                meta.statistics.adopt_schema_from(pending.schema);
+            }
+        }
         // THE IDENTITY COUNTER IS PRESERVED — by never being touched (`rmp` #1023), for the same
         // reason as the page map below. It used to be rebuilt from `meta.element_id_next` and then
         // raised back to its pre-rollback value by the caller. Both steps are now gone: the counter is
@@ -14171,8 +14535,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     }
 
     /// The **committed** catalog image: the live [`Statistics`] with every still-open transaction's
-    /// pending schema DDL undone (`rmp` #734) **and** its pending live-record counts withdrawn
-    /// (`rmp` #866).
+    /// pending schema DDL undone (`rmp` #734/#1083) **and** every *other* one's pending live-record
+    /// counts withdrawn (`rmp` #866).
     ///
     /// This is what a checkpoint must persist. The live `Statistics` is shared by every transaction,
     /// so it also holds the *uncommitted* state of whatever transactions happen to be open — and
@@ -14194,10 +14558,19 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///
     /// # The committing transaction is EXCLUDED explicitly, not by removal order
     ///
-    /// `committing` names the transaction whose commit is being checkpointed; its entry is skipped, so
-    /// its own counts and DDL are persisted while every OTHER still-open transaction's are stripped.
-    /// Were it the other way round, this would persist a catalog that omits a committed write — one
-    /// drift traded for another.
+    /// `committing` names the transaction whose commit is being checkpointed; its entry is skipped by
+    /// the COUNTS withdrawal, so its own counts are persisted while every OTHER still-open
+    /// transaction's are stripped. Were it the other way round, this would persist a catalog that
+    /// omits a committed write — one drift traded for another.
+    ///
+    /// Its **DDL** is no longer excluded (`rmp` #1083). Every open transaction's schema undo log is
+    /// merged into one reverse-global replay, so what this returns in
+    /// [`committed`](CommittedImage#structfield.committed) is committed schema and nothing else; the
+    /// committing transaction's own contribution comes back separately in
+    /// [`pending_schema`](CommittedImage#structfield.pending_schema), to be persisted **attributed to
+    /// it** rather than folded into a catalogue that claims to be committed. The asymmetry the counts
+    /// half keeps is not an inconsistency: a count delta has its own durable log record and the DDL
+    /// has none, so the DDL needs an attributed carrier and the counts already have one.
     ///
     /// This used to be achieved *implicitly*, by `commit_prepare` removing `txn` from
     /// [`active`](Self#structfield.active) before checkpointing, so the committing transaction simply
@@ -14261,8 +14634,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             ResourceId::txn(committing.0),
         );
         let active = &self.active;
-        let (mut committed, applied, mut pending, last_seq, base, coverage) =
-            self.with_catalog(|c| {
+        let (mut committed, applied, mut pending, own_seqs, last_seq, base, coverage) = self
+            .with_catalog(|c| {
                 let mut committed = (*c.statistics).clone();
                 // Cloned INSIDE this hold, beside the counters it describes (`rmp` #1066) — see the note
                 // on this method. Cheap: empty in every store this build writes.
@@ -14293,11 +14666,24 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 // reverse GLOBAL order below. Sorting by the store-global `seq` is also what makes the
                 // result deterministic: `active` is a HashMap, so its iteration order is not stable, but
                 // `seq` is unique and totally ordered.
+                //
+                // THE COMMITTING TRANSACTION'S OWN DDL IS MERGED IN TOO SINCE `rmp` #1083, and it must
+                // be merged rather than replayed afterwards. The replay is ordered by the store-global
+                // `seq` precisely because two transactions can write the SAME entry, and running the
+                // others' log first and this one's second is not the same computation: with
+                // `committing` writing `K` at generation 7 and an open bystander writing it at 5, the
+                // bystander's entry declines against a `last_seq` of 7, and undoing `committing`'s
+                // afterwards then restores the BYSTANDER's uncommitted value into the durable image.
+                // One merged pass in reverse global order unwinds both links and lands on the
+                // committed value, which is the whole reason `seq` is global.
+                let mut own_seqs: HashSet<u64> = HashSet::default();
                 let pending: Vec<SchemaUndo> = active.fold_all(Vec::new(), |mut acc, txn, a| {
                     if txn != committing {
                         a.counts.withdraw_from(&mut committed);
-                        acc.extend(a.schema_undo.iter().cloned());
+                    } else {
+                        own_seqs.extend(a.schema_undo.iter().map(|e| e.seq));
                     }
+                    acc.extend(a.schema_undo.iter().cloned());
                     acc
                 });
                 // A scratch copy of the generations: this is a read-only view of the catalog, so the
@@ -14329,29 +14715,63 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 Self::debug_assert_base_plus_pending_is_committed(
                     c, active, committing, &committed,
                 );
-                (committed, applied, pending, last_seq, base, coverage)
+                (
+                    committed, applied, pending, own_seqs, last_seq, base, coverage,
+                )
             });
         // The replay works on the three snapshots taken above and touches no shared state, so it sits
         // OUTSIDE the hold: what has to be atomic is the sampling, not the arithmetic.
         let Some(mut last_seq) = last_seq else {
             return CommittedImage {
                 committed,
+                pending_schema: None,
                 base,
                 applied,
                 coverage,
             };
         };
         pending.sort_unstable_by_key(|e| std::cmp::Reverse(e.seq));
+        // What the committing transaction contributes, keyed by entry (`rmp` #1083). Built DURING the
+        // replay because that is the only moment its value is observable: the entries are visited
+        // newest-global-first, so when this transaction's newest entry for a key is reached, every
+        // later writer of that key has already been unwound and the value standing at the key is
+        // exactly what this transaction left there.
+        let mut owned: HashMap<SchemaKey, Option<SchemaValue>> = HashMap::default();
         for entry in pending {
+            let mine = own_seqs.contains(&entry.seq);
+            // Read BEFORE the restore, and only for our own entries. `HashMap::entry` keeps the FIRST
+            // value recorded for a key, which is the newest one — a chain of this transaction's own
+            // writes to one key must contribute the value the last of them left, not the first.
+            let before = mine.then(|| committed.schema_get(&entry.key));
             // No splice here, and none is needed. A decline means some transaction wrote this entry
             // after `entry` and is not in `pending` — i.e. it COMMITTED, and its log was dropped with
             // its active-set slot. Its value is therefore the committed one, which is exactly what
             // declining leaves in place. Every link that is still live is present in `pending` (a
             // rollback splices out the ones that are not), so live chains unwind here without gaps.
-            Self::undo_schema_entry(&mut committed, &mut last_seq, &entry);
+            let fired = Self::undo_schema_entry(&mut committed, &mut last_seq, &entry);
+            // A DECLINED entry of ours owes NOTHING, and that is the same argument the comment above
+            // makes, read the other way: the entry that superseded ours belongs to a transaction that
+            // committed, so the committed value is the one standing, and re-asserting ours over it at
+            // `open` would revert somebody else's committed DDL.
+            if let (true, Some(value)) = (fired, before) {
+                owned.entry(entry.key).or_insert(value);
+            }
         }
+        // Rebuilt from the COMMITTED image plus this transaction's contribution, so the block and the
+        // catalogue beside it agree by construction on every entry the transaction did not touch.
+        // Schema-only: the counters ride the base (`rmp` #1067) and would be a second, contradictory
+        // claim about them here.
+        let pending_schema = (!owned.is_empty()).then(|| {
+            let mut schema = Statistics::new();
+            schema.adopt_schema_from(committed.clone());
+            for (key, value) in owned {
+                schema.schema_put(&key, value);
+            }
+            schema
+        });
         CommittedImage {
             committed,
+            pending_schema,
             base,
             applied,
             coverage,
@@ -15131,6 +15551,19 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// The freed physical ids of `kind`'s store (`04 §2.7`).
     pub(crate) fn checker_free_ids(&self, kind: StoreKind) -> Vec<u64> {
         self.store(kind).alloc.free_ids()
+    }
+
+    /// The freed physical ids of `kind`'s store, in the allocator's own order (`04 §2.7`) —
+    /// diagnostics, and the only way a test can see what
+    /// [`narrow_free_lists_to_unused_records`](Self::narrow_free_lists_to_unused_records) did
+    /// (`rmp` #1083).
+    ///
+    /// The narrowing is invisible in every value the store returns — the store simply allocates a
+    /// fresh id instead of a recycled one — so without this a build that narrowed nothing and a
+    /// build that narrowed correctly are indistinguishable from the outside.
+    #[must_use]
+    pub fn free_ids(&self, kind: StoreKind) -> Vec<u64> {
+        self.checker_free_ids(kind)
     }
 
     /// The number of interned `PropKey`-namespace tokens (`04 §2.6`): key token ids are dense in
@@ -17704,6 +18137,296 @@ mod tests {
             "the catalog reload lowered the high-water mark to the durable image. A writer \
              allocating at that instant would be handed an id another open transaction has already \
              written a record into (`rmp` #1023, window A)"
+        );
+    }
+
+    /// **`rmp` #1083: a catalogue image carrying a pending-DDL block registers a reclaim floor at or
+    /// below the `COMMIT` record that decides it.**
+    ///
+    /// The block names a transaction and `open` applies it only if it finds that transaction's
+    /// `COMMIT` record in the RETAINED log, defaulting to DROP. So the log must still be able to say
+    /// what that transaction did for as long as the block can be the durable image — attributing
+    /// state to a transaction and keeping its verdict readable are one obligation, not two.
+    ///
+    /// Asserted on the FLOOR rather than on a reclaim outcome, deliberately. Three other properties
+    /// currently keep that record alive on their own (`unfrozen_commit_lsn` floors it and is cleared
+    /// only by a GC prune, which a DDL-only transaction never gets; every later write commit rewrites
+    /// the catalogue; a GC pass itself commits), so no workload in this tree reaches the loss — that
+    /// was measured, with the registration removed, before this test was written this way. What is
+    /// testable, and what the design actually rests on, is that the floor is registered at all and
+    /// that it lands below the verdict it protects.
+    ///
+    /// A `UNIQUE` constraint over `(label, key)` — fixture helper for the `rmp` #1083 tests.
+    fn unique_constraint(label: u32, key: u32) -> crate::meta::ConstraintEntry {
+        crate::meta::ConstraintEntry {
+            label_token: label,
+            property_tokens: vec![key],
+            kind: crate::meta::ConstraintKind::Unique,
+            type_descriptor: None,
+        }
+    }
+
+    /// What the image a checkpoint by `committing` would carry: `(committed half, block)`, both as
+    /// the constraint named `name` holds in each.
+    fn image_halves(
+        s: &Store,
+        committing: TxnId,
+        name: &str,
+    ) -> (Option<u32>, Option<Option<u32>>) {
+        let sample = s.committed_statistics(committing);
+        let label_of = |c: Option<&crate::meta::ConstraintEntry>| c.map(|e| e.label_token);
+        (
+            label_of(sample.committed.constraint(name)),
+            sample
+                .pending_schema
+                .as_ref()
+                .map(|p| label_of(p.constraint(name))),
+        )
+    }
+
+    /// **`rmp` #1083, the merged replay — the committing transaction writes the SAME key twice.**
+    ///
+    /// The entries are visited newest-global-`seq` first and the FIRST value recorded per key wins
+    /// (`owned.entry(..).or_insert`), so the block must carry the value the LAST write left, not the
+    /// first. Reversing that rule — or replaying ascending — makes the block carry the earlier value
+    /// while the live catalogue holds the later one, which is a catalogue that disagrees with itself
+    /// across a restart.
+    #[test]
+    fn the_block_carries_the_last_of_the_committing_transactions_own_writes_1083() {
+        let s = fresh();
+        let t = TxnId(1);
+        s.begin(t);
+        let key = s.intern_token(Namespace::PropKey, "k").expect("intern");
+        s.set_constraint(t, "u".to_owned(), unique_constraint(10, key));
+        s.set_constraint(t, "u".to_owned(), unique_constraint(20, key));
+        let (committed, block) = image_halves(&s, t, "u");
+        assert_eq!(
+            committed, None,
+            "the committed half carries an uncommitted declaration"
+        );
+        assert_eq!(
+            block,
+            Some(Some(20)),
+            "the block must carry the LAST of this transaction's writes to the key"
+        );
+    }
+
+    /// **`rmp` #1083, the merged replay — an open BYSTANDER and the committing transaction write the
+    /// same key, in BOTH orders.**
+    ///
+    /// This is the case that forces ONE merged reverse-global-`seq` pass, and only the second order
+    /// has teeth. Replaying the other open transactions' logs first and this one's afterwards gives
+    /// the same answer when the bystander wrote LAST — but when the bystander wrote FIRST its entry
+    /// declines against a `last_seq` that names the committing transaction, and undoing the
+    /// committing transaction's entry afterwards then restores the BYSTANDER's uncommitted value
+    /// into an image that claims to be committed. Both orders are asserted because the first one
+    /// alone is satisfied by the broken computation (measured: a two-phase replay passes it).
+    #[test]
+    fn a_bystander_sharing_a_key_never_reaches_the_committed_half_1083() {
+        // `bystander_first` decides which of the two takes the LOWER generation.
+        for bystander_first in [false, true] {
+            let s = fresh();
+            let seed = TxnId(1);
+            s.begin(seed);
+            let key = s.intern_token(Namespace::PropKey, "k").expect("intern");
+            s.set_constraint(seed, "u".to_owned(), unique_constraint(1, key));
+            s.commit(seed).expect("the committed baseline");
+
+            let committer = TxnId(2);
+            let bystander = TxnId(3);
+            s.begin(committer);
+            s.begin(bystander);
+            if bystander_first {
+                s.set_constraint(bystander, "u".to_owned(), unique_constraint(99, key));
+                s.set_constraint(committer, "u".to_owned(), unique_constraint(10, key));
+            } else {
+                s.set_constraint(committer, "u".to_owned(), unique_constraint(10, key));
+                s.set_constraint(bystander, "u".to_owned(), unique_constraint(99, key));
+            }
+
+            let (committed, block) = image_halves(&s, committer, "u");
+            assert_eq!(
+                committed,
+                Some(1),
+                "bystander_first={bystander_first}: the committed half must hold the SEED's \
+                 committed value; 99 is the bystander's uncommitted write leaking through, and 10 \
+                 is the committing transaction's, which belongs in the block"
+            );
+            assert_eq!(
+                block,
+                Some(Some(10)),
+                "bystander_first={bystander_first}: the block must carry the committing \
+                 transaction's own value"
+            );
+        }
+    }
+
+    /// **`rmp` #1083, the merged replay — the committing transaction's entry DECLINES.**
+    ///
+    /// Another transaction wrote the key after it and COMMITTED, so the committing transaction's
+    /// write is already superseded and its entry no longer owns the key. The block must owe nothing
+    /// for that key: re-asserting the superseded value at `open` would revert somebody else's
+    /// committed DDL. The `fired` half of the `if let (true, Some(value))` guard is what does this.
+    #[test]
+    fn a_superseded_write_by_the_committer_contributes_nothing_to_the_block_1083() {
+        let s = fresh();
+        let key = {
+            let t0 = TxnId(1);
+            s.begin(t0);
+            let k = s.intern_token(Namespace::PropKey, "k").expect("intern");
+            s.commit(t0).expect("seed");
+            k
+        };
+        let committer = TxnId(2);
+        s.begin(committer);
+        s.set_constraint(committer, "u".to_owned(), unique_constraint(10, key));
+        // A LATER writer that COMMITS, so its log is gone and its value is the committed one.
+        let later = TxnId(3);
+        s.begin(later);
+        s.set_constraint(later, "u".to_owned(), unique_constraint(77, key));
+        s.commit(later).expect("the later writer commits");
+
+        let (committed, block) = image_halves(&s, committer, "u");
+        assert_eq!(
+            committed,
+            Some(77),
+            "the committed half must hold the value the LATER, committed writer left"
+        );
+        assert_eq!(
+            block, None,
+            "the committing transaction's write was superseded by a committed one, so it owes \
+             nothing — re-asserting it at open would revert committed DDL"
+        );
+    }
+
+    /// Non-vacuous: deleting the `fetch_min` in `checkpoint_meta` makes the first assertion fail.
+    #[test]
+    fn a_pending_ddl_image_floors_the_reclaim_below_its_commit_record_1083() {
+        let s = fresh();
+        // A DDL-ONLY transaction: no record write, so no count delta and no commit slot — the class
+        // whose declaration reaches disk through the catalogue image and nothing else.
+        let t1 = TxnId(1);
+        s.begin(t1);
+        let label = s.intern_token(Namespace::Label, "L").expect("intern");
+        let key = s.intern_token(Namespace::PropKey, "k").expect("intern");
+        s.set_constraint(
+            t1,
+            "u".to_owned(),
+            crate::meta::ConstraintEntry {
+                label_token: label,
+                property_tokens: vec![key],
+                kind: crate::meta::ConstraintKind::Unique,
+                type_descriptor: None,
+            },
+        );
+        assert_eq!(
+            s.pending_ddl_floor.load(Ordering::Acquire),
+            u64::MAX,
+            "NON-VACUITY: a floor was already registered before any image was written"
+        );
+        let (_, commit_lsn) = s.commit_prepare(t1).expect("prepare");
+        let commit_lsn = commit_lsn
+            .expect("a DDL-bearing commit is not read-only, so it must append a COMMIT record")
+            .0;
+        let floor = s.pending_ddl_floor.load(Ordering::Acquire);
+        assert_ne!(
+            floor,
+            u64::MAX,
+            "the image carried the declaration but registered no floor, so a reclaim could drop the \
+             record that decides it (`rmp` #1083)"
+        );
+        assert!(
+            floor <= commit_lsn,
+            "the floor {floor} is ABOVE the COMMIT record at {commit_lsn} it must keep readable"
+        );
+
+        // And a checkpoint discharges it: the image it writes carries no block, so nothing is left to
+        // decide and the floor is released rather than held for the life of the process.
+        s.checkpoint().expect("checkpoint");
+        assert_eq!(
+            s.pending_ddl_floor.load(Ordering::Acquire),
+            u64::MAX,
+            "the floor survived a checkpoint that wrote a block-free image, so it would hold WAL \
+             reclamation down for ever"
+        );
+    }
+
+    /// **`rmp` #1083: an unrelated transaction's rollback must not lose a committed declaration that
+    /// lives in the durable image's pending-DDL block.**
+    ///
+    /// `rollback_physical` reinstalls the schema half of the durable image over the in-memory one.
+    /// Since #1083 that image's committed half no longer carries the DDL of the transaction whose
+    /// commit wrote it, so a reload that ignored the block beside it would drop a committed
+    /// `CREATE CONSTRAINT` from memory — and the next checkpoint would then persist an image without
+    /// it and without the block, making the loss permanent.
+    ///
+    /// The rolling-back transaction is chosen with care, and the choice is the test. It must own no
+    /// COMMIT SLOT — a transaction that writes any record takes `rollback_logical`, which reloads
+    /// nothing and would make this pass for the wrong reason (measured: an earlier draft created a
+    /// node and stayed green with the fold removed). And it must hold no schema undo of its own, so
+    /// that `pre_statistics` is `None` and the durable revert is the whole story, which is exactly the
+    /// path whose premise `rmp` #1083 changed. Interning a token satisfies both: catalog-only, no
+    /// delta, no slot.
+    ///
+    /// Non-vacuous: removing the `adopt_schema_from` fold in `reload_catalog` makes it fail. Note that
+    /// the constraint's absence from the image's committed half is asserted first, so a build that put
+    /// the DDL back into the image would fail HERE rather than passing this test for the wrong reason.
+    #[test]
+    fn a_rollback_does_not_lose_a_committed_declaration_from_the_block_1083() {
+        let s = fresh();
+        let t1 = TxnId(1);
+        s.begin(t1);
+        let label = s.intern_token(Namespace::Label, "L").expect("intern");
+        let key = s.intern_token(Namespace::PropKey, "k").expect("intern");
+        s.set_constraint(
+            t1,
+            "u".to_owned(),
+            crate::meta::ConstraintEntry {
+                label_token: label,
+                property_tokens: vec![key],
+                kind: crate::meta::ConstraintKind::Unique,
+                type_descriptor: None,
+            },
+        );
+        s.commit(t1).expect("the declaration commits");
+        assert!(
+            s.constraint("u").is_some(),
+            "NON-VACUITY: the declaration is not even live before the rollback"
+        );
+        // The declaration is in the BLOCK and not in the committed half of the image ON THE PAGE —
+        // which is what makes the reload below able to lose it, and what this test is actually about.
+        // Read through `read_meta`, the very function the reload uses; a fresh `snapshot_meta` would
+        // recompute an image in which `t1` is already committed and prove nothing.
+        let (durable, _chain) = Store::read_meta(&s.pool).expect("read the durable catalogue");
+        assert_eq!(
+            durable.pending_ddl.as_ref().map(|p| p.txn),
+            Some(t1.0),
+            "the durable image does not attribute the declaration to t1, so the reload has no block \
+             to drop and this test proves nothing"
+        );
+        assert!(
+            durable.statistics.constraint("u").is_none(),
+            "the committed half of the image already carries the declaration, so the reload cannot \
+             lose it and this test proves nothing"
+        );
+
+        // An unrelated transaction that owns no commit slot and no schema undo, then rolls back —
+        // which is the `rollback_physical` path, and therefore the reload.
+        let t2 = TxnId(2);
+        s.begin(t2);
+        s.intern_token(Namespace::Label, "Other").expect("intern");
+        let reloads_before = s.with_catalog(|c| c.catalog_reloads);
+        s.rollback(t2).expect("rollback");
+        assert!(
+            s.with_catalog(|c| c.catalog_reloads) > reloads_before,
+            "the rollback took the logical path and reloaded no catalogue, so this test never \
+             reaches the code it is about"
+        );
+
+        assert!(
+            s.constraint("u").is_some(),
+            "an unrelated rollback erased a COMMITTED constraint from the in-memory catalogue \
+             (`rmp` #1083): the reload dropped the pending-DDL block"
         );
     }
 

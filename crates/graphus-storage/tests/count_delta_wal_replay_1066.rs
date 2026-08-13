@@ -509,10 +509,15 @@ fn a_version_4_image_without_its_block_is_refused() {
         "NON-VACUITY: the intact image must decode, or the truncation below proves nothing"
     );
 
-    // The block is `magic(8) + frontier(8) + count(4)` for an empty set: dropping any of it must be
-    // refused, and dropping all of it must be refused too (that is the case a "trailing bytes are
-    // optional" decoder would wave through as an older image).
-    for drop in 1..=20usize {
+    // The applied-set block is `magic(8) + frontier(8) + count(4)` for an empty set, and the
+    // pending-DDL block that now follows it (`rmp` #1083) is `magic(8) + presence(1)`: dropping any
+    // byte of either must be refused, and dropping all of both must be refused too (that is the case
+    // a "trailing bytes are optional" decoder would wave through as an older image).
+    //
+    // The offset is FOUND rather than counted back from the end, so appending a further trailing
+    // block does not silently turn this into a test of that block instead.
+    let counts_at = find_magic(&bytes, b"GRPHCNTD");
+    for drop in 1..=(bytes.len() - counts_at) {
         let cut = bytes.len() - drop;
         assert!(
             Meta::decode(&bytes[..cut]).is_err(),
@@ -521,13 +526,34 @@ fn a_version_4_image_without_its_block_is_refused() {
         );
     }
 
-    // And a block whose magic is wrong is named as such rather than parsed.
-    let mut corrupt = bytes.clone();
-    let magic_at = bytes.len() - 20;
-    corrupt[magic_at] ^= 0xFF;
-    let err = Meta::decode(&corrupt).expect_err("a bad magic must be refused");
-    assert!(
-        format!("{err}").contains("applied-transaction-set block has a bad magic"),
-        "the refusal must name the block: {err}"
-    );
+    // And a block whose magic is wrong is named as such rather than parsed — for BOTH blocks, so
+    // neither refusal rides on the other's.
+    for (magic, named) in [
+        (
+            &b"GRPHCNTD"[..],
+            "applied-transaction-set block has a bad magic",
+        ),
+        (&b"GRPHPDDL"[..], "pending-DDL block has a bad magic"),
+    ] {
+        let mut corrupt = bytes.clone();
+        corrupt[find_magic(&bytes, magic)] ^= 0xFF;
+        let err = Meta::decode(&corrupt).expect_err("a bad magic must be refused");
+        assert!(
+            format!("{err}").contains(named),
+            "the refusal must name the block: {err}"
+        );
+    }
+}
+
+/// The offset of `magic` inside `bytes`, panicking if it is not there.
+fn find_magic(bytes: &[u8], magic: &[u8]) -> usize {
+    bytes
+        .windows(magic.len())
+        .position(|w| w == magic)
+        .unwrap_or_else(|| {
+            panic!(
+                "a current-version catalog must carry the {} magic",
+                String::from_utf8_lossy(magic)
+            )
+        })
 }
