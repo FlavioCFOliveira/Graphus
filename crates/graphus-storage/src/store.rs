@@ -5469,9 +5469,27 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// The in-memory fold is not undone in that case and does not need to be: the base and the
     /// pending set move together, so the pair stays exact and the next checkpoint persists it.
     ///
+    /// # The returned flag is "I wrote a page", and the caller owes it a flush (`rmp` #1085)
+    ///
+    /// The second element is `true` **iff** [`checkpoint_meta`](Self::checkpoint_meta) actually ran —
+    /// which is the exact predicate for "this fold dirtied a page", because `checkpoint_meta` is the
+    /// only thing here that writes one. It is reported rather than inferred by the caller: the fold
+    /// declines to write on two independent conditions (nothing owed and no pending-DDL block; or a
+    /// lost race for `counts_fold_lock`), and a caller that tried to re-derive that would be
+    /// duplicating a decision this function already makes.
+    ///
+    /// [`checkpoint`](Self::checkpoint) uses it to harden the image, because that write lands AFTER
+    /// its own flush and would otherwise leave the metadata page dirty — bytes its stored checksum
+    /// does not cover. The flag matters and is not a micro-optimisation: a flush is not free even
+    /// with nothing dirty. With a doublewrite buffer attached (which is every production store) it
+    /// chunks the mapped set by [`crate::dwb::DWB_MAX_BATCH`] and each chunk reaches
+    /// `ConcurrentBufferPool::flush_batch`, whose empty-batch path still issues the trailing device
+    /// barrier — so an unconditional second flush would add one `fsync` per ~1018 mapped pages to
+    /// every checkpoint, including the common one where this fold writes nothing at all.
+    ///
     /// # Errors
     /// Returns a storage error if the catalogue image that carries the folded base cannot be written.
-    fn fold_counts_for_reclaim(&self, wanted: u64) -> Result<u64> {
+    fn fold_counts_for_reclaim(&self, wanted: u64) -> Result<(u64, bool)> {
         // Read BEFORE the catalogue hold, and it needs no atomicity with it: a record positioned
         // after this read is positioned above the checkpoint record this floor was computed from.
         let positioning = self.oldest_delta_floor();
@@ -5529,6 +5547,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // Read BEFORE the write, so the release below clears only what that image superseded.
         let ddl_observed = self.pending_ddl_floor.load(Ordering::Acquire);
         let ddl_epoch = self.pending_ddl_epoch.load(Ordering::Acquire);
+        // Set at the ONE site that writes a page, immediately after the write returns `Ok` — not from
+        // the enclosing conditions, which is what would let it drift out of step with reality
+        // (`rmp` #1085).
+        let mut wrote_image = false;
         if owed || ddl_observed != u64::MAX {
             // One at a time, and never waiting: the write below runs under `SYSTEM_TXN`, and two
             // threads inside it would share one WAL transaction — the second `commit` would find it
@@ -5539,6 +5561,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // needs no rank (`graphus_core::latch`).
             if let Ok(_fold) = self.counts_fold_lock.try_lock() {
                 self.checkpoint_meta(SYSTEM_TXN, true)?;
+                wrote_image = true;
                 if owed {
                     self.with_catalog_mut(|c| {
                         c.counts_cov_durable = c.counts_cov_durable.max(target);
@@ -5576,7 +5599,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // must stay readable. Re-read AFTER the release so a block written during this call is
         // honoured too.
         let ddl_floor = self.pending_ddl_floor.load(Ordering::Acquire);
-        Ok(self.with_catalog(|c| {
+        let floor = self.with_catalog(|c| {
             let owed = c.pending_counts.first_key_value().map_or(u64::MAX, |(&lsn, _)| lsn);
             debug_assert!(
                 owed >= c.counts_cov_durable,
@@ -5584,7 +5607,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                  to that coverage would drop a record whose delta no image accounts for"
             );
             target.min(c.counts_cov_durable).min(owed).min(ddl_floor)
-        }))
+        });
+        Ok((floor, wrote_image))
     }
 
     /// Folds **every** logged cardinality delta into the durable base and persists it, so the
@@ -5753,6 +5777,39 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Physical reclamation of the now-redundant WAL prefix (bounding **disk** and the analysis
     /// scan) is the separate follow-up to this redo-bounding step.
     ///
+    /// # Why the flush can happen twice (`rmp` #1085)
+    ///
+    /// The checkpoint is not only a reader of the data image: the counter fold writes a catalogue
+    /// image of its own (`fold_counts_for_reclaim`, `rmp` #1067 and
+    /// #1083). That write cannot be hoisted above the first flush — it needs the reclaim floor, the
+    /// floor needs the `CHECKPOINT-END` record, and that record's empty Dirty Page Table is only
+    /// truthful because a flush preceded it — so the image is written after the first flush and a
+    /// **second** flush hardens it, taken only when the fold actually wrote. Without it a sharp
+    /// checkpoint returned with the metadata page dirty, holding bytes its stored CRC32C did not cover
+    /// (the checksum is stamped at write-back), which is what `rmp` #1085 measured through the DST
+    /// integrity oracle.
+    ///
+    /// # The sharpness above holds against THIS thread's writes, not against a concurrent writer
+    ///
+    /// Stated because the paragraph above would otherwise overclaim. The empty Dirty Page Table makes
+    /// recovery's `redo_start` this checkpoint's own LSN, and redo then skips every record below it.
+    /// That is sound only if no page is left dirty carrying a change logged *below* that LSN — which
+    /// the flush guarantees only while nothing else is writing.
+    /// [`ConcurrentBufferPool::flush_all`](graphus_bufpool::ConcurrentBufferPool::flush_all) says so
+    /// itself: a caller needing the stronger barrier "must quiesce writers", which it notes the
+    /// single-threaded engine did by construction. That premise no longer holds — since `rmp`
+    /// #1033/#975 the engine runs `W` workers over one store held by an unlocked `SharedRef`
+    /// (`graphus-cypher`), and `commit` reaches here through
+    /// `maybe_checkpoint` — so a page dirtied by another worker can be
+    /// missed by the flush and then excluded from redo by the very record this method appends.
+    ///
+    /// That is a **pre-existing defect of the empty Dirty Page Table**, not of the fold or of the
+    /// second flush, and it is not closed here: closing it means emitting a real Dirty Page Table (or
+    /// a conservative pre-flush LSN) so the checkpoint is honestly fuzzy, which is a design decision
+    /// with its own task. `rmp` #1085 narrowed the window — the second flush runs entirely after the
+    /// checkpoint record and catches most pages carrying sub-`ckpt_lsn` changes — but narrowing is not
+    /// closing, and no reader of this method should take the sharpness claim as unconditional.
+    ///
     /// # Errors
     /// Returns a storage error if flushing the dirty pages or syncing the device fails.
     ///
@@ -5789,7 +5846,49 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // It also settles the pending-DDL block for the same reason and in the same image
         // (`rmp` #1083): the durable image may still name a transaction whose `COMMIT` record decides
         // its DDL, and that record must not be dropped underneath it.
-        let reclaim_floor = self.fold_counts_for_reclaim(reclaim_floor)?;
+        let (reclaim_floor, fold_wrote_image) = self.fold_counts_for_reclaim(reclaim_floor)?;
+        // THE CHECKPOINT HARDENS WHAT THE CHECKPOINT ITSELF WROTE (`rmp` #1085).
+        //
+        // The fold above is not a bookkeeping step: it writes a fresh catalogue image through
+        // [`checkpoint_meta`](Self::checkpoint_meta), and it necessarily runs AFTER the `flush` at the
+        // top of this method — it needs the floor, and the floor needs the checkpoint record, and that
+        // record's empty dirty-page table is only truthful because the flush preceded it. So since
+        // `rmp` #1067 gave the fold a page write (and #1083 added the pending-DDL settle to the same
+        // image), a "sharp" checkpoint was returning with the metadata page DIRTY.
+        //
+        // A dirty frame carries a checksum that predates its own bytes — the CRC32C is stamped at
+        // write-back (`page::write_checksum`, called only from the pool's home-write paths) and never
+        // by the store's write path. That is a pool-wide invariant and not a metadata-page quirk, so
+        // the repair belongs here, at the path that promised the pages would be home, and NOT in a
+        // checksum stamped by hand at the write site.
+        //
+        // Placed before the doublewrite floor and the reclaim, so the pages are durable before the log
+        // prefix that would rebuild them is dropped.
+        //
+        // A FULL flush, but only WHEN the fold wrote. The two halves of that are separate decisions:
+        //
+        // * **Full**, rather than a hand-listed page set, because `checkpoint_meta` dirties more than
+        //   the metadata chain — its `map_pages_up_to_high_water` may materialise a record page and
+        //   stamp its type word, and growing the chain writes link bytes into the preceding chunk.
+        //   Enumerating that set is exactly the case analysis this defect came from.
+        // * **Conditional**, because a flush is NOT free when nothing is dirty, and an unconditional
+        //   one would tax every checkpoint for a write that usually does not happen. With a
+        //   doublewrite buffer attached — every production store — `flush` chunks the mapped set by
+        //   `DWB_MAX_BATCH` (1018 pages) and each chunk reaches `flush_batch`, whose empty-batch path
+        //   still issues the trailing device barrier: one `fsync` per chunk, dirty or not, on the
+        //   committer's thread via `maybe_checkpoint`. The gate is the fold's own report of whether it
+        //   called `checkpoint_meta`, which is the precise predicate — that call is the only thing in
+        //   the fold that writes a page — and not a re-derivation of the conditions it decided under.
+        //
+        // Nothing after this point dirties a page: `set_floor` writes the doublewrite device directly,
+        // `reclaim` is WAL-only, and the rest is in-memory bookkeeping.
+        //
+        // What this does NOT claim is global quiescence: a concurrent committer can dirty the metadata
+        // page again the instant this returns, exactly as it can any other page. The invariant restored
+        // is that this checkpoint leaves none of ITS OWN writes in the pool.
+        if fold_wrote_image {
+            self.flush()?;
+        }
         // DOUBLEWRITE FLOOR (`rmp` #437): persist the reclaim floor durably in the DWB **before** the
         // WAL prefix below it is reclaimed. On the next open, eviction-ring recovery ignores any ring
         // slot whose staged `page_lsn` is below this floor (provably superseded by a flushed home
@@ -15504,11 +15603,27 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         });
     }
 
-    /// Reads device page `page` through the pool (verifying its checksum), returning its bytes.
-    /// A DST helper for snapshotting the on-disk image (`04 §11`).
+    /// Reads page `page` **through the pool**, returning its bytes. A DST helper for snapshotting the
+    /// image (`04 §11`).
+    ///
+    /// # It serves the pool, so it is the on-disk image only when the pool is cold (`rmp` #1085)
+    ///
+    /// The read goes through
+    /// [`with_page_fetched`](graphus_bufpool::ConcurrentBufferPool::with_page_fetched), which answers
+    /// a **resident** frame from cache. Only the miss path reads the device, and only that path
+    /// verifies the checksum — a hit returns the cached bytes whatever their stored CRC32C says.
+    ///
+    /// That matters because a **dirty** resident frame holds bytes its checksum does not yet cover:
+    /// the CRC32C is stamped at write-back and never by the store's write path (`rmp` #426 states the
+    /// same fact for the offline checker's cold-open contract). So a caller that wants the DURABLE
+    /// image must flush first. Both callers do — [`crate::backup::backup_store`] quiesces before
+    /// framing its pages, and the DST integrity oracle checkpoints before its checksum pass — and
+    /// `rmp` #1085 was a checkpoint that no longer left the pool cold, surfacing here as a page whose
+    /// bytes and checksum disagreed.
     ///
     /// # Errors
-    /// Returns a storage error if the page is missing or fails checksum verification.
+    /// Returns a storage error if the page is missing, or — on a pool miss only — if the image read
+    /// from the device fails checksum verification.
     pub fn read_device_page(&self, page: PageId) -> Result<Box<graphus_io::Page>> {
         self.pool.with_page_fetched(page, |p| Box::new(*p))
     }
