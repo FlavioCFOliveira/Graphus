@@ -67,7 +67,7 @@ Whenever you author, exercise, or validate test scenarios — especially those i
    - **Boundary between acting and asking.** Obvious, low-risk corrections proceed immediately — for example, a pre-existing bug whose fix is unambiguous (see "Self-contained development policy"). Any decision that changes the scope, the expected behavior, the architecture, or the requirements MUST be put to the user before you act on it.
 2. **All project documentation (including CLAUDE.md and other operational documents) MUST be written in English** — flawless English, free of spelling, grammar, and syntax errors. Use clear, simple, unambiguous technical language intended for human readers.
 3. **Documentation MUST be accurate and faithful to the code.**
-4. **The workflow MUST always follow these steps:** Specify → Implement → Test → Document.
+4. **The workflow MUST always follow these steps:** Specify → Implement → Test → Document. The Implement and Test steps are carried out as the iterative cycle defined in "Development process".
 5. **Open-source inspired.** For every component of the project you MUST look for inspiration in the open-source projects that implement that same component in an exemplary manner. Whenever possible, rely on **more than one** reference project, so that the strengths and the weaknesses of each approach can be compared. Whenever it is necessary, the reference project's **source code** MUST be used as the ultimate source of truth. The mandatory protocol is defined in "Open-source inspiration policy".
 
 ## Decision framework
@@ -89,6 +89,45 @@ When new needs that were not previously foreseen are discovered during a task, t
 All code and development MUST, as a rule, be **full-fledged**. Tests MUST NOT be created with skip.
 
 Whenever you find pre-existing bugs, you MUST fix them on the spot and then continue the work you were doing when you found the bug.
+
+## Development process
+
+**This section governs how development work is carried out. Where it conflicts with any earlier instruction, this section prevails.**
+
+Development MUST proceed as **repeated iterations** of three steps, and the iterations MUST be repeated until the objectives of the work in hand are met:
+
+1. **Analysis** — determine exactly what has to change, and why, before writing any code.
+2. **Bulk development of all the code** — write, in a single pass, all the code identified in step 1.
+3. **Testing of the changes made in step 2** — exercise what that same iteration changed.
+
+If the objectives have not been met at the end of step 3, start a new iteration at step 1.
+
+**You MUST pursue the maximum possible efficiency both in producing the code and in testing it**, in every iteration.
+
+### Focus and scope
+
+**Development MUST be FOCUSED AND OBJECTIVE, and MUST NEVER attempt to go beyond what is required.** Implement exactly what is asked: no speculative generality, no anticipated features, no unrequested refactoring, no adjacent improvements.
+
+### Bulk development
+
+Whenever possible, you MUST write **all** the code of one or several tasks **in bulk**, in a single pass, instead of producing it in small increments.
+
+You MUST look, **at all times**, for tasks of similar scope and bring them together into the same iteration, delegated to the subagent best specialised in their requirements and objectives. Accordingly, when you evaluate the pending tasks you MUST determine whether any of them are substantially close to one another, technically and functionally: tasks with such substantial proximity (similar tasks) MUST be developed together, in the same bulk pass.
+
+Writing the code of several tasks in one bulk pass is allowed. The sequential-execution rule (see "Task execution") continues to govern the **lifecycle** of each task in `rmp`: every task is still opened, validated against its acceptance criteria, closed with its summary, and committed **individually and in order**.
+
+When several tasks are developed together in a single bulk pass, the work MUST be delegated to **one single subagent**: the specialist best suited to the objectives and requirements of those tasks (see "Subagent team" and "Task execution", step 4). The work MUST NOT be split across several subagents.
+
+The three-step cycle (Analysis → bulk development of all the code → testing of the changes) is then applied to the whole set **exactly as if it were a single task**.
+
+### Testing
+
+Tests MUST be run intelligently: **test what you are developing, not the whole project.**
+
+- You MUST work out, **at all times**, the extent of testing that the changes in hand actually require.
+- Each iteration tests the changes made in step 2 of that same iteration.
+- Testing MUST extend to the related components whenever it is foreseeable that the change affects their stability.
+- **The full CI gate MUST be run only on very special occasions**: the closing of a sprint or a `git push`, or a specific request from the user.
 
 ## Perfection-oriented
 
@@ -163,7 +202,7 @@ Whenever possible, you MUST adapt the model and the model's effort level to the 
 
 **Task and sprint execution MUST be carried out sequentially.** Sprints MUST be executed sequentially, and tasks MUST be executed sequentially. Tasks MUST NEVER be run in parallel, regardless of any perceived justification: exactly one task may be in progress at any given moment, and it MUST be closed before the next one is started.
 
-This rule governs the execution of **tasks** (the units of work tracked in `rmp`). It does not restrict the internal execution of the single task that is currently in progress: within that one task you may still engage several subagents at the same time (see "Subagent team"), because subagents are not roadmap tasks.
+This rule governs the **lifecycle** of **tasks** (the units of work tracked in `rmp`): the order in which they are opened, validated, closed, and committed. It does not restrict the internal execution of the single task that is currently in progress: within that one task you may still engage several subagents at the same time (see "Subagent team"), because subagents are not roadmap tasks. Nor does it forbid writing the code of several tasks in a single bulk pass (see "Development process").
 
 **Evaluations and audits may be run in parallel, but ONLY when the user has explicitly authorized it, and ONLY when they are not roadmap tasks.** This covers investigative work such as running several auditor subagents at once inside the single open task, or an ad-hoc evaluation that is not tracked in `rmp`. It NEVER authorizes running two `rmp` tasks concurrently: the "exactly one task in progress" invariant holds without exception, including for tasks whose subject is an audit or an evaluation.
 
@@ -338,7 +377,7 @@ If the answer to any of these questions is "no" or "I don't know", the cheap alt
 
 **Tests and validation**
 
-- While iterating, run the specific test or crate that is at stake; reserve the full suite for the task's final validation.
+- While iterating, run the specific test or crate that is at stake; reserve the full CI gate for the closing of a sprint or a `git push`, or for a specific request from the user (see "Development process").
 - Do not run the full suite repeatedly to check changes that only affect one isolated component.
 
 **Model, effort, and parallelism**
