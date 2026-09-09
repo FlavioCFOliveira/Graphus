@@ -5,7 +5,7 @@
 //!
 //! Graphus's GC "lazy-freeze" rewrites a record's two MVCC header words — `xmin` (created-ts) and
 //! `xmax` (expired-ts) — *in place*, as **two separate, non-atomic, WAL-logged 8-byte writes**
-//! (`graphus-storage::store::freeze_store_headers` → `patch_header_word`). It is a value-preserving
+//! (`graphus-storage::store::settle_and_census_headers` → `patch_header_word`). It is a value-preserving
 //! representation change: visibility resolves a record identically before and after the freeze. The
 //! only hazard, once reads run **off-thread** concurrently with the freeze (the later #336/#339
 //! slices), is a **torn read of a single 8-byte word** — a reader observing 4 old bytes and 4 new
@@ -138,7 +138,7 @@ impl WalRule for TrackingNoopWal {
 /// One frame, two threads:
 /// * the **writer** takes the write latch once and performs the two sequential 8-byte header-word
 ///   writes (xmin then xmax), each as a `with_page_mut_lsn` — mirroring the store's two
-///   `patch_header_word` calls in `freeze_store_headers`;
+///   `patch_header_word` calls in `settle_and_census_headers`;
 /// * the **reader** repeatedly read-latches and reads BOTH words, asserting on every observation that
 ///   each single word is *whole* (either fully-old or fully-new), and that the pair is one of the
 ///   three legal freeze prefixes.
@@ -163,7 +163,7 @@ fn loom_freeze_two_words_vs_reader_no_torn_word() {
         let writer = loom::thread::spawn(move || {
             let f = pw.fetch(PageId(0)).expect("writer fetch");
             // Two separate non-atomic WAL-logged 8-byte writes, each write-latched and lsn-stamped —
-            // exactly `freeze_store_headers`'s two `patch_header_word` calls.
+            // exactly `settle_and_census_headers`'s two `patch_header_word` calls.
             pw.with_page_mut_lsn(f, Lsn(0x10), |p| write_word(p, XMIN_OFF, XMIN_NEW));
             pw.with_page_mut_lsn(f, Lsn(0x11), |p| write_word(p, XMAX_OFF, XMAX_NEW));
             pw.unpin(f);

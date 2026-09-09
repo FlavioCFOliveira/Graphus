@@ -146,16 +146,18 @@ pub fn backup_store<D: BlockDevice, S: LogSink>(store: &RecordStore<D, S>) -> Re
     //      this task's scope; it is recorded here because this is where the evidence surfaced.
     //
     //    Settling a stamp remains a real optimisation — it removes an indirection from every later
-    //    read — and the sweep that does it on every GC pass, `freeze_store_headers_incremental`, is
-    //    untouched. It is simply no longer a *correctness* precondition for a backup.
+    //    read — and it still happens on every GC pass. Since `rmp` #1070 it is performed by the
+    //    reference census's own walk (`RecordStore::settle_and_census_headers`) rather than by a
+    //    sweep with a frontier of its own. It is simply no longer a *correctness* precondition for a
+    //    backup.
     //
     //    One consequence is worth naming rather than leaving to be rediscovered:
-    //    [`RecordStore::freeze_committed_headers`] — the WHOLE-store variant, as opposed to the
-    //    frontier-based one the GC runs — was called from here and from nowhere else, so it now has
-    //    **no caller in the workspace**. It is deliberately retained rather than deleted: `rmp` #1069
-    //    does not retire the freeze machinery (that is #1070, which owns the decision), and it is the
-    //    operation the format-version-6 migration route names — performed by the *previous* build, on
-    //    an image this build refuses. #1070 must decide whether it survives that retirement.
+    //    [`RecordStore::freeze_committed_headers`] was called from here and from nowhere else, so it
+    //    now has **no caller in the workspace**. `rmp` #1070 took the decision to KEEP it — re-expressed
+    //    over the census's scan, so there is no second sweep to drift — because it is the operation the
+    //    format-version-6 migration route names in `05 §12.6`. That route is performed by the
+    //    *previous* build, on an image this build refuses; keeping the operation here is what leaves an
+    //    operator on THIS build the same lever. See that method for the argument in both directions.
 
     // 0b. Make the CARDINALITY self-sufficient without the WAL too (`rmp` #1067), for exactly the
     //     reason step 0 makes the MVCC headers self-sufficient. Since #1067 the durable counters are

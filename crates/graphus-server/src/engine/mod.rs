@@ -51,7 +51,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use graphus_core::error::{GraphusError, Result};
 use graphus_cypher::{IndexBuildTotals, IndexCollectionTotals, TxnCoordinator};
 use graphus_io::BlockDevice;
-use graphus_storage::{GcPassReport, RecordStore};
+use graphus_storage::RecordStore;
 use graphus_txn::IsolationLevel;
 use graphus_wal::LogSink;
 
@@ -2996,10 +2996,6 @@ fn maybe_run_maintenance<D: BlockDevice, S: LogSink>(
             // Success: record progress (aggregate observability counters) and clear **this engine's
             // own** reclamation-degraded flag (`rmp` #435 — never another engine's); reset the streak.
             metrics.record_maintenance_checkpoint(report.reclaimed as u64, report.frozen as u64);
-            // `rmp` #809: raise the durability alert if the release-active freeze-frontier audit found a
-            // committed stamp stranded unfrozen (the pass already skipped the prune fail-closed, so no
-            // data was lost — this makes the regression observable). Zero on every healthy pass.
-            note_freeze_frontier_violations(metrics, &report, db);
             // `rmp` #992: republish this database's derived-index footprint. The pass has just
             // collected the entries its reclaimed versions orphaned, so this is the point at which the
             // number is meaningful — and a gauge that climbs under a steady write workload with no
@@ -3494,37 +3490,6 @@ fn publish_index_collection(metrics: &Metrics, db: &str, totals: &IndexCollectio
         totals.keys_retained,
         totals.abandonments,
     );
-}
-
-/// Raises the `rmp` #809 durability alert for a GC report whose release-active freeze-frontier audit
-/// found a stranded committed stamp. Increments `graphus_freeze_frontier_violations_total` and logs at
-/// `error` with the exact offending store/id/stamps (the storage crate carries no logger, so it surfaced
-/// the detail on the report). A no-op on the healthy path (`freeze_violations == 0`, every normal pass).
-///
-/// The GC pass has ALREADY taken the protective action — it skipped the registry prune, so every affected
-/// committed writer stays resolvable and no committed version is forgotten (`RecordStore::gc`, `rmp`
-/// #809). This is purely the observability half: it makes a freeze-frontier regression (the `rmp` #522
-/// silent-committed-data-loss class) loud and alertable instead of silently degrading GC.
-fn note_freeze_frontier_violations(metrics: &Metrics, report: &GcPassReport, db: &str) {
-    if report.freeze_violations == 0 {
-        return;
-    }
-    metrics.record_freeze_frontier_violations(report.freeze_violations);
-    if let Some(v) = report.first_freeze_violation {
-        tracing::error!(
-            database = db,
-            violations = report.freeze_violations,
-            store = ?v.kind,
-            record_id = v.id,
-            xmin = format_args!("{:#018x}", v.xmin),
-            xmax = format_args!("{:#018x}", v.xmax),
-            "rmp #809 DURABILITY ALERT: the GC freeze-frontier audit found an in-use record still \
-             bearing an unfrozen committed stamp before the registry prune (the rmp #522 \
-             silent-committed-data-loss invariant). The pass SKIPPED the prune fail-closed, so no \
-             committed data was lost, but the Active/Recent Transaction Table is no longer being pruned \
-             — a freeze-frontier regression is live; investigate immediately."
-        );
-    }
 }
 
 /// **Test-only** (`rmp` #435, `internal-test-udf`): handles a [`EngineCommand::SimulateMaintenance`]
@@ -5186,10 +5151,6 @@ fn handle_checkpoint<D: BlockDevice, S: LogSink>(
     // `rmp` #588: reader-safe reclaim — shadow-hold freed slots from reuse while a predating off-thread
     // reader may still be walking a chain through them (see `TxnCoordinator::checkpoint_reader_safe`).
     let report = coordinator.checkpoint_reader_safe(reuse_barrier, oldest_open_ticket)?;
-    // `rmp` #809: an operator `CHECKPOINT DATABASE` runs the same GC pass as the background cadence, so it
-    // must raise the same freeze-frontier durability alert (the pass already skipped the prune fail-closed
-    // if it fired). No-op on the healthy path.
-    note_freeze_frontier_violations(metrics, &report, db);
     // `rmp` #992: an operator `CHECKPOINT DATABASE` runs the same pass, so it republishes the same
     // derived-index footprint gauge as the background cadence.
     metrics.publish_derived_index_entries_for(db, coordinator.derived_index_entries() as u64);

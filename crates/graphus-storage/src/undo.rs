@@ -44,18 +44,19 @@
 //! `RecordStore::gc_reclaim_orphan_slots` (`D-orphan-slot-parking`). Every other path that finishes
 //! with a slot only clears its `in_use` bit and arms the census.
 //!
-//! ### The freeze sweep still runs — the two mechanisms coexist
+//! ### The settle is now part of that same census (`rmp` #1070)
 //!
-//! The indirection removes the need for a **delta** to carry a settled stamp. It did **not** retire
-//! the per-record freeze sweep, which settles the in-place MVCC headers of the three record stores:
-//! `RecordStore::freeze_store_headers_incremental` still walks `[freeze_low, high_water)` on every
-//! GC pass, and the `freeze_low` frontier is still lowered whenever a fresh in-flight stamp lands
-//! below it — by `note_created` / `note_expired`, and by the in-place property-cell write, which
-//! re-stamps an id the sweep would otherwise never revisit. Both mechanisms are live in the current
-//! code, and any reasoning about this store must account for both.
+//! The indirection removes the need for a **delta** to carry a settled stamp, and `rmp` #1069 gave
+//! the same property to a record **header**. What was left was a per-record freeze sweep with a
+//! frontier of its own — a floor every writer had to lower whenever it stamped a header — bounding a
+//! scan whose only remaining purpose was to save one indirection per read.
 //!
-//! Retiring the sweep is its own work, not a side effect of this indirection: `rmp` #1069 → #1070 →
-//! #1071, in that order.
+//! `rmp` #1070 folded that sweep into the census above. There is now ONE walk of the three MVCC
+//! stores per GC pass: it reports which slots the headers name, and settles what it can settle while
+//! it is there. The frontier is gone, and with it every write-path update that maintained it. The
+//! census reads each word as it stood BEFORE the settle, which is what keeps the "an in-use header
+//! names this slot" disjunct observable rather than nominal — see
+//! `RecordStore::settle_and_census_headers`.
 //!
 //! ## Encoding
 //!

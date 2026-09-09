@@ -113,8 +113,9 @@ pub enum StampOutcome {
     /// the Active Transaction Table says so. A gate whose subject is liveness — "keep covering this
     /// record because its writer may still commit" — must ask
     /// `graphus_storage::RecordStore::is_txn_active`, and combine it with the *identity*
-    /// [`names_writer`](CommitOracle::names_writer) gives it. See
-    /// `RecordStore::is_inflight_of_inflight_writer` for the worked reasoning.
+    /// [`names_writer`](CommitOracle::names_writer) gives it. (The worked example used to be
+    /// `RecordStore::is_inflight_of_inflight_writer`, the freeze frontier's carry-forward test, which
+    /// `rmp` #1070 retired with the frontier — the distinction it turned on is unchanged.)
     InFlight(TxnId),
     /// The word's transaction aborted, or is not known to the oracle at all — which means the same
     /// thing for visibility: its writes are never visible (`04 §5.3`).

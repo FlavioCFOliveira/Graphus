@@ -37,7 +37,6 @@ use graphus_core::sched::{self, ResourceId, YieldSite};
 use graphus_core::{
     CommandId, ElementId, HeaderStamp, Lsn, MAX_TIMESTAMP, PageId, Timestamp, TxnId, VersionStamp,
 };
-use graphus_freezefloor::FreezeFloor;
 use graphus_io::{BlockDevice, PAGE_SIZE};
 use graphus_pagemap::PageMapWriter;
 use graphus_txn::{CommitOracle, CommitRegistry, Snapshot, StampOutcome};
@@ -1034,31 +1033,23 @@ pub struct GcPassReport {
     /// [`reclaimed`](Self#structfield.reclaimed) because a delta is not a record version — a caller
     /// tracking live-record cardinality must not see chain maintenance in that figure.
     pub undo_deltas_reclaimed: usize,
-    /// MVCC header words (`xmin`/`xmax`) frozen from a committed writer's in-flight `TxnId` to its
-    /// `Committed(ts)` stamp (`rmp` task #59), making those versions self-describing.
+    /// MVCC header words (`xmin`/`xmax`) **settled** this pass from the naming form — the word holds
+    /// the writer's `commit.store` slot — to the self-describing `Committed(ts)` form (`rmp` task #59,
+    /// `rmp` #1069, `rmp` #1070).
+    ///
+    /// Since `rmp` #1070 the settle is not a pass of its own: it is what the reference census does
+    /// while it walks the three MVCC stores to decide which commit slots nothing names any more (see
+    /// [`settle_and_census_headers`](RecordStore::settle_and_census_headers)). The number therefore
+    /// counts the same words the retired freeze sweep counted, produced by one scan instead of two.
     pub frozen: usize,
     /// Committed writers scheduled to be forgotten from the Active/Recent Transaction Table when
     /// the GC transaction commits (a mid-pass rollback discards the schedule and prunes nothing).
     pub prune_scheduled: usize,
-    /// The total physical-id span the **freeze sweep** visited across the three MVCC stores this pass
-    /// (`rmp` #522 observability): `Σ (high_water - freeze_low)` per kind. On a steadily-growing store
-    /// this stays ≈ the records added since the last pass (O(Δ)) instead of the whole store (O(N)) — the
-    /// direct evidence the maintenance cost is no longer quadratic.
+    /// The total physical-id span the **settle-and-census scan** visited across the three MVCC stores
+    /// this pass (`rmp` #522 observability, `rmp` #1070): `Σ high_water` per kind, because the scan is
+    /// full-range. It is the honest cost of proving a commit slot unreachable, and it is reported so a
+    /// deployment can see that cost rather than infer it.
     pub freeze_scanned: u64,
-    /// **`rmp` #809 — release-active freeze-frontier audit.** How many in-use MVCC records the bounded
-    /// rotating-window audit ([`audit_freeze_frontier_window`](RecordStore::audit_freeze_frontier_window))
-    /// found still bearing an **unfrozen committed-writer stamp** *after* the freeze sweep and *before*
-    /// the registry prune — the exact silent-committed-data-loss invariant of `rmp` #522, verified in an
-    /// ordinary release build (the [`debug_assert_freeze_complete`](RecordStore::debug_assert_freeze_complete)
-    /// full scan runs only under `debug_assertions`/`check-cold-assert`). Normally `0`. A non-zero value
-    /// means a freeze-frontier regression stranded a committed stamp: this pass **skipped the prune** as
-    /// a fail-closed protective response (the affected writers stay resolvable, so no committed version is
-    /// forgotten), and the caller must raise the operator alert.
-    pub freeze_violations: u64,
-    /// The first stranded record the `rmp` #809 audit found this pass (for the operator-facing WARN/ERROR
-    /// log), or `None` when `freeze_violations == 0`. The storage crate carries no logger, so it surfaces
-    /// the offending store/id/stamps here for the server maintenance loop to log.
-    pub first_freeze_violation: Option<FreezeFrontierViolation>,
     /// **`rmp` #992.** How many [`DeadIndexKey`]s this pass collected for the derived-index layer —
     /// i.e. how many index entries the reclamation it just performed may have orphaned.
     ///
@@ -1241,25 +1232,7 @@ impl std::ops::AddAssign for PropChainSweep {
     }
 }
 
-/// One in-use MVCC record found by the `rmp` #809 release-active freeze-frontier audit to still bear an
-/// **unfrozen committed-writer in-flight stamp** after the freeze sweep — i.e. a stamp whose writer the
-/// registry records as `Committed` but whose on-disk word is still the in-flight `TxnId` form. Forgetting
-/// that writer at the following prune would make this version read as **invisible** (silent lost committed
-/// data; the `rmp` #522 class). Carried out of the storage layer (which has no logger) so the server can
-/// emit the structured alert naming the exact store/id/stamps.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FreezeFrontierViolation {
-    /// Which MVCC store the stranded record lives in.
-    pub kind: StoreKind,
-    /// The stranded record's physical id.
-    pub id: u64,
-    /// The record's raw `xmin` (created-ts) header word at detection.
-    pub xmin: u64,
-    /// The record's raw `xmax` (expired-ts) header word at detection.
-    pub xmax: u64,
-}
-
-/// The prune a completed [`RecordStore::gc`] freeze sweep scheduled, held until its GC transaction
+/// The prune a completed [`RecordStore::gc`] settle sweep scheduled, held until its GC transaction
 /// resolves (`rmp` task #59): [`RecordStore::commit`] of `gc_txn` forgets `writers` from the
 /// Active/Recent Transaction Table (the freeze that made them forgettable is durable from that
 /// point on); [`RecordStore::rollback`] of `gc_txn` discards the schedule, because the rollback's
@@ -1636,8 +1609,32 @@ struct CommitDurability {
     /// The largest `commit_ts` of a durable **write** commit — the causal bookmark high-water
     /// (`rmp` #813). Only ever raised, and only by draining the queue above.
     durable_write_commit_ts_hw: u64,
-    /// The `commit_lsn` of each committed transaction whose on-disk headers the GC has not yet frozen.
-    /// Its minimum is the LSN below which the log holds nothing a visibility decision still needs.
+    /// The `commit_lsn` of each committed transaction whose on-disk headers the GC has not yet
+    /// settled. Its minimum floors WAL reclamation.
+    ///
+    /// # `rmp` #1070 examined this for removal, MEASURED it, and kept it — for a different reason
+    ///
+    /// The reason it was written for is gone. It existed so that a header still naming an unsettled
+    /// writer stayed resolvable across a crash, back when only the in-memory [`CommitRegistry`] could
+    /// translate a stamp; since `rmp` #1069 the stamp names a durable `commit.store` slot, which is a
+    /// data page the checkpoint's own flush writes home before it reclaims anything below it. That
+    /// half of the case for removal was verified and holds.
+    ///
+    /// The reason it survives is one `rmp` #1069 created without naming: this floor is what keeps
+    /// `TxnId`s from being **re-issued while a commit slot still records one**. `WalManager::
+    /// max_recovered_txn_id` scans only the RETAINED log, `open` seeds the id counter from it, and
+    /// `CommitSlot::txn_id` — which `read_view`'s oracle compares against the reading transaction to
+    /// answer "is this my own write?" — lives in a data page the log no longer describes. Raise the
+    /// floor and the two disagree: a re-issued id reads a stranger's committed version as its own
+    /// uncommitted write, which `is_visible_via` answers before it ever consults the outcome.
+    ///
+    /// Measured on `d105f96`, 40 write commits with no GC pass, one checkpoint, with and without the
+    /// clamp: retained WAL 733 379 B → 868 B (the clamp is emphatically NOT redundant with the other
+    /// two — with no open transaction they restrict nothing), and `recovered_txn_hw` 6 → 0, after
+    /// which a re-issued `TxnId(1)` sees a version committed at `ts = 1` as its own at a snapshot of
+    /// `ts = 0`. Removing this is therefore gated on making the `TxnId` high-water independent of the
+    /// retained log — deriving it from `commit.store` at `open` is the candidate — which is a task of
+    /// its own and not this one.
     unfrozen_commit_lsn: BTreeMap<TxnId, Lsn>,
     /// The WAL's durable length when the last checkpoint ran — the base the checkpoint interval is
     /// measured from.
@@ -1646,15 +1643,6 @@ struct CommitDurability {
 
 #[derive(Debug)]
 struct Maintenance {
-    /// **`rmp` #809 — release-active freeze-frontier audit cursor.** Per-kind resume id for the bounded
-    /// rotating-window audit ([`audit_freeze_frontier_window`](Self::audit_freeze_frontier_window)) that
-    /// runs on every GC pass in an ordinary release build. Each pass scans `[freeze_audit_from[kind],
-    /// +[`FREEZE_AUDIT_WINDOW_IDS`])` of each MVCC store and advances the cursor, wrapping to `1` at
-    /// `high_water` — so the whole id space is re-verified every `⌈high_water / FREEZE_AUDIT_WINDOW_IDS⌉`
-    /// passes at a fixed `O(window)` per-pass cost, independent of store size. Pure in-memory, rebuilt
-    /// from `1` every open (no on-disk representation, so the store format and crash recovery are
-    /// unchanged). Index `Strings` is unused (heap blocks carry no MVCC stamps).
-    freeze_audit_from: [u64; STORE_COUNT],
     /// **`rmp` #992.** The [`DeadIndexKey`]s the current GC pass has collected, cleared at the start of
     /// every pass and drained by [`take_dead_index_keys`](RecordStore::take_dead_index_keys). Always empty
     /// while `index_interest.is_idle()`.
@@ -1683,7 +1671,6 @@ struct Maintenance {
     /// which also strands that transaction's commit slot. The next full GC pass resolves it with a
     /// reference sweep over `undo.store`; until then the slot is a bounded leak, never a hazard.
     undo_orphan_slots_possible: bool,
-    gc_freeze_low_savepoint: Option<(TxnId, [u64; STORE_COUNT])>,
     /// MVCC version history for the node **label bitmap** (`rmp` task #767).
     ///
     /// The label word is mutated IN PLACE inside the node record, so — unlike a property, which is a
@@ -1701,25 +1688,6 @@ struct Maintenance {
     /// the GC transaction's [`commit`](RecordStore::commit) and discarded at its
     /// [`rollback`](RecordStore::rollback) (`rmp` task #59). `None` while no GC pass is pending.
     pending_gc_prune: Option<PendingGcPrune>,
-    /// The `(gc_txn, freeze_low-before-freeze)` savepoint of the in-progress GC pass (`rmp` #522). A GC
-    /// pass's freeze sweep advances [`freeze_low`](RecordStore::freeze_low), but a rollback of that pass's
-    /// transaction restores (via WAL undo) the in-flight stamps it had frozen — which now sit BELOW the
-    /// advanced frontier and would be skipped by the next sweep, silently stranding a committed writer's
-    /// stamp unfrozen (an unbounded Active/Recent-Transaction-Table leak). So [`gc`](RecordStore::gc) snapshots
-    /// the frontier here before freezing; [`rollback`](RecordStore::rollback) restores it if the aborting
-    /// transaction is this GC pass, and [`commit_prepare`](RecordStore::commit_prepare) clears it. `None`
-    /// outside a GC pass. Mirrors [`pending_gc_prune`](RecordStore::pending_gc_prune)'s lifecycle.
-    ///
-    /// **Audited for `rmp` #1011 (layer 3 of #975) and deliberately left SHARED.** It looks like the
-    /// `undo_slab` — one `Option` keyed by a `TxnId`, so it structurally admits exactly one owner —
-    /// but the conclusion is the opposite, and the reason is worth stating so the next reader does not
-    /// re-open it. Both consumers are guarded on `sp_txn == txn`
-    /// ([`settle_committed_txn`](RecordStore::settle_committed_txn) and [`rollback`](RecordStore::rollback)), so a
-    /// transaction that is *not* the GC pass provably leaves it alone; and the one-owner limit is not
-    /// a constraint to remove, because **GC stays a single actor** under N writers. Making it
-    /// per-transaction would model a concurrency that the design does not have and does not want:
-    /// two simultaneous freeze-frontier savepoints would mean two simultaneous freeze sweeps racing
-    /// on `freeze_low`, which is the `rmp` #522 silent-data-loss shape, not a scalability win.
     /// **`rmp` #1011 — the partly-consumed undo slabs a finished transaction handed back.**
     ///
     /// A slab is one `undo.store` page's worth of ids, owned by ONE transaction while it is open (see
@@ -1844,10 +1812,8 @@ impl Maintenance {
             gc_full_scan_pending: false,
             // The audit window starts at id 1 for every store — a rotating scan has to begin
             // somewhere, and 1 is the first physical id.
-            freeze_audit_from: [1; STORE_COUNT],
             pending_prop_corpses: false,
             undo_orphan_slots_possible: false,
-            gc_freeze_low_savepoint: None,
             pending_gc_prune: None,
             spare_undo_slabs: Vec::new(),
         }
@@ -1933,37 +1899,18 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// the durable [`Meta`], and are re-initialised on every [`open`](Self::open) so crash recovery and
     /// the on-disk format are byte-for-byte unchanged.
     ///
-    /// The **freeze frontier**: `freeze_low[kind]` is the smallest physical id that may still carry an
-    /// unfrozen committed-in-flight MVCC stamp. The freeze sweep visits only `[freeze_low, high_water)`.
-    /// Invariant: every in-use record below `freeze_low[kind]` has all its committed-writer stamps
-    /// already frozen to `Committed(ts)` and carries no in-flight-writer stamp. It is LOWERED to `id`
-    /// by [`note_created`](Self::note_created) / [`note_expired`](Self::note_expired) (a fresh
-    /// `xmin`/`xmax` in-flight stamp at `id`) and RAISED by the freeze sweep to the smallest id in the
-    /// range still bearing an in-flight-writer stamp (or `high_water` if none). Initialised to `1` on
-    /// open, so the first pass is a full freeze that settles every pre-existing on-disk stamp.
+    /// **What `rmp` #1070 removed from this set, and why it could go.** There used to be a *freeze
+    /// frontier* here — a per-kind floor, lowered by every writer that stamped a header and raised by a
+    /// freeze sweep of its own — whose job was to bound that sweep to the records written since the
+    /// last pass. It is gone. Settling a header is no longer a correctness obligation (since `rmp`
+    /// #1069 an unsettled word names a durable commit slot and resolves for ever), so there is no
+    /// separate sweep left to bound: the settle is a side effect of the reference census, which has to
+    /// walk the three MVCC stores anyway to prove a commit slot unreachable. A frontier maintained by
+    /// the WRITE path to bound a scan the COLLECTOR performs was the one part of this set whose cost
+    /// fell on every property write, and the census cannot use it — a census bounded by a frontier is
+    /// only as complete as the frontier, and completeness is what licenses freeing a slot.
+    /// See [`settle_and_census_headers`](Self::settle_and_census_headers).
     ///
-    /// [`FreezeFloor`] since `rmp` #1014, and the type is the CORRECTION, not a way to change a
-    /// signature. Each of the three operations has exactly one correct primitive, and each wrong one
-    /// strands a stamp by a different route:
-    ///
-    /// * **descend** must be `fetch_min`. Expressed as read-compare-write it is a lost update: two
-    ///   writers stamping records below the frontier both read the old value, both decide, and the
-    ///   later store discards the earlier descent.
-    /// * **raise** must be a compare-exchange against the value the sweep's scan started from. Its
-    ///   `new_low` is a statement about `[from, high_water)` and about nothing below `from`, so an
-    ///   unconditional store swallows any descent that landed under it while the pass ran.
-    /// * **a rolled-back sweep's restore** must descend to the savepoint, for the same reason.
-    ///
-    /// In every case the frontier stops covering an id, the freeze sweep never revisits it, and a
-    /// committed writer's stamp stays in-flight for ever — the `rmp` #522 silent-data-loss shape.
-    ///
-    /// The algebra lives in [`graphus_freezefloor`] rather than here, and this field **is** that type,
-    /// because a leaf crate is the only place it can be `loom`-model-checked (`--cfg loom` is a global
-    /// rustflag, so a crate with an edge to `graphus-bufpool` cannot be modelled at all). The models
-    /// there pair every property with a negative control that calls the naive alternative and requires
-    /// it to lose a descent — so the three sentences above are measured, not asserted. Same
-    /// arrangement as [`graphus_chainhead`] (`rmp` #1028).
-    freeze_low: [FreezeFloor; STORE_COUNT],
     /// The GC's pending-work sets (`rmp` #1014). See [`Maintenance`] for why they are one latch,
     /// and [`with_maintenance`](Self::with_maintenance) for the only way to reach them.
     /// The commit path's durability bookkeeping (`rmp` #1032). See [`CommitDurability`] for why the
@@ -2075,7 +2022,8 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// A monotonic **drain-progress beacon** (`rmp` #563): the store bumps it as its long-running
     /// engine-thread operations make forward progress — every doublewrite flush chunk written home
     /// ([`flush_protected_with_attached_dwb`](Self::flush_protected_with_attached_dwb)) and every step of
-    /// the O(N) GC scan ([`gc`](Self::gc), [`freeze_store_headers`](Self::freeze_store_headers)). The
+    /// the O(N) GC scan ([`gc`](Self::gc),
+    /// [`settle_and_census_headers`](Self::settle_and_census_headers)). The
     /// server's `stop_engine` polls this same [`AtomicU64`] (a clone shared via the engine handle) while
     /// draining an engine, so it can tell a **healthy-but-slow** engine (this counter still advancing)
     /// from a genuinely **wedged** one (a hung syscall / livelock — the counter frozen) and force-detach
@@ -2225,19 +2173,6 @@ pub const DEFAULT_CHECKPOINT_INTERVAL_BYTES: u64 = 64 * 1024 * 1024;
 /// costs that page's unused tail and nothing else — a spare is an optimisation, never a correctness
 /// requirement.
 const MAX_SPARE_UNDO_SLABS: usize = 16;
-
-/// **`rmp` #809 — release-active freeze-frontier audit window.** How many physical ids of *each* MVCC
-/// store the always-on prune-soundness audit re-verifies per GC pass (see
-/// [`RecordStore::audit_freeze_frontier_window`]). It bounds the audit's per-pass cost to a fixed
-/// `3 * O(FREEZE_AUDIT_WINDOW_IDS)` (constant, independent of store size), while the per-kind rotating
-/// cursor re-covers the whole id space every `⌈high_water / FREEZE_AUDIT_WINDOW_IDS⌉` passes. `8192`
-/// was chosen empirically (`freeze_audit_window_cost_is_negligible_809`): at this size the three windows
-/// add on the order of tens of microseconds to a GC pass — negligible next to the pass's own freeze /
-/// reclaim / checkpoint work — while a store of a few hundred thousand records is fully re-audited within
-/// a few dozen maintenance ticks (and a *systematic* freeze regression, which strands stamps densely, is
-/// caught in far fewer). One page holds 125 node / 80 rel / ~146 prop records, so a window spans ~55–100
-/// store pages — a handful of page fetches per kind.
-const FREEZE_AUDIT_WINDOW_IDS: u64 = 8192;
 
 /// Shards of the page log-apply-order latch (`rmp` #1028, re-keyed by page in `rmp` #1062).
 ///
@@ -2544,13 +2479,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 image_cov_refs: Mutex::new(BTreeMap::new()),
             }),
             commit_registry: RwLock::new(CommitRegistry::new()),
-            // `rmp` #522 incremental-GC state (pure in-memory; rebuilt from scratch every open). The
-            // freeze frontier starts at `1` so the first pass fully settles every pre-existing on-disk
-            // stamp; `gc_full_scan_pending` forces that first pass to also do the full corpse/property
-            // sweep for anything a fresh process has no in-memory record of.
-            freeze_low: std::array::from_fn(|_| FreezeFloor::new(1)),
-            // `rmp` #809: the release-active freeze-frontier audit starts each store's rotating window
-            // at id 1 (pure in-memory; rebuilt every open, so the on-disk format is unchanged).
+            // `rmp` #522 incremental-GC state (pure in-memory; rebuilt from scratch every open).
+            // `gc_full_scan_pending` forces the first pass to do the full corpse/property sweep for
+            // anything a fresh process has no in-memory record of.
             commit_durability: std::sync::Mutex::new(CommitDurability::default()),
             maintenance: std::sync::Mutex::new(Maintenance::default()),
             // `rmp` #588: reader-safe slot-reuse overlay (in-memory; empty unless off-thread readers hold a slot).
@@ -2773,13 +2704,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 image_cov_refs: Mutex::new(BTreeMap::new()),
             }),
             commit_registry: RwLock::new(commit_registry),
-            // `rmp` #522 incremental-GC state (pure in-memory; rebuilt from scratch every open). The
-            // freeze frontier starts at `1` so the first pass fully settles every pre-existing on-disk
-            // stamp; `gc_full_scan_pending` forces that first pass to also do the full corpse/property
-            // sweep for anything a fresh process has no in-memory record of.
-            freeze_low: std::array::from_fn(|_| FreezeFloor::new(1)),
-            // `rmp` #809: the release-active freeze-frontier audit starts each store's rotating window
-            // at id 1 (pure in-memory; rebuilt every open, so the on-disk format is unchanged).
+            // `rmp` #522 incremental-GC state (pure in-memory; rebuilt from scratch every open).
+            // `gc_full_scan_pending` forces the first pass to do the full corpse/property sweep for
+            // anything a fresh process has no in-memory record of.
             // Restored from what recovery reconstructed, NOT defaulted (`rmp` #1032). Three values
             // ride on this and each fails silently if zeroed: the durable-write bookmark must resume at
             // the recovered `commit_ts_hw` or a reader's causal bookmark steps BACKWARDS across a
@@ -3649,9 +3576,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// The scan is paid **only** by a pre-version-3 image: every catalog this build writes is version
     /// 3 ([`snapshot_meta`](Self::snapshot_meta)), so the first checkpoint after a successful upgrade
     /// retires the cost permanently, and a store this build created never pays it once. It is also a
-    /// pass this store already performs: the first GC pass after every `open` scans `props.store` from
-    /// id 1 (`freeze_low` starts at `1`, `gc_full_scan_pending` is `true`), so the marginal cost of
-    /// the gate is one extra linear pass over the property store, once, on a legacy image.
+    /// pass this store already performs: every GC pass scans `props.store` from id 1 (the
+    /// settle-and-census walk is full-range, `rmp` #1070), so the marginal cost of the gate is one
+    /// extra linear pass over the property store, once, on a legacy image.
     ///
     /// **Measured** before the choice was taken, on this project's file-backed device
     /// (`FileBlockDevice` + `FileLogSink`, 8192-frame pool, release build, x86-64):
@@ -3745,9 +3672,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// lossless, and refusing it would be a false alarm that costs an operator a migration for
     /// nothing.
     ///
-    /// The scan covers the three versioned stores in full (not `[freeze_low, high_water)`): the
-    /// frontier is in-memory state that a freshly-opened store has not yet established, so the only
-    /// honest bound at `open` is the whole id space. It runs once, at open, on an image that is by
+    /// The scan covers the three versioned stores in full, which is the only honest bound at `open`:
+    /// nothing in memory can vouch for any part of an image this build has not yet read. (It used to
+    /// be worth saying that it is NOT the freeze frontier's bounded range; since `rmp` #1070 there is
+    /// no bounded range to contrast it with.) It runs once, at open, on an image that is by
     /// construction one version behind.
     ///
     /// # Errors
@@ -4458,23 +4386,17 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 cell.mvcc.expired_ts, cell.mvcc.undo_ptr
             )));
         }
-        // `rmp` #522 FREEZE FRONTIER, re-armed for the `rmp` #967 in-place write path.
+        // NOTHING IS BOOKKEPT HERE ANY MORE (`rmp` #1070), and that is the point of this line's
+        // absence. Until #1070 this write — the one place a property cell is rewritten IN PLACE, and
+        // therefore the one place a fresh unsettled stamp lands at an id far BELOW a frontier the
+        // append path could never take it under — had to lower the freeze frontier, an atomic
+        // read-modify-write on ONE shared cache line paid by every property overwrite of every writer.
         //
-        // This is the one place a property cell is rewritten IN PLACE, and every such rewrite restamps
-        // `created_ts` to the writer's in-flight stamp. Before #967 a property write always ALLOCATED a
-        // record, so a fresh in-flight stamp could only ever appear at or above the frontier and
-        // `note_created`'s `lower_freeze_low` was enough. After #967 a `SET`/`REMOVE` of an existing key
-        // restamps an EXISTING id, which is very often far BELOW the frontier — so the incremental
-        // freeze sweep (`[freeze_low, high_water)`) never revisits it, the stamp is never settled to
-        // `Committed(ts)`, and once the registry forgets that writer `is_visible_via` reads the stamp as
-        // unresolvable. That is the exact #522 silent-lost-committed-data shape, reopened from a new
-        // direction; `debug_assert_freeze_complete` caught it (DST
-        // `bulk_load_mid_abort_wal_bound_590` / `reader_store_growth`, "in-use Prop record N still
-        // bears an unfrozen committed-writer in-flight stamp").
-        //
-        // Lowering the frontier is the same remedy `note_created` documents for a reused id, and it
-        // fails CLOSED: the only cost of lowering it too far is a wider sweep on the next GC pass.
-        self.lower_freeze_low(StoreKind::Prop, id);
+        // It was load-bearing while a bounded freeze sweep was the only thing that could settle a
+        // stamp before the registry forgot its writer (the `rmp` #522 shape, reopened by #967's
+        // in-place path). Since `rmp` #1069 an unsettled word names a durable commit slot and resolves
+        // for ever, so no sweep has to find this record by a deadline, and since #1070 the settle is
+        // performed by the census's own full-range walk, which does not need to be told where to look.
         let mut buf = [0u8; PROP_RECORD_SIZE];
         cell.encode(&mut buf);
         let (rel_page, off) = paging::record_location(id, PROP_RECORD_SIZE);
@@ -4706,7 +4628,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// that the row vanished — [`CommitRegistry::outcome`] maps an unknown id to
     /// [`Aborted`](graphus_txn::TxnOutcome::Aborted), so a committed version whose writer the table
     /// had forgotten read as invisible. That is `rmp` #522's silent-lost-committed-data shape, and it
-    /// is why the freeze sweep, the freeze frontier and the WAL retention floor all had to exist.
+    /// is why the freeze sweep, the freeze frontier and the WAL retention floor all had to exist
+    /// (`rmp` #1070 retired all three on the strength of exactly this experiment).
     /// Since phase 3 the stamp names a durable commit slot, so the row survives — and this seam is
     /// what lets a test say so.
     ///
@@ -5360,8 +5283,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // The settle itself is DEFERRED to [`settle_committed_txn`](Self::settle_committed_txn), which
         // runs at each of this method's two exits — and at neither of them before every fallible step
         // has succeeded (`rmp` #955). Until then NOTHING of this transaction's bookkeeping is released:
-        // not the active-set entry (`rmp` #866), not the linked undo deltas, not the freeze-frontier
-        // savepoint. That is what keeps a FAILED commit recoverable: the transaction is still, in every
+        // not the active-set entry (`rmp` #866), not the linked undo deltas. That is what keeps a
+        // FAILED commit recoverable: the transaction is still, in every
         // respect the store can be asked about, an open writer holding uncommitted state, so
         // [`uncommitted_data_writer`](Self::uncommitted_data_writer) keeps naming it (the `rmp` #902
         // constraint-DDL guard stays fail-CLOSED) and a subsequent [`rollback`](Self::rollback)
@@ -5628,10 +5551,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // rollback path.
         let holds_ddl = self.open_txn_holds_pending_ddl();
         self.with_catalog_mut(|c| c.catalog_dirty = holds_ddl);
-        // Remember this commit record's LSN until a GC freeze settles `txn`'s versions: WAL
-        // reclamation must keep it readable so a crash can still resolve an unfrozen in-flight stamp
-        // (`rmp` #114 / the lazy freeze of #49/#59). This only ever LOWERS the reclaim floor, and reclaim
-        // runs only in the post-harden `maybe_checkpoint`, so setting it pre-harden advances no watermark.
+        // Remember this commit record's LSN until a GC pass settles `txn`'s versions (`rmp` #114 / the
+        // lazy freeze of #49/#59). Its ORIGINAL reason — keeping the record readable so a crash could
+        // still resolve an unsettled stamp — was retired by `rmp` #1069, which made the stamp resolve
+        // through a durable data page instead; the floor is retained because it is also what keeps a
+        // `TxnId` from being re-issued while a `commit.store` slot still records it. See the field.
+        // This only ever LOWERS the reclaim floor, and reclaim runs only in the post-harden
+        // `maybe_checkpoint`, so setting it pre-harden advances no watermark.
         self.with_commit_durability(|d| d.unfrozen_commit_lsn.insert(txn, commit_lsn));
         // If `txn` was a GC pass, its header freeze is durable once the deferred harden completes (`rmp`
         // task #59): every writer the pass scheduled is no longer referenced by any on-disk in-flight
@@ -5647,8 +5573,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .forget(writer);
-                // The writer's versions are now frozen (commit-ts stamps on disk): its commit record
-                // is no longer needed to resolve any stamp, so it stops flooring WAL reclamation.
+                // The writer's versions are now settled (commit-ts stamps on disk) and its registry
+                // entry is gone, so nothing names its id any more and its commit record stops
+                // flooring WAL reclamation.
                 self.with_commit_durability(|d| d.unfrozen_commit_lsn.remove(&writer));
             }
         }
@@ -5663,29 +5590,23 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// store can be asked about, an open writer holding uncommitted state — otherwise a failed commit
     /// leaves mutations that are physically present but attributable to nobody.
     ///
-    /// It does three things, in this order:
+    /// It does two things, in this order:
     ///
     /// 1. **Settles the retained label versions** from the in-flight stamp to `Committed(commit_ts)`
     ///    (`rmp` #767). Unlike the record headers — settled lazily at GC time because doing it eagerly
     ///    was `O(records)` WAL-logged page writes — this history is small and purely in-memory, so
     ///    settling now is free and logs nothing. It is REQUIRED, not an optimisation: a raw in-flight
     ///    stamp is only resolvable while the [`CommitRegistry`] still holds `txn`, and a GC pass
-    ///    FORGETS committed writers from that registry once their headers are frozen. After that the
+    ///    FORGETS committed writers from that registry once their headers are settled. After that the
     ///    registry maps the unknown id to `Aborted`, so the version would read as never-committed and
     ///    every reader would fall back to the PRE-CHANGE bitmap — a committed label change silently
     ///    reverting in memory, healed only by a restart.
-    /// 2. **Clears the GC freeze-frontier savepoint** (`rmp` #522). This GC pass is committing, so its
-    ///    freeze-frontier advance is permanent and the rollback savepoint is no longer needed. A no-op
-    ///    for any transaction that is not the in-progress GC pass.
-    /// 3. **Removes the active-set entry**, and with it the count delta (`rmp` #866) and the schema
+    /// 2. **Removes the active-set entry**, and with it the count delta (`rmp` #866) and the schema
     ///    undo log (`rmp` #734) a rollback would otherwise have withdrawn.
+    ///
+    /// It used to do a third thing — clear the GC freeze-frontier savepoint — and `rmp` #1070 removed
+    /// both the savepoint and the frontier it saved.
     fn settle_committed_txn(&self, txn: TxnId, _commit_ts: Timestamp) {
-        if self.with_maintenance(|m| {
-            m.gc_freeze_low_savepoint
-                .is_some_and(|(sp_txn, _)| sp_txn == txn)
-        }) {
-            self.with_maintenance(|m| m.gc_freeze_low_savepoint = None);
-        }
         // Hand the unconsumed undo slab back before the entry that owns it is dropped (`rmp` #1011).
         let slab = self.active.remove(txn).and_then(|a| a.undo_slab);
         self.return_undo_slab(slab);
@@ -6490,7 +6411,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// would then resurrect a stale stamp (a lost-update / visibility breach). Used for the MVCC
     /// **tombstone** (`xmax = in_flight(txn)`) writes of [`delete_node`](Self::delete_node),
     /// [`delete_rel`](Self::delete_rel).
-    /// The GC-time freeze ([`freeze_store_headers`](Self::freeze_store_headers)) keeps the plain
+    /// The GC-time settle ([`settle_and_census_headers`](Self::settle_and_census_headers)) keeps the plain
     /// [`patch_header_word`](Self::patch_header_word): it runs only inside a GC pass that holds the
     /// store exclusively (no interleaving mutator), so its undo can never race a concurrent writer.
     fn patch_header_word_cas(
@@ -7874,10 +7795,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///
     /// 1. **No concurrent property writer.** This check: while `W` holds the entity, every other
     ///    transaction's property write on it is refused.
-    /// 2. **The freeze sweep will not touch it.**
-    ///    [`freeze_store_headers_incremental`](Self::freeze_store_headers_incremental) rewrites only
-    ///    stamps that [`frozen_word`](Self::frozen_word) resolves to a **committed** writer;
-    ///    `W` is unresolved, so its `created_ts` is skipped.
+    /// 2. **The settle sweep will not touch it.**
+    ///    [`settle_and_census_headers`](Self::settle_and_census_headers) rewrites only stamps that
+    ///    [`frozen_word`](Self::frozen_word) resolves to a **committed** writer; `W` is unresolved, so
+    ///    its `created_ts` is skipped.
     /// 3. **GC will not reclaim the cell.** [`gc_property_chain`](Self::gc_property_chain) requires
     ///    the owner's `undo_ptr == 0`, and `W`'s open delta is on that chain, so the head is non-zero.
     /// 4. **The whole chain will not be freed.** [`free_property_chain`](Self::free_property_chain)
@@ -8534,7 +8455,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///
     /// # Errors
     /// Returns a storage error if a chain is malformed or a write fails.
-    fn gc_reclaim_undo_chains(&self, txn: TxnId, watermark: Timestamp) -> Result<usize> {
+    fn gc_reclaim_undo_chains(
+        &self,
+        txn: TxnId,
+        watermark: Timestamp,
+        named_by_header: &std::collections::BTreeSet<u64>,
+    ) -> Result<usize> {
         // The full-store census, collected only on the pass that scans the record stores anyway. Its
         // chain-head half is what lets the orphan sweep below free a delta a CRASH stranded (see
         // [`gc_sweep_undo_orphans`](Self::gc_sweep_undo_orphans)).
@@ -8584,7 +8510,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // [`reclaim_aborted_undo`](Self::reclaim_aborted_undo) on a physical one — and the sweep
         // itself re-arms when it had to DEFER a slot, so a deferral is never a permanent leak.
         if self.with_maintenance(|m| m.undo_orphan_slots_possible) || full_census.is_some() {
-            freed += self.gc_sweep_undo_orphans(txn, full_census.as_ref())?;
+            freed += self.gc_sweep_undo_orphans(txn, full_census.as_ref(), named_by_header)?;
         }
         Ok(freed)
     }
@@ -8660,42 +8586,127 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         Ok(census)
     }
 
-    /// Every `commit.store` slot an MVCC record header may still name, collected on **every** pass
-    /// that runs the reference census (`rmp` #1069).
+    /// **The settle-and-census scan** (`rmp` #1070): one walk of the three MVCC record stores that
+    /// *settles* every header word it can settle and *reports* every `commit.store` slot still named
+    /// by one afterwards.
     ///
-    /// # Why the range is `[freeze_low, high_water)` and why that is exact
+    /// Returns `(slots still named, header words settled, physical ids visited)`.
     ///
-    /// A header word names a slot only while it is **unsettled** — see
-    /// [`slot_named_by_header_word`]. The freeze frontier
-    /// ([`freeze_low`](Self#structfield.freeze_low)) is defined as the smallest id that may still
-    /// carry an unsettled stamp, and the whole store already rests on that definition: every in-use
-    /// record below it has had its committed writers' stamps frozen to `Committed(ts)`, a record
-    /// still bearing an **open** writer's stamp holds the frontier down
-    /// ([`is_inflight_of_inflight_writer`](Self::is_inflight_of_inflight_writer)), and a fresh stamp
-    /// lowers it ([`lower_freeze_low`](Self::lower_freeze_low)). A stamp stranded below the frontier
-    /// is already silent lost committed data, which is why
-    /// [`debug_assert_freeze_complete`](Self::debug_assert_freeze_complete) scans the FULL range to
-    /// assert it cannot happen. So this census adds no new risk class: it is exactly as sound as the
-    /// freeze sweep, and it is bounded by the same frontier that keeps the sweep affordable rather
-    /// than by an `O(store)` scan on every GC pass.
+    /// # Why the two jobs are one scan, and one operation
+    ///
+    /// They ask the same question of the same word — "does this word name a `commit.store` slot?" —
+    /// and until #1070 they asked it in two separate sweeps of the same id range, one per GC pass.
+    /// Merging them removes the second walk. It does NOT change the answer, and deliberately so: the
+    /// census still reads the word as it stood BEFORE this pass settled it, which is the order the
+    /// two sweeps had (census in phase F, settle in phase E after it) and the order `rmp` #1069's
+    /// header disjunct is only observable in. See the per-word comment in the loop for why the
+    /// apparently better order — settle, then census — is the one that would quietly disarm it.
+    ///
+    /// The consequence is the one #1069 already ratified: a slot whose last naming header this pass
+    /// settles is retired by the NEXT pass, and the sweep re-arms its own gate so that costs one pass
+    /// rather than waiting for an unrelated event.
+    ///
+    /// # Why the range is the WHOLE store, and why that is not a regression it pretends away
+    ///
+    /// A census that frees a slot must be **complete**: one header missed is one committed version
+    /// silently re-attributed to whichever transaction next receives the recycled id. Completeness is
+    /// therefore the property, and a bound is admissible only if something proves nothing lies
+    /// outside it. The retired freeze frontier was exactly such a proof — and it was a proof
+    /// maintained by the WRITE path, at the cost of an atomic read-modify-write on one shared cache
+    /// line per stamped record (`rmp` #522, widened to every in-place property overwrite by #967).
+    ///
+    /// It is worth being precise about what that bought, because the answer is "less than it looks".
+    /// The frontier is a floor over every id that may bear an unsettled stamp, and it is dragged to
+    /// the bottom by any tombstone of an old record and any in-place property overwrite of one. On an
+    /// append-only store it stayed high and the sweep was `O(Δ)`; on any store with churn it sat near
+    /// `1` and the sweep was already `O(store)` — twice, once for the census and once for the freeze,
+    /// plus the rotating audit window that watched the frontier. What this scan costs, per pass, is
+    /// one full-range header read; what it replaces cost two bounded ones plus an audit, and the
+    /// bound was only tight for workloads that never delete and never overwrite.
+    ///
+    /// The scan itself is the cheap half and the settle is the dear one, and they scale differently:
+    /// naming is a pure bit test on a word already read by the page-batched header scan
+    /// ([`slot_named_by_header_word`]), whereas settling costs a durable `commit.store` read plus a
+    /// WAL-logged 8-byte patch — and *only unsettled records pay it*. So the durable work stays
+    /// `O(Δ)` exactly as it was, and it is the header read that becomes `O(store)`.
+    ///
+    /// # A concurrent writer stamping behind the scan is covered, and not by this scan
+    ///
+    /// The walk is not atomic against other writers, so a writer may stamp a header at an id this
+    /// pass has already visited, and its slot is then in neither this scan's answer nor — if it
+    /// commits before phase F samples the open set — the `open` disjunct. What covers it is the
+    /// THIRD disjunct: every write that stamps a header also links an undo delta naming the same
+    /// slot as `commit_info` (a creation's header undo, a tombstone's, and the `SetProperty` delta
+    /// `link_set_property` writes before the in-place cell write), and a delta is reclaimable only
+    /// once the watermark has passed its transaction's commit — which cannot have happened in the
+    /// window between this scan and the sweep that reads it. The exposure is unchanged from before
+    /// `rmp` #1070: the retired census read its frontier once at its start and had the same window.
     ///
     /// # Errors
-    /// Returns a storage error if a record page cannot be read. The caller must then free **nothing**
-    /// — an unreadable census is not an empty one.
-    fn census_slots_named_by_headers(&self) -> Result<std::collections::BTreeSet<u64>> {
+    /// Returns a storage error if a record page cannot be read or a settle patch cannot be written.
+    /// The caller must then free **nothing** — an unreadable census is not an empty one.
+    fn settle_and_census_headers(
+        &self,
+        txn: TxnId,
+    ) -> Result<(std::collections::BTreeSet<u64>, usize, u64)> {
         let mut named = std::collections::BTreeSet::new();
+        let mut settled = 0usize;
+        let mut visited = 0u64;
         for kind in MVCC_STORE_KINDS {
-            // Same budget discipline as the freeze sweep, which scans this very range: a large store
-            // must not let one scan look like a stalled drain.
+            // A large store must not let one scan look like a stalled drain (`rmp` #563).
             self.bump_drain_progress();
-            let from = self.freeze_low[kind as usize].get();
-            for (_, mvcc) in read_view::scan_in_use_mvcc_from(&self.pool, &self.stores, kind, from)?
-            {
-                named.extend(slot_named_by_header_word(mvcc.created_ts));
-                named.extend(slot_named_by_header_word(mvcc.expired_ts));
+            // ONE COVERAGE POINT PER KIND, exactly as the retired phase-E sweep offered (`rmp` #973):
+            // the deterministic scheduler's seeds place a concurrent writer between two stores'
+            // scans, and collapsing three sites into one would silently narrow the interleavings
+            // gate 5 of `scripts/verify.sh` can reach.
+            sched::yield_at(YieldSite::GcPhaseE, ResourceId::slot(kind as u8, 0));
+            visited += self.store(kind).alloc.high_water().saturating_sub(1);
+            let in_use = read_view::scan_in_use_mvcc(&self.pool, &self.stores, kind)?;
+            for (i, &(id, mvcc)) in in_use.iter().enumerate() {
+                for (offset, word) in [
+                    (MVCC_OFF_CREATED_TS, mvcc.created_ts),
+                    (MVCC_OFF_EXPIRED_TS, mvcc.expired_ts),
+                ] {
+                    // CENSUS FIRST, SETTLE SECOND — per word, and this order is load-bearing.
+                    //
+                    // The tempting order is the other one: settle, then ask what is left naming a
+                    // slot, which retires a slot in the same pass that removed its last name and
+                    // saves one pass of reclamation latency. It is UNSOUND AS A TEST SUBJECT and
+                    // marginal as an optimisation, and the first half is what decides it.
+                    //
+                    // `rmp` #1069's whole contribution is the disjunct "a slot is reachable while an
+                    // in-use MVCC header names it". Settling first would leave that disjunct
+                    // reachable only for a header naming an ABORTED transaction's slot (which the
+                    // settle declines) or an open one (which the `open` disjunct already covers) —
+                    // so the census's header half would answer "nothing" for every committed
+                    // transaction, for ever, and the test that pins it
+                    // (`the_census_keeps_a_commit_slot_an_mvcc_header_still_names`) would pass
+                    // against a build with that disjunct deleted. An upstream step that makes the
+                    // primary control's test vacuous is not defence in depth; it is the control
+                    // being switched off quietly.
+                    //
+                    // Deferring instead costs exactly one pass, and that pass was already the
+                    // behaviour `rmp` #1069 measured, documented and ratified: the sweep re-arms its
+                    // own gate, so the slot is retired by the next pass rather than waiting for an
+                    // unrelated event.
+                    named.extend(slot_named_by_header_word(word));
+                    if let Some(settled_word) = self.frozen_word(word)? {
+                        self.patch_header_word(kind, id, offset, settled_word, txn)?;
+                        settled += 1;
+                    }
+                }
+                // A tombstone (in-use, `xmax` set) is a reclaim candidate — seed the reclaim set
+                // (idempotent). Inherited from the retired freeze sweep, which is where this scan's
+                // predecessor learnt about tombstones a fresh process has no in-memory record of.
+                if mvcc.expired_ts != 0 {
+                    self.with_maintenance(|m| m.pending_tombstones[kind as usize].insert(id));
+                }
+                if i % 4096 == 0 {
+                    self.bump_drain_progress();
+                }
             }
         }
-        Ok(named)
+        Ok((named, settled, visited))
     }
 
     /// The undo area's **reference sweep**: retires every delta and every commit slot that nothing
@@ -8727,12 +8738,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// silently re-attributed to another transaction.
     ///
     /// Where each half comes from: the undo-store scan supplies `next` and `commit_info`;
-    /// [`census_slots_named_by_headers`](Self::census_slots_named_by_headers) supplies the header
-    /// half on **every** pass, bounded by the freeze frontier; and `full_census` supplies the
-    /// `undo_ptr` half plus a full-range widening of the header half, and is `Some` only on a pass
-    /// that has just scanned the record stores
-    /// ([`seed_pending_undo_chains`](Self::seed_pending_undo_chains)). Without it the **delta** phase
-    /// is skipped rather than guessed — a skipped reclamation is a bounded leak, a wrong one is
+    /// `named_by_header` is handed in by [`settle_and_census_headers`](Self::settle_and_census_headers),
+    /// which ran earlier in this same pass and walked the FULL id range of all three MVCC stores
+    /// (`rmp` #1070) — it is a complete statement, not a bounded one, and that completeness is what
+    /// licenses the free below; and `full_census` supplies the `undo_ptr` half plus a redundant
+    /// widening of the header half, and is `Some` only on a pass that has just scanned the record
+    /// stores ([`seed_pending_undo_chains`](Self::seed_pending_undo_chains)). Without it the **delta**
+    /// phase is skipped rather than guessed — a skipped reclamation is a bounded leak, a wrong one is
     /// corruption. The **slot** phase needs no such gate, because its header half is always available.
     ///
     /// Three conservative rules, all in the safe direction:
@@ -8745,16 +8757,18 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// * a retired slot is **parked**, not freed. It re-enters circulation one pass later, through
     ///   [`gc_reclaim_orphan_slots`](Self::gc_reclaim_orphan_slots).
     ///
-    /// # Phases E and F are deliberately NOT reordered (`rmp` #1069)
+    /// # The one-pass deferral phase E used to impose is gone (`rmp` #1070)
     ///
-    /// This sweep runs inside phase F, and phase E — the freeze sweep that settles the very headers
-    /// the census reads — runs after it. So on the pass that reclaims a transaction's last chain, its
-    /// headers still name its slot and the census defers. Moving the freeze before phase F would close
-    /// that window and save one pass of latency, and it was considered and **declined**: with the
-    /// release discipline of `rmp` #1069 in place, phase F frees no slot at all, so the window is a
-    /// deferral and never a wrong answer. Reordering two GC phases to buy one pass of reclamation
-    /// latency is not worth the risk of disturbing an order the property sweep and the tombstone prune
-    /// also depend on. The deferral is made self-healing instead, by re-arming the gate.
+    /// There used to be a separate freeze sweep — phase E — that settled the very headers this census
+    /// reads, and it ran AFTER phase F. So on the pass that reclaimed a transaction's last chain its
+    /// headers still named its slot, the census deferred, and the slot waited a pass. `rmp` #1069
+    /// declined to reorder the two phases to close that window, on the grounds that a deferral is
+    /// never a wrong answer and that the order was worth more than the pass. `rmp` #1070 makes the
+    /// question disappear rather than answering it: the settle and the census are ONE scan
+    /// ([`settle_and_census_headers`](Self::settle_and_census_headers)) which runs before this sweep,
+    /// so a slot whose last naming header was settled in this pass is reported unnamed in this pass.
+    /// The self-healing re-arm below stays regardless — it still covers a slot deferred because its
+    /// transaction is open, or because a delta still names it.
     ///
     /// If the GC pass that ran this sweep later **rolls back**, its writes are undone by the WAL while
     /// the parked ids stay parked in memory; the next pass's `!in_use` re-check finds them live again
@@ -8776,6 +8790,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         &self,
         txn: TxnId,
         full_census: Option<&FullStoreCensus>,
+        named_by_header: &std::collections::BTreeSet<u64>,
     ) -> Result<usize> {
         let chain_heads = full_census.map(|c| &c.chain_heads);
         let undo_hw = self.store(StoreKind::Undo).alloc.high_water();
@@ -8853,7 +8868,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // full-store scan on the pass that ran one. A read error propagates: an unreadable census is
         // not an empty one, and freeing on the strength of one would be exactly the corruption this
         // sweep is here to prevent.
-        let mut named_by_header = self.census_slots_named_by_headers()?;
+        let mut named_by_header = named_by_header.clone();
         if let Some(census) = full_census {
             named_by_header.extend(&census.slots_named_by_headers);
         }
@@ -9056,11 +9071,6 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Records that `txn` version-stamped (created) record `id` in `kind`'s store, so `commit` can
     /// settle its `xmin`. A no-op for the reserved system transaction, which never creates records.
     fn note_created(&self, txn: TxnId, kind: StoreKind, id: u64) {
-        // `rmp` #522: a fresh `xmin = in_flight(txn)` stamp at `id` needs freezing once `txn` commits.
-        // Lower the freeze frontier so the next freeze sweep re-visits `id` (a no-op for the common case
-        // where `id >= freeze_low[kind]` — a fresh append above the frontier — but load-bearing when a
-        // reused id lands below it). Recorded even for `SYSTEM_TXN` so a system-created record is frozen.
-        self.lower_freeze_low(kind, id);
         if txn != SYSTEM_TXN {
             self.active.with_entry(txn, |active| {
                 active.created.push((kind, id));
@@ -9071,37 +9081,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         }
     }
 
-    /// Lowers the `rmp` #522 freeze frontier for `kind` to cover `id` (a no-op if `id` is already at or
-    /// above it). See [`freeze_low`](Self::freeze_low).
-    #[cfg(test)]
-    pub(crate) fn freeze_frontier(&self, kind: StoreKind) -> u64 {
-        self.freeze_low[kind as usize].get()
-    }
-
-    /// Lowers the `rmp` #522 freeze frontier for `kind` to cover `id`. Takes `&self` since `rmp` #1014.
-    #[cfg(test)]
-    pub(crate) fn lower_freeze_frontier(&self, kind: StoreKind, id: u64) {
-        self.lower_freeze_low(kind, id);
-    }
-
-    fn lower_freeze_low(&self, kind: StoreKind, id: u64) {
-        // `descend` is `fetch_min`, not read-compare-write: see the field's documentation for the lost
-        // update the latter admits and the `rmp` #522 stamp it strands.
-        //
-        // Called AFTER the stamp at `id` has been written, which is `descend`'s documented obligation
-        // on its caller: a sweep that observes the lowered frontier and scans `id` must find the stamp
-        // there. Both call sites — `note_created` and `note_expired` — are reached from the write path
-        // once the header word is already in the page.
-        self.freeze_low[kind as usize].descend(id);
-    }
-
     /// Records that `txn` tombstoned (expired) record `id` in `kind`'s store, so `commit` can settle
     /// its `xmax`.
     fn note_expired(&self, txn: TxnId, kind: StoreKind, id: u64) {
-        // `rmp` #522: a fresh `xmax = in_flight(txn)` stamp both needs freezing (lower the frontier) and
-        // makes `id` a reclaim candidate once the tombstone commits at or below the GC watermark. The
-        // reclaim sweep iterates this set instead of scanning the whole store.
-        self.lower_freeze_low(kind, id);
+        // `rmp` #522: a fresh `xmax` stamp makes `id` a reclaim candidate once the tombstone commits at
+        // or below the GC watermark. The reclaim sweep iterates this set instead of scanning the whole
+        // store. (Until `rmp` #1070 this also had to lower a freeze frontier so a bounded sweep would
+        // revisit `id`; there is no frontier and no bounded sweep any more.)
         self.with_maintenance(|m| m.pending_tombstones[kind as usize].insert(id));
         if txn != SYSTEM_TXN {
             self.active.with_entry(txn, |a| a.expired.push((kind, id)));
@@ -9398,17 +9384,17 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// The caller owns the transaction lifecycle (it must later commit or roll back `txn`), exactly
     /// as for any other mutator; the reclamation writes are WAL-logged and crash-recovered the same.
     ///
-    /// ## GC-time header freezing + table pruning (`rmp` task #59)
+    /// ## GC-time header settling + table pruning (`rmp` task #59, `rmp` #1070)
     ///
     /// After the reclamation sweeps, every surviving record of **all MVCC record kinds** (nodes,
-    /// relationships, per-value property versions) has its header **frozen**
-    /// ([`freeze_store_headers`](Self::freeze_store_headers)): an `xmin`/`xmax` word that carries a
-    /// committed writer's in-flight `TxnId` is rewritten — WAL-logged under `txn`, like every other
-    /// header write — to the `Committed(ts)` form the Active/Recent Transaction Table resolves it
-    /// to. Still-in-flight stamps (no committed outcome) are left untouched. The freeze sweep walks
-    /// each store's full physical-id range, independent of chain structure and of `watermark`, so a
-    /// single pass provably visits every record: after it, **no** in-use record references any
-    /// writer the table records as committed.
+    /// relationships, per-value property versions) has its header **settled**
+    /// ([`settle_and_census_headers`](Self::settle_and_census_headers)): an `xmin`/`xmax` word that
+    /// names a committed writer's `commit.store` slot is rewritten — WAL-logged under `txn`, like
+    /// every other header write — to the self-describing `Committed(ts)` form. Stamps of writers
+    /// that have not resolved are left untouched. The scan walks each store's full physical-id
+    /// range, independent of chain structure and of `watermark`, so a single pass provably visits
+    /// every record: after it, **no** in-use record names the slot of any writer the table records
+    /// as committed.
     ///
     /// The pass therefore schedules every such writer to be **forgotten** from the table — but only
     /// once the freeze is durable: the prune applies when `txn` **commits**
@@ -9425,11 +9411,16 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.gc_inner(txn, watermark, false)
     }
 
-    /// A **freeze-only** GC pass (`rmp` #590): runs only the incremental freeze sweep (Phase E) and the
-    /// registry-prune scheduling, **skipping** the reclamation sweeps (Phases A–D: relationship/node
-    /// tombstone reclaim, the corpse splice, and the property-chain sweep). Its sole purpose is to drain
-    /// the store's `unfrozen_commit_lsn` map — i.e. to **lower the WAL reclaim floor** — as cheaply as
-    /// possible, so a caller can bound the retained WAL without paying the reclamation sweeps.
+    /// A **settle-only** GC pass (`rmp` #590): runs only the settle-and-census scan (phase S) and the
+    /// registry-prune scheduling, **skipping** the reclamation sweeps (phases A–D: relationship/node
+    /// tombstone reclaim, the corpse splice, and the property-chain sweep) and phase F. Its sole purpose
+    /// is to drain the store's `unfrozen_commit_lsn` map — i.e. to **lower the WAL reclaim floor** — as
+    /// cheaply as possible, so a caller can bound the retained WAL without paying the reclamation sweeps.
+    ///
+    /// It kept that purpose through `rmp` #1070: the drain runs off the registry prune, the prune is
+    /// scheduled by phase S, and phase S is exactly what this pass still runs. What changed is the
+    /// pass's per-call cost, which is now one full-range header walk rather than a frontier-bounded
+    /// one — see [`settle_and_census_headers`](Self::settle_and_census_headers).
     ///
     /// Why this exists: a network Mode A bulk-import updates a durable checkpoint-sentinel node's
     /// counters **every batch** (`graphus_server`'s `bulk_load::checkpoint_sentinel`), and each update
@@ -9437,17 +9428,16 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// and the Phase D property sweep — a full `O(store)` scan of every live owner's property chain —
     /// gates ON on every pass. Running that sweep on a *tightened* mid-load cadence would reintroduce the
     /// exact `O(N²)` maintenance cost `rmp` #556/#565 widened the loading cadence to avoid, even though
-    /// the freeze sweep itself is `O(Δ)` since `rmp` #522. The freeze sweep is all that is needed to
-    /// advance the WAL floor; the (few, sentinel-only) dead property versions a load leaves behind are
+    /// the settle's own DURABLE work is `O(Δ)` (only unsettled records are written). The settle is all
+    /// that is needed to advance the WAL floor; the (few, sentinel-only) dead property versions a load leaves behind are
     /// reclaimed later by the ordinary full cadence after the next `START DATABASE`, or by the FULL
     /// end-of-load checkpoint (`rmp` #579) at a clean `End`.
     ///
-    /// Soundness: the prune's precondition is *freeze completeness* (every committed writer's on-disk
-    /// in-flight stamps settled to `Committed(ts)`), which the Phase E freeze establishes independently
-    /// of whether dead slots are reclaimed; the freeze-frontier invariant (see [`freeze_low`](Self::freeze_low))
-    /// likewise holds whether or not a tombstone below the frontier is physically freed (its stamps are
-    /// frozen either way). This pass therefore leaves the store's *committed, visible* image and its
-    /// crash-recovery behaviour identical to a full pass — only deferred slot reclamation differs.
+    /// Soundness: the prune's precondition is *settle completeness* (every committed writer's on-disk
+    /// naming stamps rewritten to `Committed(ts)`), which the phase-S scan establishes independently of
+    /// whether dead slots are reclaimed — it walks the whole id space either way. This pass therefore
+    /// leaves the store's *committed, visible* image and its crash-recovery behaviour identical to a
+    /// full pass; only deferred slot reclamation differs.
     ///
     /// # Errors
     /// Returns a storage error if a record read or a freeze write fails.
@@ -9476,30 +9466,23 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             m.dead_index_keys_dropped = 0;
         });
 
-        // `rmp` #522: snapshot the freeze frontier BEFORE the freeze sweep advances it, so a rollback of
-        // this GC pass (whose WAL undo restores the stamps it froze) can restore the frontier and not
-        // strand those now-un-frozen stamps below it. Cleared at this pass's commit. No other transaction
-        // runs between here and this pass's commit/rollback (the single engine thread holds the store).
-        //
-        // THAT PREMISE NO LONGER HOLDS (`rmp` #1032): the store is `&self` throughout and several
-        // writers run at once, so a concurrent descent CAN land between this capture and the rollback
-        // that consumes it, making the savepoint HIGHER than the live frontier. The savepoint is
-        // still correct, and by construction rather than by luck: the restore is a `descend`
-        // (`fetch_min`, `rmp` #1014), so a savepoint above the live value restores nothing and the
-        // concurrent writer's lower claim survives untouched. Restoring with a plain store is what
-        // would need the single-thread premise — which is exactly why #1014 removed it.
-        let savepoint = (txn, std::array::from_fn(|i| self.freeze_low[i].get()));
-        self.with_maintenance(|m| m.gc_freeze_low_savepoint = Some(savepoint));
+        // NO FRONTIER SAVEPOINT IS TAKEN HERE ANY MORE (`rmp` #1070). There used to be one, because a
+        // rollback of this pass restores (via WAL undo) the stamps its freeze sweep had settled, and
+        // those stamps would then sit BELOW a frontier the sweep had already advanced past — stranded
+        // for ever. With the frontier gone the restored stamps are simply seen again by the next
+        // pass's full-range scan, which is what makes the savepoint unnecessary rather than merely
+        // unused: there is no state a rollback has to put back.
 
         // `rmp` #563: heartbeat the drain-progress beacon across every phase of this GC pass so a
         // `STOP DATABASE` that races it sees a *progressing* engine and waits rather than force-detaching.
         self.bump_drain_progress();
 
-        // ---- Phases A–D: reclamation sweeps. SKIPPED in a freeze-only pass (`rmp` #590). ----
-        // A freeze-only pass exists solely to advance the WAL reclaim floor (Phase E) cheaply during a
-        // bulk load; the reclamation sweeps are what make a mid-load pass `O(store)` (the Phase D property
-        // sweep gates ON every batch because the load's checkpoint sentinel tombstones a property version
-        // per batch), so they are deferred to the next full pass. See [`gc_freeze_only`](Self::gc_freeze_only).
+        // ---- Phases A–D and F: reclamation sweeps. SKIPPED in a settle-only pass (`rmp` #590). ----
+        // A settle-only pass exists solely to advance the WAL reclaim floor — which the registry prune
+        // that phase S schedules is what drains — cheaply during a bulk load. The reclamation sweeps are
+        // what make a mid-load pass `O(store)` in WRITES (the Phase D property sweep gates ON every batch
+        // because the load's checkpoint sentinel tombstones a property version per batch), so they are
+        // deferred to the next full pass. See [`gc_freeze_only`](Self::gc_freeze_only).
         if !freeze_only {
             // ---- Phase A: reclaim reclaimable RELATIONSHIP tombstones (`rmp` #522: pending-set driven). ----
             // Was an O(store) `scan_in_use_mvcc(Rel)` every tick; now iterates only the tombstones tracked
@@ -9549,7 +9532,30 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // parkings are always listed by the NEXT pass and never by the one that proved them.
             sched::yield_at(YieldSite::GcPhaseB2, ResourceId::txn(txn.0));
             reclaimed += self.gc_reclaim_orphan_slots(txn)?;
+        }
 
+        // ---- Phase S: SETTLE the MVCC header stamps and CENSUS the slots they name (`rmp` #1070). ----
+        // One walk of the three MVCC record stores that does both jobs, replacing the retired phase E
+        // (a freeze sweep bounded by a writer-maintained frontier) and the retired `rmp` #809 audit
+        // window that watched that frontier. See [`settle_and_census_headers`] for why the two jobs are
+        // one operation and why the range is the whole store.
+        //
+        // WHERE IT SITS, AND WHY. After the reclamation sweeps A–C, so a slot they freed (no longer
+        // `in_use`) is skipped rather than settled and then thrown away. Before phase F, because F is
+        // where the census's answer is consumed — and being before it is what removes the one-pass
+        // deferral #1069 had to accept when the settle ran last.
+        //
+        // It runs in a FREEZE-ONLY pass too, which is what keeps `gc_freeze_only`'s contract intact:
+        // that pass exists to settle stamps without paying the reclamation sweeps, and settling is
+        // exactly what this does. Its census output is simply unused there, because phase F is skipped.
+        let mut frozen = 0usize;
+        let mut freeze_scanned = 0u64;
+        self.bump_drain_progress();
+        let (named_by_header, settled, visited) = self.settle_and_census_headers(txn)?;
+        frozen += settled;
+        freeze_scanned += visited;
+
+        if !freeze_only {
             // ---- Phase F: reclaim undo chains no live snapshot can reach (`rmp` #966). ----
             // Runs after the node/relationship sweeps, so an entity reclaimed above has already had
             // its own chain freed with it and is not walked again here. Candidate-set driven exactly
@@ -9568,7 +9574,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // footprint independent of the GC cadence.
             self.bump_drain_progress();
             sched::yield_at(YieldSite::GcPhaseF, ResourceId::txn(txn.0));
-            undo_deltas_reclaimed = self.gc_reclaim_undo_chains(txn, watermark)?;
+            undo_deltas_reclaimed =
+                self.gc_reclaim_undo_chains(txn, watermark, &named_by_header)?;
 
             // ---- Phase D: sweep PROPERTY chains, gated (`rmp` #522). ----
             // Reclaims **empty** property cells (`rmp` #967, `D-property-removal`) and dead-link
@@ -9601,34 +9608,6 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             }
         }
 
-        // ---- Phase E: freeze committed-but-unfrozen MVCC stamps (`rmp` task #59), frontier-based. ----
-        // Settle every surviving committed in-flight stamp to its durable `Committed(ts)` form across the
-        // three MVCC record stores (heap blocks carry no version stamps). Was an O(store)
-        // `scan_in_use_mvcc` per kind every tick; now the freeze frontier (`freeze_low`) starts each scan
-        // at the smallest id that may still bear an unfrozen stamp, so a steadily-growing store freezes
-        // only the records added since the last pass (`rmp` #522). Runs AFTER the reclamation sweeps so
-        // reclaimed slots (no longer `in_use`) are skipped. After this pass no in-use record references
-        // any writer the registry records as committed, which is the precondition for the prune below.
-        //
-        // ORDER vs phase F (`rmp` #1069): the freeze is deliberately NOT hoisted above phase F. Doing
-        // so would settle the headers before F's reference census reads them, closing the one-pass
-        // window in which a just-reclaimed transaction's headers still name its commit slot. That is a
-        // RECLAMATION-LATENCY choice, not a correctness one, and it was declined: since #1069 phase F
-        // frees no commit slot at all — it only parks what its census has proved unreachable — so the
-        // window can produce a deferral and never a wrong answer, and the sweep re-arms its own gate so
-        // the deferral costs exactly one pass. Reordering two GC phases buys that one pass at the price
-        // of disturbing an order the property sweep (phase D) and the tombstone prune below both read
-        // as given. See `gc_sweep_undo_orphans`.
-        let mut frozen = 0usize;
-        let mut freeze_scanned = 0u64;
-        for kind in [StoreKind::Rel, StoreKind::Node, StoreKind::Prop] {
-            self.bump_drain_progress();
-            sched::yield_at(YieldSite::GcPhaseE, ResourceId::slot(kind as u8, 0));
-            let (f, s) = self.freeze_store_headers_incremental(txn, kind)?;
-            frozen += f;
-            freeze_scanned += s;
-        }
-
         // The first post-open pass has now discovered every pre-existing on-disk corpse/tombstone and
         // seeded the tracking sets, so subsequent passes can safely run the gated incremental sweeps.
         // A freeze-only pass (`rmp` #590) SKIPPED those seeding scans (Phases A–D), so it must NOT clear
@@ -9639,161 +9618,49 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         }
 
         // `rmp` #522 (durability-audit W1 regression guard): before scheduling the prune that will
-        // forget every committed writer, assert the freeze sweep actually settled ALL of their on-disk
-        // in-flight stamps — the invariant the prune's soundness rests on (a stranded committed stamp
-        // whose writer is forgotten reads as invisible: silent lost committed data). This FULL-store
-        // scan is compiled out (costs nothing) in an ordinary release build; it stays the strongest
-        // guarantee under `debug_assertions`/`check-cold-assert`. See [`debug_assert_freeze_complete`].
+        // forget every committed writer, assert phase S actually settled ALL of their on-disk stamps.
+        // This FULL-store scan is compiled out (costs nothing) in an ordinary release build; it stays
+        // the strongest guarantee under `debug_assertions`/`check-cold-assert`.
+        //
+        // ITS ROLE CHANGED WITH `rmp` #1070, and it is worth saying which way. It used to be the
+        // debug-build half of a two-tier watch on a frontier that could STRAND a stamp below itself,
+        // the release-active half being the #809 rotating window. There is no frontier to strand a
+        // stamp under any more: phase S visits every id of every MVCC store on every pass, so the
+        // invariant this asserts is a direct restatement of what that scan just did, and it fires only
+        // if the scan is wrong — which is precisely what a regression guard is for. The #809 window is
+        // retired with the frontier it watched. See [`debug_assert_freeze_complete`].
         self.debug_assert_freeze_complete();
 
-        // `rmp` #809: the always-on, release-active counterpart of the guard above. It re-verifies the
-        // SAME invariant over a bounded rotating id window (so full-store coverage every N passes at a
-        // fixed O(window) per-pass cost), and reports any stranded committed stamp it finds — the tier
-        // that runs in production, where the full scan does not. See [`audit_freeze_frontier_window`].
-        let (freeze_violations, first_freeze_violation) = self.audit_freeze_frontier_window()?;
-
-        if freeze_violations == 0 {
-            // Normal path: schedule the table prune. Every writer recorded as committed at this point had
-            // ALL of its on-disk in-flight stamps rewritten by the freeze sweep (the frontier invariant
-            // guarantees no in-use record below `freeze_low` bears an unfrozen committed stamp, and the
-            // sweep froze the rest), so each becomes forgettable the moment the freeze is durable — i.e.
-            // when `txn` commits. The GC transaction itself, and any transaction that commits between
-            // here and that commit, is not in this set and is pruned by a later pass.
-            let writers = self
-                .commit_registry
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .committed_writers();
-            let prune_scheduled = writers.len();
-            // Both counters under ONE hold: the pair is reported together, so reading them at two
-            // instants could report a queue length that never coexisted with that drop count.
-            let dead_keys =
-                self.with_maintenance(|m| (m.dead_index_keys.len(), m.dead_index_keys_dropped));
-            self.with_maintenance(|m| {
-                m.pending_gc_prune = Some(PendingGcPrune {
-                    gc_txn: txn,
-                    writers,
-                });
+        // Schedule the table prune. Every writer recorded as committed at this point had ALL of its
+        // on-disk naming stamps rewritten by phase S's full-range settle, so each becomes forgettable
+        // the moment that settle is durable — i.e. when `txn` commits. The GC transaction itself, and
+        // any transaction that commits between here and that commit, is not in this set and is pruned
+        // by a later pass.
+        let writers = self
+            .commit_registry
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .committed_writers();
+        let prune_scheduled = writers.len();
+        // Both counters under ONE hold: the pair is reported together, so reading them at two
+        // instants could report a queue length that never coexisted with that drop count.
+        let dead_keys =
+            self.with_maintenance(|m| (m.dead_index_keys.len(), m.dead_index_keys_dropped));
+        self.with_maintenance(|m| {
+            m.pending_gc_prune = Some(PendingGcPrune {
+                gc_txn: txn,
+                writers,
             });
-            Ok(GcPassReport {
-                reclaimed,
-                undo_deltas_reclaimed,
-                frozen,
-                prune_scheduled,
-                freeze_scanned,
-                freeze_violations: 0,
-                first_freeze_violation: None,
-                dead_index_keys: dead_keys.0,
-                dead_index_keys_dropped: dead_keys.1,
-            })
-        } else {
-            // `rmp` #809 fail-closed response: a committed stamp is stranded unfrozen below the frontier,
-            // so pruning now would forget a writer that a live version still needs to resolve — the exact
-            // `rmp` #522 silent-committed-data-loss failure. **Skip the prune this pass** (leave every
-            // committed writer in the Active/Recent Transaction Table, so its version stays visible) and
-            // surface the violation to the caller for the operator alert. This is strictly safer than
-            // pruning-then-losing-data, and safer than aborting the whole database on a durability path (a
-            // false abort is itself a durability hazard); a later pass reprunes once the condition clears.
-            // Not scheduling `pending_gc_prune` mirrors exactly what a rolled-back GC pass does.
-            let dead_keys =
-                self.with_maintenance(|m| (m.dead_index_keys.len(), m.dead_index_keys_dropped));
-            Ok(GcPassReport {
-                reclaimed,
-                undo_deltas_reclaimed,
-                frozen,
-                prune_scheduled: 0,
-                freeze_scanned,
-                freeze_violations,
-                first_freeze_violation,
-                dead_index_keys: dead_keys.0,
-                dead_index_keys_dropped: dead_keys.1,
-            })
-        }
-    }
-
-    /// **Release-active freeze-frontier audit** (`rmp` #809) — the always-on counterpart of
-    /// [`debug_assert_freeze_complete`](Self::debug_assert_freeze_complete). Called by
-    /// [`gc`](Self::gc)/[`gc_freeze_only`](Self::gc_freeze_only) after the freeze sweep and immediately
-    /// before the registry prune, in **every** build (not just debug/`check-cold-assert`).
-    ///
-    /// It re-verifies the `rmp` #522 prune-soundness invariant — *no in-use MVCC record still bears an
-    /// unfrozen committed-writer in-flight stamp* — using the exact [`frozen_word`](Self::frozen_word)
-    /// predicate the sweep clears (`frozen_word(word).is_some()` ⇔ an unfrozen committed stamp). The
-    /// difference from the debug guard is **cost, not correctness**: the debug guard scans the *whole*
-    /// store on every prune (O(store), too dear for production); this scans a fixed-size id **window**
-    /// (`FREEZE_AUDIT_WINDOW_IDS` ids of each MVCC store) and advances a per-kind rotating cursor, so the
-    /// per-pass cost is `O(window)` — constant, independent of store size — and the whole id space is
-    /// re-verified every `⌈high_water / FREEZE_AUDIT_WINDOW_IDS⌉` passes.
-    ///
-    /// **Detection latency.** A *systematic* freeze-frontier regression (the real failure mode: e.g. the
-    /// dead `outcome == InFlight` predicate that caused `rmp` #522) strands committed stamps *densely* —
-    /// essentially every record a GC pass raised the frontier past while a writer was in flight — so the
-    /// window hits one within a handful of passes (O(1) in the density). An *isolated* single stranding
-    /// is caught within one full sweep of the id space (the bound above). Either way this is eventual, not
-    /// per-prune, detection — acceptable for a defense-in-depth guard over a path already audited SOUND,
-    /// and the caller's fail-closed prune-skip means the FIRST detection prevents the data loss regardless
-    /// of how many passes it took (the writers are not forgotten until a clean pass finds zero violations).
-    ///
-    /// Returns `(violation_count, first_violation)` for this pass's windows. Read-only + best-effort: a
-    /// page-read error surfaces nothing and leaves the cursor put (the next pass retries) rather than
-    /// failing the GC pass — a transient read fault must not turn a maintenance tick into an abort.
-    fn audit_freeze_frontier_window(&self) -> Result<(u64, Option<FreezeFrontierViolation>)> {
-        let mut violations = 0u64;
-        let mut first: Option<FreezeFrontierViolation> = None;
-        // The three MVCC stores (heap `Strings` blocks carry no version stamps). Each advances its own
-        // window cursor every pass, so total per-pass cost is `3 * O(FREEZE_AUDIT_WINDOW_IDS)`.
-        for kind in [StoreKind::Node, StoreKind::Rel, StoreKind::Prop] {
-            let ki = kind as usize;
-            let from = self.with_maintenance(|m| m.freeze_audit_from[ki]);
-            let (records, next_from) = match read_view::scan_in_use_mvcc_window(
-                &self.pool,
-                &self.stores,
-                kind,
-                from,
-                FREEZE_AUDIT_WINDOW_IDS,
-            ) {
-                Ok(v) => v,
-                // Best-effort: a read fault must never fail the maintenance pass. Leave the cursor so the
-                // next pass re-covers this window; report no violation (we simply did not observe here).
-                Err(_) => continue,
-            };
-            for (id, mvcc) in records {
-                // The SAME "unfrozen committed stamp" predicate the freeze sweep clears (`frozen_word`
-                // is `Some` only for an in-flight stamp whose writer the registry records as Committed).
-                // A genuinely-open writer's stamp maps to `None` (correctly not a violation — it is frozen
-                // once that writer commits), so this never fires on legitimately in-flight data.
-                // A stamp that cannot be RESOLVED is a different failure from a page that cannot be
-                // READ, and it is deliberately NOT folded into the best-effort `continue` above: the
-                // caller treats `violations == 0` as licence to prune the transaction table, so
-                // answering "no violation" on a fault would fail OPEN — precisely the `rmp` #522
-                // silent-lost-committed-data direction. It propagates and the GC pass fails instead,
-                // which leaves every committed writer in the table. Unreachable in phase 2 (the
-                // in-memory registry never faults); load-bearing from `rmp` #1069 phase 3 on.
-                if self.frozen_word(mvcc.created_ts)?.is_some()
-                    || self.frozen_word(mvcc.expired_ts)?.is_some()
-                {
-                    violations += 1;
-                    if first.is_none() {
-                        first = Some(FreezeFrontierViolation {
-                            kind,
-                            id,
-                            xmin: mvcc.created_ts,
-                            xmax: mvcc.expired_ts,
-                        });
-                    }
-                }
-            }
-            // Advance the rotating cursor: resume at `next_from`, or wrap to `1` once the window reached
-            // this store's high-water (a full sweep of its id space is complete).
-            let high_water = self.store(kind).alloc.high_water();
-            let advanced = if next_from >= high_water {
-                1
-            } else {
-                next_from
-            };
-            self.with_maintenance(|m| m.freeze_audit_from[ki] = advanced);
-        }
-        Ok((violations, first))
+        });
+        Ok(GcPassReport {
+            reclaimed,
+            undo_deltas_reclaimed,
+            frozen,
+            prune_scheduled,
+            freeze_scanned,
+            dead_index_keys: dead_keys.0,
+            dead_index_keys_dropped: dead_keys.1,
+        })
     }
 
     /// Reads just the 25-byte MVCC header of record `id` in `kind`'s store (freeze-sweep helper —
@@ -9818,14 +9685,15 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// The two-part shape is **unchanged** — an identity pre-gate, then the outcome — and the reason
     /// for the pre-gate is unchanged too: [`resolve_stamp`](CommitOracle::resolve_stamp) maps an
     /// already-settled word to `Committed(ts)` as well, so asking the outcome alone would make every
-    /// frozen record look freezable for ever (and would report a spurious frontier-audit violation on
-    /// each one). What changed is what the pre-gate costs and what the arms mean:
+    /// settled record look settleable for ever, and every pass would rewrite every header it read.
+    /// What changed is what the pre-gate costs and what the arms mean:
     ///
     /// * the pre-gate is now a **pure bit test** on the word — `HeaderStamp::slot_id().is_some()` —
     ///   instead of a probe of an in-memory table. It is stated directly rather than through
-    ///   `names_writer`, which since phase 3 answers the same question by *reading the slot*: this
-    ///   sweep visits every record in `[freeze_low, high_water)`, so paying a durable read merely to
-    ///   discover that a settled word needs no work would be a per-record tax for nothing.
+    ///   `names_writer`, which since phase 3 answers the same question by *reading the slot*: the
+    ///   scan that calls this visits every in-use record of every MVCC store (`rmp` #1070), so paying
+    ///   a durable read merely to discover that a settled word needs no work would be a per-record tax
+    ///   on the whole store, every pass.
     /// * the `InFlight` arm was **dead** before phase 3 (an unresolved writer read as `Aborted`
     ///   through the registry — `rmp` #522 / #778) and mapped to `None` by luck. It is now genuinely
     ///   reachable, and mapping it to `None` is the deliberate rule: an open transaction's stamp
@@ -9836,11 +9704,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Before phase 3, a stamp the sweep failed to settle became **silent lost committed data** the
     /// moment the registry forgot its writer: nothing else could translate the `TxnId`. Since phase 3
     /// the word names a durable slot, so an unsettled stamp resolves correctly for ever — it merely
-    /// costs one extra indirection per read. The freeze sweep is therefore a **performance** device
-    /// now, where it used to be a correctness one, and the frontier machinery around it
-    /// ([`is_inflight_of_inflight_writer`](Self::is_inflight_of_inflight_writer),
-    /// [`debug_assert_freeze_complete`](Self::debug_assert_freeze_complete)) keeps its teeth without
-    /// carrying that weight. Retiring any of it is explicitly **not** this task.
+    /// costs one extra indirection per read. The settle is therefore a **performance** device now,
+    /// where it used to be a correctness one — which is what let `rmp` #1070 retire the frontier and
+    /// the audit built around it, and fold what remained into the reference census
+    /// ([`settle_and_census_headers`](Self::settle_and_census_headers)). What settling still buys
+    /// beyond the saved indirection is the ability to UN-NAME a commit slot, without which no census
+    /// could ever prove one unreachable.
     fn frozen_word(&self, word: u64) -> Result<Option<u64>> {
         if HeaderStamp::from_raw(word).slot_id().is_none() {
             return Ok(None);
@@ -9853,25 +9722,31 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         })
     }
 
-    /// **Debug-only invariant check** for the `rmp` #522 incremental-freeze prune (the W1 regression
-    /// guard from the 2026-07 durability audit). Called by [`gc`](Self::gc) after the freeze sweep and
-    /// immediately before it schedules the Active/Recent-Transaction-Table prune: it asserts that **no
-    /// in-use record in any MVCC store still bears an unfrozen committed-writer in-flight stamp**.
+    /// **Debug-only invariant check** for the `rmp` #522 prune (the W1 regression guard from the
+    /// 2026-07 durability audit). Called by [`gc`](Self::gc) after phase S and immediately before it
+    /// schedules the Active/Recent-Transaction-Table prune: it asserts that **no in-use record in any
+    /// MVCC store still bears an unsettled stamp of a committed writer**.
     ///
     /// That is exactly the precondition the prune's soundness rests on — every writer the registry
-    /// records as `Committed` must have had *all* of its on-disk in-flight stamps rewritten to
-    /// `Committed(ts)` by the freeze sweep — and it holds only if the incremental freeze frontier
-    /// (`freeze_low`) actually covered every such record. The **full-range** scan here (not just
-    /// `[freeze_low, high_water)`) is what surfaces a stamp stranded **below** the frontier;
-    /// [`frozen_word`](Self::frozen_word)`.is_some()` is the exact "unfrozen committed stamp" predicate
-    /// the sweep clears. A firing means a committed version would be forgotten while still keyed by an
-    /// unresolvable in-flight `TxnId` — which [`is_visible_via`](graphus_txn::is_visible_via) reads as
-    /// **invisible**, i.e. silent lost committed data (the class the frontier carry-forward fix in
-    /// [`is_inflight_of_inflight_writer`](Self::is_inflight_of_inflight_writer) closes). Compiled out in
-    /// an ordinary release build (the full-store scan is O(store) per GC pass), but **opt-in for release**
-    /// via the `check-cold-assert` feature (`rmp` #596): a paranoid deployment or a release certification
-    /// run can enable it to get an always-on runtime guard against this silent-lost-committed-data class,
-    /// not just the debug/DST coverage.
+    /// records as `Committed` must have had *all* of its on-disk naming stamps rewritten to
+    /// `Committed(ts)`. [`frozen_word`](Self::frozen_word)`.is_some()` is the exact predicate phase S
+    /// clears, so this re-asks phase S's own question over the whole store and fires only if that scan
+    /// is wrong.
+    ///
+    /// **What it means changed with `rmp` #1070, and it is worth stating which way.** It used to be
+    /// the debug-build half of a two-tier watch on a frontier that could raise itself past a record
+    /// and STRAND its stamp below itself for ever; its full-range scan was what could see under that
+    /// frontier, and the release-active half was the `rmp` #809 rotating window. There is no frontier
+    /// now, and phase S visits every id of every MVCC store on every pass, so this is a restatement of
+    /// what that scan just did rather than a search for what it could not reach. A firing still means
+    /// the same thing it always did: a committed version would be forgotten while a live header still
+    /// resolves through it — silent lost committed data.
+    ///
+    /// Compiled out in an ordinary release build (the full-store scan is O(store) per GC pass), but
+    /// **opt-in for release** via the `check-cold-assert` feature (`rmp` #596): a paranoid deployment
+    /// or a release certification run can enable it to get an always-on runtime guard against this
+    /// class, not just the debug/DST coverage. The always-on guarantee in an ordinary build comes from
+    /// the test `a_gc_pass_leaves_no_header_naming_a_resolved_writer_1070` instead.
     #[cfg(any(debug_assertions, feature = "check-cold-assert"))]
     fn debug_assert_freeze_complete(&self) {
         for kind in [StoreKind::Rel, StoreKind::Node, StoreKind::Prop] {
@@ -9908,28 +9783,42 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     #[inline]
     fn debug_assert_freeze_complete(&self) {}
 
-    /// Freezes **every** committed-but-unfrozen MVCC header in all three record stores under `txn`,
-    /// settling each in-flight `TxnId` stamp to its durable `Committed(ts)` form (the freeze sweep of
-    /// [`gc`](Self::gc), without any reclamation). After this commits, every committed version on disk
-    /// carries a self-describing commit timestamp, so the image is **MVCC-resolvable without the WAL's
-    /// commit records** — which is exactly what a backup needs: a restored store opens with a *fresh*
-    /// WAL (the backup carries the data image, not the log), so any header still keyed by an in-flight
-    /// `TxnId` would be unresolvable and read as invisible. Freezing before capture makes the backup
-    /// base self-sufficient (`rmp` task #149; this also closes the same latent gap for the full-backup
-    /// path of `rmp` task #23 — a backup taken before any GC pass had frozen recent commits).
+    /// Settles **every** settleable MVCC header word in all three record stores under `txn`: each
+    /// `created_ts` / `expired_ts` that still names the `commit.store` slot of a committed transaction
+    /// is rewritten to its self-describing `Committed(ts)` form. The census half of the scan is
+    /// discarded — this reclaims nothing.
+    ///
+    /// # Who calls it, and why it survived `rmp` #1070 with no caller in this workspace
+    ///
+    /// It has none, and that is a deliberate state rather than an oversight, so the reasoning is
+    /// recorded here instead of in a commit message.
+    ///
+    /// It was the pre-capture step of the backup path (`rmp` task #149 / #23): a restored store opens
+    /// with a *fresh* WAL, so any header a backup froze in the naming form would have been
+    /// unresolvable in the restored image. `rmp` #1069 removed that need — the naming form points at a
+    /// `commit.store` slot, which is part of the data image and is therefore captured by the backup
+    /// itself — and dropped the call.
+    ///
+    /// What keeps the operation is `05 §12.6`. The format-version-6 gate refuses a version-5 image
+    /// that still carries an unsettled stamp, and it names its migration route in the error it raises:
+    /// *settle every stamp with the build that wrote the image*. That route is executed by the
+    /// PREVIOUS build, so deleting this method would not invalidate it — but it would leave this build
+    /// without the lever the message describes, and an operator who upgrades and then needs a fully
+    /// settled image (to hand it back to an older build, or to make it self-describing before an
+    /// out-of-band copy) would have nothing to call. Since `rmp` #1070 the whole-store settle has
+    /// exactly ONE implementation — the census's own scan — so keeping the operation costs a wrapper
+    /// rather than a second sweep that could drift from it. Deleting it was the alternative, and it
+    /// was declined for that asymmetry: the wrapper is cheap and reversible, the removal is neither.
     ///
     /// `txn` must be a fresh, not-yet-begun id; the caller drives `begin(txn)` → this →
-    /// `commit(txn)`. Returns the number of header words frozen.
+    /// `commit(txn)`. Returns the number of header words settled.
     ///
     /// # Errors
-    /// Returns a storage error if a header read or a freeze patch write fails.
+    /// Returns a storage error if a header read or a settle patch write fails.
     pub fn freeze_committed_headers(&self, txn: TxnId) -> Result<usize> {
-        let mut frozen = 0usize;
-        frozen += self.freeze_store_headers(txn, StoreKind::Rel)?;
-        frozen += self.freeze_store_headers(txn, StoreKind::Node)?;
-        frozen += self.freeze_store_headers(txn, StoreKind::Prop)?;
-        // Schedule the same Active/Recent Transaction Table prune `gc` does: the sweep rewrote every
-        // committed writer's on-disk in-flight stamps, so each becomes forgettable once this freeze is
+        let (_named, frozen, _visited) = self.settle_and_census_headers(txn)?;
+        // Schedule the same Active/Recent Transaction Table prune `gc` does: the scan rewrote every
+        // committed writer's on-disk naming stamps, so each becomes forgettable once this settle is
         // durable (when `txn` commits). Mirrors `gc`'s prune scheduling so the table stays bounded.
         let writers = self
             .commit_registry
@@ -9946,189 +9835,6 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             });
         }
         Ok(frozen)
-    }
-
-    /// Freezes the MVCC headers of every in-use record in `kind`'s store (`rmp` task #59): each
-    /// `xmin`/`xmax` word carrying a committed writer's in-flight `TxnId` is rewritten to its
-    /// `Committed(ts)` form via the same WAL-logged 8-byte header patch as a tombstone or the old
-    /// eager commit settle ([`patch_header_word`](Self::patch_header_word)), under the GC `txn`.
-    /// Walks the full physical-id range `1..high_water`, so the sweep is complete regardless of
-    /// chain reachability. Returns the number of header words frozen.
-    fn freeze_store_headers(&self, txn: TxnId, kind: StoreKind) -> Result<usize> {
-        // Page-batched read (`rmp` #365): read every in-use record's MVCC header with ONE pin + read
-        // latch per store page (was one `read_mvcc` — one latch — per id), then freeze the committed-
-        // but-unfrozen words id-by-id. `scan_in_use_mvcc` already filters to `in_use`, so the freed-
-        // slot skip the former loop did per id is folded into the scan. The freeze itself
-        // (`patch_header_word`) is a WAL-logged 8-byte patch under the per-record **write** latch — the
-        // read is batched, the mutating write is not (no latch downgrade).
-        let in_use = read_view::scan_in_use_mvcc(&self.pool, &self.stores, kind)?;
-        let mut frozen = 0usize;
-        for (i, &(id, mvcc)) in in_use.iter().enumerate() {
-            if let Some(word) = self.frozen_word(mvcc.created_ts)? {
-                self.patch_header_word(kind, id, MVCC_OFF_CREATED_TS, word, txn)?;
-                frozen += 1;
-            }
-            if let Some(word) = self.frozen_word(mvcc.expired_ts)? {
-                self.patch_header_word(kind, id, MVCC_OFF_EXPIRED_TS, word, txn)?;
-                frozen += 1;
-            }
-            // Heartbeat the drain-progress beacon across this O(N) freeze sweep (`rmp` #563).
-            if i % 4096 == 0 {
-                self.bump_drain_progress();
-            }
-        }
-        Ok(frozen)
-    }
-
-    /// The incremental freeze sweep of [`gc`](Self::gc) (`rmp` #522): freezes committed-but-unfrozen
-    /// MVCC stamps in `kind`'s store, but starting the scan at the **freeze frontier**
-    /// [`freeze_low[kind]`](Self::freeze_low) instead of at id `1`. On a steadily-growing store this
-    /// visits only the records added since the last pass — the fix for the O(store²) maintenance cost.
-    ///
-    /// Correctness rests on the frontier invariant (see [`freeze_low`](Self::freeze_low)): every in-use
-    /// record below `freeze_low[kind]` already has all committed-writer stamps frozen and bears no
-    /// in-flight-writer stamp. A fresh in-flight stamp below the frontier lowers it
-    /// ([`note_created`](Self::note_created) / [`note_expired`](Self::note_expired)), and a committed
-    /// writer's stamps always sit at or above the frontier (nothing below it was in-flight), so this
-    /// bounded scan still freezes **every** committed writer's stamps — the precondition the GC prune
-    /// relies on. After the scan the frontier is raised to the smallest id still bearing an
-    /// in-flight-writer stamp (or `high_water` if none remain).
-    ///
-    /// It also (re)seeds [`pending_tombstones[kind]`](Self::pending_tombstones) from every tombstone it
-    /// observes, which — because the first post-open pass starts at `freeze_low == 1` (a full scan) —
-    /// discovers every pre-existing on-disk tombstone that a fresh process has no in-memory record of.
-    fn freeze_store_headers_incremental(
-        &self,
-        txn: TxnId,
-        kind: StoreKind,
-    ) -> Result<(usize, u64)> {
-        let from = self.freeze_low[kind as usize].get();
-        let high_water = self.store(kind).alloc.high_water();
-        let scanned = high_water.saturating_sub(from.max(1));
-        let in_use = read_view::scan_in_use_mvcc_from(&self.pool, &self.stores, kind, from)?;
-        let mut frozen = 0usize;
-        // The next frontier: the smallest id in the scanned range still bearing an in-flight-writer
-        // stamp after this pass. If none, advance to `high_water` (everything at/above `from` settled).
-        let mut new_low = high_water;
-        for (i, &(id, mvcc)) in in_use.iter().enumerate() {
-            if let Some(word) = self.frozen_word(mvcc.created_ts)? {
-                self.patch_header_word(kind, id, MVCC_OFF_CREATED_TS, word, txn)?;
-                frozen += 1;
-            }
-            if let Some(word) = self.frozen_word(mvcc.expired_ts)? {
-                self.patch_header_word(kind, id, MVCC_OFF_EXPIRED_TS, word, txn)?;
-                frozen += 1;
-            }
-            // A tombstone (in-use, `xmax` set) is a reclaim candidate — seed the reclaim set (idempotent).
-            if mvcc.expired_ts != 0 {
-                self.with_maintenance(|m| m.pending_tombstones[kind as usize].insert(id));
-            }
-            // Still bearing an in-flight-writer stamp (a committed writer's stamp was just frozen above,
-            // so it no longer counts)? Then it must stay covered by the frontier for a later pass.
-            if self.is_inflight_of_inflight_writer(mvcc.created_ts)?
-                || self.is_inflight_of_inflight_writer(mvcc.expired_ts)?
-            {
-                new_low = new_low.min(id);
-            }
-            if i % 4096 == 0 {
-                self.bump_drain_progress();
-            }
-        }
-        // The sweep ADVANCES the frontier, which `fetch_min` cannot express (it only lowers) — so it is
-        // a COMPARE-EXCHANGE against the value the scan started from, never a plain store (`rmp` #1014).
-        //
-        // A plain store here is a lost update in exactly the shape this task exists to remove, and the
-        // claim that it is not — "any concurrent descent re-lowers the frontier afterwards, so the
-        // order is immaterial" — is false in one of the two orders. Take the frontier at 1000, and a
-        // writer reusing freed id 100 (`note_created`'s documented "load-bearing" case, since a reused
-        // id can land anywhere in the space):
-        //
-        //     sweep:  from = 1000; scans [1000, high_water); computes new_low = 1500
-        //     writer: lower_freeze_low(100)          -> frontier = 100
-        //     sweep:  store(1500)                    -> frontier = 1500, the descent is GONE
-        //
-        // Record 100 was never scanned — the scan started at 1000 — and is now below the frontier for
-        // ever, so no future sweep will visit it and its committed writer's stamp stays in-flight
-        // permanently. That is the `rmp` #522 silent-data-loss shape, not a re-scan.
-        //
-        // The compare-exchange makes the raise conditional on nothing having moved the frontier since
-        // the scan read it. Only descents can have moved it (GC is a single actor — see
-        // `gc_freeze_low_savepoint` — so no second sweep raises it), and a descent is precisely the
-        // event that invalidates this raise. Declining therefore keeps the lower value, which costs one
-        // wider scan next pass and cannot strand a stamp. That is the fail-closed direction.
-        let _ = self.freeze_low[kind as usize].try_raise(from, new_low);
-        Ok((frozen, scanned))
-    }
-
-    /// Whether `word` is an **unsettled** stamp of a writer that is still open (`rmp` #522, the
-    /// freeze-frontier's carry-forward test): such a stamp cannot be settled yet — its writer has not
-    /// committed, so [`frozen_word`](Self::frozen_word) declines it — and its record MUST stay covered
-    /// by the frontier so a later pass (after the writer commits) settles it. A committed writer's
-    /// stamp (frozen this pass) and an aborted writer's stamp (reverted by that writer's undo) both
-    /// return `false`.
-    ///
-    /// # What this gate asks, and why it changed with `rmp` #1069 phase 3
-    ///
-    /// It now asks the **outcome**: `resolve_stamp(word) == InFlight(_)`. That is a reversal of the
-    /// phase-2 rule, and it is deliberate — the reason the outcome was refused is gone, and the exact
-    /// predicate this method wants is expressible for the first time.
-    ///
-    /// **Why the outcome was refused before.** Through the [`CommitRegistry`] the `InFlight` arm was
-    /// **dead — always `false`**: the table gains an entry only when a transaction *resolves*
-    /// ([`record_commit`](graphus_txn::CommitRegistry)), and
-    /// [`outcome`](graphus_txn::CommitRegistry::outcome) maps an unknown id to `Aborted`. Writing the
-    /// gate that way raised the frontier PAST records still bearing a genuinely open writer's stamp
-    /// whenever a maintenance GC ran while that writer was in flight (an explicit `BEGIN … RUN …`
-    /// spanning engine commands). When the writer committed, the next incremental sweep skipped those
-    /// records (now below the frontier), left their stamps unfrozen, and the GC prune forgot the
-    /// writer — so the version resolved against a now-unknown (→ aborted) writer and read as
-    /// **invisible**: silent lost committed data (`rmp` #522, regression
-    /// `tests/incremental_freeze_inflight_writer.rs`). The workaround was to ask *identity* from the
-    /// word and *liveness* from the store's [`active`](Self#structfield.active) set.
-    ///
-    /// **Why the outcome is now part of the question.** A commit slot is a **durable** record of a
-    /// transaction's state, so `InFlight` means precisely "this slot has not been published". Combine
-    /// that with liveness and the predicate becomes *exact* — it is the set of words
-    /// [`frozen_word`](Self::frozen_word) declines **today but may accept later**. Enumerate what a
-    /// header word can be:
-    ///
-    /// | word | `frozen_word` | can a later pass settle it? | cover it? |
-    /// | --- | --- | --- | --- |
-    /// | `0` / already settled | `None` | never | no |
-    /// | names an aborted (corpse) slot | `None` | never — an abort's stamps are reverted by its rollback's undo | no |
-    /// | names a published slot | `Some(..)` | settled by this very pass | no |
-    /// | names an unpublished slot, writer **still active** | `None` | **yes**, once it commits | **yes** |
-    /// | names an unpublished slot, writer **gone** (a crash or backup loser) | `None` | never — nothing will ever publish it | no |
-    ///
-    /// Only the fourth row must hold the frontier down, and it is exactly
-    /// `InFlight(w) && is_txn_active(w)`. Each half alone is an over-approximation, and each in a
-    /// different direction:
-    ///
-    /// * identity + liveness (the phase-2 form) also covers rows 3 — a published slot of a writer
-    ///   that has not yet left `active` — costing a needless carry-forward;
-    /// * outcome alone also covers row 5, and that one is not merely wasteful: a store restored from
-    ///   a backup taken while a writer was in flight keeps such a slot **for ever**, so the frontier
-    ///   would be pinned at that record for the life of the store and every GC pass would rescan from
-    ///   there. A permanent scan-cost leak, not a bounded one.
-    ///
-    /// Asking both is therefore not belt-and-braces; it is the predicate itself, expressible for the
-    /// first time because half of it is now answerable.
-    ///
-    /// **The stakes also changed.** Before phase 3, raising the frontier past a record that still
-    /// needed settling was silent lost committed data (the whole of `rmp` #522). Since phase 3 the
-    /// word names a durable slot, so a stranded stamp merely costs one indirection per read for ever
-    /// — this predicate protects a *cost*, not a *correctness* property. It is nevertheless kept
-    /// exact, because a frontier that drifts is how the earlier defect became invisible.
-    fn is_inflight_of_inflight_writer(&self, word: u64) -> Result<bool> {
-        // The durable half: has this writer resolved either way? `?` first, so a read fault fails the
-        // sweep rather than quietly answering "no need to cover" (`rmp` #733).
-        let StampOutcome::InFlight(writer) = self.resolve_stamp(word)? else {
-            return Ok(false);
-        };
-        // The in-memory half: might it still commit? `is_txn_active`, never
-        // `commit_registry.outcome(w) == InFlight` — that predicate is dead through the registry and
-        // mistaking the two is `rmp` #522 / #778.
-        Ok(self.is_txn_active(writer))
     }
 
     /// Reclaims the reclaimable MVCC tombstones of `kind` (`Rel` or `Node`) under `txn` (`rmp` #522).
@@ -11321,29 +11027,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 m.pending_gc_prune = None;
             }
         });
-        // `rmp` #522: if `txn` is the in-progress GC pass, restore the freeze frontier its freeze sweep
-        // advanced. The WAL undo above un-froze the stamps this pass had frozen (restoring them to
-        // their in-flight form); without restoring the frontier those records would sit below it and the
-        // next freeze sweep would skip them, stranding a committed writer's stamp unfrozen forever. Taken
-        // (not just read) so a normal write transaction — whose savepoint this never is — leaves it be.
-        // Taken under the latch and only when it names this pass, so the savepoint of a concurrent
-        // pass is never consumed by this rollback.
-        let savepoint = self.with_maintenance(|m| {
-            m.gc_freeze_low_savepoint
-                .filter(|(sp_txn, _)| *sp_txn == txn)
-                .inspect(|_| m.gc_freeze_low_savepoint = None)
-        });
-        if let Some((_, saved)) = savepoint {
-            // A DESCENT, not a store (`rmp` #1014). The saved value is the frontier as it stood before
-            // this pass's sweep raised it, so restoring it can only ever lower the frontier — which is
-            // exactly what `fetch_min` expresses. A plain store would additionally *raise* it over any
-            // descent a concurrent writer landed while the pass ran, discarding that writer's claim on
-            // a range this rollback knows nothing about and stranding its stamp below the frontier for
-            // ever: the same `rmp` #522 loss the sweep's own raise had to be made conditional to avoid.
-            for (slot, v) in self.freeze_low.iter().zip(saved) {
-                slot.descend(v);
-            }
-        }
+        // NOTHING RESTORES A FREEZE FRONTIER HERE ANY MORE (`rmp` #1070). A rolled-back GC pass's WAL
+        // undo does still un-settle the stamps its scan settled — that has not changed — but there is
+        // no longer a frontier those records could end up *underneath*, so there is nothing to put
+        // back: the next pass's full-range scan sees them again and settles them again.
         self.with_catalog_mut(|c| c.tokens = pre_tokens);
         // The live-record COUNTERS were settled above, at the instant this transaction's entry left the
         // active table (`rmp` #866 / #1052). What used to stand here — reinstall a `counts_image()`
@@ -14889,12 +14576,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             MvccStampField::Expired => MVCC_OFF_EXPIRED_TS,
         };
         self.patch_header_word(kind, id, offset, word, txn)?;
-        // The frontier must cover the record this wrote an unsettled stamp onto, exactly as the
-        // production write path's `note_created` / `note_expired` do — otherwise the every-pass header
-        // census, which scans `[freeze_low, high_water)`, would legitimately never look at it and a
-        // test aimed at that census would prove nothing. Lowering is unconditional because it is
-        // always safe: it only ever widens a scan.
-        self.lower_freeze_low(kind, id);
+        // No frontier to lower since `rmp` #1070: the header census walks the full id range of each
+        // MVCC store, so a stamp forged at ANY id is seen by the very next pass. That is precisely
+        // what the removal bought — a test no longer has to reproduce the write path's bookkeeping to
+        // be visible to the collector, because there is no bookkeeping to reproduce.
         Ok(())
     }
 
@@ -18359,21 +18044,44 @@ mod tests {
         report
     }
 
-    /// `rmp` #522 (measurement): the incremental freeze sweep visits only the records added since the
-    /// previous maintenance pass, so on a monotonically growing store the per-pass cost is O(Δ), not
-    /// O(store size). Grows the store in equal stages, runs one GC pass per stage, and asserts each
-    /// steady-state pass scans ≈ one stage's worth of ids — a small, bounded FRACTION of the whole
-    /// store — rather than the whole store every tick (the pre-#522 O(N²)-in-aggregate behaviour).
+    /// **`D-retired-mechanism-tests` — the semantic replacement for `rmp` #522's
+    /// `gc_freeze_scan_is_incremental_not_quadratic_522`** (`rmp` #1070).
+    ///
+    /// # What the retired test asserted, and why that assertion could not survive
+    ///
+    /// It asserted that `report.freeze_scanned` — the physical-id span the freeze sweep visited — stayed
+    /// ≈ one stage's delta on every steady-state pass, and that the final pass over the fullest store
+    /// scanned less than a quarter of it. That is a statement about the SCAN, and the scan's bound was
+    /// the freeze frontier, which `rmp` #1070 removed: the settle-and-census walk is full-range by
+    /// construction, because a census that frees a commit slot must have looked at every header that
+    /// could name it. Keeping the old assertion would mean keeping the frontier.
+    ///
+    /// # What it was really protecting, and why THAT survives intact
+    ///
+    /// The defect `rmp` #522 closed was a maintenance cost that grew with the store on every tick and
+    /// was therefore `O(N²)` in aggregate. The expensive part of a maintenance tick is not reading a
+    /// 25-byte header out of an already-pinned page: it is the DURABLE work — one `commit.store` read
+    /// and one WAL-logged 8-byte page patch per word settled — and that work has never been
+    /// proportional to the store. It is proportional to the records written since the last pass,
+    /// because a settled word is settled for ever and costs nothing but a bit test thereafter.
+    ///
+    /// So this asserts the surviving half directly, and it is the half with teeth: **the settled-word
+    /// count per pass stays ≈ one stage's delta while the store grows eightfold**. It also pins the
+    /// half that changed — `freeze_scanned` now equals the full span — so the new cost is recorded by
+    /// a test rather than left to be discovered.
+    ///
+    /// The positive control is the growth of the store itself: if the stages stopped creating records
+    /// the settled count would be trivially flat and the assertion would prove nothing.
     #[test]
-    fn gc_freeze_scan_is_incremental_not_quadratic_522() {
+    fn gc_settles_only_the_delta_even_though_it_scans_the_whole_store_1070() {
         let mut s = fresh();
         const STAGE: u64 = 250;
         const STAGES: u64 = 8;
         let mut next_txn = 1u64;
+        let mut settled_per_pass = Vec::new();
         let mut scanned_per_pass = Vec::new();
 
-        for stage in 0..STAGES {
-            // Create one stage's worth of committed nodes.
+        for _ in 0..STAGES {
             let t = TxnId(next_txn);
             next_txn += 1;
             s.begin(t);
@@ -18381,30 +18089,46 @@ mod tests {
                 s.create_node(t).unwrap();
             }
             s.commit(t).unwrap();
-            // One maintenance GC pass.
             let report = gc_pass(&mut s, next_txn);
             next_txn += 1;
+            settled_per_pass.push(report.frozen as u64);
             scanned_per_pass.push(report.freeze_scanned);
-            let _ = stage;
         }
 
         let total_ids = STAGE * STAGES;
-        // The first pass is a full scan (freeze frontier starts at id 1). Every steady-state pass after
-        // it must scan only ≈ one stage delta, INDEPENDENT of how large the store has grown.
-        for (i, &scanned) in scanned_per_pass.iter().enumerate().skip(1) {
+        // THE SURVIVING PROPERTY. Each stage stamps `STAGE` fresh `created_ts` words (one per node) and
+        // nothing else, so a pass settles ≈ STAGE words however large the store has become. A settle
+        // whose cost tracked the store would show up here immediately as a growing count.
+        for (i, &settled) in settled_per_pass.iter().enumerate() {
             assert!(
-                scanned <= 2 * STAGE,
-                "pass {i}: freeze_scanned={scanned} must be ≈ a stage delta ({STAGE}), not the whole \
-                 {total_ids}-id store — the O(Δ) incremental-GC property"
+                settled <= 2 * STAGE,
+                "pass {i}: settled {settled} header words, which must stay ≈ a stage delta ({STAGE})                  and not grow towards the whole {total_ids}-record store — the durable half of the                  O(Δ) maintenance property `rmp` #522 established and `rmp` #1070 keeps"
             );
         }
-        // The decisive contrast: the LAST pass, over the FULLEST store, scans a small fraction of it.
-        // Pre-#522 every pass re-scanned the whole store, so this would have been ≈ total_ids.
-        let last = *scanned_per_pass.last().unwrap();
+        // The decisive contrast, stated as the retired test stated it but on the durable work: the LAST
+        // pass, over the FULLEST store, settles a small fraction of it.
+        let last_settled = *settled_per_pass.last().unwrap();
         assert!(
-            last * 4 < total_ids,
-            "the final pass scanned {last} of {total_ids} ids — a per-tick cost proportional to the \
-             whole store would fail here (that is exactly the reverted O(N²) behaviour)"
+            last_settled * 4 < total_ids,
+            "the final pass settled {last_settled} words of a {total_ids}-record store; durable work              proportional to the whole store is exactly the reverted O(N²) behaviour"
+        );
+        // POSITIVE CONTROL: the store really did grow, and the passes really did settle something.
+        assert!(
+            settled_per_pass.iter().all(|&n| n >= STAGE),
+            "positive control: every pass must settle a stage's worth of stamps, or the assertion              above is flat for the wrong reason: {settled_per_pass:?}"
+        );
+        // AND THE HALF THAT CHANGED, pinned rather than left implicit: the SCAN is now full-range, and
+        // it grows with the store. This is the cost `rmp` #1070 accepted in exchange for removing the
+        // write path's frontier bookkeeping; a future change that re-bounds the scan must revisit the
+        // census's completeness argument, and will fail here first.
+        let last_scanned = *scanned_per_pass.last().unwrap();
+        assert!(
+            last_scanned >= total_ids,
+            "the settle-and-census scan is full-range by design since `rmp` #1070: the last pass              visited {last_scanned} ids over a store holding {total_ids} records"
+        );
+        assert!(
+            scanned_per_pass.windows(2).all(|w| w[0] <= w[1]),
+            "a full-range scan grows monotonically with the store: {scanned_per_pass:?}"
         );
     }
 
@@ -18499,11 +18223,10 @@ mod tests {
         };
         let before = fingerprint(&mut s);
 
-        // Force a FULL-scan GC pass at the SAME watermark: reset the freeze frontier and the full-scan
-        // flag (the child test module reaches the private incremental-GC state directly).
-        for slot in &s.freeze_low {
-            slot.reset(1);
-        }
+        // Force a FULL-scan GC pass at the SAME watermark by re-arming the full-scan flag (the child
+        // test module reaches the private incremental-GC state directly). Since `rmp` #1070 there is no
+        // freeze frontier to reset alongside it: the settle-and-census walk is already full-range on
+        // every pass, and this flag now re-arms only the corpse / property / chain-head seeding scans.
         s.with_maintenance(|m| m.gc_full_scan_pending = true);
         let wm = s.snapshot_ts();
         s.begin(TxnId(next));
@@ -18531,16 +18254,45 @@ mod tests {
         );
     }
 
-    /// `rmp` #809 (healthy path — the always-on audit is a no-op on a well-formed store, in EVERY build).
-    /// A normal mixed workload driven through real `gc()` passes must report zero freeze-frontier
-    /// violations and still schedule its prunes: the release-active audit must never fire on legitimately
-    /// in-flight or correctly-frozen data (the "does NOT fire in the normal case" half of AC#3).
+    /// **`D-retired-mechanism-tests` — the semantic replacement for the three `rmp` #809 audit tests**
+    /// (`freeze_frontier_audit_silent_on_healthy_store_809`,
+    /// `freeze_frontier_audit_fires_on_stranded_committed_stamp_809` and
+    /// `freeze_frontier_audit_skips_prune_fail_closed_809`), retired by `rmp` #1070.
+    ///
+    /// # What those three asserted, and what became of each
+    ///
+    /// They watched ONE invariant — *no in-use MVCC record still bears a naming stamp of a resolved
+    /// writer when the registry prune is scheduled* — through a detector built for a frontier that
+    /// could strand a stamp underneath itself. The detector scanned a rotating fixed-size window per
+    /// pass (so full coverage took `⌈high_water / 8192⌉` passes), reported what it found, and made the
+    /// pass skip the prune fail-closed.
+    ///
+    /// * The **silent-on-a-healthy-store** half is asserted here, and *more strongly*: this checks the
+    ///   whole store on every round instead of one window, and it checks the invariant itself
+    ///   ([`read_view::scan_unsettled_stamps`] — zero words naming a slot) rather than a detector's
+    ///   opinion of it.
+    /// * The **fires-on-a-stranded-stamp** half asserted the detector's non-vacuity. There is nothing
+    ///   left to strand a stamp: the settle walks every id of every MVCC store on every pass, so
+    ///   "below the frontier" no longer denotes a place. The property that a header naming a slot is
+    ///   respected rather than ignored is pinned instead by
+    ///   `undo_chain.rs::the_census_keeps_a_commit_slot_an_mvcc_header_still_names`, which forges such
+    ///   a header and requires the census to decline the slot.
+    /// * The **fail-closed prune skip** was the detector's response, and it goes with the detector.
+    ///   What replaces it is that the prune's precondition is now established by construction and
+    ///   asserted directly below: the pass settles the whole store, so if any naming stamp of a
+    ///   resolved writer survived a pass, this test fails — in every build, debug or release, where
+    ///   the retired audit only ever sampled a window.
+    ///
+    /// # Non-vacuity
+    ///
+    /// The `settled` control requires the passes to have settled something: an assertion that "no
+    /// unsettled stamp remains" is trivially true of a store where nothing was ever stamped.
     #[test]
-    fn freeze_frontier_audit_silent_on_healthy_store_809() {
+    fn a_gc_pass_leaves_no_header_naming_a_resolved_writer_1070() {
         let mut s = fresh();
         let key = s.intern_token(Namespace::PropKey, "v").unwrap();
         let mut next = 1u64;
-        // Several rounds of create + property + a GC pass each; every pass must stay silent.
+        let mut settled_total = 0usize;
         for round in 0..4u64 {
             let t = TxnId(next);
             next += 1;
@@ -18552,163 +18304,56 @@ mod tests {
             s.commit(t).unwrap();
             let report = gc_pass(&mut s, next);
             next += 1;
-            assert_eq!(
-                report.freeze_violations, 0,
-                "round {round}: the audit must not fire on a healthy store"
-            );
+            settled_total += report.frozen;
             assert!(
-                report.first_freeze_violation.is_none(),
-                "round {round}: no violation detail on a clean pass"
+                report.prune_scheduled > 0,
+                "round {round}: a healthy pass schedules the registry prune"
+            );
+
+            // THE INVARIANT ITSELF, over the WHOLE store, in every build. No transaction is open at
+            // this point, so every word still naming a slot would be a resolved writer's — exactly
+            // what the retired `rmp` #809 window audit hunted one slice at a time.
+            let (unsettled, first) =
+                read_view::scan_unsettled_stamps(&s.pool, &s.stores).expect("scan");
+            assert_eq!(
+                unsettled, 0,
+                "round {round}: {unsettled} header word(s) still name a commit slot after a GC pass \
+                 with no open transaction (first: {first:?}). The prune scheduled above would then \
+                 forget a writer a live version still resolves through — the `rmp` #522 \
+                 silent-committed-data-loss shape."
             );
         }
+        assert!(
+            settled_total >= 4,
+            "positive control: the passes must actually have settled stamps ({settled_total}), or \
+             'nothing is unsettled' is true for the wrong reason"
+        );
     }
 
-    /// `rmp` #809 (non-vacuity — the audit FIRES on an injected stranded stamp, and stays SILENT in the
-    /// normal case). This tests the release-active [`audit_freeze_frontier_window`] predicate DIRECTLY
-    /// (build-independent: it bypasses the debug-only `debug_assert_freeze_complete`, which would panic
-    /// on the same state before the audit ran). It models the exact `rmp` #522 failure: a committed
-    /// writer whose on-disk in-flight stamp the incremental freeze sweep never settled because the
-    /// frontier was raised past it.
-    #[test]
-    fn freeze_frontier_audit_fires_on_stranded_committed_stamp_809() {
-        let s = fresh();
-
-        // A committed node whose xmin is still the writer's in-flight TxnId (headers are frozen lazily at
-        // GC, never at commit — see `commit`). So after this the registry says W is Committed while the
-        // on-disk stamp is unfrozen: exactly the "committed but unfrozen" condition the audit hunts.
-        let w = TxnId(1);
-        s.begin(w);
-        let (nid, _) = s.create_node(w).unwrap();
-        s.commit(w).unwrap();
-
-        // Model the #522 stranding: raise the freeze frontier PAST the node, so the (frontier-bounded)
-        // incremental freeze sweep would skip it, leaving the committed stamp unfrozen forever.
-        s.freeze_low[StoreKind::Node as usize].reset(nid + 1);
-        // Prove the frontier-bounded sweep really does MISS it (it scans only `[freeze_low, high_water)`).
-        let (missed, _) = read_view::scan_in_use_mvcc_from(
-            &s.pool,
-            &s.stores,
-            StoreKind::Node,
-            s.freeze_low[0].get(),
-        )
-        .map(|v| (v.iter().any(|&(id, _)| id == nid), v))
-        .unwrap();
-        assert!(
-            !missed,
-            "the frontier-bounded sweep must skip the stranded node — that is what makes it invisible \
-             to the incremental freeze (the #522 hole)"
-        );
-
-        // The full-range window audit (frontier-agnostic) MUST catch it.
-        s.with_maintenance(|m| m.freeze_audit_from = [1; STORE_COUNT]);
-        let (violations, first) = s.audit_freeze_frontier_window().unwrap();
-        assert!(
-            violations >= 1,
-            "the release-active audit must detect the stranded committed stamp (got {violations})"
-        );
-        let v = first.expect("a firing audit reports the offending record");
-        assert_eq!(v.kind, StoreKind::Node, "the stranded record is a node");
-        assert_eq!(v.id, nid, "the audit names the exact stranded id");
-        assert_eq!(
-            v.xmin,
-            VersionStamp::in_flight(w),
-            "the reported xmin is the unfrozen in-flight stamp of the committed writer"
-        );
-
-        // Now settle the stamp properly (a real full freeze) and re-audit: it must go SILENT. Reset the
-        // frontier so the sweep actually visits the node, then freeze under a fresh GC-style txn.
-        s.freeze_low[StoreKind::Node as usize].reset(1);
-        let g = TxnId(2);
-        s.begin(g);
-        let (frozen, _) = s
-            .freeze_store_headers_incremental(g, StoreKind::Node)
-            .unwrap();
-        s.commit(g).unwrap();
-        assert!(frozen >= 1, "the freeze sweep settled the committed stamp");
-
-        s.with_maintenance(|m| m.freeze_audit_from = [1; STORE_COUNT]);
-        let (violations_after, first_after) = s.audit_freeze_frontier_window().unwrap();
-        assert_eq!(
-            violations_after, 0,
-            "after a proper freeze the audit must be SILENT (no stranded stamp remains)"
-        );
-        assert!(first_after.is_none(), "no violation detail on a clean pass");
-    }
-
-    /// `rmp` #809 (fail-closed integration — a firing audit SKIPS the prune, a clean pass prunes normally).
-    /// Drives real `gc()` passes end to end. The full-store `debug_assert_freeze_complete` panics on a
-    /// stranded stamp *before* the release-active audit runs, so the firing half is exercised only where
-    /// that assert is compiled out — an ordinary release build. Run with `cargo test --release`.
-    #[test]
-    #[cfg_attr(
-        any(debug_assertions, feature = "check-cold-assert"),
-        ignore = "debug_assert_freeze_complete panics before the release-active audit; run under --release"
-    )]
-    fn freeze_frontier_audit_skips_prune_fail_closed_809() {
-        let mut s = fresh();
-
-        // Healthy pass first: a committed node, a normal gc() → zero violations and the prune IS scheduled.
-        let t = TxnId(1);
-        s.begin(t);
-        let (nid, _) = s.create_node(t).unwrap();
-        s.commit(t).unwrap();
-        let clean = gc_pass(&mut s, 2);
-        assert_eq!(
-            clean.freeze_violations, 0,
-            "a healthy pass reports no freeze-frontier violation"
-        );
-        assert!(
-            clean.prune_scheduled > 0,
-            "a healthy pass schedules the registry prune (a committed writer became forgettable)"
-        );
-
-        // Inject a stranding: a second committed node whose stamp we strand by raising the frontier past
-        // it, so the next gc()'s frontier-bounded freeze sweep leaves it committed-but-unfrozen.
-        let t = TxnId(3);
-        s.begin(t);
-        let (nid2, _) = s.create_node(t).unwrap();
-        s.commit(t).unwrap();
-        s.freeze_low[StoreKind::Node as usize].reset(nid2 + 1);
-        // Aim the audit window at the node store so this pass definitely covers the stranded id.
-        s.with_maintenance(|m| m.freeze_audit_from = [1; STORE_COUNT]);
-
-        let poisoned = gc_pass(&mut s, 4);
-        assert!(
-            poisoned.freeze_violations >= 1,
-            "the release-active audit fires inside gc() on the stranded stamp"
-        );
-        assert_eq!(
-            poisoned.prune_scheduled, 0,
-            "fail-closed: a gc() pass that detects a stranded committed stamp SKIPS the prune, so no \
-             committed writer is forgotten (the #522 data-loss is prevented)"
-        );
-        let v = poisoned
-            .first_freeze_violation
-            .expect("the report carries the offending record for the operator alert");
-        assert_eq!((v.kind, v.id), (StoreKind::Node, nid2));
-        let _ = nid;
-    }
-
-    /// `rmp` #809 (AC#2 measurement, `#[ignore]`d — a reproducible benchmark, not a CI assertion). Prints
-    /// the per-GC-pass cost the release-active window audit ADDS, the full-store scan cost it AVOIDS (what
-    /// a periodic-tick design would spike to every Nth pass), and a steady-state `gc()` pass cost for
-    /// scale — so the "negligible" claim is backed by numbers on the running host. Run with:
-    /// `cargo test --release -p graphus-storage -- --ignored --nocapture freeze_audit_window_cost`.
+    /// **`D-retired-mechanism-tests` — the semantic replacement for `rmp` #809's
+    /// `freeze_audit_window_cost_is_negligible_809`** (`rmp` #1070), and the measurement `rmp` #1070
+    /// owes for the cost it accepted.
+    ///
+    /// The retired benchmark justified the audit window's size by showing what a *periodic full scan*
+    /// would have cost. `rmp` #1070 pays that full scan, once per pass, and folds the freeze sweep and
+    /// the census into it — so the number that has to be defended is no longer "what the window adds"
+    /// but "what the merged full-range scan costs against the two bounded scans plus the window it
+    /// replaced". This prints both, on the running host, for a store of a realistic size.
+    ///
+    /// Run with:
+    /// `cargo test --release -p graphus-storage -- --ignored --nocapture settle_and_census_scan_cost`.
     #[test]
     #[ignore = "measurement/benchmark; run explicitly with --ignored --nocapture"]
-    fn freeze_audit_window_cost_is_negligible_809() {
+    fn settle_and_census_scan_cost_per_pass_1070() {
         use std::time::Instant;
 
         const N: u64 = 200_000;
-        // A representative buffer pool (production auto-sizes to hardware — a 64-frame pool would thrash a
-        // 200k-record scan through eviction, exaggerating the audit's page-fetch cost). Large enough to
-        // hold the node store's pages warm.
+        // A representative buffer pool (production auto-sizes to hardware — a 64-frame pool would
+        // thrash a 200k-record scan through eviction and exaggerate every page-fetch cost).
         let device = MemBlockDevice::new(0);
         let wal = WalManager::create(MemLogSink::new()).expect("create wal");
         let mut s = RecordStore::create(device, wal, 4096, 1).expect("create store");
 
-        // Build N committed nodes in batches, then a steady-state gc() so everything is frozen and pruned
-        // (the realistic state the audit runs against on every subsequent maintenance tick).
         let mut txn = 1u64;
         const BATCH: u64 = 20_000;
         let mut made = 0u64;
@@ -18722,86 +18367,61 @@ mod tests {
             s.commit(t).unwrap();
             made += BATCH;
         }
+        // Reach the steady state: everything settled, nothing pending.
+        gc_pass(&mut s, txn);
+        txn += 1;
         gc_pass(&mut s, txn);
         txn += 1;
 
-        // (a) The 3-kind window audit's per-pass added cost at the SHIPPING window size, averaged over
-        // many calls (the cursor rotates, so successive calls cover successive windows).
-        const ITERS: u32 = 500;
-        s.with_maintenance(|m| m.freeze_audit_from = [1; STORE_COUNT]);
+        // (a) The merged settle-and-census scan, on a fully settled store — the steady-state cost this
+        // task added to every pass. Measured through a real transaction because it may write.
+        const ITERS: u32 = 50;
         let t0 = Instant::now();
-        let mut sink = 0u64;
+        let mut sink = 0usize;
         for _ in 0..ITERS {
-            let (v, _) = s.audit_freeze_frontier_window().unwrap();
-            sink = sink.wrapping_add(v);
+            let g = TxnId(txn);
+            txn += 1;
+            s.begin(g);
+            let (named, settled, _) = s.settle_and_census_headers(g).expect("scan");
+            s.commit(g).expect("commit");
+            sink += named.len() + settled;
         }
-        let audit_ns = t0.elapsed().as_nanos() / ITERS as u128;
+        let merged_ns = t0.elapsed().as_nanos() / u128::from(ITERS);
 
-        // (a') The raw window scan+predicate cost for several candidate window sizes on the Node store, to
-        // justify the chosen constant (this isolates one kind's window, so multiply by ~3 for a full pass).
-        let mut per_w = Vec::new();
-        for w in [1024u64, 2048, 4096, 8192] {
-            let mut from = 1u64;
-            let mut acc = 0u128;
-            let reps = 300u32;
-            for _ in 0..reps {
-                let t = Instant::now();
-                let (recs, next) = read_view::scan_in_use_mvcc_window(
-                    &s.pool,
-                    &s.stores,
-                    StoreKind::Node,
-                    from,
-                    w,
-                )
-                .unwrap();
-                let mut bad = 0u64;
-                for (_, mvcc) in &recs {
-                    if s.frozen_word(mvcc.created_ts).unwrap().is_some()
-                        || s.frozen_word(mvcc.expired_ts).unwrap().is_some()
-                    {
-                        bad += 1;
+        // (b) The steady-state shape it replaced, reconstructed: on a store with any churn the freeze
+        // frontier sat at or near id 1, so a pass paid the SAME full-range walk TWICE — once for the
+        // freeze sweep, once for the census — plus the rotating audit window. Measured as two
+        // full-range header scans, which is the honest lower bound for that shape.
+        let t1 = Instant::now();
+        let mut fullsink = 0usize;
+        for _ in 0..ITERS {
+            for _pass in 0..2 {
+                for kind in MVCC_STORE_KINDS {
+                    let in_use = read_view::scan_in_use_mvcc(&s.pool, &s.stores, kind).unwrap();
+                    for &(_, mvcc) in &in_use {
+                        if HeaderStamp::from_raw(mvcc.created_ts).slot_id().is_some() {
+                            fullsink += 1;
+                        }
                     }
                 }
-                acc += t.elapsed().as_nanos();
-                sink = sink.wrapping_add(bad);
-                let hw = s.store(StoreKind::Node).alloc.high_water();
-                from = if next >= hw { 1 } else { next };
-            }
-            per_w.push((w, acc / reps as u128));
-        }
-
-        // (b) The full-store scan cost (all three MVCC kinds) — the periodic-tick spike the window avoids.
-        let t1 = Instant::now();
-        let mut fullsink = 0u64;
-        for kind in [StoreKind::Node, StoreKind::Rel, StoreKind::Prop] {
-            let in_use = read_view::scan_in_use_mvcc(&s.pool, &s.stores, kind).unwrap();
-            for &(_, mvcc) in &in_use {
-                if s.frozen_word(mvcc.created_ts).unwrap().is_some()
-                    || s.frozen_word(mvcc.expired_ts).unwrap().is_some()
-                {
-                    fullsink += 1;
-                }
             }
         }
-        let full_ns = t1.elapsed().as_nanos();
+        let two_scans_ns = t1.elapsed().as_nanos() / u128::from(ITERS);
 
-        // (c) A realistic maintenance operation for scale: a full store checkpoint (flush dirty pages home
-        // + WAL reclaim), which is what the background cadence actually runs around each gc() pass.
+        // (c) A realistic maintenance operation for scale.
         let t2 = Instant::now();
         gc_pass(&mut s, txn);
         s.checkpoint().unwrap();
         let ckpt_ns = t2.elapsed().as_nanos();
 
         println!(
-            "rmp #809 freeze-audit cost @ N={N} nodes, pool=4096 frames:\n  \
-             3-kind window audit ADDED/pass (W={FREEZE_AUDIT_WINDOW_IDS}) : {audit_ns:>10} ns\n  \
-             full-store scan (AVOIDED periodic-tick spike)   : {full_ns:>10} ns\n  \
-             gc()+checkpoint (a real maintenance pass)       : {ckpt_ns:>10} ns\n  \
-             audit / maintenance pass                        : {:.4}%\n  \
-             per-window (Node only) 1024/2048/4096/8192 ns   : {:?}\n  \
-             (sink={sink}, full_flagged={fullsink})",
-            audit_ns as f64 / ckpt_ns as f64 * 100.0,
-            per_w
+            "rmp #1070 settle-and-census cost @ N={N} nodes, pool=4096 frames:\n  \
+             merged settle+census scan / pass          : {merged_ns:>10} ns\n  \
+             retired shape (2 full-range scans) / pass : {two_scans_ns:>10} ns\n  \
+             gc()+checkpoint (a real maintenance pass) : {ckpt_ns:>10} ns\n  \
+             merged / maintenance pass                 : {:.4}%\n  \
+             (sink={sink}, fullsink={fullsink})",
+            merged_ns as f64 / ckpt_ns as f64 * 100.0,
         );
     }
 
@@ -20366,88 +19986,6 @@ mod tests {
                 "an isolated commit still performs exactly one fdatasync"
             );
         }
-    }
-
-    /// **Two concurrent descents of the freeze frontier cannot lose one another** (`rmp` #1014, AC2).
-    ///
-    /// The frontier's operation is "lower it if the new value is smaller", and written as
-    /// read-compare-write that is a lost update: two writers appending records below the frontier both
-    /// read the old value, both decide to lower, and the later store discards the earlier descent. The
-    /// consequence is not a slow sweep — the freeze sweep visits only `[freeze_low, high_water)`, so a
-    /// frontier that failed to descend means those ids are never revisited and a committed writer's
-    /// stamp stays in-flight for ever. That is the `rmp` #522 silent-data-loss shape.
-    ///
-    /// `fetch_min` is that operation and cannot lose an update.
-    ///
-    /// # This test does NOT falsify the defect, and says so (`rmp` #1014)
-    ///
-    /// Stated plainly because a test credited with more than it proves is worse than no test. With
-    /// `fetch_min` replaced by `if id < load { store(id) }`, this **still passes**: three drafts were
-    /// tried — synchronised descents from opposite ends, a monotonicity observer, and the round-based
-    /// re-arm below — and none reproduced the lost update on x86, whose TSO makes the load-then-store
-    /// window vanishingly narrow. That is the same reason the page map's multi-producer claim needed
-    /// `loom` rather than threads (`rmp` #1012): a green thread test on x86 is not evidence about an
-    /// atomic protocol.
-    ///
-    /// What this test is, then, is a **behavioural regression guard** — the frontier ends at the
-    /// smallest id anybody proposed, under real contention — not a proof of the mechanism. The proof
-    /// belongs with the `loom` model this task's chain-head compare-and-swap also requires, and which
-    /// must live in a leaf crate because `--cfg loom` is a global rustflag. `fetch_min` is adopted
-    /// here on the strength of it being the operation the semantics names, not on this test.
-    #[test]
-    fn concurrent_descents_of_the_freeze_frontier_are_never_lost_1014() {
-        use std::sync::Arc;
-
-        use std::sync::Barrier;
-
-        /// Rounds. Each one re-arms the frontier high and races the same two proposals, so the
-        /// load-then-store window a read-compare-write opens is retried rather than existing only at
-        /// start-up (which is what made an earlier single-race draft of this test pass under the
-        /// defect).
-        const ROUNDS: usize = 5_000;
-        const HIGH: u64 = 1_000_000;
-
-        let s = Arc::new(fresh());
-        let gate = Arc::new(Barrier::new(2));
-        let rises = Arc::new(AtomicU64::new(0));
-
-        // The descender: proposes a value far above the winner's, but below the re-armed frontier, so
-        // its store is a legitimate descent from what it read — and, under read-compare-write, lands
-        // on top of the winner's `1` whenever the winner slips in between its load and its store.
-        let descender = {
-            let s = Arc::clone(&s);
-            let gate = Arc::clone(&gate);
-            std::thread::spawn(move || {
-                for _ in 0..ROUNDS {
-                    gate.wait();
-                    s.lower_freeze_frontier(StoreKind::Node, HIGH - 1);
-                }
-            })
-        };
-
-        for _ in 0..ROUNDS {
-            // Re-arm above both proposals. Written directly: `lower_freeze_frontier` only descends.
-            s.freeze_low[StoreKind::Node as usize].reset(HIGH);
-            gate.wait();
-            s.lower_freeze_frontier(StoreKind::Node, 1);
-            // Both proposals are in; the frontier must be the smaller of them. Anything else is a
-            // descent that was overwritten by a larger one.
-            if s.freeze_frontier(StoreKind::Node) != 1 {
-                rises.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        descender.join().expect("descender thread panicked");
-
-        // THE property. An id below the frontier is one the freeze sweep will never revisit, so a
-        // frontier left above the smallest proposal has forfeited that range — and a committed
-        // writer's stamp in it stays in-flight for ever (`rmp` #522).
-        assert_eq!(
-            rises.load(Ordering::Relaxed),
-            0,
-            "in {ROUNDS} rounds the frontier ended above the smallest id proposed {} time(s): a \
-             concurrent descent was overwritten by a larger one (`rmp` #1014)",
-            rises.load(Ordering::Relaxed)
-        );
     }
 }
 

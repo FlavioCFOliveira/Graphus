@@ -1,5 +1,11 @@
-//! Regression: the `rmp` #522 incremental freeze frontier must not strand a committed writer's stamp
-//! when a maintenance GC ran while that writer was still in-flight.
+//! Regression: a maintenance GC that runs while a writer is still in flight must not leave that
+//! writer's stamp unresolvable once the writer commits and a later pass forgets it (`rmp` #522).
+//!
+//! The mechanism under the test changed twice and the property never did. `rmp` #522 fixed it with a
+//! freeze frontier that had to keep covering an in-flight writer's records; `rmp` #1069 made an
+//! unsettled stamp resolve through the durable commit slot; `rmp` #1070 retired the frontier and made
+//! the settle a side effect of the reference census. This asserts the OUTCOME — the committed value
+//! is still visible — so it survives all three and would have caught any of them getting it wrong.
 //!
 //! Reproduces the exact production-reachable sequence:
 //!   1. `t1` creates `n.v = 1` and commits.
@@ -69,8 +75,9 @@ fn committed_value_survives_a_gc_that_ran_while_its_writer_was_in_flight() {
     s.set_node_property_value(t2, n, key, &Value::Integer(2))
         .unwrap();
 
-    // 3) A maintenance GC runs under its own txn WHILE t2 is in-flight. Its freeze sweep must keep the
-    //    freeze frontier covering t2's not-yet-committable records so a later pass can freeze them.
+    // 3) A maintenance GC runs under its own txn WHILE t2 is in-flight. Its settle-and-census scan
+    //    must decline t2's not-yet-resolvable stamps (there is no commit timestamp to settle them to)
+    //    and leave them for a later pass, without losing track of them.
     let gc_a = TxnId(3);
     s.begin(gc_a);
     s.gc(gc_a, s.snapshot_ts()).unwrap();
