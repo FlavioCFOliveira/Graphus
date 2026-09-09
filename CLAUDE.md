@@ -161,11 +161,33 @@ Graphus is built by a **team**, not by a lone generalist. In addition to your ow
 
 This complements — and does not replace — the task-execution rule that you MUST determine and delegate to the most appropriate subagent for each task (see "Task execution", step 4).
 
+## Mandatory skills
+
+Three areas of this project are governed **exclusively** by skills. Whenever the work in hand falls into one of them, the corresponding skill is the **only** admissible route: invoke it and let it drive the operation. Carrying that work out by any other means — ad-hoc commands, direct tool calls, or your own improvisation — is forbidden.
+
+| Area | Mandatory skill | Where it is expanded |
+| --- | --- | --- |
+| Git operations that change the repository | `gitflow` | "Git operations" |
+| Coordination and maintenance of tasks and sprints | `roadmap-manager` | "Task planning and execution" |
+| Knowledge about the project (structure, components, files, ...) | `knowledge-authority` | "Knowledge Graph" |
+
+These rules govern **how** an operation is carried out; they complement — and never replace — the delegation rule of "Subagent team", which governs **who** does the engineering work.
+
+## Git operations
+
+**Every git operation that changes the repository MUST be carried out through the `gitflow` skill.** That skill is the sole interface to the repository's history and branch topology: it translates the roadmap's sprint and task lifecycle into correct, safe git operations according to the gitflow branching model (Vincent Driessen).
+
+- **Governed by the skill (mandatory):** commits, staging, branch creation, deletion and switching, merges, rebases, tags, pushes, stashes, reverts, resets, releases, and hotfixes — in short, anything that writes to the working tree, the index, the refs, or a remote.
+- **Not governed by it (perform directly):** read-only enquiries — `git log`, `git show`, `git diff`, `git status`, `git blame` — which remain the cheapest route and stay subject to the "Token-economy policy".
+- The skill MUST be invoked, at the very least: whenever a sprint is opened or closed; whenever a task is closed and its work must be recorded as a commit (see "Task execution", step 7); and whenever a release or a hotfix is cut.
+- You MUST NOT improvise the branch topology or the commit flow: the branching model, the branch names, and the merge routes are decided by the skill, never by you.
+- If the repository's state and the gitflow model appear to be in conflict, you MUST ask the user how to proceed (see "Core rules", rule 1) instead of resolving it by hand.
+
 ## Task planning and execution
 
-**For any operation that involves Tasks or Sprints, you MUST use the `roadmap-manager` skill.** That skill is the interface through which the roadmap is planned, queried, and updated; do not drive the roadmap by any other means.
+**Every operation related to the coordination and maintenance of tasks and sprints MUST be carried out through the `roadmap-manager` skill.** That skill is the sole operator of the roadmap and the only interface through which it is planned, queried, and updated: creating, listing, inspecting, and editing tasks, sprints, and backlog items; the sprint lifecycle (plan, start, close, reopen); state transitions; priorities and severities; dependencies and subtasks; reordering and moving tasks; the typed comment log (FINDING, HYPOTHESIS, TEST, DECISION, PROGRESS, UPDATE, NOTE); the audit log and statistics; and status reports. Do not drive the roadmap by any other means.
 
-To plan and coordinate execution, you MUST use the `rmp` tool (a CLI available on the system for roadmap management). Treat this tool as the **single source of truth** for planning and executing this project's tasks; no other means must be used for this purpose.
+The roadmap itself lives in the `rmp` tool (Groadmap, a CLI available on the system for roadmap management). Treat that tool as the **single source of truth** for planning and executing this project's tasks, and reach it **through the `roadmap-manager` skill**; no other means must be used for this purpose. The single exception is `rmp graph ...`, which belongs to the `knowledge-authority` skill (see "Knowledge Graph").
 
 Use the **Knowledge Graph** to better understand the project, its components, and how they relate, so that it is easier to identify the scope and impact of each task on the project.
 
@@ -187,7 +209,7 @@ When the work for a task is substantially large (too much for a single task to b
 
 ### Task execution
 
-Task execution is the natural continuation (the next step) of planning. You MUST always use the `rmp` tool to determine:
+Task execution is the natural continuation (the next step) of planning. You MUST always use the `roadmap-manager` skill to determine:
 
 1. Whether there is an open task that is not yet complete, in order to continue it;
 2. Identify which is the next task;
@@ -195,8 +217,8 @@ Task execution is the natural continuation (the next step) of planning. You MUST
 4. Determine which subagent is most appropriate and delegate the task's execution to it;
 5. Always validate that the acceptance criteria are met before closing the task;
 6. Ensure the task is closed with a short summary of what was done;
-7. After the task is closed and before moving on to the next one, make a git commit following best practices, explaining what was done;
-8. Update the Knowledge Graph.
+7. After the task is closed and before moving on to the next one, make a git commit **through the `gitflow` skill** (see "Git operations"), following best practices and explaining what was done;
+8. Update the Knowledge Graph **through the `knowledge-authority` skill** (see "Knowledge Graph").
 
 Whenever possible, you MUST adapt the model and the model's effort level to the requirements of each task's individual operations.
 
@@ -210,7 +232,7 @@ This rule governs the **lifecycle** of **tasks** (the units of work tracked in `
 
 ## Knowledge Graph
 
-**The Knowledge Graph MUST be managed with the help of the `knowledge-authority` skill.** That skill is the empirical source of truth about this project's own contents: use it to bootstrap, query, refresh, and synchronize the graph, and to update it after every commit.
+**Every task related to knowledge about the project — its structure, its components, its files, its features, its tests, its specifications, its dependencies, and the relationships between them — MUST be carried out through the `knowledge-authority` skill.** That skill is the empirical source of truth about this project's own contents and the sole operator of `rmp graph`. Use it to answer any factual question about the codebase (which file or function implements a feature, which components exist and how they relate, what depends on what, which tests cover which behaviour, what the scope and impact of a change are), and to bootstrap, query, refresh, synchronize, and audit the graph, including after every commit. Consult it **before** reading files or searching the code — even when the answer looks one `grep` away.
 
 You MUST use the "Graph" features of `rmp` (Groadmap) to create, maintain (update), and query a knowledge graph of the project. This graph **MUST CONTAIN EVERYTHING** that proves useful to know about the project (examples: which features it has; where they are specified; where they are implemented; which tests exist and what they test; which components exist and how they relate; the dependencies between them; in which git commit a feature was specified, implemented, and tested; the rmp tasks; the component tasks; ...) among other information worth mapping.
 
@@ -342,9 +364,9 @@ If the answer to any of these questions is "no" or "I don't know", the cheap alt
 - **If an operation can be performed locally through a CLI, it MUST be performed through the CLI and by no other means.** The local CLI is systematically the cheapest option, so, where an equivalent command exists, no other way of obtaining the same result is acceptable.
 - This applies to every more expensive alternative: web queries, browser tooling, navigating graphical interfaces, or any remote service that returns what a local command already returns.
 - Examples:
-  - `git log`, `git show`, `git diff`, `git blame` locally, instead of consulting the repository's web interface;
+  - `git log`, `git show`, `git diff`, `git blame` locally, instead of consulting the repository's web interface (these are read-only enquiries; every git operation that **changes** the repository goes through the `gitflow` skill — see "Git operations");
   - `gh issue view`, `gh pr view`, `gh api` (the GitHub CLI), instead of opening the corresponding web pages;
-  - `rmp` for everything concerning tasks, sprints, and the Knowledge Graph (see "Task planning and execution" and "Knowledge Graph"), which is moreover the single source of truth;
+  - the `roadmap-manager` skill for everything concerning tasks, sprints, and the backlog, and the `knowledge-authority` skill for everything concerning the Knowledge Graph (see "Mandatory skills"); both drive the local `rmp` CLI, which is moreover the single source of truth;
   - `--help`, `man`, or the command's own documentation, instead of searching for that same documentation online;
   - filtering and aggregating data locally (for example with `grep`, `jq`, `sort`, `wc`) instead of pulling the full result set into the context.
 - Reserve the more expensive routes (web, browser, remote services) for the cases where **no** local command can produce the same result.
@@ -358,7 +380,7 @@ If the answer to any of these questions is "no" or "I don't know", the cheap alt
 
 **Consulting this project**
 
-- Consult the **Knowledge Graph first** (see "Knowledge Graph"). Reading the graph is cheaper than reading files or walking the code in search of the same answer. That is exactly what the graph exists for.
+- Consult the **Knowledge Graph first**, through the `knowledge-authority` skill (see "Knowledge Graph"). Reading the graph is cheaper than reading files or walking the code in search of the same answer. That is exactly what the graph exists for.
 - Use targeted searches (`grep` / `glob` with precise patterns) instead of reading whole files in search of a single reference.
 - When reading a large file, read only the range of lines you need instead of the complete file.
 - For wide searches (sweeping many files or directories), **delegate to a subagent** that returns only the conclusion, instead of pulling the content of every file into the main context.
@@ -404,4 +426,4 @@ Every package, component, and function MUST follow a strict separation-of-respon
 
 Use the KG as the memory of the project, of the agents, and of the skills. You MUST take advantage of the relational capabilities (of the graph database) to optimize how you read and write your memories. You MUST use this method to save the token cost of reading files.
 
-**WHENEVER** the project files are changed, you MUST update the KG so that you preserve your ability to understand the project.
+**WHENEVER** the project files are changed, you MUST update the KG — through the `knowledge-authority` skill (see "Mandatory skills") — so that you preserve your ability to understand the project.
