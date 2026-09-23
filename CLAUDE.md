@@ -64,11 +64,27 @@ Whenever you author, exercise, or validate test scenarios — especially those i
 1. **You are NOT authorized to make decisions on your own.** Whenever the instructions are insufficient, unclear, non-specific, non-concrete, or whenever there are contradictions or ambiguities, you MUST ALWAYS ASK the user how to proceed. When asking the user:
    - Provide multiple options (a, b, c, ...) and clearly state which one is your recommendation.
    - When there are multiple questions (clarifications needed), ask them to the user **sequentially, one at a time**.
-   - **Boundary between acting and asking.** Obvious, low-risk corrections proceed immediately — for example, a pre-existing bug whose fix is unambiguous (see "Self-contained development policy"). Any decision that changes the scope, the expected behavior, the architecture, or the requirements MUST be put to the user before you act on it.
-2. **All project documentation (including CLAUDE.md and other operational documents) MUST be written in English** — flawless English, free of spelling, grammar, and syntax errors. Use clear, simple, unambiguous technical language intended for human readers.
+   - **Boundary between acting and asking.** Obvious, low-risk corrections **within the scope of the task in hand** proceed immediately — for example, a pre-existing bug that the task requires fixing and whose fix is unambiguous (see "Completeness"). Anything outside that scope MUST be put to the user first (see "Initiative and proactivity"). Any decision that changes the scope, the expected behavior, the architecture, or the requirements MUST be put to the user before you act on it.
+2. **All project documentation (including CLAUDE.md and other operational documents) MUST be written in English**, as defined in "Language".
 3. **Documentation MUST be accurate and faithful to the code.**
 4. **The workflow MUST always follow these steps:** Specify → Implement → Test → Document. The Implement and Test steps are carried out as the iterative cycle defined in "Development process".
 5. **Open-source inspired.** For every component of the project you MUST look for inspiration in the open-source projects that implement that same component in an exemplary manner. Whenever possible, rely on **more than one** reference project, so that the strengths and the weaknesses of each approach can be compared. Whenever it is necessary, the reference project's **source code** MUST be used as the ultimate source of truth. The mandatory protocol is defined in "Open-source inspiration policy".
+6. **Precedence.** The sections "Language", "Initiative and proactivity", "Completeness", "Synergy and convergence policy", "Subagent team", and "Mandatory skills" prevail over any other instruction in this document, including "Development process".
+
+## Language
+
+### Writing and interpreting
+
+Write — and interpret — every text (instructions, tasks, prompts, documentation, and messages) so that, at all times, it is:
+
+- **Explicit** — what is intended is clear.
+- **Objective** — what is to be executed is always known.
+- **Closed** — the scope of the work to be done is bounded.
+- **Concise** — few words describe what is intended.
+
+### Documentation language
+
+**All documentation** — from the main README to the specification, including code documentation — MUST be written in flawless English, in a professional tone, free of spelling, grammar, and syntax errors. Use clear, simple, unambiguous technical language intended for human readers. Documentation MUST always meet the four requirements of "Writing and interpreting".
 
 ## Decision framework
 
@@ -80,25 +96,52 @@ To decide what the project expects as a result — whether during evaluations an
 
 If there are conflicts between these steps, or difficulty in following them, you MUST immediately ask the user how to proceed, presenting the possible options.
 
-## Self-contained development policy
+## Initiative and proactivity
 
-Every development cycle MUST be self-contained. You must NEVER do only part of a task; each development cycle must produce a tangible result.
+Your action MUST be strictly directed at the objective of the work in hand.
 
-When new needs that were not previously foreseen are discovered during a task, those new needs MUST be resolved (as immediately as possible) within the same development cycle — add the new tasks and develop them as quickly as possible.
+- You are **forbidden to start, on your own initiative, any task that was not EXPLICITLY requested.**
+- Whenever you identify a need outside the scope of the task in hand, you MUST ask the user how to proceed. NEVER start that work proactively.
 
-All code and development MUST, as a rule, be **full-fledged**. Tests MUST NOT be created with skip.
+## Completeness
 
-Whenever you find pre-existing bugs, you MUST fix them on the spot and then continue the work you were doing when you found the bug.
+**You are forbidden to carry out any task or work only partially.** Every piece of work you start MUST be carried out in full. **NEVER leave a task half-done or partially done.**
+
+- Every development cycle MUST be self-contained and MUST produce a tangible result.
+- All code and development MUST, as a rule, be **full-fledged**. Tests MUST NOT be created with skip.
+- A need discovered during a task is part of that task when the task's objective cannot be met correctly without it: resolve it within the same development cycle. Any other need is outside the task's scope: ask the user (see "Initiative and proactivity").
+- Pre-existing bugs follow the same rule. Fix on the spot — and then continue the task — only a bug that the task's objective requires fixing. Report any other bug to the user and ask how to proceed.
+
+## Synergy and convergence policy
+
+**Motto: "Get the most out of every effort: deliver the maximum with the minimum work."**
+
+This policy is your default way of working in this project. The user MUST NOT need to ask for it, and it MUST NOT be recorded as a task in `rmp`.
+
+### Synergy
+
+1. Whenever tasks — tracked in `rmp` or requested ad hoc by the user — have a verifiable functional or technical proximity, you MUST join them into a single development effort, so that one effort serves several tasks.
+2. By default, look for synergies inside the work as well, and apply this principle to all work. For example:
+   - **Code and tests:** write all the code of all the tasks in a single pass, and test all the changes in a single pass, instead of writing and testing small pieces in isolation.
+   - **Documentation:** write all the documentation in a single pass; when the scope is too large, split it into blocks and write each block in a single pass.
+3. **Reach the objectives with the fewest possible tasks and iterations.**
+
+### Convergence
+
+1. You MUST ALWAYS look for convergence among the individual objectives of the tasks, and turn it into synergy: when tasks have complementary objectives or a functional or technical proximity, the effort MUST be organised so that the synergy is maximised.
+2. Group tasks of the same type whenever grouping makes the delivery faster without harming its quality.
+3. Synergy and convergence MUST deliver better work than task-by-task development would — never work of lower quality.
+4. Make the fullest use of the resources available to you — skills, specialised subagents (see "Subagent team"), the Knowledge Graph, and local tools — so that deliveries are faster and cheaper for the user.
 
 ## Development process
 
-**This section governs how development work is carried out. Where it conflicts with any earlier instruction, this section prevails.**
+**This section governs how development work is carried out. Where it conflicts with any earlier instruction, this section prevails, except over the sections listed in "Core rules", rule 6.**
 
-Development MUST proceed as **repeated iterations** of three steps, and the iterations MUST be repeated until the objectives of the work in hand are met:
+Development MUST proceed as **repeated iterations** of three steps, and the iterations MUST be repeated until the objectives of the work in hand are met. Reach those objectives with the fewest iterations possible (see "Synergy and convergence policy").
 
 1. **Analysis** — determine exactly what has to change, and why, before writing any code.
 2. **Bulk development of all the code** — write, in a single pass, all the code identified in step 1.
-3. **Testing of the changes made in step 2** — exercise what that same iteration changed.
+3. **Testing of the changes made in step 2** — exercise, in a single pass, what that same iteration changed.
 
 If the objectives have not been met at the end of step 3, start a new iteration at step 1.
 
@@ -106,13 +149,11 @@ If the objectives have not been met at the end of step 3, start a new iteration 
 
 ### Focus and scope
 
-**Development MUST be FOCUSED AND OBJECTIVE, and MUST NEVER attempt to go beyond what is required.** Implement exactly what is asked: no speculative generality, no anticipated features, no unrequested refactoring, no adjacent improvements.
+**Development MUST be FOCUSED AND OBJECTIVE, and MUST NEVER attempt to go beyond what is required.** Implement exactly what is asked: no speculative generality, no anticipated features, no unrequested refactoring, no adjacent improvements (see "Initiative and proactivity").
 
 ### Bulk development
 
-Whenever possible, you MUST write **all** the code of one or several tasks **in bulk**, in a single pass, instead of producing it in small increments.
-
-You MUST look, **at all times**, for tasks of similar scope and bring them together into the same iteration, delegated to the subagent best specialised in their requirements and objectives. Accordingly, when you evaluate the pending tasks you MUST determine whether any of them are substantially close to one another, technically and functionally: tasks with such substantial proximity (similar tasks) MUST be developed together, in the same bulk pass.
+Bulk development applies the "Synergy and convergence policy" to code: you MUST write **all** the code of the tasks joined into one development effort **in bulk**, in a single pass, instead of producing it in small increments.
 
 Writing the code of several tasks in one bulk pass is allowed. The sequential-execution rule (see "Task execution") continues to govern the **lifecycle** of each task in `rmp`: every task is still opened, validated against its acceptance criteria, closed with its summary, and committed **individually and in order**.
 
@@ -149,15 +190,27 @@ The general architecture of the project — and the specific architecture of eac
 
 ## Subagent team
 
-Graphus is built by a **team**, not by a lone generalist. In addition to your own work, you have a roster of **subagents** covering every available scope: the **built-in (global)** ones provided by the harness, the ones defined at the **user level** (`~/.claude/agents/`), and any defined at the **project level** (`.claude/agents/`). You MUST treat these subagents as **members of the working team** and actively put them to work.
+Graphus is built by a **team**, not by a lone generalist. You have a roster of **subagents** covering every available scope: the **built-in (global)** ones provided by the harness, the ones defined at the **user level** (`~/.claude/agents/`), and any defined at the **project level** (`.claude/agents/`). You MUST treat these subagents as **members of the working team** and put them to work.
+
+### Delegation
+
+**ALL work in this project MUST be delegated** to the subagent specialised in the objectives that the work is meant to reach. You MUST ALWAYS choose the most appropriate subagent. The main conversation coordinates the work — it plans, delegates, validates, and reports — and does not execute it.
+
+### One subagent at a time
+
+- **At most ONE subagent may run at any moment**, in parallel with the main conversation. You MUST NEVER run more than one subagent at the same time.
+- Use every subagent the work needs, **in series, never in parallel**: start the next subagent only after the previous one has finished.
+- **Exception:** whenever the user explicitly authorizes more than one subagent in parallel, that authorization is an exception, limited to what the user authorized, and it is **always revoked at the end of the task** in hand.
+
+### Team rules
 
 1. **Know your team.** You MUST be aware of which subagents are available (global, user-level, and project-level) and what each one specializes in. The roster includes deep specialists across the project's domains — for example, and non-exhaustively: the Bolt protocol, PackStream, storage engines, concurrency and parallelism, Rust engineering and profiling, columnar / NoSQL / graph-theory knowledge, security research, specification management, and releases.
 
-2. **They act and intervene whenever their specialty is useful.** A specialist MUST act and intervene **whenever its expertise adds value to the work at hand — not only when explicitly asked**. Delegate proactively: route each piece of work to the subagent best suited to it, and call in the relevant specialist to design, review, audit, or certify anything that touches their domain (for example: a storage change reviewed by the storage auditor; security-sensitive code vetted by the security researcher; Bolt / PackStream work validated by the respective protocol experts) — including proactively, before a task is closed.
+2. **They intervene whenever their specialty is useful to the task in hand.** A specialist MUST intervene **whenever its expertise adds value to the task in hand — not only when explicitly named**. Route each piece of work to the subagent best suited to it, and call in the relevant specialist to design, review, audit, or certify anything the task touches in their domain (for example: a storage change reviewed by the storage auditor; security-sensitive code vetted by the security researcher; Bolt / PackStream work validated by the respective protocol experts) before the task is closed. This never extends the scope of the task (see "Initiative and proactivity").
 
 3. **Maximum effort, every time.** Each subagent MUST behave like a **top professional hired to give their absolute best** on every task they take part in. Partial, careless, or mediocre contributions are not acceptable; each specialist is accountable for the quality of the work in their area of expertise.
 
-4. **Work as a team, toward a better version.** The subagents MUST collaborate as a team — combining their perspectives, challenging one another's work, and building on each other's contributions — with a single shared objective: to guarantee that **every development produces a better, more evolved version** of Graphus than the one before it. Their combined judgment MUST continuously raise the bar on correctness, safety, performance, and conformance.
+4. **Work as a team, toward a better version.** The subagents MUST collaborate as a team — combining their perspectives, challenging one another's work, and building on each other's contributions — with a single shared objective: to guarantee that **every development produces a better, more evolved version** of Graphus than the one before it. Because subagents run in series, each one builds on, and challenges, the output of the ones before it. Their combined judgment MUST continuously raise the bar on correctness, safety, performance, and conformance.
 
 This complements — and does not replace — the task-execution rule that you MUST determine and delegate to the most appropriate subagent for each task (see "Task execution", step 4).
 
@@ -167,9 +220,9 @@ Three areas of this project are governed **exclusively** by skills. Whenever the
 
 | Area | Mandatory skill | Where it is expanded |
 | --- | --- | --- |
-| Git operations that change the repository | `gitflow` | "Git operations" |
-| Coordination and maintenance of tasks and sprints | `roadmap-manager` | "Task planning and execution" |
-| Knowledge about the project (structure, components, files, ...) | `knowledge-authority` | "Knowledge Graph" |
+| Every git operation that changes the repository, following the gitflow branching model | `gitflow` | "Git operations" |
+| Coordination and management of tasks, sprints, and comments, and every `rmp` command except `rmp graph` | `roadmap-manager` | "Task planning and execution" |
+| Management of the Knowledge Graph (every `rmp graph` command) and knowledge about the project (structure, components, files, ...) | `knowledge-authority` | "Knowledge Graph" |
 
 These rules govern **how** an operation is carried out; they complement — and never replace — the delegation rule of "Subagent team", which governs **who** does the engineering work.
 
@@ -185,7 +238,7 @@ These rules govern **how** an operation is carried out; they complement — and 
 
 ## Task planning and execution
 
-**Every operation related to the coordination and maintenance of tasks and sprints MUST be carried out through the `roadmap-manager` skill.** That skill is the sole operator of the roadmap and the only interface through which it is planned, queried, and updated: creating, listing, inspecting, and editing tasks, sprints, and backlog items; the sprint lifecycle (plan, start, close, reopen); state transitions; priorities and severities; dependencies and subtasks; reordering and moving tasks; the typed comment log (FINDING, HYPOTHESIS, TEST, DECISION, PROGRESS, UPDATE, NOTE); the audit log and statistics; and status reports. Do not drive the roadmap by any other means.
+**Every operation related to the coordination and maintenance of tasks, sprints, and comments MUST be carried out through the `roadmap-manager` skill.** That skill is the sole operator of the roadmap and the only interface through which it is planned, queried, and updated: creating, listing, inspecting, and editing tasks, sprints, and backlog items; the sprint lifecycle (plan, start, close, reopen); state transitions; priorities and severities; dependencies and subtasks; reordering and moving tasks; the typed comment log (FINDING, HYPOTHESIS, TEST, DECISION, PROGRESS, UPDATE, NOTE); the audit log and statistics; and status reports. Do not drive the roadmap by any other means.
 
 The roadmap itself lives in the `rmp` tool (Groadmap, a CLI available on the system for roadmap management). Treat that tool as the **single source of truth** for planning and executing this project's tasks, and reach it **through the `roadmap-manager` skill**; no other means must be used for this purpose. The single exception is `rmp graph ...`, which belongs to the `knowledge-authority` skill (see "Knowledge Graph").
 
@@ -204,6 +257,8 @@ If the work being planned requires several phases (or sprints), then the plannin
 Use the **Knowledge Graph** to help identify which tasks bring the most gains and the extent of each task's impact. Use the KG (Knowledge Graph) to help determine which tasks are foundational and highest-gain, in order to optimize the best path for executing the tasks.
 
 High-gain tasks (those with the greatest gain or the greatest impact on the project), tasks that unblock other tasks or features, and foundational tasks MUST always take priority. By default, you must always seek to work from the highest-gain tasks down to the least essential ones.
+
+Plan the fewest tasks that reach the objectives (see "Synergy and convergence policy").
 
 When the work for a task is substantially large (too much for a single task to be developed by an AI agent such as Claude Code), that task MUST be subdivided into parts, respecting the operating principles already established (for example, the self-contained-task principle).
 
@@ -224,11 +279,9 @@ Whenever possible, you MUST adapt the model and the model's effort level to the 
 
 **Task and sprint execution MUST be carried out sequentially.** Sprints MUST be executed sequentially, and tasks MUST be executed sequentially. Tasks MUST NEVER be run in parallel, regardless of any perceived justification: exactly one task may be in progress at any given moment, and it MUST be closed before the next one is started.
 
-This rule governs the **lifecycle** of **tasks** (the units of work tracked in `rmp`): the order in which they are opened, validated, closed, and committed. It does not restrict the internal execution of the single task that is currently in progress: within that one task you may still engage several subagents at the same time (see "Subagent team"), because subagents are not roadmap tasks. Nor does it forbid writing the code of several tasks in a single bulk pass (see "Development process").
+This rule governs the **lifecycle** of **tasks** (the units of work tracked in `rmp`): the order in which they are opened, validated, closed, and committed. It does not forbid writing the code of several tasks in a single bulk pass (see "Development process"). Subagents follow their own rule: at most one at a time (see "Subagent team").
 
-**Evaluations and audits may be run in parallel, but ONLY when the user has explicitly authorized it, and ONLY when they are not roadmap tasks.** This covers investigative work such as running several auditor subagents at once inside the single open task, or an ad-hoc evaluation that is not tracked in `rmp`. It NEVER authorizes running two `rmp` tasks concurrently: the "exactly one task in progress" invariant holds without exception, including for tasks whose subject is an audit or an evaluation.
-
-**Even when parallel execution has been authorized, you MUST NEVER run more than 2 (two) evaluations or audits at the same time.** Plan every evaluation and audit that is needed, but execute them in waves of at most two: as soon as one finishes, start the next one, always keeping the limit of two running in parallel.
+A user authorization to run subagents in parallel (see "Subagent team") NEVER authorizes running two `rmp` tasks concurrently: the "exactly one task in progress" invariant holds without exception, including for tasks whose subject is an audit or an evaluation.
 
 ## Knowledge Graph
 
@@ -389,7 +442,7 @@ If the answer to any of these questions is "no" or "I don't know", the cheap alt
 
 - Do not re-read files you have already read in this session, and do not re-confirm an edit that was applied successfully.
 - Do not re-derive facts already established in the conversation, and do not reopen decisions the user has already taken.
-- Do not launch the same search twice (for example, delegating a search to a subagent and also running it yourself). Delegate **or** execute, never both.
+- Do not launch the same search twice (for example, delegating a search to a subagent and also running it yourself).
 
 **Commands and output**
 
@@ -405,8 +458,8 @@ If the answer to any of these questions is "no" or "I don't know", the cheap alt
 **Model, effort, and parallelism**
 
 - Adapt the model and the effort level to the real difficulty of each operation (see "Task execution"): simple, mechanical operations do not justify the most expensive model or the highest effort level.
-- Group into a single message the tool calls that are independent of one another, instead of issuing them one at a time.
-- Respect the limit of 2 evaluations or audits in parallel (see "Task execution"): excessive parallelism multiplies the cost without accelerating the result.
+- Group into a single message the tool calls that are independent of one another, instead of issuing them one at a time. Subagent launches are the exception: at most one subagent runs at a time (see "Subagent team").
+- Respect the limit of one subagent at a time (see "Subagent team"): excessive parallelism multiplies the cost without accelerating the result.
 
 ### Safeguard
 
@@ -416,7 +469,7 @@ If, during execution, you find that the cheap route you chose is not producing t
 
 ## Regression prevention
 
-Whenever a bug is identified, the necessary regression tests MUST be created to ensure that the same bugs do not recur as a consequence of future development.
+Whenever a bug is fixed, the necessary regression tests MUST be created to ensure that the same bug does not recur as a consequence of future development.
 
 ## Separation of responsibilities
 
