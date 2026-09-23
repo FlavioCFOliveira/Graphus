@@ -227,10 +227,14 @@ fail by deliberate corruption, then the graph was restored by rebuild:
 
 | Script | Role |
 |---|---|
-| `rebuild.sh` | the whole pipeline: rustdoc × 3 targets → extract → populate → audit |
+| `rebuild.sh` | the whole pipeline: rustdoc × 3 targets → extract → populate → audit; reuses a running `rmp graph serve`, or starts one before populate and stops it on exit |
 | `extract.py` | nodes/edges as JSON, from rustdoc + `cargo metadata` + `git` (~7 s) |
-| `populate.py` | wipe + batched `rmp graph create` (~57 s) |
-| `audit.py` | the 17 criteria (~7 s) |
+| `populate.py` | batched wipe (edges, then nodes) + batched writes, one `rmp graph client` statement each, checked against `counters` and a final census (~5 s) |
+| `audit.py` | the 17 criteria, read through `rmp graph client` (~1 s) |
+
+Every statement goes through `rmp graph client`, which needs a live
+`rmp graph serve -r graphus` and runs one statement per invocation, under a
+5-second server-side budget and a 1,048,576-byte statement limit.
 
 Symbol extraction needs nightly rustdoc:
 `RUSTDOCFLAGS='-Zunstable-options --output-format json' cargo +nightly doc --workspace --no-deps --lib`
@@ -246,12 +250,14 @@ Symbol extraction needs nightly rustdoc:
    attribute** — `limits.rs:45:10` is the `Debug` token in `#[derive(Debug, Clone)]`,
    where no function is written. 2403 such items (30% of the raw set) must be
    dropped, or the graph asserts 2403 declarations that do not exist.
-3. **Edge properties must be Cypher literals.** `rmp graph` does **not** resolve
-   an `UNWIND` row variable inside a *relationship* property map — it writes
-   `null` and reports success. (Node property maps resolve correctly.) With every
-   `kind` nulled, `MERGE` then collapsed `normal` and `dev` into one edge and 292
-   real dependencies silently became 276. `populate.py` groups by property value
-   and emits literals.
+3. **Edge properties are written as Cypher literals.** The `rmp graph` binary of
+   2026-07-16 did **not** resolve an `UNWIND` row variable inside a
+   *relationship* property map — it wrote `null` and reported success. (Node
+   property maps resolved correctly.) With every `kind` nulled, `MERGE` then
+   collapsed `normal` and `dev` into one edge and 292 real dependencies silently
+   became 276. Re-probed on rmp 1.17.3 (2026-09-23), the row variable resolves.
+   `populate.py` still groups by property value and emits literals, which is
+   correct on both binaries.
 
 The decision register (`specification/02-decision-register.md`) carries a
 canonical, machine-readable index fenced by

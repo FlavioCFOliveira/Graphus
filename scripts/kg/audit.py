@@ -17,6 +17,9 @@ Two rules keep this honest:
 
 Exit code 0 = every criterion holds. Non-zero = the number of failed criteria.
 
+Every read goes through `rmp graph client`, so a graph server must be running
+for the roadmap (`rmp graph serve -r graphus`; rebuild.sh manages one).
+
 Usage: scripts/kg/audit.py [--roadmap graphus]
 """
 
@@ -61,10 +64,12 @@ def sh(*a: str) -> str:
 
 
 def q(roadmap: str, query: str) -> list[list]:
-    p = subprocess.run(["rmp", "graph", "query", "-r", roadmap],
+    """Run ONE read statement through `rmp graph client` (needs a live server)."""
+    p = subprocess.run(["rmp", "graph", "client", "-r", roadmap],
                        input=query, capture_output=True, text=True)
     if p.returncode != 0:
-        raise SystemExit(f"FATAL: query failed: {p.stderr[:200]}\n{query[:200]}")
+        raise SystemExit(f"FATAL: rmp graph client failed (rc={p.returncode}): "
+                         f"{p.stderr[:300]}\n{query[:200]}")
     return json.loads(p.stdout)["rows"]
 
 
