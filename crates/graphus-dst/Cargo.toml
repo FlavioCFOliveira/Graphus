@@ -147,3 +147,11 @@ required-features = ["det-sched"]
 [[test]]
 name = "det_scheduler_census_window_1070"
 required-features = ["det-sched"]
+
+[[test]]
+name = "det_scheduler_phase_f_toctou_1092"
+required-features = ["det-sched"]
+
+[[test]]
+name = "zz_aud"
+required-features = ["det-sched"]

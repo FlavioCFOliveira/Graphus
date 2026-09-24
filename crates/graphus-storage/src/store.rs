@@ -1762,6 +1762,18 @@ struct Maintenance {
     /// `rmp` #578 / #588 shape. Parking moves the recycle past the end of that transaction, which is
     /// the same maintenance boundary for the same class of reason.
     pending_orphan_slots: [std::collections::BTreeSet<u64>; STORE_COUNT],
+    /// What the store's allocators held **when it opened** (`rmp` #1092): sampled by
+    /// [`sample_allocators_at_open`](RecordStore::sample_allocators_at_open) before the store serves
+    /// anybody, read by the first full GC pass, and dropped when that pass completes. `None` on a
+    /// freshly created store, which cannot hold a crash-stranded record.
+    ///
+    /// The first full pass is the one that collects what a crash left behind, and it runs beside
+    /// writers. Among the slots it finds `!in_use`, it must tell a slot the crash (or a lost parking
+    /// set) retired from a slot a writer has just allocated and not yet written — both read the
+    /// same. The sample tells them apart: an id below the sampled high-water and on no sampled free
+    /// list could not have been handed to any writer since `open` unless this very pass listed it,
+    /// because every allocation pops the free list or grows past the high-water.
+    open_allocator_sample: Option<OpenAllocatorSample>,
     /// Whether an **unreclaimed empty** property cell (`rmp` #967, `D-property-removal`) may exist:
     /// set by [`empty_prop_cell`](RecordStore::empty_prop_cell), and **re-derived** after every property
     /// sweep from what that sweep actually saw ([`PropChainSweep::deferred_empty`]) rather than
@@ -1808,6 +1820,7 @@ impl Maintenance {
             pending_undo_chains: Default::default(),
             pending_corpse_rels: Default::default(),
             pending_orphan_slots: Default::default(),
+            open_allocator_sample: None,
             pending_empty_prop_cells: false,
             dead_index_keys: Vec::new(),
             dead_property_keys: 0,
@@ -2744,10 +2757,35 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // the image that claimed them. Runs after every page-map reconstruction above, so the records
         // it reads are addressable, and before the store serves anybody.
         store.narrow_free_lists_to_unused_records();
+        // `rmp` #1092: sample the allocators while nothing else runs — after the narrowing, so the
+        // sample sees the free lists the store will actually serve from.
+        store.sample_allocators_at_open();
         // Size the WAL segment seal threshold to the RECOVERED store, so a reopened database immediately
         // uses a segment size matched to its data image rather than the sink's default 64 MiB (`rmp` #706).
         store.apply_adaptive_wal_segment_target();
         Ok(store)
+    }
+
+    /// Samples the allocators into
+    /// [`open_allocator_sample`](Maintenance#structfield.open_allocator_sample) (`rmp` #1092).
+    ///
+    /// Called by [`open`](Self::open) before the store serves anybody, so the sample is exact: no
+    /// writer holds an allocated id whose record it has not written yet. It costs in-memory copies of
+    /// the free lists and no I/O.
+    fn sample_allocators_at_open(&self) {
+        let sample = OpenAllocatorSample {
+            undo: self.allocator_sample(StoreKind::Undo),
+        };
+        self.with_maintenance(|m| m.open_allocator_sample = Some(sample));
+    }
+
+    /// `kind`'s high-water and free list, read under one allocation hold.
+    fn allocator_sample(&self, kind: StoreKind) -> (u64, BTreeSet<u64>) {
+        let alloc = self.store(kind).alloc.lock();
+        (
+            alloc.high_water(),
+            alloc.free().ids().iter().copied().collect(),
+        )
     }
 
     /// Drops from every store's free list any id whose record still reads `in_use` — the free-list
@@ -6413,11 +6451,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     // That is the state `rmp` #220 / #172 designed the header-only creation undo around; it is
     // recovered, not repaired by an unsound restoration.
     //
-    // The one chain-head write that KEEPS a physical undo is the GC's
-    // [`free_undo_chain`](Self::free_undo_chain), which clears `undo_ptr` to `0`. It is not a prepend:
-    // leaving it un-undone on a rolled-back GC pass would leave an entity with no history while its
-    // deltas are restored, which is a visibility error rather than a reclaimable corpse. A GC pass is a
-    // single non-yielding call, so its plain pre-image can never go stale.
+    // The one chain-head write that KEEPS an undo image is the GC's
+    // [`detach_undo_chain_head`](Self::detach_undo_chain_head), which clears `undo_ptr` to `0`. It is
+    // not a prepend: leaving it un-undone on a rolled-back GC pass would leave an entity with no
+    // history while its deltas are restored, which is a visibility error rather than a reclaimable
+    // corpse. A GC pass is NOT a single non-yielding call — it yields between phases and writers run
+    // beside it (`rmp` #1092) — so that image is a compare-and-set in both directions: the detach
+    // fires only if the head is still the one the pass judged dead, and its undo restores the head
+    // only if it is still `0`.
 
     /// Writes a chain-pointer / chain-flag field of record `id` in `kind`'s store with **no undo**
     /// (`rmp` #970) — see the section note above. Touches exactly
@@ -6606,10 +6647,15 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///   runs no chain reaches the record. There is no head for anyone to be publishing, so there is
     ///   no comparison to defeat. Same argument as `create_node` / `create_rel` installing `undo_ptr`
     ///   in a record's first write.
-    /// * `relink_run_endpoint`, `reclaim_node`, `reclaim_rel`, `gc_splice_corpses` phase 3 and
-    ///   `free_undo_chain` — whole-record or header writes carrying head words, **GC only**, covered by
-    ///   the exclusivity of a GC pass. Note that exclusivity is a convention documented in prose, not a
-    ///   lock: `gc` takes `&self`, and `rmp` #1016 is what would have to re-establish it.
+    /// * `relink_run_endpoint`, `reclaim_node`, `reclaim_rel` and `gc_splice_corpses` phase 3 —
+    ///   whole-record or header writes carrying head words, **GC only**. They are NOT covered by any
+    ///   exclusivity: a GC pass takes `&self`, yields between its phases, and writers run beside it.
+    ///   Passes are serialized with each other by the coordinator, not with writers; `rmp` #1016 /
+    ///   #979 is what would have to make these writes safe against a concurrent writer of the same
+    ///   record.
+    /// * GC phase F's clear of `undo_ptr` is no longer in this list (`rmp` #1092): it goes through
+    ///   [`detach_undo_chain_head`](Self::detach_undo_chain_head), a compare-and-set under the same
+    ///   rank-27 section, against the head the pass judged dead.
     /// * The DEFERRED WAL UNDO of a whole-record write is a second writer of all three words —
     ///   `rollback_physical` and crash recovery re-apply a pre-image taken before the write. Neither
     ///   document mentioned this class before `rmp` #1030. `repoint_neighbour` is out of it entirely
@@ -7546,31 +7592,93 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     }
 
     /// Detaches entity `(kind, entity)`'s **whole** undo chain under `txn` and reclaims every delta on
-    /// it, returning how many deltas were freed.
+    /// it, returning how many deltas were freed — for a caller that is reclaiming the **entity itself**
+    /// ([`reclaim_node`](Self::reclaim_node), [`reclaim_rel`](Self::reclaim_rel)).
     ///
-    /// Detaching before freeing is what keeps the chain valid at every instant: the head is set to
-    /// `0` first — with a plain pre-image undo, the one chain-head write that keeps one, because this
-    /// is not a prepend (see the section note on `write_field_redo_only`) — so nothing can reach a
-    /// delta whose slot is about to be listed as free.
+    /// Such an entity is a committed tombstone below the watermark, and a tombstone refuses every
+    /// write, so no writer can be prepending onto its chain: the chain read here is the chain that is
+    /// freed. That is an invariant rather than a race to lose, so a refused detach is an error — see
+    /// [`free_checked_undo_chain`](Self::free_checked_undo_chain), which does the work.
     ///
     /// # Errors
-    /// Returns a storage error if the chain is malformed or a write fails.
+    /// Returns a storage error if the chain is malformed, a write fails, or the chain head moved
+    /// between the read and the detach (a writer reached a reclaimable tombstone).
     fn free_undo_chain(&self, kind: StoreKind, entity: u64, txn: TxnId) -> Result<usize> {
         let chain = self.undo_chain(kind, entity)?;
         if chain.is_empty() {
             return Ok(0);
         }
+        match self.free_checked_undo_chain(kind, entity, &chain, txn)? {
+            Some(freed) => Ok(freed),
+            None => Err(GraphusError::Storage(format!(
+                "undo-chain head of reclaimable {kind:?} {entity} moved while GC reclaimed the \
+                 entity; a writer reached a committed tombstone (`rmp` #1092)"
+            ))),
+        }
+    }
+
+    /// Detaches `chain` — entity `(kind, entity)`'s undo chain **as the caller read and judged it** —
+    /// and reclaims every delta on it, returning how many deltas were freed, or `None` when the chain
+    /// is no longer the one that was judged (`rmp` #1092).
+    ///
+    /// # Act on the chain that was checked, never on a re-read
+    ///
+    /// A GC pass runs beside writers: it is a sequence of phases with yield points between them and
+    /// latches taken and released inside each, not a single non-yielding call. A writer may therefore
+    /// prepend onto this entity at any moment between the caller's read of `chain` and the writes
+    /// below. This method used to re-walk the chain itself, set the head to `0` unconditionally and
+    /// free whatever the second walk found — so a writer that prepended in between had its
+    /// **in-flight** delta freed along with the dead ones, unlinked from the chain, and its commit
+    /// slot's `delta_count` decremented while the delta was still its only record of the old value.
+    ///
+    /// So the head is cleared by a **compare-and-set against the head the caller observed**
+    /// (`chain[0].0`), and only `chain`'s deltas are freed:
+    ///
+    /// * **The compare wins** — the head still names the delta the caller judged, and every delta
+    ///   below it is immutable once linked (`05 §12.2`: nothing is ever spliced out of the middle of a
+    ///   chain), so the chain below the head is exactly `chain`. A writer that read the old head and
+    ///   has not published yet is refused by its own compare-and-publish (the head is now `0`), re-reads
+    ///   it and links its delta onto an empty chain; nothing it writes names a freed delta.
+    /// * **The compare loses** — a writer published on top. The chain is no longer all dead, nothing
+    ///   is written, and the entity stays a candidate for a later pass.
+    ///
+    /// A head that has moved away and come back is still the same chain: the only way the head can
+    /// return to a delta after a prepend is that prepender's own logical rollback detaching its prefix
+    /// (`detach_own_deltas`), and the delta it returns to is still linked, still dead and not yet
+    /// freed — only this pass frees a committed chain's deltas, and GC passes are serialized.
+    ///
+    /// # The undo image is a compare-and-set too
+    ///
+    /// A physical rollback of this GC pass (or ARIES undo of it as a crash loser) restores the head
+    /// only **if it is still `0`**, so it can never overwrite a delta a writer published onto the
+    /// emptied chain after the detach — the `rmp` #301 discipline of
+    /// [`settle_header_word`](Self::settle_header_word). The redo is the compare-and-set image of
+    /// [`compare_and_publish_chain_head`](Self::compare_and_publish_chain_head), so a replay reaches
+    /// the verdict the live system reached.
+    ///
+    /// # Errors
+    /// Returns a storage error if the entity's page cannot be read or a write fails.
+    fn free_checked_undo_chain(
+        &self,
+        kind: StoreKind,
+        entity: u64,
+        chain: &[(u64, UndoDelta)],
+        txn: TxnId,
+    ) -> Result<Option<usize>> {
+        let Some(&(observed_head, _)) = chain.first() else {
+            return Ok(Some(0));
+        };
+        if !self.detach_undo_chain_head(kind, entity, observed_head, txn)? {
+            return Ok(None);
+        }
         // `rmp` #992: the versions on this chain are about to stop existing, so report the derived-index
         // entries they were the last warrant for. BEFORE `free_delta`, which frees a `SetProperty`
-        // delta's overflow chain and would leave the value undecodable.
-        for &(_, delta) in &chain {
+        // delta's overflow chain and would leave the value undecodable. AFTER the detach, so a chain a
+        // writer kept alive reports nothing.
+        for &(_, delta) in chain {
             self.note_dead_index_keys_of_delta(kind, entity, delta);
         }
-        // A physical pre-image undo, deliberately, and the only chain-head write that keeps one:
-        // see the section note on `write_field_redo_only`. Safe because a GC pass is a single
-        // non-yielding call, so no concurrent writer can stale the image.
-        self.patch_header_word(kind, entity, MVCC_OFF_UNDO_PTR, NULL_ID, txn)?;
-        for &(id, delta) in &chain {
+        for &(id, delta) in chain {
             self.free_delta(id, delta, txn)?;
         }
         // The candidate entry is deliberately LEFT in `pending_undo_chains`. Dropping it here would be
@@ -7578,7 +7686,46 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // would restore the candidate, so the chain would go unswept until the next post-open full
         // scan. The next pass reads an empty chain and drops the entry then, which is self-healing
         // under both outcomes and costs one header read.
-        Ok(chain.len())
+        Ok(Some(chain.len()))
+    }
+
+    /// Clears entity `(kind, entity)`'s `undo_ptr` under `txn` **if it still holds `observed_head`**,
+    /// and reports whether it did (`rmp` #1092).
+    ///
+    /// Read, compare, append and apply are ONE step of the page's log-apply order (`rmp` #1062) — the
+    /// same rank-27 section every compare-and-publish of this word takes, which is what makes the
+    /// compare meaningful against a concurrent prepend. A refused detach logs nothing.
+    ///
+    /// # Errors
+    /// Returns a storage error if the entity's page is not allocated or cannot be fetched.
+    fn detach_undo_chain_head(
+        &self,
+        kind: StoreKind,
+        entity: u64,
+        observed_head: u64,
+        txn: TxnId,
+    ) -> Result<bool> {
+        let (rel_page, off) = paging::record_location(entity, kind.record_size());
+        let dev = self.device_page(kind, rel_page)?;
+        let abs = off + MVCC_OFF_UNDO_PTR;
+        let f = self.pool.fetch(dev)?;
+        let detached = self.in_page_order(dev, || {
+            let current = self.pool.with_page(f, |p| {
+                u64::from_le_bytes(p[abs..abs + 8].try_into().expect("8-byte slice"))
+            });
+            if current != observed_head {
+                return false;
+            }
+            let redo = paging::encode_cas_patch(abs, observed_head, NULL_ID);
+            let undo = paging::encode_cas_patch(abs, NULL_ID, observed_head).into_vec();
+            let lsn = self.log_page_record(dev, |w| w.log_update_borrowed(txn, dev, &redo, undo));
+            self.pool.with_page_mut_lsn(f, lsn, |p| {
+                p[abs..abs + 8].copy_from_slice(&NULL_ID.to_le_bytes());
+            });
+            true
+        });
+        self.pool.unpin(f);
+        Ok(detached)
     }
 
     /// Reclaims one unreachable delta: frees the `strings.store` overflow chain it owns (if any),
@@ -8410,7 +8557,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 }
             }
             if all_dead {
-                freed += self.free_undo_chain(kind, entity, txn)?;
+                // Free THE CHAIN JUST JUDGED, never a re-read of it (`rmp` #1092): a writer may have
+                // prepended since the walk above, and a `None` says one did — its delta keeps the
+                // chain alive, and the entity stays a candidate for the next pass.
+                if let Some(n) = self.free_checked_undo_chain(kind, entity, &chain, txn)? {
+                    freed += n;
+                }
             }
         }
         // The reference sweep runs when something may have been stranded: a rollback that left a
@@ -8799,6 +8951,29 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         if let Some(heads) = chain_heads {
             // Phase 1 — unreachable deltas. `next` links come from deltas that are themselves still
             // allocated; a free-listed delta's stale body is not a reference.
+            //
+            // A `!in_use` delta is a CANDIDATE only if no writer can be holding its id (`rmp` #1092).
+            // This sweep runs beside writers, and a writer that has popped a slot and not yet written
+            // its delta leaves exactly what a crash-stranded corpse looks like: `!in_use` (the stale
+            // body of the slot's previous life), off the free list, and named by nothing. Freeing it
+            // lists a slot the writer is about to fill, and the next allocation hands it out again —
+            // two transactions on one delta. Every id a writer can hold since `open` was on the free
+            // list `open` sampled, at or above the high-water it sampled, or listed by THIS pass (the
+            // only pass since `open` that frees anything, since this sweep runs on the first full
+            // one); so those three are excluded, and what remains was retired before `open`.
+            let (open_hw, open_free) = self
+                .with_maintenance(|m| m.open_allocator_sample.as_ref().map(|s| s.undo.clone()))
+                .unwrap_or_default();
+            let listed_by_this_pass: BTreeSet<u64> = self
+                .active
+                .with(txn, |a| {
+                    a.freed_ids
+                        .iter()
+                        .filter(|&&(k, _)| k == StoreKind::Undo)
+                        .map(|&(_, id)| id)
+                        .collect()
+                })
+                .unwrap_or_default();
             let mut reachable = heads.clone();
             let mut corpses: Vec<u64> = Vec::new();
             for id in 1..undo_hw {
@@ -8811,7 +8986,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 if delta.next != NULL_ID {
                     reachable.insert(delta.next);
                 }
-                if !delta.in_use() {
+                if !delta.in_use()
+                    && id < open_hw
+                    && !open_free.contains(&id)
+                    && !listed_by_this_pass.contains(&id)
+                {
                     corpses.push(id);
                 }
             }
@@ -9679,7 +9858,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // the flag — the next FULL pass still owes the one-time seeding scan (a freeze-only pass never
         // relies on the tracking sets, since it reclaims nothing).
         if !freeze_only {
-            self.with_maintenance(|m| m.gc_full_scan_pending = false);
+            self.with_maintenance(|m| {
+                m.gc_full_scan_pending = false;
+                // The only pass that reads the open-time sample has completed (`rmp` #1092).
+                m.open_allocator_sample = None;
+            });
         }
 
         // The census journal has been read by the sweep (or was never needed): close it now rather
@@ -10651,9 +10834,15 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// with no MVCC version to name, and a *catalog-only* writer, whose effects are in-memory schema
     /// the metadata page settles. Both keep the ARIES path
     /// ([`rollback_physical`](Self::rollback_physical)) — physical undo is the right inverse for a
-    /// physical change, and a GC pass is a single non-yielding call, so no concurrent writer can
-    /// stale its pre-images. Retiring that path belongs to the tasks that version the catalog (#984)
-    /// and make collection concurrent (#979), not to this one.
+    /// physical change. A GC pass is **not** a single non-yielding call (`rmp` #1092): it yields
+    /// between phases and writers run beside it, so a pre-image it logged can be stale by the time a
+    /// rollback applies it. The words a writer shares with the pass therefore carry compare-and-set
+    /// undo images that restore only what the pass itself wrote — the settled header stamps
+    /// ([`settle_header_word`](Self::settle_header_word)) and the detached undo-chain head
+    /// ([`detach_undo_chain_head`](Self::detach_undo_chain_head)); the remaining plain pre-images
+    /// (the reclamation and splice record writes) are sound only while no writer touches those
+    /// records during the pass. Retiring that path belongs to the tasks that version the catalog
+    /// (#984) and make collection concurrent (#979), not to this one.
     ///
     /// # Errors
     /// Returns a storage error if the rollback fails; the transaction then stays **open**, exactly as
@@ -16558,6 +16747,13 @@ impl ChainWordWrite {
 /// tail). `pred`/`succ` are LIVE positions from the walk, never the corpses' own (possibly stale)
 /// stored pointers — see [`RecordStore::gc_splice_corpses`](RecordStore::gc_splice_corpses). Bridging
 /// collapses the whole run by repointing `pred` and `succ` directly at each other.
+/// The allocators as [`open`](RecordStore::open) found them — `(high-water, free list)` per store —
+/// for the first full GC pass (`rmp` #1092; see `Maintenance::open_allocator_sample`).
+#[derive(Debug, Clone)]
+struct OpenAllocatorSample {
+    undo: (u64, BTreeSet<u64>),
+}
+
 #[derive(Clone, Copy)]
 struct CorpseRun {
     node: u64,
@@ -18164,6 +18360,225 @@ mod tests {
         let report = s.gc(TxnId(txn), wm).unwrap();
         s.commit(TxnId(txn)).unwrap();
         report
+    }
+
+    /// **`rmp` #1092, the sibling path — the first pass's orphan sweep never frees a delta slot a
+    /// writer holds.**
+    ///
+    /// Places the writer by hand, twice. A writer pops a delta slot and has not yet written its new
+    /// delta, so the slot reads `!in_use` (the stale body of its previous life), off the free list,
+    /// and named by nothing — exactly a crash-stranded corpse. The first pass after `open` then runs
+    /// its orphan sweep:
+    ///
+    /// * `d1` was listed by THIS pass (phase F freed it) and popped before the sweep;
+    /// * `d2` was on the free list when the store opened, and popped after;
+    /// * `d3` was allocated from fresh space after `open`, freed by its writer's rollback, and popped
+    ///   by a second writer.
+    ///
+    /// None may be listed again; each of the filter's three conditions is what protects one of them. Inverse edit (`$S/g1092_inverse_sweep.patch`: drop the sweep's
+    /// candidate filter) and both are listed a second time while the writer holds them.
+    #[test]
+    fn first_pass_orphan_sweep_never_frees_a_slot_a_writer_holds_1092() {
+        let mut s = fresh();
+        let t0 = TxnId(1);
+        s.begin(t0);
+        let key = s.intern_token(Namespace::PropKey, "v").unwrap();
+        let (n, _) = s.create_node(t0).unwrap();
+        let (m, _) = s.create_node(t0).unwrap();
+        s.set_node_property_value(t0, n, key, &Value::Integer(0))
+            .unwrap();
+        s.set_node_property_value(t0, m, key, &Value::Integer(0))
+            .unwrap();
+        s.commit(t0).unwrap();
+        // `m`'s chain is reclaimed by a pass that commits BEFORE the "open": its deltas are on the
+        // free list the open samples.
+        let g0 = TxnId(2);
+        s.begin(g0);
+        let judged = s.undo_chain(StoreKind::Node, m).unwrap();
+        assert!(!judged.is_empty());
+        s.free_checked_undo_chain(StoreKind::Node, m, &judged, g0)
+            .unwrap()
+            .expect("detach");
+        s.commit(g0).unwrap();
+        let d2 = judged[0].0;
+        assert!(s.free_ids(StoreKind::Undo).contains(&d2));
+
+        // "Open": sample, and arm the first full pass. A real `open` starts with no spare undo slab
+        // (they are in memory), so the ones this process accumulated are dropped first — otherwise
+        // the next delta would come from a slab tail below the sampled high-water, which no reopened
+        // store can do.
+        s.with_maintenance(|mt| mt.spare_undo_slabs.clear());
+        s.sample_allocators_at_open();
+        s.with_maintenance(|mt| mt.gc_full_scan_pending = true);
+        let open_hw = s.store(StoreKind::Undo).alloc.high_water();
+        // A writer pops every slot that was free at `open` — `d2` among them — and writes none.
+        let w = TxnId(4);
+        s.begin(w);
+        let mut popped = BTreeSet::new();
+        while !s.free_ids(StoreKind::Undo).is_empty() {
+            let id = s.alloc_undo_id(w).unwrap();
+            assert!(popped.insert(id), "the allocator handed {id} out twice");
+        }
+        assert!(popped.contains(&d2));
+        // A second writer links a delta — from fresh space, the list being empty — and rolls back,
+        // which lists it.
+        let w1 = TxnId(10);
+        s.begin(w1);
+        s.set_node_property_value(w1, n, key, &Value::Integer(9))
+            .unwrap();
+        let d3 = s.read_mvcc(StoreKind::Node, n).unwrap().undo_ptr;
+        s.rollback(w1).unwrap();
+        assert!(
+            d3 >= open_hw,
+            "non-vacuity: `d3` was allocated after `open`, from fresh space"
+        );
+        assert!(s.free_ids(StoreKind::Undo).contains(&d3));
+
+        // The first pass: phase F frees `n`'s chain…
+        let g = TxnId(3);
+        s.begin(g);
+        let judged = s.undo_chain(StoreKind::Node, n).unwrap();
+        s.free_checked_undo_chain(StoreKind::Node, n, &judged, g)
+            .unwrap()
+            .expect("detach");
+        let d1 = judged[0].0;
+        // …and the first writer pops `d1` and `d3` too, writing neither.
+        while !(popped.contains(&d1) && popped.contains(&d3)) {
+            let id = s.alloc_undo_id(w).unwrap();
+            assert!(popped.insert(id), "the allocator handed {id} out twice");
+            assert!(
+                popped.len() < 64,
+                "the writer never reached {d1}, {d2}, {d3}"
+            );
+        }
+        for id in [d1, d2, d3] {
+            assert!(
+                !s.read_delta(id).unwrap().is_some_and(|d| d.in_use()),
+                "non-vacuity: popped slot {id} reads as retired"
+            );
+            assert!(!s.free_ids(StoreKind::Undo).contains(&id));
+        }
+        let census = s.seed_pending_undo_chains().unwrap();
+        let (window, _journal) = s.open_census_window();
+        let (named, _, _) = s.settle_and_census_headers(g).unwrap();
+        s.gc_sweep_undo_orphans(g, Some(&census), &named, &window)
+            .unwrap();
+        let free = s.free_ids(StoreKind::Undo);
+        assert!(
+            !free.contains(&d1),
+            "a slot this pass listed and a writer popped is not listed again"
+        );
+        assert!(
+            !free.contains(&d2),
+            "a slot that was free at `open` and a writer popped is not listed again"
+        );
+        assert!(
+            !free.contains(&d3),
+            "a slot allocated after `open` and popped again by a writer is not listed again"
+        );
+        s.rollback(w).unwrap();
+        s.commit(g).unwrap();
+    }
+
+    /// **`rmp` #1092 — phase F frees the chain it judged, and only if it is still that chain.**
+    ///
+    /// Places the writer in the window by hand, single-threaded: a GC transaction reads an entity's
+    /// chain (every delta committed, so dead below the watermark), a writer then prepends an in-flight
+    /// delta onto that entity, and only then does the GC transaction act on what it read. The detach
+    /// must be refused and nothing freed — the writer's delta stays the head, its chain intact below
+    /// it, and the writer commits and reads back. With no writer in between, the same call detaches
+    /// and frees exactly the judged chain.
+    ///
+    /// Inverse edit: make [`RecordStore::detach_undo_chain_head`] ignore `observed_head` and the first
+    /// half fails — the head is cleared under the writer and its delta is lost from the chain.
+    #[test]
+    fn phase_f_detach_is_refused_when_a_writer_prepended_after_the_judgement_1092() {
+        let mut s = fresh();
+        let t0 = TxnId(1);
+        s.begin(t0);
+        let key = s.intern_token(Namespace::PropKey, "v").unwrap();
+        let (n, _) = s.create_node(t0).unwrap();
+        s.set_node_property_value(t0, n, key, &Value::Integer(0))
+            .unwrap();
+        s.commit(t0).unwrap();
+        let t1 = TxnId(2);
+        s.begin(t1);
+        s.set_node_property_value(t1, n, key, &Value::Integer(1))
+            .unwrap();
+        s.commit(t1).unwrap();
+
+        // The GC transaction judges the chain dead…
+        let watermark = s.snapshot_ts();
+        let g = TxnId(3);
+        s.begin(g);
+        let judged = s.undo_chain(StoreKind::Node, n).unwrap();
+        assert!(
+            !judged.is_empty(),
+            "non-vacuity: the entity has a chain to judge"
+        );
+        for &(_, d) in &judged {
+            assert!(
+                s.delta_is_dead(d, watermark).unwrap(),
+                "every judged delta is dead"
+            );
+        }
+        // …a writer prepends onto it…
+        let w = TxnId(4);
+        s.begin(w);
+        s.set_node_property_value(w, n, key, &Value::Integer(2))
+            .unwrap();
+        let writer_head = s.read_mvcc(StoreKind::Node, n).unwrap().undo_ptr;
+        assert_ne!(writer_head, judged[0].0, "the writer published a new head");
+        // …and the GC transaction acts on what it judged: refused, nothing written or freed.
+        let undo_free_before = s.free_id_set(StoreKind::Undo);
+        assert_eq!(
+            s.free_checked_undo_chain(StoreKind::Node, n, &judged, g)
+                .unwrap(),
+            None,
+            "a detach against a head a writer has moved must be refused"
+        );
+        assert_eq!(
+            s.read_mvcc(StoreKind::Node, n).unwrap().undo_ptr,
+            writer_head,
+            "the writer's delta is still the head"
+        );
+        assert_eq!(
+            s.free_id_set(StoreKind::Undo),
+            undo_free_before,
+            "a refused detach frees nothing"
+        );
+        let live = s.undo_chain(StoreKind::Node, n).unwrap();
+        assert_eq!(
+            live.len(),
+            judged.len() + 1,
+            "the writer's delta sits on the judged chain"
+        );
+        s.commit(g).unwrap();
+        s.commit(w).unwrap();
+        let report = crate::check::check_store(&s, &[]).unwrap();
+        assert!(report.is_consistent(), "{:?}", report.violations);
+
+        // Without a writer in between, the same call detaches and frees exactly the judged chain.
+        let watermark = s.snapshot_ts();
+        let g2 = TxnId(5);
+        s.begin(g2);
+        let judged = s.undo_chain(StoreKind::Node, n).unwrap();
+        for &(_, d) in &judged {
+            assert!(
+                s.delta_is_dead(d, watermark).unwrap(),
+                "every judged delta is dead"
+            );
+        }
+        assert_eq!(
+            s.free_checked_undo_chain(StoreKind::Node, n, &judged, g2)
+                .unwrap(),
+            Some(judged.len())
+        );
+        assert_eq!(s.read_mvcc(StoreKind::Node, n).unwrap().undo_ptr, NULL_ID);
+        s.commit(g2).unwrap();
+        let report = crate::check::check_store(&s, &[]).unwrap();
+        assert!(report.is_consistent(), "{:?}", report.violations);
+        let _ = gc_pass(&mut s, 6);
     }
 
     /// **`D-retired-mechanism-tests` — the semantic replacement for `rmp` #522's

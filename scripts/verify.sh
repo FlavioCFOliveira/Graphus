@@ -142,6 +142,7 @@ cargo test --profile gate -p graphus-dst --features det-sched --test det_schedul
 cargo test --profile gate -p graphus-dst --features det-sched --test det_scheduler_lost_update_1056
 cargo test --profile gate -p graphus-dst --features det-sched --test det_scheduler_live_snapshot_1058
 cargo test --profile gate -p graphus-dst --features det-sched --test det_scheduler_census_window_1070
+cargo test --profile gate -p graphus-dst --features det-sched --test det_scheduler_phase_f_toctou_1092
 
 # `rmp` #973 acceptance criterion 3 — the production cost is ZERO — asserted mechanically rather
 # than argued. The release build below reproduces the container image's `-p graphus-server` package
