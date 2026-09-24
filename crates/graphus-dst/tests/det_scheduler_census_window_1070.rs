@@ -18,10 +18,9 @@
 //! [`a_writer_alive_across_every_gc_pass_loses_no_committed_row_1070`] drives the only shape that
 //! reaches the window: one writer that commits continuously — and aborts every seventh transaction —
 //! while the main thread runs full GC pass after full GC pass, under a scheduler that may switch at
-//! every yield point. Because the debug assertions are on, the same run also checks finding B: the
-//! prune set is sampled before the header walk, so no writer that committed behind the walk is
-//! pruned with its headers unsettled (`RecordStore::debug_assert_prune_precondition` fires if one
-//! is).
+//! every yield point. (Until `rmp` #1071 the same run also checked finding B — that the in-memory
+//! transaction table's prune never forgot a writer whose headers were still unsettled; #1071 removed
+//! the table, its prune and that debug check.)
 //!
 //! # The settle race
 //!

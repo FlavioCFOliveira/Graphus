@@ -94,7 +94,7 @@
 //! The label axis is separated by *signature* rather than by type, and was already so before this
 //! module existed: the decision-grade read
 //! [`RecordStore::label_bitmap_at`](crate::RecordStore::label_bitmap_at) cannot be called without a
-//! `(Snapshot, &CommitRegistry)` pair, and the superset-grade read
+//! `graphus_txn::Snapshot`, and the superset-grade read
 //! [`RecordStore::node_label_superset`](crate::RecordStore::node_label_superset) says its polarity in
 //! its name.
 

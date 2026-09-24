@@ -450,7 +450,7 @@ fn writer_threads(history: &SchedHistory) -> BTreeSet<u32> {
 fn commit_step(site: u16) -> Option<u8> {
     match site {
         s if s == YieldSite::CommitPublishSlot.code() => Some(0),
-        s if s == YieldSite::CommitRegistryRecord.code() => Some(1),
+        s if s == YieldSite::CommitPublishVisible.code() => Some(1),
         s if s == YieldSite::CommitSettle.code() => Some(2),
         _ => None,
     }
@@ -466,7 +466,7 @@ fn commit_step(site: u16) -> Option<u8> {
 /// the instant a commit becomes visible.
 ///
 /// "Strictly inside" is taken literally: the bracket must be two *consecutive* steps of one commit
-/// (`CommitPublishSlot` → `CommitRegistryRecord`, or `CommitRegistryRecord` → `CommitSettle`), never
+/// (`CommitPublishSlot` → `CommitPublishVisible`, or `CommitPublishVisible` → `CommitSettle`), never
 /// the gap between one transaction's last commit step and the next transaction's first, which would
 /// merely say the writer paused between transactions.
 fn writer_inside_another_writers_commit(history: &SchedHistory) -> Option<String> {
@@ -632,7 +632,7 @@ fn a_writer_really_steps_inside_another_writers_commit() {
         // All three commit steps must be present, or the bracket could not exist to be found.
         for site in [
             YieldSite::CommitPublishSlot,
-            YieldSite::CommitRegistryRecord,
+            YieldSite::CommitPublishVisible,
             YieldSite::CommitSettle,
         ] {
             assert!(
@@ -736,7 +736,7 @@ fn the_write_path_yield_points_are_reached_by_more_than_one_writer() {
         YieldSite::WriteLinkDelta,
         YieldSite::UndoChainHeadPublish,
         YieldSite::CommitPublishSlot,
-        YieldSite::CommitRegistryRecord,
+        YieldSite::CommitPublishVisible,
         YieldSite::CommitSettle,
     ] {
         let reached: BTreeSet<u32> = steps

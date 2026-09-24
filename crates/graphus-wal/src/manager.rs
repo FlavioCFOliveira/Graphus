@@ -199,12 +199,12 @@ impl<S: LogSink> WalManager<S> {
     /// Scans the durable log and returns every committed transaction with the MVCC `commit_ts` its
     /// commit record carries (`rmp` task #49).
     ///
-    /// This is how a reopened [`RecordStore`](../../graphus_storage) rebuilds its Active/Recent
-    /// Transaction Table after recovery: with lazy GC-time header freezing a committed version keeps
-    /// the writer's in-flight `TxnId` on disk, so visibility must resolve that id to a commit
-    /// timestamp, and the durable commit records are the source of truth. Non-MVCC commits (index /
-    /// system transactions written via [`commit`](Self::commit)) carry the `0` sentinel timestamp;
-    /// they are harmless to include (no version header references their `TxnId`).
+    /// A reopened [`RecordStore`](../../graphus_storage) reads it to learn which transactions the
+    /// retained log proves committed — which decides whether a logged count delta and a pending-DDL
+    /// block are applied. (It once also rebuilt an in-memory Active/Recent Transaction Table from the
+    /// timestamps; since `rmp` #1069 a header names a durable commit slot instead, and `rmp` #1071
+    /// removed the table.) Non-MVCC commits (index / system transactions written via
+    /// [`commit`](Self::commit)) carry the `0` sentinel timestamp.
     ///
     /// Corruption handling matches [`recover_from`](crate::recover_from) exactly: an undecodable
     /// record that is **followed** by a genuine, self-consistent record is *interior corruption* —
@@ -543,10 +543,8 @@ impl<S: LogSink> WalManager<S> {
     /// Commits `txn` (group commit) carrying its MVCC `commit_ts` (`04 §5.2`, `rmp` task #49) in the
     /// commit record, then hardens the log.
     ///
-    /// The `commit_ts` is embedded in the commit record so recovery can rebuild the Active/Recent
-    /// Transaction Table: with lazy GC-time header freezing a committed version keeps the writer's
-    /// in-flight `TxnId` on disk, and the commit record is the only durable proof of the timestamp it
-    /// committed at (robust to checkpoint truncation — see [`LogRecord::commit`]).
+    /// The `commit_ts` is embedded in the commit record (see [`LogRecord::commit`] for why it is still
+    /// there after `rmp` #1071).
     ///
     /// # Errors
     /// Returns an error if `txn` is not active.

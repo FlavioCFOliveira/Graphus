@@ -230,105 +230,11 @@ fn an_in_place_property_restamp_at_a_low_id_is_settled_with_no_write_path_bookke
 
 // =================================================================================================
 // 2. Nothing grows without bound now that the settle has moved.
+//
+// The in-memory Active/Recent Transaction Table this section used to pin (`rmp` #1070 AC 4) was
+// removed by `rmp` #1071. What still has to plateau — the Active Transaction Table and the process's
+// heap under concurrent writers — is `transaction_tables_plateau_1070.rs`; `commit.store` is section 4.
 // =================================================================================================
-
-/// **The `CommitRegistry` — the Active/Recent Transaction Table — plateaus under sustained
-/// create/delete churn** (`rmp` #1070, acceptance criterion 4).
-///
-/// # Why this needs its own test, beside the `commit.store` one
-///
-/// They are two different leaks with two different causes, and one can be fixed while the other is
-/// live. `commit.store` grows when the CENSUS stops proving slots unreachable; the registry grows when
-/// the PRUNE stops being scheduled. The prune's precondition is that the pass settled every naming
-/// stamp of every resolved writer — so if the settle stops happening, or stops being complete, this
-/// table grows by one entry per writing transaction, for ever, and nothing else fails.
-///
-/// `undo_chain.rs::the_undo_store_plateaus_under_sustained_create_delete_churn` is the `commit.store`
-/// half. This is the registry half, on the same churn profile.
-///
-/// # Non-vacuity
-///
-/// * **The inverse edit that makes it fail**: delete the `pending_gc_prune` scheduling at the end of
-///   `RecordStore::gc_inner`. The table then climbs with the round number instead of sitting flat.
-///   (Dropping the settle instead is caught one step earlier, by
-///   `RecordStore::debug_assert_prune_precondition` in a debug build.) The concurrent-writer form of
-///   this property, with the Active Transaction Table, the WAL floor map and heap bytes as well, is
-///   `transaction_tables_plateau_1070.rs`.
-/// * **The positive control**: the warm-up length must be non-zero and the churn must really reclaim,
-///   or "flat" is what an idle store looks like.
-#[test]
-fn the_commit_registry_plateaus_under_sustained_create_delete_churn_1070() {
-    const PER_ROUND: usize = 20;
-    const ROUNDS: u64 = 30;
-    const WARMUP: u64 = 5;
-
-    let store = fresh();
-    let rel_type = {
-        let t = TxnId(1);
-        store.begin(t);
-        let rt = store.intern_token(Namespace::RelType, "LINK").unwrap();
-        store.commit(t).expect("commit intern");
-        rt
-    };
-
-    let registry_len = |s: &Store| s.commit_registry().len();
-    let mut warm_len = 0usize;
-    let mut total_reclaimed = 0usize;
-    let mut next = 2u64;
-
-    for round in 0..ROUNDS {
-        let mut entities = Vec::with_capacity(PER_ROUND);
-        let txn = TxnId(next);
-        next += 1;
-        store.begin(txn);
-        for _ in 0..PER_ROUND {
-            let (a, _) = store.create_node(txn).expect("node a");
-            let (b, _) = store.create_node(txn).expect("node b");
-            let (r, _) = store.create_rel(txn, rel_type, a, b).expect("rel");
-            entities.push((a, b, r));
-        }
-        store.commit(txn).expect("commit creates");
-
-        let txn = TxnId(next);
-        next += 1;
-        store.begin(txn);
-        for &(a, b, r) in &entities {
-            store.delete_rel(txn, r).expect("delete rel");
-            store.delete_node(txn, a).expect("delete a");
-            store.delete_node(txn, b).expect("delete b");
-        }
-        store.commit(txn).expect("commit deletes");
-
-        let report = gc_pass(&store, next);
-        next += 1;
-        total_reclaimed += report.reclaimed;
-
-        if round == WARMUP {
-            warm_len = registry_len(&store);
-        } else if round > WARMUP {
-            assert_eq!(
-                registry_len(&store),
-                warm_len,
-                "round {round}: the Active/Recent Transaction Table must not grow once the churn is \
-                 in steady state — it went {warm_len} -> {}. A table that grows by one entry per \
-                 writing transaction is what a settle that stopped covering the store looks like: \
-                 nothing errs, no row is wrong, and the process's memory climbs until it is killed",
-                registry_len(&store)
-            );
-        }
-    }
-
-    assert!(
-        warm_len > 0,
-        "positive control: the registry must actually hold entries between passes ({warm_len}), or \
-         'it does not grow' is a statement about an empty table"
-    );
-    assert!(
-        total_reclaimed >= PER_ROUND * 3 * (ROUNDS as usize - 2),
-        "positive control: each round must really reclaim its entities ({total_reclaimed} over \
-         {ROUNDS} rounds)"
-    );
-}
 
 // =================================================================================================
 // 3. A store this task's predecessor could leave behind still reads.

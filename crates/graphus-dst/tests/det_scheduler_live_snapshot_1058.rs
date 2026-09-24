@@ -4,7 +4,7 @@
 //!
 //! `RecordStore::commit_prepare` issues its commit timestamp `C` at the top and makes `C` readable
 //! only later, in two places: the durable `commit.store` slot ([`YieldSite::CommitPublishSlot`]) and
-//! then the in-memory commit registry ([`YieldSite::CommitRegistryRecord`]). Between the issue and
+//! then the in-memory commit registry ([`YieldSite::CommitPublishVisible`]). Between the issue and
 //! the slot write there is a whole `checkpoint_meta`; nothing at `C` is visible for any of it.
 //!
 //! A reader resolves each undo delta it walks against a **live** read of that delta's commit slot
@@ -57,7 +57,7 @@
 //!   and the writers **acknowledged** every transfer — counted after `commit` returned, never read
 //!   back off the loop bound ([`the_threads_really_interleave`]);
 //! * all three seams of this scenario were really reached — [`YieldSite::SnapshotBegin`],
-//!   [`YieldSite::CommitPublishSlot`], [`YieldSite::CommitRegistryRecord`];
+//!   [`YieldSite::CommitPublishSlot`], [`YieldSite::CommitPublishVisible`];
 //! * the reader really read a moving store **on some single seed**, not merely across the pooled
 //!   sweep ([`the_reader_really_reads_a_moving_store`]);
 //! * and the window the defect needs really occurred, **fully attributed**
@@ -576,7 +576,7 @@ fn the_threads_really_interleave() {
         for site in [
             YieldSite::SnapshotBegin,
             YieldSite::CommitPublishSlot,
-            YieldSite::CommitRegistryRecord,
+            YieldSite::CommitPublishVisible,
         ] {
             assert!(
                 run.history.count_site(site) > 0,

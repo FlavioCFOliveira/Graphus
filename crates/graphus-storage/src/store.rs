@@ -39,7 +39,7 @@ use graphus_core::{
 };
 use graphus_io::{BlockDevice, PAGE_SIZE};
 use graphus_pagemap::PageMapWriter;
-use graphus_txn::{CommitOracle, CommitRegistry, Snapshot, StampOutcome};
+use graphus_txn::{CommitOracle, Snapshot, StampOutcome};
 use graphus_wal::{LogSink, WalManager};
 
 use crate::counts_log::{AppliedTxSet, CountDelta, replay_count_deltas};
@@ -348,14 +348,16 @@ impl<D: BlockDevice, S: LogSink> Drop for GcPassGuard<'_, D, S> {
 /// paths cannot answer a visibility question by different mechanisms (the `rmp` #755/#768/#769/#770
 /// parity rule).
 ///
-/// Two things the bare pages oracle cannot do are added here, both because this type owns the
-/// Active Transaction Table:
+/// One thing the bare pages oracle cannot do is added here, because this type owns the Active
+/// Transaction Table: [`names_own_write`](CommitOracle::names_own_write) can answer **yes** without a
+/// durable read, by comparing the word's slot id against the owner's own slot (the shortcut is
+/// one-sided — see the method).
 ///
-/// * [`names_own_write`](CommitOracle::names_own_write) can answer **yes** without a durable read, by
-///   comparing the word's slot id against the owner's own slot (the shortcut is one-sided — see the
-///   method);
-/// * [`audit_visibility`](CommitOracle::audit_visibility) cross-checks every verdict against the
-///   pre-#1069 in-memory oracle under `debug_assertions` (`rmp` #1069 AC 2).
+/// There is no second oracle behind it. The in-memory Active/Recent Transaction Table this store kept
+/// beside `commit.store` until `rmp` #1071 — and the debug-build cross-check that compared every
+/// verdict against it (`rmp` #1069 AC 2) — is gone: no read path consulted it after #1069, and
+/// measured, it could not have served as a cache without first reading the very slot it would
+/// have spared (see `tests/commit_resolution_cost_1071.rs`).
 impl<D: BlockDevice, S: LogSink> CommitOracle for RecordStore<D, S> {
     fn resolve_stamp(&self, word: u64) -> Result<StampOutcome> {
         self.commit_oracle().resolve_stamp(word)
@@ -403,107 +405,6 @@ impl<D: BlockDevice, S: LogSink> CommitOracle for RecordStore<D, S> {
         // slot carries `txn_id`, so the own-write half comes free from the read the outcome already
         // paid for.
         self.commit_oracle().resolve_for(word, owner)
-    }
-
-    /// The `rmp` #1069 AC 2 equivalence oracle, on **every** visibility decision this store makes.
-    ///
-    /// It reconstructs, byte for byte, the header words the pre-phase-3 build would have written —
-    /// `VersionStamp::in_flight(TxnId(slot.txn_id))` for a word that now names a slot — and asserts
-    /// that the in-memory [`CommitRegistry`], asked about those words, reaches the **same verdict**.
-    /// The whole DST battery therefore exercises the new oracle seed by seed, with no new test per
-    /// scenario.
-    ///
-    /// # Verdicts, never outcomes
-    ///
-    /// The two oracles legitimately disagree on the *outcome* of one word: a commit publishes its
-    /// durable slot before it registers in memory (`rmp` #973), so inside that window the slot says
-    /// `Committed(ts)` while the registry still says `Aborted`. Comparing outcomes would fire on a
-    /// correct engine. Comparing **verdicts** does not, because `D-published-snapshot-horizon`
-    /// guarantees no live snapshot carries `s >= ts` until both halves have published — so within the
-    /// window both oracles answer "invisible", by different routes. That makes this check a live
-    /// proof of the horizon discipline rather than a tautology: were a snapshot ever issued inside
-    /// the window, the two verdicts would diverge and this would say so.
-    ///
-    /// # And only where the registry HAS an answer — a premise the DST battery corrected
-    ///
-    /// The check was first written believing the publish window above was the *only* legitimate
-    /// divergence. It is not, and the deterministic backup/restore scenarios said so on the first
-    /// run: **a store opened over an image whose log does not carry the commits has an empty
-    /// Active/Recent Transaction Table beside a fully-populated `commit.store`.** A restore from
-    /// backup is exactly that — the artifact carries the data image, not the log — so every committed
-    /// version in it resolves from its slot and from nothing else.
-    ///
-    /// That divergence is not a defect to report; it **is** the phase. Before it, those rows read as
-    /// invisible, because an id the table does not know resolves as aborted: a restored chain silently
-    /// lost every version whose stamp the base's freeze had not settled. So the audit fires only where
-    /// the registry has something to preserve — the writer is one it **recorded**
-    /// ([`CommitRegistry::knows`]) or one this store still holds **active**. Comparing a real answer
-    /// against a documented default is not a comparison.
-    ///
-    /// The horizon tooth survives the narrowing intact, and that is why the condition is a
-    /// disjunction rather than just `knows`: a transaction inside the `rmp` #973 publish window has
-    /// not yet registered but **is still in the active set**, so the window is still audited on every
-    /// read that crosses it.
-    ///
-    /// It is `debug_assertions`-only and it **panics** on divergence rather than returning an error:
-    /// an audit that could fail a read would be a second oracle in the answer path, which is the very
-    /// thing this task removes.
-    #[cfg_attr(not(debug_assertions), allow(unused_variables))]
-    fn audit_visibility(&self, snapshot: Snapshot, xmin: u64, xmax: u64, verdict: bool) {
-        #[cfg(debug_assertions)]
-        {
-            // If neither word names a slot, the two oracles are the SAME FUNCTION on these inputs:
-            // `HeaderStamp` and `VersionStamp` decode a `0` sentinel and a settled `Committed(ts)`
-            // word identically, and neither consults anything. Comparing them would be a tautology,
-            // and paying a registry lock per settled record — the overwhelming majority — for a
-            // tautology is not a cost this build should carry.
-            if HeaderStamp::from_raw(xmin).slot_id().is_none()
-                && HeaderStamp::from_raw(xmax).slot_id().is_none()
-            {
-                return;
-            }
-            // The audit's own slot reads are NOT reads the engine performs to answer the query, so
-            // they must not land in the `read-probe` counters the structural proof reads (`rmp`
-            // #1069 AC 4). Suppression is scoped and panic-safe.
-            crate::read_probe::suppressed(|| {
-                let Ok(rebuilt_min) = self.pre_1069_word(xmin) else {
-                    return; // an unresolvable stamp already failed the read; nothing to compare.
-                };
-                let Ok(rebuilt_max) = self.pre_1069_word(xmax) else {
-                    return;
-                };
-                let registry = self
-                    .commit_registry
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                // Does the registry have anything to preserve about these two words? See the doc
-                // above: a writer it neither recorded nor still holds active is one it cannot answer
-                // for, and its `Aborted` fallback is a stated default, not a verdict.
-                let has_an_answer = |rebuilt: u64| match VersionStamp::from_raw(rebuilt) {
-                    VersionStamp::InFlight(w) => registry.knows(w) || self.is_txn_active(w),
-                    // The sentinel and a settled word are decoded identically by both oracles.
-                    VersionStamp::None | VersionStamp::Committed(_) => true,
-                };
-                if !has_an_answer(rebuilt_min) || !has_an_answer(rebuilt_max) {
-                    return;
-                }
-                let legacy = graphus_txn::is_visible_via(
-                    &graphus_txn::RegistryOracle(&registry),
-                    snapshot,
-                    rebuilt_min,
-                    rebuilt_max,
-                )
-                .expect("the in-memory registry never faults");
-                assert_eq!(
-                    verdict, legacy,
-                    "rmp #1069 AC2: the slot-backed oracle and the pre-#1069 registry disagree on \
-                     VISIBILITY.\n  snapshot        = {snapshot:?}\n  xmin (slot form) = \
-                     {xmin:#018x}\n  xmax (slot form) = {xmax:#018x}\n  xmin (txn form)  = \
-                     {rebuilt_min:#018x}\n  xmax (txn form)  = {rebuilt_max:#018x}\n  slot oracle \
-                     verdict = {verdict}\n  registry verdict    = {legacy}"
-                );
-            });
-        }
     }
 }
 
@@ -779,9 +680,9 @@ impl StorePages for [FixedStore; STORE_COUNT] {
 /// # What broke without it
 ///
 /// [`RecordStore::commit_prepare`] issues its commit timestamp at the top and only afterwards
-/// publishes the commit — the durable commit slot, then the in-memory
-/// [`CommitRegistry`](graphus_txn::CommitRegistry) entry. While `RecordStore` was still one writer's
-/// property those two instants could not be told apart. Under `D-multi-writer` they can: a second
+/// publishes the commit — into the durable commit slot (and, until `rmp` #1071, into an in-memory
+/// commit table as well). While `RecordStore` was still one writer's property the issue and the
+/// publication could not be told apart. Under `D-multi-writer` they can: a second
 /// worker beginning a transaction inside that window read the *allocation* clock, took a begin
 /// timestamp `B == C` for a commit `C` it could not yet see, and read the pre-`C` value of every
 /// record `C` had written.
@@ -1170,9 +1071,6 @@ pub struct GcPassReport {
     /// [`settle_and_census_headers`](RecordStore::settle_and_census_headers)). The number therefore
     /// counts the same words the retired freeze sweep counted, produced by one scan instead of two.
     pub frozen: usize,
-    /// Committed writers scheduled to be forgotten from the Active/Recent Transaction Table when
-    /// the GC transaction commits (a mid-pass rollback discards the schedule and prunes nothing).
-    pub prune_scheduled: usize,
     /// The total physical-id span the **settle-and-census scan** visited across the three MVCC stores
     /// this pass (`rmp` #522 observability, `rmp` #1070): `Σ high_water` per kind, because the scan is
     /// full-range. It is the honest cost of proving a commit slot unreachable, and it is reported so a
@@ -1360,17 +1258,6 @@ impl std::ops::AddAssign for PropChainSweep {
     }
 }
 
-/// The prune a completed [`RecordStore::gc`] settle sweep scheduled, held until its GC transaction
-/// resolves (`rmp` task #59): [`RecordStore::commit`] of `gc_txn` forgets `writers` from the
-/// Active/Recent Transaction Table (the freeze that made them forgettable is durable from that
-/// point on); [`RecordStore::rollback`] of `gc_txn` discards the schedule, because the rollback's
-/// WAL undo restores the in-flight header stamps that still need those entries to resolve.
-#[derive(Debug)]
-struct PendingGcPrune {
-    gc_txn: TxnId,
-    writers: Vec<TxnId>,
-}
-
 /// Both **directional** relationship-count projections of `rmp` task #856:
 /// `(by_start_label_type, by_type_end_label)`, keyed `(startLabelToken, typeToken)` and
 /// `(typeToken, endLabelToken)` respectively.
@@ -1432,7 +1319,8 @@ pub type DirectionalRelCounts = (
 /// Every query plan consults it — which indexes exist, their state, the selectivity histograms — while
 /// only DDL writes it. A `Mutex` would serialise the planner against itself and hand the sprint's
 /// multi-writer engine a single-reader catalog, so the split is not an optimisation but the point.
-/// The same reasoning, and the same conclusion, as `commit_registry` in layer 5a (`rmp` #1013).
+/// The same reasoning, and the same conclusion, as the per-store commit table layer 5a put behind an
+/// `RwLock` (`rmp` #1013), which `rmp` #1071 has since removed.
 ///
 /// # This is a LATCH, not a version chain — and the difference is the whole of `rmp` #984
 ///
@@ -1737,33 +1625,6 @@ struct CommitDurability {
     /// The largest `commit_ts` of a durable **write** commit — the causal bookmark high-water
     /// (`rmp` #813). Only ever raised, and only by draining the queue above.
     durable_write_commit_ts_hw: u64,
-    /// The `commit_lsn` of each committed transaction whose on-disk headers the GC has not yet
-    /// settled. Its minimum floors WAL reclamation.
-    ///
-    /// # `rmp` #1070 examined this for removal, MEASURED it, and kept it — for a different reason
-    ///
-    /// The reason it was written for is gone. It existed so that a header still naming an unsettled
-    /// writer stayed resolvable across a crash, back when only the in-memory [`CommitRegistry`] could
-    /// translate a stamp; since `rmp` #1069 the stamp names a durable `commit.store` slot, which is a
-    /// data page the checkpoint's own flush writes home before it reclaims anything below it. That
-    /// half of the case for removal was verified and holds.
-    ///
-    /// The reason it survives is one `rmp` #1069 created without naming: this floor is what keeps
-    /// `TxnId`s from being **re-issued while a commit slot still records one**. `WalManager::
-    /// max_recovered_txn_id` scans only the RETAINED log, `open` seeds the id counter from it, and
-    /// `CommitSlot::txn_id` — which `read_view`'s oracle compares against the reading transaction to
-    /// answer "is this my own write?" — lives in a data page the log no longer describes. Raise the
-    /// floor and the two disagree: a re-issued id reads a stranger's committed version as its own
-    /// uncommitted write, which `is_visible_via` answers before it ever consults the outcome.
-    ///
-    /// Measured on `d105f96`, 40 write commits with no GC pass, one checkpoint, with and without the
-    /// clamp: retained WAL 733 379 B → 868 B (the clamp is emphatically NOT redundant with the other
-    /// two — with no open transaction they restrict nothing), and `recovered_txn_hw` 6 → 0, after
-    /// which a re-issued `TxnId(1)` sees a version committed at `ts = 1` as its own at a snapshot of
-    /// `ts = 0`. Removing this is therefore gated on making the `TxnId` high-water independent of the
-    /// retained log — deriving it from `commit.store` at `open` is the candidate — which is a task of
-    /// its own and not this one.
-    unfrozen_commit_lsn: BTreeMap<TxnId, Lsn>,
     /// The WAL's durable length when the last checkpoint ran — the base the checkpoint interval is
     /// measured from.
     wal_len_at_last_checkpoint: u64,
@@ -1830,23 +1691,6 @@ struct Maintenance {
     /// Set the moment a second GC pass body starts while another runs, and cleared only when none
     /// runs any more. While set, no commit-slot census retires anything — in EITHER pass.
     gc_overlap: bool,
-    /// MVCC version history for the node **label bitmap** (`rmp` task #767).
-    ///
-    /// The label word is mutated IN PLACE inside the node record, so — unlike a property, which is a
-    /// separate MVCC-versioned `PropRecord` — it has no version for `graphus_txn::is_visible_via` to
-    /// filter. Without this, a label read returned whatever the word held at that instant: an
-    /// uncommitted writer's change was visible to a concurrent reader (a **dirty read**) and a
-    /// committed one was visible to a reader whose snapshot predated it (a **non-repeatable read**).
-    /// This supplies the "older versions as logical undo deltas" half of `04 §5.1`'s ratified scheme
-    /// that the in-place label write never had.
-    ///
-    /// `Arc`-shared with every [`StoreReadView`] so an off-thread reader resolves against the SAME
-    /// live history (the page cache it decodes from is itself live, `rmp` #721, so a change committed
-    /// after dispatch is already in the word it reads and only a live history can undo it).
-    /// The registry prune the last completed [`gc`](RecordStore::gc) freeze sweep scheduled, applied at
-    /// the GC transaction's [`commit`](RecordStore::commit) and discarded at its
-    /// [`rollback`](RecordStore::rollback) (`rmp` task #59). `None` while no GC pass is pending.
-    pending_gc_prune: Option<PendingGcPrune>,
     /// **`rmp` #1011 — the partly-consumed undo slabs a finished transaction handed back.**
     ///
     /// A slab is one `undo.store` page's worth of ids, owned by ONE transaction while it is open (see
@@ -1976,7 +1820,6 @@ impl Maintenance {
             next_commit_slot_alloc: 0,
             gc_passes_running: 0,
             gc_overlap: false,
-            pending_gc_prune: None,
             spare_undo_slabs: Vec::new(),
         }
     }
@@ -2038,20 +1881,6 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// Per-open-transaction version-stamp bookkeeping, consumed at [`commit`](Self::commit) to
     /// settle in-flight headers to the commit timestamp (`04 §5.2`).
     active: ActiveTable,
-    /// The Active/Recent Transaction Table (`04 §5.2`, `rmp` task #49). With **lazy GC-time header
-    /// freezing**, [`commit`](Self::commit) no longer rewrites every version's header to settle its
-    /// in-flight `TxnId` to the commit timestamp — it just records the `(TxnId → commit_ts)` here.
-    /// Visibility and reclamation resolve an on-disk in-flight stamp through this table
-    /// ([`is_reclaimable`](Self::is_reclaimable); readers via [`commit_registry`](Self::commit_registry)).
-    /// Rebuilt on reopen from the WAL's commit records (each carries its `commit_ts`), so a
-    /// committed-but-unfrozen version stays resolvable across a crash. The table is **bounded** by
-    /// GC-time header freezing (`rmp` task #59): a [`gc`](Self::gc) pass rewrites every in-flight
-    /// stamp of a committed writer to its `Committed(ts)` form and, once that freeze is durable
-    /// (the GC transaction commits), forgets the now-unreferenced writers from this table.
-    /// Behind an `RwLock` since `rmp` #1013: **read-mostly by construction** — every visibility
-    /// decision reads it, and only a commit writes. A `Mutex` would have serialised readers against
-    /// each other for no reason; the whole point of layer 5a is that the hot read path stops queueing.
-    commit_registry: RwLock<CommitRegistry>,
     /// **Incremental-GC state** (`rmp` #522). Before this, every maintenance [`gc`](Self::gc) pass
     /// re-scanned the ENTIRE store (freeze sweep, reclaim sweep, corpse walk, property sweep) even when
     /// almost nothing had changed since the last pass. On a monotonically growing store that made the
@@ -2640,7 +2469,6 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 counts_cov_durable: 0,
                 image_cov_refs: Mutex::new(BTreeMap::new()),
             }),
-            commit_registry: RwLock::new(CommitRegistry::new()),
             // `rmp` #522 incremental-GC state (pure in-memory; rebuilt from scratch every open).
             // `gc_full_scan_pending` forces the first pass to do the full corpse/property sweep for
             // anything a fresh process has no in-memory record of.
@@ -2694,27 +2522,17 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         let shared = SharedWal::new(wal);
         let pool = ConcurrentBufferPool::with_wal(device, shared.clone(), pool_capacity).shared();
         let (mut meta, meta_chain) = Self::read_meta(&pool)?;
-        // Rebuild the Active/Recent Transaction Table from the WAL's commit records (`rmp` task #49):
-        // with lazy GC-time freezing a committed version may still carry its writer's in-flight
-        // `TxnId` on disk, so visibility/reclamation must resolve that id to the commit timestamp the
-        // commit record durably holds. The scan is robust to checkpoint truncation (the timestamp
-        // lives in each commit record, not derived from log position). Writers a pre-crash GC pass
-        // had already frozen and pruned (`rmp` task #59) reappear here; that is harmless — no header
-        // references them, so the entries are never consulted and the next GC pass prunes them again.
-        let mut commit_registry = CommitRegistry::new();
-        let mut unfrozen_commit_lsn = BTreeMap::new();
         // ONE pass over the retained log for both the commit records and the count-delta records
         // (`rmp` #1066): a reopen already pays two full scans, and a third for state this one
         // collects at the cost of a `match` arm would be a third CRC verification of every record.
         let recovered = shared.with(|w| w.recovered_transactions())?;
         let mut committed_txns: HashSet<TxnId> = HashSet::default();
-        for &(committed_txn, ts, lsn) in &recovered.commits {
-            commit_registry.record_commit(committed_txn, ts);
+        // Nothing in memory is rebuilt from the commit records any more (`rmp` #1071): a header names
+        // a durable `commit.store` slot, so no table has to translate a `TxnId` after a crash. The
+        // records still decide which pending DDL block and which count deltas belong to a committed
+        // transaction.
+        for &(committed_txn, _ts, _lsn) in &recovered.commits {
             committed_txns.insert(committed_txn);
-            // Conservatively treat every surviving committed txn as possibly-unfrozen (a pre-crash GC
-            // may have frozen some, harmlessly re-included; the next GC pass re-prunes them). This
-            // floors WAL reclamation so no commit record an unfrozen version needs is dropped.
-            unfrozen_commit_lsn.insert(committed_txn, lsn);
         }
         // `Meta::decode` has already decided the format-version question (`05 §12.6`): a version-1
         // image arrives here with two EMPTY undo-area stores — which is exactly the state of a store
@@ -2818,12 +2636,24 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             .map(|rec| (rec.lsn.0, rec.txn_id))
             .collect();
         let applied_counts = AppliedTxSet::from_retained_ids(folded_counts.values().copied());
-        // Restore the transaction-id high-water from the durable WAL so the coordinator's id counter
-        // resumes *past* every id already in the log. Without this the counter would restart low and
-        // reuse ids, which breaks ARIES loser/winner classification on a later crash and can resurrect
-        // uncommitted records (the atomicity violation this fixes). See
-        // [`WalManager::max_recovered_txn_id`].
-        let recovered_txn_hw = shared.with(|w| w.max_recovered_txn_id())?;
+        // Restore the transaction-id high-water so the coordinator's id counter resumes *past* every id
+        // this store still records anywhere. Two places record one:
+        //
+        // * the durable WAL — reusing an id already in the log breaks ARIES loser/winner
+        //   classification on a later crash and can resurrect uncommitted records. See
+        //   [`WalManager::max_recovered_txn_id`];
+        // * `commit.store` (`rmp` #1071). Every slot carries its writer's `TxnId`, and the oracle
+        //   compares it against a reader's own id to answer "is this my own write?" — a re-issued id
+        //   would read a stranger's committed version as its own uncommitted one. Until #1071 the
+        //   WAL was kept from forgetting such an id by a reclamation floor per unsettled writer
+        //   (`unfrozen_commit_lsn`), which pinned the log behind every writer the GC had not yet
+        //   settled. Reading the slots here makes the high-water independent of what the log
+        //   retains, so the floor is gone.
+        //
+        // The slot scan is `O(commit.store high-water)` once per open — a store small by
+        // construction, since the census recycles every slot nothing names.
+        let slot_txn_hw = Self::max_txn_id_in_commit_store(&pool, &stores)?;
+        let recovered_txn_hw = shared.with(|w| w.max_recovered_txn_id())?.max(slot_txn_hw);
         let store = Self {
             pool,
             wal: shared,
@@ -2865,23 +2695,19 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 counts_cov_durable: 0,
                 image_cov_refs: Mutex::new(BTreeMap::new()),
             }),
-            commit_registry: RwLock::new(commit_registry),
             // `rmp` #522 incremental-GC state (pure in-memory; rebuilt from scratch every open).
             // `gc_full_scan_pending` forces the first pass to do the full corpse/property sweep for
             // anything a fresh process has no in-memory record of.
-            // Restored from what recovery reconstructed, NOT defaulted (`rmp` #1032). Three values
-            // ride on this and each fails silently if zeroed: the durable-write bookmark must resume at
-            // the recovered `commit_ts_hw` or a reader's causal bookmark steps BACKWARDS across a
-            // restart (`rmp` #813); `unfrozen_commit_lsn` is the floor below which WAL reclamation may
-            // drop records a visibility decision still needs; and `wal_len_at_last_checkpoint` is the
-            // base the checkpoint interval measures from, so a zero makes the first post-open write
-            // checkpoint immediately.
+            // Restored from what recovery reconstructed, NOT defaulted (`rmp` #1032). Two values ride
+            // on this and each fails silently if zeroed: the durable-write bookmark must resume at the
+            // recovered `commit_ts_hw` or a reader's causal bookmark steps BACKWARDS across a restart
+            // (`rmp` #813); and `wal_len_at_last_checkpoint` is the base the checkpoint interval
+            // measures from, so a zero makes the first post-open write checkpoint immediately.
             commit_durability: std::sync::Mutex::new(CommitDurability {
                 pending_write_commits: VecDeque::new(),
                 // Nothing is un-hardened at open (recovery truncated the un-synced WAL tail), so the
                 // last durable write is exactly what the recovered catalog reports.
                 durable_write_commit_ts_hw: meta.commit_ts_hw,
-                unfrozen_commit_lsn,
                 wal_len_at_last_checkpoint: shared_len,
             }),
             maintenance: std::sync::Mutex::new(Maintenance::default()),
@@ -3805,6 +3631,30 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
              build that wrote it, export the graph from it (`graphus-bulk dump` writes the node and \
              relationship CSV pair), and load that export into a NEW store created by this build."
         )))
+    }
+
+    /// The largest `TxnId` any `commit.store` slot records — the half of the `TxnId` high-water that
+    /// the retained WAL cannot supply (`rmp` #1071).
+    ///
+    /// A slot keeps its writer's id for as long as it exists, and the oracle compares that id against
+    /// a reader's own to answer "is this my own write?". The id counter must therefore resume past it,
+    /// whatever the log still holds. Every slot is read, in use or retired: a retired slot's body
+    /// still carries its id, and counting it costs nothing and can only raise the mark.
+    ///
+    /// # Errors
+    /// Returns a storage error if a `commit.store` page cannot be read or a slot does not decode.
+    fn max_txn_id_in_commit_store(
+        pool: &ConcurrentBufferPool<D, SharedWal<S>>,
+        stores: &[FixedStore; STORE_COUNT],
+    ) -> Result<u64> {
+        let high_water = stores[StoreKind::Commit as usize].alloc.high_water();
+        let mut max = 0u64;
+        for id in 1..high_water {
+            if let Some(slot) = read_view::read_commit_slot(pool, stores, id)? {
+                max = max.max(slot.txn_id);
+            }
+        }
+        Ok(max)
     }
 
     /// Refuses an image whose MVCC stamps predate `rmp` #1069 phase 3 **and still carry an unsettled
@@ -4761,65 +4611,6 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
 
     // ------------------------- transaction control -------------------------
 
-    /// The Active/Recent Transaction Table (`rmp` task #49). The reader layer
-    /// ([`RecordStoreGraph`](../../graphus_cypher)) resolves an on-disk in-flight `xmin`/`xmax`
-    /// stamp to its writer's commit timestamp — or learns the writer is still in flight or aborted —
-    /// through this, since lazy freezing leaves a committed version stamped with its writer's
-    /// `TxnId` until a [`gc`](Self::gc) pass freezes it to `Committed(ts)` and prunes the entry
-    /// (`rmp` task #59). Borrowed read-only; the store owns the table.
-    #[must_use]
-    pub fn commit_registry_snapshot(&self) -> CommitRegistry {
-        self.commit_registry().clone()
-    }
-
-    /// A read guard over the registry — the shape the hot visibility path needs (`rmp` #1013). Cloning
-    /// it per decision would be absurd on a path taken once per record; callers that must hold a value
-    /// across a mutation of the store take [`commit_registry_snapshot`](Self::commit_registry_snapshot)
-    /// instead, and pay the copy knowingly.
-    pub fn commit_registry(&self) -> std::sync::RwLockReadGuard<'_, CommitRegistry> {
-        self.commit_registry
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// **Test seam** (`rmp` #1069 AC 1): erases `txn` from the in-memory Active/Recent Transaction
-    /// Table, without the durable freeze that would normally have to precede it.
-    ///
-    /// This exists to make one specific experiment possible: **destroy the only thing that could
-    /// translate a pre-#1069 record stamp, and then read the row.** Before phase 3 the answer was
-    /// that the row vanished — [`CommitRegistry::outcome`] maps an unknown id to
-    /// [`Aborted`](graphus_txn::TxnOutcome::Aborted), so a committed version whose writer the table
-    /// had forgotten read as invisible. That is `rmp` #522's silent-lost-committed-data shape, and it
-    /// is why the freeze sweep, the freeze frontier and the WAL retention floor all had to exist
-    /// (`rmp` #1070 retired all three on the strength of exactly this experiment).
-    /// Since phase 3 the stamp names a durable commit slot, so the row survives — and this seam is
-    /// what lets a test say so.
-    ///
-    /// It is a **violation of the engine's own discipline** (the prune is only ever run after a
-    /// durable freeze), so a caller must wrap its reads in
-    /// [`without_commit_oracle_audit`] — the AC 2 cross-check compares against exactly the invariant
-    /// this breaks. Nothing in the engine calls this.
-    #[doc(hidden)]
-    pub fn forget_committed_writer_for_test(&self, txn: TxnId) {
-        self.commit_registry
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .forget(txn);
-    }
-
-    /// Whether `txn` is a **live, unresolved** transaction of this store: it has
-    /// [`begin`](Self::begin)-ed and has neither committed nor rolled back.
-    ///
-    /// # Use this, not `commit_registry().outcome(txn) == TxnOutcome::InFlight`
-    ///
-    /// That predicate is **dead — always `false`** — and mistaking it for this one has now caused two
-    /// separate silent-data-loss defects (`rmp` #522, `rmp` #778). The registry records an outcome only
-    /// when a transaction *resolves*: [`commit`](Self::commit) inserts `Committed(ts)` and
-    /// [`rollback`](Self::rollback) inserts `Aborted`. A still-running transaction therefore has **no
-    /// registry entry at all**, and [`CommitRegistry::outcome`](graphus_txn::CommitRegistry::outcome)
-    /// maps an unknown id to `Aborted`, never `InFlight` — so the naive predicate silently reports every
-    /// genuinely open writer as resolved. Live membership in the Active Transaction Table is the correct
-    /// "this writer might still commit, so treat its versions as uncommitted" signal.
     /// How many times this store has rebuilt its in-memory catalog from the durable metadata page
     /// (`rmp` #970). Zero for a store that has only ever committed and logically rolled back data
     /// transactions; it advances on `open`, on a maintenance/catalog-only transaction's physical
@@ -4829,6 +4620,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.with_catalog(|c| c.catalog_reloads)
     }
 
+    /// Whether `txn` is a **live, unresolved** transaction of this store: it has
+    /// [`begin`](Self::begin)-ed and has neither committed nor rolled back.
+    ///
+    /// This is the one "is this writer still running?" predicate. An outcome table cannot answer it:
+    /// `graphus_txn::CommitRegistry::outcome` records an outcome only when a transaction resolves, so
+    /// a running writer has no entry and reads as `Aborted`, never `InFlight` — the dead predicate
+    /// behind `rmp` #522 and #778. Live membership in the Active Transaction Table is the correct
+    /// "this writer might still commit, so treat its versions as uncommitted" signal.
     #[must_use]
     pub fn is_txn_active(&self, txn: TxnId) -> bool {
         self.active.contains_key(txn)
@@ -4840,14 +4639,6 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     #[must_use]
     pub fn active_transaction_count(&self) -> usize {
         self.active.fold_all(0usize, |n, _, _| n + 1)
-    }
-
-    /// How many committed writers still floor WAL reclamation through the unsettled-commit map (the
-    /// `unfrozen_commit_lsn` field) — an observability accessor for the plateau tests of `rmp` #1070
-    /// acceptance criterion 4. A map that only grows here pins the whole log.
-    #[must_use]
-    pub fn unfrozen_commit_count(&self) -> usize {
-        self.with_commit_durability(|d| d.unfrozen_commit_lsn.len())
     }
 
     /// How many **live label deltas** the undo area currently holds, and how many of them belong to
@@ -5084,9 +4875,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Publishes `commit_ts`: the commit that issued it is now readable as committed by everybody, so
     /// the horizon may advance over it (`rmp` #1056).
     ///
-    /// Call at the instant the commit becomes visible — after **both** halves of publication (the
-    /// durable `commit.store` slot and the in-memory [`CommitRegistry`](graphus_txn::CommitRegistry)
-    /// entry), never between them.
+    /// Call at the instant the commit becomes visible — after the durable `commit.store` slot has
+    /// been published, never before.
     fn publish_commit_ts(&self, commit_ts: Timestamp) {
         self.with_commit_seq(|seq| {
             seq.pending.remove(&commit_ts.0);
@@ -5247,8 +5037,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// [`capture_read_meta`](Self::capture_read_meta)d [`MetaSnapshot`]. The view exposes the same read
     /// surface the Cypher layer drives, computed purely from `(pool, meta)`; it carries no
     /// snapshot/visibility logic of its own (the caller filters returned records by
-    /// `graphus_txn::is_visible_via` against its own cloned `CommitRegistry`, exactly as the `&self` read
-    /// methods are filtered above this layer). Slice 3a is single-threaded and behaviour-preserving
+    /// `graphus_txn::is_visible_via` against the view's own `commit.store` oracle, exactly as the `&self`
+    /// read methods are filtered above this layer). Slice 3a is single-threaded and behaviour-preserving
     /// (the view is proven byte-identical to the `&self` methods); Slice 3b moves it onto reader
     /// threads.
     #[must_use]
@@ -5377,9 +5167,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
 
     /// Commit-**PREPARE** (cross-transaction group commit, phase 1, `04 §4.2` / `rmp` #528): runs the
     /// entire in-memory commit of `txn` EXCEPT the group-commit `fdatasync` and the redo-bounding
-    /// auto-checkpoint. It assigns the commit timestamp, records the commit in the Active/Recent
-    /// Transaction Table (so `txn` is committed-**visible** to new readers the instant this returns),
-    /// persists any catalog delta, and appends the WAL `COMMIT` record — but leaves that record
+    /// auto-checkpoint. It assigns the commit timestamp, publishes it into `txn`'s commit slot and
+    /// then over the commit-visibility horizon (so `txn` is committed-**visible** to new readers the
+    /// instant this returns), persists any catalog delta, and appends the WAL `COMMIT` record — but
+    /// leaves that record
     /// **un-hardened** in the sink's pending buffer for a later batch [`harden_wal`](Self::harden_wal).
     ///
     /// Returns `Some(commit_lsn)` when a durable `COMMIT` record was appended (a real write commit the
@@ -5390,14 +5181,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// (recovery truncates the un-synced tail), which is correct precisely because the client was never
     /// acked.
     ///
-    /// **Ordering note (`rmp` #528):** the post-append bookkeeping below (`catalog_dirty = false`, the
-    /// `unfrozen_commit_lsn` insert, the GC-prune) runs here — *before* the deferred harden — rather
-    /// than after an inline `fdatasync` as the pre-split path did. This is sound because the only failure
-    /// mode of the deferred harden is a PANIC (`04 §4.9`, fsyncgate) that aborts the process, after which
-    /// this in-memory state is irrelevant (recovery rebuilds from the durable WAL); on a *successful*
-    /// harden the resulting state is exactly what the pre-split ordering produced. No watermark is
-    /// advanced here (the `unfrozen_commit_lsn` floor only ever *lowers* what reclaim may drop, and
-    /// reclaim itself runs only in `maybe_checkpoint`, after the batch harden).
+    /// **Ordering note (`rmp` #528):** the post-append bookkeeping below (`catalog_dirty = false`)
+    /// runs here — *before* the deferred harden — rather than after an inline `fdatasync` as the
+    /// pre-split path did. This is sound because the only failure mode of the deferred harden is a
+    /// PANIC (`04 §4.9`, fsyncgate) that aborts the process, after which this in-memory state is
+    /// irrelevant (recovery rebuilds from the durable WAL); on a *successful* harden the resulting state
+    /// is exactly what the pre-split ordering produced. Reclaim itself runs only in
+    /// `maybe_checkpoint`, after the batch harden.
     ///
     /// # Errors
     /// Returns a storage error if the catalog cannot be persisted or `txn` is not active.
@@ -5426,17 +5216,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// # Errors
     /// As [`commit_prepare`](Self::commit_prepare).
     fn commit_prepare_at(&self, txn: TxnId, commit_ts: Timestamp) -> Result<Option<Lsn>> {
-        // Assign this transaction's commit timestamp (`04 §5.2`). **Lazy GC-time freezing**
-        // (`04 §5.5`, hint-bit style, `rmp` task #49): do NOT settle each version's header from the
-        // in-flight `TxnId` to the commit timestamp here — that was O(records touched) WAL-logged
-        // header writes (the eager, correctness-first path of task #45). Instead record the outcome
-        // in the Active/Recent Transaction Table; a reader resolves an in-flight stamp to its commit
-        // timestamp through that table ([`is_reclaimable`](Self::is_reclaimable) and the cypher
-        // visibility layer via [`commit_registry`](Self::commit_registry)); the GC-time header
-        // freeze (`rmp` task #59) later settles the stamps and prunes the entries, bounding the
-        // table. What makes a committed insert/delete survive a crash is now the WAL commit record
-        // carrying `commit_ts` (`commit_at_no_sync`): recovery rebuilds the table from it
-        // ([`open`](Self::open)). Commit is now O(1) in header writes.
+        // Assign this transaction's commit timestamp (`04 §5.2`). **Lazy GC-time settling** (`04 §5.5`,
+        // hint-bit style, `rmp` task #49): do NOT rewrite each version's header here — that was
+        // O(records touched) WAL-logged header writes. A header this transaction stamped names its
+        // `commit.store` slot, and publishing the slot below commits every such header at once
+        // (`rmp` #1069); a later GC pass settles the words to their self-describing form. Commit is
+        // O(1) in header writes, and what makes it survive a crash is the slot, covered by this
+        // transaction's own WAL frames and `COMMIT` record.
+        //
         // Did `txn` change anything durable? Two independent signals (`rmp` #529):
         //   * `wrote_durable` — it logged a WAL data record. Because `BEGIN` is lazy and every record
         //     write goes through [`WalManager::log_update`] (which creates the WAL Active-Transaction-
@@ -5447,19 +5234,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         //     ONLY via the commit-time `checkpoint_meta`; missing it would silently drop a committed
         //     catalog change (the `statistics` reopen tests are the regression guard).
         let wrote_durable = self.wal.with(|w| w.is_active(txn));
-        // Settle this transaction's retained label versions from its in-flight stamp to
-        // `Committed(commit_ts)` (`rmp` #767). Unlike the record headers above — settled lazily at GC
-        // time because doing it eagerly was O(records) WAL-logged page writes — this history is small
-        // and purely in-memory, so settling now is free and logs nothing.
-        //
-        // It is REQUIRED, not an optimisation: a raw in-flight stamp is only resolvable while the
-        // `commit_registry` still holds `txn`, and a GC pass FORGETS committed writers from that
-        // registry once their headers are frozen (`pending_gc_prune`, applied below). After that the
-        // registry maps the unknown id to `Aborted`, so the version would read as never-committed and
-        // every reader would fall back to the PRE-CHANGE bitmap — a committed label change silently
-        // reverting in memory, healed only by a restart.
-        // The settle itself is DEFERRED to [`settle_committed_txn`](Self::settle_committed_txn), which
-        // runs at each of this method's two exits — and at neither of them before every fallible step
+        // The release of this transaction's bookkeeping is DEFERRED to
+        // [`settle_committed_txn`](Self::settle_committed_txn), which runs at each of this method's two
+        // exits — and at neither of them before every fallible step
         // has succeeded (`rmp` #955). Until then NOTHING of this transaction's bookkeeping is released:
         // not the active-set entry (`rmp` #866), not the linked undo deltas. That is what keeps a
         // FAILED commit recoverable: the transaction is still, in every
@@ -5477,15 +5254,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // long as a property-only writer is named, and the two halves are one mechanism.
         //
         // `committed_statistics(txn)` excludes the committing transaction BY NAME rather than by it
-        // having already been removed, so the checkpoint below still persists its counts and DDL. The
-        // rest of the per-txn created/expired bookkeeping fed the old eager settle loop and is dead once
-        // the commit-registry entry exists; it is dropped with the entry.
+        // having already been removed, so the checkpoint below still persists its counts and DDL.
 
-        // Read-only fast path (`rmp` #529): a transaction that changed nothing durable — and is not a
-        // GC pass with a scheduled Active/Recent-Transaction-Table prune to apply — has nothing to
+        // Read-only fast path (`rmp` #529): a transaction that changed nothing durable has nothing to
         // persist. Skip the catalog checkpoint, the WAL `COMMIT` record and the group-commit
-        // `fdatasync` entirely: it produced no version, so no on-disk in-flight stamp bears its `TxnId`
-        // (no `commit_registry` entry is needed — no reader/GC will ever resolve it), and its bumped
+        // `fdatasync` entirely: it produced no version, so no header names a slot of it (it owns
+        // none) and nothing will ever resolve it, and its bumped
         // `commit_ts` is intentionally NOT made durable. After a crash that `commit_ts` is simply
         // reissued, which is harmless precisely because the transaction produced no versions (nothing on
         // disk references it). ALL in-memory bookkeeping the coordinator relies on is preserved: the
@@ -5494,9 +5268,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // (`oldest_active_snapshot`) is a coordinator-level concern.
         // `commit_ts_hw` monotonicity across a later rollback's `reload_catalog` is preserved by that
         // method taking `max` (a read-only bump is not durable, so the persisted catalog lags it).
-        let is_gc_prune =
-            self.with_maintenance(|m| m.pending_gc_prune.as_ref().is_some_and(|p| p.gc_txn == txn));
-        if !wrote_durable && !self.with_catalog(|c| c.catalog_dirty) && !is_gc_prune {
+        if !wrote_durable && !self.with_catalog(|c| c.catalog_dirty) {
             // Nothing fallible remains, so the bookkeeping can go (`rmp` #866 / #955). A transaction on
             // this path wrote no record, so its count delta is empty and there is nothing to withdraw.
             debug_assert!(
@@ -5534,21 +5306,17 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // the WAL `COMMIT` record — which it must still precede, so recovery replays it as part of the
         // committed transaction.
         //
-        // Order matters because the slot is a SECOND visibility oracle. A record header's in-flight
-        // stamp is resolved through the commit registry, which is published only once every fallible
-        // step has succeeded; a delta's status is resolved through this slot. Published before
-        // `checkpoint_meta`, a failure in `checkpoint_meta` left the two disagreeing: the registry
-        // still said "in flight" while the slot already said `Committed(commit_ts)`, so any reader
-        // resolving through the chain saw an uncommitted transaction's change as committed — while
-        // the comment above promised exactly the opposite ("a failure here leaves `txn` a
-        // fully-formed open writer whose slot still carries its in-flight stamp"). The window existed
-        // from `rmp` #967, when deltas first carried a value; #968 made it observable, because a
-        // label change — unlike a property overwrite by the same failing writer — is read by
+        // Order matters because the slot IS the visibility oracle — for every delta and, since `rmp`
+        // #1069, for every record header. Published before `checkpoint_meta`, a failure there would
+        // leave a transaction the caller is about to roll back reading as `Committed(commit_ts)`: a
+        // dirty read of every change it made, and a permanent one if that rollback also fails. The
+        // window existed from `rmp` #967, when deltas first carried a value; #968 made it observable,
+        // because a label change — unlike a property overwrite by the same failing writer — is read by
         // `label_bitmap_at` on a node every snapshot can see.
         // `rmp` #973: the DURABLE half of commit publication. The interesting window for a
-        // concurrent reader is BETWEEN this and `commit_registry.record_commit` below — the slot is
-        // on disk but the in-memory registry still answers "in flight" — so both halves are yield
-        // points, not one.
+        // concurrent reader is BETWEEN this and the horizon's advance below — the slot says committed
+        // but no snapshot can yet be taken at or after `commit_ts` — so both halves are yield points,
+        // not one.
         sched::yield_at(YieldSite::CommitPublishSlot, ResourceId::txn(txn.0));
         self.publish_commit_slot(txn, commit_ts)?;
         // THE COUNT DELTA REACHES DISK HERE, AS ITS OWN LOG RECORD (`rmp` #1067), and it must be
@@ -5576,8 +5344,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // Between the append below and the registration in `pending_counts` a few lines later, the
         // delta is in NO structure a reclaim consults, and the transaction has by then left every
         // one that would otherwise have covered it: `commit_at_no_sync` removes it from the WAL's
-        // active table (so it stops contributing to `oldest_active_first_lsn`) and its
-        // `unfrozen_commit_lsn` entry is not inserted until much later. A concurrent `checkpoint`
+        // active table (so it stops contributing to `oldest_active_first_lsn`), and no other floor
+        // names a committed transaction's records. A concurrent `checkpoint`
         // computing its floor inside that gap can put the floor ABOVE this record, fold nothing for
         // it, publish a base that does not contain it, and reclaim it — a committed transaction's
         // counter change gone from the log and from the base at once.
@@ -5666,44 +5434,17 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // COMMIT SETTLED. Every fallible step has succeeded, so — and not one line earlier — this
         // transaction becomes committed-visible and its bookkeeping is released.
         //
-        // The registry entry is PUBLISHED here rather than before `checkpoint_meta` (`rmp` #955).
-        //
-        // Since `rmp` #1069 the registry no longer resolves a header stamp — an unsettled `xmin`/`xmax`
-        // names this transaction's commit slot, and the slot is the oracle. The ordering below is kept
-        // for the reason it was introduced, which survives the change: the registry is still the
-        // authority for `outcome`/`is_txn_active`, which the SSI tracker, the GC watermark and the
-        // equivalence audit all read, so an entry published before the last fallible step would still
-        // announce a transaction that `checkpoint_meta` may yet refuse. The slot itself is published
-        // even later, and for the same reason.
-        //
-        // The paragraph this replaced said the registry "is what resolves an in-flight `xmin`/`xmax`
-        // stamp, and every record this transaction wrote still carries one", so writing it earlier
-        // meant that a `checkpoint_meta` failure left the whole
-        // uncommitted write set resolving as `Committed(commit_ts)` — a dirty read of data the caller
-        // is about to roll back, and a permanent one if that rollback also fails. Publishing it after
-        // the last fallible step makes the absence of an entry (which
-        // [`CommitRegistry::outcome`](graphus_txn::CommitRegistry::outcome) reads as `Aborted`) the
-        // fail-safe answer for exactly the window where the outcome is not yet decided.
-        //
-        // It is published BEFORE the label settle below, not after: between the two, a concurrent
-        // reader resolves an `InFlight(txn)` label version through the registry and gets
-        // `Committed(commit_ts)` — the same answer the settle then writes down. The reverse order would
-        // open a window in which a settled label version read as committed while the record headers of
-        // the same transaction still read as aborted.
-        // `rmp` #973: the IN-MEMORY half — this is the instant the commit becomes visible to every
-        // reader resolving a delta through the registry. Yielding here is what lets a scheduled
-        // reader observe the durable-but-not-yet-visible state the line above created.
-        sched::yield_at(YieldSite::CommitRegistryRecord, ResourceId::txn(txn.0));
-        self.commit_registry
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .record_commit(txn, commit_ts);
-        // BOTH halves of publication are now done — the durable commit slot above and the in-memory
-        // registry entry on the line before — so and only so may the commit-visibility horizon advance
-        // over this timestamp (`rmp` #1056). Moving this call any earlier reopens the window a snapshot
-        // could be taken in: a reader would get a begin timestamp `>= commit_ts` while one of the two
-        // oracles still answered "in flight", read the pre-commit value, and — being a writer — go on
-        // to overwrite it. That is the lost update this task closes; see [`CommitSequencer`].
+        // `rmp` #973: the second half of publication, and a yield point of its own. The slot above is
+        // durable and already says `Committed(commit_ts)`; what has not happened yet is the horizon's
+        // advance, so no snapshot can be taken at or after `commit_ts` — the window a scheduled reader
+        // is placed in here. (Until `rmp` #1071 this instant also recorded the commit in an in-memory
+        // Active/Recent Transaction Table; nothing read it any more, and it is gone.)
+        sched::yield_at(YieldSite::CommitPublishVisible, ResourceId::txn(txn.0));
+        // The durable commit slot is published, so and only so may the commit-visibility horizon
+        // advance over this timestamp (`rmp` #1056). Moving this call any earlier reopens the window a
+        // snapshot could be taken in: a reader would get a begin timestamp `>= commit_ts` while the
+        // slot still answered "in flight", read the pre-commit value, and — being a writer — go on to
+        // overwrite it. That is the lost update #1056 closes; see [`CommitSequencer`].
         self.publish_commit_ts(commit_ts);
         // Releases the active-set entry — and with it this transaction's count delta and schema undo log
         // (`rmp` #866). This must happen before `open_txn_holds_pending_ddl()` below, which asks whether
@@ -5729,34 +5470,6 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // rollback path.
         let holds_ddl = self.open_txn_holds_pending_ddl();
         self.with_catalog_mut(|c| c.catalog_dirty = holds_ddl);
-        // Remember this commit record's LSN until a GC pass settles `txn`'s versions (`rmp` #114 / the
-        // lazy freeze of #49/#59). Its ORIGINAL reason — keeping the record readable so a crash could
-        // still resolve an unsettled stamp — was retired by `rmp` #1069, which made the stamp resolve
-        // through a durable data page instead; the floor is retained because it is also what keeps a
-        // `TxnId` from being re-issued while a `commit.store` slot still records it. See the field.
-        // This only ever LOWERS the reclaim floor, and reclaim runs only in the post-harden
-        // `maybe_checkpoint`, so setting it pre-harden advances no watermark.
-        self.with_commit_durability(|d| d.unfrozen_commit_lsn.insert(txn, commit_lsn));
-        // If `txn` was a GC pass, its header freeze is durable once the deferred harden completes (`rmp`
-        // task #59): every writer the pass scheduled is no longer referenced by any on-disk in-flight
-        // stamp, so the Active/Recent Transaction Table entries can be forgotten — this bounds the table.
-        // A crash before the harden loses this GC commit record, and recovery rebuilds the table from the
-        // still-durable writer commit records, so pruning here (pre-harden) cannot lose a needed entry.
-        if is_gc_prune {
-            let pending = self
-                .with_maintenance(|m| m.pending_gc_prune.take())
-                .expect("is_gc_prune ⇒ Some(gc_txn == txn)");
-            for writer in pending.writers {
-                self.commit_registry
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .forget(writer);
-                // The writer's versions are now settled (commit-ts stamps on disk) and its registry
-                // entry is gone, so nothing names its id any more and its commit record stops
-                // flooring WAL reclamation.
-                self.with_commit_durability(|d| d.unfrozen_commit_lsn.remove(&writer));
-            }
-        }
         Ok(Some(commit_lsn))
     }
 
@@ -5768,22 +5481,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// store can be asked about, an open writer holding uncommitted state — otherwise a failed commit
     /// leaves mutations that are physically present but attributable to nobody.
     ///
-    /// It does two things, in this order:
-    ///
-    /// 1. **Settles the retained label versions** from the in-flight stamp to `Committed(commit_ts)`
-    ///    (`rmp` #767). Unlike the record headers — settled lazily at GC time because doing it eagerly
-    ///    was `O(records)` WAL-logged page writes — this history is small and purely in-memory, so
-    ///    settling now is free and logs nothing. It is REQUIRED, not an optimisation: a raw in-flight
-    ///    stamp is only resolvable while the [`CommitRegistry`] still holds `txn`, and a GC pass
-    ///    FORGETS committed writers from that registry once their headers are settled. After that the
-    ///    registry maps the unknown id to `Aborted`, so the version would read as never-committed and
-    ///    every reader would fall back to the PRE-CHANGE bitmap — a committed label change silently
-    ///    reverting in memory, healed only by a restart.
-    /// 2. **Removes the active-set entry**, and with it the count delta (`rmp` #866) and the schema
-    ///    undo log (`rmp` #734) a rollback would otherwise have withdrawn.
-    ///
-    /// It used to do a third thing — clear the GC freeze-frontier savepoint — and `rmp` #1070 removed
-    /// both the savepoint and the frontier it saved.
+    /// It **removes the active-set entry**, and with it the count delta (`rmp` #866) and the schema undo
+    /// log (`rmp` #734) a rollback would otherwise have withdrawn, and hands the transaction's unused
+    /// undo slab back (`rmp` #1011). It used to settle an in-memory label history (retired by `rmp`
+    /// #968) and clear the GC freeze-frontier savepoint (retired by `rmp` #1070).
     fn settle_committed_txn(&self, txn: TxnId, _commit_ts: Timestamp) {
         // Hand the unconsumed undo slab back before the entry that owns it is dropped (`rmp` #1011).
         let slab = self.active.remove(txn).and_then(|a| a.undo_slab);
@@ -6369,11 +6070,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // committer here; zero-sized with `det-sched` off.
         sched::yield_at(YieldSite::CheckpointRecordAppend, ResourceId::NONE);
         // Reclaim the WAL prefix that recovery no longer needs (`rmp` #114): below the REDO FLOOR
-        // (everything before it is provably home) AND below the oldest unfrozen committed
-        // transaction's commit record (so an unfrozen in-flight stamp stays resolvable). The WAL
-        // additionally clamps to the oldest active transaction's first record (loser undo).
-        let oldest_unfrozen =
-            self.with_commit_durability(|d| d.unfrozen_commit_lsn.values().map(|l| l.0).min());
+        // (everything before it is provably home). The WAL additionally clamps to the oldest active
+        // transaction's first record (loser undo). There is no floor per unsettled committed writer
+        // any more (`rmp` #1071): an unsettled header names a durable `commit.store` slot, and the
+        // `TxnId` high-water that floor protected is recovered from `commit.store` itself at `open`.
         // Compute the EXACT reclaim floor here (the same clamp `reclaim` applies, including the WAL's
         // oldest-active-first-lsn), so the doublewrite floor we persist below matches the WAL prefix
         // about to be dropped.
@@ -6385,10 +6085,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // below the checkpoint record but at or above the floor is a byte recovery still reads:
             // flooring reclamation at `ckpt_lsn` here would drop exactly the records the fix above
             // exists to replay. The two numbers are one decision and must not drift apart.
-            let floor = oldest_unfrozen.map_or(redo_floor.0, |u| redo_floor.0.min(u));
             let floor = w
                 .oldest_active_first_lsn()
-                .map_or(floor, |oldest| floor.min(oldest.0));
+                .map_or(redo_floor.0, |oldest| redo_floor.0.min(oldest.0));
             (ckpt_lsn, floor)
         });
         debug_assert!(
@@ -7176,34 +6875,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///
     /// Private, and deliberately so: the public seam is
     /// [`CommitOracle`](graphus_txn::CommitOracle) implemented on `RecordStore` itself, which adds
-    /// the own-write fast path and the AC 2 audit. A caller reaching for the bare pages oracle would
-    /// silently opt out of both.
+    /// the own-write fast path. A caller reaching for the bare pages oracle would silently opt out of
+    /// it.
     fn commit_oracle(&self) -> read_view::PagesOracle<'_, D, S, [FixedStore; STORE_COUNT]> {
         read_view::PagesOracle::new(&self.pool, &self.stores)
-    }
-
-    /// The header word a **pre-`rmp` #1069-phase-3** build would have written for the same version:
-    /// `VersionStamp::in_flight(TxnId)` where the word now carries `HeaderStamp::Slot`, and the word
-    /// itself where it is already settled or the `0` sentinel.
-    ///
-    /// The AC 2 equivalence audit's half that has to touch storage — see
-    /// [`audit_visibility`](graphus_txn::CommitOracle::audit_visibility). It exists as a named method
-    /// rather than inline in the audit so the reconstruction is stated once, testably, in the
-    /// vocabulary of the two conventions it bridges.
-    ///
-    /// # Errors
-    /// Propagates a fault reading the named commit slot.
-    #[cfg(debug_assertions)]
-    fn pre_1069_word(&self, word: u64) -> Result<u64> {
-        match HeaderStamp::from_raw(word).slot_id() {
-            None => Ok(word),
-            Some(id) => match self.read_commit_slot(id)? {
-                Some(slot) => Ok(VersionStamp::in_flight(TxnId(slot.txn_id))),
-                None => Err(GraphusError::Storage(format!(
-                    "commit slot {id} named by header stamp {word:#018x} was never written"
-                ))),
-            },
-        }
     }
 
     /// Returns a physical id for a fresh `undo.store` delta: a reclaimed id when one is available,
@@ -8883,9 +8558,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// the property store's frontier at the sentinel's cell for the whole load. Measured on a
     /// Mode-A-shaped import (1.6 M nodes with two properties, 1.6 M relationships with one, a pass per
     /// 50 000 rows): 12.7 – 13.9 s of passes at `d105f96` against 16.0 – 16.1 s here, 34 % against 39 %
-    /// of the import, both quadratic. A settle-only pass walks the headers only because the
-    /// Active/Recent Transaction Table prune, and the WAL floor it drains, need every settled stamp;
-    /// removing that need removes the walk from the bulk cadence, and it is the work of `rmp` #1071.
+    /// of the import, both quadratic. The bulk cadence ran that pass only to drain a per-writer WAL
+    /// floor through the Active/Recent Transaction Table prune; `rmp` #1071 removed the table, the
+    /// prune and the floor, so a `checkpoint` alone now bounds the log during a load and the cadence
+    /// no longer needs the walk at all (see [`gc_freeze_only`](Self::gc_freeze_only)).
     ///
     /// # What this scan does NOT prove, and what does (`rmp` #1070, audit finding A)
     ///
@@ -9778,15 +9454,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// scan began. A writer that commits while the scan runs may still be named behind it, and is
     /// settled by the next pass.
     ///
-    /// The pass therefore schedules exactly the writers that had committed **before the scan began**
-    /// (sampled then, not after — `rmp` #1070, audit finding B) to be **forgotten** from the table —
-    /// but only once the settle is durable: the prune applies when `txn` **commits**
-    /// ([`commit`](Self::commit)) and is discarded if `txn` rolls back
-    /// ([`rollback`](Self::rollback)), whose WAL undo restores the stamps that still need the
-    /// entries. A crash before the GC commit recovers the same way (the GC txn is a loser; the table
-    /// is rebuilt from the WAL commit records on [`open`](Self::open)). This settle-then-prune cycle
-    /// bounds the table on a long-lived server: each completed pass leaves it holding only writers
-    /// that committed after the pass's scan began.
+    /// Settling is no longer a correctness step (an unsettled word names a durable slot and resolves
+    /// for ever, `rmp` #1069), and nothing is pruned after it (`rmp` #1071 removed the in-memory table
+    /// that needed pruning). What it still buys is one indirection fewer per later read, and the
+    /// un-naming without which the census could never retire a slot.
     ///
     /// # Precondition
     ///
@@ -9801,44 +9472,39 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.gc_inner(txn, watermark, false)
     }
 
-    /// A **settle-only** GC pass (`rmp` #590): runs only the settle-and-census scan (phase S) and the
-    /// registry-prune scheduling, **skipping** the reclamation sweeps (phases A–D: relationship/node
-    /// tombstone reclaim, the corpse splice, and the property-chain sweep) and phase F. Its sole purpose
-    /// is to drain the store's `unfrozen_commit_lsn` map — i.e. to **lower the WAL reclaim floor** — as
-    /// cheaply as possible, so a caller can bound the retained WAL without paying the reclamation sweeps.
+    /// A **settle-only** GC pass (`rmp` #590): runs only the settle-and-census scan (phase S),
+    /// **skipping** the reclamation sweeps (phases A–D: relationship/node tombstone reclaim, the corpse
+    /// splice, the property-chain sweep) and phase F. It rewrites every header word that names a
+    /// committed writer's slot to its self-describing `Committed(ts)` form and reclaims nothing.
     ///
-    /// It kept that purpose through `rmp` #1070: the drain runs off the registry prune, the prune is
-    /// scheduled by phase S, and phase S is exactly what this pass still runs. What changed is the
-    /// pass's per-call cost, which is now one full-range header walk rather than a frontier-bounded
-    /// one — see [`settle_and_census_headers`](Self::settle_and_census_headers).
+    /// # What it is for since `rmp` #1071
     ///
-    /// Why this exists: a network Mode A bulk-import updates a durable checkpoint-sentinel node's
-    /// counters **every batch** (`graphus_server`'s `bulk_load::checkpoint_sentinel`), and each update
-    /// tombstones the prior property version, so `pending_tombstones[Prop]` is never empty during a load
-    /// and the Phase D property sweep — a full `O(store)` scan of every live owner's property chain —
-    /// gates ON on every pass. Running that sweep on a *tightened* mid-load cadence would reintroduce the
-    /// exact `O(N²)` maintenance cost `rmp` #556/#565 widened the loading cadence to avoid, even though
-    /// the settle's own DURABLE work is `O(Δ)` (only unsettled records are written). The settle is all
-    /// that is needed to advance the WAL floor; the (few, sentinel-only) dead property versions a load leaves behind are
-    /// reclaimed later by the ordinary full cadence after the next `START DATABASE`, or by the FULL
-    /// end-of-load checkpoint (`rmp` #579) at a clean `End`.
+    /// It was written to drain the store's per-writer WAL floor (`unfrozen_commit_lsn`) cheaply during
+    /// a bulk load, through the Active/Recent Transaction Table prune a settle made safe. `rmp` #1071
+    /// removed the table, its prune and that floor, so a settle-only pass no longer bounds the WAL: a
+    /// [`checkpoint`](Self::checkpoint) alone does. What remains is the settle itself — one indirection
+    /// fewer on every later read of those headers, and the un-naming that lets the next full pass
+    /// retire their slots. A caller that ran this pass only to advance the WAL floor (the bulk-load
+    /// cadence) no longer needs it; its per-call cost is one full-range header walk of the three MVCC
+    /// stores. Measured on a Mode-A-shaped
+    /// import after #1071 (1.6 M nodes with two properties, 1.6 M relationships with one, one
+    /// maintenance step per 50 000 rows, release, one host, three runs): this pass plus a checkpoint
+    /// per step, 40.3 – 41.2 s in total and 15.5 – 16.1 s in maintenance; the checkpoint alone, 29.3 –
+    /// 29.7 s and 3.99 – 4.01 s — with the same 14 KiB of log retained at the end either way.
     ///
-    /// Soundness: the prune's precondition is *settle completeness* (every committed writer's on-disk
-    /// naming stamps rewritten to `Committed(ts)`), which the phase-S scan establishes independently of
-    /// whether dead slots are reclaimed — it walks the whole id space either way. This pass therefore
-    /// leaves the store's *committed, visible* image and its crash-recovery behaviour identical to a
-    /// full pass; only deferred slot reclamation differs.
+    /// Soundness: the settle is the same compare-and-set walk a full pass runs, so the store's
+    /// committed, visible image and its crash-recovery behaviour are identical to a full pass's; only
+    /// reclamation is deferred.
     ///
     /// # Errors
-    /// Returns a storage error if a record read or a freeze write fails.
+    /// Returns a storage error if a record read or a settle write fails.
     pub fn gc_freeze_only(&self, txn: TxnId, watermark: Timestamp) -> Result<GcPassReport> {
         self.gc_inner(txn, watermark, true)
     }
 
     /// Shared body of [`gc`](Self::gc) (`freeze_only == false`) and
     /// [`gc_freeze_only`](Self::gc_freeze_only) (`freeze_only == true`). When `freeze_only` is set the
-    /// reclamation sweeps (Phases A–D) are skipped; only the incremental freeze sweep and the prune
-    /// scheduling run. See [`gc_freeze_only`](Self::gc_freeze_only) for why.
+    /// reclamation sweeps (Phases A–D and F) are skipped; only the settle-and-census walk runs.
     fn gc_inner(
         &self,
         txn: TxnId,
@@ -9870,11 +9536,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.bump_drain_progress();
 
         // ---- Phases A–D and F: reclamation sweeps. SKIPPED in a settle-only pass (`rmp` #590). ----
-        // A settle-only pass exists solely to advance the WAL reclaim floor — which the registry prune
-        // that phase S schedules is what drains — cheaply during a bulk load. The reclamation sweeps are
-        // what make a mid-load pass `O(store)` in WRITES (the Phase D property sweep gates ON every batch
-        // because the load's checkpoint sentinel tombstones a property version per batch), so they are
-        // deferred to the next full pass. See [`gc_freeze_only`](Self::gc_freeze_only).
+        // A settle-only pass settles headers without paying the reclamation sweeps, which are what make
+        // a mid-load pass `O(store)` in WRITES (the Phase D property sweep gates ON every batch because
+        // the load's checkpoint sentinel rewrites a property per batch); they are deferred to the next
+        // full pass. See [`gc_freeze_only`](Self::gc_freeze_only).
         if !freeze_only {
             // ---- Phase A: reclaim reclaimable RELATIONSHIP tombstones (`rmp` #522: pending-set driven). ----
             // Was an O(store) `scan_in_use_mvcc(Rel)` every tick; now iterates only the tombstones tracked
@@ -9940,21 +9605,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // that pass exists to settle stamps without paying the reclamation sweeps, and settling is
         // exactly what this does. Its census output is simply unused there, because phase F is skipped.
         //
-        // TWO SAMPLES PRECEDE IT, AND BOTH MUST (`rmp` #1070, audit findings A and B). Writers run
-        // beside this walk, so what it proves is exact only for writers that had resolved before it
-        // began:
-        //
-        // * the census window — what the reference census must exclude because its owner may still
-        //   have been creating references while the walk read (`open_census_window`). Only a pass
-        //   that will consume the census opens one;
-        // * the prune set — the committed writers whose every naming stamp this walk will settle.
-        //   Sampled AFTER the walk (as it was), it also named writers that committed behind the walk,
-        //   and pruned them with their headers still unsettled.
-        let prune_writers = self
-            .commit_registry
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .committed_writers();
+        // THE CENSUS WINDOW PRECEDES IT (`rmp` #1070, audit finding A). Writers run beside this walk,
+        // so what it proves is exact only for writers that had resolved before it began; the window
+        // samples what the reference census must therefore exclude (`open_census_window`). Only a
+        // pass that will consume the census opens one.
         let census = (!freeze_only).then(|| self.open_census_window());
         let mut frozen = 0usize;
         let mut freeze_scanned = 0u64;
@@ -10033,35 +9687,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // soon as nothing will read it.
         drop(census);
 
-        // `rmp` #522 (durability-audit W1 regression guard), restated for concurrent writers (`rmp`
-        // #1070, audit finding B): before scheduling the prune, assert that phase S left no in-use
-        // header naming the slot of ANY writer about to be pruned. The set is the one sampled before
-        // phase S; a writer that committed behind the walk is not in it and is pruned by a later
-        // pass. See [`debug_assert_prune_precondition`].
-        self.debug_assert_prune_precondition(&prune_writers);
-
-        // Schedule the table prune. Every writer in `prune_writers` had resolved before phase S began,
-        // so phase S's full-range settle rewrote every one of its on-disk naming stamps (a
-        // compare-and-set that declines only because a later writer overwrote the word, which removes
-        // the name just as well), and each becomes forgettable the moment that settle is durable —
-        // when `txn` commits.
-        let writers = prune_writers;
-        let prune_scheduled = writers.len();
         // Both counters under ONE hold: the pair is reported together, so reading them at two
         // instants could report a queue length that never coexisted with that drop count.
         let dead_keys =
             self.with_maintenance(|m| (m.dead_index_keys.len(), m.dead_index_keys_dropped));
-        self.with_maintenance(|m| {
-            m.pending_gc_prune = Some(PendingGcPrune {
-                gc_txn: txn,
-                writers,
-            });
-        });
         Ok(GcPassReport {
             reclaimed,
             undo_deltas_reclaimed,
             frozen,
-            prune_scheduled,
             freeze_scanned,
             dead_index_keys: dead_keys.0,
             dead_index_keys_dropped: dead_keys.1,
@@ -10126,68 +9759,6 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             StampOutcome::None | StampOutcome::InFlight(_) | StampOutcome::Aborted => None,
         })
     }
-
-    /// **Debug-only invariant check** for the Active/Recent-Transaction-Table prune (the `rmp` #522 W1
-    /// regression guard from the 2026-07 durability audit, restated for concurrent writers by `rmp`
-    /// #1070, audit finding B). Called by [`gc`](Self::gc) after phase S and immediately before it
-    /// schedules the prune of `writers`: it asserts that **no in-use record in any MVCC store still
-    /// names the `commit.store` slot of a writer about to be forgotten**.
-    ///
-    /// # Why it is scoped to the prune set, and not to "every committed writer"
-    ///
-    /// The previous form asked whether ANY committed writer still had an unsettled stamp, which is
-    /// the right question only when nothing commits during a pass. With writers running beside GC it
-    /// fired on a correct engine: a writer that commits after phase S has walked past its record is
-    /// committed, unsettled and — correctly — not in this pass's prune set. The invariant the prune
-    /// actually rests on is narrower and exact: every writer it forgets had resolved before phase S
-    /// began, so phase S's full-range settle reached every one of its stamps. The set is sampled
-    /// before phase S for that reason (see [`gc_inner`](Self::gc_inner)).
-    ///
-    /// A firing means a writer would be forgotten while a live header still names its slot. Since
-    /// `rmp` #1069 that no longer loses the row — the slot resolves on its own — but it lifts that
-    /// writer's WAL floor (`unfrozen_commit_lsn`) while its `TxnId` is still recorded in a slot a
-    /// header resolves through, which is the `TxnId`-reuse hazard that floor exists to prevent.
-    ///
-    /// Compiled out in an ordinary release build (the full-store scan is `O(store)` per GC pass), and
-    /// opt-in for release via the `check-cold-assert` feature (`rmp` #596).
-    #[cfg(any(debug_assertions, feature = "check-cold-assert"))]
-    fn debug_assert_prune_precondition(&self, writers: &[TxnId]) {
-        if writers.is_empty() {
-            return;
-        }
-        let pruned: HashSet<u64> = writers.iter().map(|w| w.0).collect();
-        for kind in MVCC_STORE_KINDS {
-            let in_use = read_view::scan_in_use_mvcc(&self.pool, &self.stores, kind)
-                .expect("the prune-precondition guard reads only in-use MVCC headers");
-            for &(id, mvcc) in &in_use {
-                for word in [mvcc.created_ts, mvcc.expired_ts] {
-                    let Some(slot_id) = slot_named_by_header_word(word) else {
-                        continue;
-                    };
-                    // `.expect`: this is a debug-only invariant guard, so an unreadable slot is a loud
-                    // failure of the guard itself, never a quietly-passed assertion.
-                    let owner = self
-                        .read_commit_slot(slot_id)
-                        .expect("the prune-precondition guard reads every slot a header names")
-                        .map(|slot| slot.txn_id);
-                    assert!(
-                        owner.is_none_or(|owner| !pruned.contains(&owner)),
-                        "rmp #522/#1070 prune precondition VIOLATED: in-use {kind:?} record {id} \
-                         still names commit slot {slot_id} (word {word:#018x}) of writer {owner:?}, \
-                         which this pass is about to forget. Every writer in the prune set resolved \
-                         before the settle walk began, so the walk must have settled this word.",
-                    );
-                }
-            }
-        }
-    }
-
-    /// Release-build no-op counterpart of [`debug_assert_prune_precondition`] (`rmp` #522/#596): the
-    /// full-store scan it performs is `O(store)` per GC pass, so it costs nothing in an ordinary
-    /// optimized build (enable the `check-cold-assert` feature to run it in release).
-    #[cfg(not(any(debug_assertions, feature = "check-cold-assert")))]
-    #[inline]
-    fn debug_assert_prune_precondition(&self, _writers: &[TxnId]) {}
 
     /// Opens this GC pass's **commit-slot census window** (`rmp` #1070, audit finding A): opens the
     /// census journal, then samples `commit.store`'s high-water and free list under one allocation
@@ -11393,7 +10964,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // FALLIBLE SECTION (`rmp` #955). Everything from here to `reload_catalog` can fail — with an
         // `Err` from the pool/catalog, or by unwinding out of the WAL `fdatasync` panic. NOTHING in it
         // may release or mutate this transaction's bookkeeping: its active-set entry, its count delta,
-        // its schema undo log, the scheduled GC prune and the freeze-frontier savepoint all stay
+        // and its schema undo log all stay
         // exactly as they were, so a failure leaves `txn` a fully-formed open writer rather than a
         // half-dismantled one. That is why the entry is removed BELOW this section and not above it,
         // and why the removal needs no unwind guard: an entry that is never taken cannot be dropped on
@@ -11508,22 +11079,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // A CONCURRENT open transaction's still-pending catalog DDL, by contrast, IS restored below and
         // must stay flagged: the `rmp` #534 superset-preserve block re-sets this flag when it keeps one.
         self.with_catalog_mut(|c| c.catalog_dirty = false);
-        // If `txn` was a GC pass, discard its scheduled registry prune (`rmp` task #59): the WAL
-        // undo above restored the in-flight header stamps the freeze had rewritten, and those
-        // stamps still need their Active/Recent Transaction Table entries to resolve. A rolled-back
-        // GC pass must therefore prune NOTHING — otherwise a restored in-flight stamp would be
-        // stranded as unresolvable (it would wrongly read as aborted).
-        // ONE hold: the test names the pass whose prune is being discarded, and a second hold could
-        // discard a prune scheduled by a *different* pass between the two.
-        self.with_maintenance(|m| {
-            if m.pending_gc_prune.as_ref().is_some_and(|p| p.gc_txn == txn) {
-                m.pending_gc_prune = None;
-            }
-        });
-        // NOTHING RESTORES A FREEZE FRONTIER HERE ANY MORE (`rmp` #1070). A rolled-back GC pass's WAL
-        // undo does still un-settle the stamps its scan settled — that has not changed — but there is
-        // no longer a frontier those records could end up *underneath*, so there is nothing to put
-        // back: the next pass's full-range scan sees them again and settles them again.
+        // NOTHING OF A GC PASS'S IS DISCARDED OR RESTORED HERE ANY MORE (`rmp` #1070, #1071). A
+        // rolled-back pass's WAL undo still un-settles the stamps its walk settled, but there is
+        // neither a freeze frontier those records could end up *underneath* nor a table prune the
+        // restored stamps would need cancelled: an unsettled word names a durable slot, and the next
+        // pass's full-range walk settles it again.
         self.with_catalog_mut(|c| c.tokens = pre_tokens);
         // The live-record COUNTERS were settled above, at the instant this transaction's entry left the
         // active table (`rmp` #866 / #1052). What used to stand here — reinstall a `counts_image()`
@@ -14189,7 +13749,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// that `snapshot` can see, and nothing else (`rmp` task #905).
     ///
     /// This is [`superset_scan_node_properties`](Self::superset_scan_node_properties) narrowed by
-    /// [`SupersetProperties::decide`] against this store's [`CommitRegistry`] — that is, by the same
+    /// [`SupersetProperties::decide`] against this store's `commit.store` — that is, by the same
     /// [`graphus_txn::is_visible_via`] predicate the query read path applies, so the caller decides over
     /// exactly the graph a `MATCH` in the same transaction would return.
     ///
@@ -17195,7 +16755,7 @@ mod tests {
     /// fails to build the moment a non-`Sync` field is introduced. Slice 1 already made the two shared
     /// fields (`pool: Arc<ConcurrentBufferPool>` and `wal: SharedWal`) `Send + Sync`
     /// ([`crate::wal_rule`] asserts the latter); every other field is plain owned data (`Vec` /
-    /// `HashMap` / `BTreeMap` / scalars / `Statistics` / `TokenStore` / `CommitRegistry`), so the auto
+    /// `HashMap` / `BTreeMap` / scalars / `Statistics` / `TokenStore`), so the auto
     /// derivation holds with **no** `unsafe impl`. Bounded on `D, S: Send + Sync`, the bound the
     /// concurrent pool's auto `Send + Sync` itself requires (its `Mutex<D>` / `Mutex<W>` need `D, W:
     /// Send`, and `SharedWal<S>: Send + Sync` needs `S: Send + Sync`).
@@ -17508,6 +17068,75 @@ mod tests {
             &original[..][..],
             "repaired page must equal its doublewrite copy"
         );
+    }
+
+    /// **`rmp` #1071 — the `TxnId` high-water survives WAL reclamation, because `commit.store`
+    /// supplies it.**
+    ///
+    /// Every commit slot records its writer's `TxnId`, and the oracle compares that id against a
+    /// reader's own to answer "is this my own write?". A re-issued id therefore reads a stranger's
+    /// committed version as its own uncommitted write — visible before it is committed, whatever the
+    /// snapshot. Until #1071 the WAL was kept from forgetting such ids by a reclamation floor per
+    /// unsettled writer; #1071 removed that floor and reads the ids from `commit.store` at `open`.
+    ///
+    /// # Non-vacuity
+    ///
+    /// * **The positive control**: the checkpoint must really reclaim the log past every writer — the
+    ///   id the retained WAL alone reports is asserted to be below them — or the test is measuring the
+    ///   WAL half again.
+    /// * **The inverse edit that makes it fail**: in `open`, drop `.max(slot_txn_hw)` from the
+    ///   high-water. The reopened store then reports the WAL's figure, and the next id it would hand
+    ///   out already names a committed slot.
+    #[test]
+    fn recovered_txn_hw_covers_every_id_a_commit_slot_records_1071() {
+        use crate::recovery::recover_device;
+
+        let mut s = fresh();
+        const FIRST: u64 = 11;
+        const LAST: u64 = 50;
+        let mut nodes = Vec::new();
+        for t in FIRST..=LAST {
+            s.begin(TxnId(t));
+            nodes.push(s.create_node(TxnId(t)).unwrap().0);
+            s.commit(TxnId(t)).unwrap();
+        }
+        // No GC pass: every header still names its writer's slot, and every slot records its writer.
+        s.checkpoint().unwrap();
+
+        let mut device = snapshot_device(&mut s);
+        let mut sink = MemLogSink::new();
+        sink.append(&s.with_wal(|w| w.sink().durable_bytes()));
+        sink.sync().unwrap();
+        let mut wal = WalManager::open(sink.clone()).unwrap();
+        recover_device(&mut wal, &mut device).unwrap();
+        let wal_only = wal.max_recovered_txn_id().unwrap();
+        let reopened = RecordStore::open(device, WalManager::open(sink).unwrap(), 64).unwrap();
+
+        assert!(
+            wal_only < LAST,
+            "positive control: the checkpoint must reclaim the log past the writers, or the WAL alone \
+             would still remember them (it reports {wal_only})"
+        );
+        assert!(
+            reopened.recovered_txn_hw() >= LAST,
+            "the reopened store must resume its id counter past every id a commit slot records ({LAST}); \
+             it reports {}",
+            reopened.recovered_txn_hw()
+        );
+        // The hazard itself, stated on the store's own oracle: the next id the counter hands out owns
+        // none of the committed versions.
+        let next = TxnId(reopened.recovered_txn_hw() + 1);
+        for &n in &nodes {
+            let word = reopened.read_mvcc(StoreKind::Node, n).unwrap().created_ts;
+            assert!(
+                HeaderStamp::from_raw(word).slot_id().is_some(),
+                "precondition: node {n}'s header is unsettled"
+            );
+            assert!(
+                !reopened.names_own_write(word, next).unwrap(),
+                "a re-issued id would read node {n} as its own uncommitted write"
+            );
+        }
     }
 
     #[test]
@@ -18798,10 +18427,6 @@ mod tests {
             let report = gc_pass(&mut s, next);
             next += 1;
             settled_total += report.frozen;
-            assert!(
-                report.prune_scheduled > 0,
-                "round {round}: a healthy pass schedules the registry prune"
-            );
 
             // THE INVARIANT ITSELF, over the WHOLE store, in every build. No transaction is open at
             // this point, so every word still naming a slot would be a resolved writer's — exactly
@@ -18811,9 +18436,9 @@ mod tests {
             assert_eq!(
                 unsettled, 0,
                 "round {round}: {unsettled} header word(s) still name a commit slot after a GC pass \
-                 with no open transaction (first: {first:?}). The prune scheduled above would then \
-                 forget a writer a live version still resolves through — the `rmp` #522 \
-                 silent-committed-data-loss shape."
+                 with no open transaction (first: {first:?}). Every one of them keeps its commit slot \
+                 from being recycled, and costs a slot read on every access, until some pass settles \
+                 it."
             );
         }
         assert!(
@@ -19748,11 +19373,11 @@ mod tests {
     /// what that transaction did for as long as the block can be the durable image — attributing
     /// state to a transaction and keeping its verdict readable are one obligation, not two.
     ///
-    /// Asserted on the FLOOR rather than on a reclaim outcome, deliberately. Three other properties
-    /// currently keep that record alive on their own (`unfrozen_commit_lsn` floors it and is cleared
-    /// only by a GC prune, which a DDL-only transaction never gets; every later write commit rewrites
-    /// the catalogue; a GC pass itself commits), so no workload in this tree reaches the loss — that
-    /// was measured, with the registration removed, before this test was written this way. What is
+    /// Asserted on the FLOOR rather than on a reclaim outcome, deliberately. Other properties keep that
+    /// record alive on their own in most workloads (every later write commit rewrites the catalogue; a
+    /// GC pass itself commits; until `rmp` #1071 a per-writer WAL floor held it too), so a reclaim
+    /// outcome is a weak witness — that was measured, with the registration removed, before this test
+    /// was written this way. What is
     /// testable, and what the design actually rests on, is that the floor is registered at all and
     /// that it lands below the verdict it protects.
     ///
@@ -20058,8 +19683,8 @@ mod tests {
         s.delete_node(t2, doomed_a).expect("delete");
         s.delete_node(t2, doomed_b).expect("delete");
         s.commit(t2).expect("commit");
-        // The GC pass is BEGUN and COMMITTED, as `gc`'s own contract requires ("the prune applies
-        // when `txn` commits and is discarded if `txn` rolls back") and as the DST harness drives it
+        // The GC pass is BEGUN and COMMITTED, as `gc`'s own contract requires (its writes are durable
+        // when `txn` commits and undone if `txn` rolls back) and as the DST harness drives it
         // (`crates/graphus-dst/src/harness.rs`, `gc_after_recovery`). This fixture used to call `gc`
         // bare, leaving the pass permanently OPEN, and then relied on an **uncommitted** transaction's
         // frees reaching the durable catalogue. Since `rmp` #1063 they do not: `snapshot_meta` samples

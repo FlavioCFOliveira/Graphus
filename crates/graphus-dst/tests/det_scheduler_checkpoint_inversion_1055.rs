@@ -146,7 +146,7 @@
 //!   write in between — the chain-growth loop uses `with_page_mut` and `flush_unlogged` (distinct
 //!   sites), `map_pages_up_to_high_water` runs strictly before the image is sampled, and the commit
 //!   slot is published strictly after every metadata page has been written.
-//! * **retirement** — [`YieldSite::CommitRegistryRecord`]. The delta is cleared at `store.rs:4189`,
+//! * **retirement** — [`YieldSite::CommitPublishVisible`]. The delta is cleared at `store.rs:4189`,
 //!   between the `COMMIT` record and that yield, with no other yield in between, so it runs in the
 //!   segment ending at that step. `YieldSite::CommitSettle` is NOT the marker: by the time it is
 //!   reached the delta has been empty for several steps.
@@ -421,7 +421,7 @@ fn checkpoints(history: &SchedHistory) -> Vec<Checkpoint> {
     // between, so it runs in the segment ending here. See the module note on attribution.
     let mut retire: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
     for (i, &(_, _, site, _, resource)) in steps.iter().enumerate() {
-        if site == YieldSite::CommitRegistryRecord.code()
+        if site == YieldSite::CommitPublishVisible.code()
             && let Some(txn) = txn_of_resource(resource)
             && writer_of(txn).is_some()
         {

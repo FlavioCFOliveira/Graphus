@@ -94,7 +94,7 @@
 //!
 //! * every logical thread really ran and the token really moved ([`the_run_is_contended`]);
 //! * the window is really **entered**: on named seeds a writer's whole commit publication — its
-//!   `CommitPublishSlot` and the `CommitRegistryRecord` that follows its `COMMIT` record — falls
+//!   `CommitPublishSlot` and the `CommitPublishVisible` that follows its `COMMIT` record — falls
 //!   strictly inside the segment another thread spent parked at `CheckpointRecordAppend`
 //!   ([`the_hazard_window_is_entered`]). That interval is where the `COMMIT` record is appended, so
 //!   a commit located there provably logged below the checkpoint record;
@@ -408,7 +408,7 @@ fn in_flush_windows(history: &SchedHistory) -> Vec<(usize, usize)> {
 
 /// How many whole commit publications fall strictly inside a checkpoint window on this run.
 ///
-/// A commit publication is a thread's `CommitPublishSlot` followed by its own `CommitRegistryRecord`
+/// A commit publication is a thread's `CommitPublishSlot` followed by its own `CommitPublishVisible`
 /// — the `COMMIT` record is appended between them — so a publication located entirely inside the
 /// window is a `COMMIT` record appended while a checkpoint's flush was already behind it and its
 /// `CHECKPOINT-END` record was not yet written.
@@ -427,7 +427,7 @@ fn commits_inside(history: &SchedHistory, intervals: &[(usize, usize)]) -> usize
             }
             let thread = steps[i].1;
             if (i + 1..close).any(|j| {
-                steps[j].1 == thread && steps[j].2 == YieldSite::CommitRegistryRecord.code()
+                steps[j].1 == thread && steps[j].2 == YieldSite::CommitPublishVisible.code()
             }) {
                 found += 1;
             }

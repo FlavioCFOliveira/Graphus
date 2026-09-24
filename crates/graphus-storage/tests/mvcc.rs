@@ -16,14 +16,12 @@
 //!   once the freeze is durable — bounding the table (`rmp` task #59); a rolled-back or crashed GC
 //!   pass prunes nothing and leaves every restored in-flight stamp resolvable.
 
-use graphus_core::{HeaderStamp, Timestamp, TxnId, Value, VersionStamp};
+use graphus_core::{HeaderStamp, Timestamp, TxnId, Value};
 use graphus_io::MemBlockDevice;
 use graphus_storage::recovery::recover_device;
 use graphus_storage::{Namespace, RecordStore};
-// `resolve_commit_ts` moved onto the `rmp` #1069 commit door. `RegistryOracle` is the deliberate,
-// named way to ask the IN-MEMORY table about a `TxnId`-payload word — the only population that still
-// carries one; a record header is asked of the STORE.
-use graphus_txn::{CommitOracle, RegistryOracle};
+// `resolve_commit_ts` moved onto the `rmp` #1069 commit door: a record header is asked of the STORE.
+use graphus_txn::CommitOracle;
 use graphus_wal::{LogSink, MemLogSink, WalManager};
 
 type Store = RecordStore<MemBlockDevice, MemLogSink>;
@@ -214,10 +212,10 @@ fn commit_timestamp_high_water_survives_recovery_and_stays_monotonic() {
 
 #[test]
 fn lazy_committed_version_survives_recovery_while_a_loser_resolves_invisible() {
-    // `rmp` task #49: with lazy GC-time freezing a committed version keeps its writer's in-flight
-    // stamp on disk (no GC ran), yet must resolve as committed after a crash — which works only
-    // because recovery rebuilds the Active/Recent Transaction Table from the WAL commit records.
-    // Conversely an uncommitted (loser) transaction must resolve as invisible.
+    // `rmp` task #49: with lazy GC-time settling a committed version keeps its writer's unsettled
+    // stamp on disk (no GC ran), yet must resolve as committed after a crash — which works because the
+    // stamp names the writer's durable `commit.store` slot (`rmp` #1069); no in-memory table is rebuilt
+    // for it (`rmp` #1071). Conversely an uncommitted (loser) transaction must resolve as invisible.
     let s = fresh();
     s.begin(TxnId(1));
     let (committed_node, _) = s.create_node(TxnId(1)).unwrap();
@@ -225,11 +223,11 @@ fn lazy_committed_version_survives_recovery_while_a_loser_resolves_invisible() {
 
     // A second transaction writes but never commits — a recovery loser.
     s.begin(TxnId(2));
-    let _ = s.create_node(TxnId(2)).unwrap();
+    let (loser_node, _) = s.create_node(TxnId(2)).unwrap();
 
     let s = recover_no_force(&s);
 
-    // The committed version's header is unfrozen, yet the rebuilt table resolves it to ts 1.
+    // The committed version's header is unsettled, yet its durable slot resolves it to ts 1.
     let mvcc = s.node(committed_node).unwrap().mvcc;
     assert!(mvcc.in_use(), "the committed node survives recovery");
     assert_unsettled_by(
@@ -241,30 +239,29 @@ fn lazy_committed_version_survives_recovery_while_a_loser_resolves_invisible() {
     assert_eq!(
         s.resolve_commit_ts(mvcc.created_ts).unwrap(),
         Some(Timestamp(1)),
-        "the table rebuilt from the WAL resolves the committed-but-unfrozen version"
+        "the durable slot resolves the committed-but-unsettled version"
     );
 
-    // The loser left no commit record, so the table has no entry for it: its in-flight stamp
-    // resolves to "not committed" — invisible to every snapshot.
-    assert_eq!(
-        RegistryOracle(&s.commit_registry())
-            .resolve_commit_ts(VersionStamp::in_flight(TxnId(2)))
-            .unwrap(),
-        None,
+    // The loser left no commit record, so recovery undid its creation: the record is not in use, and
+    // nothing it stamped resolves as committed — invisible to every snapshot.
+    let loser = s.node(loser_node).unwrap().mvcc;
+    let reader = graphus_txn::Snapshot::new(TxnId(9_999), s.snapshot_ts());
+    assert!(
+        !loser.in_use()
+            || !graphus_txn::is_visible_via(&s, reader, loser.created_ts, loser.expired_ts)
+                .unwrap(),
         "an uncommitted (loser) transaction never resolves as committed after recovery"
     );
 }
 
 // ============================ GC-time freezing + table pruning (`rmp` task #59) ============================
 
-/// (i) **Freeze**: a GC pass settles every committed in-flight stamp — `xmin` of survivors and
-/// `xmax` of tombstones, across nodes, relationships and per-value property versions — to its
-/// `Committed(ts)` form, and (ii) **safe prune**: once the GC transaction commits, the
-/// Active/Recent Transaction Table forgets the frozen writers, holding only writers that committed
-/// after the freeze sweep (the GC transaction itself here; in-flight writers are never table
-/// entries at the store level — their stamps resolve as not-committed by absence).
+/// **Settle**: a GC pass settles every committed unsettled stamp — `xmin` of survivors and `xmax` of
+/// tombstones, across nodes, relationships and per-value property versions — to its `Committed(ts)`
+/// form, independently of the watermark. (Until `rmp` #1071 the pass also pruned an in-memory
+/// Active/Recent Transaction Table of the writers it settled; the table and its prune are gone.)
 #[test]
-fn gc_freezes_committed_headers_and_prunes_the_transaction_table() {
+fn gc_settles_committed_headers_across_every_record_kind() {
     let s = fresh();
     let key = s.intern_token(Namespace::PropKey, "v").unwrap();
     let knows = s.intern_token(Namespace::RelType, "KNOWS").unwrap();
@@ -288,15 +285,10 @@ fn gc_freezes_committed_headers_and_prunes_the_transaction_table() {
         .set_node_property_value(t2, a, key, &Value::Integer(2))
         .unwrap();
     s.commit(t2).unwrap();
-    assert_eq!(
-        s.commit_registry().len(),
-        2,
-        "two committed writers retained"
-    );
 
     // GC at a watermark BELOW t2's commit (an older reader could still see the tombstoned
-    // versions): nothing is reclaimable, but freezing is watermark-independent — every committed
-    // stamp settles, and the full prune is scheduled.
+    // versions): nothing is reclaimable, but settling is watermark-independent — every committed
+    // stamp settles.
     let t3 = TxnId(3);
     s.begin(t3);
     let report = s.gc(t3, Timestamp(1)).unwrap();
@@ -316,8 +308,7 @@ fn gc_freezes_committed_headers_and_prunes_the_transaction_table() {
         report.frozen, 5,
         "every committed stamp across all record kinds froze"
     );
-    assert_eq!(report.prune_scheduled, 2, "t1 and t2 scheduled for pruning");
-    s.commit(t3).unwrap(); // the freeze is durable: the prune applies now
+    s.commit(t3).unwrap(); // the settle is durable
 
     // (i) The headers are self-describing `Committed(ts)` stamps.
     assert_settled_at(
@@ -357,18 +348,8 @@ fn gc_freezes_committed_headers_and_prunes_the_transaction_table() {
         "a property operation never stamps `xmax` after `rmp` #967"
     );
 
-    // (ii) The table shrank to exactly the writers not yet frozen: only the GC transaction itself.
-    assert_eq!(s.commit_registry().len(), 1, "only the GC writer remains");
-    assert_eq!(
-        RegistryOracle(&s.commit_registry())
-            .resolve_commit_ts(VersionStamp::in_flight(t1))
-            .unwrap(),
-        None,
-        "t1 was pruned — safe, because no header carries its in-flight stamp any more"
-    );
-
-    // A later pass at the latest watermark reclaims the tombstones (their frozen `Committed(2)`
-    // xmax resolves directly, no table entry needed) and prunes the previous GC writer.
+    // A later pass at the latest watermark reclaims the tombstones (their settled `Committed(2)`
+    // xmax resolves directly, no slot read needed).
     let latest = s.snapshot_ts();
     let t4 = TxnId(4);
     s.begin(t4);
@@ -383,15 +364,13 @@ fn gc_freezes_committed_headers_and_prunes_the_transaction_table() {
         report.undo_deltas_reclaimed > 0,
         "and that chain IS reclaimed by the same pass: {report:?}"
     );
-    assert_eq!(report.prune_scheduled, 1, "the previous GC writer (t3)");
-    assert_eq!(s.commit_registry().len(), 1, "only t4 remains");
 }
 
-/// A writer that commits **between** the GC freeze sweep and the GC transaction's commit is not in
-/// the scheduled prune set: its stamps were not frozen this pass (it was still in flight during the
-/// sweep), so its table entry must survive — it is pruned only by a *later* pass that freezes it.
+/// A writer that commits **between** the GC settle walk and the GC transaction's commit keeps its
+/// unsettled stamps (it was still in flight during the walk), and they must resolve through its
+/// durable slot — a *later* pass settles them.
 #[test]
-fn a_writer_committing_during_the_gc_window_is_not_pruned() {
+fn a_writer_committing_during_the_gc_window_stays_resolvable() {
     let s = fresh();
     let t1 = TxnId(1);
     s.begin(t1);
@@ -405,15 +384,11 @@ fn a_writer_committing_during_the_gc_window_is_not_pruned() {
 
     let t3 = TxnId(3);
     s.begin(t3);
-    let report = s.gc(t3, s.snapshot_ts()).unwrap();
-    assert_eq!(
-        report.prune_scheduled, 1,
-        "only t1 was committed at sweep time"
-    );
+    s.gc(t3, s.snapshot_ts()).unwrap();
 
-    // t2 commits inside the GC window; then the GC transaction commits and prunes.
+    // t2 commits inside the GC window; then the GC transaction commits.
     s.commit(t2).unwrap(); // ts 2
-    s.commit(t3).unwrap(); // applies the prune of {t1}
+    s.commit(t3).unwrap();
 
     // t2's version still carries an in-flight stamp (not frozen this pass) and MUST resolve.
     let mvcc = s.node(b).unwrap().mvcc;
@@ -426,34 +401,25 @@ fn a_writer_committing_during_the_gc_window_is_not_pruned() {
     assert_eq!(
         s.resolve_commit_ts(mvcc.created_ts).unwrap(),
         Some(Timestamp(2)),
-        "the mid-window committer survives the prune"
-    );
-    // And t1 is gone (its stamps froze before the prune).
-    assert_eq!(
-        RegistryOracle(&s.commit_registry())
-            .resolve_commit_ts(VersionStamp::in_flight(t1))
-            .unwrap(),
-        None
+        "the mid-window committer resolves through its slot"
     );
 }
 
-/// (iii) **Mid-GC rollback**: rolling the GC transaction back undoes its header freezes (WAL undo
-/// restores the in-flight stamps) and MUST discard the scheduled prune — otherwise a restored
-/// in-flight stamp would be stranded as unresolvable (it would wrongly read as aborted).
+/// **Mid-GC rollback**: rolling the GC transaction back undoes its header settles (WAL undo restores
+/// the naming stamps), and every restored stamp must still resolve — it names a durable slot.
 #[test]
-fn rolled_back_gc_pass_prunes_nothing_and_strands_no_stamp() {
+fn rolled_back_gc_pass_strands_no_stamp() {
     let s = fresh();
     let t1 = TxnId(1);
     s.begin(t1);
     let (a, _) = s.create_node(t1).unwrap();
     s.commit(t1).unwrap(); // ts 1
 
-    // A GC pass freezes a's xmin and schedules the prune of {t1} — then rolls back.
+    // A GC pass settles a's xmin — then rolls back.
     let t2 = TxnId(2);
     s.begin(t2);
     let report = s.gc(t2, s.snapshot_ts()).unwrap();
     assert_eq!(report.frozen, 1);
-    assert_eq!(report.prune_scheduled, 1);
     assert_settled_at(
         s.node(a).unwrap().mvcc.created_ts,
         1,
@@ -461,16 +427,16 @@ fn rolled_back_gc_pass_prunes_nothing_and_strands_no_stamp() {
     );
     s.rollback(t2).unwrap();
 
-    // The WAL undo restored the in-flight stamp, and the table still resolves it: no prune ran.
+    // The WAL undo restored the naming stamp, and its slot still resolves it.
     let mvcc = s.node(a).unwrap().mvcc;
     assert_unsettled_by(&s, mvcc.created_ts, t1, "rollback undid the freeze");
     assert_eq!(
         s.resolve_commit_ts(mvcc.created_ts).unwrap(),
         Some(Timestamp(1)),
-        "the rolled-back pass pruned nothing — the restored stamp still resolves"
+        "the restored stamp still resolves"
     );
 
-    // A subsequent committed pass freezes and prunes normally.
+    // A subsequent committed pass settles normally.
     let t3 = TxnId(3);
     s.begin(t3);
     s.gc(t3, s.snapshot_ts()).unwrap();
@@ -480,19 +446,13 @@ fn rolled_back_gc_pass_prunes_nothing_and_strands_no_stamp() {
         1,
         "the stamp is settled at this timestamp",
     );
-    assert_eq!(
-        s.commit_registry().len(),
-        1,
-        "only the GC writer (t3) remains"
-    );
 }
 
-/// A **crash mid-GC** (the GC transaction never committed, but its freeze writes reached the
-/// durable WAL) leaves the table correct after recovery: the GC transaction is a loser — its
-/// header freezes are undone — and the table rebuilt from the WAL commit records still resolves
-/// every restored in-flight stamp. No prune survives the crash (it was never applied).
+/// A **crash mid-GC** (the GC transaction never committed, but its settle writes reached the durable
+/// WAL): the GC transaction is a loser — its settles are undone — and every restored naming stamp
+/// still resolves through its durable slot.
 #[test]
-fn crash_mid_gc_restores_inflight_stamps_and_a_resolving_table() {
+fn crash_mid_gc_restores_naming_stamps_that_still_resolve() {
     let s = fresh();
     let t1 = TxnId(1);
     s.begin(t1);
@@ -510,7 +470,7 @@ fn crash_mid_gc_restores_inflight_stamps_and_a_resolving_table() {
 
     let s = recover_no_force(&s);
 
-    // The loser GC's freeze was undone; the rebuilt table resolves the restored in-flight stamp.
+    // The loser GC's settle was undone; the slot resolves the restored naming stamp.
     let mvcc = s.node(a).unwrap().mvcc;
     assert!(mvcc.in_use());
     assert_unsettled_by(
@@ -522,10 +482,10 @@ fn crash_mid_gc_restores_inflight_stamps_and_a_resolving_table() {
     assert_eq!(
         s.resolve_commit_ts(mvcc.created_ts).unwrap(),
         Some(Timestamp(1)),
-        "the table rebuilt from the WAL still resolves the committed writer"
+        "the durable slot still resolves the committed writer"
     );
 
-    // A fresh committed GC pass after recovery freezes and prunes normally.
+    // A fresh committed GC pass after recovery settles normally.
     let t3 = TxnId(3);
     s.begin(t3);
     let report = s.gc(t3, s.snapshot_ts()).unwrap();
@@ -536,18 +496,12 @@ fn crash_mid_gc_restores_inflight_stamps_and_a_resolving_table() {
         1,
         "the stamp is settled at this timestamp",
     );
-    assert_eq!(
-        s.commit_registry().len(),
-        1,
-        "only the GC writer (t3) remains"
-    );
 }
 
-/// Frozen-then-pruned state survives a crash: after a committed GC pass and a crash, the table is
-/// rebuilt from the WAL commit records (pruned writers harmlessly reappear), every frozen header
-/// reads back as `Committed(ts)`, and the next pass simply prunes the stale entries again.
+/// Settled state survives a crash: after a committed GC pass and a crash, every settled header reads
+/// back as `Committed(ts)`, and the next pass finds nothing left to settle.
 #[test]
-fn frozen_headers_survive_a_crash_and_stale_entries_reprune() {
+fn frozen_headers_survive_a_crash() {
     let s = fresh();
     let t1 = TxnId(1);
     s.begin(t1);
@@ -557,37 +511,22 @@ fn frozen_headers_survive_a_crash_and_stale_entries_reprune() {
     let t2 = TxnId(2);
     s.begin(t2);
     s.gc(t2, s.snapshot_ts()).unwrap();
-    s.commit(t2).unwrap(); // freeze durable; t1 pruned
-    assert_eq!(s.commit_registry().len(), 1);
+    s.commit(t2).unwrap(); // settle durable
 
     let s = recover_no_force(&s);
 
-    // The frozen header is durable; the rebuilt table again holds every WAL-committed writer —
-    // t1, t2, and the create-time system catalog transaction (its commit record carries the ts-0
-    // sentinel) — stale but harmless, since no header references any of them any more.
     assert_settled_at(
         s.node(a).unwrap().mvcc.created_ts,
         1,
-        "the committed freeze survived the crash",
-    );
-    assert_eq!(
-        s.commit_registry().len(),
-        3,
-        "rebuild restores WAL-committed writers (t1, t2, system catalog txn)"
+        "the committed settle survived the crash",
     );
 
-    // The next pass re-prunes the stale entries (nothing left to freeze).
+    // The next pass finds nothing left to settle.
     let t3 = TxnId(3);
     s.begin(t3);
     let report = s.gc(t3, s.snapshot_ts()).unwrap();
-    assert_eq!(report.frozen, 0, "everything already frozen");
-    assert_eq!(report.prune_scheduled, 3, "the stale t1/t2/system entries");
+    assert_eq!(report.frozen, 0, "everything already settled");
     s.commit(t3).unwrap();
-    assert_eq!(
-        s.commit_registry().len(),
-        1,
-        "only the GC writer (t3) remains"
-    );
 }
 
 /// Crash-recovery variant of the aborted-creation dead-link survivor (`rmp` #220): instead of an

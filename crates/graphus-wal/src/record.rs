@@ -186,11 +186,11 @@ impl LogRecord {
     /// Builds a [`Commit`](RecordType::Commit) record for `txn` carrying its MVCC `commit_ts` in the
     /// `redo` field (`04 §5.2`, `rmp` task #49).
     ///
-    /// Lazy GC-time freezing leaves a committed version's on-disk `xmin`/`xmax` as the writer's
-    /// in-flight `TxnId`; the only durable record of "this `TxnId` committed at this timestamp" is the
-    /// commit record itself, so it must carry the timestamp. Recovery rebuilds the in-memory
-    /// Active/Recent Transaction Table from these records ([`commit_ts`](Self::commit_ts)) regardless
-    /// of which older commits a checkpoint truncated away. The 8 little-endian bytes live in `redo`
+    /// The timestamp was carried so recovery could rebuild the store's in-memory Active/Recent
+    /// Transaction Table, back when a version header named its writer's `TxnId`. Since `rmp` #1069 a
+    /// header names a durable `commit.store` slot, and since `rmp` #1071 the store keeps no such table;
+    /// the field stays in the record format and is still decoded by
+    /// [`commit_ts`](Self::commit_ts). The 8 little-endian bytes live in `redo`
     /// because a `Commit` record is never a page change ([`RecordType::is_page_change`] excludes it),
     /// so recovery never replays `redo` as a page image — the field is otherwise unused for commits.
     #[must_use]
@@ -539,8 +539,7 @@ mod tests {
 
     #[test]
     fn commit_record_carries_its_commit_ts_through_encode_decode() {
-        // `rmp` task #49: lazy freeze relies on the commit record carrying the commit timestamp so
-        // recovery can rebuild the Active/Recent Transaction Table.
+        // `rmp` task #49: the commit record carries the commit timestamp through encode/decode.
         let mut r = LogRecord::commit(TxnId(9), Lsn(40), Timestamp(0x1234_5678));
         assert_eq!(r.rec_type, RecordType::Commit);
         assert_eq!(r.commit_ts(), Some(Timestamp(0x1234_5678)));

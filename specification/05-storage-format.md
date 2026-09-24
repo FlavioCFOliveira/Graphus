@@ -146,8 +146,8 @@ The change exists so that the store has **one** commit oracle rather than two. A
 resolved through the slot (§12.4); the header did not, and a `TxnId` is translatable only by the
 in-memory Active/Recent Transaction Table. Three mechanisms existed to keep that second oracle
 usable: the per-record freeze sweep, which rewrote a committed writer's stamps in place; the
-`freeze_low` frontier, which bounded that sweep; and the WAL reclamation floor, which holds a
-committed transaction's log record alive until its stamps are settled, so that a restart can rebuild
+`freeze_low` frontier, which bounded that sweep; and the WAL reclamation floor, which held a
+committed transaction's log record alive until its stamps were settled, so that a restart could rebuild
 the table that translates them. A stamp that names a slot is resolvable from the **data alone**.
 
 This change did not remove the three mechanisms; it removed their standing: none of them is what makes
@@ -159,9 +159,14 @@ longer exist; a stamp is settled by the full-range walk every GC pass performs, 
 the header half of the slot census (§12.4; `04-technical-design.md` §5.6). **`freeze_low` was never
 persisted.** It was an in-memory value, initialised to `1` whenever a store was opened, and no durable
 structure ever carried it; its removal therefore moves no byte, the format stays at version **6**, and
-no migration exists or is needed. The WAL reclamation floor remains. It no longer keeps a stamp
-resolvable; what it still protects is the `TxnId` a `commit.store` slot records (§12.4), which a
-restart must not re-issue while a live slot still records it.
+no migration exists or is needed.
+
+**Task #1071 removed the third.** Once #1069 had made it unnecessary for resolution, the WAL floor held
+per unsettled committed writer protected only the `TxnId` a `commit.store` slot records (§12.4), which a
+restart must not re-issue. That id is now protected directly: the transaction-id high-water computed at
+open covers every `txn_id` recorded in `commit.store` as well as every id in the retained log
+(`04-technical-design.md` §5.2). The in-memory Active/Recent Transaction Table the three mechanisms
+served went with it. No byte moved here either.
 
 Three consequences are normative rather than incidental:
 
@@ -513,7 +518,7 @@ only for its disk-backed storage mode and has no Graphus counterpart.
 | 0 | 1 | `flags` | bit 0 `in_use`; remaining reserved, must be zero. |
 | 1 | 7 | — | reserved, must be zero. |
 | 8 | 8 | `commit_ts` | **the commit indirection point.** Carries the writer's `TxnId` in the in-flight `VersionStamp` encoding while the transaction is open, and its commit timestamp once it has committed. Written exactly once, by a single store, at commit. |
-| 16 | 8 | `txn_id` | the owning transaction's id, retained after commit for recovery and diagnostics. |
+| 16 | 8 | `txn_id` | the owning transaction's id, retained after commit for recovery and diagnostics. Since task **#1071** it is also read at open, from every slot below the high-water, to raise the transaction-id high-water (`04-technical-design.md` §5.2). |
 | 24 | 8 | `delta_count` | `0` while the transaction is open; set at commit to the number of deltas the transaction created, then decremented by GC as each one is reclaimed. Since task **#1069** it is an accounting cross-check and **not** a reclamation trigger — a live committed slot carrying `0` is a legitimate state, and the slot is freed by the reference census below. |
 
 **Why one slot and not one timestamp per delta.** A transaction that touched *k* entities commits with

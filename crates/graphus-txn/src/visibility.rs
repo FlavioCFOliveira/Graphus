@@ -189,10 +189,11 @@ pub trait CommitOracle {
     /// `snapshot` (`rmp` #1069 AC 2).
     ///
     /// The default does nothing, and an implementor that overrides it is expected to make the body
-    /// `debug_assertions`-only so a release build optimises the call away entirely. It exists so the
-    /// slot-backed oracle can compare its **verdict** — never its outcome — against the one the
-    /// pre-#1069 [`CommitRegistry`] would have produced over the same records, on every read the
-    /// whole DST battery performs, without a new test per scenario.
+    /// `debug_assertions`-only so a release build optimises the call away entirely. It was written so
+    /// the slot-backed oracle could compare its **verdict** — never its outcome — against the one the
+    /// pre-#1069 [`CommitRegistry`] would have produced over the same records. Since `rmp` #1071 the
+    /// store keeps no such table and no oracle in the workspace overrides this hook; wrapper oracles
+    /// still forward it, which costs nothing.
     ///
     /// Deliberately infallible and return-less: an audit that could fail the read would be a second
     /// oracle in the answer path, which is the very thing `rmp` #1069 removes. It diverges loudly or
@@ -230,15 +231,12 @@ pub trait CommitOracle {
 /// header must be resolved by the store (`graphus_storage::RecordStore` /
 /// `graphus_storage::StoreReadView`), never here.
 ///
-/// There are exactly two legitimate uses:
-///
-/// 1. **Populations that still carry a `TxnId`.** The in-memory reference store
-///    (`crate::store::MemVersionedStore`) stamps its own headers with
-///    [`VersionStamp::in_flight`](crate::oracle::VersionStamp::in_flight) and resolves them here; it
-///    has no `commit.store` and never touches a record header.
-/// 2. **The `rmp` #1069 AC 2 equivalence audit.** The slot-backed oracle reconstructs, byte for
-///    byte, the word the pre-phase-3 build would have written and checks that this oracle reaches
-///    the same *verdict* — see [`CommitOracle::audit_visibility`].
+/// There is exactly one legitimate use: **populations that still carry a `TxnId`.** The in-memory
+/// reference store (`crate::store::MemVersionedStore`) stamps its own headers with
+/// [`VersionStamp::in_flight`](crate::oracle::VersionStamp::in_flight) and resolves them here; it
+/// has no `commit.store` and never touches a record header. (The second, the `rmp` #1069 AC 2
+/// equivalence audit over `graphus_storage::RecordStore`'s own table, went with that table in
+/// `rmp` #1071.)
 ///
 /// Infallible: every method wraps its answer in `Ok`, because the table is a `HashMap` in this
 /// process. It therefore cannot produce [`StampOutcome::InFlight`] (see that variant's docs).
@@ -296,8 +294,8 @@ pub fn is_visible_via(
     } else {
         false
     };
-    // The `rmp` #1069 AC 2 cross-check, on EVERY visibility decision the engine makes. A no-op
-    // unless the oracle overrides it, and overridden only under `debug_assertions`.
+    // The `rmp` #1069 AC 2 cross-check hook, on EVERY visibility decision the engine makes. A no-op
+    // unless the oracle overrides it — and since `rmp` #1071 none does.
     oracle.audit_visibility(snapshot, xmin, xmax, verdict);
     Ok(verdict)
 }

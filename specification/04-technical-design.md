@@ -648,6 +648,24 @@ Recovery starts from the checkpoint's DPT (the oldest `recovery_lsn` therein), n
 the log. Checkpoint cadence is time- and log-volume-based and is itself WAL-logged so a crash during
 checkpointing is handled.
 
+**The WAL reclamation floor.** A checkpoint reclaims the log prefix below one floor, and every term of
+that floor is a record something may still need to read:
+
+- It starts from the **conservative redo floor** (task #1086): the lower of the oldest active
+  transaction's first LSN and the log's end, sampled in one hold of the WAL lock **before** the
+  checkpoint's flush begins. Recovery's redo starts there too, so the two numbers are one decision.
+- It is lowered to the first LSN of the oldest transaction still active when the checkpoint record is
+  appended, because recovery must be able to undo a loser.
+- The **counter fold** may lower it further and never raises it: the floor may pass neither the log
+  position the durable counter image covers nor the first logged cardinality delta that image has not
+  yet absorbed (task #1067), and, while a catalogue image carrying a pending-DDL block may still be the
+  durable one, it keeps the `COMMIT` record of the transaction that block names (task #1083).
+
+There is no other term. Until task #1071 the floor also held the commit record of every committed
+writer whose header stamps no GC pass had yet settled, and a GC pass released that term as it settled
+them. It is gone because it protected nothing any more: an unsettled stamp names a durable commit slot
+(§5.3), and the transaction-id high-water no longer depends on what the log retains (§5.2).
+
 ### 4.8 Three-phase ARIES recovery
 
 On startup, if the superblock is not marked cleanly shut down:
@@ -988,23 +1006,18 @@ decision, so it is a read-mostly, heavily-shared cache line and must be sized an
 becomes committed at the same instant** — which is atomicity (the **A** of ACID) expressed directly in
 the data structure rather than reconstructed by a sweep.
 
-That single store settles the deltas — and, since #1069, the record headers with them. It is still
-not the whole of publication: a commit also has to appear in the **in-memory commit registry**, so
-publication remains **two writes in two media** and cannot be made instantaneous the way Memgraph's
-is. What that second write is for has changed, and the distinction matters: it is no longer what
-resolves a record header — the slot is (§5.3). The registry is the process's record of **commit
-outcomes keyed by `TxnId`**, rebuilt from the log's commit records when a store is opened, and nothing
-on the answer path reads it: no delta, no record header and no label version resolves through it.
-Two consumers remain. A debug-build cross-check compares its visibility verdict with the slot's
-wherever the registry has an answer to give. And a GC pass forgets, once its settle is durable, the
-committed writers whose every naming stamp that pass's walk settled — the set is sampled **before** the
-walk begins, so a writer that commits behind the walk is forgotten by a later pass — and forgetting a
-writer releases its WAL reclamation floor (§5.3).
+That single store settles the deltas — and, since #1069, the record headers with them — and since task
+**#1071** it is the whole of a commit's publication to the data: the store keeps **no in-memory commit
+registry**. Until #1071 a commit also recorded its outcome in one, keyed by `TxnId` and rebuilt from the
+log's commit records at open. Since #1069 nothing on the answer path had read it; #1071 removed it,
+together with the GC prune that kept it bounded and the per-writer WAL floor that prune released
+(§4.7).
 
-What guarantees that no reader ever observes the transaction half-published is therefore not the
-store's atomicity but the horizon of §5.2: the commit timestamp stays unpublished — and no snapshot
-may reach it — until both writes are done. That rule is unchanged by #1069, because the second write
-still publishes state a concurrent reader may consult.
+Publication is still not instantaneous the way Memgraph's is, because the commit timestamp is issued
+before the slot is written. What guarantees that no reader observes a commit before its slot says
+committed is therefore not the store's atomicity but the horizon of §5.2: a commit **publishes its slot
+first and only then advances the horizon** over its timestamp, so no snapshot can reach that timestamp
+while the slot still answers "in flight".
 
 #### 5.1.4 Statement-level isolation: `command_id`
 
@@ -1328,13 +1341,13 @@ committed creator exactly when its commit timestamp is ≤ the snapshot's, the c
 on the same test, and the SSI tracker of §5.4 reads `commit_ts ≤ begin_ts` as "committed before it
 began" and therefore forms no rw-antidependency edge. What no mechanism did was **establish** it.
 
-**Why the allocation clock is not a snapshot.** A commit publishes itself in two writes in two media —
-the durable commit-info slot of §5.1.3, then the in-memory commit registry — while the commit
-timestamp is issued *before* both. Handing out the allocation clock as a begin timestamp therefore
-promises a reader a commit that no oracle will yet admit. (When this defect was found there were two
-oracles, and the sentence read "neither"; since task #1069 a record header resolves through the slot
-alone — §5.3. The argument is unchanged either way, because the timestamp is issued before the
-**first** of the two writes.) While one thread owned the
+**Why the allocation clock is not a snapshot.** A commit publishes itself by writing the durable
+commit-info slot of §5.1.3, and the commit timestamp is issued *before* that write. Handing out the
+allocation clock as a begin timestamp therefore promises a reader a commit that no oracle will yet
+admit. (When this defect was found a commit published itself in two writes in two media — the slot,
+then an in-memory commit registry — and the sentence read "neither oracle"; task #1069 made the slot
+the only oracle for a record header, and task #1071 removed the registry. The argument is unchanged,
+because the timestamp is issued before the **first** write.) While one thread owned the
 write path the two instants could not be told apart; under `D-multi-writer` they can, and a
 transaction that begins inside that window reads the pre-commit value of every record the committing
 transaction wrote. When that transaction is itself a writer, it computes its own write from the value
@@ -1358,8 +1371,9 @@ have not finished publishing**, and derives the horizon from it:
   *consistency*.
 - It is published with an atomic maximum, so it is **monotone** whichever order two workers recompute
   it in: a stale recomputation can fail to advance the horizon, never move it backwards.
-- A commit timestamp is released to the horizon **only after both halves of publication are done** —
-  the durable slot and the registry entry — and never between them. A read-only commit (§4.2, the
+- A commit timestamp is released to the horizon **only after the durable slot is published**, never
+  before it. (Until task #1071 publication had a second half, the in-memory registry entry, and the
+  release waited for both.) A read-only commit (§4.2, the
   `rmp` #529 fast path) publishes nothing and so releases its timestamp as soon as it stops being
   pending.
 
@@ -1400,6 +1414,17 @@ complementary and neither subsumes the other.
 Nothing here changes an on-disk format: the horizon is derived in memory from state the store already
 maintains, and it is recomputed from the recovered commit-timestamp high-water when a store is opened.
 
+**The transaction-id high-water at open** (task **#1071**). An opened store reports a transaction-id
+high-water, and the engine issues new ids above it. It is the larger of two numbers: the highest id
+in the retained WAL, and the highest `txn_id` recorded by any `commit.store` slot below that store's
+high-water, in use or retired. Both halves are load-bearing. Re-issuing an id the log still carries
+breaks the winner/loser classification of a later recovery. Re-issuing an id a slot records makes the
+own-write test of §5.3 read that stranger's committed version as the new transaction's own uncommitted
+write. Until #1071 the second hazard was prevented indirectly, by a WAL floor that kept every
+unsettled committed writer's commit record in the log; reading the slots makes the high-water
+independent of what the log retains. The slot scan runs once per open and is linear in
+`commit.store`'s high-water, a store the census keeps small by recycling every slot nothing names.
+
 ### 5.3 Visibility rules
 
 A transaction `T` with snapshot `s` sees version `v` iff:
@@ -1425,9 +1450,10 @@ backup image self-sufficient (`05-storage-format.md` §7 and §11) and what remo
 machinery the old in-memory oracle required in order to stay bounded — the per-record freeze sweep,
 its frontier, and the WAL reclamation floor that held a committed transaction's log record down until
 its stamps were settled. #1069 demoted all three from correctness to performance, and task **#1070**
-removed the sweep and its frontier (§5.6). The WAL reclamation floor remains, for a different reason:
-a `commit.store` slot records its writer's `TxnId`, and the floor keeps that id in the retained log so
-that a restart cannot re-issue it while a live slot still records it.
+removed the sweep and its frontier (§5.6). Task **#1071** removed the WAL reclamation floor, whose last
+remaining purpose was to keep in the retained log the `TxnId` a `commit.store` slot records: the
+transaction-id high-water computed at open now reads the slots themselves (§5.2), and the floor that
+remains is §4.7's.
 
 **This two-clause rule is the answer *between* transactions, and it is complete as such.** It is not
 the whole answer *within* one, and it structurally cannot be: the two header words record **which
@@ -1670,9 +1696,12 @@ pass alike — walks the in-use records of the three MVCC record stores across t
 `[1, high_water)`. For each header word it first records the commit slot the word names (the header
 half of the reference census above) and then settles the word if it names a committed writer's slot,
 by compare-and-set against the value it read (`RecordStore::settle_and_census_headers`). A settle-only
-pass (`RecordStore::gc_freeze_only`) runs this walk and skips every reclamation phase. The settle
-spares every later reader an indirection, which is a performance argument, and it un-names the slot,
-which is what lets the census retire it; the census rules are `05-storage-format.md` §12.4.
+pass (`RecordStore::gc_freeze_only`) runs this walk and skips every reclamation phase. Until task #1071
+a settle-only pass was also what advanced the WAL reclamation floor during a bulk load; since #1071 a
+checkpoint alone bounds the log (§4.7), and a settle-only pass keeps only the settle's own two
+benefits. The settle spares every later reader an indirection, which is a performance argument, and it
+un-names the slot, which is what lets the census retire it; the census rules are
+`05-storage-format.md` §12.4.
 
 **The bound is the whole id range, decided on completeness** (task #1070). A census that frees a slot
 must see every reference, so a bound is admissible only if something proves that nothing lies outside

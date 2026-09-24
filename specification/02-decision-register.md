@@ -1189,8 +1189,8 @@ scope and are propagated into `00-overview.md` and `01-needs-survey.md`:
 > of `D-published-snapshot-horizon` — what it stopped being is the resolver of a record header.
 >
 > **Note (2026-09-24).** The paragraph above is the state after #1069, and it stays as written. Task
-> **#1070** has since removed the freeze sweep and the `freeze_low` frontier; the WAL reclamation floor
-> remains. See the note of 2026-09-24 below.
+> **#1070** has since removed the freeze sweep and the `freeze_low` frontier, and task **#1071** the WAL
+> reclamation floor and the in-memory commit registry. See the two notes of 2026-09-24 below.
 >
 > **A ratified text to read through this note.** Passages ratified before today name the
 > cross-transaction predicate `graphus_txn::is_visible` (the 2026-08-05 statement-isolation round and
@@ -1262,10 +1262,42 @@ scope and are propagated into `00-overview.md` and `01-needs-survey.md`:
 > installer, so no live cell names an aborted transaction's slot.
 >
 > **What this note does not claim.** The in-memory commit registry and the WAL reclamation floor tied to
-> it are unchanged by #1070.
+> it are unchanged by #1070; task #1071 removed them (next note).
 >
 > Design in `04-technical-design.md` §5.1.3, §5.3 and §5.6; on-disk form in `05-storage-format.md` §7,
 > §12.4 and §12.6; the deterministic regression in `07-dst-simulator.md` §5.2.7.
+
+## Post-ratification note (2026-09-24) — `D-published-snapshot-horizon`: one write publishes a commit
+
+> **This note records how task #1071 removed the second medium of publication. It creates no new
+> decision and changes no ratified outcome of the 2026-08-12 round.** A snapshot timestamp is still the
+> published commit-visibility horizon, the horizon is still the contiguous published prefix of the
+> issued timestamps, and the rank-20 commit sequencer is unchanged.
+>
+> **What changed.** The ratified text describes a commit that publishes itself "in two writes in two
+> media — the durable commit-info slot and the in-memory commit registry". Since #1071 the store keeps
+> no in-memory commit registry. Since #1069 no reader had resolved anything through it. The owner's
+> decision, taken on measurement, was to remove it rather than reduce it to a cache of `commit.store`:
+> keyed by `TxnId`, it could not resolve a header that names a slot without reading that slot, and a
+> cache keyed by slot would have saved at most some tens of nanoseconds per read of an unsettled
+> header — a header every GC pass settles — at the price of an invalidation hazard whenever a slot is
+> recycled. A commit now publishes its durable slot and only then advances the horizon
+> over its timestamp; "both halves of publication are done" in the ratified text reads, from here on,
+> as "the slot is published". The deterministic-scheduler yield point at that instant was renamed from
+> `CommitRegistryRecord` to `CommitPublishVisible`, with its code unchanged.
+>
+> **What went with the registry.** The GC prune that kept it bounded, and the WAL floor per unsettled
+> committed writer that the prune released. The one thing that floor still protected — that a restart
+> never re-issues a `TxnId` a `commit.store` slot records — is now guaranteed at open, where the
+> transaction-id high-water is the larger of the retained log's highest id and the highest id any slot
+> records.
+>
+> **What this note does not claim.** `graphus_txn::CommitRegistry` still exists as the outcome table of
+> the reference transaction manager in `graphus-txn`, resolved through `RegistryOracle`; that manager
+> is not the store, and its own prune is unchanged.
+>
+> Design in `04-technical-design.md` §4.7, §5.1.3, §5.2 and §5.3; on-disk form in
+> `05-storage-format.md` §7 and §12.4; the yield point in `07-dst-simulator.md` §5.2.5.
 
 ## TCK target (pinned — closes `D-cypher-line` open question 1)
 

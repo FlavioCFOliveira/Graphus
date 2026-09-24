@@ -5,8 +5,8 @@
 //! committed MVCC stamps, lowering the WAL reclaim floor) followed by a sharp store checkpoint (flush
 //! dirty pages home + physically reclaim the WAL prefix below the floor). Before #305 there was no
 //! production trigger: `MemLogSink::reclaim` only zero-*filled* the durable buffer (it never freed
-//! memory, so RSS grew forever under delete-churn — #313), and the freeze sweep that drains
-//! `unfrozen_commit_lsn` (lowering the floor) was never driven (#305).
+//! memory, so RSS grew forever under delete-churn — #313), and the freeze sweep that drained the
+//! per-writer WAL floor (lowering it; that floor was removed by `rmp` #1071) was never driven (#305).
 //!
 //! These tests prove, over the real engine:
 //!  1. A maintenance checkpoint **physically frees** the in-memory WAL backing under delete-churn

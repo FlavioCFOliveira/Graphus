@@ -570,9 +570,8 @@ pub(crate) fn handle_bulk_import_batch<D: BlockDevice, S: LogSink>(
 /// ## Cost and failure handling
 ///
 /// One-shot: a single `O(total store)` GC freeze + checkpoint, run once at session close — never the
-/// per-batch `O(N²)` cadence `rmp` #522/#556 guard against. The freeze is *required*, not optional: it
-/// is what drains the store's `unfrozen_commit_lsn` map and lowers the WAL reclaim floor; a reclaim that
-/// skipped it would free nothing.
+/// per-batch `O(N²)` cadence `rmp` #522/#556 guard against. (Until `rmp` #1071 the freeze was required
+/// to drain a per-writer WAL floor before a reclaim could free anything; that floor is gone.)
 ///
 /// Best-effort: a checkpoint failure leaves the store fully durable and consistent (the reclaim floor is
 /// always respected — [`TxnCoordinator::checkpoint`]'s contract), only the WAL un-reclaimed, i.e. the
@@ -582,9 +581,8 @@ pub(crate) fn handle_bulk_import_batch<D: BlockDevice, S: LogSink>(
 fn reclaim_after_bulk_load<D: BlockDevice, S: LogSink>(coordinator: &TxnCoordinator<D, S>) {
     match coordinator.checkpoint() {
         Ok(report) => {
-            // `report.frozen` is the load-bearing signal: the freeze sweep settled that many committed
-            // MVCC stamps, draining the store's `unfrozen_commit_lsn` map and so lowering the WAL reclaim
-            // floor — which is what let the checkpoint physically free the WAL prefix below it. (The
+            // `report.frozen` counts the committed MVCC stamps the pass settled; the checkpoint then
+            // physically freed the WAL prefix below its floor. (The
             // absolute retained-WAL shrink is not logged because the coordinator's `wal_durable_len` is a
             // monotonic lifetime offset that reclamation never lowers, so it would read as growth, not a
             // shrink; the drop is instead observed on disk / in RSS by the `rmp` #579 verification.)

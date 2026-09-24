@@ -463,7 +463,7 @@ pub trait LogSink {
 /// Crucially the **logical length and every byte offset are unchanged** (LSN == byte offset, `§4.1`):
 /// the reclaimed gap `[head_len, base)` is simply absent and reads back as **zeros**, exactly the
 /// contract recovery relies on (it skips a leading zero run to the first surviving record). No offset
-/// is ever rebased, so commit-record LSNs, `page_lsn` references, and the `unfrozen_commit_lsn` floor
+/// is ever rebased, so commit-record LSNs, `page_lsn` references, and every reclaim floor
 /// all stay valid across a reclaim — which is what makes this recovery-safe.
 ///
 /// ## Opt-in **deferred-harden** mode (`rmp` #554, commit-pipelining fidelity)

@@ -191,9 +191,8 @@ fn an_unknown_presence_byte_is_refused() {
 /// It pins the settle: after `checkpoint()` the durable image is block-free and still holds the
 /// declaration. It does **not** demonstrate that the loss is reachable without the settle, and the
 /// difference was measured rather than assumed. Three independent properties currently keep the
-/// deciding `COMMIT` record alive on their own: `unfrozen_commit_lsn` floors the reclaim at that
-/// record and is cleared only by a GC prune (which a DDL-only transaction never gets, since it has no
-/// versions to freeze); every later write commit rewrites the catalogue, so the block stops being
+/// deciding `COMMIT` record alive on their own: until `rmp` #1071 a per-writer WAL floor
+/// (`unfrozen_commit_lsn`) held the reclaim at that record; every later write commit rewrites the catalogue, so the block stops being
 /// durable; and a GC pass itself commits, which rewrites it too. So the settle is defence in depth —
 /// but each of those three is an accident of other machinery rather than a stated invariant, and
 /// `rmp` #1083's whole subject is durable state whose fate rides on a decision made elsewhere.

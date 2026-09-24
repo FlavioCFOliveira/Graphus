@@ -16,9 +16,10 @@
 //!
 //!   The implementor of that door is now `graphus_storage::RecordStore` (and its off-thread twin
 //!   `StoreReadView`), which resolves a header stamp against the **durable** commit slot the word
-//!   names. This crate's [`CommitRegistry`] is no longer a `CommitOracle`: it still records commit
-//!   outcomes by `TxnId`, and [`RegistryOracle`] is the explicitly-named way to resolve the
-//!   populations that still carry one — see its docs for the two legitimate uses.
+//!   names. This crate's [`CommitRegistry`] is no longer a `CommitOracle`: it records commit outcomes
+//!   by `TxnId` for this crate's own reference manager ([`TxnManager`] over `MemVersionedStore`),
+//!   and [`RegistryOracle`] is the explicitly-named way to resolve that population. The record store
+//!   keeps no such table at all since `rmp` #1071.
 //! - **Statement-level isolation** (`§5.1.4`, `rmp` #972): a [`Snapshot`] names not only the
 //!   transaction and its begin timestamp but the **statement** within it ([`graphus_core::CommandId`])
 //!   and which side of that statement the read is taken on ([`View`]). `View::New` is

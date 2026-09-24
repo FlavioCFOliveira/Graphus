@@ -523,7 +523,7 @@ mod off_thread {
 // For a record header that is safe, because the GC freeze sweep rewrites the header to
 // `Committed(ts)` BEFORE the pass forgets the writer from the registry. That retained history was not
 // a record header: the freeze sweep never walked it, so its stamp stayed in-flight forever while
-// `pending_gc_prune` forgot the writer — after which `CommitRegistry::outcome` maps the unknown id to
+// the GC prune (since removed by `rmp` #1071) forgot the writer — after which `CommitRegistry::outcome` maps the unknown id to
 // `Aborted`, the version reads as never-committed, and every reader falls back to `base`.
 //
 // Both defects below are therefore GC-cadence-dependent and, being purely in-memory, HEAL ON RESTART

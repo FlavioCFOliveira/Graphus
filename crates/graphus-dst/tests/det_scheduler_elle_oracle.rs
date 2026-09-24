@@ -237,7 +237,7 @@ fn the_vopr_safety_oracle_still_runs_under_an_installed_scheduler() {
         "no record-read yield point was reached: the seam was not armed over the VOPR run"
     );
     assert!(
-        history.count_site(YieldSite::CommitRegistryRecord) > 0,
+        history.count_site(YieldSite::CommitPublishVisible) > 0,
         "no commit-publication yield point was reached"
     );
 }

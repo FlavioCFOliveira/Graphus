@@ -29,11 +29,11 @@
 //!
 //! # Why the WAL reclaim needs a freeze pass to move at all
 //!
-//! The reclaim floor is clamped by `unfrozen_commit_lsn` — the oldest committed transaction whose
-//! record versions a GC pass has not yet frozen — because an unfrozen in-flight stamp is resolved
-//! through its commit record. So a store that checkpoints but never runs GC retains its whole log by
-//! design, and the applied set legitimately grows with it. `RecordStore::gc_freeze_only` (`rmp` #590)
-//! exists precisely to drain that map, and the maintenance cycle below is the shape a server runs.
+//! Until `rmp` #1071 the reclaim floor was also clamped by a per-writer WAL floor
+//! (`unfrozen_commit_lsn`) that only a GC settle drained, so a store that checkpointed but never ran
+//! GC retained its whole log. #1071 removed that floor; the maintenance cycle below — a settle-only
+//! pass (`RecordStore::gc_freeze_only`, `rmp` #590) then a checkpoint — is still the shape a server
+//! runs, and the bound it measures holds either way.
 //!
 //! ```text
 //! cargo test -p graphus-storage --test applied_counts_stabilises_1067 -- --nocapture
@@ -103,8 +103,7 @@ fn run() -> (Vec<Sample>, u64, u64) {
             committed += 1;
         }
         if r % MAINTENANCE == 0 {
-            // The server's maintenance cycle: freeze (which lowers the WAL reclaim floor by draining
-            // `unfrozen_commit_lsn`), then checkpoint (which folds the deltas below the floor into the
+            // The server's maintenance cycle: settle, then checkpoint (which folds the deltas below the floor into the
             // durable base, persists the pair, reclaims the prefix and prunes the set).
             let watermark = store.snapshot_ts();
             let gc_txn = TxnId(1_000_000 + r);
@@ -112,10 +111,8 @@ fn run() -> (Vec<Sample>, u64, u64) {
             store
                 .gc_freeze_only(gc_txn, watermark)
                 .expect("freeze pass");
-            // The pass only SCHEDULES the registry prune; committing it is what applies it and drops
-            // the frozen writers out of `unfrozen_commit_lsn`, which is what lets the reclaim floor
-            // move at all. Without this commit the log is retained by design and nothing here is
-            // measuring the bound.
+            // The pass is a transaction like any other; an open one would floor reclamation at its
+            // first record.
             store.commit(gc_txn).expect("commit the freeze pass");
             store.checkpoint().expect("checkpoint");
             let applied = store.applied_counts();

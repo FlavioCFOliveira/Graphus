@@ -11976,10 +11976,9 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// The order is load-bearing:
     ///
     /// 1. **[`gc`](Self::gc)** reclaims dead versions *and* runs the freeze sweep that settles each
-    ///    committed in-flight MVCC stamp to its durable `Committed(ts)` form. Freezing is what lets
-    ///    [`RecordStore`] drop a writer from its `unfrozen_commit_lsn` map — i.e. it **lowers the WAL
-    ///    reclaim floor**. Without this pass first, the floor stays pinned at the oldest unfrozen
-    ///    commit record and a checkpoint can free almost nothing.
+    ///    committed MVCC stamp to its durable `Committed(ts)` form. (Until `rmp` #1071 settling also
+    ///    drained a per-writer WAL floor, without which a checkpoint could free almost nothing; that
+    ///    floor is gone, and the checkpoint below reclaims on its own.)
     /// 2. **[`RecordStore::checkpoint`]** then flushes every dirty page home (enforcing WAL-before-data
     ///    per page), writes the clean checkpoint marker, and physically reclaims the WAL prefix below
     ///    the now-lowered floor.

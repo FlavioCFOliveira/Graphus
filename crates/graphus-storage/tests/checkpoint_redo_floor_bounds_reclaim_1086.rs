@@ -14,8 +14,9 @@
 //!
 //! Measured, not assumed. `graphus-dst`'s `det_scheduler_checkpoint_redo_floor_1086` is the suite
 //! that reproduces the data loss, and with **only** the reclaim half of the fix reverted it comes
-//! back GREEN over all its seeds — because in that workload every commit is still unfrozen, so
-//! `unfrozen_commit_lsn` already clamps the reclaim floor below anything redo needs and the coupling
+//! back GREEN over all its seeds — because in that workload every commit was still unfrozen, so the
+//! per-writer WAL floor (`unfrozen_commit_lsn`, removed by `rmp` #1071) already clamped the reclaim
+//! floor below anything redo needs and the coupling
 //! is never what decides. A control that cannot fail is not a control, so the reclaim half gets one
 //! here, in the shape where it IS what decides: a store with no unfrozen commit to clamp it.
 
@@ -84,7 +85,7 @@ fn the_reclaimed_prefix_stays_below_redo_start_with_nothing_to_clamp_it() {
     let store = RecordStore::create(device, wal, POOL_PAGES, 1).expect("create store");
     store.set_checkpoint_interval_bytes(0);
 
-    // No write commit, so `unfrozen_commit_lsn` is empty and no active transaction floors anything:
+    // No write commit and no active transaction, so nothing but the checkpoint floors reclamation:
     // the reclaim floor is decided by the checkpoint alone, which is the case under test.
     store.checkpoint().expect("checkpoint");
 

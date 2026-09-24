@@ -251,10 +251,24 @@ fn no_dirty_page_survives_a_checkpoint_with_a_doublewrite_buffer() {
 /// case that exercises the *skipped* branch. It must still leave the store clean — and it does, for a
 /// reason worth stating: if the fold wrote nothing, nothing dirtied a page after the checkpoint's own
 /// flush, so there is nothing left to harden.
+///
+/// # How the second checkpoint is kept from folding
+///
+/// A fold is owed whenever a checkpoint's reclaim floor moves past the catalogue's durable coverage.
+/// Until `rmp` #1071 an unsettled committed writer held that floor at its own `COMMIT` record, so a
+/// back-to-back second checkpoint could not move it and had nothing to fold. #1071 removed that
+/// floor, so every checkpoint that can reclaim now re-publishes the coverage. The floor is therefore
+/// held the way production holds it: by a transaction that is still OPEN and has logged a record
+/// before the first checkpoint, whose first record the WAL will not reclaim past.
 #[test]
 fn a_checkpoint_with_nothing_to_fold_also_leaves_the_store_clean() {
     let (store, device) = fresh_store();
     commit_some_nodes(&store, 1);
+    let holder = TxnId(2);
+    store.begin(holder);
+    store
+        .create_node(holder)
+        .expect("the open writer logs a record");
 
     store.checkpoint().expect("first checkpoint");
     let written_before = store.meta_chunk_writes().0;
@@ -267,4 +281,5 @@ fn a_checkpoint_with_nothing_to_fold_also_leaves_the_store_clean() {
     );
 
     assert_every_mapped_page_is_home(&store, &device, "back-to-back checkpoint");
+    store.rollback(holder).expect("the floor holder withdraws");
 }

@@ -8,8 +8,8 @@
 //! retention floor so a crash could rebuild the table.
 //!
 //! The header now names the slot. This file pins what that buys, in the one experiment that could
-//! not be written before it: **destroy the in-memory table's entry for a committed writer and read
-//! the row anyway.**
+//! not be written before it: **read a committed row whose writer no in-memory table knows.** Since
+//! `rmp` #1071 that is simply the store's only state — it keeps no in-memory commit table at all.
 //!
 //! Two more properties are pinned beside it, because each is a way the change could have been made
 //! wrongly and still looked right:
@@ -22,7 +22,7 @@
 use graphus_core::{HeaderStamp, TxnId, Value};
 use graphus_io::MemBlockDevice;
 use graphus_storage::{Namespace, RecordStore, StoreKind};
-use graphus_txn::{CommitOracle, Snapshot, StampOutcome, TxnOutcome, is_visible_via};
+use graphus_txn::{CommitOracle, Snapshot, StampOutcome, is_visible_via};
 use graphus_wal::{MemLogSink, WalManager};
 
 type Store = RecordStore<MemBlockDevice, MemLogSink>;
@@ -41,15 +41,17 @@ fn spectator(s: &Store) -> Snapshot {
 /// **The test that was impossible to write before `rmp` #1069 phase 3 (acceptance criterion 1).**
 ///
 /// A transaction commits a node with a property. No GC runs, so no stamp is settled: the records
-/// still carry an *unsettled* header stamp. Its writer is then **erased from the in-memory
-/// Active/Recent Transaction Table** — the state the pre-phase-3 engine went to considerable expense
-/// to make unreachable, because reaching it meant losing the data.
+/// still carry an *unsettled* header stamp. No in-memory table knows the writer — until `rmp` #1071
+/// the test erased the writer from the store's Active/Recent Transaction Table to reach this state;
+/// since #1071 the store has no such table, so this is the state every commit leaves. The pre-phase-3
+/// engine went to considerable expense to make it unreachable, because reaching it meant losing the
+/// data.
 ///
 /// # Why it failed before, and what it proves now
 ///
 /// Before phase 3 the stamp held the writer's `TxnId`, and
 /// [`CommitRegistry::outcome`](graphus_txn::CommitRegistry) maps an id it does not know to
-/// [`TxnOutcome::Aborted`]. Erase the entry and the committed version resolves as aborted, i.e.
+/// [`TxnOutcome::Aborted`](graphus_txn::TxnOutcome::Aborted). Erase the entry and the committed version resolves as aborted, i.e.
 /// **invisible**: the row disappears, silently, with no error and no corruption anywhere on disk.
 /// That is exactly the shape of `rmp` #522, and it is why the freeze sweep had to settle every stamp
 /// *before* the table could be pruned, why the frontier had to be exact, and why the WAL floor had
@@ -57,17 +59,8 @@ fn spectator(s: &Store) -> Snapshot {
 ///
 /// Since phase 3 the stamp names a slot in `commit.store`, which is durable and which no in-memory
 /// pruning can touch. The row stays. That is the whole phase, expressed as one assertion.
-///
-/// # And why the AC 2 equivalence audit stays silent through it
-///
-/// That audit asserts the pre-phase-3 registry reaches the same *verdict* as the slot. Here it
-/// deliberately cannot: the writer has been erased, so the registry has no answer to preserve — only
-/// its documented `Aborted` default, which is not a verdict about this store. The audit is scoped to
-/// writers it **recorded** or that are still **active**, so it skips this word rather than firing.
-/// That scope is not a concession to this test: the deterministic backup/restore scenarios reach the
-/// same state through the front door, because a restore carries the data image and not the log.
 #[test]
-fn a_committed_version_survives_the_registry_forgetting_its_writer() {
+fn a_committed_version_resolves_with_no_in_memory_commit_table() {
     let s = fresh();
     let key = s.intern_token(Namespace::PropKey, "v").expect("intern");
     let writer = TxnId(1);
@@ -94,14 +87,6 @@ fn a_committed_version_survives_the_registry_forgetting_its_writer() {
             StampOutcome::Committed(_)
         ),
         "the durable slot says the writer committed",
-    );
-
-    // Destroy the ONLY thing that could have translated a pre-#1069 stamp.
-    s.forget_committed_writer_for_test(writer);
-    assert_eq!(
-        s.commit_registry().outcome(writer),
-        TxnOutcome::Aborted,
-        "an id the table does not know reads as aborted — the mechanism that used to lose the row",
     );
 
     // The row is still there, and still says 42.

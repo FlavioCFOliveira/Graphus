@@ -7,7 +7,9 @@
 //! Resolving a version's visibility (`04 §5.3`) requires knowing, for any [`VersionStamp`], whether
 //! the writer is committed (and at which timestamp) or aborted/in-flight. The frozen header stores
 //! only the writer's `TxnId` while it is in flight; the mapping `TxnId → outcome` lives in the
-//! [`CommitRegistry`], which is the manager's Active/Recent Transaction Table.
+//! [`CommitRegistry`], which is the reference [`TxnManager`](crate::TxnManager)'s Active/Recent
+//! Transaction Table. (`graphus_storage::RecordStore` names a durable `commit.store` slot in its
+//! headers instead, and keeps no such table since `rmp` #1071.)
 
 // FxHashMap: keyed by internal TxnId (never attacker-controlled) and never iterated in an
 // order-observable way, so the faster non-cryptographic hash is safe on this visibility hot path.
@@ -214,12 +216,6 @@ impl CommitRegistry {
         self.outcomes.insert(txn, TxnOutcome::Aborted);
     }
 
-    /// Forgets `txn` once GC proves it is no longer observable. After this, the writer must not be
-    /// referenced by any live version header.
-    pub fn forget(&mut self, txn: TxnId) {
-        self.outcomes.remove(&txn);
-    }
-
     /// The number of entries currently in the table (observability: GC-time pruning, `04 §5.5`,
     /// bounds this; see [`prune_settled`](Self::prune_settled)).
     #[must_use]
@@ -231,23 +227,6 @@ impl CommitRegistry {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.outcomes.is_empty()
-    }
-
-    /// The writers currently recorded as [`TxnOutcome::Committed`], in no particular order.
-    ///
-    /// GC captures this set **after** its header-freeze sweep (`04 §5.5`, `rmp` task #59): the sweep
-    /// rewrote every on-disk in-flight stamp of these writers to its committed timestamp, so once
-    /// the freeze is durable (the GC transaction commits) every one of them may be
-    /// [`forget`](Self::forget)-ten without any version becoming unresolvable.
-    #[must_use]
-    pub fn committed_writers(&self) -> Vec<TxnId> {
-        self.outcomes
-            .iter()
-            .filter_map(|(txn, outcome)| match outcome {
-                TxnOutcome::Committed(_) => Some(*txn),
-                TxnOutcome::InFlight | TxnOutcome::Aborted => None,
-            })
-            .collect()
     }
 
     /// Prunes entries that GC has proven settled, returning how many were removed (`04 §5.5`,
@@ -268,21 +247,6 @@ impl CommitRegistry {
             TxnOutcome::Committed(ts) => low_water.is_some_and(|mark| *ts > mark),
         });
         before - self.outcomes.len()
-    }
-
-    /// Whether the table has a **recorded** outcome for `txn`, as opposed to falling back to the
-    /// [`TxnOutcome::Aborted`] default [`outcome`](Self::outcome) returns for an unknown id.
-    ///
-    /// This is a **diagnostic** distinction, never a visibility one: for deciding what a reader sees,
-    /// "aborted" and "never heard of" mean the same thing and [`outcome`](Self::outcome) rightly
-    /// collapses them. It exists so a cross-check can tell "the table disagrees" from "the table has
-    /// nothing to say" — the `rmp` #1069 AC 2 equivalence audit is the one caller, and the difference
-    /// is load-bearing for it: a store opened over an image whose log does not carry the commits (a
-    /// restore from backup, most of all) has an EMPTY table beside a fully-populated `commit.store`,
-    /// and comparing a real answer against a default is not a comparison.
-    #[must_use]
-    pub fn knows(&self, txn: TxnId) -> bool {
-        self.outcomes.contains_key(&txn)
     }
 
     /// The recorded outcome of `txn`. An unknown id is treated as [`TxnOutcome::Aborted`]: it was
@@ -440,10 +404,6 @@ mod tests {
         reg.record_commit(TxnId(3), Timestamp(30)); // committed > low_water: kept
         reg.record_abort(TxnId(4)); // aborted: pruned (unknown resolves as aborted anyway)
         assert_eq!(reg.len(), 4);
-
-        let mut committed = reg.committed_writers();
-        committed.sort_unstable();
-        assert_eq!(committed, vec![TxnId(2), TxnId(3)]);
 
         assert_eq!(reg.prune_settled(Some(Timestamp(20))), 2);
         assert_eq!(reg.outcome(TxnId(1)), TxnOutcome::InFlight);

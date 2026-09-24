@@ -9,9 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`RecordStore::active_transaction_count` and `RecordStore::unfrozen_commit_count` (rmp #1070)**,
-  observability accessors for the size of the store's in-memory transaction tables, used by the
-  plateau tests that check those tables stay bounded under sustained concurrent writes.
+- **`RecordStore::active_transaction_count` (rmp #1070)**, an observability accessor for the size of
+  the store's active-transaction table, used by the plateau test that checks the table stays bounded
+  under sustained concurrent writes.
 
 ### Changed
 
@@ -23,6 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on one store must be serialized — an overlap makes the census retire nothing. A rollback of an
   in-place property write re-stamps the cell with its value's committed installer, so no live cell
   names an aborted transaction's slot. No on-disk format change: the format version stays 6.
+- **A commit publishes itself with one durable write, and the WAL no longer waits for the GC (rmp
+  #1071).** A commit publishes its `commit.store` slot and then advances the commit-visibility horizon.
+  The WAL reclamation floor is the lower of the conservative redo floor and the oldest active
+  transaction's first record, lowered further only by the counter fold and the pending-DDL block; it no
+  longer holds a committed writer's record until a GC pass settles its stamps, so a settle-only GC pass
+  (`RecordStore::gc_freeze_only`) no longer bounds the log. At open, the transaction-id high-water is
+  the larger of the retained log's highest id and the highest id any `commit.store` slot records. The
+  deterministic-scheduler yield point `YieldSite::CommitRegistryRecord` is renamed
+  `YieldSite::CommitPublishVisible`; its code, 41, is unchanged.
 
 ### Removed
 
@@ -31,6 +40,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `GcPassReport.freeze_violations` and `GcPassReport.first_freeze_violation` fields, the
   `FreezeFrontierViolation` type, and `RecordStore::freeze_committed_headers` are gone. `freeze_low`
   was never persisted, so no stored image needs a migration.
+- **The store's in-memory commit registry (rmp #1071).** `RecordStore::commit_registry`,
+  `RecordStore::commit_registry_snapshot` and `RecordStore::forget_committed_writer_for_test`, the
+  `GcPassReport.prune_scheduled` field, and the `CommitRegistry::forget`,
+  `CommitRegistry::committed_writers` and `CommitRegistry::knows` methods are gone, together with the
+  GC prune of the registry and the WAL floor per unsettled committed writer.
+  `graphus_txn::CommitRegistry` remains as the outcome table of the reference transaction manager in
+  `graphus-txn`.
 
 ## [0.0.10] - 2026-07-21
 

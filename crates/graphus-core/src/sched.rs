@@ -163,10 +163,13 @@ pub enum YieldSite {
     // ---- Commit publication (40..=49) -------------------------------------------------------
     /// `RecordStore::commit` — just before the **durable** commit slot is published.
     CommitPublishSlot = 40,
-    /// `RecordStore::commit` — just before the **in-memory** registry records the commit. This is the
-    /// instant a commit becomes visible; the interesting window is *between* this and
-    /// [`CommitPublishSlot`](Self::CommitPublishSlot).
-    CommitRegistryRecord = 41,
+    /// `RecordStore::commit` — just before the commit-visibility horizon advances over the commit's
+    /// timestamp. This is the instant a commit becomes visible to new snapshots; the interesting
+    /// window is *between* this and [`CommitPublishSlot`](Self::CommitPublishSlot), where the durable
+    /// slot already says committed. (Named `CommitRegistryRecord` until `rmp` #1071 removed the
+    /// in-memory table that used to be written at this instant; the code, 41, is unchanged, so
+    /// recorded schedules replay identically.)
+    CommitPublishVisible = 41,
     /// `RecordStore::commit` — just before the transaction's active-set entry is settled.
     CommitSettle = 42,
     /// `RecordStore::committed_statistics` — just before a checkpoint samples the catalog image it is
@@ -1085,7 +1088,7 @@ mod tests {
             YieldSite::ThreadExit,
             YieldSite::ThreadJoin,
             YieldSite::CommitPublishSlot,
-            YieldSite::CommitRegistryRecord,
+            YieldSite::CommitPublishVisible,
             YieldSite::CommitSettle,
             YieldSite::CatalogCommittedImage,
             YieldSite::CheckpointRecordAppend,

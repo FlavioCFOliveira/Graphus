@@ -2,8 +2,9 @@
 //! crash / SIGKILL / power-loss / `STOP DATABASE` **before** `?end=true` must NOT leave the whole
 //! retained WAL un-reclaimed for the next `START DATABASE` to materialise into its ARIES recovery heap
 //! (the confirmed reopen-OOM). The fix runs a **freeze-only** maintenance pass on a tight adaptive
-//! cadence *during* the load: the incremental freeze sweep (`rmp` #522) drains `unfrozen_commit_lsn` and
-//! so lowers the WAL reclaim floor — bounding the retained WAL to ≈ the cadence at ANY mid-abort point —
+//! cadence *during* the load: until `rmp` #1071 the settle drained a per-writer WAL floor
+//! (`unfrozen_commit_lsn`, since removed — a checkpoint alone now reclaims) and so lowered the WAL
+//! reclaim floor — bounding the retained WAL to ≈ the cadence at ANY mid-abort point —
 //! WITHOUT paying the `O(store)` property sweep the Mode A checkpoint sentinel would otherwise gate ON
 //! every batch (`sweep_property_chains`), which on a tight cadence would reintroduce the `O(N²)`
 //! maintenance cost `rmp` #556/#565 had widened the loading cadence to avoid.
@@ -126,7 +127,8 @@ fn ingest_batch(
 
 /// One **freeze-only** maintenance pass + sharp store checkpoint — the storage half of the engine's
 /// mid-load maintenance (`TxnCoordinator::checkpoint_reader_safe_freeze_only`): the incremental freeze
-/// sweep drains `unfrozen_commit_lsn`, then `checkpoint()` flushes dirty pages home and physically
+/// sweep settles headers (until `rmp` #1071 it also drained the per-writer WAL floor), then
+/// `checkpoint()` flushes dirty pages home and physically
 /// reclaims the WAL prefix below the now-lowered floor.
 fn freeze_only_maintenance(store: &mut Store, txn: TxnId) {
     let watermark = store.snapshot_ts();

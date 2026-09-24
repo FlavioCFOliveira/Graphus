@@ -709,7 +709,7 @@ mod tests {
                     move || {
                         for _ in 0..20 {
                             graphus_core::sched::yield_at(
-                                YieldSite::CommitRegistryRecord,
+                                YieldSite::CommitPublishVisible,
                                 ResourceId::txn(u64::from(t)),
                             );
                             shared.fetch_add(1, Ordering::Relaxed);

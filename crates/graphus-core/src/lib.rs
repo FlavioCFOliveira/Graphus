@@ -225,7 +225,7 @@ pub mod version {
     ///
     /// | Type | High bit set means | Resolved by |
     /// | --- | --- | --- |
-    /// | [`VersionStamp`] | the payload is a [`TxnId`] | the in-memory Active/Recent Transaction Table |
+    /// | [`VersionStamp`] | the payload is a [`TxnId`] | the owner check of the slot or reference store that holds it |
     /// | [`HeaderStamp`] | the payload is a **`commit.store` slot id** | a durable read of that slot |
     ///
     /// Before `rmp` #1069 phase 3 a record header carried the first form, which is why resolving it

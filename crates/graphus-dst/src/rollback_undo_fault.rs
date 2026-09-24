@@ -477,24 +477,30 @@ pub fn run_bystander_survives_failed_rollback() -> (bool, bool) {
     )
 }
 
-/// Whether `store`'s commit registry reports `txn` as committed — the predicate an in-flight version
-/// stamp is resolved through. A transaction whose commit FAILED must never report as committed.
-fn registry_says_committed<D: graphus_io::BlockDevice, S: LogSink>(
+/// Whether `store` resolves the creator of `node` as committed — through the one commit oracle the
+/// store has, the durable `commit.store` slot `node`'s unsettled `created_ts` names (`rmp` #1069; the
+/// in-memory commit registry this scenario used to read was removed by `rmp` #1071). A transaction
+/// whose commit FAILED must never resolve as committed.
+fn store_says_committed<D: graphus_io::BlockDevice, S: LogSink>(
     store: &RecordStore<D, S>,
-    txn: TxnId,
+    node: u64,
 ) -> bool {
-    matches!(
-        store.commit_registry().outcome(txn),
-        graphus_txn::TxnOutcome::Committed(_)
-    )
+    let word = store
+        .node(node)
+        .expect("read the node header")
+        .mvcc
+        .created_ts;
+    graphus_txn::CommitOracle::resolve_commit_ts(store, word)
+        .expect("resolve the creator's stamp")
+        .is_some()
 }
 
-/// **Scenario 4 — a failed commit must not publish a commit-registry entry.**
+/// **Scenario 4 — a failed commit must not resolve as committed.**
 ///
-/// The registry is what resolves an `InFlight(txn)` stamp, and every record a transaction wrote still
-/// carries one until GC freezes it. Publishing the entry before `checkpoint_meta` therefore made a
-/// failed commit's whole uncommitted write set resolve as `Committed(commit_ts)`. Returns
-/// `(fault_surfaced, registry_says_committed_after_the_failed_commit)`.
+/// Every record a transaction wrote carries a stamp that resolves through its commit slot until GC
+/// settles it. Publishing the commit before `checkpoint_meta` therefore made a failed commit's whole
+/// uncommitted write set resolve as `Committed(commit_ts)`. Returns
+/// `(fault_surfaced, says_committed_after_the_failed_commit)`.
 ///
 /// # Panics
 /// Panics if the store fixture cannot be built or the seed transaction cannot commit.
@@ -507,15 +513,15 @@ pub fn run_failed_commit_publishes_no_registry_entry() -> (bool, bool) {
     // `true` for a transaction that committed. Without this, "the writer is not reported as committed"
     // could hold simply because the predicate never reports anything.
     assert!(
-        registry_says_committed(&store, TxnId(1)),
-        "the seed transaction committed, so the registry predicate must report it as committed — \
-         otherwise the assertion below is vacuous"
+        store_says_committed(&store, node),
+        "the seed transaction committed, so the predicate must report it as committed — otherwise \
+         the assertion below is vacuous"
     );
 
     let writer = TxnId(2);
     store.begin(writer);
     relabel(&store, writer, node);
-    let (_created, _) = store.create_node(writer).expect("writer node");
+    let (created, _) = store.create_node(writer).expect("writer node");
     for i in 0..CHAIN_GROWTH_TOKENS {
         store
             .intern_token(Namespace::PropKey, &format!("prop_key_number_{i:08}"))
@@ -528,7 +534,7 @@ pub fn run_failed_commit_publishes_no_registry_entry() -> (bool, bool) {
         .as_ref()
         .err()
         .is_some_and(|e| e.to_string().contains("injected I/O error"));
-    let says_committed = registry_says_committed(&store, writer);
+    let says_committed = store_says_committed(&store, created);
     (fault_surfaced, says_committed)
 }
 
@@ -893,8 +899,8 @@ mod tests {
         );
     }
 
-    /// A commit that failed must not have published a commit-registry entry, because that entry is
-    /// what resolves the in-flight stamps its uncommitted records still carry.
+    /// A commit that failed must not resolve as committed, because its commit slot is what resolves
+    /// the stamps its uncommitted records still carry.
     ///
     /// Fails against the pre-#955 code, which recorded the commit before `checkpoint_meta`.
     #[test]
@@ -906,9 +912,9 @@ mod tests {
         );
         assert!(
             !says_committed,
-            "a commit that FAILED must not report as committed: every record it wrote still bears its \
-             in-flight stamp, and the registry is what resolves that stamp — so a premature entry makes \
-             the whole uncommitted write set readable as committed data (rmp #955)"
+            "a commit that FAILED must not report as committed: every record it wrote still bears a \
+             stamp its commit slot resolves — so a premature publication makes the whole uncommitted \
+             write set readable as committed data (rmp #955)"
         );
     }
 

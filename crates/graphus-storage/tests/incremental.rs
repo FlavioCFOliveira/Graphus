@@ -1168,15 +1168,10 @@ fn a_restored_chain_still_reads_the_versions_its_increment_carried() {
     let wal = WalManager::create(MemLogSink::new()).expect("fresh wal");
     let reopened = RecordStore::open(restored, wal, 64).expect("open the restored store");
 
-    // PREMISE 2: the in-memory table really is empty. It is the mechanism of the defect — with
-    // entries in it the old build would have resolved these stamps too, and the test would be
-    // measuring nothing.
-    assert!(
-        reopened.commit_registry().is_empty(),
-        "NON-VACUITY: a restored store opens over an empty WAL, so its Active/Recent Transaction \
-         Table must be empty — that emptiness is exactly why the durable commit slot has to be the \
-         oracle",
-    );
+    // PREMISE 2 used to be that the reopened store's in-memory commit table was empty — the mechanism
+    // of the defect, since with entries in it the old build would have resolved these stamps too.
+    // Since `rmp` #1071 the store keeps no such table at all, so the premise holds by construction:
+    // nothing but the durable commit slot can resolve these stamps.
 
     // ---- The assertion, by value. ----
     let snapshot = Snapshot::new(TxnId(u64::MAX - 1), reopened.snapshot_ts());

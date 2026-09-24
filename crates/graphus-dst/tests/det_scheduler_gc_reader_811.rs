@@ -353,7 +353,7 @@ fn the_installed_yield_points_are_actually_reached() {
         YieldSite::FrameLatchRelease,
         YieldSite::FrameWriteWithPageMutLsn,
         YieldSite::CommitPublishSlot,
-        YieldSite::CommitRegistryRecord,
+        YieldSite::CommitPublishVisible,
         YieldSite::CommitSettle,
         YieldSite::GcPhaseA,
         YieldSite::GcPhaseD,

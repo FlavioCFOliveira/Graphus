@@ -105,8 +105,7 @@ const INDEX_BUILD_TICK: std::time::Duration = std::time::Duration::from_millis(2
 /// tail), disk (sealed WAL segments) and version slots are reclaimed without an operator trigger.
 ///
 /// Distinct from [`graphus_storage::DEFAULT_CHECKPOINT_INTERVAL_BYTES`] (the store's own redo-bounding
-/// checkpoint, which cannot lower the floor on its own because only the GC freeze sweep settles the
-/// `unfrozen_commit_lsn` map). It is checked only after a mutating command, so a fully idle engine (no
+/// checkpoint). It is checked only after a mutating command, so a fully idle engine (no
 /// WAL growth, nothing to reclaim) never wakes to run it.
 ///
 /// Since `rmp` #556 this 256 MiB value is the **upper cap** of the adaptive ordinary cadence
@@ -2966,7 +2965,8 @@ fn maybe_run_maintenance<D: BlockDevice, S: LogSink>(
     // no-reader fast path are unchanged).
     //
     // `rmp` #590: while a Mode A bulk-import session is `Loading`, run a **freeze-only** pass. It advances
-    // the WAL reclaim floor (the incremental freeze sweep drains `unfrozen_commit_lsn`) so a crash/`STOP`
+    // the WAL reclaim floor (until `rmp` #1071 the settle drained a per-writer floor; now the checkpoint
+    // alone reclaims, and this pass is kept for #1078 to retire) so a crash/`STOP`
     // *before* `?end=true` cannot leave a multi-GB un-reclaimed WAL for the next `START DATABASE` to
     // materialise into its recovery heap — WITHOUT paying the O(store) property sweep the Mode A checkpoint
     // sentinel would otherwise gate ON every batch (which, on this now-tight cadence, would reintroduce the
