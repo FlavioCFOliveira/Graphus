@@ -1188,6 +1188,10 @@ scope and are propagated into `00-overview.md` and `01-needs-survey.md`:
 > in-memory commit registry is still written at commit and still gates the published snapshot horizon
 > of `D-published-snapshot-horizon` — what it stopped being is the resolver of a record header.
 >
+> **Note (2026-09-24).** The paragraph above is the state after #1069, and it stays as written. Task
+> **#1070** has since removed the freeze sweep and the `freeze_low` frontier; the WAL reclamation floor
+> remains. See the note of 2026-09-24 below.
+>
 > **A ratified text to read through this note.** Passages ratified before today name the
 > cross-transaction predicate `graphus_txn::is_visible` (the 2026-08-05 statement-isolation round and
 > the 2026-08-12 horizon round both do). That free function was **removed**, not deprecated, and
@@ -1225,6 +1229,43 @@ scope and are propagated into `00-overview.md` and `01-needs-survey.md`:
 >
 > Design in `04-technical-design.md` §5.1.5 (the ratified record-slot case) and §5.6;
 > `05-storage-format.md` §12.4 (the commit-slot case).
+
+## Post-ratification note (2026-09-24) — `D-version-representation`: the freeze sweep retired
+
+> **This note records how task #1070 removed the machinery that #1069 had demoted. It creates no new
+> decision and changes no ratified outcome of the 2026-08-02 round.** The version representation, the
+> unified chain and the commit indirection point are unchanged.
+>
+> **What was removed.** The per-record freeze sweep, the `freeze_low` frontier that bounded it, the
+> write-path maintenance of that frontier (an atomic descent on every in-place restamp of a record
+> below it), the release-active audit that watched the frontier (rmp #809) with its metric
+> `graphus_freeze_frontier_violations_total`, and the `graphus-freezefloor` crate that held the
+> frontier's algebra and its `loom` models. `freeze_low` was never persisted, so no byte of any durable
+> structure moved and the on-disk format stays at version 6.
+>
+> **What replaced the one job the sweep still had.** Since #1069 a commit slot is freed only when a
+> census proves that nothing names it, and settling a header word is what removes that word's name.
+> Every GC pass now walks the whole id range of the three MVCC record stores once; the walk records
+> the slot each header word names and then settles the word, by compare-and-set, if its writer has
+> committed. The range is the whole store because completeness is the only admissible bound for a
+> census that frees: a write-path frontier is the retired mechanism, and a pairing of each header stamp
+> with a delta of the same slot would be a design of its own.
+>
+> **A defect found during the removal, and what closed it.** The census reads the store in walks that
+> are not atomic against writers, and a writer that began after one sample and committed before another
+> was seen by none of them: its slot was retired while a header still named it, and its committed rows
+> read as absent. The defect originated with #1069; the first cut of #1070, which moved the header census
+> ahead of the undo-chain reclamation phase, made it far more frequent. The census now excludes,
+> before it is consulted, every slot whose owner may not have resolved when the header walk began — the
+> four facts of the **census window** — and it requires GC passes to be serialized, failing closed when
+> they are not. A rollback of an in-place property write now re-stamps the cell with its value's true
+> installer, so no live cell names an aborted transaction's slot.
+>
+> **What this note does not claim.** The in-memory commit registry and the WAL reclamation floor tied to
+> it are unchanged by #1070.
+>
+> Design in `04-technical-design.md` §5.1.3, §5.3 and §5.6; on-disk form in `05-storage-format.md` §7,
+> §12.4 and §12.6; the deterministic regression in `07-dst-simulator.md` §5.2.7.
 
 ## TCK target (pinned — closes `D-cypher-line` open question 1)
 

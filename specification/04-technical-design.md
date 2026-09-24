@@ -83,7 +83,6 @@ A single Cargo workspace, Edition 2024, 64-bit-only targets (`D-target-matrix`).
 | `graphus-wal` | lib | WAL record format, log writer with group commit, LSN allocation, checkpointer, ARIES analysis/redo/undo, recovery driver. |
 | `graphus-bufpool` | lib | Frame table, page latches, pin counts, eviction (CLOCK/2Q), prefetch, write-back coordination with WAL (WAL rule). |
 | `graphus-chainhead` | lib | The **prepend publication protocol** every chain head in the storage core shares — `first_rel`, `first_prop` and the MVCC `undo_ptr` (§5.7.1): the four ordered steps, the retry a refused publication demands, and the `ChainHead` trait that states the two obligations the underlying medium must honour. A true **leaf**: it depends on no other crate, and that is a requirement rather than an accident. `--cfg loom` is a global rustflag, so a protocol that must be model-checked cannot live in a crate that reaches `graphus-bufpool`, whose own loom seam would then stop matching. `#![forbid(unsafe_code)]`. |
-| `graphus-freezefloor` | lib | The **freeze frontier** of the fixed-record stores (§5.6): the lower bound below which the incremental GC's freeze sweep has already visited every record, and the three — and only three — operations its algebra admits. It **descends** by `fetch_min` (a writer announcing a stamp below it), it **rises** only by a compare-exchange against the value the sweep started from (so a descent that lands mid-sweep refuses the raise instead of being swallowed), and it is stored into only to initialise it. A plain store in either of the first two roles strands a committed writer's stamp below the frontier, where no later sweep visits it — the silent-data-loss shape of tasks `#522` and `#778`. **That shape is closed since task `#1069`**: a stranded stamp still names its commit slot and still resolves (§5.3), so a mis-advanced frontier now costs a stamp that is never settled and a slot that is never reclaimed, not a committed version that reads as absent. The frontier is a performance frontier from here on, and task `#1070` retires it. A true **leaf** for the same reason as `graphus-chainhead`, and the type is the one `RecordStore` holds, so the `loom` models check the production cell rather than a copy of it. `#![forbid(unsafe_code)]`. |
 | `graphus-storage` | lib | Page formats; node/relationship/property/label record codecs; index-free adjacency chains; token/dictionary store; free-space management; element-ID→physical-ID map. |
 | `graphus-index` | lib | B+-tree, token-lookup index, composite & relationship-property indexes; constraint checks; index recovery. |
 | `graphus-txn` | lib | Transaction lifecycle, MVCC version chains and their undo deltas, visibility, SSI conflict tracker, timestamp oracle, version GC, write-conflict detection (§5.7), latch policy. |
@@ -542,7 +541,7 @@ batch is acknowledged (§4.9).
 **What undo logging still decides, and what it no longer decides** (task **#970**). Undo logging
 stays mandatory, for two reasons that outlive the move to logical rollback. It is how recovery rolls
 back the **losers** of a crash (§4.8, phase 3), and it is the inverse of a **maintenance**
-transaction — a GC reclamation, a corpse splice, a freeze sweep — whose writes are physical space
+transaction — a GC reclamation, a corpse splice, a header settle — whose writes are physical space
 management naming no MVCC version. What it is no longer is the mechanism of **isolation**: a live
 data transaction is rolled back by applying its own deltas against the current state of each record
 it touched, never by reverting the bytes it wrote (§5.1.5 row 4). One test selects between the two
@@ -947,19 +946,23 @@ every delta of its transaction, and that slot is published by a single atomic st
 one indirection is the load-bearing part of the whole design, and it is worth stating why in full.
 
 **Since task #1069 the record header goes through the same slot** (`05-storage-format.md` §7). The
-paragraph below described the cost Graphus was still paying because it did not: the header was the one
-axis of the store decided outside the unified chain, and the freeze sweep existed to pay for it. That
-sweep still runs — retiring it is task #1070 — but it is no longer the thing that makes an unsettled
-stamp resolvable, and so it is no longer load-bearing for correctness: a stamp resolves through its
-slot whether the sweep has reached it or not. What the sweep now buys is that a settled stamp costs no
-indirection to read.
+paragraph below describes the cost Graphus paid while it did not: the header was the one axis of the
+store decided outside the unified chain, and a freeze sweep existed to pay for it. Task #1070 retired
+that sweep, together with its `freeze_low` frontier and the audit that watched the frontier. What
+remains is a **settle**: every GC pass walks the whole id range of the three MVCC record stores once
+and rewrites, by compare-and-set, each header word that names a committed writer's slot to that
+writer's `Committed(ts)` (§5.6; `05-storage-format.md` §12.4). The settle is not load-bearing for
+correctness — a stamp resolves through its slot whether it has been settled or not — but it buys two
+things: a settled stamp costs no indirection to read, and settling removes a header's name for a
+slot, without which no census could ever prove that slot unreachable.
 
 Without the indirection, committing a transaction that touched *k* records means writing *k*
 timestamps, and every one of those writes must be made durable and must be found again after a crash.
-That was the cost the header used to pay: a committed writer's records kept an in-flight stamp until a
-**freeze sweep** rewrote each one in place, scanning `[freeze_low, high_water)` across all three
-stores. The frontier is a correctness-critical invariant of its own, it has needed its own
-release-active audit, and moving it past a live writer caused a silent-data-loss defect (rmp #522).
+That was the cost the header paid until task #1069: a committed writer's records kept an in-flight
+stamp until a **freeze sweep** rewrote each one in place, scanning `[freeze_low, high_water)` across all
+three stores. The frontier was a correctness-critical invariant of its own, it needed its own
+release-active audit (rmp #809), and moving it past a live writer caused a silent-data-loss defect
+(rmp #522).
 With the indirection, commit is **one atomic store
 into one slot**, and every delta of that transaction becomes committed at the same instant, because
 every one of them reads its timestamp through the slot. Memgraph does exactly this, in one line:
@@ -973,7 +976,7 @@ the representation choice. PostgreSQL has no such shared slot: it stamps each tu
 id and then consults the commit log per tuple, caching the answer in per-tuple **hint bits**
 (`/data/refsrc/postgres/src/include/access/htup_details.h:204`, `HEAP_XMIN_COMMITTED`, set by
 `SetHintBits`, `src/backend/access/heap/heapam_visibility.c:198-199`). Hint bits are that design's
-answer to the same problem the freeze sweep answers here. The shared commit slot removes the problem
+answer to the same problem the freeze sweep answered here. The shared commit slot removes the problem
 instead of answering it.
 
 **Consequences to hold.** The slot is per-transaction, so it must outlive the transaction object and
@@ -989,12 +992,14 @@ That single store settles the deltas — and, since #1069, the record headers wi
 not the whole of publication: a commit also has to appear in the **in-memory commit registry**, so
 publication remains **two writes in two media** and cannot be made instantaneous the way Memgraph's
 is. What that second write is for has changed, and the distinction matters: it is no longer what
-resolves a record header — the slot is (§5.3). What the registry remains is the process's record of
-**commit outcomes keyed by `TxnId`**, rebuilt from the log's commit records when a store is opened,
-and therefore the only thing that can translate a stamp whose payload really is a `TxnId`. The commit
-path still depends on it in that role, which is why the entry is published where it is: the in-memory
-label-version history retained by the store is settled from its in-flight form to `Committed(ts)`
-immediately afterwards, and it can only be settled while the registry still holds the writer.
+resolves a record header — the slot is (§5.3). The registry is the process's record of **commit
+outcomes keyed by `TxnId`**, rebuilt from the log's commit records when a store is opened, and nothing
+on the answer path reads it: no delta, no record header and no label version resolves through it.
+Two consumers remain. A debug-build cross-check compares its visibility verdict with the slot's
+wherever the registry has an answer to give. And a GC pass forgets, once its settle is durable, the
+committed writers whose every naming stamp that pass's walk settled — the set is sampled **before** the
+walk begins, so a writer that commits behind the walk is forgotten by a later pass — and forgetting a
+writer releases its WAL reclamation floor (§5.3).
 
 What guarantees that no reader ever observes the transaction half-published is therefore not the
 store's atomicity but the horizon of §5.2: the commit timestamp stays unpublished — and no snapshot
@@ -1419,8 +1424,10 @@ answered with a guess. And the answer no longer depends on process memory, which
 backup image self-sufficient (`05-storage-format.md` §7 and §11) and what removes the *need* for the
 machinery the old in-memory oracle required in order to stay bounded — the per-record freeze sweep,
 its frontier, and the WAL reclamation floor that held a committed transaction's log record down until
-its stamps were settled. **All three still exist**; #1069 demoted them from correctness to
-performance, and task **#1070** is what removes them.
+its stamps were settled. #1069 demoted all three from correctness to performance, and task **#1070**
+removed the sweep and its frontier (§5.6). The WAL reclamation floor remains, for a different reason:
+a `commit.store` slot records its writer's `TxnId`, and the floor keeps that id in the retained log so
+that a restart cannot re-issue it while a live slot still records it.
 
 **This two-clause rule is the answer *between* transactions, and it is complete as such.** It is not
 the whole answer *within* one, and it structurally cannot be: the two header words record **which
@@ -1651,14 +1658,32 @@ contract between §5 and the rest of the engine.
   is then **parked** for one collection pass before its id returns to the allocator
   (`05-storage-format.md` §12.4).
 
-**What disappears from this interface.** The freeze sweep does — as an *obligation*, since task
-#1069, and as *code* with task #1070. A committed writer's records carry unsettled stamps until a
-sweep rewrites each one in place across `[freeze_low, high_water)`
-(`RecordStore::freeze_store_headers_incremental`); with the commit indirection point (§5.1.3) a
-transaction's commit timestamp is published once, and since #1069 the record header reads it through
-that same slot, so there is nothing a reader needs the sweep to have done. The sweep and its frontier
-are still present and still run on every GC pass: settling a stamp spares every later reader an
-indirection, which is a performance argument and no longer a correctness one.
+**What disappeared from this interface.** The freeze sweep did — as an *obligation* with task #1069,
+and as *code* with task #1070, which also removed its `freeze_low` frontier, the write-path
+maintenance of that frontier, and the release-active audit that watched it (rmp #809). With the commit
+indirection point (§5.1.3) a transaction's commit timestamp is published once, and since #1069 the
+record header reads it through that same slot, so there is nothing a reader needs a sweep to have
+done.
+
+**What replaced it is one walk per GC pass with two jobs.** Every pass — a full pass and a settle-only
+pass alike — walks the in-use records of the three MVCC record stores across the whole id range
+`[1, high_water)`. For each header word it first records the commit slot the word names (the header
+half of the reference census above) and then settles the word if it names a committed writer's slot,
+by compare-and-set against the value it read (`RecordStore::settle_and_census_headers`). A settle-only
+pass (`RecordStore::gc_freeze_only`) runs this walk and skips every reclamation phase. The settle
+spares every later reader an indirection, which is a performance argument, and it un-names the slot,
+which is what lets the census retire it; the census rules are `05-storage-format.md` §12.4.
+
+**The bound is the whole id range, decided on completeness** (task #1070). A census that frees a slot
+must see every reference, so a bound is admissible only if something proves that nothing lies outside
+it. There were three candidates. A frontier maintained by the write path is the retired mechanism,
+and it is not reintroduced. A pairing invariant — settle a header when the delta of the same slot is
+reclaimed, and census the deltas alone — would need that pairing proved at every stamp site, a
+separate rule for an aborted property cell, and a full walk after every open; it is a design of its
+own. The whole range needs no proof beyond the loop itself. Its cost is the header **read**, `O(store)`
+per pass; the durable work stays `O(Δ)`, because only an unsettled word is written. Measured on the
+build that adopted it (release, one host), the walk took 2.36–2.41 ms per pass at 200 000 nodes,
+against 4.00–4.15 ms for the two full-range walks it merged.
 
 ### 5.7 Latches, conflict detection, and multi-writer execution
 
@@ -3154,10 +3179,11 @@ of each level.
   rustflag, so building a model flips the loom seam of **every** crate in the dependency graph at
   once: a protocol living inside a crate that reaches `graphus-bufpool` could not be checked at all,
   because its `std::sync` types would stop matching that crate's `loom::sync` types. This is why
-  `graphus-pagemap` (task #721), `graphus-groupsync` (task #994), `graphus-chainhead` (task #1028,
-  §1.2) and `graphus-freezefloor` (task #1014, §1.2) carry **no edge to `graphus-bufpool`**: the first
-  two depend on `graphus-core` alone, and the last two on nothing at all. It is a design constraint on
-  where a model-checkable protocol may live, not an accident of packaging.
+  `graphus-pagemap` (task #721), `graphus-groupsync` (task #994) and `graphus-chainhead` (task #1028,
+  §1.2) carry **no edge to `graphus-bufpool`**: the first two depend on `graphus-core` alone, and the
+  last on nothing at all. It is a design constraint on where a model-checkable protocol may live, not
+  an accident of packaging. (`graphus-freezefloor`, the leaf crate of task #1014, was removed by task
+  #1070 together with the freeze frontier it modelled.)
 - **proptest:** for the high-value pure modules — the order-preserving key encoding (§6.2),
   three-valued logic / ordering / equivalence (§7.6), PackStream and Jolt/CBOR round-trips, temporal
   arithmetic, and record codecs (round-trip and invariant properties).

@@ -151,13 +151,10 @@ pub fn backup_store<D: BlockDevice, S: LogSink>(store: &RecordStore<D, S>) -> Re
     //    sweep with a frontier of its own. It is simply no longer a *correctness* precondition for a
     //    backup.
     //
-    //    One consequence is worth naming rather than leaving to be rediscovered:
-    //    [`RecordStore::freeze_committed_headers`] was called from here and from nowhere else, so it
-    //    now has **no caller in the workspace**. `rmp` #1070 took the decision to KEEP it — re-expressed
-    //    over the census's scan, so there is no second sweep to drift — because it is the operation the
-    //    format-version-6 migration route names in `05 §12.6`. That route is performed by the
-    //    *previous* build, on an image this build refuses; keeping the operation here is what leaves an
-    //    operator on THIS build the same lever. See that method for the argument in both directions.
+    //    One consequence is worth naming rather than leaving to be rediscovered: the whole-store
+    //    settle this step used to call (`freeze_committed_headers`) had no other caller, and `rmp`
+    //    #1070 removed it. A settle-only GC pass (`RecordStore::gc_freeze_only`) performs the same
+    //    walk, so an operator who wants a fully settled image on this build still has the lever.
 
     // 0b. Make the CARDINALITY self-sufficient without the WAL too (`rmp` #1067), for exactly the
     //     reason step 0 makes the MVCC headers self-sufficient. Since #1067 the durable counters are

@@ -18,7 +18,7 @@
 use graphus_core::{HeaderStamp, PageId, TxnId, Value};
 use graphus_io::{BlockDevice, MemBlockDevice, Page};
 use graphus_storage::{Namespace, RecordStore, StoreKind, StorePages, recovery::recover_device};
-use graphus_txn::{Snapshot, is_visible_via};
+use graphus_txn::{CommitOracle, Snapshot, is_visible_via};
 use graphus_wal::{LogSink, MemLogSink, WalManager};
 
 type Store = RecordStore<MemBlockDevice, MemLogSink>;
@@ -111,11 +111,11 @@ fn reopen(store: &mut Store) -> Store {
 ///
 /// `RecordStore::write_prop_cell` is the one place a property cell is rewritten in place, and every
 /// such rewrite restamps `created_ts` with the writer's own commit slot. Until #1070 that write had to
-/// call `lower_freeze_low` — an atomic read-modify-write on ONE cache line shared by every writer of
-/// the database — for a reason that was not cosmetic: the freeze sweep only visited
-/// `[freeze_low, high_water)`, and a `SET` of an existing key restamps an id that is very often far
-/// below the frontier, so without the descent the sweep never revisited the record and the stamp was
-/// never settled (`rmp` #967 reopened the `rmp` #522 shape from a new direction).
+/// lower the retired freeze frontier — an atomic read-modify-write on ONE cache line shared by every
+/// writer of the database — for a reason that was not cosmetic: the freeze sweep only visited the ids
+/// from the frontier up to the high-water mark, and a `SET` of an existing key restamps an id that is
+/// very often far below the frontier, so without the descent the sweep never revisited the record and
+/// the stamp was never settled (`rmp` #967 reopened the `rmp` #522 shape from a new direction).
 ///
 /// The test therefore builds exactly that geometry: a store whose recent activity is all at HIGH ids
 /// (so a frontier, had one survived, would sit high), then a `SET` on the property of the FIRST node
@@ -249,11 +249,11 @@ fn an_in_place_property_restamp_at_a_low_id_is_settled_with_no_write_path_bookke
 /// # Non-vacuity
 ///
 /// * **The inverse edit that makes it fail**: delete the `pending_gc_prune` scheduling at the end of
-///   `RecordStore::gc_inner`, or drop the settle from `settle_and_census_headers` (which is the same
-///   thing one step earlier — a pass that settles nothing still schedules a prune, but
-///   `debug_assert_freeze_complete` fires first in a debug build, and in a release build the registry
-///   is pruned while headers still name the forgotten writers). Either way the table climbs with the
-///   round number instead of sitting flat.
+///   `RecordStore::gc_inner`. The table then climbs with the round number instead of sitting flat.
+///   (Dropping the settle instead is caught one step earlier, by
+///   `RecordStore::debug_assert_prune_precondition` in a debug build.) The concurrent-writer form of
+///   this property, with the Active Transaction Table, the WAL floor map and heap bytes as well, is
+///   `transaction_tables_plateau_1070.rs`.
 /// * **The positive control**: the warm-up length must be non-zero and the churn must really reclaim,
 ///   or "flat" is what an idle store looks like.
 #[test]
@@ -459,5 +459,361 @@ fn a_store_left_with_unsettled_headers_reopens_and_reads_them_1070() {
         unsettled_records(&store, StoreKind::Prop),
         0,
         "one GC pass over a reopened image must settle every leftover property stamp"
+    );
+}
+
+// =================================================================================================
+// 4. The settle is the only un-namer: what it bounds, and what it deliberately does not.
+// =================================================================================================
+
+/// The `commit.store` high-water mark and how many slots in it are in use.
+fn commit_store_shape(store: &Store) -> (u64, usize) {
+    let high_water = store.read_view().meta().high_water(StoreKind::Commit);
+    let live = (1..high_water)
+        .filter(|&id| matches!(store.commit_slot(id), Ok(Some(slot)) if slot.in_use()))
+        .count();
+    (high_water, live)
+}
+
+/// **`commit.store` plateaus on a workload where the settle is the ONLY thing that un-names a slot**
+/// (`rmp` #1070, acceptance criterion 5, audit finding E).
+///
+/// # Why this workload, and not create/delete churn
+///
+/// Under create/delete churn a slot loses its last header name when the record is RECLAIMED, so the
+/// census frees slots whether or not anything settles — which is why
+/// `undo_chain.rs::the_undo_store_plateaus_under_sustained_create_delete_churn` passes with the
+/// settle removed and proves nothing about it. Here every node SURVIVES: each round commits five new
+/// nodes (a creation header that names the round's slot for as long as nothing settles it) and
+/// overwrites the property of the SAME five old nodes in place (cells that are restamped every
+/// round). Nothing is ever reclaimed, so the only way a slot stops being named is that a GC pass
+/// rewrites the words naming it to their `Committed(ts)` form.
+///
+/// # Non-vacuity
+///
+/// * **The inverse edit that makes it fail**: in `RecordStore::settle_and_census_headers`, make the
+///   settle never write (e.g. `if false && let Some(settled_word) = …`). Every creation header keeps
+///   its name, every round pins one more slot, and the high-water climbs with the round number.
+/// * **The positive control**: the churn must allocate a slot per writing transaction and the store
+///   must really keep what it creates, or "flat" is what an idle store looks like.
+#[test]
+fn commit_store_plateaus_when_only_the_settle_can_un_name_a_slot_1070() {
+    const ROUNDS: u64 = 30;
+    const WARMUP: u64 = 5;
+    let store = fresh();
+    let key = store.intern_token(Namespace::PropKey, "v").unwrap();
+    let mut next = 10u64;
+    let mut nodes: Vec<u64> = Vec::new();
+    let mut warm = (0u64, 0usize);
+    for round in 0..ROUNDS {
+        let value = Value::Integer(i64::try_from(round).expect("small"));
+        let t = TxnId(next);
+        next += 1;
+        store.begin(t);
+        for _ in 0..5 {
+            let (n, _) = store.create_node(t).unwrap();
+            store.set_node_property_value(t, n, key, &value).unwrap();
+            nodes.push(n);
+        }
+        store.commit(t).unwrap();
+        let t = TxnId(next);
+        next += 1;
+        store.begin(t);
+        for &n in nodes.iter().take(5) {
+            store.set_node_property_value(t, n, key, &value).unwrap();
+        }
+        store.commit(t).unwrap();
+        gc_pass(&store, next);
+        next += 1;
+        let shape = commit_store_shape(&store);
+        if round == WARMUP {
+            warm = shape;
+        } else if round > WARMUP {
+            assert!(
+                shape.0 <= warm.0 && shape.1 <= warm.1,
+                "round {round}: commit.store must not grow once the churn is in steady state — \
+                 (high-water, live slots) went {warm:?} -> {shape:?}. A slot named by a surviving \
+                 record is freed only after a GC pass settles that name away, so a store whose \
+                 settle stopped leaks one slot per writing transaction, for ever."
+            );
+        }
+    }
+    let reader = Snapshot::new(TxnId(9_999_999), store.snapshot_ts());
+    assert!(
+        nodes.len() == 5 * ROUNDS as usize
+            && nodes.iter().all(|&n| node_visible(&store, n, reader)),
+        "positive control: every node the churn created must survive and stay visible"
+    );
+    assert!(
+        next > 2 * ROUNDS && warm.0 > 1,
+        "positive control: the churn must have allocated commit slots ({warm:?})"
+    );
+}
+
+/// The `created_ts` word of `n`'s cell for `key`.
+fn cell_word(store: &Store, n: u64, key: u32) -> u64 {
+    store
+        .superset_scan_node_properties(n)
+        .expect("read the cells")
+        .cells_ignoring_history()
+        .iter()
+        .find(|(_, cell)| cell.key == key)
+        .map(|(_, cell)| cell.mvcc.created_ts)
+        .expect("the node's cell")
+}
+
+/// **An aborted in-place `SET` leaves the cell stamped with its value's TRUE installer — and a crash
+/// with a later writer open cannot bring the aborted transaction's slot name back** (`rmp` #1070,
+/// audit findings G and F1).
+///
+/// # The defect this pins
+///
+/// The rollback used to restore the cell's value but leave its `created_ts` naming the aborted
+/// transaction A's slot, relying on the census to pin that slot. The pin did not survive a later
+/// writer: W overwrote the cell (so the census stopped seeing A's name), A's slot — which no delta
+/// names — was zeroed and recycled, and a crash with W still open had ARIES restore W's whole-cell
+/// pre-image, i.e. A's name. The recovered cell then named a slot that "was never written" (every
+/// later `gc()` failed) or a stranger's slot (the next settle stamped the stranger as installer).
+///
+/// Now the rollback re-stamps the cell with the settled commit timestamp of whoever installed the
+/// value it restores (`RecordStore::installer_stamp_after_rollback`), so no live cell ever names an
+/// aborted slot and W's pre-image is a value, not an id.
+///
+/// # Non-vacuity
+///
+/// * **The inverse edit that makes it fail**: in `RecordStore::undo_own_property`, drop the
+///   `cell.mvcc.created_ts = …installer_stamp_after_rollback(…)?` assignment. The first assertion
+///   fails (the cell names A's slot), and with it removed too, the post-recovery GC pass fails with
+///   the "never written" read fault.
+/// * **The positive controls**: W's write really restamps the cell (so the census cannot see A's
+///   name any more), and the churn really recycles slots, so a recycled name would be observable.
+#[test]
+fn an_aborted_in_place_set_leaves_no_slot_name_a_crash_can_resurrect_1070() {
+    let mut store = fresh();
+    let key = store.intern_token(Namespace::PropKey, "v").unwrap();
+    let t1 = TxnId(1);
+    store.begin(t1);
+    let (n, _) = store.create_node(t1).unwrap();
+    store
+        .set_node_property_value(t1, n, key, &Value::Integer(1))
+        .unwrap();
+    let ts1 = store.commit(t1).unwrap();
+    gc_pass(&store, 2);
+
+    // A overwrites in place and aborts.
+    let a = TxnId(100);
+    store.begin(a);
+    store
+        .set_node_property_value(a, n, key, &Value::Integer(2))
+        .unwrap();
+    store.rollback(a).unwrap();
+    assert_eq!(
+        cell_word(&store, n, key),
+        HeaderStamp::committed(ts1),
+        "the rolled-back cell must carry its value's installer (t1, committed at {ts1:?}), never the \
+         aborted transaction's slot"
+    );
+
+    // W overwrites in place and stays OPEN across passes and slot churn.
+    let w = TxnId(200);
+    store.begin(w);
+    store
+        .set_node_property_value(w, n, key, &Value::Integer(3))
+        .unwrap();
+    assert!(
+        HeaderStamp::from_raw(cell_word(&store, n, key))
+            .slot_id()
+            .is_some(),
+        "positive control: W's write restamps the cell with W's slot"
+    );
+    let mut next = 1_000u64;
+    let mut churn = std::collections::BTreeSet::new();
+    for _ in 0..4 {
+        for _ in 0..5 {
+            let u = TxnId(next);
+            next += 1;
+            store.begin(u);
+            let (m, _) = store.create_node(u).unwrap();
+            churn.extend(
+                HeaderStamp::from_raw(
+                    store
+                        .read_mvcc_for_test(StoreKind::Node, m)
+                        .unwrap()
+                        .created_ts,
+                )
+                .slot_id(),
+            );
+            store.commit(u).unwrap();
+        }
+        gc_pass(&store, next);
+        next += 1;
+    }
+    assert!(
+        churn.len() < 20,
+        "positive control: the churn must recycle slots ({} distinct for 20 writers)",
+        churn.len()
+    );
+
+    // Crash with W in flight: ARIES undoes W's cell write, restoring its pre-image.
+    let recovered = reopen(&mut store);
+    let word = cell_word(&recovered, n, key);
+    assert_eq!(
+        word,
+        HeaderStamp::committed(ts1),
+        "after recovery the cell must carry t1's settled stamp again, not a slot name"
+    );
+    let reader = Snapshot::new(TxnId(9_999_999), recovered.snapshot_ts());
+    let seen = recovered
+        .decision_scan_node_properties(n, reader)
+        .unwrap()
+        .visible_version(key)
+        .map(|pv| {
+            recovered
+                .decode_property_value(pv.type_tag, pv.value_inline)
+                .unwrap()
+        });
+    assert_eq!(
+        seen,
+        Some(Value::Integer(1)),
+        "the committed value reads back"
+    );
+    gc_pass(&recovered, 900_000);
+    assert_eq!(
+        cell_word(&recovered, n, key),
+        HeaderStamp::committed(ts1),
+        "a GC pass after recovery succeeds and leaves the installer unchanged"
+    );
+    let report = graphus_storage::check::check_store(&recovered, &[]).expect("consistency pass");
+    assert!(report.is_consistent(), "{:?}", report.violations);
+}
+
+/// **When the installer's own delta has already been reclaimed, the rollback stamps a lower bound
+/// that every reader answers identically** (`rmp` #1070, audit finding G).
+///
+/// Here t1's chain is reclaimed (the watermark has passed it) before A writes, so no delta on the
+/// chain names the installer; the stamp falls back to the entity's creation timestamp. The oracle
+/// is behavioural: every snapshot that can still exist reads t1's value, and the cell's stamp is a
+/// committed timestamp at or below t1's.
+///
+/// # Non-vacuity
+///
+/// The positive control asserts the chain really is empty before A writes. The inverse edit that
+/// makes it fail is the same as the sibling test's (drop the re-stamp): the cell then names A's slot.
+#[test]
+fn an_aborted_set_over_a_reclaimed_history_stamps_a_sound_lower_bound_1070() {
+    let store = fresh();
+    let key = store.intern_token(Namespace::PropKey, "v").unwrap();
+    let t1 = TxnId(1);
+    store.begin(t1);
+    let (n, _) = store.create_node(t1).unwrap();
+    store
+        .set_node_property_value(t1, n, key, &Value::Integer(1))
+        .unwrap();
+    let ts1 = store.commit(t1).unwrap();
+    gc_pass(&store, 2);
+    gc_pass(&store, 3);
+    assert_eq!(
+        store
+            .read_mvcc_for_test(StoreKind::Node, n)
+            .unwrap()
+            .undo_ptr,
+        0,
+        "positive control: t1's chain is reclaimed before A writes"
+    );
+    let a = TxnId(100);
+    store.begin(a);
+    store
+        .set_node_property_value(a, n, key, &Value::Integer(2))
+        .unwrap();
+    store.rollback(a).unwrap();
+    let word = cell_word(&store, n, key);
+    assert!(
+        HeaderStamp::from_raw(word).slot_id().is_none() && word != 0,
+        "the cell must carry a settled stamp, not a slot name ({word:#x})"
+    );
+    let stamped = store.resolve_commit_ts(word).unwrap().expect("committed");
+    assert!(
+        stamped <= ts1,
+        "{stamped:?} must not be later than the installer's {ts1:?}"
+    );
+    let reader = Snapshot::new(TxnId(9_999_999), store.snapshot_ts());
+    let seen = store
+        .decision_scan_node_properties(n, reader)
+        .unwrap()
+        .visible_version(key)
+        .map(|pv| {
+            store
+                .decode_property_value(pv.type_tag, pv.value_inline)
+                .unwrap()
+        });
+    assert_eq!(seen, Some(Value::Integer(1)));
+}
+
+/// **The installer found on the chain is the NEWEST committed writer of the key, not a lower bound**
+/// (`rmp` #1070, audit finding G, re-certification gap).
+///
+/// T1 installs `v = 1`, T2 overwrites it with `v = 2`, T3 overwrites again and aborts. T2's delta is
+/// still on the chain, so the rollback must stamp the cell `Committed(ts2)`. A lower bound here would
+/// be UNSOUND: the cell's stamp is what the column cache's freshness witness tests against a reader's
+/// snapshot, and a stamp at or below `ts1` tells a reader at `ts1` that the cell's `v = 2` is visible
+/// to it — while the authoritative chain read correctly gives that reader `v = 1`.
+///
+/// # Non-vacuity
+///
+/// The inverse edit that makes it fail: in `RecordStore::installer_stamp_after_rollback`, skip the
+/// chain walk (start it at `NULL_ID`), so every rollback takes the reclaimed-history fallback. The
+/// cell is then stamped with the entity's creation timestamp (`ts1`), and both assertions below fail.
+#[test]
+fn an_aborted_set_stamps_the_newest_committed_installer_on_the_chain_1070() {
+    let store = fresh();
+    let key = store.intern_token(Namespace::PropKey, "v").unwrap();
+    let t1 = TxnId(1);
+    store.begin(t1);
+    let (n, _) = store.create_node(t1).unwrap();
+    store
+        .set_node_property_value(t1, n, key, &Value::Integer(1))
+        .unwrap();
+    let ts1 = store.commit(t1).unwrap();
+    let t2 = TxnId(2);
+    store.begin(t2);
+    store
+        .set_node_property_value(t2, n, key, &Value::Integer(2))
+        .unwrap();
+    let ts2 = store.commit(t2).unwrap();
+    assert!(ts1 < ts2, "positive control: two distinct commits");
+
+    let t3 = TxnId(3);
+    store.begin(t3);
+    store
+        .set_node_property_value(t3, n, key, &Value::Integer(3))
+        .unwrap();
+    store.rollback(t3).unwrap();
+
+    assert_eq!(
+        cell_word(&store, n, key),
+        HeaderStamp::committed(ts2),
+        "the restored v = 2 was installed by T2 (committed at {ts2:?}); the cell must say so"
+    );
+    // The consequence the stamp exists for: a reader at ts1 must not be told, by the cell's own
+    // header, that the cell's current value is visible to it.
+    let old_reader = Snapshot::new(TxnId(9_999_999), ts1);
+    let word = cell_word(&store, n, key);
+    assert!(
+        !is_visible_via(&store, old_reader, word, 0).unwrap(),
+        "a reader at {ts1:?} must not see the cell's v = 2 through its header"
+    );
+    let seen = store
+        .decision_scan_node_properties(n, old_reader)
+        .unwrap()
+        .visible_version(key)
+        .map(|pv| {
+            store
+                .decode_property_value(pv.type_tag, pv.value_inline)
+                .unwrap()
+        });
+    assert_eq!(
+        seen,
+        Some(Value::Integer(1)),
+        "the chain read gives that reader v = 1"
     );
 }

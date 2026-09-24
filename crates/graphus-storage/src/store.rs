@@ -213,6 +213,134 @@ fn slot_named_by_header_word(word: u64) -> Option<u64> {
     HeaderStamp::from_raw(word).slot_id()
 }
 
+/// What a GC pass's commit-slot census must **exclude**, sampled before the pass reads a single MVCC
+/// header (`rmp` #1070, audit finding A).
+///
+/// A census proves a slot unreachable by failing to find a reference to it, so it can only be wrong
+/// about a slot whose owner was still able to create references while the census was reading — an
+/// owner **unresolved at the instant the header walk began**. Everything here, together with the
+/// census journal and the in-flight allocations (`Maintenance::census_journal`,
+/// `Maintenance::commit_slot_allocs_in_flight`), exists to name every such slot. The argument is on
+/// [`RecordStore::gc_sweep_undo_orphans`].
+#[derive(Debug)]
+struct CensusWindow {
+    /// `commit.store`'s high-water at the sample. A slot allocated afterwards from fresh space has an
+    /// id at or above it.
+    high_water: u64,
+    /// `commit.store`'s free list at the sample, read under the SAME allocation hold as `high_water`.
+    /// A slot popped afterwards was on it, because GC passes are serialized and a GC pass's phase B2
+    /// — the only thing that lists a commit slot — runs before the sample.
+    free: std::collections::BTreeSet<u64>,
+    /// The commit slot of every transaction in the active table at the sample.
+    open: std::collections::BTreeSet<u64>,
+    /// The allocation sequence number reached just AFTER the allocator sample. An allocation that
+    /// drew a smaller number may have popped before the sample (so fact 1 does not exclude its slot)
+    /// and, while it is still in flight, nothing names its slot.
+    alloc_seq: u64,
+}
+
+/// One `commit.store` allocation in flight (`rmp` #1070, audit finding A): registered in
+/// `Maintenance::commit_slot_allocs_in_flight` from before the pop until the owner's active-table entry
+/// names the slot, and journalled into an open census when it completes.
+///
+/// A guard rather than two calls, because the allocation has two fallible steps between the halves
+/// and an early return must still retire the registration — one left behind would make every later
+/// retirement loop defer every `!in_use` slot for the life of the process.
+struct PendingSlotAllocation<'a, D: BlockDevice, S: LogSink> {
+    store: &'a RecordStore<D, S>,
+    /// The sequence number this allocation drew.
+    seq: u64,
+    /// The slot, once the pop has produced one. Journalled even when a later step fails: the id is
+    /// then off the free list with a body nobody can vouch for, which is exactly what the journal
+    /// keeps the census from writing.
+    id: Option<u64>,
+}
+
+impl<'a, D: BlockDevice, S: LogSink> PendingSlotAllocation<'a, D, S> {
+    fn begin(store: &'a RecordStore<D, S>) -> Self {
+        let seq = store.with_maintenance(|m| {
+            let seq = m.next_commit_slot_alloc;
+            m.next_commit_slot_alloc += 1;
+            m.commit_slot_allocs_in_flight.insert(seq);
+            seq
+        });
+        Self {
+            store,
+            seq,
+            id: None,
+        }
+    }
+}
+
+impl<D: BlockDevice, S: LogSink> Drop for PendingSlotAllocation<'_, D, S> {
+    fn drop(&mut self) {
+        let (seq, id) = (self.seq, self.id);
+        self.store.with_maintenance(|m| {
+            m.commit_slot_allocs_in_flight.remove(&seq);
+            if let (Some(journal), Some(id)) = (m.census_journal.as_mut(), id) {
+                journal.insert(id);
+            }
+        });
+    }
+}
+
+/// Closes a GC pass's census journal however the pass ends (`rmp` #1070, audit finding A).
+///
+/// A journal left open would never be read and would grow by one entry per writing transaction for
+/// the life of the process; a pass that returned early through `?` is the obvious way to leave one.
+struct CensusJournalGuard<'a, D: BlockDevice, S: LogSink> {
+    store: &'a RecordStore<D, S>,
+}
+
+impl<D: BlockDevice, S: LogSink> Drop for CensusJournalGuard<'_, D, S> {
+    fn drop(&mut self) {
+        // Only the last pass out closes the journal: an overlapping pass must not erase the one a
+        // concurrent pass is still using (`rmp` #1070, audit finding F3). With passes serialized, as
+        // required, "the last pass out" is always this one.
+        self.store.with_maintenance(|m| {
+            if m.gc_passes_running <= 1 {
+                m.census_journal = None;
+            }
+        });
+    }
+}
+
+/// Marks one GC pass body as running (`rmp` #1070, audit finding F3).
+///
+/// GC passes on one store must be serialized: the commit-slot census samples the allocator's free
+/// list before it walks, and a second pass's phase B2 — the only code that lists a commit slot —
+/// could list one in between. The engine's coordinator serializes them. If that precondition is ever
+/// broken, this guard makes the census FAIL CLOSED for every pass involved: the second pass to enter
+/// raises `Maintenance::gc_overlap`, which stays up until no pass is running, and a retirement loop
+/// that sees it retires nothing and re-arms. Detection starts at the body's first line, so it covers
+/// a second pass's phase B2 as well as its census.
+struct GcPassGuard<'a, D: BlockDevice, S: LogSink> {
+    store: &'a RecordStore<D, S>,
+}
+
+impl<'a, D: BlockDevice, S: LogSink> GcPassGuard<'a, D, S> {
+    fn enter(store: &'a RecordStore<D, S>) -> Self {
+        store.with_maintenance(|m| {
+            m.gc_passes_running += 1;
+            if m.gc_passes_running > 1 {
+                m.gc_overlap = true;
+            }
+        });
+        Self { store }
+    }
+}
+
+impl<D: BlockDevice, S: LogSink> Drop for GcPassGuard<'_, D, S> {
+    fn drop(&mut self) {
+        self.store.with_maintenance(|m| {
+            m.gc_passes_running = m.gc_passes_running.saturating_sub(1);
+            if m.gc_passes_running == 0 {
+                m.gc_overlap = false;
+            }
+        });
+    }
+}
+
 /// The live store as the **record-header commit oracle** (`rmp` #1069 phase 3).
 ///
 /// Resolution is [`read_view::PagesOracle`] over this store's own `commit.store` — the same body the
@@ -1671,6 +1799,37 @@ struct Maintenance {
     /// which also strands that transaction's commit slot. The next full GC pass resolves it with a
     /// reference sweep over `undo.store`; until then the slot is a bounded leak, never a hazard.
     undo_orphan_slots_possible: bool,
+    /// **The commit-slot census journal** (`rmp` #1070, audit finding A). `Some` exactly while a GC
+    /// pass's commit-slot census is open — from the instant it samples its [`CensusWindow`] to the
+    /// instant its retirement loop reads this set — and it records every `commit.store` slot whose
+    /// allocation COMPLETED inside that span (see [`PendingSlotAllocation`]).
+    ///
+    /// It is one of the four facts that together name every slot whose owner was still unresolved
+    /// when the census began reading headers — the only slots a census can be wrong about, because
+    /// their owner can stamp a header or link a delta behind the walk. See
+    /// [`gc_sweep_undo_orphans`](RecordStore::gc_sweep_undo_orphans) for the full argument.
+    census_journal: Option<std::collections::BTreeSet<u64>>,
+    /// The `commit.store` allocations **between their pop and their registration** in the owner's
+    /// active-table entry, by the sequence number each drew when it began (`rmp` #1070, audit
+    /// finding A).
+    ///
+    /// A slot in that span has an owner nothing else can name yet — not the active table (the entry
+    /// has no slot), not the census journal (the allocation has not completed) — and its page may
+    /// still hold the stale body of its previous life. So while an allocation that began before a
+    /// census window was sampled is still in this set, the retirement loop writes no slot whose body
+    /// it cannot tell from such a stale one (every `!in_use` slot); see
+    /// [`gc_sweep_undo_orphans`](RecordStore::gc_sweep_undo_orphans). Keyed by sequence rather than
+    /// counted so that allocations which began AFTER the sample — excluded by id already — do not
+    /// hold that deferral up under a sustained write load.
+    commit_slot_allocs_in_flight: std::collections::BTreeSet<u64>,
+    /// The sequence number the next `commit.store` allocation will draw (`rmp` #1070, finding A).
+    next_commit_slot_alloc: u64,
+    /// How many GC pass bodies (`gc_inner`) are running on this store (`rmp` #1070, audit finding F3).
+    /// Passes must be serialized; see [`GcPassGuard`].
+    gc_passes_running: usize,
+    /// Set the moment a second GC pass body starts while another runs, and cleared only when none
+    /// runs any more. While set, no commit-slot census retires anything — in EITHER pass.
+    gc_overlap: bool,
     /// MVCC version history for the node **label bitmap** (`rmp` task #767).
     ///
     /// The label word is mutated IN PLACE inside the node record, so — unlike a property, which is a
@@ -1810,10 +1969,13 @@ impl Maintenance {
             dead_property_keys: 0,
             dead_index_keys_dropped: 0,
             gc_full_scan_pending: false,
-            // The audit window starts at id 1 for every store — a rotating scan has to begin
-            // somewhere, and 1 is the first physical id.
             pending_prop_corpses: false,
             undo_orphan_slots_possible: false,
+            census_journal: None,
+            commit_slot_allocs_in_flight: std::collections::BTreeSet::new(),
+            next_commit_slot_alloc: 0,
+            gc_passes_running: 0,
+            gc_overlap: false,
             pending_gc_prune: None,
             spare_undo_slabs: Vec::new(),
         }
@@ -4672,6 +4834,22 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.active.contains_key(txn)
     }
 
+    /// How many transactions the Active Transaction Table currently holds — an observability accessor
+    /// for the plateau tests of `rmp` #1070 acceptance criterion 4. A whole-table fold, so it belongs in
+    /// tests and diagnostics, never on a per-statement path.
+    #[must_use]
+    pub fn active_transaction_count(&self) -> usize {
+        self.active.fold_all(0usize, |n, _, _| n + 1)
+    }
+
+    /// How many committed writers still floor WAL reclamation through the unsettled-commit map (the
+    /// `unfrozen_commit_lsn` field) — an observability accessor for the plateau tests of `rmp` #1070
+    /// acceptance criterion 4. A map that only grows here pins the whole log.
+    #[must_use]
+    pub fn unfrozen_commit_count(&self) -> usize {
+        self.with_commit_durability(|d| d.unfrozen_commit_lsn.len())
+    }
+
     /// How many **live label deltas** the undo area currently holds, and how many of them belong to
     /// still-unresolved transactions (`rmp` #968).
     ///
@@ -6411,9 +6589,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// would then resurrect a stale stamp (a lost-update / visibility breach). Used for the MVCC
     /// **tombstone** (`xmax = in_flight(txn)`) writes of [`delete_node`](Self::delete_node),
     /// [`delete_rel`](Self::delete_rel).
-    /// The GC-time settle ([`settle_and_census_headers`](Self::settle_and_census_headers)) keeps the plain
-    /// [`patch_header_word`](Self::patch_header_word): it runs only inside a GC pass that holds the
-    /// store exclusively (no interleaving mutator), so its undo can never race a concurrent writer.
+    /// The GC-time settle does NOT use this: it needs the compare on the way IN as well, because a
+    /// writer can restamp the word between the settle's read and its write — see
+    /// [`settle_header_word`](Self::settle_header_word).
     fn patch_header_word_cas(
         &self,
         kind: StoreKind,
@@ -6448,6 +6626,66 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         });
         self.pool.unpin(f);
         Ok(())
+    }
+
+    /// **Settles** one MVCC header word under the GC transaction `txn`: rewrites it from `expected`
+    /// (a word naming a committed writer's `commit.store` slot) to `settled` (that writer's
+    /// self-describing `Committed(ts)` form) — **only if it still holds `expected`** — and reports
+    /// whether it did (`rmp` #1070, audit finding A).
+    ///
+    /// # Why both directions are compare-and-set
+    ///
+    /// The settle runs beside writers. Between the header scan that read `expected` and this call, a
+    /// writer may have restamped the word — an in-place property `SET` restamps a cell's `created_ts`
+    /// whenever it likes. The **redo** direction therefore compares first, inside this page's
+    /// log-apply order (`rmp` #1062), so the read, the log append and the page write are one step
+    /// against every other writer of the page; a word that moved is left alone, and costs nothing but
+    /// one pass of settling latency.
+    ///
+    /// The **undo** direction is the `rmp` #301 compare-and-set of
+    /// [`patch_header_word_cas`](Self::patch_header_word_cas): a physical rollback of this GC pass (or
+    /// ARIES undo of it as a crash loser) restores `expected` only if the word still holds `settled`,
+    /// so it can never overwrite a stamp a writer placed after the settle.
+    ///
+    /// Restoring `expected` restores a slot **id**, and restoring an id is sound only while that id
+    /// cannot have been recycled in between (`rmp` #220's lesson). It cannot here: the census that runs in
+    /// the same walk reads the word BEFORE settling it (census first, settle second), so this pass
+    /// counts the slot as named and does not retire it; a later pass can retire it only after this one
+    /// has committed, and GC passes are serialized — so no undo of this pass can ever run after the
+    /// slot it names has been retired.
+    ///
+    /// # Errors
+    /// Returns a storage error if the record's page is not allocated or cannot be fetched.
+    fn settle_header_word(
+        &self,
+        kind: StoreKind,
+        id: u64,
+        field_off: usize,
+        expected: u64,
+        settled: u64,
+        txn: TxnId,
+    ) -> Result<bool> {
+        let (rel_page, off) = paging::record_location(id, kind.record_size());
+        let dev = self.device_page(kind, rel_page)?;
+        let abs = off + field_off;
+        let f = self.pool.fetch(dev)?;
+        let wrote = self.in_page_order(dev, || {
+            let current = self.pool.with_page(f, |p| {
+                u64::from_le_bytes(p[abs..abs + 8].try_into().expect("8-byte slice"))
+            });
+            if current != expected {
+                return false;
+            }
+            let redo = paging::encode_patch(abs, &settled.to_le_bytes());
+            let undo = paging::encode_cas_patch(abs, settled, expected).into_vec();
+            let lsn = self.log_page_record(dev, |w| w.log_update_borrowed(txn, dev, &redo, undo));
+            self.pool.with_page_mut_lsn(f, lsn, |p| {
+                p[abs..abs + 8].copy_from_slice(&settled.to_le_bytes());
+            });
+            true
+        });
+        self.pool.unpin(f);
+        Ok(wrote)
     }
 
     // --------- chain writes: redo-only, because their inverse is logical (`rmp` #970) ---------
@@ -7112,7 +7350,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         if let Some(id) = self.active.with(txn, |a| a.commit_slot).flatten() {
             return Ok(id);
         }
+        // COUNTED FROM BEFORE THE POP TO AFTER THE REGISTRATION (`rmp` #1070, audit finding A). Between
+        // the two, this slot has an owner the reference census has no way to name: the active entry
+        // does not carry it yet, so a census sampling the open set sees nothing, and the page may
+        // still hold the body of the slot's previous life. See `PendingSlotAllocation`.
+        let mut pending = PendingSlotAllocation::begin(self);
         let id = self.alloc_id(StoreKind::Commit, txn)?;
+        pending.id = Some(id);
         let mut buf = [0u8; undo::COMMIT_RECORD_SIZE];
         CommitSlot::open(txn.0, VersionStamp::in_flight(txn)).encode(&mut buf);
         // Header-only creation undo, as for a relationship/property record (`rmp` #220): an abort
@@ -7121,6 +7365,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // failed to commit.
         self.write_undo_area_create(StoreKind::Commit, id, &buf, undo::COMMIT_OFF_FLAGS, txn)?;
         self.active.with_entry(txn, |a| a.commit_slot = Some(id));
+        // Registration done: only now may the count fall, and the journal hears of it in the same
+        // hold. Dropped explicitly so the order is on the page rather than implied by scope.
+        drop(pending);
         Ok(id)
     }
 
@@ -8460,6 +8707,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         txn: TxnId,
         watermark: Timestamp,
         named_by_header: &std::collections::BTreeSet<u64>,
+        window: &CensusWindow,
     ) -> Result<usize> {
         // The full-store census, collected only on the pass that scans the record stores anyway. Its
         // chain-head half is what lets the orphan sweep below free a delta a CRASH stranded (see
@@ -8510,7 +8758,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // [`reclaim_aborted_undo`](Self::reclaim_aborted_undo) on a physical one — and the sweep
         // itself re-arms when it had to DEFER a slot, so a deferral is never a permanent leak.
         if self.with_maintenance(|m| m.undo_orphan_slots_possible) || full_census.is_some() {
-            freed += self.gc_sweep_undo_orphans(txn, full_census.as_ref(), named_by_header)?;
+            freed +=
+                self.gc_sweep_undo_orphans(txn, full_census.as_ref(), named_by_header, window)?;
         }
         Ok(freed)
     }
@@ -8552,11 +8801,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// rebuilt for it.
     ///
     /// The chain-head half is what lets [`gc_sweep_undo_orphans`](Self::gc_sweep_undo_orphans) free a
-    /// delta a **crash** stranded (see that method). The header half is a *superset* contribution to
-    /// the slot census: this scan covers `1..high_water` in full, where the every-pass census
-    /// ([`census_slots_named_by_headers`](Self::census_slots_named_by_headers)) covers only the
-    /// records that can still bear an unsettled stamp. Contributing it costs nothing and makes the
-    /// one pass with the least in-memory knowledge — the first after a crash — the most conservative.
+    /// delta a **crash** stranded (see that method). The header half is a redundant contribution to
+    /// the slot census: the every-pass census
+    /// ([`settle_and_census_headers`](Self::settle_and_census_headers)) already covers `1..high_water`
+    /// in full, and this scan reads the same headers a little later. Contributing it costs two field
+    /// reads per record on a scan that runs anyway, and it can only widen the set of slots kept.
     ///
     /// Only **in-use** records contribute a stamp, the same rule the delta census applies to a
     /// free-listed delta's stale body: a slot nothing can read is not a reference.
@@ -8606,41 +8855,63 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// settles is retired by the NEXT pass, and the sweep re-arms its own gate so that costs one pass
     /// rather than waiting for an unrelated event.
     ///
-    /// # Why the range is the WHOLE store, and why that is not a regression it pretends away
+    /// # The bound: the WHOLE store, decided on completeness and measured (`rmp` #1070, AC 6)
     ///
     /// A census that frees a slot must be **complete**: one header missed is one committed version
-    /// silently re-attributed to whichever transaction next receives the recycled id. Completeness is
-    /// therefore the property, and a bound is admissible only if something proves nothing lies
-    /// outside it. The retired freeze frontier was exactly such a proof — and it was a proof
-    /// maintained by the WRITE path, at the cost of an atomic read-modify-write on one shared cache
-    /// line per stamped record (`rmp` #522, widened to every in-place property overwrite by #967).
+    /// silently re-attributed to whichever transaction next receives the recycled id. A bound is
+    /// admissible only if something proves nothing lies outside it, and there are exactly three
+    /// candidates:
     ///
-    /// It is worth being precise about what that bought, because the answer is "less than it looks".
-    /// The frontier is a floor over every id that may bear an unsettled stamp, and it is dragged to
-    /// the bottom by any tombstone of an old record and any in-place property overwrite of one. On an
-    /// append-only store it stayed high and the sweep was `O(Δ)`; on any store with churn it sat near
-    /// `1` and the sweep was already `O(store)` — twice, once for the census and once for the freeze,
-    /// plus the rotating audit window that watched the frontier. What this scan costs, per pass, is
-    /// one full-range header read; what it replaces cost two bounded ones plus an audit, and the
-    /// bound was only tight for workloads that never delete and never overwrite.
+    /// * **a frontier maintained by the write path** — the retired `freeze_low`: an atomic
+    ///   read-modify-write on one shared cache line per stamped record, dragged to the bottom by any
+    ///   tombstone or in-place overwrite of an old record. Retired by this task and not reintroduced;
+    /// * **a pairing invariant** — every header stamp is paired with a delta of the same slot, so the
+    ///   header half could be settled when the delta is reclaimed and the census could read deltas
+    ///   only. It needs that pairing proved over every stamp site, a separate rule for the aborted
+    ///   property cell (`undo_own_property`), and a full walk after every `open`; it is a design of its
+    ///   own, not a bound to adopt in passing;
+    /// * **the whole id range**, which needs no proof beyond the loop itself. This is the bound.
     ///
-    /// The scan itself is the cheap half and the settle is the dear one, and they scale differently:
-    /// naming is a pure bit test on a word already read by the page-batched header scan
-    /// ([`slot_named_by_header_word`]), whereas settling costs a durable `commit.store` read plus a
-    /// WAL-logged 8-byte patch — and *only unsettled records pay it*. So the durable work stays
-    /// `O(Δ)` exactly as it was, and it is the header read that becomes `O(store)`.
+    /// What it costs, measured on the build that adopted it (release, one host): the walk is 2.36 –
+    /// 2.41 ms per pass at 200 000 nodes, 51–52 % of a `gc` + `checkpoint` maintenance pass, against
+    /// 4.00 – 4.15 ms for the two full-range walks it merged. The durable work stays `O(Δ)` — only an
+    /// unsettled word is written — and it is the header READ that is `O(store)`.
     ///
-    /// # A concurrent writer stamping behind the scan is covered, and not by this scan
+    /// Where that read is paid most is the bulk-load cadence, which runs a settle-only pass per WAL
+    /// interval: `O(N)` per pass, `O(N²)` per import. The retired frontier did not avoid that either —
+    /// the load's checkpoint sentinel overwrites its property cells in place every batch, which held
+    /// the property store's frontier at the sentinel's cell for the whole load. Measured on a
+    /// Mode-A-shaped import (1.6 M nodes with two properties, 1.6 M relationships with one, a pass per
+    /// 50 000 rows): 12.7 – 13.9 s of passes at `d105f96` against 16.0 – 16.1 s here, 34 % against 39 %
+    /// of the import, both quadratic. A settle-only pass walks the headers only because the
+    /// Active/Recent Transaction Table prune, and the WAL floor it drains, need every settled stamp;
+    /// removing that need removes the walk from the bulk cadence, and it is the work of `rmp` #1071.
     ///
-    /// The walk is not atomic against other writers, so a writer may stamp a header at an id this
-    /// pass has already visited, and its slot is then in neither this scan's answer nor — if it
-    /// commits before phase F samples the open set — the `open` disjunct. What covers it is the
-    /// THIRD disjunct: every write that stamps a header also links an undo delta naming the same
-    /// slot as `commit_info` (a creation's header undo, a tombstone's, and the `SetProperty` delta
-    /// `link_set_property` writes before the in-place cell write), and a delta is reclaimable only
-    /// once the watermark has passed its transaction's commit — which cannot have happened in the
-    /// window between this scan and the sweep that reads it. The exposure is unchanged from before
-    /// `rmp` #1070: the retired census read its frontier once at its start and had the same window.
+    /// # What this scan does NOT prove, and what does (`rmp` #1070, audit finding A)
+    ///
+    /// The walk is not atomic against other writers. A writer may stamp a header at an id this pass
+    /// has already visited, or link a delta the undo scan never reads, and then commit before the
+    /// retirement loop runs. Such a slot is in no answer this scan gives. The first version of this
+    /// comment claimed the undo-delta disjunct covered it; it does not — the undo scan has its own
+    /// snapshot, sampled later, and a delta written after it is as invisible as a header written
+    /// behind this walk. The deterministic scheduler lost committed rows through exactly that gap.
+    ///
+    /// So the census is exact only for slots whose owner had **resolved before this walk began**.
+    /// Every other slot is excluded before the census is consulted at all — by the [`CensusWindow`]
+    /// sampled immediately before this scan, the census journal, and the pending-allocation count.
+    /// [`gc_sweep_undo_orphans`](Self::gc_sweep_undo_orphans) states the whole argument.
+    ///
+    /// # The settle is a compare-and-set, because writers run beside it
+    ///
+    /// Between the page-batched read that yielded `word` and the patch that settles it, a writer can
+    /// restamp the same word — an in-place property `SET` restamps a cell's `created_ts` at any time.
+    /// An unconditional patch would then overwrite the writer's in-flight stamp with the committed
+    /// stamp of the writer before it: the cell would claim an older installer for a newer value, and
+    /// the cell-stamp consumers (the column cache's freshness witness, the composite build's interval,
+    /// the index build's active-writer gate) would treat an uncommitted value as committed. The settle
+    /// therefore rewrites the word only if it still holds what the scan read, and its undo restores
+    /// the old word only if the settle's own word is still there
+    /// ([`settle_header_word`](Self::settle_header_word)).
     ///
     /// # Errors
     /// Returns a storage error if a record page cannot be read or a settle patch cannot be written.
@@ -8690,8 +8961,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                     // own gate, so the slot is retired by the next pass rather than waiting for an
                     // unrelated event.
                     named.extend(slot_named_by_header_word(word));
-                    if let Some(settled_word) = self.frozen_word(word)? {
-                        self.patch_header_word(kind, id, offset, settled_word, txn)?;
+                    if let Some(settled_word) = self.frozen_word(word)?
+                        && self.settle_header_word(kind, id, offset, word, settled_word, txn)?
+                    {
                         settled += 1;
                     }
                 }
@@ -8730,8 +9002,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// A delta is reachable exactly when it is some record's `undo_ptr` or some live delta's `next`.
     ///
     /// A slot is reachable exactly when **a live delta names it as `commit_info`, OR an in-use MVCC
-    /// record header names it in `created_ts` / `expired_ts`, OR it belongs to an open transaction.**
-    /// The second disjunct is what `rmp` #1069 adds, and it is the difference between counting and
+    /// record header names it in `created_ts` / `expired_ts`, OR its owner has not resolved.** The
+    /// second disjunct is what `rmp` #1069 adds, and it is the difference between counting and
     /// proving: the retired rule freed a slot when its last *delta* went, which was only ever the
     /// last *reference* because nothing else could name one. `rmp` #1069 makes a header name one, and
     /// a slot id — unlike a `TxnId` — is recycled, so one reference missed is one committed version
@@ -8740,35 +9012,68 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Where each half comes from: the undo-store scan supplies `next` and `commit_info`;
     /// `named_by_header` is handed in by [`settle_and_census_headers`](Self::settle_and_census_headers),
     /// which ran earlier in this same pass and walked the FULL id range of all three MVCC stores
-    /// (`rmp` #1070) — it is a complete statement, not a bounded one, and that completeness is what
-    /// licenses the free below; and `full_census` supplies the `undo_ptr` half plus a redundant
-    /// widening of the header half, and is `Some` only on a pass that has just scanned the record
-    /// stores ([`seed_pending_undo_chains`](Self::seed_pending_undo_chains)). Without it the **delta**
-    /// phase is skipped rather than guessed — a skipped reclamation is a bounded leak, a wrong one is
+    /// (`rmp` #1070); and `full_census` supplies the `undo_ptr` half plus a redundant widening of the
+    /// header half, and is `Some` only on a pass that has just scanned the record stores
+    /// ([`seed_pending_undo_chains`](Self::seed_pending_undo_chains)). Without it the **delta** phase
+    /// is skipped rather than guessed — a skipped reclamation is a bounded leak, a wrong one is
     /// corruption. The **slot** phase needs no such gate, because its header half is always available.
     ///
-    /// Three conservative rules, all in the safe direction:
+    /// # What makes a slot retirable, when writers run beside the census (`rmp` #1070, finding A)
+    ///
+    /// Neither scan is atomic against writers, so "no reference found" proves "no reference exists"
+    /// only for a slot whose owner could not create one while the scans were reading — an owner that
+    /// had **resolved before the header walk began**. Call that instant `t_S`. An owner resolved
+    /// before `t_S` created every reference it will ever create before `t_S`; the header walk reads
+    /// every in-use header after `t_S`, and the undo scan reads every live delta below a high-water
+    /// sampled after `t_S` (a live delta is never on the free list), so each reference is either seen
+    /// or was removed — by a settle, a reclamation or an overwrite — before it was read. A removed
+    /// reference never comes back: only its owner writes it, and the owner has resolved; the physical
+    /// undo of a GC pass restores only words that pass's own census counted, so it cannot resurrect a
+    /// name for a slot that pass retires.
+    ///
+    /// Every slot whose owner was **not** resolved at `t_S` is excluded before the census is asked,
+    /// by one of four facts sampled around it — and the proof that the four cover everything is what
+    /// the `rmp` #1070 audit found missing (a writer that began after the undo snapshot and committed
+    /// before the old `open` sample was seen by nothing, and its committed rows became invisible):
+    ///
+    /// 1. **`window.high_water` / `window.free`** — `commit.store`'s high-water and free list under ONE
+    ///    allocation hold, sampled immediately before `t_S` ([`CensusWindow`]). A slot popped after
+    ///    the sample was on that list, and a slot grown after it is at or above that mark, because GC
+    ///    passes are serialized and the only code that lists a commit slot (this pass's phase B2) ran
+    ///    before the sample. So every slot allocated after the sample is excluded by id alone.
+    /// 2. **`window.open`** — the commit slot of every transaction in the active table, folded after
+    ///    the allocator sample and before `t_S`. An owner that registered its slot before the fold
+    ///    and was unresolved at `t_S` was, a fortiori, active at the fold.
+    /// 3. **the census journal** — opened before the allocator sample and read here: every slot whose
+    ///    registration completed after it opened ([`PendingSlotAllocation`]). That is every owner the
+    ///    fold could have missed by registering after it.
+    /// 4. **the allocations still in flight that began before the sample** (`window.alloc_seq`),
+    ///    read here in the same hold as the journal. Such an owner may have popped before the sample
+    ///    and not registered yet, so it is in neither the fold nor the journal — but it has created no
+    ///    reference yet either (references follow registration), so the only hazard is this loop
+    ///    WRITING its slot: the page may still hold the stale body of the slot's previous life. A
+    ///    stale body is never `in_use` (the free list only ever receives retired slots), so while one
+    ///    such allocation is in flight every `!in_use` slot is deferred and nothing else is.
+    ///
+    /// Excluded slots are deferred, never guessed, and the deferral re-arms the gate, so each costs one
+    /// pass. A slot still `in_use` with an in-flight stamp that none of the four names belongs to no
+    /// live transaction of this process — a loser a restored or ported image carried in — and is
+    /// retired as a corpse; one whose owner the active table still holds is left alone.
+    ///
+    /// Two more conservative rules, both in the safe direction:
     ///
     /// * a **freed** delta's body is not rewritten when it is freed (only its flag is cleared), so its
     ///   stale `next` must not be counted as a reference — free-listed deltas are excluded from the
     ///   census, and so are the headers of records that are not in use;
-    /// * a slot owned by a **still-open** transaction is never retired, because that transaction may
-    ///   be between allocating its slot and linking its first delta, at which instant nothing names it;
     /// * a retired slot is **parked**, not freed. It re-enters circulation one pass later, through
     ///   [`gc_reclaim_orphan_slots`](Self::gc_reclaim_orphan_slots).
     ///
-    /// # The one-pass deferral phase E used to impose is gone (`rmp` #1070)
+    /// # A slot whose last name is settled in this pass is retired by the NEXT one
     ///
-    /// There used to be a separate freeze sweep — phase E — that settled the very headers this census
-    /// reads, and it ran AFTER phase F. So on the pass that reclaimed a transaction's last chain its
-    /// headers still named its slot, the census deferred, and the slot waited a pass. `rmp` #1069
-    /// declined to reorder the two phases to close that window, on the grounds that a deferral is
-    /// never a wrong answer and that the order was worth more than the pass. `rmp` #1070 makes the
-    /// question disappear rather than answering it: the settle and the census are ONE scan
-    /// ([`settle_and_census_headers`](Self::settle_and_census_headers)) which runs before this sweep,
-    /// so a slot whose last naming header was settled in this pass is reported unnamed in this pass.
-    /// The self-healing re-arm below stays regardless — it still covers a slot deferred because its
-    /// transaction is open, or because a delta still names it.
+    /// The header walk counts a word as naming its slot BEFORE it settles it (census first, settle
+    /// second — see [`settle_and_census_headers`](Self::settle_and_census_headers) for why the reverse
+    /// order would make the header disjunct untestable). So the pass that removes a slot's last name
+    /// still finds it named, defers it, and re-arms; the next pass retires it.
     ///
     /// If the GC pass that ran this sweep later **rolls back**, its writes are undone by the WAL while
     /// the parked ids stay parked in memory; the next pass's `!in_use` re-check finds them live again
@@ -8791,6 +9096,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         txn: TxnId,
         full_census: Option<&FullStoreCensus>,
         named_by_header: &std::collections::BTreeSet<u64>,
+        window: &CensusWindow,
     ) -> Result<usize> {
         let chain_heads = full_census.map(|c| &c.chain_heads);
         let undo_hw = self.store(StoreKind::Undo).alloc.high_water();
@@ -8842,8 +9148,40 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         }
 
         // Phase 2 — unreachable commit slots, over what phase 1 left standing. RE-SNAPSHOT: phase 1
-        // above has just freed deltas, and this loop must skip them, exactly as the per-id live probe
+        // above has just freed deltas, and this scan must skip them, exactly as the per-id live probe
         // it replaces did.
+        let referenced = self.commit_slots_named_by_deltas(undo_hw)?;
+        // The THIRD reference kind, and the reason this sweep exists at all since `rmp` #1069: an
+        // MVCC record header that names a slot. Collected on every pass by
+        // [`settle_and_census_headers`](Self::settle_and_census_headers), and widened by the
+        // full-store scan on the pass that ran one. A read error propagates: an unreadable census is
+        // not an empty one, and freeing on the strength of one would be exactly the corruption this
+        // sweep is here to prevent.
+        let mut named_by_header = named_by_header.clone();
+        if let Some(census) = full_census {
+            named_by_header.extend(&census.slots_named_by_headers);
+        }
+        let deferred =
+            self.retire_unreferenced_commit_slots(txn, &referenced, &named_by_header, window)?;
+        // Re-arm, never assign: the gate was cleared at the top, so anything that armed it while this
+        // sweep ran must survive. `deferred` adds this pass's own reason to come back.
+        if deferred {
+            self.arm_undo_orphan_census();
+        }
+        Ok(freed_deltas)
+    }
+
+    /// Every `commit.store` slot some delta below `undo_hw` names as its `commit_info` — the delta
+    /// half of the slot census (`rmp` #966). Free-listed deltas are skipped: a freed delta's body is
+    /// not rewritten, so its stale `commit_info` is not a reference. Corpses (`!in_use`) are counted,
+    /// in the safe direction.
+    ///
+    /// # Errors
+    /// Returns a storage error if an `undo.store` page cannot be read.
+    fn commit_slots_named_by_deltas(
+        &self,
+        undo_hw: u64,
+    ) -> Result<std::collections::BTreeSet<u64>> {
         let undo_free = self.free_id_set(StoreKind::Undo);
         let mut referenced = std::collections::BTreeSet::new();
         for id in 1..undo_hw {
@@ -8854,46 +9192,72 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 referenced.insert(delta.commit_info);
             }
         }
-        let open: std::collections::BTreeSet<u64> =
-            self.active
-                .fold_all(std::collections::BTreeSet::new(), |mut acc, _, a| {
-                    if let Some(slot) = a.commit_slot {
-                        acc.insert(slot);
-                    }
-                    acc
-                });
-        // The THIRD reference kind, and the reason this sweep exists at all since `rmp` #1069: an
-        // MVCC record header that names a slot. Collected on every pass (see
-        // [`census_slots_named_by_headers`](Self::census_slots_named_by_headers)), and widened by the
-        // full-store scan on the pass that ran one. A read error propagates: an unreadable census is
-        // not an empty one, and freeing on the strength of one would be exactly the corruption this
-        // sweep is here to prevent.
-        let mut named_by_header = named_by_header.clone();
-        if let Some(census) = full_census {
-            named_by_header.extend(&census.slots_named_by_headers);
+        Ok(referenced)
+    }
+
+    /// The retirement half of the slot census (`rmp` #1069, #1070): retires and parks every
+    /// `commit.store` slot below `window.high_water` that no delta in `referenced` and no header in
+    /// `named_by_header` names and whose owner the four window facts do not exclude, and reports
+    /// whether it had to DEFER one it would otherwise have examined. The argument is on
+    /// [`gc_sweep_undo_orphans`](Self::gc_sweep_undo_orphans).
+    ///
+    /// # Errors
+    /// Returns a storage error if a slot cannot be read or retired.
+    fn retire_unreferenced_commit_slots(
+        &self,
+        txn: TxnId,
+        referenced: &std::collections::BTreeSet<u64>,
+        named_by_header: &std::collections::BTreeSet<u64>,
+        window: &CensusWindow,
+    ) -> Result<bool> {
+        // Facts 3 and 4 of the argument on `gc_sweep_undo_orphans`, read in ONE hold so the pair is one
+        // instant: the slots whose
+        // registration completed since the window opened, and whether an allocation that began before
+        // the window's allocator sample is still between its pop and its registration.
+        let (registered_since, allocs_pending, overlapped) = self.with_maintenance(|m| {
+            (
+                m.census_journal.clone().unwrap_or_default(),
+                m.commit_slot_allocs_in_flight
+                    .range(..window.alloc_seq)
+                    .next()
+                    .is_some(),
+                m.gc_overlap,
+            )
+        });
+        // FAIL CLOSED on a broken serialization precondition (`rmp` #1070, audit finding F3): another
+        // pass body ran while this census was open, so fact 1 may no longer hold. Retire nothing and
+        // come back on a later, serialized pass. See `GcPassGuard`.
+        if overlapped {
+            return Ok(true);
         }
-        let commit_hw = self.store(StoreKind::Commit).alloc.high_water();
-        // This loop RETIRES commit slots as it goes, and both snapshots stay exact — worth stating so
-        // it is not "fixed" into a per-id probe again. Each iteration touches at most its own `id`,
-        // and `id` ascends, so everything the loop has changed is strictly BELOW the id the next
-        // iteration tests.
+        // The loop covers only ids that existed at the window's sample (fact 1): anything at or above
+        // that high-water was allocated afterwards. It RETIRES commit slots as it goes, and the
+        // snapshots stay exact — each iteration touches at most its own `id`, and `id` ascends, so
+        // everything the loop has changed is strictly BELOW the id the next iteration tests. The
+        // current free list is consulted beside the window's as well: under the serialization
+        // precondition it is a subset of it, and taking the union costs one snapshot and makes the
+        // loop's own reading of the allocator independent of that premise.
         let commit_free = self.free_id_set(StoreKind::Commit);
         let parked =
             self.with_maintenance(|m| m.pending_orphan_slots[StoreKind::Commit as usize].clone());
-        // Whether this pass had to DEFER a slot it would otherwise have retired. It re-arms the gate,
-        // so a deferral costs one pass instead of waiting for an unrelated event to arm it again —
-        // the self-healing shape the property sweep uses for `pending_empty_prop_cells`. Without it a
-        // store that goes quiet right after its last commit would strand that commit's slot until the
-        // next reopen, because the deferral below is guaranteed on the pass that reclaims the chain:
-        // this sweep runs inside phase F, and phase E — which settles the headers still naming the
-        // slot — runs after it.
+        // Whether this pass had to DEFER a slot it would otherwise have examined. It re-arms the gate,
+        // so a deferral costs one pass instead of waiting for an unrelated event to arm it again — the
+        // self-healing shape the property sweep uses for `pending_empty_prop_cells`. Without it a store
+        // that goes quiet right after its last commit would strand that commit's slot until the next
+        // reopen, because the deferral is guaranteed on the pass that settles the last header naming
+        // it (census first, settle second — see `gc_sweep_undo_orphans`).
         let mut deferred = false;
-        for id in 1..commit_hw {
+        for id in 1..window.high_water {
             if referenced.contains(&id)
-                || open.contains(&id)
+                || window.free.contains(&id)
                 || commit_free.contains(&id)
                 || parked.contains(&id)
             {
+                continue;
+            }
+            // Facts 2 and 3: an owner that may have been unresolved when the header walk began.
+            if window.open.contains(&id) || registered_since.contains(&id) {
+                deferred = true;
                 continue;
             }
             let Some(slot) = self.read_commit_slot(id)? else {
@@ -8906,22 +9270,44 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 deferred = true;
                 continue;
             }
+            let retire_whole = if slot.in_use() {
+                match VersionStamp::from_raw(slot.commit_ts) {
+                    // A COMMITTED slot nothing names any more: the ordinary steady-state exit for every
+                    // committed transaction's slot since `rmp` #1069. One byte is written, the same
+                    // byte the retired `delta_count` rule wrote at exactly this moment, so what changed
+                    // is WHO proves the slot is unreachable, not what is left on the page.
+                    VersionStamp::Committed(_) => false,
+                    // Unpublished. An owner this process still holds active is left alone — by facts
+                    // 1–4 it cannot reach here, and this check keeps that a statement about the facts
+                    // rather than about this slot. Anything else is a loser a restored or ported image
+                    // carried in, which no transaction of this process will ever resolve: retired as
+                    // the corpse it is.
+                    VersionStamp::InFlight(owner) => {
+                        if self.is_txn_active(owner) {
+                            continue;
+                        }
+                        true
+                    }
+                    VersionStamp::None => true,
+                }
+            } else {
+                // A corpse slot: an aborted or crashed transaction's — OR the stale body of a slot an
+                // allocation popped and has not rewritten yet (fact 4). The two are indistinguishable
+                // on the page, so while any allocation is in flight no `!in_use` slot is written.
+                if allocs_pending {
+                    deferred = true;
+                    continue;
+                }
+                true
+            };
             let (rel_page, off) = paging::record_location(id, undo::COMMIT_RECORD_SIZE);
             let dev = self.device_page(StoreKind::Commit, rel_page)?;
-            if slot.in_use() {
-                // A COMMITTED slot nothing names any more. Until `rmp` #1069 this branch was
-                // unreachable-by-design — the `delta_count` rule was supposed to have freed the slot
-                // already, and reaching here meant the count and the references disagreed — and the
-                // sweep declined to act. Now the count decides nothing and this is the ordinary
-                // steady-state exit for every committed transaction's slot. One byte is written, the
-                // same byte the retired count rule wrote at exactly this moment, so what changed is
-                // WHO proves the slot is unreachable, not what is left on the page.
-                self.write_region(dev, off + undo::COMMIT_OFF_FLAGS, &[0u8], txn)?;
-            } else {
-                // A corpse slot: an aborted or crashed transaction's. Zeroed whole, as before — a
-                // zeroed slot decodes as no slot at all (`05 §12.3`), which is the strongest possible
-                // statement that nothing may resolve through it.
+            if retire_whole {
+                // Zeroed whole, as before — a zeroed slot decodes as no slot at all (`05 §12.3`),
+                // which is the strongest possible statement that nothing may resolve through it.
                 self.write_region(dev, off, &[0u8; undo::COMMIT_RECORD_SIZE], txn)?;
+            } else {
+                self.write_region(dev, off + undo::COMMIT_OFF_FLAGS, &[0u8], txn)?;
             }
             // PARKED, not freed (`D-orphan-slot-parking`, `rmp` #1069). The id goes back into
             // circulation on a LATER pass, through
@@ -8933,12 +9319,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 m.pending_orphan_slots[StoreKind::Commit as usize].insert(id)
             });
         }
-        // Re-arm, never assign: the gate was cleared at the top, so anything that armed it while this
-        // sweep ran must survive. `deferred` adds this pass's own reason to come back.
-        if deferred {
-            self.arm_undo_orphan_census();
-        }
-        Ok(freed_deltas)
+        Ok(deferred)
     }
 
     /// Writes node `id`'s 8-byte `labels` bitmap word to `new_labels`, logging a **compare-and-set
@@ -9392,18 +9773,27 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// names a committed writer's `commit.store` slot is rewritten — WAL-logged under `txn`, like
     /// every other header write — to the self-describing `Committed(ts)` form. Stamps of writers
     /// that have not resolved are left untouched. The scan walks each store's full physical-id
-    /// range, independent of chain structure and of `watermark`, so a single pass provably visits
-    /// every record: after it, **no** in-use record names the slot of any writer the table records
-    /// as committed.
+    /// range, independent of chain structure and of `watermark`, so a single pass visits every
+    /// record: after it, no in-use record names the slot of any writer that had committed before the
+    /// scan began. A writer that commits while the scan runs may still be named behind it, and is
+    /// settled by the next pass.
     ///
-    /// The pass therefore schedules every such writer to be **forgotten** from the table — but only
-    /// once the freeze is durable: the prune applies when `txn` **commits**
+    /// The pass therefore schedules exactly the writers that had committed **before the scan began**
+    /// (sampled then, not after — `rmp` #1070, audit finding B) to be **forgotten** from the table —
+    /// but only once the settle is durable: the prune applies when `txn` **commits**
     /// ([`commit`](Self::commit)) and is discarded if `txn` rolls back
-    /// ([`rollback`](Self::rollback)), whose WAL undo restores the in-flight stamps that still need
-    /// the entries. A crash before the GC commit recovers the same way (the GC txn is a loser; the
-    /// table is rebuilt from the WAL commit records on [`open`](Self::open)). This freeze-then-prune
-    /// cycle is what bounds the table on a long-lived server: it ends each completed pass holding
-    /// only still-in-flight writers plus writers that committed after the pass's freeze sweep.
+    /// ([`rollback`](Self::rollback)), whose WAL undo restores the stamps that still need the
+    /// entries. A crash before the GC commit recovers the same way (the GC txn is a loser; the table
+    /// is rebuilt from the WAL commit records on [`open`](Self::open)). This settle-then-prune cycle
+    /// bounds the table on a long-lived server: each completed pass leaves it holding only writers
+    /// that committed after the pass's scan began.
+    ///
+    /// # Precondition
+    ///
+    /// GC passes on one store are serialized, from this call to the commit or rollback of `txn`: the
+    /// commit-slot census samples the allocator's free list before it walks the headers, and a second
+    /// pass listing a slot in between would invalidate that sample. The engine's coordinator holds the
+    /// store for exactly that span.
     ///
     /// # Errors
     /// Returns a storage error if a record read or a reclamation/freeze write fails.
@@ -9455,6 +9845,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         watermark: Timestamp,
         freeze_only: bool,
     ) -> Result<GcPassReport> {
+        // Held for the whole body, so an overlapping pass is detected from its first line on.
+        let _pass = GcPassGuard::enter(self);
         let mut reclaimed = 0usize;
         let mut undo_deltas_reclaimed = 0usize;
 
@@ -9542,12 +9934,28 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         //
         // WHERE IT SITS, AND WHY. After the reclamation sweeps A–C, so a slot they freed (no longer
         // `in_use`) is skipped rather than settled and then thrown away. Before phase F, because F is
-        // where the census's answer is consumed — and being before it is what removes the one-pass
-        // deferral #1069 had to accept when the settle ran last.
+        // where the census's answer is consumed.
         //
         // It runs in a FREEZE-ONLY pass too, which is what keeps `gc_freeze_only`'s contract intact:
         // that pass exists to settle stamps without paying the reclamation sweeps, and settling is
         // exactly what this does. Its census output is simply unused there, because phase F is skipped.
+        //
+        // TWO SAMPLES PRECEDE IT, AND BOTH MUST (`rmp` #1070, audit findings A and B). Writers run
+        // beside this walk, so what it proves is exact only for writers that had resolved before it
+        // began:
+        //
+        // * the census window — what the reference census must exclude because its owner may still
+        //   have been creating references while the walk read (`open_census_window`). Only a pass
+        //   that will consume the census opens one;
+        // * the prune set — the committed writers whose every naming stamp this walk will settle.
+        //   Sampled AFTER the walk (as it was), it also named writers that committed behind the walk,
+        //   and pruned them with their headers still unsettled.
+        let prune_writers = self
+            .commit_registry
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .committed_writers();
+        let census = (!freeze_only).then(|| self.open_census_window());
         let mut frozen = 0usize;
         let mut freeze_scanned = 0u64;
         self.bump_drain_progress();
@@ -9574,8 +9982,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // footprint independent of the GC cadence.
             self.bump_drain_progress();
             sched::yield_at(YieldSite::GcPhaseF, ResourceId::txn(txn.0));
+            let (window, _journal) = census
+                .as_ref()
+                .expect("INVARIANT: a full pass opened its census window before phase S");
             undo_deltas_reclaimed =
-                self.gc_reclaim_undo_chains(txn, watermark, &named_by_header)?;
+                self.gc_reclaim_undo_chains(txn, watermark, &named_by_header, window)?;
 
             // ---- Phase D: sweep PROPERTY chains, gated (`rmp` #522). ----
             // Reclaims **empty** property cells (`rmp` #967, `D-property-removal`) and dead-link
@@ -9617,30 +10028,24 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             self.with_maintenance(|m| m.gc_full_scan_pending = false);
         }
 
-        // `rmp` #522 (durability-audit W1 regression guard): before scheduling the prune that will
-        // forget every committed writer, assert phase S actually settled ALL of their on-disk stamps.
-        // This FULL-store scan is compiled out (costs nothing) in an ordinary release build; it stays
-        // the strongest guarantee under `debug_assertions`/`check-cold-assert`.
-        //
-        // ITS ROLE CHANGED WITH `rmp` #1070, and it is worth saying which way. It used to be the
-        // debug-build half of a two-tier watch on a frontier that could STRAND a stamp below itself,
-        // the release-active half being the #809 rotating window. There is no frontier to strand a
-        // stamp under any more: phase S visits every id of every MVCC store on every pass, so the
-        // invariant this asserts is a direct restatement of what that scan just did, and it fires only
-        // if the scan is wrong — which is precisely what a regression guard is for. The #809 window is
-        // retired with the frontier it watched. See [`debug_assert_freeze_complete`].
-        self.debug_assert_freeze_complete();
+        // The census journal has been read by the sweep (or was never needed): close it now rather
+        // than at the end of the pass, so a writer's allocation stops paying the journal insert as
+        // soon as nothing will read it.
+        drop(census);
 
-        // Schedule the table prune. Every writer recorded as committed at this point had ALL of its
-        // on-disk naming stamps rewritten by phase S's full-range settle, so each becomes forgettable
-        // the moment that settle is durable — i.e. when `txn` commits. The GC transaction itself, and
-        // any transaction that commits between here and that commit, is not in this set and is pruned
-        // by a later pass.
-        let writers = self
-            .commit_registry
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .committed_writers();
+        // `rmp` #522 (durability-audit W1 regression guard), restated for concurrent writers (`rmp`
+        // #1070, audit finding B): before scheduling the prune, assert that phase S left no in-use
+        // header naming the slot of ANY writer about to be pruned. The set is the one sampled before
+        // phase S; a writer that committed behind the walk is not in it and is pruned by a later
+        // pass. See [`debug_assert_prune_precondition`].
+        self.debug_assert_prune_precondition(&prune_writers);
+
+        // Schedule the table prune. Every writer in `prune_writers` had resolved before phase S began,
+        // so phase S's full-range settle rewrote every one of its on-disk naming stamps (a
+        // compare-and-set that declines only because a later writer overwrote the word, which removes
+        // the name just as well), and each becomes forgettable the moment that settle is durable —
+        // when `txn` commits.
+        let writers = prune_writers;
         let prune_scheduled = writers.len();
         // Both counters under ONE hold: the pair is reported together, so reading them at two
         // instants could report a queue length that never coexisted with that drop count.
@@ -9722,119 +10127,111 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         })
     }
 
-    /// **Debug-only invariant check** for the `rmp` #522 prune (the W1 regression guard from the
-    /// 2026-07 durability audit). Called by [`gc`](Self::gc) after phase S and immediately before it
-    /// schedules the Active/Recent-Transaction-Table prune: it asserts that **no in-use record in any
-    /// MVCC store still bears an unsettled stamp of a committed writer**.
+    /// **Debug-only invariant check** for the Active/Recent-Transaction-Table prune (the `rmp` #522 W1
+    /// regression guard from the 2026-07 durability audit, restated for concurrent writers by `rmp`
+    /// #1070, audit finding B). Called by [`gc`](Self::gc) after phase S and immediately before it
+    /// schedules the prune of `writers`: it asserts that **no in-use record in any MVCC store still
+    /// names the `commit.store` slot of a writer about to be forgotten**.
     ///
-    /// That is exactly the precondition the prune's soundness rests on — every writer the registry
-    /// records as `Committed` must have had *all* of its on-disk naming stamps rewritten to
-    /// `Committed(ts)`. [`frozen_word`](Self::frozen_word)`.is_some()` is the exact predicate phase S
-    /// clears, so this re-asks phase S's own question over the whole store and fires only if that scan
-    /// is wrong.
+    /// # Why it is scoped to the prune set, and not to "every committed writer"
     ///
-    /// **What it means changed with `rmp` #1070, and it is worth stating which way.** It used to be
-    /// the debug-build half of a two-tier watch on a frontier that could raise itself past a record
-    /// and STRAND its stamp below itself for ever; its full-range scan was what could see under that
-    /// frontier, and the release-active half was the `rmp` #809 rotating window. There is no frontier
-    /// now, and phase S visits every id of every MVCC store on every pass, so this is a restatement of
-    /// what that scan just did rather than a search for what it could not reach. A firing still means
-    /// the same thing it always did: a committed version would be forgotten while a live header still
-    /// resolves through it — silent lost committed data.
+    /// The previous form asked whether ANY committed writer still had an unsettled stamp, which is
+    /// the right question only when nothing commits during a pass. With writers running beside GC it
+    /// fired on a correct engine: a writer that commits after phase S has walked past its record is
+    /// committed, unsettled and — correctly — not in this pass's prune set. The invariant the prune
+    /// actually rests on is narrower and exact: every writer it forgets had resolved before phase S
+    /// began, so phase S's full-range settle reached every one of its stamps. The set is sampled
+    /// before phase S for that reason (see [`gc_inner`](Self::gc_inner)).
     ///
-    /// Compiled out in an ordinary release build (the full-store scan is O(store) per GC pass), but
-    /// **opt-in for release** via the `check-cold-assert` feature (`rmp` #596): a paranoid deployment
-    /// or a release certification run can enable it to get an always-on runtime guard against this
-    /// class, not just the debug/DST coverage. The always-on guarantee in an ordinary build comes from
-    /// the test `a_gc_pass_leaves_no_header_naming_a_resolved_writer_1070` instead.
+    /// A firing means a writer would be forgotten while a live header still names its slot. Since
+    /// `rmp` #1069 that no longer loses the row — the slot resolves on its own — but it lifts that
+    /// writer's WAL floor (`unfrozen_commit_lsn`) while its `TxnId` is still recorded in a slot a
+    /// header resolves through, which is the `TxnId`-reuse hazard that floor exists to prevent.
+    ///
+    /// Compiled out in an ordinary release build (the full-store scan is `O(store)` per GC pass), and
+    /// opt-in for release via the `check-cold-assert` feature (`rmp` #596).
     #[cfg(any(debug_assertions, feature = "check-cold-assert"))]
-    fn debug_assert_freeze_complete(&self) {
-        for kind in [StoreKind::Rel, StoreKind::Node, StoreKind::Prop] {
+    fn debug_assert_prune_precondition(&self, writers: &[TxnId]) {
+        if writers.is_empty() {
+            return;
+        }
+        let pruned: HashSet<u64> = writers.iter().map(|w| w.0).collect();
+        for kind in MVCC_STORE_KINDS {
             let in_use = read_view::scan_in_use_mvcc(&self.pool, &self.stores, kind)
-                .expect("W1 freeze-completeness guard reads only in-use MVCC headers");
+                .expect("the prune-precondition guard reads only in-use MVCC headers");
             for &(id, mvcc) in &in_use {
-                // `.expect` matches the `.expect` on the scan above: this is a debug-only invariant
-                // guard, so an unresolvable stamp (`rmp` #1069) is a loud failure of the guard
-                // itself, never a quietly-passed assertion.
-                let unfrozen = |word: u64| {
-                    self.frozen_word(word)
-                        .expect("W1 freeze-completeness guard resolves every header stamp")
-                        .is_some()
-                };
-                assert!(
-                    !unfrozen(mvcc.created_ts) && !unfrozen(mvcc.expired_ts),
-                    "rmp #522 freeze-frontier invariant VIOLATED: in-use {kind:?} record {id} still \
-                     bears an unfrozen committed-writer in-flight stamp (xmin={:#018x}, \
-                     xmax={:#018x}) after the freeze sweep. Its writer committed but the incremental \
-                     freeze never settled the stamp (the frontier was raised past it), so forgetting \
-                     that writer at the prune below would make its committed version read as INVISIBLE \
-                     (silent lost committed data).",
-                    mvcc.created_ts,
-                    mvcc.expired_ts,
-                );
+                for word in [mvcc.created_ts, mvcc.expired_ts] {
+                    let Some(slot_id) = slot_named_by_header_word(word) else {
+                        continue;
+                    };
+                    // `.expect`: this is a debug-only invariant guard, so an unreadable slot is a loud
+                    // failure of the guard itself, never a quietly-passed assertion.
+                    let owner = self
+                        .read_commit_slot(slot_id)
+                        .expect("the prune-precondition guard reads every slot a header names")
+                        .map(|slot| slot.txn_id);
+                    assert!(
+                        owner.is_none_or(|owner| !pruned.contains(&owner)),
+                        "rmp #522/#1070 prune precondition VIOLATED: in-use {kind:?} record {id} \
+                         still names commit slot {slot_id} (word {word:#018x}) of writer {owner:?}, \
+                         which this pass is about to forget. Every writer in the prune set resolved \
+                         before the settle walk began, so the walk must have settled this word.",
+                    );
+                }
             }
         }
     }
 
-    /// Release-build no-op counterpart of the W1 freeze-completeness guard (`rmp` #522/#596): the
-    /// full-store scan it performs is O(store) per GC pass, so it costs nothing in an ordinary optimized
-    /// build (enable the `check-cold-assert` feature to run it in release — see the active counterpart).
+    /// Release-build no-op counterpart of [`debug_assert_prune_precondition`] (`rmp` #522/#596): the
+    /// full-store scan it performs is `O(store)` per GC pass, so it costs nothing in an ordinary
+    /// optimized build (enable the `check-cold-assert` feature to run it in release).
     #[cfg(not(any(debug_assertions, feature = "check-cold-assert")))]
     #[inline]
-    fn debug_assert_freeze_complete(&self) {}
+    fn debug_assert_prune_precondition(&self, _writers: &[TxnId]) {}
 
-    /// Settles **every** settleable MVCC header word in all three record stores under `txn`: each
-    /// `created_ts` / `expired_ts` that still names the `commit.store` slot of a committed transaction
-    /// is rewritten to its self-describing `Committed(ts)` form. The census half of the scan is
-    /// discarded — this reclaims nothing.
+    /// Opens this GC pass's **commit-slot census window** (`rmp` #1070, audit finding A): opens the
+    /// census journal, then samples `commit.store`'s high-water and free list under one allocation
+    /// hold, then the in-flight allocation watermark, then the open transactions' slots — in that
+    /// order, which is what the four-fact argument on
+    /// [`gc_sweep_undo_orphans`](Self::gc_sweep_undo_orphans) depends on.
     ///
-    /// # Who calls it, and why it survived `rmp` #1070 with no caller in this workspace
+    /// Returns the window and the guard that closes the journal when the pass is done with it.
     ///
-    /// It has none, and that is a deliberate state rather than an oversight, so the reasoning is
-    /// recorded here instead of in a commit message.
+    /// # Precondition: GC passes are serialized
     ///
-    /// It was the pre-capture step of the backup path (`rmp` task #149 / #23): a restored store opens
-    /// with a *fresh* WAL, so any header a backup froze in the naming form would have been
-    /// unresolvable in the restored image. `rmp` #1069 removed that need — the naming form points at a
-    /// `commit.store` slot, which is part of the data image and is therefore captured by the backup
-    /// itself — and dropped the call.
-    ///
-    /// What keeps the operation is `05 §12.6`. The format-version-6 gate refuses a version-5 image
-    /// that still carries an unsettled stamp, and it names its migration route in the error it raises:
-    /// *settle every stamp with the build that wrote the image*. That route is executed by the
-    /// PREVIOUS build, so deleting this method would not invalidate it — but it would leave this build
-    /// without the lever the message describes, and an operator who upgrades and then needs a fully
-    /// settled image (to hand it back to an older build, or to make it self-describing before an
-    /// out-of-band copy) would have nothing to call. Since `rmp` #1070 the whole-store settle has
-    /// exactly ONE implementation — the census's own scan — so keeping the operation costs a wrapper
-    /// rather than a second sweep that could drift from it. Deleting it was the alternative, and it
-    /// was declined for that asymmetry: the wrapper is cheap and reversible, the removal is neither.
-    ///
-    /// `txn` must be a fresh, not-yet-begun id; the caller drives `begin(txn)` → this →
-    /// `commit(txn)`. Returns the number of header words settled.
-    ///
-    /// # Errors
-    /// Returns a storage error if a header read or a settle patch write fails.
-    pub fn freeze_committed_headers(&self, txn: TxnId) -> Result<usize> {
-        let (_named, frozen, _visited) = self.settle_and_census_headers(txn)?;
-        // Schedule the same Active/Recent Transaction Table prune `gc` does: the scan rewrote every
-        // committed writer's on-disk naming stamps, so each becomes forgettable once this settle is
-        // durable (when `txn` commits). Mirrors `gc`'s prune scheduling so the table stays bounded.
-        let writers = self
-            .commit_registry
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .committed_writers();
-        let prune_scheduled = writers.len();
-        if prune_scheduled > 0 {
-            self.with_maintenance(|m| {
-                m.pending_gc_prune = Some(PendingGcPrune {
-                    gc_txn: txn,
-                    writers,
-                });
-            });
-        }
-        Ok(frozen)
+    /// From [`gc`](Self::gc) to the commit or rollback of its transaction, no second pass may run on
+    /// the same store. The engine's coordinator holds the store for exactly that span. The window
+    /// depends on it — a second pass's phase B2 could list a commit slot after this window sampled the
+    /// free list — and so does the physical rollback of a pass, which restores pre-images a
+    /// concurrent pass may have acted on. An overlap is therefore a broken precondition, and it fails
+    /// closed for every pass involved: see [`GcPassGuard`].
+    fn open_census_window(&self) -> (CensusWindow, CensusJournalGuard<'_, D, S>) {
+        // Open the journal unless an overlapping pass already has it open — never replace it, which
+        // would erase the entries that pass is relying on. Overlap itself is handled at the loop.
+        self.with_maintenance(|m| {
+            m.census_journal.get_or_insert_with(BTreeSet::new);
+        });
+        let guard = CensusJournalGuard { store: self };
+        let (high_water, free) = {
+            let alloc = self.store(StoreKind::Commit).alloc.lock();
+            let high_water = alloc.high_water();
+            let free: BTreeSet<u64> = alloc.free().ids().iter().copied().collect();
+            (high_water, free)
+        };
+        let alloc_seq = self.with_maintenance(|m| m.next_commit_slot_alloc);
+        let open = self.active.fold_all(BTreeSet::new(), |mut acc, _, a| {
+            if let Some(slot) = a.commit_slot {
+                acc.insert(slot);
+            }
+            acc
+        });
+        let window = CensusWindow {
+            high_water,
+            free,
+            open,
+            alloc_seq,
+        };
+        (window, guard)
     }
 
     /// Reclaims the reclaimable MVCC tombstones of `kind` (`Rel` or `Node`) under `txn` (`rmp` #522).
@@ -10147,9 +10544,105 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         {
             return self.retire_own_prop_cell(kind, entity, cell_id, cell.next_prop, txn);
         }
+        // THE CELL IS RE-STAMPED WITH ITS VALUE'S TRUE INSTALLER (`rmp` #1070, audit findings G/F1).
+        //
+        // The value is restored from the delta; the stamp must be restored too, or the cell goes on
+        // naming THIS transaction's slot, which the rollback is about to retire. That name looked
+        // harmless while the census pinned the slot, but the pin does not survive a later writer: W
+        // overwrites the cell (the census no longer sees this name), the slot is zeroed and recycled,
+        // and a crash with W open has ARIES restore W's whole-cell pre-image — this name — so the cell
+        // then names nothing, or a stranger. See `installer_stamp_after_rollback` for why the word
+        // written here is a settled VALUE and never a restored id.
+        let own_slot = self.active.with(txn, |a| a.commit_slot).flatten();
+        cell.mvcc.created_ts =
+            self.installer_stamp_after_rollback(kind, entity, delta.token, own_slot)?;
         cell.type_tag = delta.type_tag;
         cell.value_inline = delta.value_inline;
         self.write_prop_cell(cell_id, &cell, txn)
+    }
+
+    /// The settled `Committed(ts)` word naming the transaction that installed the value a rollback is
+    /// restoring into `(kind, entity)`'s cell for `token` (`rmp` #1070, audit findings G and F1).
+    ///
+    /// # Why the answer is on the chain
+    ///
+    /// The value being restored is the one the key held before the aborting transaction's first
+    /// write to it, so its installer is the writer of the next retained delta below the aborting
+    /// transaction's own run that WROTE the key: a live committed `SetProperty` for `token`, or the
+    /// entity's own creation (`DeleteObject`). Nothing else can be in between — the head-prefix
+    /// invariant keeps every other open writer off a chain this transaction holds, and a corpse (or a
+    /// delta whose slot is retired) is a write that never happened and is skipped.
+    ///
+    /// # Why the word is a VALUE, never an id
+    ///
+    /// The installer committed, so the word written is its self-describing `Committed(ts)` — exactly
+    /// what a settle would write — and not the installer's slot name. Restoring a slot id is sound
+    /// only while nothing can recycle it; a timestamp needs no such argument.
+    ///
+    /// # When the installer's delta is already reclaimed
+    ///
+    /// Then no live snapshot is older than its commit: a chain is reclaimed whole only once the
+    /// watermark — the oldest live snapshot — has passed every delta on it, and snapshots only move
+    /// forward. Any `Committed(ts')` with `ts'` at or below the true commit is therefore read the same
+    /// way by every reader that exists or ever will; the entity's own creation timestamp is such a
+    /// lower bound (the key cannot have been installed before the entity existed), and it is the
+    /// bound the composite-index build already uses for the same reason. Floored at `1`, because
+    /// `Committed(0)` is the `0` "no creator" sentinel.
+    ///
+    /// # Errors
+    /// A storage error if the chain or a slot cannot be read, or — fail closed — if the delta below
+    /// belongs to a transaction that is still unresolved, which the head-prefix invariant forbids.
+    fn installer_stamp_after_rollback(
+        &self,
+        kind: StoreKind,
+        entity: u64,
+        token: u32,
+        own_slot: Option<u64>,
+    ) -> Result<u64> {
+        let mvcc = self.read_mvcc(kind, entity)?;
+        let guard = self.store(StoreKind::Undo).alloc.high_water() + 1;
+        let mut cur = mvcc.undo_ptr;
+        let mut steps = 0u64;
+        while cur != NULL_ID {
+            steps += 1;
+            if steps > guard {
+                return Err(GraphusError::Storage(format!(
+                    "undo chain of {kind:?} {entity} does not terminate (malformed)"
+                )));
+            }
+            let Some(delta) = self.read_delta(cur)? else {
+                return Err(GraphusError::Storage(format!(
+                    "undo chain of {kind:?} {entity} reaches empty delta slot {cur}"
+                )));
+            };
+            cur = delta.next;
+            let wrote_key = match delta.action {
+                UndoAction::SetProperty => delta.token == token,
+                UndoAction::DeleteObject => true,
+                _ => false,
+            };
+            if !wrote_key || !delta.in_use() || Some(delta.commit_info) == own_slot {
+                continue;
+            }
+            let Some(slot) = self.read_commit_slot(delta.commit_info)? else {
+                continue;
+            };
+            if !slot.in_use() {
+                continue; // an aborted writer's: its write never happened
+            }
+            return match VersionStamp::from_raw(slot.commit_ts) {
+                VersionStamp::Committed(ts) => Ok(HeaderStamp::committed(ts)),
+                other => Err(GraphusError::Storage(format!(
+                    "rollback of {kind:?} {entity}: the installer of property key {token} is \
+                     unresolved ({other:?}); the head-prefix invariant forbids an open writer below \
+                     a transaction's own run"
+                ))),
+            };
+        }
+        let entity_ts = self
+            .resolve_commit_ts(mvcc.created_ts)?
+            .map_or(1, |ts| ts.0);
+        Ok(HeaderStamp::committed(Timestamp(entity_ts.max(1))))
     }
 
     /// Unlinks property cell `cell_id` from `(kind, entity)`'s chain and returns its slot to the free
@@ -18328,6 +18821,369 @@ mod tests {
             "positive control: the passes must actually have settled stamps ({settled_total}), or \
              'nothing is unsettled' is true for the wrong reason"
         );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // `rmp` #1070, audit findings A and F2 — the four facts of the commit-slot census window, one test
+    // each.
+    //
+    // Each test runs ONE census by hand — window, header walk, delta scan, retirement — and places a
+    // writer at the one instant its fact exists for, which a single thread can do exactly where a
+    // random schedule almost never does: `graphus-dst`'s `det_scheduler_census_window_1070` catches the
+    // defect as shipped, but no single fact's removal.
+    // ---------------------------------------------------------------------------------------------
+
+    /// The oracle all three share: `node`, committed by `writer`, is visible to a fresh snapshot and
+    /// its `created_ts` still names a slot that is in use and records `writer`.
+    fn assert_committed_node_intact(s: &Store, node: u64, writer: TxnId, what: &str) {
+        let m = s
+            .read_mvcc(StoreKind::Node, node)
+            .expect("read the node header");
+        let reader = Snapshot::new(TxnId(9_999_999), s.snapshot_ts());
+        let visible = m.in_use()
+            && graphus_txn::is_visible_via(s, reader, m.created_ts, m.expired_ts)
+                .expect("resolve the node header");
+        let slot = HeaderStamp::from_raw(m.created_ts)
+            .slot_id()
+            .map(|id| s.read_commit_slot(id).expect("read the named slot"));
+        assert!(
+            visible && matches!(slot, Some(Some(c)) if c.in_use() && c.txn_id == writer.0),
+            "{what}: node {node}, committed by {writer:?}, must stay visible through its own slot \
+             — visible {visible}, slot {slot:?}. A census that retires the slot of a writer it could \
+             not see loses the committed row, and recycling the id then re-attributes it."
+        );
+    }
+
+    /// **An overlapping GC pass fails closed for BOTH passes** (`rmp` #1070, audit finding F3).
+    ///
+    /// Pass P1 opens its census window and walks; then a second pass body P2 starts (its phase B2
+    /// could list a commit slot after P1 sampled the free list). Neither may retire anything while the
+    /// overlap lasts: P1's retirement loop, run with P2 still inside, retires nothing, and a whole P2
+    /// pass run while P1 is still inside retires nothing either. Once both are out, a serialized pass
+    /// retires the slot as usual.
+    ///
+    /// # Non-vacuity
+    ///
+    /// * **The positive control**: the last, serialized pass really retires the slot, so "not
+    ///   retired" above is the overlap's doing, not an unretirable slot.
+    /// * **The inverse edit that makes it fail**: delete the `if overlapped { return Ok(true); }` in
+    ///   `retire_unreferenced_commit_slots`. (The pre-fix code instead replaced P1's journal with an
+    ///   empty one and retired freely in P1.)
+    #[test]
+    fn overlapping_gc_passes_fail_closed_for_both_1070() {
+        let s = fresh();
+        let t = TxnId(1);
+        s.begin(t);
+        let (n, _) = s.create_node(t).unwrap();
+        s.commit(t).unwrap();
+        let slot = HeaderStamp::from_raw(s.read_mvcc(StoreKind::Node, n).unwrap().created_ts)
+            .slot_id()
+            .unwrap();
+        // One ordinary pass settles the header and reclaims the chain; the slot is then retirable.
+        let g = TxnId(2);
+        s.begin(g);
+        s.gc(g, s.snapshot_ts()).unwrap();
+        s.commit(g).unwrap();
+        let retired = |s: &Store| !matches!(s.read_commit_slot(slot), Ok(Some(c)) if c.in_use());
+        assert!(
+            !retired(&s),
+            "setup: the slot is still in use before the retiring pass"
+        );
+
+        // P1, by hand: enter, window, walks … then P2 enters before P1's retirement loop.
+        let p1 = TxnId(3);
+        s.begin(p1);
+        {
+            let _p1 = GcPassGuard::enter(&s);
+            let (window, _journal) = s.open_census_window();
+            let (named, _, _) = s.settle_and_census_headers(p1).unwrap();
+            let referenced = s
+                .commit_slots_named_by_deltas(s.store(StoreKind::Undo).alloc.high_water())
+                .unwrap();
+            let _p2 = GcPassGuard::enter(&s);
+            let deferred = s
+                .retire_unreferenced_commit_slots(p1, &referenced, &named, &window)
+                .unwrap();
+            assert!(deferred, "an overlapped loop defers and re-arms");
+            assert!(!retired(&s), "P1 must retire nothing while P2 overlaps it");
+        }
+        s.commit(p1).unwrap();
+
+        // A whole pass run while another pass body is inside retires nothing either.
+        {
+            let _other = GcPassGuard::enter(&s);
+            let p2 = TxnId(4);
+            s.begin(p2);
+            s.gc(p2, s.snapshot_ts()).unwrap();
+            s.commit(p2).unwrap();
+            assert!(
+                !retired(&s),
+                "P2 must retire nothing while it overlaps another pass"
+            );
+        }
+
+        // Serialized again: the slot is retired.
+        let p3 = TxnId(5);
+        s.begin(p3);
+        s.gc(p3, s.snapshot_ts()).unwrap();
+        s.commit(p3).unwrap();
+        assert!(
+            retired(&s),
+            "positive control: a serialized pass retires the slot"
+        );
+    }
+
+    /// **Fact 2 — the open set.** A writer that registered its slot BEFORE the window was sampled
+    /// links its first delta and stamps its first header only after both walks, then commits before
+    /// the retirement loop runs. Neither walk saw it; only the window's fold of the active table
+    /// names it.
+    ///
+    /// # Non-vacuity
+    ///
+    /// The inverse edit that makes it fail: in `retire_unreferenced_commit_slots`, drop
+    /// `window.open.contains(&id)` from the exclusion. The positive controls below prove facts 1, 3
+    /// and 4 do not name the slot, so fact 2 is the only thing between it and retirement.
+    #[test]
+    fn census_window_excludes_a_writer_registered_before_the_sample_1070() {
+        let s = fresh();
+        let w = TxnId(10);
+        s.begin(w);
+        let slot = s.commit_slot_for(w).expect("W registers its slot");
+        let g = TxnId(20);
+        s.begin(g);
+        let (window, _journal) = s.open_census_window();
+        assert!(
+            window.open.contains(&slot) && slot < window.high_water && !window.free.contains(&slot),
+            "positive control: only fact 2 names W's slot"
+        );
+        let (named, _, _) = s.settle_and_census_headers(g).expect("header walk");
+        let referenced = s
+            .commit_slots_named_by_deltas(s.store(StoreKind::Undo).alloc.high_water())
+            .expect("delta scan");
+        assert!(
+            !named.contains(&slot) && !referenced.contains(&slot),
+            "positive control: neither walk saw W, which has written nothing yet"
+        );
+        // W writes behind both walks and commits.
+        let (node, _) = s.create_node(w).expect("W creates");
+        s.commit(w).expect("W commits");
+        s.retire_unreferenced_commit_slots(g, &referenced, &named, &window)
+            .expect("retirement");
+        s.commit(g).expect("commit the pass");
+        assert_committed_node_intact(&s, node, w, "fact 2");
+    }
+
+    /// **Fact 3 — the journal.** A writer POPS its slot before the window's allocator sample but
+    /// REGISTERS it only after the window folded the active table; it then writes behind both walks
+    /// and commits before the retirement loop. The pop predates the sample (fact 1 is silent), the
+    /// fold predates the registration (fact 2 is silent), and the allocation has finished by the
+    /// loop (fact 4 is silent): only the journal names it.
+    ///
+    /// # Non-vacuity
+    ///
+    /// The inverse edit that makes it fail: drop `registered_since.contains(&id)` from the exclusion
+    /// in `retire_unreferenced_commit_slots` (or stop `PendingSlotAllocation::drop` journalling).
+    #[test]
+    fn census_window_excludes_a_slot_registered_after_the_fold_1070() {
+        let s = fresh();
+        let w = TxnId(10);
+        s.begin(w);
+        // `commit_slot_for`, cut open at the instant fact 3 exists for.
+        let mut pending = PendingSlotAllocation::begin(&s);
+        let slot = s.alloc_id(StoreKind::Commit, w).expect("pop");
+        pending.id = Some(slot);
+        let g = TxnId(20);
+        s.begin(g);
+        let (window, _journal) = s.open_census_window();
+        assert!(
+            !window.open.contains(&slot)
+                && slot < window.high_water
+                && !window.free.contains(&slot),
+            "positive control: facts 1 and 2 do not name the slot"
+        );
+        let mut buf = [0u8; undo::COMMIT_RECORD_SIZE];
+        CommitSlot::open(w.0, VersionStamp::in_flight(w)).encode(&mut buf);
+        s.write_undo_area_create(StoreKind::Commit, slot, &buf, undo::COMMIT_OFF_FLAGS, w)
+            .expect("write the slot");
+        s.active.with_entry(w, |a| a.commit_slot = Some(slot));
+        drop(pending);
+        let (named, _, _) = s.settle_and_census_headers(g).expect("header walk");
+        let referenced = s
+            .commit_slots_named_by_deltas(s.store(StoreKind::Undo).alloc.high_water())
+            .expect("delta scan");
+        let (node, _) = s
+            .create_node(w)
+            .expect("W creates through its registered slot");
+        s.commit(w).expect("W commits");
+        assert!(
+            !named.contains(&slot) && !referenced.contains(&slot),
+            "positive control: neither walk saw W"
+        );
+        s.retire_unreferenced_commit_slots(g, &referenced, &named, &window)
+            .expect("retirement");
+        s.commit(g).expect("commit the pass");
+        assert_committed_node_intact(&s, node, w, "fact 3");
+    }
+
+    /// **Fact 4 — the allocations still in flight.** A writer pops a RECYCLED slot — whose page
+    /// still holds the retired body of its previous owner, `!in_use` — before the window's sample,
+    /// and registers it only after the retirement loop. Nothing names the slot during the census,
+    /// and its body is indistinguishable from an aborted transaction's. Writing it anyway is the
+    /// hazard: the GC's write sits under the writer's own in the log, and a rollback of the GC pass
+    /// restores the stale body over the writer's live slot.
+    ///
+    /// # Non-vacuity
+    ///
+    /// The inverse edit that makes it fail: replace `if allocs_pending {` with `if false {` in
+    /// `retire_unreferenced_commit_slots`. The loop then parks the slot and zeroes it; the GC pass is
+    /// rolled back here on purpose, and the committed node reads as aborted.
+    #[test]
+    fn census_window_writes_no_slot_an_allocation_is_still_claiming_1070() {
+        let s = fresh();
+        // A committed slot, retired and recycled: `A` commits, then passes until its slot is listed.
+        let a = TxnId(1);
+        s.begin(a);
+        let (a_node, _) = s.create_node(a).expect("A creates");
+        s.commit(a).expect("A commits");
+        let a_slot =
+            HeaderStamp::from_raw(s.read_mvcc(StoreKind::Node, a_node).unwrap().created_ts)
+                .slot_id()
+                .expect("A's unsettled header names its slot");
+        let mut next = 100u64;
+        for _ in 0..4 {
+            let g = TxnId(next);
+            next += 1;
+            let wm = s.snapshot_ts();
+            s.begin(g);
+            s.gc(g, wm).expect("gc");
+            s.commit(g).expect("commit gc");
+        }
+        assert!(
+            s.commit_slot_is_free_for_test(a_slot),
+            "setup: A's slot must be back on the free list"
+        );
+        assert!(
+            matches!(s.read_commit_slot(a_slot), Ok(Some(c)) if !c.in_use()),
+            "setup: the recycled slot must still hold its previous, retired body"
+        );
+        // W pops it, and stays between the pop and the registration across the whole census.
+        let w = TxnId(10);
+        s.begin(w);
+        let mut pending = PendingSlotAllocation::begin(&s);
+        let slot = s.alloc_id(StoreKind::Commit, w).expect("pop");
+        assert_eq!(slot, a_slot, "setup: W must receive the recycled slot");
+        pending.id = Some(slot);
+        let g = TxnId(next);
+        s.begin(g);
+        let (window, _journal) = s.open_census_window();
+        let (named, _, _) = s.settle_and_census_headers(g).expect("header walk");
+        let referenced = s
+            .commit_slots_named_by_deltas(s.store(StoreKind::Undo).alloc.high_water())
+            .expect("delta scan");
+        s.retire_unreferenced_commit_slots(g, &referenced, &named, &window)
+            .expect("retirement");
+        assert!(
+            !s.with_maintenance(
+                |m| m.pending_orphan_slots[StoreKind::Commit as usize].contains(&slot)
+            ),
+            "the retirement loop wrote and parked a slot an allocation still claimed"
+        );
+        // W completes its allocation and commits; then the GC pass rolls back.
+        let mut buf = [0u8; undo::COMMIT_RECORD_SIZE];
+        CommitSlot::open(w.0, VersionStamp::in_flight(w)).encode(&mut buf);
+        s.write_undo_area_create(StoreKind::Commit, slot, &buf, undo::COMMIT_OFF_FLAGS, w)
+            .expect("write the slot");
+        s.active.with_entry(w, |a| a.commit_slot = Some(slot));
+        drop(pending);
+        let (node, _) = s.create_node(w).expect("W creates");
+        s.commit(w).expect("W commits");
+        drop(_journal);
+        s.rollback(g).expect("the GC pass rolls back");
+        assert_committed_node_intact(&s, node, w, "fact 4");
+    }
+
+    /// **Fact 1 — the allocator sample.** A writer begins its allocation and pops a RECYCLED slot only
+    /// AFTER the window was sampled, and registers it only after the retirement loop. The slot was on
+    /// the sampled free list; nothing else names it, and its page holds the retired body of its
+    /// previous owner. Writing it anyway puts the GC's write under the writer's in the log, and a
+    /// rollback of the GC pass then restores the stale body over the writer's live slot.
+    ///
+    /// # Non-vacuity
+    ///
+    /// The inverse edit that makes it fail: in `retire_unreferenced_commit_slots`, drop
+    /// `window.free.contains(&id)` from the exclusion (and iterate to the current high-water). The
+    /// loop then parks the slot and zeroes it, and the committed node reads as aborted after the GC
+    /// rollback.
+    #[test]
+    fn census_window_excludes_a_slot_popped_after_the_sample_1070() {
+        let s = fresh();
+        // A committed slot, retired and recycled: `A` commits, then passes until its slot is listed.
+        let a = TxnId(1);
+        s.begin(a);
+        let (a_node, _) = s.create_node(a).expect("A creates");
+        s.commit(a).expect("A commits");
+        let a_slot =
+            HeaderStamp::from_raw(s.read_mvcc(StoreKind::Node, a_node).unwrap().created_ts)
+                .slot_id()
+                .expect("A's unsettled header names its slot");
+        let mut next = 100u64;
+        for _ in 0..4 {
+            let g = TxnId(next);
+            next += 1;
+            let wm = s.snapshot_ts();
+            s.begin(g);
+            s.gc(g, wm).expect("gc");
+            s.commit(g).expect("commit gc");
+        }
+        assert!(
+            s.commit_slot_is_free_for_test(a_slot),
+            "setup: A's slot must be back on the free list"
+        );
+        assert!(
+            matches!(s.read_commit_slot(a_slot), Ok(Some(c)) if !c.in_use()),
+            "setup: the recycled slot must still hold its previous, retired body"
+        );
+        // The window is sampled FIRST; only then does W begin its allocation and pop the slot, and it
+        // stays between the pop and the registration across the rest of the census. Its allocation
+        // began after the sample, so fact 4 does not count it; it has registered nothing, so facts 2
+        // and 3 do not name the slot. Only fact 1 — the slot was on the sampled free list — does.
+        let g = TxnId(next);
+        s.begin(g);
+        let (window, _journal) = s.open_census_window();
+        assert!(
+            window.free.contains(&a_slot),
+            "setup: the sample saw the slot on the free list"
+        );
+        let w = TxnId(10);
+        s.begin(w);
+        let mut pending = PendingSlotAllocation::begin(&s);
+        let slot = s.alloc_id(StoreKind::Commit, w).expect("pop");
+        assert_eq!(slot, a_slot, "setup: W must receive the recycled slot");
+        pending.id = Some(slot);
+        let (named, _, _) = s.settle_and_census_headers(g).expect("header walk");
+        let referenced = s
+            .commit_slots_named_by_deltas(s.store(StoreKind::Undo).alloc.high_water())
+            .expect("delta scan");
+        s.retire_unreferenced_commit_slots(g, &referenced, &named, &window)
+            .expect("retirement");
+        assert!(
+            !s.with_maintenance(
+                |m| m.pending_orphan_slots[StoreKind::Commit as usize].contains(&slot)
+            ),
+            "the retirement loop wrote and parked a slot an allocation still claimed"
+        );
+        // W completes its allocation and commits; then the GC pass rolls back.
+        let mut buf = [0u8; undo::COMMIT_RECORD_SIZE];
+        CommitSlot::open(w.0, VersionStamp::in_flight(w)).encode(&mut buf);
+        s.write_undo_area_create(StoreKind::Commit, slot, &buf, undo::COMMIT_OFF_FLAGS, w)
+            .expect("write the slot");
+        s.active.with_entry(w, |a| a.commit_slot = Some(slot));
+        drop(pending);
+        let (node, _) = s.create_node(w).expect("W creates");
+        s.commit(w).expect("W commits");
+        drop(_journal);
+        s.rollback(g).expect("the GC pass rolls back");
+        assert_committed_node_intact(&s, node, w, "fact 1");
     }
 
     /// **`D-retired-mechanism-tests` — the semantic replacement for `rmp` #809's

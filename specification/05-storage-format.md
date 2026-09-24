@@ -145,15 +145,23 @@ slot id.
 The change exists so that the store has **one** commit oracle rather than two. A delta already
 resolved through the slot (§12.4); the header did not, and a `TxnId` is translatable only by the
 in-memory Active/Recent Transaction Table. Three mechanisms existed to keep that second oracle
-usable: the per-record freeze sweep, which rewrites a committed writer's stamps in place; the
-`freeze_low` frontier, which bounds that sweep; and the WAL reclamation floor, which holds a
+usable: the per-record freeze sweep, which rewrote a committed writer's stamps in place; the
+`freeze_low` frontier, which bounded that sweep; and the WAL reclamation floor, which holds a
 committed transaction's log record alive until its stamps are settled, so that a restart can rebuild
 the table that translates them. A stamp that names a slot is resolvable from the **data alone**.
 
-**All three mechanisms are still present — this change did not remove them.** Retiring them is task
-**#1070**. What this change removed is their standing: none of them is what makes an unsettled stamp
-resolvable any more. Settling a stamp is now an optimisation, because a settled word is read with no
-indirection at all; it is no longer a precondition for reading the version.
+This change did not remove the three mechanisms; it removed their standing: none of them is what makes
+an unsettled stamp resolvable any more. Settling a stamp became an optimisation, because a settled word
+is read with no indirection at all; it is no longer a precondition for reading the version.
+
+**Task #1070 removed the first two.** The per-record freeze sweep and the `freeze_low` frontier no
+longer exist; a stamp is settled by the full-range walk every GC pass performs, which also supplies
+the header half of the slot census (§12.4; `04-technical-design.md` §5.6). **`freeze_low` was never
+persisted.** It was an in-memory value, initialised to `1` whenever a store was opened, and no durable
+structure ever carried it; its removal therefore moves no byte, the format stays at version **6**, and
+no migration exists or is needed. The WAL reclamation floor remains. It no longer keeps a stamp
+resolvable; what it still protects is the `TxnId` a `commit.store` slot records (§12.4), which a
+restart must not re-issue while a live slot still records it.
 
 Three consequences are normative rather than incidental:
 
@@ -511,13 +519,12 @@ only for its disk-backed storage mode and has no Graphus counterpart.
 **Why one slot and not one timestamp per delta.** A transaction that touched *k* entities commits with
 **one** write, and all *k* of its deltas become committed at the same instant because each resolves its
 status through this slot. Since task **#1069** the record headers of those *k* entities resolve
-through it too (§7), so the slot is now the store's **only** commit oracle. This is what lets the
+through it too (§7), so the slot is now the store's **only** commit oracle. This is what let the
 freeze sweep be retired — the in-place rewrite of every committed writer's stamps across
-`[freeze_low, high_water)` (`RecordStore::freeze_store_headers_incremental`), a frontier that needs its
-own release-active audit and whose mis-advance was a silent-data-loss defect (rmp #522). **The sweep is
-still present today:** #1069 removed the *need* for it — nothing now depends on it to resolve a stamp —
-but removing the code is separate work (rmp #1070, then #1071), and until that lands the sweep still
-runs on every GC pass as an optimisation. Memgraph publishes the same way, in one
+`[freeze_low, high_water)`, bounded by a frontier that needed its own release-active audit (rmp #809)
+and whose mis-advance was a silent-data-loss defect (rmp #522). #1069 removed the *need* for the sweep,
+and task **#1070** removed the sweep, the frontier and the audit; what settles a stamp now is the
+full-range walk described under reclamation below. Memgraph publishes the same way, in one
 line: `transaction_.commit_info->timestamp.store(*commit_timestamp_, std::memory_order_release)`
 (`/data/refsrc/memgraph/src/storage/v2/inmemory/storage.cpp:1299`).
 
@@ -548,6 +555,73 @@ Every other path — the GC's chain reclamation, a live abort, and a physical ab
 a slot by clearing its `in_use` bit and arming that census, and none of them returns an id to the
 allocator. An **aborting** transaction still applies and frees its own deltas itself (§12.5) and
 retires its slot with them; what changed is that retiring is not freeing.
+
+**Where the header half of the census comes from** (task **#1070**). Every GC pass walks the in-use
+records of the three MVCC record stores across the whole id range `[1, high_water)`, once. For each
+`created_ts` / `expired_ts` word the walk first records the slot the word names, and only then settles
+the word if it names a committed writer's slot (`04-technical-design.md` §5.6). The order is
+normative. Settling first would leave the header disjunct above observable only for an aborted or an
+open writer — both already covered by other means — so a test of that disjunct would pass against a
+build without it. The consequence is bounded and deliberate: **a slot whose last naming word a pass
+settles is still found named by that pass, deferred, and retired by the next pass.** The deferral
+re-arms the census gate, so the cost is one pass and never a wait for an unrelated event.
+
+**The settle is a compare-and-set.** A writer can restamp a word between the walk's read and the
+settle's write — an in-place property `SET` restamps a cell's `created_ts` at any time — and an
+unconditional write would then stamp a newer value with an older installer's commit. The settle
+therefore rewrites the word only if it still holds the value the walk read, and its undo restores the
+old word only if the settle's own word is still there.
+
+**Writers run beside the census, so it proves only what it can.** Neither the header walk nor the
+`undo.store` scan is atomic against writers: a writer may stamp a header the walk has passed, or link
+a delta the scan never reads, and commit before the retirement loop runs. "No reference found" proves
+"no reference exists" only for a slot whose owner had **resolved before the header walk began**. Every
+other slot is excluded before the census is consulted, by four facts sampled around the walk (the
+**census window**):
+
+1. **The allocator sample.** `commit.store`'s high-water and free list, read under one allocation hold
+   immediately before the walk. A slot allocated afterwards is at or above that high-water or was on
+   that free list, so it is excluded by its id alone. This holds only because no other pass can list a
+   commit slot in between (see the precondition below).
+2. **The open slots.** The commit slot of every transaction in the active table, sampled after the
+   allocator and before the walk.
+3. **The census journal.** Opened before the allocator sample, it receives every slot whose
+   registration in the active table completes while it is open — every owner fact 2 could miss by
+   registering after the fold.
+4. **The allocations in flight.** An allocation that began before the allocator sample and has not yet
+   registered is in neither fact 2 nor fact 3. It has created no reference yet, but its page may still
+   hold the stale body of the slot's previous life, and a stale body is never `in_use`; so while any
+   such allocation is in flight, no slot whose `in_use` bit is clear is written.
+
+An excluded slot is deferred, never guessed, and the deferral re-arms the gate. A slot still `in_use`
+whose `commit_ts` is not a committed timestamp and whose owner none of the four facts names and this
+process does not hold active is a loser that a restored or ported image carried in, and is retired as
+the corpse it is.
+
+**Precondition: GC passes on one store are serialized**, from the start of the pass to the commit or
+rollback of its transaction, because fact 1 assumes that no second pass lists a commit slot between the
+sample and the walk. The engine's coordinator holds one guard across that whole span. The store does
+not rely on it silently: every pass body registers itself as running (`GcPassGuard`), a second body
+entering while one runs raises an overlap flag that stays raised until no pass is running, and a
+retirement loop that sees the flag retires nothing and re-arms — it **fails closed** for every pass
+involved.
+
+**How a retired slot is written.** A committed slot that nothing names has only its `flags` byte
+cleared, which is the byte the retired `delta_count` rule wrote at the same moment. A slot whose
+`commit_ts` is not a committed timestamp, and a slot whose `in_use` bit is already clear, is zeroed
+whole. Either way the id is then parked, not freed.
+
+**No live cell names an aborted transaction's slot** (task **#1070**). A rollback that restores a
+property cell the aborting transaction overwrote in place writes the restored value **and** re-stamps
+the cell's `created_ts` with a settled `Committed(ts)` word naming that value's true installer: the
+newest committed writer of that key, or the entity's creation, found on the entity's undo chain below
+the aborting transaction's own deltas (`RecordStore::installer_stamp_after_rollback`). If that
+installer's delta has already been reclaimed, the word is `Committed(ts)` of the entity's creation,
+floored at `1` because `Committed(0)` is the `0` sentinel. That lower bound is sound: a chain is
+reclaimed only once the watermark has passed it, so every existing and future snapshot reads any
+commit timestamp at or below the true one identically. The word written is a **value**, never a slot
+id — restoring an id is sound only while nothing can recycle it, and the aborting transaction's slot
+is about to be retired.
 
 A retired slot is then **parked** rather than freed, and re-enters circulation one collection pass
 later, under `D-orphan-slot-parking` — the same restraint the record stores already apply, and for a
@@ -670,7 +744,10 @@ only route was export and re-import. This one is not. Settling every stamp is a 
 the build that wrote the image*: `RecordStore::freeze_committed_headers`, which that build's own backup
 path already invoked. Opening the store with the previous build and forcing a full freeze leaves an
 image both conventions read identically. The gate's error message says exactly that, and names the
-first offending record — store kind, id, and the raw word — rather than merely refusing.
+first offending record — store kind, id, and the raw word — rather than merely refusing. The function
+belongs to that version-5 build only: task #1070 removed it from later builds, where every GC pass
+settles each committed writer's stamps and a settle-only pass (`RecordStore::gc_freeze_only`) does so
+without reclaiming anything.
 
 **Why the version-4 upgrade is lossless, and why the bump was still necessary.** The set's invariant is
 "these transactions are already folded into the counters beside it". For a pre-version-4 image the

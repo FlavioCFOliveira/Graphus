@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`RecordStore::active_transaction_count` and `RecordStore::unfrozen_commit_count` (rmp #1070)**,
+  observability accessors for the size of the store's in-memory transaction tables, used by the
+  plateau tests that check those tables stay bounded under sustained concurrent writes.
+
+### Changed
+
+- **Header stamps are settled by one full-range walk per GC pass, and that walk feeds the commit-slot
+  census (rmp #1070).** Every GC pass, full or settle-only, walks the whole id range of the three MVCC
+  record stores once: it records the `commit.store` slot each header word names, then settles the word
+  to `Committed(ts)` by compare-and-set if its writer has committed. The census excludes every slot
+  whose owner may still have been creating references while it read (the census window), and GC passes
+  on one store must be serialized — an overlap makes the census retire nothing. A rollback of an
+  in-place property write re-stamps the cell with its value's committed installer, so no live cell
+  names an aborted transaction's slot. No on-disk format change: the format version stays 6.
+
+### Removed
+
+- **The freeze sweep, the `freeze_low` frontier and the #809 frontier audit (rmp #1070).** The crate
+  `graphus-freezefloor`, the metric `graphus_freeze_frontier_violations_total`, the
+  `GcPassReport.freeze_violations` and `GcPassReport.first_freeze_violation` fields, the
+  `FreezeFrontierViolation` type, and `RecordStore::freeze_committed_headers` are gone. `freeze_low`
+  was never persisted, so no stored image needs a migration.
+
 ## [0.0.10] - 2026-07-21
 
 This cycle brings Graphus to **full Neo4j-5.x index and constraint parity**, closes a large tranche

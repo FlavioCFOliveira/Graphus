@@ -143,3 +143,7 @@ required-features = ["det-sched"]
 [[test]]
 name = "det_scheduler_checkpoint_redo_floor_1086"
 required-features = ["det-sched"]
+
+[[test]]
+name = "det_scheduler_census_window_1070"
+required-features = ["det-sched"]

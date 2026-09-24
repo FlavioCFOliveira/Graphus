@@ -130,9 +130,8 @@ const _: () = assert!(
 ///
 /// Version 3's hazard was irrecoverable — no rewrite could say which property cells had been
 /// removals — so its only route was export and re-import. This one is not: settling every stamp is a
-/// *supported operation of the build that wrote the image*
-/// ([`RecordStore::freeze_committed_headers`](crate::RecordStore::freeze_committed_headers), which
-/// the backup path already invokes). Opening the store with the previous build and forcing a full
+/// *supported operation of the build that wrote the image* (its `freeze_committed_headers`, which
+/// that build's backup path invokes). Opening the store with the previous build and forcing a full
 /// freeze leaves an image both conventions read identically. The gate's message says so.
 pub(crate) const COMMIT_SLOT_STAMP_FORMAT_VERSION: u32 = 6;
 

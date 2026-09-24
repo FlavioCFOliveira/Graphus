@@ -228,7 +228,10 @@ pub enum YieldSite {
     /// GC phase D — the property-chain sweep. This is the phase that reclaims a tombstone sitting on
     /// a live owner's chain, i.e. the `rmp` #811 severance window.
     GcPhaseD = 67,
-    /// GC phase E — MVCC stamp freeze.
+    /// GC phase S — the settle-and-census walk (`RecordStore::settle_and_census_headers`), once per
+    /// MVCC record store: settles every header word naming a committed writer's slot and reports the
+    /// `commit.store` slots headers still name. Keeps the name `GcPhaseE` and code 68 of the retired
+    /// phase-E freeze sweep it replaced (`rmp` #1070), so recorded schedules replay identically.
     GcPhaseE = 68,
 
     // ---- Write-path header reads (80..=89) --------------------------------------------------
